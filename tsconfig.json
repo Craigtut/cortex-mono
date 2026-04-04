@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@animus-labs/cortex": ["packages/cortex/src"],
+      "@animus-labs/cortex-code": ["packages/cortex-code/src"]
+    }
+  },
+  "references": [
+    { "path": "packages/cortex" },
+    { "path": "packages/cortex-code" }
+  ],
+  "include": [],
+  "exclude": ["node_modules", "dist"]
+}
