@@ -10,11 +10,12 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { Type, type Static } from '@sinclair/typebox';
 import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
+import type { CortexToolRuntime } from './runtime.js';
+import { attachRuntimeAwareTool } from './runtime.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -52,7 +53,8 @@ export interface WriteDetails {
 // ---------------------------------------------------------------------------
 
 export interface WriteToolConfig {
-  readRegistry: ReadRegistry;
+  runtime?: CortexToolRuntime | undefined;
+  readRegistry?: ReadRegistry | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,9 +153,12 @@ export function createWriteTool(config: WriteToolConfig): {
   parameters: typeof WriteParams;
   execute: (params: WriteParamsType) => Promise<ToolContentDetails<WriteDetails>>;
 } {
-  const { readRegistry } = config;
+  const readRegistry = config.runtime?.readRegistry ?? config.readRegistry;
+  if (!readRegistry) {
+    throw new Error('createWriteTool requires either runtime or readRegistry');
+  }
 
-  return {
+  const tool = {
     name: 'Write',
     description: 'Create a new file or overwrite an existing file on the local filesystem.',
     parameters: WriteParams,
@@ -302,4 +307,13 @@ export function createWriteTool(config: WriteToolConfig): {
       };
     },
   };
+
+  return attachRuntimeAwareTool(tool, {
+    toolKind: 'Write',
+    cloneForRuntime: (runtime) => createWriteTool({
+      ...config,
+      runtime,
+      readRegistry: runtime.readRegistry,
+    }),
+  });
 }

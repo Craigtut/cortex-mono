@@ -10,11 +10,16 @@
 
 import * as child_process from 'node:child_process';
 import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
 import type { CwdTracker } from '../shared/cwd-tracker.js';
 import type { ToolContentDetails } from '../../types.js';
 import { buildSafeEnv, runSafetyChecks } from './safety.js';
+import {
+  type BackgroundTask,
+  type CortexToolRuntime,
+  attachRuntimeAwareTool,
+  globalBackgroundTaskStore,
+} from '../runtime.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -67,7 +72,8 @@ const CWD_MARKER = '___CWD___';
 // ---------------------------------------------------------------------------
 
 export interface BashToolConfig {
-  cwdTracker: CwdTracker;
+  runtime?: CortexToolRuntime | undefined;
+  cwdTracker?: CwdTracker | undefined;
   /** Custom shell path override. */
   shellPath?: string | undefined;
   /** Auto-yield threshold in ms. Default: 10000. */
@@ -86,40 +92,12 @@ export interface BashToolConfig {
   envOverrides?: Record<string, string> | undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Background task store
-// ---------------------------------------------------------------------------
-
-export interface BackgroundTask {
-  id: string;
-  process: child_process.ChildProcess;
-  stdout: string;
-  stderr: string;
-  exitCode: number | null;
-  completed: boolean;
-  startTime: number;
-}
-
-/** Module-level store for background tasks. Shared with TaskOutput tool. */
-const backgroundTasks = new Map<string, BackgroundTask>();
-
 export function getBackgroundTask(id: string): BackgroundTask | undefined {
-  return backgroundTasks.get(id);
-}
-
-/** Clean up completed background tasks older than 30 minutes to prevent memory leaks. */
-function cleanupCompletedTasks(): void {
-  const maxAge = 30 * 60 * 1000;
-  const now = Date.now();
-  for (const [id, task] of backgroundTasks) {
-    if (task.completed && now - task.startTime > maxAge) {
-      backgroundTasks.delete(id);
-    }
-  }
+  return globalBackgroundTaskStore.get(id);
 }
 
 export function getAllBackgroundTasks(): Map<string, BackgroundTask> {
-  return backgroundTasks;
+  return globalBackgroundTaskStore.getAll();
 }
 
 // ---------------------------------------------------------------------------
@@ -271,23 +249,26 @@ function extractCwd(output: string): [string, string | null] {
 // Tool factory
 // ---------------------------------------------------------------------------
 
-let taskIdCounter = 0;
-
 export function createBashTool(config: BashToolConfig): {
   name: string;
   description: string;
   parameters: typeof BashParams;
   execute: (params: BashParamsType) => Promise<ToolContentDetails<BashDetails>>;
 } {
-  const { cwdTracker, autoYieldThreshold = AUTO_YIELD_THRESHOLD } = config;
+  const cwdTracker = config.runtime?.cwdTracker ?? config.cwdTracker;
+  if (!cwdTracker) {
+    throw new Error('createBashTool requires either runtime or cwdTracker');
+  }
+  const backgroundTasks = config.runtime?.backgroundTasks ?? globalBackgroundTaskStore;
+  const autoYieldThreshold = config.autoYieldThreshold ?? AUTO_YIELD_THRESHOLD;
 
-  return {
+  const tool = {
     name: 'Bash',
     description: 'Execute a shell command in the host environment.',
     parameters: BashParams,
 
     async execute(params: BashParamsType): Promise<ToolContentDetails<BashDetails>> {
-      cleanupCompletedTasks();
+      backgroundTasks.cleanupCompletedTasks();
       const timeout = Math.min(params.timeout ?? DEFAULT_TIMEOUT, MAX_TIMEOUT);
       const background = params.background ?? false;
       const startTime = Date.now();
@@ -379,7 +360,7 @@ export function createBashTool(config: BashToolConfig): {
 
       // Background execution
       if (background) {
-        const taskId = `task_${++taskIdCounter}`;
+        const taskId = backgroundTasks.nextTaskId();
         const task: BackgroundTask = {
           id: taskId,
           process: proc,
@@ -389,7 +370,7 @@ export function createBashTool(config: BashToolConfig): {
           completed: false,
           startTime: Date.now(),
         };
-        backgroundTasks.set(taskId, task);
+        backgroundTasks.set(task);
 
         proc.stdout?.setEncoding('utf8');
         proc.stderr?.setEncoding('utf8');
@@ -442,7 +423,7 @@ export function createBashTool(config: BashToolConfig): {
         const autoYieldTimer = setTimeout(() => {
           if (!proc.exitCode && proc.pid) {
             autoYielded = true;
-            taskId = `task_${++taskIdCounter}`;
+            taskId = backgroundTasks.nextTaskId();
             const task: BackgroundTask = {
               id: taskId,
               process: proc,
@@ -452,7 +433,7 @@ export function createBashTool(config: BashToolConfig): {
               completed: false,
               startTime: Date.now(),
             };
-            backgroundTasks.set(taskId, task);
+            backgroundTasks.set(task);
 
             // Remove original foreground listeners to prevent memory leak
             proc.stdout?.removeAllListeners('data');
@@ -560,6 +541,15 @@ export function createBashTool(config: BashToolConfig): {
       });
     },
   };
+
+  return attachRuntimeAwareTool(tool, {
+    toolKind: 'Bash',
+    cloneForRuntime: (runtime) => createBashTool({
+      ...config,
+      runtime,
+      cwdTracker: runtime.cwdTracker,
+    }),
+  });
 }
 
 // ---------------------------------------------------------------------------

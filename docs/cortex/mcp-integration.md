@@ -27,10 +27,10 @@ CortexAgent
 │       └── tools/list -> AgentTool wrappers
 │
 └── beforeToolCall hook
-    └── Permission gate (resolveToolGate) for all tools
+    └── Permission gate (resolvePermission) for all tools
 ```
 
-Sub-agents may share the same MCP server connection as the parent agent. If the consumer uses a shared bridge process, both the main agent (via Cortex) and sub-agents route tool calls through the same bridge.
+Sub-agents inherit the live MCP tool wrappers that exist on the parent at spawn time. Built-in tools are recreated with fresh per-agent runtime state, while MCP wrappers reuse the already connected client path.
 
 ## MCP Client Manager
 
@@ -162,28 +162,33 @@ mcpClientManager.connect('browser', {
 All tools, regardless of source, flow through the same `beforeToolCall` hook on the pi-agent-core Agent. This hook is the single enforcement point for the permission system.
 
 ```typescript
-agent.beforeToolCall = async (toolName, args) => {
-  const gate = await resolveToolGate(toolName, currentContact);
+agent.beforeToolCall = async ({ toolCall, args }) => {
+  const decision = await resolvePermission(toolCall.name, args);
 
-  if (gate.mode === 'off') {
-    return { blocked: true, reason: 'Tool is disabled' };
+  if (decision === true || decision?.decision === 'allow') {
+    return undefined;
   }
 
-  if (gate.mode === 'ask') {
-    // Two-tick approval dance: request approval, wait for user response
-    return await requestToolApproval(toolName, args);
+  if (decision?.decision === 'ask') {
+    return {
+      block: true,
+      reason: decision.reason ?? `Tool "${toolCall.name}" requires approval before it can run.`,
+    };
   }
 
-  // 'always_allow': proceed
-  return { blocked: false };
+  return {
+    block: true,
+    reason: decision?.reason ?? `Tool "${toolCall.name}" is blocked or disabled.`,
+  };
 };
 ```
 
 Key details:
 
-- `resolveToolGate()` is imported from `tool-gate.ts` (existing implementation)
-- Permission modes: `off` (blocked), `ask` (approval flow), `always_allow` (permitted)
-- For `ask` mode, the consumer's approval flow is invoked (same two-tick approval pattern as today)
+- `resolvePermission()` is a consumer callback supplied to `CortexAgent`
+- Structured decisions are `allow`, `block`, and `ask`
+- Boolean results are still accepted for compatibility and are normalized to `allow` or `block`
+- `ask` currently blocks the tool call and returns an approval-needed reason to the model. Consumers that want an approval UX must handle it out-of-band and retry later.
 - Permission lookup uses the `tool_permissions` table in system.db
 - Permission entries use the namespaced tool name (e.g., `domain__search_memories`, `weather__get_forecast`)
 - Built-in tools also pass through this hook
@@ -226,13 +231,13 @@ The consumer may run a shared bridge process (e.g., an HTTP server within the ba
 
 ```
 Main Agent (Cortex)
-  -> MCP client (stdio) -> domain MCP server subprocess -> bridge -> tool handler
+  -> inherited MCP wrapper -> existing client connection -> bridge -> tool handler
 
 Sub-Agent
-  -> MCP client (stdio) -> domain MCP server subprocess -> bridge -> tool handler
+  -> inherited MCP wrapper -> existing client connection -> bridge -> tool handler
 ```
 
-Each agent gets its own MCP server subprocess instance. The bridge distinguishes them by task ID (e.g., `'main'` for the primary agent, UUIDs for sub-agents). Tool permissions are checked at the bridge level for all paths.
+Child agents inherit the parent's live MCP wrappers at spawn time instead of reconnecting their own MCP subprocesses. This preserves access to currently connected tools while avoiding duplicate built-in runtime state.
 
 ## Open Questions
 

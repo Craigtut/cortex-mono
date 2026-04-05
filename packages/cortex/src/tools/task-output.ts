@@ -11,7 +11,11 @@
 
 import { Type, type Static } from '@sinclair/typebox';
 import type { ToolContentDetails } from '../types.js';
-import { getBackgroundTask } from './bash/index.js';
+import type { CortexToolRuntime } from './runtime.js';
+import {
+  attachRuntimeAwareTool,
+  globalBackgroundTaskStore,
+} from './runtime.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -51,13 +55,19 @@ export interface TaskOutputDetails {
 // Tool factory
 // ---------------------------------------------------------------------------
 
-export function createTaskOutputTool(): {
+export interface TaskOutputToolConfig {
+  runtime?: CortexToolRuntime | undefined;
+}
+
+export function createTaskOutputTool(config?: TaskOutputToolConfig): {
   name: string;
   description: string;
   parameters: typeof TaskOutputParams;
   execute: (params: TaskOutputParamsType) => Promise<ToolContentDetails<TaskOutputDetails>>;
 } {
-  return {
+  const backgroundTasks = config?.runtime?.backgroundTasks ?? globalBackgroundTaskStore;
+
+  const tool = {
     name: 'TaskOutput',
     description: 'Poll, send input to, or kill a backgrounded process.',
     parameters: TaskOutputParams,
@@ -65,7 +75,7 @@ export function createTaskOutputTool(): {
     async execute(params: TaskOutputParamsType): Promise<ToolContentDetails<TaskOutputDetails>> {
       const { task_id: taskId, action } = params;
 
-      const task = getBackgroundTask(taskId);
+      const task = backgroundTasks.get(taskId);
       if (!task) {
         return {
           content: [{ type: 'text', text: `Task not found: ${taskId}` }],
@@ -218,4 +228,9 @@ export function createTaskOutputTool(): {
       }
     },
   };
+
+  return attachRuntimeAwareTool(tool, {
+    toolKind: 'TaskOutput',
+    cloneForRuntime: (runtime) => createTaskOutputTool({ runtime }),
+  });
 }

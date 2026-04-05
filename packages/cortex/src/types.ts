@@ -13,6 +13,8 @@
  *   - working-tags.md
  */
 
+import type { CortexModel } from './model-wrapper.js';
+
 // ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
@@ -60,20 +62,30 @@ export interface CortexUsage {
 export type CortexLifecycleState = 'created' | 'active' | 'destroyed';
 
 // ---------------------------------------------------------------------------
+// Tool Permissions
+// ---------------------------------------------------------------------------
+
+export type CortexToolPermissionDecision = 'allow' | 'block' | 'ask';
+
+export interface CortexToolPermissionResult {
+  decision: CortexToolPermissionDecision;
+  reason?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Agent Configuration
 // ---------------------------------------------------------------------------
 
 /**
  * Configuration for creating a CortexAgent instance.
  *
- * The `model` field accepts any pi-ai Model object. It is typed as `unknown`
- * here to avoid a hard runtime dependency on pi-ai; the actual type is
- * `Model` from `@mariozechner/pi-ai`. Consumers pass a real Model object
- * at construction time.
+ * The `model` field uses CortexModel as the public boundary.
+ * Consumers obtain these handles from ProviderManager and pass them back to
+ * CortexAgent. Raw pi-ai model objects stay inside Cortex.
  */
 export interface CortexAgentConfig {
   /** Primary model for the agentic loop, THOUGHT, REFLECT, and all consumer-facing work. */
-  model: unknown;
+  model: CortexModel;
 
   /**
    * Initial application/base prompt.
@@ -84,10 +96,10 @@ export interface CortexAgentConfig {
   /**
    * Utility model for internal operations (WebFetch summarization, safety classifier).
    * - `'default'`: Cortex selects from a built-in mapping based on the primary model's provider.
-   * - A Model object: explicit utility model (must be same provider as primary).
+   * - A CortexModel: explicit utility model (must be same provider as primary).
    * - `undefined`: same as `'default'`.
    */
-  utilityModel?: unknown | 'default';
+  utilityModel?: CortexModel | 'default';
 
   /** Working directory for file operations (Bash, Read, Write, Edit, Glob, Grep). */
   workingDirectory: string;
@@ -134,12 +146,15 @@ export interface CortexAgentConfig {
   };
 
   /**
-   * Tool permission resolver callback.
-   * Called before each tool execution. Return true to allow, false to block.
-   * Throw to block with an error message.
-   * If not provided, all tools are allowed.
+   * Structured permission result for a tool call.
+   * - `allow`: proceed immediately
+   * - `block`: deny the call
+   * - `ask`: consumer requires approval before the call can proceed
    */
-  resolvePermission?: (toolName: string, toolArgs: unknown) => Promise<boolean>;
+  resolvePermission?: (
+    toolName: string,
+    toolArgs: unknown,
+  ) => Promise<boolean | CortexToolPermissionResult>;
 
   /**
    * Limit the effective context window for compaction calculations.

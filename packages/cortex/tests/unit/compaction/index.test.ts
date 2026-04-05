@@ -372,6 +372,39 @@ describe('CompactionManager', () => {
 
       expect(callOrder[0]).toBe('before');
     });
+
+    it('uses the current transformed-context estimate when it exceeds the stale session token count', async () => {
+      manager.setContextWindow(1_000);
+      manager.updateTokenCount(100);
+      const mockComplete = vi.fn().mockResolvedValue('Fresh summary');
+      manager.setCompleteFn(mockComplete);
+
+      const slots = [makeUserMsg('slot1'), makeUserMsg('slot2')];
+      const largeTurn = 'x'.repeat(5_000);
+      const history = [
+        makeUserMsg(largeTurn),
+        makeAssistantMsg(largeTurn),
+        makeUserMsg(largeTurn),
+        makeAssistantMsg(largeTurn),
+        makeUserMsg(largeTurn),
+        makeAssistantMsg(largeTurn),
+        makeUserMsg(largeTurn),
+        makeAssistantMsg(largeTurn),
+      ];
+      const context = makeContext([...slots, ...history]);
+      let sourceHistory = [...history];
+
+      await manager.applyInTransformContext(
+        context,
+        (ctx) => ctx.messages.slice(2),
+        (ctx, hist) => ({ ...ctx, messages: [...ctx.messages.slice(0, 2), ...hist] }),
+        () => sourceHistory,
+        (hist) => { sourceHistory = hist; },
+      );
+
+      expect(mockComplete).toHaveBeenCalled();
+      expect(sourceHistory.length).toBeLessThan(history.length);
+    });
   });
 
   // -----------------------------------------------------------------------

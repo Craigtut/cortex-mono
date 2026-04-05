@@ -69,17 +69,18 @@ Background sub-agents use pi-agent-core's `getFollowUpMessages()` mechanism to n
 
 Each sub-agent is an independent `CortexAgent` instance with its own:
 - **Message array**: No shared conversation history with the parent. The sub-agent starts fresh with only the `instructions` as its initial prompt.
-- **Tool set**: Can be restricted from the parent's tools. The sub-agent cannot access tools the parent doesn't have. **The SubAgent tool itself is always excluded from child agents.** Sub-agents cannot spawn further sub-agents. This prevents runaway recursive spawning and unbounded resource consumption. If the `tools` parameter explicitly includes `SubAgent`, it is silently stripped.
+- **Tool set**: Can be restricted from the parent's tools. The sub-agent cannot access tools the parent doesn't have. **The `SubAgent` and `load_skill` tools are always excluded from child agents.** Sub-agents cannot spawn further sub-agents, and they do not recursively load skills. If the `tools` parameter explicitly includes either excluded tool, it is silently stripped.
 - **System prompt**: Defaults to the parent's system prompt. Can be overridden for specialized tasks (e.g., a research-focused prompt).
 - **Budget guards**: Inherits from the parent's config by default. Can be tightened (but not loosened beyond the parent's limits).
 - **Context manager**: The sub-agent gets its own ContextManager. Context slots are NOT inherited. The sub-agent starts with an empty slot region.
 - **Working directory**: Inherits the parent's current working directory.
+- **Built-in tool runtime**: Fresh cwd, read-tracking, WebFetch, and background-task state. Parent and child built-in tool state do not leak into each other.
 
 Sub-agents share the parent's:
 - **API key / provider configuration**: Same pi-ai model and authentication.
 - **Permission resolver**: The same `beforeToolCall` hook applies. Sub-agents cannot bypass the parent's permission gates.
 - **Working tags config**: Inherits `workingTags.enabled` from the parent by default.
-- **MCP client connections**: Plugin MCP servers are shared (no need to reconnect).
+- **Live MCP tool inventory**: The child inherits the parent tool wrappers that are connected at spawn time, so allowed MCP tools remain available without reconnecting.
 
 ## Steering and Cancellation
 

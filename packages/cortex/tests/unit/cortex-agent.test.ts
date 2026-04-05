@@ -3,6 +3,8 @@ import { CortexAgent } from '../../src/cortex-agent.js';
 import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
 import type { PiEvent } from '../../src/event-bridge.js';
 import type { CortexAgentConfig } from '../../src/types.js';
+import { wrapModel } from '../../src/model-wrapper.js';
+import type { CortexModel } from '../../src/model-wrapper.js';
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent factory
@@ -138,15 +140,46 @@ function createTestCortexAgent(
   return new CortexAgentCtor(agent, config, tools, options);
 }
 
+function makeModel(raw: PiModel): CortexModel {
+  const rawRecord = raw as Record<string, unknown>;
+  const modelId = typeof rawRecord['id'] === 'string'
+    ? rawRecord['id']
+    : typeof raw.name === 'string'
+      ? raw.name
+      : 'test-model';
+  const contextWindow = typeof raw.contextWindow === 'number' ? raw.contextWindow : undefined;
+  return wrapModel(raw, raw.provider, modelId, contextWindow);
+}
+
+function normalizeModel(model: PiModel | CortexModel): CortexModel {
+  const asRecord = model as Record<string, unknown>;
+  return asRecord['__brand'] === 'CortexModel'
+    ? model as CortexModel
+    : makeModel(model as PiModel);
+}
+
 function createDefaultConfig(
-  overrides?: Partial<CortexAgentConfig>,
+  overrides?: Partial<CortexAgentConfig> & {
+    model?: PiModel | CortexModel;
+    utilityModel?: PiModel | CortexModel | 'default';
+  },
 ): CortexAgentConfig {
+  const { model, utilityModel, ...rest } = overrides ?? {};
   return {
-    model: { provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel,
+    model: model
+      ? normalizeModel(model)
+      : makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel),
     workingDirectory: '/tmp/test-workspace',
     initialBasePrompt: 'Test base prompt',
     slots: [],
-    ...overrides,
+    ...(utilityModel !== undefined
+      ? {
+          utilityModel: utilityModel === 'default'
+            ? 'default'
+            : normalizeModel(utilityModel),
+        }
+      : {}),
+    ...rest,
   };
 }
 
@@ -187,21 +220,21 @@ describe('CortexAgent', () => {
       const agent = createTestCortexAgent(piAgent, config);
       const utilityModel = agent.getUtilityModel();
       expect(utilityModel.provider).toBe('anthropic');
-      expect(utilityModel.name).toBe('claude-haiku-4-5-20251001');
+      expect(utilityModel.modelId).toBe('claude-haiku-4-5-20251001');
     });
 
     it('resolves utility model from defaults for openai', () => {
       const agent = createTestCortexAgent(piAgent, {
         ...config,
-        model: { provider: 'openai', name: 'gpt-4o' } as PiModel,
+        model: makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel),
       });
       const utilityModel = agent.getUtilityModel();
       expect(utilityModel.provider).toBe('openai');
-      expect(utilityModel.name).toBe('gpt-4.1-nano');
+      expect(utilityModel.modelId).toBe('gpt-4.1-nano');
     });
 
     it('uses primary model when no default mapping exists', () => {
-      const customModel = { provider: 'custom-provider', name: 'custom-model' } as PiModel;
+      const customModel = makeModel({ provider: 'custom-provider', name: 'custom-model' } as PiModel);
       const agent = createTestCortexAgent(piAgent, {
         ...config,
         model: customModel,
@@ -211,7 +244,7 @@ describe('CortexAgent', () => {
     });
 
     it('uses explicit utility model when provided', () => {
-      const explicitUtility = { provider: 'anthropic', name: 'claude-haiku-3' } as PiModel;
+      const explicitUtility = makeModel({ provider: 'anthropic', name: 'claude-haiku-3' } as PiModel);
       const agent = createTestCortexAgent(piAgent, {
         ...config,
         utilityModel: explicitUtility,
@@ -224,8 +257,8 @@ describe('CortexAgent', () => {
       expect(() => {
         createTestCortexAgent(piAgent, {
           ...config,
-          model: { provider: 'anthropic', name: 'claude-sonnet' } as PiModel,
-          utilityModel: { provider: 'openai', name: 'gpt-4o-mini' } as PiModel,
+          model: makeModel({ provider: 'anthropic', name: 'claude-sonnet' } as PiModel),
+          utilityModel: makeModel({ provider: 'openai', name: 'gpt-4o-mini' } as PiModel),
         });
       }).toThrow('does not match primary model provider');
     });
@@ -720,7 +753,7 @@ You have 12 emotions.`;
     it('auto-wires token tracking from turn_end usage data', () => {
       const agent = createTestCortexAgent(piAgent, {
         ...config,
-        model: { provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel,
+        model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
       });
 
       expect(agent.sessionTokenCount).toBe(0);
@@ -738,7 +771,7 @@ You have 12 emotions.`;
     it('auto-wires token tracking from message.usage.input pattern', () => {
       const agent = createTestCortexAgent(piAgent, {
         ...config,
-        model: { provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel,
+        model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
       });
 
       piAgent.emitEvent({
@@ -755,7 +788,7 @@ You have 12 emotions.`;
     it('does not update token count when turn_end has no usage data', () => {
       const agent = createTestCortexAgent(piAgent, {
         ...config,
-        model: { provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel,
+        model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
       });
 
       // Manually set a known value
@@ -895,7 +928,7 @@ You have 12 emotions.`;
 
   describe('model access', () => {
     it('getModel returns the primary model', () => {
-      const model = { provider: 'anthropic', name: 'claude-sonnet-4' } as PiModel;
+      const model = makeModel({ provider: 'anthropic', name: 'claude-sonnet-4' } as PiModel);
       const agent = createTestCortexAgent(piAgent, {
         ...config,
         model,
@@ -909,7 +942,7 @@ You have 12 emotions.`;
       const utility = agent.getUtilityModel();
 
       expect(utility.provider).toBe('anthropic');
-      expect(utility.name).toBeDefined();
+      expect(utility.modelId).toBeDefined();
     });
 
     it('utilityComplete uses utility model for completion', async () => {
@@ -927,7 +960,7 @@ You have 12 emotions.`;
   describe('setModel', () => {
     it('updates the primary model', () => {
       const agent = createTestCortexAgent(piAgent, config);
-      const newModel = { provider: 'openai', name: 'gpt-4o', contextWindow: 128_000 } as PiModel;
+      const newModel = makeModel({ provider: 'openai', name: 'gpt-4o', contextWindow: 128_000 } as PiModel);
 
       agent.setModel(newModel);
 
@@ -939,16 +972,18 @@ You have 12 emotions.`;
       (piAgent as unknown as Record<string, unknown>).setModel = setModelFn;
 
       const agent = createTestCortexAgent(piAgent, config);
-      const newModel = { provider: 'openai', name: 'gpt-4o' } as PiModel;
+      const newModel = makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel);
 
       agent.setModel(newModel);
 
-      expect(setModelFn).toHaveBeenCalledWith(newModel);
+      expect(setModelFn).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'openai', name: 'gpt-4o' }),
+      );
     });
 
     it('does not throw when agent lacks setModel', () => {
       const agent = createTestCortexAgent(piAgent, config);
-      const newModel = { provider: 'openai', name: 'gpt-4o' } as PiModel;
+      const newModel = makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel);
 
       // Should not throw even though piAgent has no setModel
       expect(() => agent.setModel(newModel)).not.toThrow();

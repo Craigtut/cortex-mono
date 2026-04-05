@@ -16,6 +16,8 @@ import { isIPv4, isIPv6 } from 'node:net';
 import { Type, type Static } from '@sinclair/typebox';
 import type { ToolContentDetails } from '../../types.js';
 import { WebFetchCache } from './cache.js';
+import type { CortexToolRuntime } from '../runtime.js';
+import { attachRuntimeAwareTool } from '../runtime.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -135,6 +137,7 @@ async function validateResolvedIp(hostname: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export interface WebFetchToolConfig {
+  runtime?: CortexToolRuntime | undefined;
   /** Utility model completion function for summarization. */
   utilityComplete?: ((context: unknown) => Promise<unknown>) | undefined;
   /** Max fetches per agentic loop. */
@@ -287,16 +290,21 @@ export function createWebFetchTool(config: WebFetchToolConfig): {
   /** Get the underlying cache (for testing/diagnostics). */
   getCache: () => WebFetchCache;
 } {
-  const cache = new WebFetchCache();
+  const runtimeWebFetch = config.runtime?.webFetch;
+  const cache = runtimeWebFetch?.getCache() ?? new WebFetchCache();
   const maxPerLoop = config.maxPerLoop ?? DEFAULT_MAX_PER_LOOP;
   let fetchesThisLoop = 0;
 
-  return {
+  const tool = {
     name: 'WebFetch',
     description: 'Fetch a web page and return a summarized answer to your question about its content.',
     parameters: WebFetchParams,
 
     resetRateLimit() {
+      if (runtimeWebFetch) {
+        runtimeWebFetch.resetLoop();
+        return;
+      }
       fetchesThisLoop = 0;
     },
 
@@ -346,7 +354,8 @@ export function createWebFetchTool(config: WebFetchToolConfig): {
       }
 
       // Rate limit check (only for non-cached fetches)
-      if (fetchesThisLoop >= maxPerLoop) {
+      const currentFetchCount = runtimeWebFetch?.fetchCount ?? fetchesThisLoop;
+      if (currentFetchCount >= maxPerLoop) {
         return {
           content: [{ type: 'text', text: `WebFetch rate limit reached (${maxPerLoop} per loop). Wait for the next loop or use Bash with curl for direct access.` }],
           details: {
@@ -359,7 +368,11 @@ export function createWebFetchTool(config: WebFetchToolConfig): {
         };
       }
 
-      fetchesThisLoop++;
+      if (runtimeWebFetch) {
+        runtimeWebFetch.incrementFetchCount();
+      } else {
+        fetchesThisLoop++;
+      }
 
       // DNS pre-resolution: resolve hostname and validate the IP is not private.
       // This prevents DNS rebinding attacks where a domain initially resolves to
@@ -554,6 +567,14 @@ export function createWebFetchTool(config: WebFetchToolConfig): {
       };
     },
   };
+
+  return attachRuntimeAwareTool(tool, {
+    toolKind: 'WebFetch',
+    cloneForRuntime: (runtime) => createWebFetchTool({
+      ...config,
+      runtime,
+    }),
+  });
 }
 
 // ---------------------------------------------------------------------------

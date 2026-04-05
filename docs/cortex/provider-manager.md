@@ -43,7 +43,7 @@ interface IProviderManager {
   // ── Discovery ──
   listProviders(): ProviderInfo[];
   listOAuthProviders(): string[];
-  listModels(provider: string): ModelInfo[];
+  listModels(provider: string): Promise<ModelInfo[]>;
 
   // ── OAuth ──
   initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult>;
@@ -51,12 +51,12 @@ interface IProviderManager {
   resolveOAuthApiKey(provider: string, credentials: string): Promise<OAuthRefreshResult>;
 
   // ── API Key ──
-  validateApiKey(provider: string, apiKey: string): Promise<boolean>;
+  validateApiKey(provider: string, apiKey: string): Promise<ApiKeyValidationResult>;
   checkEnvApiKey(provider: string): string | null;
 
   // ── Model Resolution ──
-  resolveModel(provider: string, modelId: string): CortexModel;
-  createCustomModel(config: CustomModelConfig): CortexModel;
+  resolveModel(provider: string, modelId: string): Promise<CortexModel>;
+  createCustomModel(config: CustomModelConfig): Promise<CortexModel>;
 }
 ```
 
@@ -222,6 +222,27 @@ interface CustomModelConfig {
 }
 ```
 
+### API Key Validation
+
+```typescript
+type ApiKeyValidationStatus =
+  | 'valid'
+  | 'invalid_credentials'
+  | 'transient_error'
+  | 'resolution_error';
+
+interface ApiKeyValidationResult {
+  provider: string;
+  modelId: string | null;
+  valid: boolean;
+  retryable: boolean;
+  status: ApiKeyValidationStatus;
+  message?: string;
+}
+```
+
+`validateApiKey()` does not collapse all failures into a single boolean. Consumers can distinguish bad credentials from retryable provider failures and from provider/model resolution errors.
+
 ## Implementation
 
 ### Default Implementation
@@ -253,7 +274,7 @@ class ProviderManager implements IProviderManager {
     return ['anthropic', 'openai-codex', 'github-copilot', 'google-gemini-cli', 'google-antigravity'];
   }
 
-  listModels(provider: string): ModelInfo[] {
+  async listModels(provider: string): Promise<ModelInfo[]> {
     // Delegates to pi-ai's getModels(), maps to ModelInfo
     const models = getModels(provider);
     return models.map(mapToModelInfo);
@@ -313,16 +334,54 @@ class ProviderManager implements IProviderManager {
     return { apiKey: result.apiKey, credentials: newCredentials, meta, changed };
   }
 
-  async validateApiKey(provider: string, apiKey: string): Promise<boolean> {
-    // Makes a minimal LLM call to verify the key works
+  async validateApiKey(
+    provider: string,
+    apiKey: string,
+  ): Promise<ApiKeyValidationResult> {
+    const modelId = this.getSmallestModel(provider);
+    if (!modelId) {
+      return {
+        provider,
+        modelId: null,
+        valid: false,
+        retryable: false,
+        status: 'resolution_error',
+        message: `No validation model available for provider "${provider}"`,
+      };
+    }
+
     try {
-      const model = getModel(provider, this.getSmallestModel(provider));
+      const model = getModel(provider, modelId);
       await completeSimple(model, {
         messages: [{ role: 'user', content: 'hi' }],
       }, { apiKey, maxTokens: 1 });
-      return true;
-    } catch {
-      return false;
+      return {
+        provider,
+        modelId,
+        valid: true,
+        retryable: false,
+        status: 'valid',
+      };
+    } catch (error) {
+      if (isInvalidCredentialError(error)) {
+        return {
+          provider,
+          modelId,
+          valid: false,
+          retryable: false,
+          status: 'invalid_credentials',
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+
+      return {
+        provider,
+        modelId,
+        valid: false,
+        retryable: true,
+        status: 'transient_error',
+        message: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
@@ -330,12 +389,12 @@ class ProviderManager implements IProviderManager {
     return getEnvApiKey(provider) ?? null;
   }
 
-  resolveModel(provider: string, modelId: string): CortexModel {
+  async resolveModel(provider: string, modelId: string): Promise<CortexModel> {
     const piModel = getModel(provider, modelId);
     return wrapModel(piModel, provider, modelId);
   }
 
-  createCustomModel(config: CustomModelConfig): CortexModel {
+  async createCustomModel(config: CustomModelConfig): Promise<CortexModel> {
     const piModel = createModel({
       baseUrl: config.baseUrl,
       modelId: config.modelId,
@@ -471,6 +530,8 @@ function extractDisplayName(credentials: Record<string, unknown>): string | unde
 
 CortexAgent receives a `CortexModel` and an optional `getApiKey` callback. The callback is the consumer's responsibility to implement; ProviderManager is not involved.
 
+`CortexModel` is the public model boundary for Cortex. Consumers obtain it from `ProviderManager`, store it, and pass it back into `CortexAgent`. Raw pi-ai model objects do not cross the public API boundary.
+
 ```typescript
 // packages/cortex/src/cortex-agent.ts
 
@@ -489,7 +550,7 @@ interface CortexAgentConfig {
 }
 ```
 
-Internally, CortexAgent unwraps the `CortexModel` to get the pi-ai `Model` and passes `getApiKey` through to pi-agent-core:
+Internally, CortexAgent unwraps the `CortexModel` once at the Cortex boundary, uses the raw pi-ai model for runtime calls, and passes `getApiKey` through to pi-agent-core:
 
 ```typescript
 const agent = await CortexAgent.create({

@@ -15,6 +15,8 @@ import { Type, type Static } from '@sinclair/typebox';
 import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
 import type { DiffHunk } from './write.js';
+import type { CortexToolRuntime } from './runtime.js';
+import { attachRuntimeAwareTool } from './runtime.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -53,7 +55,8 @@ export interface EditDetails {
 // ---------------------------------------------------------------------------
 
 export interface EditToolConfig {
-  readRegistry: ReadRegistry;
+  runtime?: CortexToolRuntime | undefined;
+  readRegistry?: ReadRegistry | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,9 +161,12 @@ export function createEditTool(config: EditToolConfig): {
   parameters: typeof EditParams;
   execute: (params: EditParamsType) => Promise<ToolContentDetails<EditDetails>>;
 } {
-  const { readRegistry } = config;
+  const readRegistry = config.runtime?.readRegistry ?? config.readRegistry;
+  if (!readRegistry) {
+    throw new Error('createEditTool requires either runtime or readRegistry');
+  }
 
-  return {
+  const tool = {
     name: 'Edit',
     description: 'Make precise string replacements in an existing file.',
     parameters: EditParams,
@@ -343,4 +349,13 @@ export function createEditTool(config: EditToolConfig): {
       };
     },
   };
+
+  return attachRuntimeAwareTool(tool, {
+    toolKind: 'Edit',
+    cloneForRuntime: (runtime) => createEditTool({
+      ...config,
+      runtime,
+      readRegistry: runtime.readRegistry,
+    }),
+  });
 }

@@ -10,6 +10,19 @@
 export { ReadRegistry } from './shared/read-registry.js';
 export type { ReadState } from './shared/read-registry.js';
 export { CwdTracker } from './shared/cwd-tracker.js';
+export {
+  CortexToolRuntime,
+  BackgroundTaskStore,
+  WebFetchRuntimeState,
+  globalBackgroundTaskStore,
+  attachRuntimeAwareTool,
+  getRuntimeAwareToolMetadata,
+  cloneRuntimeAwareTool,
+} from './runtime.js';
+export type {
+  BackgroundTask,
+  RuntimeAwareToolMetadata,
+} from './runtime.js';
 
 // Tool factories
 export { createReadTool } from './read.js';
@@ -33,11 +46,11 @@ export type { GrepToolConfig, GrepDetails, GrepParamsType } from './grep.js';
 export { GrepParams } from './grep.js';
 
 export { createBashTool, getBackgroundTask, getAllBackgroundTasks } from './bash/index.js';
-export type { BashToolConfig, BashDetails, BashParamsType, BackgroundTask } from './bash/index.js';
+export type { BashToolConfig, BashDetails, BashParamsType } from './bash/index.js';
 export { BashParams } from './bash/index.js';
 
 export { createTaskOutputTool } from './task-output.js';
-export type { TaskOutputDetails, TaskOutputParamsType } from './task-output.js';
+export type { TaskOutputDetails, TaskOutputParamsType, TaskOutputToolConfig } from './task-output.js';
 export { TaskOutputParams } from './task-output.js';
 
 export { createWebFetchTool, isPrivateIp } from './web-fetch/index.js';

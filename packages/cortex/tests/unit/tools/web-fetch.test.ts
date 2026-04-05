@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createWebFetchTool, isPrivateIp } from '../../../src/tools/web-fetch/index.js';
 import { promises as dns } from 'node:dns';
+import { CortexToolRuntime } from '../../../src/tools/runtime.js';
 
 describe('WebFetch tool', () => {
   let webFetchTool: ReturnType<typeof createWebFetchTool>;
@@ -141,6 +142,37 @@ describe('WebFetch tool', () => {
     expect(result.details.cacheHit).toBe(true);
 
     tool.getCache().destroy();
+  });
+
+  it('keeps rate limits and cache ownership isolated per runtime', async () => {
+    const runtimeA = new CortexToolRuntime('/tmp/webfetch-a');
+    const runtimeB = new CortexToolRuntime('/tmp/webfetch-b');
+    const toolA = createWebFetchTool({ runtime: runtimeA, maxPerLoop: 1 });
+    const toolB = createWebFetchTool({ runtime: runtimeB, maxPerLoop: 1 });
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response('<html><body>runtime specific</body></html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      }),
+    );
+
+    try {
+      await toolA.execute({ url: 'https://example.com/runtime-a', prompt: 'test' });
+
+      const limited = await toolA.execute({ url: 'https://example.com/runtime-a-2', prompt: 'test' });
+      expect((limited.content[0] as { type: 'text'; text: string }).text).toContain('rate limit');
+
+      const otherRuntime = await toolB.execute({ url: 'https://example.com/runtime-b', prompt: 'test' });
+      expect((otherRuntime.content[0] as { type: 'text'; text: string }).text).not.toContain('rate limit');
+
+      await toolA.execute({ url: 'https://example.com/shared-cache-check', prompt: 'one' });
+      const cacheMissInOtherRuntime = await toolB.execute({ url: 'https://example.com/shared-cache-check', prompt: 'two' });
+      expect(cacheMissInOtherRuntime.details.cacheHit).toBe(false);
+    } finally {
+      runtimeA.destroy();
+      runtimeB.destroy();
+    }
   });
 
   it('handles HTTP 404', async () => {

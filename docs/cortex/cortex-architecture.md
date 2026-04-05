@@ -26,6 +26,7 @@ packages/cortex/
     types.ts                    # Package-specific types
     tools/
       index.ts                  # Tool registration entry point
+      runtime.ts                # Per-agent mutable tool runtime state
       bash.ts                   # Bash shell execution
       bash-safety.ts            # 7-layer safety checks for shell commands
       cwd-tracker.ts            # Working directory tracking across bash calls
@@ -91,7 +92,7 @@ Built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent) are NOT
 
 ### Built-in Tools
 
-Eight tools are native `AgentTool` registrations defined directly in Cortex (`built-in-tools.ts`). These run in-process with no MCP overhead.
+Built-in tools are native `AgentTool` registrations defined directly in Cortex. These run in-process with no MCP overhead.
 
 - **Bash**: Execute shell commands and return output.
 - **Read**: Read file contents from the filesystem.
@@ -102,7 +103,9 @@ Eight tools are native `AgentTool` registrations defined directly in Cortex (`bu
 - **WebFetch**: Fetch content from URLs.
 - **SubAgent**: Spawn a sub-agent for delegated work.
 
-Each built-in tool has its own permission entry in the `tool_permissions` table (system.db). Permissions are enforced through the same `beforeToolCall` hook used for MCP tools. The consumer (backend) configures which built-in tools are enabled when creating the agent, passing a list of enabled tool names at construction time. Built-in tool schemas use TypeBox directly since they are defined within Cortex, not converted from Zod. SubAgent is a special case: it delegates work to a child Cortex agent, integrating with the existing `AgentOrchestrator` lifecycle.
+Mutable built-in tool state is scoped per agent runtime. That includes cwd tracking, read tracking, WebFetch loop counters/cache ownership, and background task ownership. Parent and child agents get fresh built-in tool instances so they do not share mutable closures.
+
+Each built-in tool has its own permission entry in the `tool_permissions` table (system.db). Permissions are enforced through the same `beforeToolCall` hook used for MCP tools. The consumer (backend) configures which built-in tools are enabled when creating the agent, passing a list of enabled tool names at construction time. Built-in tool schemas use TypeBox directly since they are defined within Cortex, not converted from Zod. SubAgent is a special case: it delegates work to a child Cortex agent.
 
 ### Schema Conversion (Zod -> TypeBox)
 
@@ -123,9 +126,9 @@ One-way conversion at the tool registration boundary. Consumer code continues us
 Pi-agent-core has no permission system. Cortex implements permissions via the `beforeToolCall` hook:
 
 - Accepts a permission resolver function from the consumer
-- For `off` mode tools: blocks execution
-- For `always_allow` mode tools: allows execution
-- For `ask` mode tools: delegates to the consumer's approval flow
+- Supports a structured result: `allow`, `block`, or `ask`
+- Accepts booleans for backward compatibility: `true` -> `allow`, `false` -> `block`
+- `ask` currently blocks the tool call with an approval-needed reason. Cortex does not run an in-band approval flow for the consumer.
 
 The consumer provides the resolver; cortex provides the hook integration.
 

@@ -2,24 +2,25 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-import { CwdTracker } from '../../../src/tools/shared/cwd-tracker.js';
-import { createBashTool, getBackgroundTask } from '../../../src/tools/bash/index.js';
+import { CortexToolRuntime } from '../../../src/tools/runtime.js';
+import { createBashTool } from '../../../src/tools/bash/index.js';
 import { createTaskOutputTool } from '../../../src/tools/task-output.js';
 
 describe('TaskOutput tool', () => {
-  let cwdTracker: CwdTracker;
+  let runtime: CortexToolRuntime;
   let bashTool: ReturnType<typeof createBashTool>;
   let taskOutputTool: ReturnType<typeof createTaskOutputTool>;
   let tmpDir: string;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-task-test-'));
-    cwdTracker = new CwdTracker(tmpDir);
-    bashTool = createBashTool({ cwdTracker });
-    taskOutputTool = createTaskOutputTool();
+    runtime = new CortexToolRuntime(tmpDir);
+    bashTool = createBashTool({ runtime });
+    taskOutputTool = createTaskOutputTool({ runtime });
   });
 
   afterEach(() => {
+    runtime.destroy();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -96,7 +97,7 @@ describe('TaskOutput tool', () => {
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
     // Verify it completed (with non-zero exit)
-    const task = getBackgroundTask(taskId);
+    const task = runtime.backgroundTasks.get(taskId);
     expect(task?.completed).toBe(true);
   }, 10000);
 
@@ -118,4 +119,35 @@ describe('TaskOutput tool', () => {
     const text = (result.content[0] as { type: 'text'; text: string }).text;
     expect(text).toContain('already completed');
   }, 10000);
+
+  it('cannot see background tasks from another runtime', async () => {
+    const otherRuntime = new CortexToolRuntime(tmpDir);
+    const otherBashTool = createBashTool({ runtime: otherRuntime });
+    const otherTaskOutputTool = createTaskOutputTool({ runtime: otherRuntime });
+
+    try {
+      const bashResult = await otherBashTool.execute({
+        command: 'sleep 1',
+        background: true,
+      });
+
+      const taskId = bashResult.details.taskId!;
+
+      const result = await taskOutputTool.execute({
+        task_id: taskId,
+        action: 'poll',
+      });
+
+      expect(result.details.status).toBe('not_found');
+
+      const ownedResult = await otherTaskOutputTool.execute({
+        task_id: taskId,
+        action: 'poll',
+      });
+
+      expect(ownedResult.details.status).toMatch(/running|completed/);
+    } finally {
+      otherRuntime.destroy();
+    }
+  });
 });

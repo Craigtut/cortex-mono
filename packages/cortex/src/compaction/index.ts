@@ -527,12 +527,15 @@ export class CompactionManager {
       return context;
     }
 
-    // Estimate current tokens if we don't have post-hoc data yet
+    // Use the current transformed context estimate as a first-class input.
+    // Post-hoc token tracking from the previous turn is useful, but it can be
+    // stale when transformContext injects large ephemeral content on this turn.
+    const estimatedCurrentTokens = this.estimateContextTokens(context);
     const currentTokens = this._sessionTokenCount > 0
-      ? this._sessionTokenCount
-      : this.estimateContextTokens(context);
+      ? Math.max(this._sessionTokenCount, estimatedCurrentTokens)
+      : estimatedCurrentTokens;
 
-    this._debugLog?.(`transformContext: historyLen=${history.length}, sessionTokens=${this._sessionTokenCount}, heuristic=${this.estimateContextTokens(context)}, currentTokens=${currentTokens}, ctxWindow=${this._contextWindow}`);
+    this._debugLog?.(`transformContext: historyLen=${history.length}, sessionTokens=${this._sessionTokenCount}, heuristic=${estimatedCurrentTokens}, currentTokens=${currentTokens}, ctxWindow=${this._contextWindow}`);
 
     // Layer 1: Microcompaction (always runs at threshold crossings)
     history = await this.microcompaction.apply(history, this._contextWindow, currentTokens);
@@ -541,8 +544,9 @@ export class CompactionManager {
     // Operates on the original transcript (agent.state.messages), not the
     // in-memory microcompacted context. After Layer 2 modifies the source,
     // we rebuild the context from the updated messages.
+    const originalHistoryTokens = this.estimateHistoryTokens(getHistory(context));
     const postMicroTokens = this.estimateHistoryTokens(history);
-    const slotTokens = currentTokens - this.estimateHistoryTokens(getHistory(context));
+    const slotTokens = Math.max(0, currentTokens - originalHistoryTokens);
     const totalAfterMicro = slotTokens + postMicroTokens;
 
     const effectiveThreshold = this.getEffectiveThreshold();

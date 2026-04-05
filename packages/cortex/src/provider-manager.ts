@@ -108,6 +108,21 @@ export interface CustomModelConfig {
   } | undefined;
 }
 
+export type ApiKeyValidationStatus =
+  | 'valid'
+  | 'invalid_credentials'
+  | 'transient_error'
+  | 'resolution_error';
+
+export interface ApiKeyValidationResult {
+  provider: string;
+  modelId: string | null;
+  valid: boolean;
+  retryable: boolean;
+  status: ApiKeyValidationStatus;
+  message?: string | undefined;
+}
+
 // ---------------------------------------------------------------------------
 // IProviderManager interface
 // ---------------------------------------------------------------------------
@@ -128,7 +143,7 @@ export interface IProviderManager {
   resolveOAuthApiKey(provider: string, credentials: string): Promise<OAuthRefreshResult>;
 
   // API Key
-  validateApiKey(provider: string, apiKey: string): Promise<boolean>;
+  validateApiKey(provider: string, apiKey: string): Promise<ApiKeyValidationResult>;
   checkEnvApiKey(provider: string): string | null;
 
   // Model Resolution
@@ -492,7 +507,7 @@ export class ProviderManager implements IProviderManager {
    * @returns True if the key is valid, false otherwise
    * @throws Error if pi-ai is not installed
    */
-  async validateApiKey(provider: string, apiKey: string): Promise<boolean> {
+  async validateApiKey(provider: string, apiKey: string): Promise<ApiKeyValidationResult> {
     const piAi = await loadPiAi();
 
     // Find the cheapest model for this provider to minimize validation cost
@@ -501,7 +516,14 @@ export class ProviderManager implements IProviderManager {
       // No known model, try a generic test with the provider's first model
       const models = piAi.getModels(provider);
       if (models.length === 0) {
-        throw new Error(`No models found for provider "${provider}"`);
+        return {
+          provider,
+          modelId: null,
+          valid: false,
+          retryable: false,
+          status: 'resolution_error',
+          message: `No models found for provider "${provider}"`,
+        };
       }
       const firstRawId = models[0]!['id'];
       const firstRawName = models[0]!['name'];
@@ -601,7 +623,7 @@ export class ProviderManager implements IProviderManager {
     provider: string,
     modelId: string,
     apiKey: string,
-  ): Promise<boolean> {
+  ): Promise<ApiKeyValidationResult> {
     try {
       const model = piAi.getModel(provider, modelId);
 
@@ -611,7 +633,13 @@ export class ProviderManager implements IProviderManager {
       if (typeof completeFn !== 'function') {
         // Cannot validate without a complete function; assume valid
         // (the consumer will discover failures at first real call)
-        return true;
+        return {
+          provider,
+          modelId,
+          valid: true,
+          retryable: false,
+          status: 'valid',
+        };
       }
 
       await completeFn(
@@ -619,9 +647,82 @@ export class ProviderManager implements IProviderManager {
         { messages: [{ role: 'user', content: 'hi' }] },
         { apiKey, maxTokens: 1 },
       );
-      return true;
-    } catch {
-      return false;
+      return {
+        provider,
+        modelId,
+        valid: true,
+        retryable: false,
+        status: 'valid',
+      };
+    } catch (err) {
+      return this.classifyValidationError(provider, modelId, err);
     }
+  }
+
+  private classifyValidationError(
+    provider: string,
+    modelId: string,
+    err: unknown,
+  ): ApiKeyValidationResult {
+    const message = err instanceof Error ? err.message : String(err);
+    const normalized = message.toLowerCase();
+
+    if (
+      /\b401\b/.test(normalized) ||
+      /\b403\b/.test(normalized) ||
+      normalized.includes('invalid api key') ||
+      normalized.includes('incorrect api key') ||
+      normalized.includes('authentication failed') ||
+      normalized.includes('invalid_auth') ||
+      normalized.includes('unauthorized') ||
+      normalized.includes('forbidden') ||
+      normalized.includes('invalid credential')
+    ) {
+      return {
+        provider,
+        modelId,
+        valid: false,
+        retryable: false,
+        status: 'invalid_credentials',
+        message,
+      };
+    }
+
+    if (
+      /\b429\b/.test(normalized) ||
+      /\b500\b/.test(normalized) ||
+      /\b502\b/.test(normalized) ||
+      /\b503\b/.test(normalized) ||
+      /\b504\b/.test(normalized) ||
+      normalized.includes('rate limit') ||
+      normalized.includes('timeout') ||
+      normalized.includes('timed out') ||
+      normalized.includes('temporar') ||
+      normalized.includes('overloaded') ||
+      normalized.includes('unavailable') ||
+      normalized.includes('server error') ||
+      normalized.includes('network') ||
+      normalized.includes('econn') ||
+      normalized.includes('enotfound') ||
+      normalized.includes('eai_again')
+    ) {
+      return {
+        provider,
+        modelId,
+        valid: false,
+        retryable: true,
+        status: 'transient_error',
+        message,
+      };
+    }
+
+    return {
+      provider,
+      modelId,
+      valid: false,
+      retryable: false,
+      status: 'resolution_error',
+      message,
+    };
   }
 }

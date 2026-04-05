@@ -15,6 +15,8 @@
 export type {
   CortexUsage,
   CortexLifecycleState,
+  CortexToolPermissionDecision,
+  CortexToolPermissionResult,
   CortexAgentConfig,
   ContextManagerConfig,
   ErrorCategory,
@@ -100,6 +102,13 @@ export type { AgentTool } from './mcp-client.js';
 export {
   ReadRegistry,
   CwdTracker,
+  CortexToolRuntime,
+  BackgroundTaskStore,
+  WebFetchRuntimeState,
+  globalBackgroundTaskStore,
+  attachRuntimeAwareTool,
+  getRuntimeAwareToolMetadata,
+  cloneRuntimeAwareTool,
   createReadTool,
   createWriteTool,
   createEditTool,
@@ -146,6 +155,7 @@ export type {
   BackgroundTask,
   TaskOutputDetails,
   TaskOutputParamsType,
+  TaskOutputToolConfig,
   WebFetchDetails,
   WebFetchParamsType,
   WebFetchToolConfig,
@@ -224,4 +234,6 @@ export type {
   OAuthResult,
   OAuthRefreshResult,
   CustomModelConfig,
+  ApiKeyValidationStatus,
+  ApiKeyValidationResult,
 } from './provider-manager.js';

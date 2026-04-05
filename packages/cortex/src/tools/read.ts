@@ -13,6 +13,8 @@ import * as path from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
 import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
+import type { CortexToolRuntime } from './runtime.js';
+import { attachRuntimeAwareTool } from './runtime.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -106,7 +108,8 @@ export interface ReadDetails {
 // ---------------------------------------------------------------------------
 
 export interface ReadToolConfig {
-  readRegistry: ReadRegistry;
+  runtime?: CortexToolRuntime | undefined;
+  readRegistry?: ReadRegistry | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,9 +204,12 @@ export function createReadTool(config: ReadToolConfig): {
   parameters: typeof ReadParams;
   execute: (params: ReadParamsType) => Promise<ToolContentDetails<ReadDetails>>;
 } {
-  const { readRegistry } = config;
+  const readRegistry = config.runtime?.readRegistry ?? config.readRegistry;
+  if (!readRegistry) {
+    throw new Error('createReadTool requires either runtime or readRegistry');
+  }
 
-  return {
+  const tool = {
     name: 'Read',
     description: 'Read the contents of a file from the local filesystem.',
     parameters: ReadParams,
@@ -408,4 +414,13 @@ export function createReadTool(config: ReadToolConfig): {
       };
     },
   };
+
+  return attachRuntimeAwareTool(tool, {
+    toolKind: 'Read',
+    cloneForRuntime: (runtime) => createReadTool({
+      ...config,
+      runtime,
+      readRegistry: runtime.readRegistry,
+    }),
+  });
 }

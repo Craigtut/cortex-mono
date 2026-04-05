@@ -339,14 +339,22 @@ describe('ProviderManager', () => {
   // -----------------------------------------------------------------------
 
   describe('validateApiKey', () => {
-    it('returns true when completeSimple succeeds', async () => {
+    it('returns a valid result when completeSimple succeeds', async () => {
       const mockModel = { provider: 'anthropic', name: 'haiku' };
       mockGetModel.mockReturnValue(mockModel);
       mockCompleteSimple.mockResolvedValue({ content: '' });
 
       const valid = await pm.validateApiKey('anthropic', 'sk-ant-test-key');
 
-      expect(valid).toBe(true);
+      expect(valid).toEqual(
+        expect.objectContaining({
+          provider: 'anthropic',
+          modelId: UTILITY_MODEL_DEFAULTS['anthropic'],
+          valid: true,
+          retryable: false,
+          status: 'valid',
+        }),
+      );
       expect(mockGetModel).toHaveBeenCalledWith(
         'anthropic',
         UTILITY_MODEL_DEFAULTS['anthropic'],
@@ -358,13 +366,36 @@ describe('ProviderManager', () => {
       );
     });
 
-    it('returns false when completeSimple throws', async () => {
+    it('classifies invalid credentials', async () => {
       mockGetModel.mockReturnValue({});
       mockCompleteSimple.mockRejectedValue(new Error('Invalid API key'));
 
       const valid = await pm.validateApiKey('anthropic', 'bad-key');
 
-      expect(valid).toBe(false);
+      expect(valid).toEqual(
+        expect.objectContaining({
+          valid: false,
+          retryable: false,
+          status: 'invalid_credentials',
+          message: 'Invalid API key',
+        }),
+      );
+    });
+
+    it('classifies transient provider failures separately', async () => {
+      mockGetModel.mockReturnValue({});
+      mockCompleteSimple.mockRejectedValue(new Error('503 Service Unavailable'));
+
+      const result = await pm.validateApiKey('anthropic', 'test-key');
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          valid: false,
+          retryable: true,
+          status: 'transient_error',
+          message: '503 Service Unavailable',
+        }),
+      );
     });
 
     it('falls back to first model when provider has no default', async () => {
@@ -377,15 +408,31 @@ describe('ProviderManager', () => {
 
       const valid = await pm.validateApiKey('unknown-provider', 'some-key');
 
-      expect(valid).toBe(true);
+      expect(valid).toEqual(
+        expect.objectContaining({
+          provider: 'unknown-provider',
+          modelId: 'unknown-model-1',
+          valid: true,
+          status: 'valid',
+        }),
+      );
       expect(mockGetModel).toHaveBeenCalledWith('unknown-provider', 'unknown-model-1');
     });
 
-    it('throws when provider has no models and no default', async () => {
+    it('returns a resolution error when provider has no models and no default', async () => {
       mockGetModels.mockReturnValue([]);
 
       await expect(pm.validateApiKey('empty-provider', 'some-key'))
-        .rejects.toThrow('No models found');
+        .resolves.toEqual(
+          expect.objectContaining({
+            provider: 'empty-provider',
+            modelId: null,
+            valid: false,
+            retryable: false,
+            status: 'resolution_error',
+            message: 'No models found for provider "empty-provider"',
+          }),
+        );
     });
   });
 

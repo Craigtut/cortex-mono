@@ -34,6 +34,9 @@ import { SubAgentManager } from './sub-agent-manager.js';
 import { SkillRegistry } from './skill-registry.js';
 import { createLoadSkillTool, buildLoadSkillDescription, LOAD_SKILL_TOOL_NAME } from './skill-tool.js';
 import { createSubAgentTool, SUB_AGENT_TOOL_NAME } from './tools/sub-agent.js';
+import { wrapModel, unwrapModel } from './model-wrapper.js';
+import type { CortexModel } from './model-wrapper.js';
+import { cloneRuntimeAwareTool, CortexToolRuntime } from './tools/runtime.js';
 import type {
   CortexAgentConfig,
   CortexLifecycleState,
@@ -50,6 +53,8 @@ import type {
   SubAgentSpawnConfig,
   SubAgentResult,
   TrackedSubAgent,
+  CortexToolPermissionDecision,
+  CortexToolPermissionResult,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -280,12 +285,15 @@ export class CortexAgent {
   // on interval changes (sleep/wake transitions).
   private _cacheRetention: 'none' | 'short' | 'long' | null = null;
 
-  // Resolved models
-  private primaryModel: PiModel;
-  private readonly resolvedUtilityModel: PiModel;
+  // Public model handles and internal pi-ai model objects.
+  private primaryModel: CortexModel;
+  private primaryPiModel: PiModel;
+  private resolvedUtilityModel: CortexModel;
+  private resolvedUtilityPiModel: PiModel;
 
   // Built-in tools registered at construction (distinct from MCP-discovered tools)
   private readonly registeredTools: RegisteredTool[];
+  private readonly toolRuntime: CortexToolRuntime;
 
   // Compaction Manager
   private readonly compactionManager: CompactionManager;
@@ -369,14 +377,19 @@ export class CortexAgent {
     this.workingTagsEnabled = config.workingTags?.enabled ?? true;
     this.workingDirectory = config.workingDirectory;
     this.envOverrides = config.envOverrides;
-    this.registeredTools = [...(tools ?? [])];
+    this.toolRuntime = new CortexToolRuntime(this.workingDirectory);
 
     // Resolve models
     if (!config.model) {
-      throw new Error('CortexAgentConfig.model is required but was undefined. Pass a pi-ai model object.');
+      throw new Error('CortexAgentConfig.model is required but was undefined. Pass a CortexModel.');
     }
-    this.primaryModel = config.model as PiModel;
-    this.resolvedUtilityModel = this.resolveUtilityModel(config);
+    const { primaryModel, primaryPiModel, utilityModel, utilityPiModel } = this.resolveModels(config);
+    this.primaryModel = primaryModel;
+    this.primaryPiModel = primaryPiModel;
+    this.resolvedUtilityModel = utilityModel;
+    this.resolvedUtilityPiModel = utilityPiModel;
+    this.registeredTools = this.normalizeRegisteredTools(tools ?? []);
+    (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
 
     // Set up ContextManager
     this.contextManager = new ContextManager(agent, {
@@ -531,6 +544,7 @@ export class CortexAgent {
       this.lifecycleState = 'active';
     }
 
+    this.toolRuntime.resetForLoop();
     this._isPrompting = true;
 
     // Record the message count before this prompt so the transformContext
@@ -628,7 +642,7 @@ export class CortexAgent {
     }
 
     // Resolve API key for the provider
-    const provider = (this.primaryModel as Record<string, unknown>)['provider'] as string;
+    const provider = this.primaryModel.provider;
     let apiKey: string | undefined;
     if (this.config.getApiKey) {
       try {
@@ -649,7 +663,7 @@ export class CortexAgent {
     // UserMessage (string or content blocks), AssistantMessage (content block
     // arrays with text/thinking/toolCall), and ToolResultMessage.
     const result = await completeFn(
-      this.primaryModel as unknown as Parameters<typeof completeFn>[0],
+      this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
       {
         systemPrompt: context.systemPrompt,
         messages: context.messages,
@@ -707,7 +721,7 @@ export class CortexAgent {
     };
 
     // Resolve API key for the provider
-    const provider = (this.primaryModel as Record<string, unknown>)['provider'] as string;
+    const provider = this.primaryModel.provider;
     let apiKey: string | undefined;
     if (this.config.getApiKey) {
       try {
@@ -724,7 +738,7 @@ export class CortexAgent {
     // UserMessage (string or content blocks), AssistantMessage (content block
     // arrays with text/thinking/toolCall), and ToolResultMessage.
     const result = await completeFn(
-      this.primaryModel as unknown as Parameters<typeof completeFn>[0],
+      this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
       {
         systemPrompt: context.systemPrompt,
         messages: context.messages,
@@ -818,10 +832,11 @@ export class CortexAgent {
     cacheBreakpointState: { cortexAgent: CortexAgent | null };
   }): Record<string, unknown> {
     const { cortexConfig, tools, initialSystemPrompt = '', cacheBreakpointState } = params;
+    const rawModel = unwrapModel(cortexConfig.model) as PiModel;
     const agentConfig: Record<string, unknown> = {
       initialState: {
         systemPrompt: initialSystemPrompt,
-        model: cortexConfig.model,
+        model: rawModel,
         tools,
         messages: [],
       },
@@ -832,9 +847,13 @@ export class CortexAgent {
       const resolver = cortexConfig.resolvePermission;
       agentConfig['beforeToolCall'] = async (ctx: unknown) => {
         const { toolCall, args } = ctx as { toolCall: { name: string }; args: unknown };
-        const allowed = await resolver(toolCall.name, args);
-        if (!allowed) {
-          return { block: true, reason: `Tool "${toolCall.name}" requires approval or is disabled.` };
+        const resolution = await resolver(toolCall.name, args);
+        const decision = CortexAgent.normalizePermissionDecision(resolution);
+        if (decision.decision !== 'allow') {
+          return {
+            block: true,
+            reason: decision.reason ?? CortexAgent.buildPermissionReason(toolCall.name, decision.decision),
+          };
         }
         return undefined;
       };
@@ -902,6 +921,25 @@ export class CortexAgent {
     };
 
     return agentConfig;
+  }
+
+  private static normalizePermissionDecision(
+    resolution: boolean | CortexToolPermissionResult,
+  ): CortexToolPermissionResult {
+    if (typeof resolution === 'boolean') {
+      return { decision: resolution ? 'allow' : 'block' };
+    }
+    return resolution;
+  }
+
+  private static buildPermissionReason(
+    toolName: string,
+    decision: CortexToolPermissionDecision,
+  ): string {
+    if (decision === 'ask') {
+      return `Tool "${toolName}" requires approval before it can run.`;
+    }
+    return `Tool "${toolName}" is blocked or disabled.`;
   }
 
   private static wireManagedPiAgent(cortexAgent: CortexAgent, piAgent: PiAgent): void {
@@ -1196,14 +1234,14 @@ export class CortexAgent {
   /**
    * Get the primary model.
    */
-  getModel(): PiModel {
+  getModel(): CortexModel {
     return this.primaryModel;
   }
 
   /**
    * Get the resolved utility model.
    */
-  getUtilityModel(): PiModel {
+  getUtilityModel(): CortexModel {
     return this.resolvedUtilityModel;
   }
 
@@ -1211,16 +1249,21 @@ export class CortexAgent {
    * Hot-swap the primary model without restarting the agent.
    * Used when the user changes their provider/model in settings.
    *
-   * @param model - The new PiModel to use
+   * @param model - The new CortexModel to use
    */
-  setModel(model: PiModel): void {
+  setModel(model: CortexModel): void {
     this.primaryModel = model;
+    this.primaryPiModel = unwrapModel(model) as PiModel;
+    const utilityModels = this.resolveUtilityModels(this.primaryModel, this.primaryPiModel, this.config.utilityModel);
+    this.resolvedUtilityModel = utilityModels.utilityModel;
+    this.resolvedUtilityPiModel = utilityModels.utilityPiModel;
+    (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
     // Recompute effective context window (applies limit if set)
     this._updateEffectiveContextWindow();
     this.rebuildLoadSkillDescription();
     // Update the pi-agent-core agent's model if it exposes setModel
     if (typeof this.agent.setModel === 'function') {
-      this.agent.setModel(model);
+      this.agent.setModel(this.primaryPiModel);
     }
   }
 
@@ -1331,7 +1374,7 @@ export class CortexAgent {
     }
 
     // Resolve API key for the utility model's provider
-    const provider = (this.resolvedUtilityModel as Record<string, unknown>)['provider'] as string;
+    const provider = this.resolvedUtilityModel.provider;
     let apiKey: string | undefined;
     if (this.config.getApiKey) {
       try {
@@ -1344,7 +1387,7 @@ export class CortexAgent {
     this._lastDirectUsage = null;
 
     const result = await completeFn(
-      this.resolvedUtilityModel as unknown as Parameters<typeof completeFn>[0],
+      this.resolvedUtilityPiModel as unknown as Parameters<typeof completeFn>[0],
       {
         systemPrompt: context.systemPrompt,
         messages: context.messages.map(m => ({
@@ -1601,7 +1644,17 @@ export class CortexAgent {
    * min(limit, contextWindow) with a floor of MINIMUM_CONTEXT_WINDOW.
    */
   setContextWindow(contextWindow: number): void {
-    this.primaryModel = { ...this.primaryModel, contextWindow };
+    this.primaryPiModel = {
+      ...this.primaryPiModel,
+      contextWindow,
+    };
+    this.primaryModel = wrapModel(
+      this.primaryPiModel,
+      this.primaryModel.provider,
+      this.primaryModel.modelId,
+      contextWindow,
+    );
+    (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
     this._updateEffectiveContextWindow();
     this.rebuildLoadSkillDescription();
   }
@@ -1974,44 +2027,87 @@ export class CortexAgent {
   // -----------------------------------------------------------------------
 
   /**
-   * Resolve the utility model from config.
-   * If 'default' or undefined, look up the provider default.
-   * Validates same-provider constraint.
+   * Normalize built-in tool instances so this agent owns fresh mutable state.
    */
-  private resolveUtilityModel(config: CortexAgentConfig): PiModel {
-    const primaryModel = config.model as PiModel;
+  private normalizeRegisteredTools(tools: RegisteredTool[]): RegisteredTool[] {
+    return tools.map(tool => cloneRuntimeAwareTool(tool, this.toolRuntime) ?? tool);
+  }
+
+  private resolveModels(config: CortexAgentConfig): {
+    primaryModel: CortexModel;
+    primaryPiModel: PiModel;
+    utilityModel: CortexModel;
+    utilityPiModel: PiModel;
+  } {
+    const primaryModel = config.model;
+    const primaryPiModel = unwrapModel(primaryModel) as PiModel;
+    const { utilityModel, utilityPiModel } = this.resolveUtilityModels(
+      primaryModel,
+      primaryPiModel,
+      config.utilityModel,
+    );
+
+    return {
+      primaryModel,
+      primaryPiModel,
+      utilityModel,
+      utilityPiModel,
+    };
+  }
+
+  /**
+   * Resolve the utility model from the public CortexModel boundary.
+   * If 'default' or undefined, look up the provider default and preserve
+   * the raw provider-specific fields from the primary pi-ai model.
+   */
+  private resolveUtilityModels(
+    primaryModel: CortexModel,
+    primaryPiModel: PiModel,
+    utilityModelConfig?: CortexModel | 'default',
+  ): {
+    utilityModel: CortexModel;
+    utilityPiModel: PiModel;
+  } {
     const primaryProvider = primaryModel.provider;
 
-    if (!config.utilityModel || config.utilityModel === 'default') {
-      // Look up from defaults map
+    if (!utilityModelConfig || utilityModelConfig === 'default') {
       const defaultModelId = UTILITY_MODEL_DEFAULTS[primaryProvider];
-      if (defaultModelId) {
-        // Copy the api field from the primary model so pi-ai can resolve
-        // the correct provider endpoint. Without this, pi-ai throws
-        // "No API provider registered for api: undefined".
+      if (!defaultModelId) {
         return {
-          ...primaryModel,
-          name: defaultModelId,
-          id: defaultModelId,
+          utilityModel: primaryModel,
+          utilityPiModel: primaryPiModel,
         };
       }
-      // No default: use primary model as utility
-      return primaryModel;
+
+      const utilityPiModel = {
+        ...primaryPiModel,
+        name: defaultModelId,
+        id: defaultModelId,
+      };
+
+      return {
+        utilityPiModel,
+        utilityModel: wrapModel(
+          utilityPiModel,
+          primaryProvider,
+          defaultModelId,
+          utilityPiModel.contextWindow ?? primaryModel.contextWindow,
+        ),
+      };
     }
 
-    // Explicit utility model provided
-    const utilityModel = config.utilityModel as PiModel;
-
-    // Validate same-provider constraint
-    if (utilityModel.provider && utilityModel.provider !== primaryProvider) {
+    if (utilityModelConfig.provider !== primaryProvider) {
       throw new Error(
-        `Utility model provider "${utilityModel.provider}" does not match ` +
+        `Utility model provider "${utilityModelConfig.provider}" does not match ` +
         `primary model provider "${primaryProvider}". ` +
         `The utility model must be from the same provider as the primary model.`,
       );
     }
 
-    return utilityModel;
+    return {
+      utilityModel: utilityModelConfig,
+      utilityPiModel: unwrapModel(utilityModelConfig) as PiModel,
+    };
   }
 
   // -----------------------------------------------------------------------
@@ -2419,6 +2515,7 @@ export class CortexAgent {
 
     // 8. Clean up compaction manager
     this.compactionManager.destroy();
+    this.toolRuntime.destroy();
 
     // 9. Clear all handler arrays
     this.loopCompleteHandlers = [];
@@ -2918,7 +3015,7 @@ export class CortexAgent {
   private buildChildToolSet(
     requestedTools?: string[],
   ): RegisteredTool[] {
-    const parentTools = this.registeredTools;
+    const parentTools = [...this.registeredTools, ...this.getMcpTools()];
     const excludedNames = new Set([SUB_AGENT_TOOL_NAME, LOAD_SKILL_TOOL_NAME]);
 
     let filteredTools: typeof parentTools;
