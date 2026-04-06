@@ -2110,7 +2110,16 @@ export class CortexAgent {
       tools.push(createTaskOutputTool() as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.WebFetch)) {
-      tools.push(createWebFetchTool({ runtime }) as RegisteredTool);
+      tools.push(createWebFetchTool({
+        runtime,
+        // Wire the utility model for WebFetch summarization.
+        // Uses a lazy callback so it resolves against the current utility model
+        // (which may change at runtime via setModel).
+        utilityComplete: (context) => this.utilityComplete(context as {
+          systemPrompt: string;
+          messages: Array<{ role: string; content: string }>;
+        }),
+      }) as RegisteredTool);
     }
 
     return tools;
@@ -3220,18 +3229,25 @@ export class CortexAgent {
     requestedTools?: string[],
   ): RegisteredTool[] {
     const parentTools = [...this.registeredTools, ...this.getMcpTools()];
-    const excludedNames = new Set([SUB_AGENT_TOOL_NAME, LOAD_SKILL_TOOL_NAME]);
+    // Exclude SubAgent, LoadSkill (disabled for children), and all built-in
+    // tools (the child's constructor creates its own built-in instances).
+    const builtInNames = new Set(Object.values(TOOL_NAMES));
+    const excludedNames = new Set([
+      SUB_AGENT_TOOL_NAME,
+      LOAD_SKILL_TOOL_NAME,
+      ...builtInNames,
+    ]);
 
     let filteredTools: typeof parentTools;
 
     if (requestedTools && requestedTools.length > 0) {
-      // Filter to only requested tools (minus excluded)
+      // Filter to only requested non-built-in tools
       const requested = new Set(requestedTools);
       filteredTools = parentTools.filter(
         t => requested.has(t.name) && !excludedNames.has(t.name),
       );
     } else {
-      // Inherit all parent tools minus excluded
+      // Inherit non-built-in parent tools (e.g., MCP tools)
       filteredTools = parentTools.filter(t => !excludedNames.has(t.name));
     }
 
