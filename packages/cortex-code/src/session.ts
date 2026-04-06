@@ -55,6 +55,7 @@ export interface SessionOptions {
   credentialStore: CredentialStore;
   cwd: string;
   yoloMode: boolean;
+  initialEffort: ThinkingLevel;
   resumeSessionId: string | undefined;
 }
 
@@ -91,7 +92,7 @@ export class Session {
     this.credentialStore = options.credentialStore;
     this.cwd = options.cwd;
     this.yoloMode = options.yoloMode;
-    this.preferredEffort = (options.config.defaultEffort as ThinkingLevel) ?? 'medium';
+    this.preferredEffort = options.initialEffort;
     this.effectiveEffort = this.preferredEffort;
     this.rules = new PermissionRuleManager(options.cwd);
     this.sessionId = options.resumeSessionId ?? generateSessionId();
@@ -744,6 +745,8 @@ export class Session {
     if (clamped && reason) {
       this.app?.transcript.addNotification('Effort', reason);
     }
+    // Persist across sessions
+    await this.credentialStore.setDefaultEffort(level);
   }
 
   getSessionId(): string { return this.sessionId; }

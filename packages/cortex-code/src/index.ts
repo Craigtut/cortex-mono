@@ -12,7 +12,7 @@
  *   cortex --yolo                   Start in YOLO mode (bypass permissions)
  */
 
-import { ProviderManager } from '@animus-labs/cortex';
+import { ProviderManager, type ThinkingLevel } from '@animus-labs/cortex';
 import { loadConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { Session } from './session.js';
@@ -139,6 +139,15 @@ async function main(): Promise<void> {
     }
   }
 
+  // Resolve initial effort: CLI config > persisted default > 'medium'
+  const VALID_EFFORTS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'max'];
+  const persistedEffort = await credentialStore.getDefaultEffort();
+  const configEffort = config.defaultEffort as ThinkingLevel | undefined;
+  const rawEffort = configEffort ?? persistedEffort ?? 'medium';
+  const initialEffort: ThinkingLevel = VALID_EFFORTS.includes(rawEffort as ThinkingLevel)
+    ? rawEffort as ThinkingLevel
+    : 'medium';
+
   // Create and start session
   const session = new Session({
     config,
@@ -150,6 +159,7 @@ async function main(): Promise<void> {
     credentialStore,
     cwd,
     yoloMode: args.yolo,
+    initialEffort,
     resumeSessionId,
   });
 

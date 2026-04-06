@@ -28,6 +28,7 @@ export interface CredentialFile {
   version: 1;
   defaultProvider: string | null;
   defaultModel: string | null;
+  defaultEffort: string | null;
   providers: Record<string, CredentialEntry>;
 }
 
@@ -39,6 +40,7 @@ function emptyCredentialFile(): CredentialFile {
     version: 1,
     defaultProvider: null,
     defaultModel: null,
+    defaultEffort: null,
     providers: {},
   };
 }
@@ -219,6 +221,31 @@ export class CredentialStore {
       const file = await readCredentialFile();
       file.defaultProvider = provider;
       file.defaultModel = model;
+      await writeCredentialFile(file);
+    } finally {
+      if (release) await release();
+    }
+  }
+
+  /** Get the persisted default effort level. */
+  async getDefaultEffort(): Promise<string | null> {
+    const file = await readCredentialFile();
+    return file.defaultEffort ?? null;
+  }
+
+  /** Persist the default effort level. */
+  async setDefaultEffort(effort: string): Promise<void> {
+    await ensureDir(CREDENTIALS_PATH);
+    let release: (() => Promise<void>) | undefined;
+    try {
+      try {
+        await readFile(CREDENTIALS_PATH);
+      } catch {
+        await writeCredentialFile(emptyCredentialFile());
+      }
+      release = await lockfile.lock(CREDENTIALS_PATH, { retries: 3 });
+      const file = await readCredentialFile();
+      file.defaultEffort = effort;
       await writeCredentialFile(file);
     } finally {
       if (release) await release();

@@ -9,6 +9,7 @@ import { resumeCommand } from './resume.js';
 import { loginCommand } from './login.js';
 import { logoutCommand } from './logout.js';
 import { yoloCommand } from './yolo.js';
+import { effortCommand } from './effort.js';
 import { exitCommand } from './exit.js';
 
 // Handler type uses `any` for the session parameter to avoid circular
@@ -62,5 +63,6 @@ export function registerBuiltinCommands(): void {
   registerCommand(loginCommand);
   registerCommand(logoutCommand);
   registerCommand(yoloCommand);
+  registerCommand(effortCommand);
   registerCommand(exitCommand);
 }

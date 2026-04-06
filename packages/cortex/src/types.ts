@@ -86,6 +86,29 @@ export interface CortexUsage {
 export type CortexLifecycleState = 'created' | 'active' | 'destroyed';
 
 // ---------------------------------------------------------------------------
+// Thinking / Effort Level
+// ---------------------------------------------------------------------------
+
+/**
+ * Consumer-facing thinking/effort level.
+ *
+ * "max" maps to pi-ai/pi-agent-core's "xhigh" internally.
+ * "off" disables extended thinking entirely.
+ */
+export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'max';
+
+/**
+ * Describes a model's thinking/reasoning capabilities.
+ * Returned by CortexAgent.getModelThinkingCapabilities().
+ */
+export interface ModelThinkingCapabilities {
+  /** Whether the model supports extended thinking at all. */
+  supportsThinking: boolean;
+  /** Whether the model supports the "max" (xhigh) thinking level. */
+  supportsMax: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Tool Permissions
 // ---------------------------------------------------------------------------
 
@@ -187,6 +210,14 @@ export interface CortexAgentConfig {
     toolName: string,
     toolArgs: unknown,
   ) => Promise<boolean | CortexToolPermissionResult>;
+
+  /**
+   * Initial thinking/effort level for the agentic loop.
+   * Omit to use the pi-agent-core default (medium).
+   * "max" is only effective on models where supportsXhigh() returns true;
+   * clamping to the highest supported level is the consumer's responsibility.
+   */
+  thinkingLevel?: ThinkingLevel;
 
   /**
    * Limit the effective context window for compaction calculations.

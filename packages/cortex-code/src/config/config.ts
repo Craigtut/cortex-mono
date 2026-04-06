@@ -13,6 +13,8 @@ export interface CortexCodeConfig {
   maxCost?: number;
   /** Max turns budget per session. */
   maxTurns?: number;
+  /** Default thinking effort level. Default: 'medium'. */
+  defaultEffort?: string;
 }
 
 const GLOBAL_CONFIG_PATH = join(homedir(), '.cortex', 'config.json');

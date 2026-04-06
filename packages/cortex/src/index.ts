@@ -50,6 +50,8 @@ export type {
   SubAgentSpawnConfig,
   SubAgentResult,
   TrackedSubAgent,
+  ThinkingLevel,
+  ModelThinkingCapabilities,
 } from './types.js';
 
 // Logger

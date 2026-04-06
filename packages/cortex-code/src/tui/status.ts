@@ -9,6 +9,7 @@ export interface StatusBarState {
   tokenLimit: number;
   gitBranch: string;
   yoloMode: boolean;
+  effortLevel: string;
 }
 
 /**
@@ -24,6 +25,7 @@ export class StatusBar implements Component {
     tokenLimit: 200_000,
     gitBranch: '',
     yoloMode: false,
+    effortLevel: '',
   };
 
   private hintText: string | null = null;
@@ -53,18 +55,23 @@ export class StatusBar implements Component {
     // Build segments
     const modeBadge = ` ${s.mode} `;
     const yoloBadge = s.yoloMode ? ` YOLO ` : '';
+    const effortBadge = s.effortLevel && s.effortLevel !== 'off'
+      ? ` E:${s.effortLevel.charAt(0).toUpperCase() + s.effortLevel.slice(1)} `
+      : '';
     const modelStr = this.hintText ?? (s.provider ? `${s.provider}/${s.model}` : s.model);
     const tokenStr = this.formatTokens(s.tokenCount, s.tokenLimit);
     const branchStr = s.gitBranch;
 
     // Try layouts from most detailed to most minimal
     const layouts = [
-      // Full: mode [YOLO] | provider/model    tokens    branch
-      () => this.layoutFull(modeBadge, yoloBadge, modelStr, tokenStr, branchStr, width),
-      // No provider: mode [YOLO] | model    tokens    branch
-      () => this.layoutFull(modeBadge, yoloBadge, s.model, tokenStr, branchStr, width),
+      // Full: mode [YOLO] [effort] | provider/model    tokens    branch
+      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, modelStr, tokenStr, branchStr, width),
+      // No provider: mode [YOLO] [effort] | model    tokens    branch
+      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, s.model, tokenStr, branchStr, width),
+      // No effort badge: mode [YOLO] | model    tokens    branch
+      () => this.layoutFull(modeBadge, yoloBadge, '', s.model, tokenStr, branchStr, width),
       // No branch: mode [YOLO] | model    tokens
-      () => this.layoutFull(modeBadge, yoloBadge, s.model, tokenStr, '', width),
+      () => this.layoutFull(modeBadge, yoloBadge, '', s.model, tokenStr, '', width),
       // Minimal: mode    tokens
       () => this.layoutMinimal(modeBadge, tokenStr, width),
     ];
@@ -81,6 +88,7 @@ export class StatusBar implements Component {
   private layoutFull(
     modeBadge: string,
     yoloBadge: string,
+    effortBadge: string,
     modelStr: string,
     tokenStr: string,
     branchStr: string,
@@ -88,6 +96,7 @@ export class StatusBar implements Component {
   ): string | null {
     const left = colors.primaryBg(modeBadge)
       + (yoloBadge ? ' ' + colors.accentBg(yoloBadge) : '')
+      + (effortBadge ? ' ' + colors.muted(effortBadge) : '')
       + colors.muted(' | ')
       + colors.white(modelStr);
 
