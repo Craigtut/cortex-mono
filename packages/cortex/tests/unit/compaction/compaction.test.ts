@@ -24,6 +24,20 @@ function makeAssistantMsg(content: string): AgentMessage {
   return { role: 'assistant', content };
 }
 
+function makeToolUseMsg(toolCallId: string): AgentMessage {
+  return {
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: toolCallId, name: 'WebFetch', input: {} }],
+  } as AgentMessage;
+}
+
+function makeToolResultMsg(toolCallId: string, result: string): AgentMessage {
+  return {
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: toolCallId, content: result }],
+  } as AgentMessage;
+}
+
 function buildHistory(turnCount: number): AgentMessage[] {
   const history: AgentMessage[] = [];
   for (let i = 0; i < turnCount; i++) {
@@ -92,6 +106,61 @@ describe('partitionHistory', () => {
 
     expect(target.length).toBe(0);
     expect(preserved.length).toBe(6);
+  });
+
+  it('does not split between a tool_use and its tool_result', () => {
+    // Build history where the naive split lands on a tool_result
+    // [0] user, [1] assistant, [2] tool_use, [3] tool_result, [4] assistant, [5] user
+    const history: AgentMessage[] = [
+      makeUserMsg('Hello'),
+      makeAssistantMsg('Let me look that up'),
+      makeToolUseMsg('toolu_123'),
+      makeToolResultMsg('toolu_123', 'fetch result'),
+      makeAssistantMsg('Here is what I found'),
+      makeUserMsg('Thanks'),
+    ];
+
+    // preserveRecentTurns=3 => naive split at index 3 (the tool_result)
+    const [target, preserved] = partitionHistory(history, 3);
+
+    // Split should move back to index 2, keeping the pair together in preserved
+    expect(target.length).toBe(2);
+    expect(preserved.length).toBe(4);
+    expect(preserved[0]).toBe(history[2]); // tool_use
+    expect(preserved[1]).toBe(history[3]); // tool_result
+  });
+
+  it('does not adjust split when it does not land on a tool_result', () => {
+    // [0] user, [1] tool_use, [2] tool_result, [3] assistant, [4] user, [5] assistant
+    const history: AgentMessage[] = [
+      makeUserMsg('Hello'),
+      makeToolUseMsg('toolu_123'),
+      makeToolResultMsg('toolu_123', 'result'),
+      makeAssistantMsg('Done'),
+      makeUserMsg('Next'),
+      makeAssistantMsg('Sure'),
+    ];
+
+    // preserveRecentTurns=2 => split at index 4 (a user msg, not a tool_result)
+    const [target, preserved] = partitionHistory(history, 2);
+
+    expect(target.length).toBe(4);
+    expect(preserved.length).toBe(2);
+  });
+
+  it('returns empty target if split adjustment would make target empty', () => {
+    // [0] tool_use, [1] tool_result, [2] user
+    const history: AgentMessage[] = [
+      makeToolUseMsg('toolu_123'),
+      makeToolResultMsg('toolu_123', 'result'),
+      makeUserMsg('Thanks'),
+    ];
+
+    // preserveRecentTurns=2 => naive split at index 1 (tool_result), adjusted to 0
+    const [target, preserved] = partitionHistory(history, 2);
+
+    expect(target.length).toBe(0);
+    expect(preserved.length).toBe(3);
   });
 });
 

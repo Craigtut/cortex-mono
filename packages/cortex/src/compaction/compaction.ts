@@ -18,7 +18,7 @@
 import type { AgentMessage } from '../context-manager.js';
 import type { CompactionConfig, CompactionResult, CompactionTarget } from '../types.js';
 import { estimateTokens } from '../token-estimator.js';
-import { extractTextContent } from './microcompaction.js';
+import { extractTextContent, isToolUseMessage, isToolResultMessage } from './microcompaction.js';
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -129,7 +129,25 @@ export function partitionHistory(
     return [[], history];
   }
 
-  const splitPoint = history.length - preserveRecentTurns;
+  let splitPoint = history.length - preserveRecentTurns;
+
+  // Never split between a tool_use (assistant) and its tool_result (user).
+  // If the split lands on a tool_result whose preceding message is a tool_use,
+  // move the split back one so the entire pair goes into the preserved tail.
+  if (
+    splitPoint > 0 &&
+    splitPoint < history.length &&
+    isToolResultMessage(history[splitPoint]!) &&
+    isToolUseMessage(history[splitPoint - 1]!)
+  ) {
+    splitPoint -= 1;
+  }
+
+  // Guard: don't create an empty target from the adjustment
+  if (splitPoint <= 0) {
+    return [[], history];
+  }
+
   return [history.slice(0, splitPoint), history.slice(splitPoint)];
 }
 
