@@ -3074,8 +3074,8 @@ export class CortexAgent {
         maxCost: childConfig.maxCost,
       },
       contextWindowLimit: this._contextWindowLimit,
-      logger: this.config.logger,
     };
+    if (this.config.logger) childCortexConfig.logger = this.config.logger;
     if (this.envOverrides) childCortexConfig.envOverrides = this.envOverrides;
     if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
     if (this.config.resolvePermission) childCortexConfig.resolvePermission = this.config.resolvePermission;
