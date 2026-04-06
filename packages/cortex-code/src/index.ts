@@ -19,6 +19,7 @@ import { Session } from './session.js';
 import { BUILD_MODE } from './modes/build.js';
 import { listSessions } from './persistence/sessions.js';
 import { runFirstRunSetup } from './providers/setup-tui.js';
+import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
 
 interface CliArgs {
   resume: string | true | undefined;
@@ -116,7 +117,10 @@ async function main(): Promise<void> {
     const entry = await credentialStore.getProvider(provider);
     if (entry?.method === 'custom' || provider === 'ollama') {
       const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
-      model = await providerManager.createCustomModel({ baseUrl, modelId });
+      const contextWindow = provider === 'ollama'
+        ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), modelId) ?? undefined
+        : undefined;
+      model = await providerManager.createCustomModel({ baseUrl, modelId, contextWindow });
     } else {
       model = await providerManager.resolveModel(provider, modelId);
     }

@@ -231,6 +231,7 @@ export const PRIMARY_MODEL_DEFAULTS: Record<string, string> = {
 export const UTILITY_MODEL_DEFAULTS: Record<string, string> = {
   anthropic: 'claude-haiku-4-5-20251001',     // $1.00/$5.00 per 1M tokens
   openai: 'gpt-4.1-nano',                     // $0.10/$0.40 per 1M tokens
+  'openai-codex': 'gpt-5.1-codex-mini',      // Smallest Codex model
   google: 'gemini-2.5-flash-lite',            // $0.10/$0.40 per 1M tokens
   groq: 'llama-3.1-8b-instant',              // ~$0.05/$0.08 per 1M tokens
   cerebras: 'llama3.1-8b',                    // ~$0.10/$0.10 per 1M tokens

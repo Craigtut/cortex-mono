@@ -342,6 +342,65 @@ export interface ToolContentDetails<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Tool Execute Context
+// ---------------------------------------------------------------------------
+
+/**
+ * Context passed to tool execute functions by the pi-agent-core adapter.
+ *
+ * Tools that want streaming support accept this as an optional second parameter.
+ * Tools that don't need it simply ignore it (backward compatible).
+ */
+export interface ToolExecuteContext {
+  /** Unique identifier for this tool call. */
+  toolCallId: string;
+  /** Abort signal for cancellation. */
+  signal?: AbortSignal;
+  /**
+   * Callback for emitting incremental results during execution.
+   * Pi-agent-core emits these as tool_execution_update events.
+   * Useful for long-running tools (bash, sub-agents) that want to
+   * stream progress to the consumer's UI.
+   */
+  onUpdate?: (partialResult: ToolContentDetails<unknown>) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Event Payloads
+// ---------------------------------------------------------------------------
+
+/**
+ * Typed payload for tool_call_start events.
+ */
+export interface ToolCallStartPayload {
+  toolCallId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+}
+
+/**
+ * Typed payload for tool_call_update events.
+ */
+export interface ToolCallUpdatePayload {
+  toolCallId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  partialResult: ToolContentDetails<unknown>;
+}
+
+/**
+ * Typed payload for tool_call_end events.
+ */
+export interface ToolCallEndPayload {
+  toolCallId: string;
+  toolName: string;
+  result: ToolContentDetails<unknown>;
+  durationMs: number;
+  isError: boolean;
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Budget Guard
 // ---------------------------------------------------------------------------
 
@@ -562,7 +621,7 @@ export interface CortexEvents {
   /** Fired at the end of each turn with parsed working tag output. */
   onTurnComplete: (output: AgentTextOutput) => void;
   /** Fired when a sub-agent is spawned for delegated work. */
-  onSubAgentSpawned: (taskId: string, instructions: string) => void;
+  onSubAgentSpawned: (taskId: string, instructions: string, background: boolean) => void;
   /** Fired when a sub-agent completes successfully. */
   onSubAgentCompleted: (taskId: string, result: string, status: string, usage: unknown) => void;
   /** Fired when a sub-agent fails. */
@@ -740,6 +799,8 @@ export interface SubAgentResult {
     durationMs: number;
     totalTokens: number;
   };
+  /** Summary of tool calls made by the sub-agent (extracted from conversation history on completion). */
+  toolCalls?: Array<{ name: string; durationMs: number; error?: string }>;
 }
 
 /**

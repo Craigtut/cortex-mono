@@ -3,19 +3,39 @@ import { UTILITY_MODEL_DEFAULTS } from '@animus-labs/cortex';
 import type { Command } from './index.js';
 import { selectListTheme, colors } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';
-import { CredentialStore } from '../config/credentials.js';
-import { detectOllama } from '../providers/ollama.js';
+import { detectOllama, getOllamaContextWindow } from '../providers/ollama.js';
 import { log } from '../logger.js';
+
+// ---------------------------------------------------------------------------
+// /model - Switch primary model (current provider)
+// ---------------------------------------------------------------------------
 
 export const modelCommand: Command = {
   name: 'model',
-  description: 'Switch provider and/or model',
+  description: 'Switch primary model',
   handler: async (session) => {
     const agent = session.getAgent();
     const app = session.getApp();
     if (!agent || !app) return;
 
-    // Build list of available providers from credentials + auto-detected Ollama
+    const provider = session.getProvider();
+    const currentModelId = session.getModelId();
+    await showModelPicker(session, provider, currentModelId, 'primary');
+  },
+};
+
+// ---------------------------------------------------------------------------
+// /provider - Switch provider, then pick a primary model
+// ---------------------------------------------------------------------------
+
+export const providerCommand: Command = {
+  name: 'provider',
+  description: 'Switch provider and model',
+  handler: async (session) => {
+    const agent = session.getAgent();
+    const app = session.getApp();
+    if (!agent || !app) return;
+
     const store = session.getCredentialStore();
     const credFile = await store.load();
     const providerIds = Object.keys(credFile.providers);
@@ -30,118 +50,74 @@ export const modelCommand: Command = {
       }
     }
 
-    if (providerIds.length > 1) {
-      // Multiple providers: show provider picker first
-      await showProviderPicker(session, providerIds, currentProvider, currentModelId);
-    } else {
-      // Single provider: show tier picker (primary vs utility)
-      await showTierPicker(session, currentProvider, currentModelId);
+    if (providerIds.length === 0) {
+      app.transcript.addNotification('Provider', 'No providers configured. Use /login to add one.');
+      return;
     }
+
+    // Show provider picker with current model info next to each
+    const items: SelectItem[] = providerIds.map(id => {
+      const isCurrent = id === currentProvider;
+      return {
+        value: id,
+        label: isCurrent ? `${id}` : id,
+        description: isCurrent ? `${currentModelId} \u2190 current` : '',
+      };
+    });
+
+    const list = new SelectList(items, Math.min(items.length, 8), selectListTheme);
+    const overlayBox = new OverlayBox(list, 'Switch Provider');
+    const handle = app.tui.showOverlay(overlayBox, {
+      anchor: 'center',
+      width: '55%',
+      maxHeight: 12,
+    });
+
+    return new Promise<void>((resolve) => {
+      list.onSelect = async (item) => {
+        handle.hide();
+
+        // Flow into primary model picker for the selected provider
+        const selectedProvider = item.value;
+        const modelId = selectedProvider === currentProvider ? currentModelId : '';
+        await showModelPicker(session, selectedProvider, modelId, 'primary');
+        app.focusEditor();
+        resolve();
+      };
+
+      list.onCancel = () => {
+        handle.hide();
+        app.focusEditor();
+        resolve();
+      };
+    });
   },
 };
 
-async function showProviderPicker(
-  session: any,
-  providerIds: string[],
-  currentProvider: string,
-  currentModelId: string,
-): Promise<void> {
-  const app = session.getApp();
-  if (!app) return;
+// ---------------------------------------------------------------------------
+// /utility-model - Switch utility model (current provider)
+// ---------------------------------------------------------------------------
 
-  const items: SelectItem[] = providerIds.map(id => {
-    const isCurrent = id === currentProvider;
-    const item: SelectItem = {
-      value: id,
-      label: isCurrent ? `${id} \u2190 current` : id,
-    };
-    return item;
-  });
+export const utilityModelCommand: Command = {
+  name: 'utility-model',
+  description: 'Switch utility model',
+  handler: async (session) => {
+    const agent = session.getAgent();
+    const app = session.getApp();
+    if (!agent || !app) return;
 
-  const list = new SelectList(items, Math.min(items.length, 8), selectListTheme);
-  const overlayBox = new OverlayBox(list, 'Select Provider');
-  const handle = app.tui.showOverlay(overlayBox, {
-    anchor: 'center',
-    width: '50%',
-    maxHeight: 12,
-  });
+    const provider = session.getProvider();
+    const utilityModel = agent.getUtilityModel();
+    // Only mark a model as current if the user explicitly overrode the utility model.
+    // In auto mode, only the Auto option should show as current.
+    const currentModelId = agent.isUtilityModelOverridden() ? utilityModel.modelId : '';
+    await showModelPicker(session, provider, currentModelId, 'utility');
+  },
+};
 
-  return new Promise<void>((resolve) => {
-    list.onSelect = async (item) => {
-      handle.hide();
-
-      if (item.value === currentProvider) {
-        // Same provider: show tier picker
-        await showTierPicker(session, currentProvider, currentModelId);
-      } else {
-        // Different provider: show tier picker for new provider
-        await showTierPicker(session, item.value, '');
-      }
-      app.focusEditor();
-      resolve();
-    };
-
-    list.onCancel = () => {
-      handle.hide();
-      app.focusEditor();
-      resolve();
-    };
-  });
-}
-
-async function showTierPicker(
-  session: any,
-  provider: string,
-  currentModelId: string,
-): Promise<void> {
-  const app = session.getApp();
-  const agent = session.getAgent();
-  if (!app || !agent) return;
-
-  const utilityModel = agent.getUtilityModel();
-  const isOverridden = agent.isUtilityModelOverridden();
-  const utilityLabel = isOverridden ? utilityModel.modelId : `${utilityModel.modelId} (auto)`;
-
-  const items: SelectItem[] = [
-    {
-      value: 'primary',
-      label: 'Primary model',
-      description: currentModelId || session.getModelId(),
-    },
-    {
-      value: 'utility',
-      label: 'Utility model',
-      description: utilityLabel,
-    },
-  ];
-
-  const list = new SelectList(items, 2, selectListTheme);
-  const overlayBox = new OverlayBox(list, 'Model Tier');
-  const handle = app.tui.showOverlay(overlayBox, {
-    anchor: 'center',
-    width: '55%',
-    maxHeight: 8,
-  });
-
-  return new Promise<void>((resolve) => {
-    list.onSelect = async (item) => {
-      handle.hide();
-      if (item.value === 'primary') {
-        await showModelPicker(session, provider, currentModelId || session.getModelId(), 'primary');
-      } else {
-        await showModelPicker(session, provider, utilityModel.modelId, 'utility');
-      }
-      app.focusEditor();
-      resolve();
-    };
-
-    list.onCancel = () => {
-      handle.hide();
-      app.focusEditor();
-      resolve();
-    };
-  });
-}
+// ---------------------------------------------------------------------------
+// Shared: Model picker
+// ---------------------------------------------------------------------------
 
 async function showModelPicker(
   session: any,
@@ -161,10 +137,14 @@ async function showModelPicker(
     if (provider === 'ollama') {
       // Ollama models come from the local Ollama API, not pi-ai's registry
       const ollama = await detectOllama();
-      models = ollama.models.map(m => ({
+      // Fetch context windows in parallel (fast local /api/show calls)
+      const contextWindows = await Promise.all(
+        ollama.models.map(m => getOllamaContextWindow(ollama.host, m.name)),
+      );
+      models = ollama.models.map((m, i) => ({
         id: m.name,
         name: m.details?.parameter_size ? `${m.name} (${m.details.parameter_size})` : m.name,
-        contextWindow: 128_000,
+        contextWindow: contextWindows[i] ?? 128_000,
       }));
     } else {
       const pm = session.getProviderManager();
@@ -283,6 +263,10 @@ async function showModelPicker(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Shared: Model switch warning
+// ---------------------------------------------------------------------------
+
 async function showModelSwitchWarning(
   session: any,
   provider: string,
@@ -352,6 +336,10 @@ async function showModelSwitchWarning(
     };
   });
 }
+
+// ---------------------------------------------------------------------------
+// Shared: Execute model switch
+// ---------------------------------------------------------------------------
 
 async function doModelSwitch(session: any, provider: string, modelId: string): Promise<void> {
   const app = session.getApp();

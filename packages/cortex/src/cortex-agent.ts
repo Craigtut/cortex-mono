@@ -68,6 +68,7 @@ import type {
   CortexToolPermissionResult,
   ThinkingLevel,
   ModelThinkingCapabilities,
+  ToolExecuteContext,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -338,7 +339,7 @@ export class CortexAgent {
   private compactionDegradedHandlers: Array<(info: CompactionDegradedInfo) => void> = [];
   private compactionExhaustedHandlers: Array<(info: CompactionExhaustedInfo) => void> = [];
   private turnCompleteHandlers: Array<(output: AgentTextOutput) => void> = [];
-  private subAgentSpawnedHandlers: Array<(taskId: string, instructions: string) => void> = [];
+  private subAgentSpawnedHandlers: Array<(taskId: string, instructions: string, background: boolean) => void> = [];
   private subAgentCompletedHandlers: Array<(taskId: string, result: string, status: string, usage: unknown) => void> = [];
   private subAgentFailedHandlers: Array<(taskId: string, error: string) => void> = [];
   private backgroundResultDeliveryHandlers: Array<(taskIds: string[]) => void> = [];
@@ -1520,9 +1521,21 @@ export class CortexAgent {
         // Pi-agent-core expects AgentToolResult { content: [...], details: T }.
         // Tools may return plain strings, which have no .content property,
         // causing toolResult messages with content: undefined.
-        execute: async (_toolCallId: string, params: unknown) => {
+        //
+        // Also passes ToolExecuteContext as the second argument so tools
+        // can opt-in to streaming updates via context.onUpdate().
+        execute: async (
+          toolCallId: string,
+          params: unknown,
+          signal?: AbortSignal,
+          onUpdate?: (partialResult: unknown) => void,
+        ) => {
+          const context: ToolExecuteContext = { toolCallId };
+          if (signal) context.signal = signal;
+          if (onUpdate) context.onUpdate = onUpdate;
           const toolStartMs = Date.now();
-          const result = await originalExecute(params);
+          // Pass context as optional second arg; tools that don't declare it ignore it.
+          const result = await (originalExecute as (p: unknown, ctx?: ToolExecuteContext) => Promise<unknown>)(params, context);
           this.logger.debug('[Tool] executed', {
             name: tool.name,
             durationMs: Date.now() - toolStartMs,
@@ -1791,7 +1804,7 @@ export class CortexAgent {
   /**
    * Register a handler for sub-agent spawn events.
    */
-  onSubAgentSpawned(handler: (taskId: string, instructions: string) => void): void {
+  onSubAgentSpawned(handler: (taskId: string, instructions: string, background: boolean) => void): void {
     this.subAgentSpawnedHandlers.push(handler);
   }
 
@@ -2702,6 +2715,33 @@ export class CortexAgent {
   }
 
   /**
+   * Extract a summary of tool calls from a child agent's conversation history.
+   * Scans for toolResult messages and builds a name + duration list.
+   */
+  private extractToolCallSummary(
+    history: unknown[],
+  ): Array<{ name: string; durationMs: number; error?: string }> {
+    const calls: Array<{ name: string; durationMs: number; error?: string }> = [];
+
+    for (const msg of history) {
+      if (!msg || typeof msg !== 'object') continue;
+      const m = msg as Record<string, unknown>;
+
+      // Look for assistant messages with tool calls in content array
+      if (m['role'] !== 'assistant' || !Array.isArray(m['content'])) continue;
+
+      for (const part of m['content'] as Array<Record<string, unknown>>) {
+        if (part['type'] === 'tool_use' || part['type'] === 'toolCall') {
+          const name = String(part['name'] ?? part['toolName'] ?? 'unknown');
+          calls.push({ name, durationMs: 0 });
+        }
+      }
+    }
+
+    return calls;
+  }
+
+  /**
    * Extract usage data from a pi-ai AssistantMessage response.
    *
    * The AssistantMessage.usage field has the structure:
@@ -3026,10 +3066,10 @@ export class CortexAgent {
    */
   private wireSubAgentHooks(): void {
     this.subAgentManager.setHooks({
-      onSpawned: (taskId, instructions) => {
+      onSpawned: (taskId, instructions, background) => {
         for (const handler of this.subAgentSpawnedHandlers) {
           try {
-            handler(taskId, instructions);
+            handler(taskId, instructions, background);
           } catch (err) {
             this.logger.error('[CortexAgent] onSubAgentSpawned handler threw', {
               taskId,
@@ -3121,8 +3161,17 @@ export class CortexAgent {
         };
       }
 
+      // Forward child events to parent's EventBridge for real-time visibility
+      const unsubForward = this.eventBridge.forwardFrom(
+        (childAgent as CortexAgent).getEventBridge(),
+        taskId,
+      );
+
       // Run the sub-agent (foreground: wait for result)
       const result = await this.runSubAgent(childAgent, params.instructions, taskId, startTime);
+
+      // Stop forwarding after completion
+      unsubForward();
 
       this.logger.info('[CortexAgent] subagent complete', {
         taskId,
@@ -3404,6 +3453,7 @@ export class CortexAgent {
           durationMs: Date.now() - startTime,
           totalTokens: childAgent.sessionTokenCount,
         },
+        toolCalls: this.extractToolCallSummary(history),
       };
 
       this.subAgentManager.complete(taskId, result);

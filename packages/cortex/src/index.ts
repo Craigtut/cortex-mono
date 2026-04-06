@@ -52,6 +52,10 @@ export type {
   TrackedSubAgent,
   ThinkingLevel,
   ModelThinkingCapabilities,
+  ToolExecuteContext,
+  ToolCallStartPayload,
+  ToolCallUpdatePayload,
+  ToolCallEndPayload,
 } from './types.js';
 
 // Logger
@@ -156,6 +160,7 @@ export type {
   GrepParamsType,
   GrepToolConfig,
   BashDetails,
+  BashStreamUpdate,
   BashParamsType,
   BashToolConfig,
   BackgroundTask,

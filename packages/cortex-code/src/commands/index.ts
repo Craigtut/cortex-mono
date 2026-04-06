@@ -2,7 +2,7 @@ import { fuzzyFilter } from '@mariozechner/pi-tui';
 import { helpCommand } from './help.js';
 import { clearCommand } from './clear.js';
 import { compactCommand } from './compact.js';
-import { modelCommand } from './model.js';
+import { modelCommand, providerCommand, utilityModelCommand } from './model.js';
 import { costCommand } from './cost.js';
 import { contextWindowCommand } from './context-window.js';
 import { resumeCommand } from './resume.js';
@@ -57,6 +57,8 @@ export function registerBuiltinCommands(): void {
   registerCommand(clearCommand);
   registerCommand(compactCommand);
   registerCommand(modelCommand);
+  registerCommand(providerCommand);
+  registerCommand(utilityModelCommand);
   registerCommand(costCommand);
   registerCommand(contextWindowCommand);
   registerCommand(resumeCommand);

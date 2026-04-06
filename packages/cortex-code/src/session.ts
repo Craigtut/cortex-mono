@@ -42,6 +42,7 @@ import type { Mode } from './modes/types.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { log } from './logger.js';
+import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -72,6 +73,8 @@ export class Session {
   private saver: ReturnType<typeof createDebouncedSaver>;
   private isRunning = false;
   private createdAt: number;
+  private permissionLockPromise: Promise<void> | null = null;
+  private permissionLockRelease: (() => void) | null = null;
 
   private readonly config: CortexCodeConfig;
   private readonly mode: Mode;
@@ -403,27 +406,56 @@ export class Session {
     });
   }
 
-  /** Permission resolution: rules check, then inline TUI prompt. */
+  /**
+   * Permission resolution: rules check, then serialized inline TUI prompt.
+   *
+   * Concurrent permission requests (from parallel tool execution) are
+   * serialized so only one prompt is active at a time. After waiting,
+   * rules are re-checked because a previous prompt may have created a
+   * rule that now covers this request.
+   */
   private async resolvePermission(
     toolName: string,
     toolArgs: unknown,
   ): Promise<boolean | CortexToolPermissionResult> {
     if (this.yoloMode) return true;
 
+    // Fast path: check rules before acquiring the lock
     const rule = this.rules.matchRule(toolName, toolArgs);
     if (rule === 'allow') return true;
     if (rule === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
 
-    // Show inline permission prompt in TUI
     if (!this.app) return { decision: 'block', reason: 'TUI not initialized' };
 
-    const result = await this.app.showPermissionPrompt(toolName, toolArgs);
-
-    if (result.pattern && result.scope) {
-      await this.rules.addRule(result.scope, result.decision, toolName, result.pattern);
+    // Serialize: wait for any active permission prompt to finish
+    while (this.permissionLockPromise) {
+      await this.permissionLockPromise;
     }
 
-    return result.decision === 'allow' ? true : { decision: 'block' };
+    // Re-check rules: a previous prompt may have added an "always allow" rule
+    const ruleAfterWait = this.rules.matchRule(toolName, toolArgs);
+    if (ruleAfterWait === 'allow') return true;
+    if (ruleAfterWait === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
+
+    // Acquire lock and show the prompt
+    this.permissionLockPromise = new Promise<void>((resolve) => {
+      this.permissionLockRelease = resolve;
+    });
+
+    try {
+      const result = await this.app.showPermissionPrompt(toolName, toolArgs);
+
+      if (result.pattern && result.scope) {
+        await this.rules.addRule(result.scope, result.decision, toolName, result.pattern);
+      }
+
+      return result.decision === 'allow' ? true : { decision: 'block' };
+    } finally {
+      const release = this.permissionLockRelease;
+      this.permissionLockPromise = null;
+      this.permissionLockRelease = null;
+      release?.();
+    }
   }
 
   /** Credential resolution: stored API key or OAuth refresh. */
@@ -782,7 +814,10 @@ export class Session {
     const entry = await this.credentialStore.getProvider(this.provider);
     if (entry?.method === 'custom' || this.provider === 'ollama') {
       const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
-      newModel = await this.providerManager.createCustomModel({ baseUrl, modelId });
+      const contextWindow = this.provider === 'ollama'
+        ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), modelId) ?? undefined
+        : undefined;
+      newModel = await this.providerManager.createCustomModel({ baseUrl, modelId, contextWindow });
     } else {
       newModel = await this.providerManager.resolveModel(this.provider, modelId);
     }
@@ -790,7 +825,7 @@ export class Session {
     this.modelId = modelId;
     // Reconcile effort with new model's capabilities
     const { clamped, reason, effective } = await this.reconcileEffort();
-    this.app?.updateStatus({ model: modelId, effortLevel: effective });
+    this.app?.updateStatus({ model: modelId, effortLevel: effective, tokenLimit: this.agent!.effectiveContextWindow });
     if (clamped && reason) {
       this.app?.transcript.addNotification('Effort', reason);
     }
@@ -805,7 +840,10 @@ export class Session {
     const entry = await this.credentialStore.getProvider(newProvider);
     if (entry?.method === 'custom' || newProvider === 'ollama') {
       const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
-      newModel = await this.providerManager.createCustomModel({ baseUrl, modelId: newModelId });
+      const contextWindow = newProvider === 'ollama'
+        ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), newModelId) ?? undefined
+        : undefined;
+      newModel = await this.providerManager.createCustomModel({ baseUrl, modelId: newModelId, contextWindow });
     } else {
       newModel = await this.providerManager.resolveModel(newProvider, newModelId);
     }
@@ -815,7 +853,7 @@ export class Session {
     this.modelId = newModelId;
     // Reconcile effort with new model's capabilities
     const { clamped, reason, effective } = await this.reconcileEffort();
-    this.app?.updateStatus({ provider: newProvider, model: newModelId, effortLevel: effective });
+    this.app?.updateStatus({ provider: newProvider, model: newModelId, effortLevel: effective, tokenLimit: this.agent!.effectiveContextWindow });
     if (clamped && reason) {
       this.app?.transcript.addNotification('Effort', reason);
     }
