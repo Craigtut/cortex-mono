@@ -29,5 +29,12 @@ export { fileLink } from './osc-links.js';
 // Registry
 export { registerRenderer, getRenderer, hasRenderer } from './registry.js';
 
-// Renderers
+// Syntax highlighting
+export { highlightCode, highlightFile, detectLanguage } from './syntax-highlighter.js';
+
+// Renderers (importing registers them with the registry)
 export { genericRenderer } from './generic-renderer.js';
+export { readRenderer } from './read-renderer.js';
+export { editRenderer } from './edit-renderer.js';
+export { writeRenderer } from './write-renderer.js';
+export { bashRenderer } from './bash-renderer.js';
