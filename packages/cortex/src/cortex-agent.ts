@@ -52,6 +52,7 @@ import type {
   CortexAgentConfig,
   CortexLifecycleState,
   CortexUsage,
+  SessionUsage,
   ClassifiedError,
   AgentTextOutput,
   CompactionResult,
@@ -390,6 +391,16 @@ export class CortexAgent {
   // Reset to null before each call. Consumers read this after a call to
   // capture per-phase usage for persistence.
   private _lastDirectUsage: CortexUsage | null = null;
+
+  // Session-lifetime usage accumulation. Unlike BudgetGuard (which resets
+  // per agentic loop for enforcement), this accumulates across all loops
+  // for reporting and persistence. Consumers can snapshot via getSessionUsage()
+  // and restore via restoreSessionUsage().
+  private _sessionUsage: SessionUsage = {
+    totalCost: 0,
+    totalTurns: 0,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
 
   /**
    * Create a CortexAgent. Prefer CortexAgent.create().
@@ -1859,6 +1870,33 @@ export class CortexAgent {
     return this._lastDirectUsage;
   }
 
+  /**
+   * Get accumulated session usage (cost, turns, token breakdown).
+   *
+   * Unlike BudgetGuard (which resets per agentic loop), this accumulates
+   * across the entire session lifetime. Consumers can persist this value
+   * and restore it via restoreSessionUsage() after loading a saved session.
+   */
+  getSessionUsage(): SessionUsage {
+    return { ...this._sessionUsage, tokens: { ...this._sessionUsage.tokens } };
+  }
+
+  /**
+   * Restore session usage from consumer-provided data.
+   *
+   * Call this after restoreConversationHistory() when resuming a saved session.
+   * Values are added to any usage already accumulated (in case turns ran
+   * before the restore call).
+   */
+  restoreSessionUsage(usage: SessionUsage): void {
+    this._sessionUsage.totalCost += usage.totalCost;
+    this._sessionUsage.totalTurns += usage.totalTurns;
+    this._sessionUsage.tokens.input += usage.tokens.input;
+    this._sessionUsage.tokens.output += usage.tokens.output;
+    this._sessionUsage.tokens.cacheRead += usage.tokens.cacheRead;
+    this._sessionUsage.tokens.cacheWrite += usage.tokens.cacheWrite;
+  }
+
   // -----------------------------------------------------------------------
   // Token Tracking and Pipeline Phase
   // -----------------------------------------------------------------------
@@ -2486,27 +2524,38 @@ export class CortexAgent {
     // Map turn_end -> onTurnComplete with AgentTextOutput
     this.eventUnsubscribers.push(
       this.eventBridge.on('turn_end', (event) => {
-        // Auto-wire token tracking: extract input token count from the
-        // turn_end event's usage data and update the compaction manager.
-        // This replaces the need for consumers to call
-        // updateSessionTokenCount() manually. See compaction-strategy.md
-        // (Token Tracking / Post-Hoc Tracking).
-        const inputTokens = this.extractInputTokens(event.data);
-        if (inputTokens > 0) {
-          this.compactionManager.updateTokenCount(inputTokens);
-        }
-        // Debug: log extraction result and event structure
-        if (event.data && typeof event.data === 'object') {
-          const d = event.data as Record<string, unknown>;
-          const msg = d['message'] as Record<string, unknown> | undefined;
-          const usage = msg?.['usage'] as Record<string, unknown> | undefined;
-          this.logger.debug('[CortexAgent] turn_end token extraction', {
-            extracted: inputTokens,
-            rawInput: usage?.['input'],
-            rawCacheRead: usage?.['cacheRead'],
-            rawOutput: usage?.['output'],
-            rawTotalTokens: usage?.['totalTokens'],
+        // Read typed usage from EventBridge (centralized extraction).
+        // Updates both CompactionManager (context window tracking) and
+        // session-lifetime usage accumulation.
+        if (event.usage) {
+          const inputTokens = event.usage.input + event.usage.cacheRead;
+          if (inputTokens > 0) {
+            this.compactionManager.updateTokenCount(inputTokens);
+          }
+
+          // Accumulate session-lifetime usage (does not reset per loop)
+          this._sessionUsage.totalCost += event.usage.cost.total;
+          this._sessionUsage.totalTurns += 1;
+          this._sessionUsage.tokens.input += event.usage.input;
+          this._sessionUsage.tokens.output += event.usage.output;
+          this._sessionUsage.tokens.cacheRead += event.usage.cacheRead;
+          this._sessionUsage.tokens.cacheWrite += event.usage.cacheWrite;
+
+          this.logger.debug('[CortexAgent] turn_end usage', {
+            input: event.usage.input,
+            output: event.usage.output,
+            cacheRead: event.usage.cacheRead,
+            cost: event.usage.cost.total,
+            sessionTotalCost: this._sessionUsage.totalCost,
           });
+        } else {
+          // Fallback: extract input tokens from raw event data if EventBridge
+          // could not build typed usage (e.g., provider returned partial data).
+          const inputTokens = this.extractInputTokens(event.data);
+          if (inputTokens > 0) {
+            this.compactionManager.updateTokenCount(inputTokens);
+          }
+          this._sessionUsage.totalTurns += 1;
         }
 
         if (event.textOutput) {
@@ -3253,17 +3302,14 @@ export class CortexAgent {
       throw new Error('Concurrency limit reached');
     }
 
-    // Forward child events to parent's EventBridge for real-time visibility
-    const unsubForward = this.eventBridge.forwardFrom(
-      (childAgent as CortexAgent).getEventBridge(),
-      taskId,
-    );
+    // Background sub-agents do NOT wire event forwarding.
+    // Real-time visibility is foreground-only; background agents provide
+    // a post-completion tool call summary via SubAgentResult.toolCalls.
 
     // Run the sub-agent in the background. When it completes, deliver the
     // result back to the parent agent and restart its agentic loop.
     this.runSubAgent(childAgent, params.instructions, taskId, startTime)
       .then((result) => {
-        unsubForward();
         this.logger.info('[CortexAgent] subagent complete', {
           taskId,
           background: true,

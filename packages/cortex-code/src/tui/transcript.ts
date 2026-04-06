@@ -206,8 +206,20 @@ export class TranscriptManager {
 
   /** Toggle expand/collapse for all tool results (Ctrl+Shift+E). */
   toggleExpandAll(): void {
+    // Detect majority state: if any are collapsed, expand all; otherwise collapse all
+    let anyCollapsed = false;
     for (const tc of this.toolCalls.values()) {
-      tc.toggleExpand();
+      if (!tc.isExpanded) {
+        anyCollapsed = true;
+        break;
+      }
+    }
+    const targetState = anyCollapsed; // expand if any collapsed, collapse if all expanded
+
+    for (const tc of this.toolCalls.values()) {
+      if (tc.isExpanded !== targetState) {
+        tc.toggleExpand();
+      }
     }
     this.tui.requestRender();
   }

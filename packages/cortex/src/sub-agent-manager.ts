@@ -102,13 +102,17 @@ export class SubAgentManager {
     // Resolve the completion promise
     entry.resolve(result);
 
-    // Fire lifecycle hook
+    // Fire lifecycle hook (pass full result metadata including toolCalls)
     try {
+      const usageWithToolCalls: Record<string, unknown> = { ...result.usage };
+      if (result.toolCalls) {
+        usageWithToolCalls['toolCalls'] = result.toolCalls;
+      }
       this.hooks.onCompleted?.(
         taskId,
         result.output,
         result.status,
-        result.usage,
+        usageWithToolCalls,
       );
     } catch {
       // Swallow hook errors

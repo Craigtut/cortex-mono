@@ -68,8 +68,13 @@ export function collapseContent(lines: string[], options: CollapseOptions): Coll
       const headSlice = lines.slice(0, headCount);
       const tailSlice = lines.slice(-tailCount);
       const middleHidden = Math.max(0, lines.length - headCount - tailCount);
-      const middleHint = chalk.dim(`  ... +${middleHidden} lines ...`);
 
+      if (middleHidden === 0) {
+        // Head and tail cover all lines; no middle to hide
+        return { lines, truncated: false, hiddenCount: 0 };
+      }
+
+      const middleHint = chalk.dim(`  ... +${middleHidden} lines ...`);
       return {
         lines: [...headSlice, middleHint, ...tailSlice],
         truncated: true,

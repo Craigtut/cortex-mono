@@ -71,9 +71,9 @@ const bashRenderer: ToolRenderer = {
       expanded: context.expanded,
     });
 
-    // Footer
-    const command = d ? '' : ''; // Command was in renderCall
-    const footer = `$ ${String((d as Record<string, unknown> | undefined)?.['command'] ?? 'command')}`.slice(0, 60);
+    // Footer: use command from original args
+    const commandStr = String(context.args['command'] ?? 'command');
+    const footer = `$ ${commandStr.length > 57 ? commandStr.slice(0, 54) + '...' : commandStr}`;
 
     // Below-box lines for error state
     const belowBoxLines: string[] = [];

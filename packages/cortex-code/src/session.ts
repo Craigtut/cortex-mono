@@ -278,13 +278,13 @@ export class Session {
 
       const list = new SelectList(items, 2, selectListTheme);
       const overlayBox = new OverlayBox(list, 'New Project MCP Servers');
-      const handle = this.app.tui.showOverlay(overlayBox, {
+      const handle = this.app!.tui.showOverlay(overlayBox, {
         anchor: 'center',
         width: '60%',
         maxHeight: 12,
       });
 
-      this.app.transcript.addNotification(
+      this.app!.transcript.addNotification(
         'MCP Trust Check',
         `This project wants to connect MCP servers:\n${serverList}`,
       );
@@ -296,16 +296,16 @@ export class Session {
           for (const server of projectServers) {
             await this.connectMcpServer(server);
           }
-          this.app.transcript.addNotification('MCP', `Connected ${projectServers.length} project server(s).`);
+          this.app!.transcript.addNotification('MCP', `Connected ${projectServers.length} project server(s).`);
         } else {
-          this.app.transcript.addNotification('MCP', 'Skipped project MCP servers.');
+          this.app!.transcript.addNotification('MCP', 'Skipped project MCP servers.');
         }
         resolve();
       };
 
       list.onCancel = () => {
         handle.hide();
-        this.app.transcript.addNotification('MCP', 'Skipped project MCP servers.');
+        this.app!.transcript.addNotification('MCP', 'Skipped project MCP servers.');
         resolve();
       };
     });
@@ -313,9 +313,9 @@ export class Session {
 
   private async connectMcpServer(server: { name: string; config: McpStdioConfig }): Promise<void> {
     try {
-      await this.agent.connectMcpServer(server.name, server.config);
+      await this.agent!.connectMcpServer(server.name, server.config);
     } catch (err) {
-      this.app.transcript.addNotification(
+      this.app!.transcript.addNotification(
         'MCP Error',
         `Failed to connect "${server.name}": ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -352,12 +352,18 @@ export class Session {
 
     // Tool call lifecycle (uses typed payloads from EventBridge)
     bridge.on('tool_call_start', (event: CortexEvent) => {
-      // Skip child agent tool events (they flow through but we don't render them as top-level tools)
-      if (event.childTaskId) return;
-
       const p = event.payload as import('@animus-labs/cortex').ToolCallStartPayload | undefined;
-      const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? Math.random());
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
+
+      // Child agent tool events: route to the parent sub-agent's renderer for nested visibility
+      if (event.childTaskId) {
+        this.app!.transcript.updateToolCall(event.childTaskId, {
+          toolCalls: [{ name: toolName, status: 'pending', summary: '' }],
+        });
+        return;
+      }
+
+      const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? Math.random());
       const args = p?.args ?? ((event.data as Record<string, unknown> | undefined)?.['args'] as Record<string, unknown> ?? {});
 
       this.app!.transcript.startToolCall(toolCallId, toolName, args);
@@ -365,7 +371,7 @@ export class Session {
 
     // Streaming tool updates (bash output, etc.)
     bridge.on('tool_call_update', (event: CortexEvent) => {
-      if (event.childTaskId) return;
+      if (event.childTaskId) return; // child streaming updates are noise at the parent level
 
       const p = event.payload as import('@animus-labs/cortex').ToolCallUpdatePayload | undefined;
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
@@ -377,7 +383,16 @@ export class Session {
     });
 
     bridge.on('tool_call_end', (event: CortexEvent) => {
-      if (event.childTaskId) return;
+      // Child agent tool_call_end: update the nested tool's status icon
+      if (event.childTaskId) {
+        const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
+        const toolName = p?.toolName ?? 'unknown';
+        const status = p?.isError ? 'error' : 'success';
+        this.app!.transcript.updateToolCall(event.childTaskId, {
+          toolCalls: [{ name: toolName, status, summary: '' }],
+        });
+        return;
+      }
 
       const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
