@@ -206,6 +206,15 @@ export class TranscriptManager {
     }
   }
 
+  /** Update a sub-agent's current activity (live tool status). */
+  updateSubAgentActivity(taskId: string, toolName: string, summary: string): void {
+    const sa = this.subAgents.get(taskId);
+    if (sa) {
+      sa.setActivity(toolName, summary);
+      this.throttledRender();
+    }
+  }
+
   /** Add a system notification (compaction, error, etc.). */
   addNotification(title: string, message: string): void {
     const header = colors.primaryMuted(`\u2500\u2500\u2500 ${title} ` + '\u2500'.repeat(Math.max(0, 56 - title.length)));

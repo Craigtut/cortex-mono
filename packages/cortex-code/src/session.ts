@@ -251,11 +251,15 @@ export class Session {
 
     // Streaming response chunks
     let assistantStarted = false;
-    bridge.on('response_start', () => {
+    bridge.on('response_start', (event: CortexEvent) => {
+      if (event.childTaskId) return;
       assistantStarted = false;
     });
 
     bridge.on('response_chunk', (event: CortexEvent) => {
+      // Skip child agent streaming; only parent text goes to transcript
+      if (event.childTaskId) return;
+
       if (!assistantStarted) {
         this.app!.transcript.startAssistantMessage();
         assistantStarted = true;
@@ -275,10 +279,21 @@ export class Session {
       const toolName = String(data?.['toolName'] ?? data?.['name'] ?? 'unknown');
       const args = data?.['args'] ?? data?.['input'] ?? {};
       const argsSummary = this.summarizeToolArgs(toolName, args);
+
+      // Child agent tool calls update the SubAgentComponent's activity line
+      if (event.childTaskId) {
+        this.app!.transcript.updateSubAgentActivity(event.childTaskId, toolName, argsSummary);
+        return;
+      }
+
       this.app!.transcript.startToolCall(toolCallId, toolName, argsSummary);
     });
 
     bridge.on('tool_call_end', (event: CortexEvent) => {
+      // Child agent tool_call_end events are handled via the activity line;
+      // don't create/complete parent tool call components for them.
+      if (event.childTaskId) return;
+
       const data = event.data as Record<string, unknown> | undefined;
       const toolCallId = String(data?.['toolCallId'] ?? data?.['id'] ?? '');
       const error = data?.['error'] as string | undefined;

@@ -103,7 +103,8 @@ export class App {
 
   /**
    * Show an inline permission prompt and wait for the user's decision.
-   * Returns a Promise that resolves when the user selects an option.
+   * Only one prompt should be active at a time; the session layer
+   * serializes concurrent requests and re-checks rules between them.
    */
   showPermissionPrompt(
     toolName: string,
@@ -111,7 +112,7 @@ export class App {
   ): Promise<PermissionResult> {
     return new Promise<PermissionResult>((resolve) => {
       const prompt = new PermissionPromptComponent(toolName, toolArgs, (result) => {
-        prompt.showResult(result.decision);
+        this.transcript.removePermissionPrompt(prompt);
         this.editor.activePermissionPrompt = null;
         resolve(result);
       });
