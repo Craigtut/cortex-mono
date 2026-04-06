@@ -157,10 +157,12 @@ export class TranscriptManager {
     if (tc) {
       tc.complete(result, durationMs);
     }
-    // Start a new assistant message segment for any post-tool text
+    // Reset assistant tracking. The next appendAssistantChunk() will
+    // lazily create a new Markdown component only when text arrives.
+    // This avoids adding empty components that grow the tree and
+    // cause unnecessary terminal scrolling.
     this.currentAssistantText = '';
-    this.currentAssistantMarkdown = new Markdown('', 0, 0, markdownTheme);
-    this.chatContainer.addChild(this.currentAssistantMarkdown);
+    this.currentAssistantMarkdown = null;
     this.throttledRender();
   }
 
@@ -170,10 +172,9 @@ export class TranscriptManager {
     if (tc) {
       tc.fail(error, durationMs);
     }
-    // Start a new assistant message segment
+    // Reset assistant tracking (lazy creation on next chunk).
     this.currentAssistantText = '';
-    this.currentAssistantMarkdown = new Markdown('', 0, 0, markdownTheme);
-    this.chatContainer.addChild(this.currentAssistantMarkdown);
+    this.currentAssistantMarkdown = null;
     this.throttledRender();
   }
 
@@ -217,6 +218,11 @@ export class TranscriptManager {
   /** Add a permission prompt inline in the transcript. */
   addPermissionPrompt(prompt: PermissionPromptComponent): void {
     this.chatContainer.addChild(prompt);
+  }
+
+  /** Remove a permission prompt after the user has decided. */
+  removePermissionPrompt(prompt: PermissionPromptComponent): void {
+    this.chatContainer.removeChild(prompt);
   }
 
   /** Toggle global expand/collapse for all tool results. */
