@@ -3,10 +3,14 @@
   "version": "0.1.0",
   "license": "MIT",
   "author": "CraigTut",
+  "description": "A terminal-based coding agent built on the Cortex agent framework",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "cortex": "./dist/index.js"
+  },
   "exports": {
     ".": {
       "source": "./src/index.ts",
@@ -25,10 +29,14 @@
     "node": ">=24.0.0"
   },
   "dependencies": {
-    "@animus-labs/cortex": "*"
+    "@animus-labs/cortex": "*",
+    "@mariozechner/pi-tui": "^0.65.0",
+    "chalk": "^5.4.0",
+    "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/proper-lockfile": "^4.1.4",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
   }
