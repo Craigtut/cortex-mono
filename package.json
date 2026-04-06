@@ -1,7 +1,7 @@
 {
   "name": "cortex-mono",
   "private": true,
-  "author": "CraigTut",
+  "author": "Craigtut",
   "description": "Cortex: production-grade agent infrastructure",
   "license": "MIT",
   "workspaces": [

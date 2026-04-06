@@ -97,7 +97,7 @@ export type {
 export { BudgetGuard } from './budget-guard.js';
 
 // CortexAgent (Phase 1B)
-export { CortexAgent, MINIMUM_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW_LIMIT } from './cortex-agent.js';
+export { CortexAgent, MINIMUM_CONTEXT_WINDOW } from './cortex-agent.js';
 export type { PiAgent, PiModel } from './cortex-agent.js';
 
 // MCP Client Manager (Phase 3)

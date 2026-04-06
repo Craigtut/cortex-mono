@@ -11,7 +11,7 @@ export const contextWindowCommand: Command = {
     const app = session.getApp();
     if (!agent || !app) return;
 
-    const maxWindow = agent.effectiveContextWindow;
+    const maxWindow = agent.modelContextWindow;
     const currentLimit = agent.contextWindowLimit;
 
     // Build 10% increment options

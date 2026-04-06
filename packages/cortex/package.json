@@ -2,7 +2,7 @@
   "name": "@animus-labs/cortex",
   "version": "0.1.0",
   "license": "MIT",
-  "author": "CraigTut",
+  "author": "Craigtut",
   "private": false,
   "type": "module",
   "sideEffects": false,

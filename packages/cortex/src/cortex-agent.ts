@@ -162,12 +162,6 @@ function mapFromPiThinkingLevel(level: string): ThinkingLevel {
  */
 export const MINIMUM_CONTEXT_WINDOW = 16_384;
 
-/**
- * Default context window limit applied when no explicit limit is set.
- * New installs use min(DEFAULT_CONTEXT_WINDOW_LIMIT, model.contextWindow).
- */
-export const DEFAULT_CONTEXT_WINDOW_LIMIT = 100_000;
-
 // ---------------------------------------------------------------------------
 // System prompt sections
 // ---------------------------------------------------------------------------
@@ -590,12 +584,18 @@ export class CortexAgent {
 
     this.toolRuntime.resetForLoop();
     this._isPrompting = true;
+    const loopStartMs = Date.now();
 
     // Record the message count before this prompt so the transformContext
     // hook knows where "old history" ends and "new tick content" begins.
     // This enables cache breakpoint optimization: old history is stable
     // across ticks and can be cached, while new content changes each tick.
     this._prePromptMessageCount = this.agent.state.messages.length;
+
+    this.logger.debug('[CortexAgent] loop start', {
+      messageCount: this._prePromptMessageCount,
+      inputLength: input.length,
+    });
 
     try {
       const result = await this.agent.prompt(input);
@@ -625,6 +625,12 @@ export class CortexAgent {
         wasAborted: this.isAborted(),
       });
 
+      this.logger.warn('[CortexAgent] loop error', {
+        category: classified.category,
+        severity: classified.severity,
+        message: classified.originalMessage,
+      });
+
       // Emit to error handlers
       for (const handler of this.errorHandlers) {
         try {
@@ -639,6 +645,13 @@ export class CortexAgent {
       throw error;
     } finally {
       this._isPrompting = false;
+
+      this.logger.debug('[CortexAgent] loop complete', {
+        durationMs: Date.now() - loopStartMs,
+        turns: this.budgetGuard.getTurnCount(),
+        totalCost: this.budgetGuard.getTotalCost(),
+        sessionTokens: this.compactionManager.sessionTokenCount,
+      });
 
       // Deliver any background sub-agent results that arrived while prompting.
       // This re-enters prompt() before the consumer's await resolves, keeping
@@ -722,6 +735,7 @@ export class CortexAgent {
     // provider-specific convertMessages() handle all format normalization:
     // UserMessage (string or content blocks), AssistantMessage (content block
     // arrays with text/thinking/toolCall), and ToolResultMessage.
+    const directStartMs = Date.now();
     const result = await completeFn(
       this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
       {
@@ -738,6 +752,11 @@ export class CortexAgent {
 
     // Capture usage from the AssistantMessage response
     this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+
+    this.logger.debug('[CortexAgent] directComplete', {
+      durationMs: Date.now() - directStartMs,
+      usage: this._lastDirectUsage,
+    });
 
     // Extract text from the AssistantMessage response
     return this.extractTextFromAssistantMessage(result);
@@ -797,6 +816,7 @@ export class CortexAgent {
     // provider-specific convertMessages() handle all format normalization:
     // UserMessage (string or content blocks), AssistantMessage (content block
     // arrays with text/thinking/toolCall), and ToolResultMessage.
+    const structStartMs = Date.now();
     const result = await completeFn(
       this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
       {
@@ -818,6 +838,12 @@ export class CortexAgent {
 
     // Capture usage from the AssistantMessage response
     this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+
+    this.logger.debug('[CortexAgent] structuredComplete', {
+      toolName,
+      durationMs: Date.now() - structStartMs,
+      usage: this._lastDirectUsage,
+    });
 
     // Extract tool call arguments from the response
     return this.extractToolCallArgs(result, toolName);
@@ -996,6 +1022,26 @@ export class CortexAgent {
       return { decision: resolution ? 'allow' : 'block' };
     }
     return resolution;
+  }
+
+  /**
+   * Extract safe, identifying fields from tool args for logging.
+   * Returns paths, commands, and patterns without content or results.
+   */
+  private static summarizeToolArgs(name: string, params: unknown): Record<string, unknown> {
+    if (!params || typeof params !== 'object') return {};
+    const p = params as Record<string, unknown>;
+    switch (name) {
+      case 'Bash': return { command: String(p['command'] ?? '').slice(0, 200) };
+      case 'Read': return { path: p['file_path'] };
+      case 'Write': return { path: p['file_path'] };
+      case 'Edit': return { path: p['file_path'] };
+      case 'Glob': return { pattern: p['pattern'], path: p['path'] };
+      case 'Grep': return { pattern: p['pattern'], path: p['path'] };
+      case 'WebFetch': return { url: p['url'] };
+      case 'TaskOutput': return { taskId: p['task_id'] };
+      default: return {};
+    }
   }
 
   private static buildPermissionReason(
@@ -1475,7 +1521,13 @@ export class CortexAgent {
         // Tools may return plain strings, which have no .content property,
         // causing toolResult messages with content: undefined.
         execute: async (_toolCallId: string, params: unknown) => {
+          const toolStartMs = Date.now();
           const result = await originalExecute(params);
+          this.logger.debug('[Tool] executed', {
+            name: tool.name,
+            durationMs: Date.now() - toolStartMs,
+            ...CortexAgent.summarizeToolArgs(tool.name, params),
+          });
           // Already correct format: must have content as a non-empty array
           if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
             const asObj = result as Record<string, unknown>;
@@ -1539,6 +1591,7 @@ export class CortexAgent {
 
     this._lastDirectUsage = null;
 
+    const utilStartMs = Date.now();
     const result = await completeFn(
       this.resolvedUtilityPiModel as unknown as Parameters<typeof completeFn>[0],
       {
@@ -1557,6 +1610,11 @@ export class CortexAgent {
     // Capture usage from utility model calls
     this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
+    this.logger.debug('[CortexAgent] utilityComplete', {
+      durationMs: Date.now() - utilStartMs,
+      usage: this._lastDirectUsage,
+    });
+
     return this.extractTextFromAssistantMessage(result);
   }
 
@@ -1569,11 +1627,13 @@ export class CortexAgent {
    * The agent remains usable for subsequent prompts.
    */
   async abort(): Promise<void> {
+    this.logger.info('[CortexAgent] abort requested', { isPrompting: this._isPrompting });
     this.abortController.abort();
     this.agent.abort();
     await this.agent.waitForIdle();
     // Reset the controller so the agent can be reused for subsequent prompts
     this.abortController = new AbortController();
+    this.logger.info('[CortexAgent] abort complete');
   }
 
   /**
@@ -1598,6 +1658,11 @@ export class CortexAgent {
       return; // Already destroyed, idempotent
     }
 
+    this.logger.info('[CortexAgent] destroy start', {
+      activeSubAgents: this.subAgentManager.activeCount,
+      mcpConnections: this.mcpClientManager.connectionCount,
+    });
+
     // Set up a force-kill deadline
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
     const forceKillPromise = new Promise<void>((resolve) => {
@@ -1618,6 +1683,7 @@ export class CortexAgent {
         clearTimeout(forceKillTimer);
       }
       this.lifecycleState = 'destroyed';
+      this.logger.info('[CortexAgent] destroy complete');
     }
   }
 
@@ -1848,6 +1914,13 @@ export class CortexAgent {
   }
 
   /**
+   * Get the model's actual context window (unaffected by consumer limits).
+   */
+  get modelContextWindow(): number {
+    return this.compactionManager.modelContextWindow;
+  }
+
+  /**
    * Recompute and apply the effective context window from the model
    * and the user-configured limit.
    */
@@ -1867,9 +1940,9 @@ export class CortexAgent {
     this.compactionManager.setModelContextWindow(modelWindow);
 
     // Determine the effective budget for Layer 1/2:
-    // - explicit limit set by user: use it (clamped to model max)
-    // - null (default): use min(DEFAULT_CONTEXT_WINDOW_LIMIT, modelWindow)
-    const limit = this._contextWindowLimit ?? Math.min(DEFAULT_CONTEXT_WINDOW_LIMIT, modelWindow);
+    // - explicit limit set by consumer: use it (clamped to model max)
+    // - null (default): use the model's full context window
+    const limit = this._contextWindowLimit ?? modelWindow;
     const clamped = Math.min(limit, modelWindow);
     this.compactionManager.setContextWindow(Math.max(MINIMUM_CONTEXT_WINDOW, clamped));
   }
@@ -2379,6 +2452,11 @@ export class CortexAgent {
     // Map session_end -> onLoopComplete
     this.eventUnsubscribers.push(
       this.eventBridge.on('session_end', () => {
+        this.logger.info('[CortexAgent] session_end', {
+          turns: this.budgetGuard.getTurnCount(),
+          totalCost: this.budgetGuard.getTotalCost(),
+          sessionTokens: this.compactionManager.sessionTokenCount,
+        });
         this.skillBuffer = [];
         for (const handler of this.loopCompleteHandlers) {
           try {
@@ -2905,7 +2983,7 @@ export class CortexAgent {
   private buildAvailableSkillsSummary(): string {
     const effectiveContextWindow = this.compactionManager?.contextWindow ?? Math.max(
       MINIMUM_CONTEXT_WINDOW,
-      this._contextWindowLimit ?? Math.min(DEFAULT_CONTEXT_WINDOW_LIMIT, this.primaryModel.contextWindow ?? DEFAULT_CONTEXT_WINDOW_LIMIT),
+      this._contextWindowLimit ?? this.primaryModel.contextWindow ?? MINIMUM_CONTEXT_WINDOW,
     );
     const maxTokens = Math.max(128, Math.floor(effectiveContextWindow * 0.02));
     return this.skillRegistry.getAvailableSkillsSummary(maxTokens);
@@ -2922,6 +3000,11 @@ export class CortexAgent {
     } else {
       this.skillBuffer.push(skill);
     }
+    this.logger.info('[CortexAgent] skill loaded', {
+      name: skill.name,
+      contentLength: skill.content.length,
+      bufferSize: this.skillBuffer.length,
+    });
   }
 
   /**
@@ -2996,6 +3079,14 @@ export class CortexAgent {
     const taskId = this.generateTaskId();
     const startTime = Date.now();
 
+    this.logger.info('[CortexAgent] subagent spawned', {
+      taskId,
+      background: false,
+      instructionsLength: params.instructions.length,
+      tools: params.tools,
+      maxTurns: params.maxTurns,
+    });
+
     // Create a completion promise
     let resolveCompletion!: (result: SubAgentResult) => void;
     const completion = new Promise<SubAgentResult>((resolve) => {
@@ -3017,7 +3108,11 @@ export class CortexAgent {
       };
 
       if (!this.subAgentManager.track(tracked)) {
-        const info = this.subAgentManager;
+        this.logger.warn('[CortexAgent] subagent rejected', {
+          taskId,
+          active: this.subAgentManager.activeCount,
+          limit: this.subAgentManager.limit,
+        });
         return {
           taskId,
           output: '',
@@ -3029,6 +3124,14 @@ export class CortexAgent {
       // Run the sub-agent (foreground: wait for result)
       const result = await this.runSubAgent(childAgent, params.instructions, taskId, startTime);
 
+      this.logger.info('[CortexAgent] subagent complete', {
+        taskId,
+        status: result.status,
+        turns: result.usage.turns,
+        cost: result.usage.cost,
+        durationMs: result.usage.durationMs,
+      });
+
       return {
         taskId,
         output: result.output,
@@ -3036,6 +3139,10 @@ export class CortexAgent {
         usage: result.usage,
       };
     } catch (err) {
+      this.logger.error('[CortexAgent] subagent failed', {
+        taskId,
+        error: err instanceof Error ? err.message : String(err),
+      });
       this.subAgentManager.fail(taskId, err instanceof Error ? err.message : String(err));
       return {
         taskId,
@@ -3059,6 +3166,14 @@ export class CortexAgent {
     const taskId = this.generateTaskId();
     const startTime = Date.now();
 
+    this.logger.info('[CortexAgent] subagent spawned', {
+      taskId,
+      background: true,
+      instructionsLength: params.instructions.length,
+      tools: params.tools,
+      maxTurns: params.maxTurns,
+    });
+
     // Create a completion promise
     let resolveCompletion!: (result: SubAgentResult) => void;
     const completion = new Promise<SubAgentResult>((resolve) => {
@@ -3079,14 +3194,34 @@ export class CortexAgent {
     };
 
     if (!this.subAgentManager.track(tracked)) {
+      this.logger.warn('[CortexAgent] subagent rejected', {
+        taskId,
+        active: this.subAgentManager.activeCount,
+        limit: this.subAgentManager.limit,
+      });
       throw new Error('Concurrency limit reached');
     }
 
     // Run the sub-agent in the background. When it completes, deliver the
     // result back to the parent agent and restart its agentic loop.
     this.runSubAgent(childAgent, params.instructions, taskId, startTime)
-      .then((result) => this.handleBackgroundCompletion(taskId, result))
+      .then((result) => {
+        this.logger.info('[CortexAgent] subagent complete', {
+          taskId,
+          background: true,
+          status: result.status,
+          turns: result.usage.turns,
+          cost: result.usage.cost,
+          durationMs: result.usage.durationMs,
+        });
+        return this.handleBackgroundCompletion(taskId, result);
+      })
       .catch((err) => {
+        this.logger.error('[CortexAgent] subagent failed', {
+          taskId,
+          background: true,
+          error: err instanceof Error ? err.message : String(err),
+        });
         this.subAgentManager.fail(taskId, err instanceof Error ? err.message : String(err));
       });
 

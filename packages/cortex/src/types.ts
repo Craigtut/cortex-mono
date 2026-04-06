@@ -222,8 +222,7 @@ export interface CortexAgentConfig {
   /**
    * Limit the effective context window for compaction calculations.
    * Clamped to min(limit, model.contextWindow) with a floor of MINIMUM_CONTEXT_WINDOW (16K).
-   * null or undefined = use the default limit of min(100K, model.contextWindow).
-   * To use the model's full context window, pass the model's contextWindow value explicitly.
+   * null or undefined = use the model's full context window.
    */
   contextWindowLimit?: number | null;
 
