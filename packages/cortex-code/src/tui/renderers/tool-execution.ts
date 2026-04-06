@@ -124,6 +124,8 @@ export class ToolExecutionComponent implements Component {
       maxContentWidth: Math.max((process.stdout.columns ?? 80) - 4, 10),
       theme,
       status: this.status,
+      toolName: this.toolName,
+      args: this.args,
     };
     if (this.durationMs !== undefined) {
       ctx.durationMs = this.durationMs;

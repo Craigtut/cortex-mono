@@ -52,6 +52,25 @@ const subAgentRenderer: ToolRenderer = {
 
     const contentLines: string[] = [];
 
+    // For background agents, show tool call summary if available
+    // toolCalls come from SubAgentResult, surfaced via the result details
+    const resultObj = result as Record<string, unknown> | undefined;
+    const toolCalls = (resultObj?.['toolCalls'] ?? (details as Record<string, unknown> | undefined)?.['toolCalls']) as
+      Array<{ name: string; durationMs?: number; error?: string }> | undefined;
+
+    if (toolCalls && toolCalls.length > 0) {
+      contentLines.push(chalk.hex(context.theme.muted)('Tools used:'));
+      for (const tc of toolCalls.slice(-MAX_ACTIVITY_LINES)) {
+        const icon = tc.error
+          ? chalk.hex(context.theme.statusError)('\u2717')
+          : chalk.hex(context.theme.statusSuccess)('\u2713');
+        contentLines.push(`  ${icon} ${tc.name}`);
+      }
+      if (text) {
+        contentLines.push(chalk.hex(context.theme.borderMuted)('\u2500'.repeat(20)));
+      }
+    }
+
     // Show result text
     if (text) {
       const textLines = text.split('\n');
@@ -63,13 +82,20 @@ const subAgentRenderer: ToolRenderer = {
       contentLines.push(...lines);
     }
 
-    // Footer with stats
+    // Footer with stats: subagent [background] N turns 1.2s completed
     const parts: string[] = ['subagent'];
     if (d?.background) {
-      parts.push('[background]');
+      parts.push(chalk.hex(context.theme.muted)('[background]'));
     }
     if (d?.turns) {
       parts.push(`${d.turns} turns`);
+    }
+    if (d?.durationMs) {
+      const sec = (d.durationMs / 1000).toFixed(1);
+      parts.push(`${sec}s`);
+    }
+    if (d?.status && d.status !== 'completed') {
+      parts.push(d.status);
     }
 
     return {

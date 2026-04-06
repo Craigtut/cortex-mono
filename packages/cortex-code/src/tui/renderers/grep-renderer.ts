@@ -27,37 +27,50 @@ function extractTextContent(result: unknown): string {
 }
 
 /**
- * Colorize grep output: file paths in accent, line numbers in muted.
+ * Parse ripgrep output and group matches under file headers.
+ *
+ * Input format varies:
+ * - "file:line:content" (content mode with line numbers)
+ * - "file" (files_with_matches mode)
+ * - "file:count" (count mode)
  */
-function colorizeGrepOutput(text: string, theme: ToolRenderContext['theme']): string[] {
-  const lines = text.split('\n');
-  const colored: string[] = [];
+function groupByFile(text: string, theme: ToolRenderContext['theme']): string[] {
+  const rawLines = text.split('\n').filter(l => l.trim().length > 0);
   const accentColor = chalk.hex(theme.accent);
   const mutedColor = chalk.hex(theme.muted);
 
-  for (const line of lines) {
-    if (!line.trim()) continue;
+  // Group lines by file path
+  const groups = new Map<string, string[]>();
+  const fileOrder: string[] = [];
 
-    // Lines with ":" are matches (file:line:content or just file:line)
-    // Lines without ":" might be file headers (files_with_matches mode)
-    const colonIdx = line.indexOf(':');
-    if (colonIdx > 0) {
-      const beforeColon = line.slice(0, colonIdx);
-      const rest = line.slice(colonIdx);
-
-      // Check if it looks like a file path (contains / or \)
-      if (beforeColon.includes('/') || beforeColon.includes('\\')) {
-        colored.push(accentColor(shortenPath(beforeColon)) + mutedColor(rest.slice(0, rest.indexOf(':', 1) + 1)) + rest.slice(rest.indexOf(':', 1) + 1));
-      } else {
-        colored.push(mutedColor(beforeColon + ':') + rest.slice(1));
+  for (const line of rawLines) {
+    // Try to parse "file:lineNum:content" or "file:lineNum"
+    const match = line.match(/^(.+?):(\d+)[:](.*)/);
+    if (match) {
+      const [, filePath, lineNum, content] = match;
+      if (!groups.has(filePath!)) {
+        groups.set(filePath!, []);
+        fileOrder.push(filePath!);
       }
+      groups.get(filePath!)!.push(`  ${mutedColor(lineNum + ':')} ${content}`);
     } else {
-      // Standalone file path or header
-      colored.push(accentColor(shortenPath(line)));
+      // Standalone file path (files_with_matches) or unrecognized format
+      if (!groups.has(line)) {
+        groups.set(line, []);
+        fileOrder.push(line);
+      }
     }
   }
 
-  return colored;
+  // Build output with file headers
+  const output: string[] = [];
+  for (const filePath of fileOrder) {
+    output.push(accentColor(shortenPath(filePath)));
+    const matches = groups.get(filePath) ?? [];
+    output.push(...matches);
+  }
+
+  return output;
 }
 
 const grepRenderer: ToolRenderer = {
@@ -75,22 +88,23 @@ const grepRenderer: ToolRenderer = {
   renderResult(result: unknown, details: unknown, context: ToolRenderContext): ToolResultDisplay {
     const d = details as GrepDetails | undefined;
     const text = extractTextContent(result);
-    const coloredLines = colorizeGrepOutput(text, context.theme);
+    const groupedLines = groupByFile(text, context.theme);
 
-    const { lines } = collapseContent(coloredLines, {
+    const { lines } = collapseContent(groupedLines, {
       mode: 'head',
       limit: COLLAPSED_LINES,
       expanded: context.expanded,
     });
 
-    // Footer with match count
-    const matchInfo = d ? `  ${d.totalMatches} matches` : '';
-    const pattern = ''; // Pattern was in renderCall
-    const footer = `grep${matchInfo}`;
+    // Footer with pattern and match count (args available via context)
+    const pattern = String(context.args['pattern'] ?? '');
+    const searchPath = String(context.args['path'] ?? '');
+    const shortPath = searchPath ? shortenPath(searchPath) : '';
+    const matchCount = d?.totalMatches ?? 0;
 
     return {
       contentLines: lines.length > 0 ? lines : [chalk.hex(context.theme.muted)('(no matches)')],
-      footerText: footer,
+      footerText: `grep /${pattern}/${shortPath ? ` in ${shortPath}` : ''}  ${matchCount} matches`,
     };
   },
 };

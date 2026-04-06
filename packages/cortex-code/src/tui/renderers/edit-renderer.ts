@@ -38,10 +38,9 @@ function windowAroundFirstChange(
   diffLines: string[],
   contextBefore: number,
 ): string[] {
-  // Find the first non-context line (actual change)
-  const firstChangeIdx = diffLines.findIndex(
-    line => line.startsWith(chalk.hex('') /* any colored +/- */) || !line.startsWith('  '),
-  );
+  // Find the first non-context line (actual change).
+  // Context lines start with two spaces; changed lines start with colored +/- symbols.
+  const firstChangeIdx = diffLines.findIndex(line => !line.startsWith('  '));
 
   if (firstChangeIdx <= contextBefore) {
     return diffLines;

@@ -34,6 +34,10 @@ export interface ToolRenderContext {
   status: ToolStatus;
   /** Execution duration in milliseconds (set after completion). */
   durationMs?: number;
+  /** The tool name (e.g., "Read", "mcp__server__tool"). Available in all render methods. */
+  toolName: string;
+  /** The original tool call arguments. Available in all render methods. */
+  args: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------

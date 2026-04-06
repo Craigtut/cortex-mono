@@ -94,10 +94,9 @@ export function highlightCode(code: string, language?: string): string[] {
 
   let highlighted: string;
   try {
-    highlighted = highlight(code, {
-      language: language,
-      ignoreIllegals: true,
-    });
+    const opts: Record<string, unknown> = { ignoreIllegals: true };
+    if (language) opts['language'] = language;
+    highlighted = highlight(code, opts);
   } catch {
     // Fall back to plain text on any highlight failure
     highlighted = code;

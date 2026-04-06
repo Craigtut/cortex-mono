@@ -53,10 +53,12 @@ const taskOutputRenderer: ToolRenderer = {
         ? context.theme.statusError
         : context.theme.statusPending;
     const statusText = d?.status ?? 'unknown';
+    const taskId = d?.taskId ?? String(context.args['task_id'] ?? '');
+    const action = d?.action ?? String(context.args['action'] ?? 'poll');
 
     return {
       contentLines: lines,
-      footerText: `task ${chalk.hex(statusColor)(statusText)}`,
+      footerText: `task ${action} ${chalk.hex(context.theme.muted)(taskId)} ${chalk.hex(statusColor)(statusText)}`,
     };
   },
 };

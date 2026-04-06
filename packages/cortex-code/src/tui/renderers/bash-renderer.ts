@@ -84,11 +84,14 @@ const bashRenderer: ToolRenderer = {
       belowBoxLines.push(chalk.hex(context.theme.error)('Command timed out'));
     }
 
-    return {
+    const display: ToolResultDisplay = {
       contentLines: lines,
       footerText: footer,
-      belowBoxLines: belowBoxLines.length > 0 ? belowBoxLines : undefined,
     };
+    if (belowBoxLines.length > 0) {
+      display.belowBoxLines = belowBoxLines;
+    }
+    return display;
   },
 
   renderStreamUpdate(update: unknown, context: ToolRenderContext): ToolResultDisplay {

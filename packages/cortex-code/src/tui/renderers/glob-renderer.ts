@@ -51,13 +51,16 @@ const globRenderer: ToolRenderer = {
       expanded: context.expanded,
     });
 
-    // Footer with file count
+    // Footer with pattern, path, and file count
+    const pattern = String(context.args['pattern'] ?? '');
+    const searchPath = String(context.args['path'] ?? '');
+    const shortPath = searchPath ? shortenPath(searchPath) : '';
     const count = d?.totalCount ?? fileLines.length;
     const truncInfo = d?.truncated ? ' (truncated)' : '';
 
     return {
       contentLines: lines.length > 0 ? lines : [chalk.hex(context.theme.muted)('(no files found)')],
-      footerText: `glob  ${count} files${truncInfo}`,
+      footerText: `glob ${pattern}${shortPath ? ` in ${shortPath}` : ''}  ${count} files${truncInfo}`,
     };
   },
 };
