@@ -40,9 +40,15 @@ const subAgentRenderer: ToolRenderer = {
       descLines.push(chalk.hex(context.theme.muted)('...'));
     }
 
+    // Model ID from args (passed via onSubAgentSpawned)
+    const modelId = context.args['modelId'] as string | undefined;
+    const modelLabel = modelId
+      ? chalk.hex(context.theme.muted)(` (${modelId})`)
+      : '';
+
     return {
       contentLines: descLines,
-      footerText: `subagent${modeLabel}`,
+      footerText: `subagent${modelLabel}${modeLabel}`,
     };
   },
 
@@ -82,8 +88,12 @@ const subAgentRenderer: ToolRenderer = {
       contentLines.push(...lines);
     }
 
-    // Footer with stats: subagent [background] N turns 1.2s completed
+    // Footer with stats: subagent (model-id) [background] N turns 1.2s completed
     const parts: string[] = ['subagent'];
+    const modelId = d?.modelId ?? (context.args['modelId'] as string | undefined);
+    if (modelId) {
+      parts.push(chalk.hex(context.theme.muted)(`(${modelId})`));
+    }
     if (d?.background) {
       parts.push(chalk.hex(context.theme.muted)('[background]'));
     }

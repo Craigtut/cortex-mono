@@ -101,6 +101,8 @@ export interface ReadDetails {
   truncated: boolean;
   truncatedLines: boolean;
   truncatedChars: boolean;
+  /** Starting line number (1-based) for the content returned. */
+  startLine: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +232,7 @@ export function createReadTool(config: ReadToolConfig): {
             truncated: false,
             truncatedLines: false,
             truncatedChars: false,
+            startLine: 1,
           },
         };
       }
@@ -280,6 +283,7 @@ export function createReadTool(config: ReadToolConfig): {
             truncated: false,
             truncatedLines: false,
             truncatedChars: false,
+            startLine: 1,
           },
         };
       }
@@ -303,6 +307,7 @@ export function createReadTool(config: ReadToolConfig): {
             truncated: false,
             truncatedLines: false,
             truncatedChars: false,
+            startLine: 1,
           },
         };
       }
@@ -318,6 +323,7 @@ export function createReadTool(config: ReadToolConfig): {
             truncated: false,
             truncatedLines: false,
             truncatedChars: false,
+            startLine: 1,
           },
         };
       }
@@ -358,6 +364,7 @@ export function createReadTool(config: ReadToolConfig): {
             truncated: false,
             truncatedLines: false,
             truncatedChars: false,
+            startLine: 1,
           },
         };
       }
@@ -379,6 +386,7 @@ export function createReadTool(config: ReadToolConfig): {
             truncated: false,
             truncatedLines: false,
             truncatedChars: false,
+            startLine: 1,
           },
         };
       }
@@ -410,6 +418,7 @@ export function createReadTool(config: ReadToolConfig): {
           truncated: truncatedLines || truncatedChars,
           truncatedLines,
           truncatedChars,
+          startLine: offset,
         },
       };
     },

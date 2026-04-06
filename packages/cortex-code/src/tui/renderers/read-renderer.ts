@@ -48,11 +48,11 @@ const readRenderer: ToolRenderer = {
     // Syntax highlight the content
     const highlightedLines = highlightFile(text, filePath);
 
-    // Add line numbers
-    const offset = 1; // Default start line
-    const maxLineNumWidth = String(offset + highlightedLines.length - 1).length;
+    // Add line numbers from the actual offset
+    const startLine = d?.startLine ?? 1;
+    const maxLineNumWidth = String(startLine + highlightedLines.length - 1).length;
     const numberedLines = highlightedLines.map((line, i) => {
-      const lineNum = String(offset + i).padStart(maxLineNumWidth);
+      const lineNum = String(startLine + i).padStart(maxLineNumWidth);
       return chalk.hex(context.theme.lineNumber)(lineNum) + '  ' + line;
     });
 
@@ -66,7 +66,9 @@ const readRenderer: ToolRenderer = {
     // Footer
     const shortPath = shortenPath(filePath);
     const linkedPath = fileLink(filePath, shortPath);
-    const rangeInfo = d ? `:1-${d.totalLines}` : '';
+    const rangeStart = d?.startLine ?? 1;
+    const rangeEnd = d ? rangeStart + d.totalLines - 1 : 0;
+    const rangeInfo = d ? `:${rangeStart}-${rangeEnd}` : '';
     const truncInfo = d?.truncated ? ' (truncated)' : '';
 
     return {

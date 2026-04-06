@@ -53,6 +53,8 @@ export interface SubAgentDetails {
   durationMs: number | null;
   turns: number | null;
   cost: number | null;
+  /** Model ID used by the sub-agent (inherited from parent). */
+  modelId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +94,12 @@ export interface SubAgentToolConfig {
    * Get concurrency info for error messages.
    */
   getConcurrencyInfo: () => { active: number; limit: number };
+
+  /**
+   * Get the model ID for the child agent.
+   * Child agents inherit the parent's primary model.
+   */
+  getModelId: () => string;
 }
 
 // ---------------------------------------------------------------------------

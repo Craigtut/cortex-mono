@@ -363,6 +363,11 @@ export class Session {
         return;
       }
 
+      // SubAgent tool calls are displayed via the onSubAgentSpawned lifecycle hook,
+      // which provides richer context (instructions, background flag). Skip here
+      // to avoid duplicate rendering.
+      if (toolName === 'SubAgent') return;
+
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? Math.random());
       const args = p?.args ?? ((event.data as Record<string, unknown> | undefined)?.['args'] as Record<string, unknown> ?? {});
 
@@ -395,6 +400,11 @@ export class Session {
       }
 
       const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
+      const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
+
+      // SubAgent tool_call_end is handled via onSubAgentCompleted/onSubAgentFailed
+      if (toolName === 'SubAgent') return;
+
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
       const durationMs = p?.durationMs ?? Number((event.data as Record<string, unknown> | undefined)?.['durationMs'] ?? 0);
 
@@ -492,6 +502,7 @@ export class Session {
       this.app!.transcript.startToolCall(taskId, 'SubAgent', {
         instructions,
         background,
+        modelId: this.agent!.getModel().modelId,
       });
     });
 

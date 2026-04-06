@@ -505,6 +505,7 @@ export class CortexAgent {
           active: this.subAgentManager.activeCount,
           limit: this.subAgentManager.limit,
         }),
+        getModelId: () => this.primaryModel.modelId,
       });
       this.registeredTools.push(subAgentTool as RegisteredTool);
     }
