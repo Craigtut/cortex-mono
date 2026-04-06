@@ -2,7 +2,105 @@ import chalk from 'chalk';
 import type { MarkdownTheme } from '@mariozechner/pi-tui';
 import type { SelectListTheme } from '@mariozechner/pi-tui';
 
-// Brand colors
+// ---------------------------------------------------------------------------
+// Tool renderer theme
+// ---------------------------------------------------------------------------
+
+export interface ToolTheme {
+  // Brand
+  primary: string;
+  accent: string;
+  error: string;
+  success: string;
+  muted: string;
+
+  // Tool rendering
+  border: string;
+  borderMuted: string;
+  diffAdd: string;
+  diffRemove: string;
+  diffContext: string;
+  lineNumber: string;
+
+  // Status indicators
+  statusPending: string;
+  statusSuccess: string;
+  statusError: string;
+
+  // Backgrounds (hex values for bgHex)
+  bgDefault: string;
+  bgError: string;
+}
+
+const darkToolTheme: ToolTheme = {
+  primary: '#00E5CC',
+  accent: '#FFB347',
+  error: '#FF6B6B',
+  success: '#4ADE80',
+  muted: '#6B7280',
+
+  border: '#008577',
+  borderMuted: '#4B5563',
+  diffAdd: '#4ADE80',
+  diffRemove: '#FF6B6B',
+  diffContext: '#6B7280',
+  lineNumber: '#6B7280',
+
+  statusPending: '#6B7280',
+  statusSuccess: '#4ADE80',
+  statusError: '#FF6B6B',
+
+  bgDefault: '#1a1a2e',
+  bgError: '#2e1a1a',
+};
+
+const lightToolTheme: ToolTheme = {
+  primary: '#007A6D',
+  accent: '#D4850A',
+  error: '#DC2626',
+  success: '#16A34A',
+  muted: '#6B7280',
+
+  border: '#007A6D',
+  borderMuted: '#9CA3AF',
+  diffAdd: '#16A34A',
+  diffRemove: '#DC2626',
+  diffContext: '#9CA3AF',
+  lineNumber: '#9CA3AF',
+
+  statusPending: '#6B7280',
+  statusSuccess: '#16A34A',
+  statusError: '#DC2626',
+
+  bgDefault: '#F3F4F6',
+  bgError: '#FEF2F2',
+};
+
+/**
+ * Auto-detect terminal background brightness.
+ * Uses COLORFGBG env var (format: "fg;bg" where bg >= 8 is dark).
+ * Falls back to dark theme.
+ */
+function detectDarkMode(): boolean {
+  const colorfgbg = process.env['COLORFGBG'];
+  if (colorfgbg) {
+    const parts = colorfgbg.split(';');
+    const bg = parseInt(parts[parts.length - 1] ?? '', 10);
+    if (!isNaN(bg) && bg < 8) return false; // light background
+  }
+  return true; // default to dark
+}
+
+let activeToolTheme: ToolTheme | null = null;
+
+export function getToolTheme(): ToolTheme {
+  if (!activeToolTheme) {
+    activeToolTheme = detectDarkMode() ? darkToolTheme : lightToolTheme;
+  }
+  return activeToolTheme;
+}
+
+// Brand colors (existing, preserved for backward compatibility)
 export const colors = {
   primary: chalk.hex('#00E5CC'),
   primaryMuted: chalk.hex('#008577'),

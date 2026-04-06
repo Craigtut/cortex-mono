@@ -32,9 +32,12 @@
     "@animus-labs/cortex": "*",
     "@mariozechner/pi-tui": "^0.65.0",
     "chalk": "^5.4.0",
+    "cli-highlight": "^2.1.11",
+    "diff": "^8.0.4",
     "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
+    "@types/diff": "^7.0.2",
     "@types/node": "^22.0.0",
     "@types/proper-lockfile": "^4.1.4",
     "typescript": "^5.6.0",
