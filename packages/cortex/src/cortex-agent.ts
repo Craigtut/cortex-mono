@@ -66,6 +66,8 @@ import type {
   TrackedSubAgent,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
+  ThinkingLevel,
+  ModelThinkingCapabilities,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -132,6 +134,26 @@ export interface PiModel {
   name: string;
   contextWindow?: number;
   [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// ThinkingLevel mapping (Cortex "max" <-> pi-agent-core "xhigh")
+// ---------------------------------------------------------------------------
+
+/**
+ * Map Cortex's consumer-facing ThinkingLevel to pi-agent-core's value.
+ * "max" -> "xhigh"; all others pass through 1:1.
+ */
+function mapToPiThinkingLevel(level: ThinkingLevel): string {
+  return level === 'max' ? 'xhigh' : level;
+}
+
+/**
+ * Map pi-agent-core's thinking level back to Cortex's consumer-facing value.
+ * "xhigh" -> "max"; all others pass through 1:1.
+ */
+function mapFromPiThinkingLevel(level: string): ThinkingLevel {
+  return (level === 'xhigh' ? 'max' : level) as ThinkingLevel;
 }
 
 /**
@@ -302,6 +324,7 @@ export class CortexAgent {
   private primaryPiModel: PiModel;
   private resolvedUtilityModel: CortexModel;
   private resolvedUtilityPiModel: PiModel;
+  private utilityModelManualOverride = false;
 
   // Built-in tools registered at construction (distinct from MCP-discovered tools)
   private readonly registeredTools: RegisteredTool[];
@@ -876,6 +899,9 @@ export class CortexAgent {
         model: rawModel,
         tools,
         messages: [],
+        ...(cortexConfig.thinkingLevel !== undefined && {
+          thinkingLevel: mapToPiThinkingLevel(cortexConfig.thinkingLevel),
+        }),
       },
       getApiKey: cortexConfig.getApiKey,
     };
@@ -1299,9 +1325,12 @@ export class CortexAgent {
   setModel(model: CortexModel): void {
     this.primaryModel = model;
     this.primaryPiModel = unwrapModel(model) as PiModel;
-    const utilityModels = this.resolveUtilityModels(this.primaryModel, this.primaryPiModel, this.config.utilityModel);
-    this.resolvedUtilityModel = utilityModels.utilityModel;
-    this.resolvedUtilityPiModel = utilityModels.utilityPiModel;
+    // Only auto-resolve utility model if the user hasn't manually overridden it
+    if (!this.utilityModelManualOverride) {
+      const utilityModels = this.resolveUtilityModels(this.primaryModel, this.primaryPiModel, this.config.utilityModel);
+      this.resolvedUtilityModel = utilityModels.utilityModel;
+      this.resolvedUtilityPiModel = utilityModels.utilityPiModel;
+    }
     (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
     // Recompute effective context window (applies limit if set)
     this._updateEffectiveContextWindow();
@@ -1313,13 +1342,92 @@ export class CortexAgent {
   }
 
   /**
-   * Change the thinking/reasoning level.
+   * Explicitly set the utility model, overriding auto-resolution.
+   * The utility model must be from the same provider as the primary model.
+   * After calling this, setModel() will NOT auto-resolve the utility model.
+   * Call resetUtilityModel() to restore auto-resolution.
    *
-   * @param level - The new thinking level (e.g., 'low', 'medium', 'high')
+   * @param model - The CortexModel to use as the utility model
    */
-  setThinkingLevel(level: string): void {
+  setUtilityModel(model: CortexModel): void {
+    if (model.provider !== this.primaryModel.provider) {
+      throw new Error(
+        `Utility model provider "${model.provider}" does not match ` +
+        `primary model provider "${this.primaryModel.provider}". ` +
+        `The utility model must be from the same provider as the primary model.`,
+      );
+    }
+    this.resolvedUtilityModel = model;
+    this.resolvedUtilityPiModel = unwrapModel(model) as PiModel;
+    this.utilityModelManualOverride = true;
+  }
+
+  /**
+   * Reset the utility model to auto-resolution based on the primary model's provider.
+   * Clears any manual override set by setUtilityModel().
+   */
+  resetUtilityModel(): void {
+    this.utilityModelManualOverride = false;
+    const utilityModels = this.resolveUtilityModels(
+      this.primaryModel,
+      this.primaryPiModel,
+      this.config.utilityModel,
+    );
+    this.resolvedUtilityModel = utilityModels.utilityModel;
+    this.resolvedUtilityPiModel = utilityModels.utilityPiModel;
+  }
+
+  /**
+   * Whether the utility model has been manually overridden.
+   */
+  isUtilityModelOverridden(): boolean {
+    return this.utilityModelManualOverride;
+  }
+
+  /**
+   * Change the thinking/reasoning effort level.
+   * Maps Cortex's "max" to pi-agent-core's "xhigh" internally.
+   *
+   * @param level - The consumer-facing thinking level
+   */
+  setThinkingLevel(level: ThinkingLevel): void {
+    const piLevel = mapToPiThinkingLevel(level);
     if (typeof this.agent.setThinkingLevel === 'function') {
-      this.agent.setThinkingLevel(level);
+      this.agent.setThinkingLevel(piLevel);
+    }
+  }
+
+  /**
+   * Get the current thinking/reasoning effort level.
+   * Maps pi-agent-core's "xhigh" back to Cortex's "max".
+   *
+   * @returns The current consumer-facing thinking level, or 'medium' if not set
+   */
+  getThinkingLevel(): ThinkingLevel {
+    const piLevel = (this.agent.state as Record<string, unknown>)['thinkingLevel'];
+    return typeof piLevel === 'string' ? mapFromPiThinkingLevel(piLevel) : 'medium';
+  }
+
+  /**
+   * Get the thinking capabilities of the current primary model.
+   * Uses dynamic import of pi-ai to check model.reasoning and supportsXhigh().
+   *
+   * @returns Capabilities object describing thinking support
+   */
+  async getModelThinkingCapabilities(): Promise<ModelThinkingCapabilities> {
+    const piModel = this.primaryPiModel as Record<string, unknown>;
+    const supportsThinking = piModel['reasoning'] === true;
+    if (!supportsThinking) {
+      return { supportsThinking: false, supportsMax: false };
+    }
+    try {
+      const { supportsXhigh } = await import('@mariozechner/pi-ai');
+      return {
+        supportsThinking: true,
+        supportsMax: supportsXhigh(this.primaryPiModel as any),
+      };
+    } catch {
+      return { supportsThinking: true, supportsMax: false };
     }
   }
 

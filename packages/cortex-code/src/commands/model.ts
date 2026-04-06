@@ -1,4 +1,5 @@
 import { SelectList, Text, Container, type SelectItem } from '@mariozechner/pi-tui';
+import { UTILITY_MODEL_DEFAULTS } from '@animus-labs/cortex';
 import type { Command } from './index.js';
 import { selectListTheme, colors } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';
@@ -33,8 +34,8 @@ export const modelCommand: Command = {
       // Multiple providers: show provider picker first
       await showProviderPicker(session, providerIds, currentProvider, currentModelId);
     } else {
-      // Single provider: go straight to model list
-      await showModelPicker(session, currentProvider, currentModelId);
+      // Single provider: show tier picker (primary vs utility)
+      await showTierPicker(session, currentProvider, currentModelId);
     }
   },
 };
@@ -70,11 +71,65 @@ async function showProviderPicker(
       handle.hide();
 
       if (item.value === currentProvider) {
-        // Same provider: show model picker
-        await showModelPicker(session, currentProvider, currentModelId);
+        // Same provider: show tier picker
+        await showTierPicker(session, currentProvider, currentModelId);
       } else {
-        // Different provider: switch and show model picker
-        await showModelPicker(session, item.value, '');
+        // Different provider: show tier picker for new provider
+        await showTierPicker(session, item.value, '');
+      }
+      app.focusEditor();
+      resolve();
+    };
+
+    list.onCancel = () => {
+      handle.hide();
+      app.focusEditor();
+      resolve();
+    };
+  });
+}
+
+async function showTierPicker(
+  session: any,
+  provider: string,
+  currentModelId: string,
+): Promise<void> {
+  const app = session.getApp();
+  const agent = session.getAgent();
+  if (!app || !agent) return;
+
+  const utilityModel = agent.getUtilityModel();
+  const isOverridden = agent.isUtilityModelOverridden();
+  const utilityLabel = isOverridden ? utilityModel.modelId : `${utilityModel.modelId} (auto)`;
+
+  const items: SelectItem[] = [
+    {
+      value: 'primary',
+      label: 'Primary model',
+      description: currentModelId || session.getModelId(),
+    },
+    {
+      value: 'utility',
+      label: 'Utility model',
+      description: utilityLabel,
+    },
+  ];
+
+  const list = new SelectList(items, 2, selectListTheme);
+  const overlayBox = new OverlayBox(list, 'Model Tier');
+  const handle = app.tui.showOverlay(overlayBox, {
+    anchor: 'center',
+    width: '55%',
+    maxHeight: 8,
+  });
+
+  return new Promise<void>((resolve) => {
+    list.onSelect = async (item) => {
+      handle.hide();
+      if (item.value === 'primary') {
+        await showModelPicker(session, provider, currentModelId || session.getModelId(), 'primary');
+      } else {
+        await showModelPicker(session, provider, utilityModel.modelId, 'utility');
       }
       app.focusEditor();
       resolve();
@@ -92,6 +147,7 @@ async function showModelPicker(
   session: any,
   provider: string,
   currentModelId: string,
+  tier: 'primary' | 'utility' = 'primary',
 ): Promise<void> {
   const app = session.getApp();
   if (!app) return;
@@ -135,7 +191,20 @@ async function showModelPicker(
     return;
   }
 
-  const items: SelectItem[] = models.map(m => {
+  const items: SelectItem[] = [];
+
+  // For utility tier, add an "(auto)" option at the top to reset to auto-resolution
+  if (tier === 'utility') {
+    const agent = session.getAgent();
+    const autoModelId = agent ? UTILITY_MODEL_DEFAULTS[provider] ?? provider : '';
+    items.push({
+      value: '__auto__',
+      label: `Auto (${autoModelId})`,
+      description: agent?.isUtilityModelOverridden() ? '' : '\u2190 current',
+    });
+  }
+
+  for (const m of models) {
     const isCurrent = m.id === currentModelId;
     const ctxK = `${(m.contextWindow / 1000).toFixed(0)}k`;
     const item: SelectItem = {
@@ -147,11 +216,12 @@ async function showModelPicker(
     } else {
       item.description = ctxK;
     }
-    return item;
-  });
+    items.push(item);
+  }
 
+  const titleSuffix = tier === 'utility' ? ' (Utility)' : '';
   const list = new SelectList(items, Math.min(items.length, 12), selectListTheme);
-  const overlayBox = new OverlayBox(list, `${provider} Models`);
+  const overlayBox = new OverlayBox(list, `${provider} Models${titleSuffix}`);
   const handle = app.tui.showOverlay(overlayBox, {
     anchor: 'center',
     width: '60%',
@@ -166,6 +236,27 @@ async function showModelPicker(
       const agent = session.getAgent();
       if (!agent) { resolve(); return; }
 
+      if (tier === 'utility') {
+        // Utility model selection
+        if (item.value === '__auto__') {
+          agent.resetUtilityModel();
+          const resolved = agent.getUtilityModel();
+          app.transcript.addNotification('Model', `Utility model reset to auto (${resolved.modelId}).`);
+        } else {
+          try {
+            const pm = session.getProviderManager();
+            const newModel = await pm.resolveModel(provider, item.value);
+            agent.setUtilityModel(newModel);
+            app.transcript.addNotification('Model', `Utility model set to ${item.value}.`);
+          } catch (err) {
+            app.transcript.addNotification('Model Error', `Failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        resolve();
+        return;
+      }
+
+      // Primary model selection
       if (item.value === currentModelId && provider === session.getProvider()) {
         app.transcript.addNotification('Model', `Already using ${item.value}.`);
         resolve();

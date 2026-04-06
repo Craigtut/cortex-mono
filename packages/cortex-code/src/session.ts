@@ -22,6 +22,7 @@ import {
   type AgentTextOutput,
   type ClassifiedError,
   type CompactionResult,
+  type ThinkingLevel,
   stripWorkingTags,
 } from '@animus-labs/cortex';
 import { App, type AppCallbacks } from './tui/app.js';
@@ -62,6 +63,10 @@ export class Session {
   private app: App | null = null;
   private rules: PermissionRuleManager;
   private yoloMode: boolean;
+  /** The user's desired effort level. Persists across model switches within a session. */
+  private preferredEffort: ThinkingLevel;
+  /** The actual effort level applied to the agent (may differ from preferred due to model limits). */
+  private effectiveEffort: ThinkingLevel;
   private sessionId: string;
   private saver: ReturnType<typeof createDebouncedSaver>;
   private isRunning = false;
@@ -86,6 +91,8 @@ export class Session {
     this.credentialStore = options.credentialStore;
     this.cwd = options.cwd;
     this.yoloMode = options.yoloMode;
+    this.preferredEffort = (options.config.defaultEffort as ThinkingLevel) ?? 'medium';
+    this.effectiveEffort = this.preferredEffort;
     this.rules = new PermissionRuleManager(options.cwd);
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.saver = createDebouncedSaver(this.sessionId);
@@ -157,6 +164,9 @@ export class Session {
     // Refresh autocomplete after skills are registered
     this.app.refreshCommands(this.cwd);
 
+    // Apply initial thinking level
+    const { effective: initialEffort } = await this.reconcileEffort();
+
     // Show banner
     const branch = await this.getGitBranch();
     const project = this.cwd.split('/').pop() ?? '';
@@ -171,6 +181,7 @@ export class Session {
       tokenLimit: this.agent.effectiveContextWindow,
       gitBranch: branch,
       yoloMode: this.yoloMode,
+      effortLevel: initialEffort,
     });
 
     // Start TUI event loop
@@ -663,6 +674,52 @@ export class Session {
   }
 
   // -------------------------------------------------------------------------
+  // Effort reconciliation
+  // -------------------------------------------------------------------------
+
+  /**
+   * Reconcile the preferred effort with the current model's capabilities.
+   * Sets the effective effort on the agent and returns whether it was clamped.
+   */
+  private async reconcileEffort(): Promise<{
+    effective: ThinkingLevel;
+    clamped: boolean;
+    reason?: string;
+  }> {
+    if (!this.agent) {
+      return { effective: this.preferredEffort, clamped: false };
+    }
+
+    const caps = await this.agent.getModelThinkingCapabilities();
+
+    let effective: ThinkingLevel;
+    let clamped = false;
+    let reason: string | undefined;
+
+    if (!caps.supportsThinking) {
+      effective = 'off';
+      if (this.preferredEffort !== 'off') {
+        clamped = true;
+        reason = `${this.modelId} does not support thinking. Effort disabled.`;
+      }
+    } else if (this.preferredEffort === 'max' && !caps.supportsMax) {
+      effective = 'high';
+      clamped = true;
+      reason = `${this.modelId} does not support Max effort. Using High.`;
+    } else if (this.preferredEffort === 'off') {
+      effective = 'off';
+    } else {
+      effective = this.preferredEffort;
+    }
+
+    this.effectiveEffort = effective;
+    this.agent.setThinkingLevel(effective);
+    const result: { effective: ThinkingLevel; clamped: boolean; reason?: string } = { effective, clamped };
+    if (reason) result.reason = reason;
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
   // Public accessors for command handlers
   // -------------------------------------------------------------------------
 
@@ -673,6 +730,22 @@ export class Session {
     this.yoloMode = enabled;
     this.app?.updateStatus({ yoloMode: enabled });
   }
+  getPreferredEffort(): ThinkingLevel { return this.preferredEffort; }
+  getEffectiveEffort(): ThinkingLevel { return this.effectiveEffort; }
+
+  /**
+   * Set the user's preferred effort level.
+   * Reconciles with current model capabilities and applies the effective level.
+   */
+  async setPreferredEffort(level: ThinkingLevel): Promise<void> {
+    this.preferredEffort = level;
+    const { effective, clamped, reason } = await this.reconcileEffort();
+    this.app?.updateStatus({ effortLevel: effective });
+    if (clamped && reason) {
+      this.app?.transcript.addNotification('Effort', reason);
+    }
+  }
+
   getSessionId(): string { return this.sessionId; }
   getRules(): PermissionRuleManager { return this.rules; }
   getProviderManager(): ProviderManager { return this.providerManager; }
@@ -711,10 +784,13 @@ export class Session {
       newModel = await this.providerManager.resolveModel(this.provider, modelId);
     }
     this.agent!.setModel(newModel);
-    // Update internal tracking (modelId is readonly, so we use a mutable backing field)
     this.modelId = modelId;
-    this.app?.updateStatus({ model: modelId });
-    // Save new default
+    // Reconcile effort with new model's capabilities
+    const { clamped, reason, effective } = await this.reconcileEffort();
+    this.app?.updateStatus({ model: modelId, effortLevel: effective });
+    if (clamped && reason) {
+      this.app?.transcript.addNotification('Effort', reason);
+    }
     await this.credentialStore.setDefaults(this.provider, modelId);
   }
 
@@ -734,7 +810,12 @@ export class Session {
     this.agent!.setModel(newModel);
     this.provider = newProvider;
     this.modelId = newModelId;
-    this.app?.updateStatus({ provider: newProvider, model: newModelId });
+    // Reconcile effort with new model's capabilities
+    const { clamped, reason, effective } = await this.reconcileEffort();
+    this.app?.updateStatus({ provider: newProvider, model: newModelId, effortLevel: effective });
+    if (clamped && reason) {
+      this.app?.transcript.addNotification('Effort', reason);
+    }
     await this.credentialStore.setDefaults(newProvider, newModelId);
   }
 }
