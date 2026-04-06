@@ -22,11 +22,50 @@ export class TranscriptManager {
   private toolCalls = new Map<string, ToolCallComponent>();
   /** Map of active sub-agent components by task ID. */
   private subAgents = new Map<string, SubAgentComponent>();
+  /** Throttle renders to avoid overwhelming the terminal during rapid events. */
+  private renderTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastRenderTime = 0;
+  private static readonly MIN_RENDER_INTERVAL_MS = 100;
 
   constructor(
     private chatContainer: Container,
     private tui: TUI,
   ) {}
+
+  /**
+   * Request a TUI render, throttled to avoid flooding the terminal with output
+   * during rapid event bursts (tool calls, streaming chunks). This prevents
+   * the terminal from force-scrolling to the bottom on every event.
+   */
+  private throttledRender(): void {
+    const now = Date.now();
+    const elapsed = now - this.lastRenderTime;
+
+    if (elapsed >= TranscriptManager.MIN_RENDER_INTERVAL_MS) {
+      // Enough time has passed, render immediately
+      this.lastRenderTime = now;
+      this.throttledRender();
+    } else if (!this.renderTimer) {
+      // Schedule a render for when the throttle window expires
+      const delay = TranscriptManager.MIN_RENDER_INTERVAL_MS - elapsed;
+      this.renderTimer = setTimeout(() => {
+        this.renderTimer = null;
+        this.lastRenderTime = Date.now();
+        this.throttledRender();
+      }, delay);
+    }
+    // If a timer is already pending, skip (the pending render will pick up all changes)
+  }
+
+  /** Force an immediate render (for user-initiated actions like submit). */
+  private immediateRender(): void {
+    if (this.renderTimer) {
+      clearTimeout(this.renderTimer);
+      this.renderTimer = null;
+    }
+    this.lastRenderTime = Date.now();
+    this.throttledRender();
+  }
 
   /** Add the startup banner to the transcript. */
   addBanner(version: string, project: string, branch: string): void {
@@ -82,7 +121,7 @@ export class TranscriptManager {
     // Pi-tui's differential renderer only redraws changed lines.
     this.currentAssistantMarkdown!.setText(this.currentAssistantText);
     // Request a TUI render so the update is visible immediately
-    this.tui.requestRender();
+    this.throttledRender();
   }
 
   /** Finalize the current assistant message (e.g., strip working tags). */
@@ -109,7 +148,7 @@ export class TranscriptManager {
     const toolComponent = new ToolCallComponent(this.tui, toolName, argsSummary);
     this.toolCalls.set(toolCallId, toolComponent);
     this.chatContainer.addChild(toolComponent);
-    this.tui.requestRender();
+    this.throttledRender();
   }
 
   /** Complete a tool call with its result. */
@@ -122,7 +161,7 @@ export class TranscriptManager {
     this.currentAssistantText = '';
     this.currentAssistantMarkdown = new Markdown('', 0, 0, markdownTheme);
     this.chatContainer.addChild(this.currentAssistantMarkdown);
-    this.tui.requestRender();
+    this.throttledRender();
   }
 
   /** Fail a tool call with an error. */
@@ -135,7 +174,7 @@ export class TranscriptManager {
     this.currentAssistantText = '';
     this.currentAssistantMarkdown = new Markdown('', 0, 0, markdownTheme);
     this.chatContainer.addChild(this.currentAssistantMarkdown);
-    this.tui.requestRender();
+    this.throttledRender();
   }
 
   /** Start a sub-agent display with tree-drawing characters. */
@@ -172,7 +211,7 @@ export class TranscriptManager {
     this.chatContainer.addChild(new Text(header));
     this.chatContainer.addChild(new Text(colors.muted(message)));
     this.chatContainer.addChild(new Spacer(1));
-    this.tui.requestRender();
+    this.immediateRender();
   }
 
   /** Add a permission prompt inline in the transcript. */
