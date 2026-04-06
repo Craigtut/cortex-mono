@@ -3167,26 +3167,28 @@ export class CortexAgent {
         taskId,
       );
 
-      // Run the sub-agent (foreground: wait for result)
-      const result = await this.runSubAgent(childAgent, params.instructions, taskId, startTime);
+      try {
+        // Run the sub-agent (foreground: wait for result)
+        const result = await this.runSubAgent(childAgent, params.instructions, taskId, startTime);
 
-      // Stop forwarding after completion
-      unsubForward();
+        this.logger.info('[CortexAgent] subagent complete', {
+          taskId,
+          status: result.status,
+          turns: result.usage.turns,
+          cost: result.usage.cost,
+          durationMs: result.usage.durationMs,
+        });
 
-      this.logger.info('[CortexAgent] subagent complete', {
-        taskId,
-        status: result.status,
-        turns: result.usage.turns,
-        cost: result.usage.cost,
-        durationMs: result.usage.durationMs,
-      });
-
-      return {
-        taskId,
-        output: result.output,
-        status: result.status,
-        usage: result.usage,
-      };
+        return {
+          taskId,
+          output: result.output,
+          status: result.status,
+          usage: result.usage,
+        };
+      } finally {
+        // Always stop forwarding, whether the sub-agent succeeded or failed
+        unsubForward();
+      }
     } catch (err) {
       this.logger.error('[CortexAgent] subagent failed', {
         taskId,
@@ -3251,10 +3253,17 @@ export class CortexAgent {
       throw new Error('Concurrency limit reached');
     }
 
+    // Forward child events to parent's EventBridge for real-time visibility
+    const unsubForward = this.eventBridge.forwardFrom(
+      (childAgent as CortexAgent).getEventBridge(),
+      taskId,
+    );
+
     // Run the sub-agent in the background. When it completes, deliver the
     // result back to the parent agent and restart its agentic loop.
     this.runSubAgent(childAgent, params.instructions, taskId, startTime)
       .then((result) => {
+        unsubForward();
         this.logger.info('[CortexAgent] subagent complete', {
           taskId,
           background: true,
@@ -3266,6 +3275,7 @@ export class CortexAgent {
         return this.handleBackgroundCompletion(taskId, result);
       })
       .catch((err) => {
+        unsubForward();
         this.logger.error('[CortexAgent] subagent failed', {
           taskId,
           background: true,

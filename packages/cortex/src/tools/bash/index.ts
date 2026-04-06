@@ -12,7 +12,7 @@ import * as child_process from 'node:child_process';
 import * as fs from 'node:fs';
 import { Type, type Static } from '@sinclair/typebox';
 import type { CwdTracker } from '../shared/cwd-tracker.js';
-import type { ToolContentDetails } from '../../types.js';
+import type { ToolContentDetails, ToolExecuteContext } from '../../types.js';
 import { buildSafeEnv, runSafetyChecks } from './safety.js';
 import {
   type BackgroundTask,
@@ -54,6 +54,18 @@ export interface BashDetails {
   backgrounded: boolean;
   taskId: string | null;
   finalCwd: string;
+}
+
+/**
+ * Partial result details emitted during bash streaming via onUpdate.
+ */
+export interface BashStreamUpdate {
+  /** New stdout chunk since last update (complete lines only). */
+  stdout: string;
+  /** New stderr chunk since last update. */
+  stderr: string;
+  /** Total stdout lines emitted so far. */
+  totalLines: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +265,7 @@ export function createBashTool(config: BashToolConfig): {
   name: string;
   description: string;
   parameters: typeof BashParams;
-  execute: (params: BashParamsType) => Promise<ToolContentDetails<BashDetails>>;
+  execute: (params: BashParamsType, context?: ToolExecuteContext) => Promise<ToolContentDetails<BashDetails>>;
 } {
   const cwdTracker = config.runtime?.cwdTracker ?? config.cwdTracker;
   if (!cwdTracker) {
@@ -267,7 +279,7 @@ export function createBashTool(config: BashToolConfig): {
     description: 'Execute a shell command in the host environment.',
     parameters: BashParams,
 
-    async execute(params: BashParamsType): Promise<ToolContentDetails<BashDetails>> {
+    async execute(params: BashParamsType, context?: ToolExecuteContext): Promise<ToolContentDetails<BashDetails>> {
       backgroundTasks.cleanupCompletedTasks();
       const timeout = Math.min(params.timeout ?? DEFAULT_TIMEOUT, MAX_TIMEOUT);
       const background = params.background ?? false;
@@ -408,10 +420,50 @@ export function createBashTool(config: BashToolConfig): {
         let autoYielded = false;
         let taskId: string | null = null;
 
+        // Streaming state: buffer chunks and emit complete lines every 100ms
+        const onUpdate = context?.onUpdate;
+        let pendingStdout = '';
+        let pendingStderr = '';
+        let totalLinesEmitted = 0;
+
+        const flushStreamUpdate = (): void => {
+          if (!onUpdate) return;
+          // Only emit complete lines (hold partial lines in the buffer)
+          const lastNewline = pendingStdout.lastIndexOf('\n');
+          const lastStderrNewline = pendingStderr.lastIndexOf('\n');
+          if (lastNewline === -1 && lastStderrNewline === -1) return;
+
+          let stdoutChunk = '';
+          if (lastNewline >= 0) {
+            stdoutChunk = pendingStdout.slice(0, lastNewline + 1);
+            pendingStdout = pendingStdout.slice(lastNewline + 1);
+            totalLinesEmitted += stdoutChunk.split('\n').length - 1;
+          }
+
+          let stderrChunk = '';
+          if (lastStderrNewline >= 0) {
+            stderrChunk = pendingStderr.slice(0, lastStderrNewline + 1);
+            pendingStderr = pendingStderr.slice(lastStderrNewline + 1);
+          }
+
+          onUpdate({
+            content: [{ type: 'text', text: stdoutChunk + stderrChunk }],
+            details: { stdout: stdoutChunk, stderr: stderrChunk, totalLines: totalLinesEmitted },
+          });
+        };
+
+        const streamInterval = onUpdate ? setInterval(flushStreamUpdate, 100) : null;
+
         proc.stdout?.setEncoding('utf8');
         proc.stderr?.setEncoding('utf8');
-        proc.stdout?.on('data', (data: string) => { stdout += data; });
-        proc.stderr?.on('data', (data: string) => { stderr += data; });
+        proc.stdout?.on('data', (data: string) => {
+          stdout += data;
+          pendingStdout += data;
+        });
+        proc.stderr?.on('data', (data: string) => {
+          stderr += data;
+          pendingStderr += data;
+        });
 
         // Timeout handler
         const timeoutTimer = setTimeout(() => {
@@ -450,6 +502,10 @@ export function createBashTool(config: BashToolConfig): {
             });
 
             clearTimeout(timeoutTimer);
+            if (streamInterval) {
+              clearInterval(streamInterval);
+              flushStreamUpdate();
+            }
 
             const [cleanedOutput] = extractCwd(sanitizeOutput(stdout));
             resolve({
@@ -472,6 +528,10 @@ export function createBashTool(config: BashToolConfig): {
         proc.on('close', (code) => {
           clearTimeout(timeoutTimer);
           clearTimeout(autoYieldTimer);
+          if (streamInterval) {
+            clearInterval(streamInterval);
+            flushStreamUpdate();
+          }
 
           if (proc.pid && config.onProcessExited) {
             config.onProcessExited(proc.pid);
@@ -520,6 +580,10 @@ export function createBashTool(config: BashToolConfig): {
         proc.on('error', (err) => {
           clearTimeout(timeoutTimer);
           clearTimeout(autoYieldTimer);
+          if (streamInterval) {
+            clearInterval(streamInterval);
+            flushStreamUpdate();
+          }
 
           if (autoYielded) return;
 

@@ -48,6 +48,7 @@ describe('EventBridge', () => {
       ['message_update', 'response_chunk'],
       ['message_end', 'response_end'],
       ['tool_execution_start', 'tool_call_start'],
+      ['tool_execution_update', 'tool_call_update'],
       ['tool_execution_end', 'tool_call_end'],
     ];
 
@@ -64,15 +65,6 @@ describe('EventBridge', () => {
         );
       });
     }
-
-    it('drops tool_execution_update events (no mapping)', () => {
-      const allListener = vi.fn();
-      bridge.onAll(allListener);
-
-      source.emit({ type: 'tool_execution_update' });
-
-      expect(allListener).not.toHaveBeenCalled();
-    });
   });
 
   // -----------------------------------------------------------------------
@@ -368,6 +360,189 @@ describe('EventBridge', () => {
         '[EventBridge] catch-all listener threw',
         expect.objectContaining({ error: 'catch-all boom' }),
       );
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Typed payloads
+  // -----------------------------------------------------------------------
+
+  describe('typed payloads', () => {
+    it('populates payload for tool_call_start', () => {
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      source.emit({
+        type: 'tool_execution_start',
+        toolCallId: 'tc-1',
+        toolName: 'Read',
+        args: { file_path: '/tmp/test.txt' },
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.payload).toEqual({
+        toolCallId: 'tc-1',
+        toolName: 'Read',
+        args: { file_path: '/tmp/test.txt' },
+      });
+    });
+
+    it('populates payload for tool_call_update', () => {
+      const listener = vi.fn();
+      bridge.on('tool_call_update', listener);
+
+      source.emit({
+        type: 'tool_execution_update',
+        toolCallId: 'tc-2',
+        toolName: 'Bash',
+        args: { command: 'echo hi' },
+        partialResult: {
+          content: [{ type: 'text', text: 'hi\n' }],
+          details: { stdout: 'hi\n', stderr: '', totalLines: 1 },
+        },
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.payload).toBeDefined();
+      expect((event.payload as Record<string, unknown>)['toolCallId']).toBe('tc-2');
+      expect((event.payload as Record<string, unknown>)['toolName']).toBe('Bash');
+      expect((event.payload as Record<string, unknown>)['partialResult']).toBeDefined();
+    });
+
+    it('populates payload for tool_call_end', () => {
+      const listener = vi.fn();
+      bridge.on('tool_call_end', listener);
+
+      source.emit({
+        type: 'tool_execution_end',
+        toolCallId: 'tc-3',
+        toolName: 'Glob',
+        result: {
+          content: [{ type: 'text', text: 'file.ts' }],
+          details: { totalCount: 1 },
+        },
+        durationMs: 42,
+        isError: false,
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.payload).toBeDefined();
+      const payload = event.payload as Record<string, unknown>;
+      expect(payload['toolCallId']).toBe('tc-3');
+      expect(payload['durationMs']).toBe(42);
+      expect(payload['isError']).toBe(false);
+      expect(payload['error']).toBeUndefined();
+    });
+
+    it('includes error in payload for failed tool calls', () => {
+      const listener = vi.fn();
+      bridge.on('tool_call_end', listener);
+
+      source.emit({
+        type: 'tool_execution_end',
+        toolCallId: 'tc-4',
+        toolName: 'Read',
+        result: { content: [], details: {} },
+        isError: true,
+        error: 'file not found',
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      const payload = event.payload as Record<string, unknown>;
+      expect(payload['isError']).toBe(true);
+      expect(payload['error']).toBe('file not found');
+    });
+
+    it('returns no payload for non-tool events', () => {
+      const listener = vi.fn();
+      bridge.on('session_start', listener);
+
+      source.emit({ type: 'agent_start' });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.payload).toBeUndefined();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Child event forwarding
+  // -----------------------------------------------------------------------
+
+  describe('forwardFrom', () => {
+    it('forwards child events with childTaskId', () => {
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      bridge.forwardFrom(childBridge, 'sub-agent-1');
+
+      childSource.emit({
+        type: 'tool_execution_start',
+        toolCallId: 'child-tc-1',
+        toolName: 'Grep',
+        args: { pattern: 'foo' },
+      });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.childTaskId).toBe('sub-agent-1');
+      expect(event.payload).toBeDefined();
+      expect((event.payload as Record<string, unknown>)['toolName']).toBe('Grep');
+    });
+
+    it('parent events have no childTaskId', () => {
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      source.emit({
+        type: 'tool_execution_start',
+        toolCallId: 'parent-tc',
+        toolName: 'Read',
+        args: {},
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.childTaskId).toBeUndefined();
+    });
+
+    it('unsubscribe stops forwarding', () => {
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      const unsub = bridge.forwardFrom(childBridge, 'sub-1');
+      childSource.emit({ type: 'tool_execution_start', toolCallId: 'a', toolName: 'X', args: {} });
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      unsub();
+      childSource.emit({ type: 'tool_execution_start', toolCallId: 'b', toolName: 'Y', args: {} });
+      expect(listener).toHaveBeenCalledTimes(1); // Not called again
+    });
+
+    it('forwards all event types from child', () => {
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+
+      const allListener = vi.fn();
+      bridge.onAll(allListener);
+
+      bridge.forwardFrom(childBridge, 'sub-2');
+
+      childSource.emit({ type: 'turn_start' });
+      childSource.emit({ type: 'tool_execution_start', toolCallId: '1', toolName: 'A', args: {} });
+      childSource.emit({ type: 'tool_execution_end', toolCallId: '1', toolName: 'A', result: {} });
+
+      expect(allListener).toHaveBeenCalledTimes(3);
+      for (const call of allListener.mock.calls) {
+        expect(call[0].childTaskId).toBe('sub-2');
+      }
     });
   });
 });

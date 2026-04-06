@@ -46,7 +46,7 @@ export type { GrepToolConfig, GrepDetails, GrepParamsType } from './grep.js';
 export { GrepParams } from './grep.js';
 
 export { createBashTool, getBackgroundTask, getAllBackgroundTasks } from './bash/index.js';
-export type { BashToolConfig, BashDetails, BashParamsType } from './bash/index.js';
+export type { BashToolConfig, BashDetails, BashStreamUpdate, BashParamsType } from './bash/index.js';
 export { BashParams } from './bash/index.js';
 
 export { createTaskOutputTool } from './task-output.js';

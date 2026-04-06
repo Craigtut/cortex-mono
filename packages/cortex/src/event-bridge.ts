@@ -13,14 +13,26 @@
  *   message_start  -> response_start
  *   message_update -> response_chunk
  *   message_end    -> response_end
- *   tool_execution_start -> tool_call_start
- *   tool_execution_update -> (dropped)
- *   tool_execution_end   -> tool_call_end
+ *   tool_execution_start  -> tool_call_start
+ *   tool_execution_update -> tool_call_update
+ *   tool_execution_end    -> tool_call_end
+ *
+ * Child event forwarding:
+ *   forwardFrom(childBridge, childTaskId) subscribes to a child agent's
+ *   event bridge and re-emits events on this bridge with childTaskId set.
+ *   Consumers use event.childTaskId to distinguish parent vs child events.
  *
  * Reference: cortex-architecture.md (Event Bridge section)
  */
 
-import type { AgentTextOutput, CortexLogger } from './types.js';
+import type {
+  AgentTextOutput,
+  CortexLogger,
+  ToolCallStartPayload,
+  ToolCallUpdatePayload,
+  ToolCallEndPayload,
+  ToolContentDetails,
+} from './types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { parseWorkingTags } from './working-tags.js';
 
@@ -37,6 +49,7 @@ export type CortexEventType =
   | 'response_chunk'
   | 'response_end'
   | 'tool_call_start'
+  | 'tool_call_update'
   | 'tool_call_end';
 
 /**
@@ -48,6 +61,17 @@ export interface CortexEvent {
   data?: unknown;
   /** Parsed text output, present only for turn_end events. */
   textOutput?: AgentTextOutput;
+  /**
+   * Typed payload for tool events (tool_call_start, tool_call_update, tool_call_end).
+   * Provides typed access to tool event data without casting `data`.
+   */
+  payload?: ToolCallStartPayload | ToolCallUpdatePayload | ToolCallEndPayload;
+  /**
+   * Present when this event originates from a child (sub-agent) event bridge.
+   * The value is the sub-agent's task ID, allowing consumers to route events
+   * to the correct UI component. Absent for parent agent events.
+   */
+  childTaskId?: string;
 }
 
 /**
@@ -97,7 +121,7 @@ const PI_TO_CORTEX_MAP: Partial<Record<PiEventType, CortexEventType>> = {
   message_update: 'response_chunk',
   message_end: 'response_end',
   tool_execution_start: 'tool_call_start',
-  // tool_execution_update is dropped (no mapping)
+  tool_execution_update: 'tool_call_update',
   tool_execution_end: 'tool_call_end',
 };
 
@@ -182,6 +206,26 @@ export class EventBridge {
   }
 
   /**
+   * Forward all events from a child agent's event bridge onto this bridge.
+   *
+   * Each forwarded event gets `childTaskId` set so consumers can distinguish
+   * parent events from child events. Returns an unsubscribe function that
+   * stops forwarding (call when the child agent completes or is destroyed).
+   *
+   * @param childBridge - The child agent's EventBridge
+   * @param childTaskId - The sub-agent task ID to tag forwarded events with
+   * @returns An unsubscribe function
+   */
+  forwardFrom(childBridge: EventBridge, childTaskId: string): () => void {
+    return childBridge.onAll((event) => {
+      this.emit({
+        ...event,
+        childTaskId,
+      });
+    });
+  }
+
+  /**
    * Update whether working tags parsing is enabled.
    */
   setWorkingTagsEnabled(enabled: boolean): void {
@@ -203,7 +247,6 @@ export class EventBridge {
   private handlePiEvent(piEvent: PiEvent): void {
     const cortexType = PI_TO_CORTEX_MAP[piEvent.type];
     if (!cortexType) {
-      // Unmapped event (e.g., tool_execution_update) is dropped
       return;
     }
 
@@ -211,6 +254,12 @@ export class EventBridge {
       type: cortexType,
       data: piEvent,
     };
+
+    // Populate typed payload for tool events
+    const payload = this.extractToolPayload(cortexType, piEvent);
+    if (payload) {
+      cortexEvent.payload = payload;
+    }
 
     // For turn_end, parse working tags from the turn's text content
     if (cortexType === 'turn_end' && this.workingTagsEnabled) {
@@ -221,6 +270,52 @@ export class EventBridge {
     }
 
     this.emit(cortexEvent);
+  }
+
+  /**
+   * Extract a typed payload from a pi-agent-core tool event.
+   * Returns undefined for non-tool events.
+   */
+  private extractToolPayload(
+    cortexType: CortexEventType,
+    piEvent: PiEvent,
+  ): CortexEvent['payload'] {
+    if (cortexType === 'tool_call_start') {
+      return {
+        toolCallId: String(piEvent['toolCallId'] ?? piEvent['id'] ?? ''),
+        toolName: String(piEvent['toolName'] ?? piEvent['name'] ?? 'unknown'),
+        args: (piEvent['args'] ?? piEvent['input'] ?? {}) as Record<string, unknown>,
+      } satisfies ToolCallStartPayload;
+    }
+
+    if (cortexType === 'tool_call_update') {
+      const partialResult = piEvent['partialResult'] as ToolContentDetails<unknown> | undefined;
+      return {
+        toolCallId: String(piEvent['toolCallId'] ?? piEvent['id'] ?? ''),
+        toolName: String(piEvent['toolName'] ?? piEvent['name'] ?? 'unknown'),
+        args: (piEvent['args'] ?? piEvent['input'] ?? {}) as Record<string, unknown>,
+        partialResult: partialResult ?? { content: [], details: {} },
+      } satisfies ToolCallUpdatePayload;
+    }
+
+    if (cortexType === 'tool_call_end') {
+      const result = piEvent['result'] as ToolContentDetails<unknown> | undefined;
+      const isError = Boolean(piEvent['isError']);
+      const error = piEvent['error'] as string | undefined;
+      const payload: ToolCallEndPayload = {
+        toolCallId: String(piEvent['toolCallId'] ?? piEvent['id'] ?? ''),
+        toolName: String(piEvent['toolName'] ?? piEvent['name'] ?? 'unknown'),
+        result: result ?? { content: [], details: {} },
+        durationMs: Number(piEvent['durationMs'] ?? piEvent['duration'] ?? 0),
+        isError,
+      };
+      if (isError) {
+        payload.error = error ?? 'unknown error';
+      }
+      return payload;
+    }
+
+    return undefined;
   }
 
   /**

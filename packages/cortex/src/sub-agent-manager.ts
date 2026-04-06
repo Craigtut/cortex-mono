@@ -23,7 +23,7 @@ export interface SubAgentManagerConfig {
 }
 
 export interface SubAgentLifecycleHooks {
-  onSpawned?: (taskId: string, instructions: string) => void;
+  onSpawned?: (taskId: string, instructions: string, background: boolean) => void;
   onCompleted?: (taskId: string, result: string, status: string, usage: unknown) => void;
   onFailed?: (taskId: string, error: string) => void;
 }
@@ -82,7 +82,7 @@ export class SubAgentManager {
 
     // Fire lifecycle hook
     try {
-      this.hooks.onSpawned?.(entry.taskId, entry.instructions);
+      this.hooks.onSpawned?.(entry.taskId, entry.instructions, entry.background);
     } catch {
       // Swallow hook errors
     }

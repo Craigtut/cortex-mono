@@ -160,7 +160,7 @@ describe('SubAgentManager', () => {
       manager.setHooks({ onSpawned });
 
       manager.track(createTrackedEntry({ taskId: 'task-1', instructions: 'do stuff' }));
-      expect(onSpawned).toHaveBeenCalledWith('task-1', 'do stuff');
+      expect(onSpawned).toHaveBeenCalledWith('task-1', 'do stuff', false);
     });
 
     it('swallows errors in hooks', () => {
