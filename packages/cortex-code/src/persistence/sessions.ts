@@ -2,6 +2,7 @@ import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import type { SessionUsage } from '@animus-labs/cortex';
 
 const SESSIONS_DIR = join(homedir(), '.cortex', 'sessions');
 
@@ -14,6 +15,8 @@ export interface SessionMeta {
   createdAt: number;
   updatedAt: number;
   tokenCount: number;
+  /** Accumulated session usage (cost, turns, tokens). Optional for backward compat. */
+  usage?: SessionUsage;
 }
 
 export interface SavedSession {

@@ -28,6 +28,7 @@
 import type {
   AgentTextOutput,
   CortexLogger,
+  CortexUsage,
   ToolCallStartPayload,
   ToolCallUpdatePayload,
   ToolCallEndPayload,
@@ -66,6 +67,13 @@ export interface CortexEvent {
    * Provides typed access to tool event data without casting `data`.
    */
   payload?: ToolCallStartPayload | ToolCallUpdatePayload | ToolCallEndPayload;
+  /**
+   * Extracted usage data from the LLM response, present on turn_end events.
+   * Centralizes extraction from pi-ai's AssistantMessage.usage structure so
+   * subscribers (BudgetGuard, CortexAgent, consumers) read typed data instead
+   * of parsing the opaque `data` field themselves.
+   */
+  usage?: CortexUsage;
   /**
    * Present when this event originates from a child (sub-agent) event bridge.
    * The value is the sub-agent's task ID, allowing consumers to route events
@@ -261,11 +269,18 @@ export class EventBridge {
       cortexEvent.payload = payload;
     }
 
-    // For turn_end, parse working tags from the turn's text content
-    if (cortexType === 'turn_end' && this.workingTagsEnabled) {
-      const text = this.extractTurnText(piEvent);
-      if (text) {
-        cortexEvent.textOutput = parseWorkingTags(text);
+    // For turn_end, extract typed usage and parse working tags
+    if (cortexType === 'turn_end') {
+      const usage = this.extractUsage(piEvent);
+      if (usage) {
+        cortexEvent.usage = usage;
+      }
+
+      if (this.workingTagsEnabled) {
+        const text = this.extractTurnText(piEvent);
+        if (text) {
+          cortexEvent.textOutput = parseWorkingTags(text);
+        }
       }
     }
 
@@ -364,6 +379,73 @@ export class EventBridge {
     }
 
     return null;
+  }
+
+  /**
+   * Extract typed CortexUsage from a turn_end event.
+   *
+   * Pi-ai's AssistantMessage carries usage at message.usage with a nested
+   * cost object. This method navigates the opaque event data once so all
+   * subscribers receive clean, typed usage without duplicating extraction.
+   */
+  private extractUsage(piEvent: PiEvent): CortexUsage | null {
+    // Pattern 1: message.usage (pi-ai AssistantMessage, the primary path)
+    const message = piEvent['message'] as Record<string, unknown> | undefined;
+    if (message) {
+      const usage = this.buildUsageFromObject(message['usage']);
+      if (usage) {
+        if (typeof message['model'] === 'string') {
+          usage.model = message['model'];
+        }
+        return usage;
+      }
+    }
+
+    // Pattern 2: Direct usage property on the event
+    const directUsage = this.buildUsageFromObject(piEvent['usage']);
+    if (directUsage) return directUsage;
+
+    // Pattern 3: result.usage
+    const result = piEvent['result'] as Record<string, unknown> | undefined;
+    if (result) {
+      const resultUsage = this.buildUsageFromObject(result['usage']);
+      if (resultUsage) return resultUsage;
+    }
+
+    return null;
+  }
+
+  /**
+   * Build a CortexUsage from a raw usage-shaped object.
+   * Returns null if the object is not a valid usage structure.
+   */
+  private buildUsageFromObject(raw: unknown): CortexUsage | null {
+    if (!raw || typeof raw !== 'object') return null;
+
+    const u = raw as Record<string, unknown>;
+    const input = typeof u['input'] === 'number' ? u['input'] : 0;
+    const output = typeof u['output'] === 'number' ? u['output'] : 0;
+    const cacheRead = typeof u['cacheRead'] === 'number' ? u['cacheRead'] : 0;
+    const cacheWrite = typeof u['cacheWrite'] === 'number' ? u['cacheWrite'] : 0;
+    const totalTokens = typeof u['totalTokens'] === 'number' ? u['totalTokens'] : input + output;
+
+    // At least one non-zero field to consider this a valid usage object
+    if (input === 0 && output === 0 && cacheRead === 0 && totalTokens === 0) return null;
+
+    let cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+    const costObj = u['cost'];
+    if (costObj && typeof costObj === 'object') {
+      const c = costObj as Record<string, unknown>;
+      cost = {
+        input: typeof c['input'] === 'number' ? c['input'] : 0,
+        output: typeof c['output'] === 'number' ? c['output'] : 0,
+        cacheRead: typeof c['cacheRead'] === 'number' ? c['cacheRead'] : 0,
+        cacheWrite: typeof c['cacheWrite'] === 'number' ? c['cacheWrite'] : 0,
+        total: typeof c['total'] === 'number' ? c['total'] : 0,
+      };
+    }
+
+    return { input, output, cacheRead, cacheWrite, totalTokens, cost };
   }
 
   /**

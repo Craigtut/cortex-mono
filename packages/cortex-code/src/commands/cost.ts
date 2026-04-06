@@ -10,18 +10,16 @@ export const costCommand: Command = {
 
     const tokenCount = agent.sessionTokenCount;
     const contextWindow = agent.effectiveContextWindow;
-    const usage = (tokenCount / 1000).toFixed(1);
+    const ctxUsage = (tokenCount / 1000).toFixed(1);
     const limit = (contextWindow / 1000).toFixed(0);
     const percentage = contextWindow > 0 ? ((tokenCount / contextWindow) * 100).toFixed(1) : '0';
 
-    const budgetGuard = agent.getBudgetGuard();
-    const turns = budgetGuard.getTurnCount();
-    const cost = budgetGuard.getTotalCost();
+    const usage = agent.getSessionUsage();
 
     const lines = [
-      `Token usage: ${usage}k / ${limit}k (${percentage}%)`,
-      `Turns: ${turns}`,
-      cost > 0 ? `Estimated cost: $${cost.toFixed(4)}` : '',
+      `Token usage: ${ctxUsage}k / ${limit}k (${percentage}%)`,
+      `Turns: ${usage.totalTurns}`,
+      usage.totalCost > 0 ? `Estimated cost: $${usage.totalCost.toFixed(4)}` : '',
       `Context window: ${limit}k tokens`,
     ].filter(Boolean);
 

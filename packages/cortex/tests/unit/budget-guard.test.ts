@@ -24,6 +24,22 @@ function createMockSource(): PiEventSource & { emit: (event: PiEvent) => void } 
   };
 }
 
+/**
+ * Build a pi-ai-shaped turn_end event with usage and cost data.
+ * Mimics the real AssistantMessage.usage structure from pi-ai.
+ */
+function turnEndWithCost(total: number): PiEvent {
+  return {
+    type: 'turn_end',
+    message: {
+      usage: {
+        input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total },
+      },
+    },
+  };
+}
+
 describe('BudgetGuard', () => {
   let bridge: EventBridge;
   let source: ReturnType<typeof createMockSource>;
@@ -95,17 +111,17 @@ describe('BudgetGuard', () => {
   // -----------------------------------------------------------------------
 
   describe('cost tracking', () => {
-    it('accumulates cost from turn_end events', () => {
+    it('accumulates cost from turn_end events (pi-ai AssistantMessage structure)', () => {
       const guard = new BudgetGuard({ maxCost: Infinity }, abortFn);
       guard.wire(bridge);
 
       source.emit({
         type: 'turn_end',
-        message: { cost: { total: 0.05 } },
+        message: { usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: { input: 0.01, output: 0.04, cacheRead: 0, cacheWrite: 0, total: 0.05 } } },
       });
       source.emit({
         type: 'turn_end',
-        message: { cost: { total: 0.03 } },
+        message: { usage: { input: 80, output: 40, cacheRead: 0, cacheWrite: 0, totalTokens: 120, cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 } } },
       });
 
       expect(guard.getTotalCost()).toBeCloseTo(0.08);
@@ -117,13 +133,13 @@ describe('BudgetGuard', () => {
 
       source.emit({
         type: 'turn_end',
-        message: { cost: { total: 0.06 } },
+        message: { usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: { input: 0.01, output: 0.05, cacheRead: 0, cacheWrite: 0, total: 0.06 } } },
       });
       expect(abortFn).not.toHaveBeenCalled();
 
       source.emit({
         type: 'turn_end',
-        message: { cost: { total: 0.05 } },
+        message: { usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: { input: 0.01, output: 0.04, cacheRead: 0, cacheWrite: 0, total: 0.05 } } },
       });
       expect(abortFn).toHaveBeenCalledTimes(1);
     });
@@ -135,38 +151,38 @@ describe('BudgetGuard', () => {
       for (let i = 0; i < 100; i++) {
         source.emit({
           type: 'turn_end',
-          message: { cost: { total: 1.0 } },
+          message: { usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: { input: 0.2, output: 0.8, cacheRead: 0, cacheWrite: 0, total: 1.0 } } },
         });
       }
 
       expect(abortFn).not.toHaveBeenCalled();
     });
 
-    it('extracts cost from result.cost.total', () => {
+    it('extracts cost from result.usage.cost.total', () => {
       const guard = new BudgetGuard({ maxCost: Infinity }, abortFn);
       guard.wire(bridge);
 
       source.emit({
         type: 'turn_end',
-        result: { cost: { total: 0.07 } },
+        result: { usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: { input: 0.02, output: 0.05, cacheRead: 0, cacheWrite: 0, total: 0.07 } } },
       });
 
       expect(guard.getTotalCost()).toBeCloseTo(0.07);
     });
 
-    it('extracts cost from direct cost property', () => {
+    it('extracts cost from direct usage on event', () => {
       const guard = new BudgetGuard({ maxCost: Infinity }, abortFn);
       guard.wire(bridge);
 
       source.emit({
         type: 'turn_end',
-        cost: 0.04,
+        usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150, cost: { input: 0.01, output: 0.03, cacheRead: 0, cacheWrite: 0, total: 0.04 } },
       });
 
       expect(guard.getTotalCost()).toBeCloseTo(0.04);
     });
 
-    it('handles turn_end with no cost data (zero cost)', () => {
+    it('handles turn_end with no usage data (zero cost)', () => {
       const guard = new BudgetGuard({ maxCost: Infinity }, abortFn);
       guard.wire(bridge);
 
@@ -185,8 +201,8 @@ describe('BudgetGuard', () => {
       const guard = new BudgetGuard({ maxTurns: Infinity, maxCost: Infinity }, abortFn);
       guard.wire(bridge);
 
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.05 } } });
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.05 } } });
+      source.emit(turnEndWithCost(0.05));
+      source.emit(turnEndWithCost(0.05));
 
       expect(guard.getTurnCount()).toBe(2);
       expect(guard.getTotalCost()).toBeCloseTo(0.10);
@@ -228,10 +244,7 @@ describe('BudgetGuard', () => {
       guard.wire(bridge);
 
       for (let i = 0; i < 50; i++) {
-        source.emit({
-          type: 'turn_end',
-          message: { cost: { total: 10.0 } },
-        });
+        source.emit(turnEndWithCost(10.0));
       }
 
       expect(abortFn).not.toHaveBeenCalled();
@@ -247,9 +260,9 @@ describe('BudgetGuard', () => {
       const guard = new BudgetGuard({ maxTurns: 3, maxCost: 100.0 }, abortFn);
       guard.wire(bridge);
 
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.01 } } });
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.01 } } });
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.01 } } });
+      source.emit(turnEndWithCost(0.01));
+      source.emit(turnEndWithCost(0.01));
+      source.emit(turnEndWithCost(0.01));
 
       expect(abortFn).toHaveBeenCalledTimes(1);
       expect(guard.getTotalCost()).toBeCloseTo(0.03); // Well under cost limit
@@ -259,8 +272,8 @@ describe('BudgetGuard', () => {
       const guard = new BudgetGuard({ maxTurns: 100, maxCost: 0.05 }, abortFn);
       guard.wire(bridge);
 
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.03 } } });
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.03 } } });
+      source.emit(turnEndWithCost(0.03));
+      source.emit(turnEndWithCost(0.03));
 
       expect(abortFn).toHaveBeenCalledTimes(1);
       expect(guard.getTurnCount()).toBe(2); // Well under turn limit
@@ -289,7 +302,7 @@ describe('BudgetGuard', () => {
       const guard = new BudgetGuard({ maxCost: 0.01 }, abortFn);
       guard.wire(bridge);
 
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.02 } } });
+      source.emit(turnEndWithCost(0.02));
       expect(guard.isBreached()).toBe(true);
     });
   });
@@ -349,7 +362,7 @@ describe('BudgetGuard', () => {
       const guard = new BudgetGuard({ maxCost: 0.05 }, abortFn, logger);
       guard.wire(bridge);
 
-      source.emit({ type: 'turn_end', message: { cost: { total: 0.06 } } });
+      source.emit(turnEndWithCost(0.06));
       expect(logger.warn).toHaveBeenCalledWith(
         '[BudgetGuard] cost limit breached',
         expect.objectContaining({ totalCost: 0.06, maxCost: 0.05 }),

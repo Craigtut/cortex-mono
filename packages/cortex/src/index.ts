@@ -15,6 +15,7 @@
 export type {
   CortexLogger,
   CortexUsage,
+  SessionUsage,
   CortexLifecycleState,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,

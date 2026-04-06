@@ -72,6 +72,31 @@ export interface CortexUsage {
 }
 
 // ---------------------------------------------------------------------------
+// Session Usage
+// ---------------------------------------------------------------------------
+
+/**
+ * Accumulated usage data across the lifetime of a session.
+ *
+ * Unlike BudgetGuard (which resets per agentic loop for enforcement),
+ * SessionUsage accumulates across all loops for reporting and persistence.
+ * Cortex tracks this in memory; consumers persist and restore as needed.
+ */
+export interface SessionUsage {
+  /** Total cost in USD across all turns. */
+  totalCost: number;
+  /** Total number of LLM turns across all loops. */
+  totalTurns: number;
+  /** Accumulated token counts across all turns. */
+  tokens: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 

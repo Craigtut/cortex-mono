@@ -172,6 +172,115 @@ describe('EventBridge', () => {
   });
 
   // -----------------------------------------------------------------------
+  // turn_end usage extraction
+  // -----------------------------------------------------------------------
+
+  describe('turn_end usage extraction', () => {
+    it('extracts usage from message.usage (pi-ai AssistantMessage)', () => {
+      const listener = vi.fn();
+      bridge.on('turn_end', listener);
+
+      source.emit({
+        type: 'turn_end',
+        message: {
+          model: 'claude-sonnet-4-20250514',
+          usage: {
+            input: 200, output: 100, cacheRead: 50, cacheWrite: 10, totalTokens: 360,
+            cost: { input: 0.01, output: 0.02, cacheRead: 0.005, cacheWrite: 0.001, total: 0.036 },
+          },
+        },
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.usage).toBeDefined();
+      expect(event.usage!.input).toBe(200);
+      expect(event.usage!.output).toBe(100);
+      expect(event.usage!.cacheRead).toBe(50);
+      expect(event.usage!.cacheWrite).toBe(10);
+      expect(event.usage!.totalTokens).toBe(360);
+      expect(event.usage!.cost.total).toBeCloseTo(0.036);
+      expect(event.usage!.cost.input).toBeCloseTo(0.01);
+      expect(event.usage!.model).toBe('claude-sonnet-4-20250514');
+    });
+
+    it('extracts usage from direct event.usage', () => {
+      const listener = vi.fn();
+      bridge.on('turn_end', listener);
+
+      source.emit({
+        type: 'turn_end',
+        usage: {
+          input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150,
+          cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+        },
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.usage).toBeDefined();
+      expect(event.usage!.cost.total).toBeCloseTo(0.03);
+    });
+
+    it('extracts usage from result.usage', () => {
+      const listener = vi.fn();
+      bridge.on('turn_end', listener);
+
+      source.emit({
+        type: 'turn_end',
+        result: {
+          usage: {
+            input: 80, output: 40, cacheRead: 0, cacheWrite: 0, totalTokens: 120,
+            cost: { input: 0.005, output: 0.01, cacheRead: 0, cacheWrite: 0, total: 0.015 },
+          },
+        },
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.usage).toBeDefined();
+      expect(event.usage!.cost.total).toBeCloseTo(0.015);
+    });
+
+    it('sets usage to undefined when no usage data present', () => {
+      const listener = vi.fn();
+      bridge.on('turn_end', listener);
+
+      source.emit({ type: 'turn_end' });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.usage).toBeUndefined();
+    });
+
+    it('handles usage with zero-cost but non-zero tokens', () => {
+      const listener = vi.fn();
+      bridge.on('turn_end', listener);
+
+      source.emit({
+        type: 'turn_end',
+        message: {
+          usage: {
+            input: 100, output: 50, cacheRead: 0, cacheWrite: 0, totalTokens: 150,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        },
+      });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.usage).toBeDefined();
+      expect(event.usage!.input).toBe(100);
+      expect(event.usage!.cost.total).toBe(0);
+    });
+
+    it('does not extract usage for non-turn_end events', () => {
+      const listener = vi.fn();
+      bridge.on('session_start', listener);
+
+      source.emit({ type: 'agent_start' });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.usage).toBeUndefined();
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Listener management
   // -----------------------------------------------------------------------
 

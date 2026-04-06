@@ -66,8 +66,8 @@ export class BudgetGuard {
       bridge.on('turn_end', (event) => {
         this.turnCount++;
 
-        // Extract cost from the event data if available
-        const cost = this.extractCost(event.data);
+        // Read cost from typed usage (extracted by EventBridge)
+        const cost = event.usage?.cost?.total ?? 0;
         if (cost > 0) {
           this.totalCost += cost;
         }
@@ -153,51 +153,4 @@ export class BudgetGuard {
     }
   }
 
-  /**
-   * Extract cost from a turn_end event's data.
-   *
-   * Pi-agent-core's turn_end event carries the AssistantMessage which
-   * includes usage.cost.total from pi-ai.
-   */
-  private extractCost(data: unknown): number {
-    if (!data || typeof data !== 'object') {
-      return 0;
-    }
-
-    const event = data as Record<string, unknown>;
-
-    // Pattern 1: Direct cost property
-    if (typeof event['cost'] === 'number') {
-      return event['cost'];
-    }
-
-    // Pattern 2: message.cost.total (pi-ai AssistantMessage structure)
-    const message = event['message'] as Record<string, unknown> | undefined;
-    if (message) {
-      const cost = message['cost'] as Record<string, unknown> | undefined;
-      if (cost && typeof cost['total'] === 'number') {
-        return cost['total'];
-      }
-    }
-
-    // Pattern 3: result.cost.total
-    const result = event['result'] as Record<string, unknown> | undefined;
-    if (result) {
-      const cost = result['cost'] as Record<string, unknown> | undefined;
-      if (cost && typeof cost['total'] === 'number') {
-        return cost['total'];
-      }
-    }
-
-    // Pattern 4: usage.cost.total
-    const usage = event['usage'] as Record<string, unknown> | undefined;
-    if (usage) {
-      const cost = usage['cost'] as Record<string, unknown> | undefined;
-      if (cost && typeof cost['total'] === 'number') {
-        return cost['total'];
-      }
-    }
-
-    return 0;
-  }
 }
