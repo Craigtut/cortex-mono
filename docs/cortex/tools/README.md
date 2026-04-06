@@ -1,8 +1,18 @@
 # Cortex Built-in Tools
 
-> **STATUS: RESEARCH** - Not yet implemented.
+Built-in tools that ship with `@animus-labs/cortex`. These are general-purpose tools any agent needs regardless of its application. They are **registered automatically** when `CortexAgent.create()` is called, using the `workingDirectory` from the agent config. No consumer-side tool creation is needed.
 
-Built-in tools that ship with `@animus-labs/cortex`. These are general-purpose tools any agent needs regardless of its application. Application-specific tools (domain-specific tools, cognitive tools, etc.) are registered by the consumer, not built into cortex.
+To disable specific built-in tools, use the `disableTools` config option:
+
+```typescript
+const agent = await CortexAgent.create({
+  model,
+  workingDirectory: cwd,
+  disableTools: ['WebFetch'], // Exclude specific tools
+});
+```
+
+Application-specific tools (domain-specific tools, cognitive tools, etc.) are registered by the consumer via MCP servers, not built into Cortex.
 
 ## Tool Tiers
 

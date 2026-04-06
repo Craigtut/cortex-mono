@@ -105,7 +105,17 @@ Built-in tools are native `AgentTool` registrations defined directly in Cortex. 
 
 Mutable built-in tool state is scoped per agent runtime. That includes cwd tracking, read tracking, WebFetch loop counters/cache ownership, and background task ownership. Parent and child agents get fresh built-in tool instances so they do not share mutable closures.
 
-Each built-in tool has its own permission entry in the `tool_permissions` table (system.db). Permissions are enforced through the same `beforeToolCall` hook used for MCP tools. The consumer (backend) configures which built-in tools are enabled when creating the agent, passing a list of enabled tool names at construction time. Built-in tool schemas use TypeBox directly since they are defined within Cortex, not converted from Zod. SubAgent is a special case: it delegates work to a child Cortex agent.
+Built-in tools are registered automatically when `CortexAgent.create()` is called, using the `workingDirectory` from the agent config. The consumer does not need to create or pass tool instances. To exclude specific built-in tools, use the `disableTools` config option:
+
+```typescript
+const agent = await CortexAgent.create({
+  model,
+  workingDirectory: cwd,
+  disableTools: ['WebFetch', 'Bash'], // Exclude specific tools
+});
+```
+
+Permissions are enforced through the `beforeToolCall` hook used for both built-in and MCP tools. Built-in tool schemas use TypeBox directly since they are defined within Cortex. SubAgent is a special case: it delegates work to a child Cortex agent.
 
 ### Schema Conversion (Zod -> TypeBox)
 
@@ -246,7 +256,9 @@ Pi-agent-core emits 10 events across 4 scopes. Cortex normalizes these into a co
 
 Pi-ai surfaces errors as plain `Error` objects with string messages. Cortex implements a regex-based error classifier that maps error strings to actionable categories (`authentication`, `rate_limit`, `context_overflow`, `server_error`, `network`, `cancelled`, `unknown`). Classified errors are emitted via the `onError` event for the consumer to route (logging, UI notifications, backoff).
 
-See **`error-recovery.md`** for the full design: classification patterns per category, error event flow, auth failure detection (pre-call and post-call), rate limit backoff mechanism, and integration with the 5-phase pipeline.
+Cortex also provides **automatic retry** for transient errors (`rate_limit`, `server_error`, `network`) inside `prompt()`. Uses `agent.continue()` from pi-agent-core with exponential backoff (default: 5 retries, 2s base delay). Retry events (`onRetry`, `onRetriesExhausted`) let consumers show UI feedback. Provider SDKs have inconsistent retry coverage; Cortex provides uniform behavior.
+
+See **`error-recovery.md`** for the full design: classification patterns per category, error event flow, auth failure detection, automatic retry mechanism, consumer-specific rate limit handling, and integration with the 5-phase pipeline.
 
 ### Token Tracking
 

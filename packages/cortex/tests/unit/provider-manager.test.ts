@@ -563,42 +563,45 @@ describe('ProviderManager', () => {
       expect(cortexModel.contextWindow).toBe(128_000);
     });
 
-    it('passes all config to pi-ai createModel', async () => {
-      mockCreateModel.mockReturnValue({});
+    it('builds correct model shape from config', async () => {
+      mockGetModel.mockReturnValue({});
 
       await pm.createCustomModel({
         baseUrl: 'http://localhost:8080/v1',
         modelId: 'test',
         contextWindow: 32_000,
         apiKey: 'local-key',
-        compat: {
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
-        },
       });
 
-      expect(mockCreateModel).toHaveBeenCalledWith({
-        baseUrl: 'http://localhost:8080/v1',
-        modelId: 'test',
-        contextWindow: 32_000,
-        apiKey: 'local-key',
-        compat: {
-          supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
-        },
-      });
+      // Should clone base model via getModel('openai', 'gpt-4.1')
+      expect(mockGetModel).toHaveBeenCalledWith('openai', 'gpt-4.1');
     });
 
-    it('unwraps back to the pi-ai model', async () => {
-      const piModel = { custom: true };
-      mockCreateModel.mockReturnValue(piModel);
+    it('uses openai-completions API and sets placeholder key for keyless endpoints', async () => {
+      mockGetModel.mockReturnValue({});
 
       const cortexModel = await pm.createCustomModel({
         baseUrl: 'http://localhost:11434/v1',
         modelId: 'test',
       });
 
-      expect(unwrapModel(cortexModel)).toBe(piModel);
+      const inner = unwrapModel(cortexModel) as Record<string, unknown>;
+      expect(inner['api']).toBe('openai-completions');
+      expect(inner['apiKey']).toBe('sk-no-key-required');
+      expect(inner['provider']).toBe('custom');
+    });
+
+    it('uses provided apiKey when given', async () => {
+      mockGetModel.mockReturnValue({});
+
+      const cortexModel = await pm.createCustomModel({
+        baseUrl: 'http://localhost:8080/v1',
+        modelId: 'test',
+        apiKey: 'local-key',
+      });
+
+      const inner = unwrapModel(cortexModel) as Record<string, unknown>;
+      expect(inner['apiKey']).toBe('local-key');
     });
   });
 

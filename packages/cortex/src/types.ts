@@ -16,6 +16,30 @@
 import type { CortexModel } from './model-wrapper.js';
 
 // ---------------------------------------------------------------------------
+// Logger
+// ---------------------------------------------------------------------------
+
+/**
+ * Pluggable logger interface for Cortex diagnostics.
+ *
+ * Cortex never decides where logs go. The consumer provides an implementation
+ * via CortexAgentConfig.logger. If omitted, all logging is silently discarded.
+ *
+ * All methods share the same signature for uniformity. The optional `data`
+ * parameter carries structured context (token counts, server names, error
+ * objects, etc.) that the consumer can serialize or inspect as needed.
+ *
+ * Compatible with `console` for quick development: `logger: console` works
+ * because console methods accept variadic args and ignore the extra object.
+ */
+export interface CortexLogger {
+  debug(message: string, data?: Record<string, unknown>): void;
+  info(message: string, data?: Record<string, unknown>): void;
+  warn(message: string, data?: Record<string, unknown>): void;
+  error(message: string, data?: Record<string, unknown>): void;
+}
+
+// ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
 
@@ -146,6 +170,14 @@ export interface CortexAgentConfig {
   };
 
   /**
+   * Disable specific built-in tools by name.
+   * Built-in tools (Read, Write, Edit, Glob, Grep, Bash, WebFetch, TaskOutput)
+   * are registered automatically. Use this to exclude tools the agent should not have.
+   * SubAgent and load_skill are controlled separately via enableSubAgentTool/enableLoadSkillTool.
+   */
+  disableTools?: string[];
+
+  /**
    * Structured permission result for a tool call.
    * - `allow`: proceed immediately
    * - `block`: deny the call
@@ -178,6 +210,15 @@ export interface CortexAgentConfig {
    * these specific variables.
    */
   envOverrides?: Record<string, string>;
+
+  /**
+   * Optional logger for Cortex internal diagnostics.
+   * If omitted, all internal logging is silently discarded (no-op).
+   * The library never decides where logs go; only the consumer does.
+   *
+   * Compatible with `console` for quick development: `{ logger: console }`.
+   */
+  logger?: CortexLogger;
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +708,7 @@ export interface SubAgentResult {
     turns: number;
     cost: number;
     durationMs: number;
+    totalTokens: number;
   };
 }
 

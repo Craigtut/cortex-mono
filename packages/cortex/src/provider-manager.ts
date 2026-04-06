@@ -588,13 +588,33 @@ export class ProviderManager implements IProviderManager {
    */
   async createCustomModel(config: CustomModelConfig): Promise<CortexModel> {
     const piAi = await loadPiAi();
-    const piModel = piAi.createModel({
+    // Clone an OpenAI model as a base for streaming/format compatibility,
+    // then override to use the Chat Completions API. The base model
+    // (openai/gpt-4.1) uses the newer Responses API which most
+    // OpenAI-compatible endpoints (Ollama, vLLM, etc.) do not support.
+    const baseModel = piAi.getModel('openai', 'gpt-4.1');
+    const piModel = {
+      ...(baseModel as Record<string, unknown>),
+      id: config.modelId,
+      name: config.modelId,
+      api: 'openai-completions',
       baseUrl: config.baseUrl,
-      modelId: config.modelId,
+      provider: 'custom',
       contextWindow: config.contextWindow ?? 128_000,
-      apiKey: config.apiKey,
-      compat: config.compat,
-    });
+      // Conservative compat for OpenAI-compatible endpoints: disable
+      // features that are OpenAI-specific or may not be supported.
+      // Consumer-provided compat overrides are merged on top.
+      compat: {
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        supportsStrictMode: false,
+        maxTokensField: 'max_tokens' as const,
+        ...config.compat,
+      },
+    };
+    // Set API key, using a placeholder for keyless endpoints (e.g., Ollama).
+    // The OpenAI SDK client requires a non-empty apiKey value.
+    (piModel as Record<string, unknown>)['apiKey'] = config.apiKey ?? 'sk-no-key-required';
     return wrapModel(
       piModel,
       'custom',

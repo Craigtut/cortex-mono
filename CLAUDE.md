@@ -43,7 +43,7 @@ Two main exports, fully independent:
 ### Architecture Highlights
 
 - **Context Management**: Named slots for organizing context, slot-based composition, prefix caching optimization
-- **Built-in Tools**: Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent, TaskOutput
+- **Built-in Tools**: Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent, TaskOutput (auto-registered, disable via `disableTools` config)
 - **Tool Permissions**: Per-tool permission modes (off/ask/always_allow), pre-execution callbacks
 - **Compaction**: Three-layer strategy (microcompaction, conversation summarization, emergency truncation)
 - **Skills**: Progressive disclosure system (advertise/load/use), SKILL.md format, dynamic context injection
@@ -122,6 +122,7 @@ Detailed documentation lives in `/docs/cortex/`. Use `/doc-explorer <topic>` to 
 
 ### Key Docs
 
+- **Product Vision**: `docs/cortex/product-vision.md` (why Cortex exists, core insight, design principles)
 - **Architecture**: `docs/cortex/cortex-architecture.md` (core design, exports, patterns)
 - **Context**: `docs/cortex/context-manager.md` (slots, prefix caching, ephemeral context)
 - **Compaction**: `docs/cortex/compaction-strategy.md` (three-layer strategy, token tracking)

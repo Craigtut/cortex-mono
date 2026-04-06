@@ -9,6 +9,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
+    "dev": "tsc --build --watch packages/cortex packages/cortex-code",
     "test": "vitest",
     "test:run": "vitest run",
     "typecheck": "tsc --noEmit",

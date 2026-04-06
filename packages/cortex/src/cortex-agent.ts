@@ -34,10 +34,21 @@ import { SubAgentManager } from './sub-agent-manager.js';
 import { SkillRegistry } from './skill-registry.js';
 import { createLoadSkillTool, buildLoadSkillDescription, LOAD_SKILL_TOOL_NAME } from './skill-tool.js';
 import { createSubAgentTool, SUB_AGENT_TOOL_NAME } from './tools/sub-agent.js';
+import { createReadTool } from './tools/read.js';
+import { createWriteTool } from './tools/write.js';
+import { createEditTool } from './tools/edit.js';
+import { createGlobTool } from './tools/glob.js';
+import { createGrepTool } from './tools/grep.js';
+import { createBashTool } from './tools/bash/index.js';
+import { createTaskOutputTool } from './tools/task-output.js';
+import { createWebFetchTool } from './tools/web-fetch/index.js';
+import { TOOL_NAMES } from './tools/index.js';
 import { wrapModel, unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime } from './tools/runtime.js';
+import { NOOP_LOGGER } from './noop-logger.js';
 import type {
+  CortexLogger,
   CortexAgentConfig,
   CortexLifecycleState,
   CortexUsage,
@@ -271,6 +282,7 @@ export class CortexAgent {
   private readonly eventBridge: EventBridge;
   private readonly budgetGuard: BudgetGuard;
   private readonly config: CortexAgentConfig;
+  private readonly logger: CortexLogger;
   private readonly workingTagsEnabled: boolean;
   private readonly workingDirectory: string;
   private readonly envOverrides: Record<string, string> | undefined;
@@ -312,6 +324,8 @@ export class CortexAgent {
   private subAgentSpawnedHandlers: Array<(taskId: string, instructions: string) => void> = [];
   private subAgentCompletedHandlers: Array<(taskId: string, result: string, status: string, usage: unknown) => void> = [];
   private subAgentFailedHandlers: Array<(taskId: string, error: string) => void> = [];
+  private backgroundResultDeliveryHandlers: Array<(taskIds: string[]) => void> = [];
+  private pendingBackgroundResults: Array<{ taskId: string; result: SubAgentResult }> = [];
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -374,6 +388,7 @@ export class CortexAgent {
   ) {
     this.agent = agent;
     this.config = config;
+    this.logger = config.logger ?? NOOP_LOGGER;
     this.workingTagsEnabled = config.workingTags?.enabled ?? true;
     this.workingDirectory = config.workingDirectory;
     this.envOverrides = config.envOverrides;
@@ -388,7 +403,10 @@ export class CortexAgent {
     this.primaryPiModel = primaryPiModel;
     this.resolvedUtilityModel = utilityModel;
     this.resolvedUtilityPiModel = utilityPiModel;
-    this.registeredTools = this.normalizeRegisteredTools(tools ?? []);
+    // Auto-register built-in tools, filtered by disableTools config
+    const disabledSet = new Set(config.disableTools ?? []);
+    const builtinTools = this.createBuiltinTools(disabledSet);
+    this.registeredTools = this.normalizeRegisteredTools([...builtinTools, ...(tools ?? [])]);
     (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
 
     // Set up ContextManager
@@ -397,7 +415,7 @@ export class CortexAgent {
     });
 
     // Set up EventBridge
-    this.eventBridge = new EventBridge(this.workingTagsEnabled);
+    this.eventBridge = new EventBridge(this.workingTagsEnabled, this.logger);
     this.eventBridge.wire(agent);
 
     // Wire internal event handlers
@@ -414,11 +432,13 @@ export class CortexAgent {
     this.budgetGuard = new BudgetGuard(
       budgetGuardConfig,
       () => this.agent.abort(),
+      this.logger,
     );
     this.budgetGuard.wire(this.eventBridge);
 
     // Set up MCP Client Manager with PID tracking and env overrides
     this.mcpClientManager = new McpClientManager();
+    this.mcpClientManager.logger = this.logger;
     this.mcpClientManager.onSubprocessSpawned = (pid) => {
       this.trackPid(pid);
     };
@@ -484,6 +504,7 @@ export class CortexAgent {
       compactionConfig,
       (config.slots ?? []).length,
     );
+    this.compactionManager.setLogger(this.logger);
 
     // Apply context window limit from config and model
     this._contextWindowLimit = config.contextWindowLimit ?? null;
@@ -555,6 +576,15 @@ export class CortexAgent {
 
     try {
       const result = await this.agent.prompt(input);
+
+      // Pi-agent-core catches streaming/provider errors internally and stores
+      // them in state.error without re-throwing. Surface these so Cortex's
+      // error classification and consumer error handlers can process them.
+      const agentState = this.agent.state as Record<string, unknown>;
+      if (agentState['error']) {
+        throw new Error(String(agentState['error']));
+      }
+
       return result;
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
@@ -576,14 +606,21 @@ export class CortexAgent {
       for (const handler of this.errorHandlers) {
         try {
           handler(classified);
-        } catch {
-          // Swallow handler errors to prevent cascading failures
+        } catch (err) {
+          this.logger.error('[CortexAgent] onError handler threw', {
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
 
       throw error;
     } finally {
       this._isPrompting = false;
+
+      // Deliver any background sub-agent results that arrived while prompting.
+      // This re-enters prompt() before the consumer's await resolves, keeping
+      // the consumer's UI state consistent.
+      await this.drainPendingBackgroundResults();
     }
   }
 
@@ -847,6 +884,9 @@ export class CortexAgent {
       const resolver = cortexConfig.resolvePermission;
       agentConfig['beforeToolCall'] = async (ctx: unknown) => {
         const { toolCall, args } = ctx as { toolCall: { name: string }; args: unknown };
+        // Spawning a sub-agent is an internal orchestration decision, not a
+        // side-effecting operation. Always allow without prompting.
+        if (toolCall.name === SUB_AGENT_TOOL_NAME) return undefined;
         const resolution = await resolver(toolCall.name, args);
         const decision = CortexAgent.normalizePermissionDecision(resolution);
         if (decision.decision !== 'allow') {
@@ -1025,7 +1065,12 @@ export class CortexAgent {
    * @throws Error if pi-agent-core or pi-ai is not installed
    */
   static async create(config: CortexAgentConfig & {
-    /** Tools to register with the agent. Each must have name, description, parameters, execute. */
+    /**
+     * Additional consumer-provided tools to register alongside the built-in tools.
+     * Built-in tools (Read, Write, Edit, Glob, Grep, Bash, WebFetch, TaskOutput)
+     * are registered automatically. Use `disableTools` on CortexAgentConfig to
+     * exclude specific built-in tools.
+     */
     tools?: RegisteredTool[];
     /** @deprecated Use initialBasePrompt instead. */
     systemPrompt?: string;
@@ -1591,6 +1636,15 @@ export class CortexAgent {
   }
 
   /**
+   * Register a handler that fires when background sub-agent results are about
+   * to be delivered to the parent agent, restarting its agentic loop.
+   * Consumers can use this to update UI state (show spinners, etc.).
+   */
+  onBackgroundResultDelivery(handler: (taskIds: string[]) => void): void {
+    this.backgroundResultDeliveryHandlers.push(handler);
+  }
+
+  /**
    * Get the EventBridge for direct event access.
    * Consumers that need raw event data (for logging) can subscribe directly.
    */
@@ -2027,6 +2081,42 @@ export class CortexAgent {
   // -----------------------------------------------------------------------
 
   /**
+   * Create built-in tool instances, excluding any in the disabled set.
+   */
+  private createBuiltinTools(disabled: Set<string>): RegisteredTool[] {
+    const tools: RegisteredTool[] = [];
+    const cwd = this.workingDirectory;
+    const runtime = this.toolRuntime;
+
+    if (!disabled.has(TOOL_NAMES.Read)) {
+      tools.push(createReadTool({ runtime }) as RegisteredTool);
+    }
+    if (!disabled.has(TOOL_NAMES.Write)) {
+      tools.push(createWriteTool({ runtime }) as RegisteredTool);
+    }
+    if (!disabled.has(TOOL_NAMES.Edit)) {
+      tools.push(createEditTool({ runtime }) as RegisteredTool);
+    }
+    if (!disabled.has(TOOL_NAMES.Glob)) {
+      tools.push(createGlobTool({ defaultCwd: cwd }) as RegisteredTool);
+    }
+    if (!disabled.has(TOOL_NAMES.Grep)) {
+      tools.push(createGrepTool({ defaultCwd: cwd }) as RegisteredTool);
+    }
+    if (!disabled.has(TOOL_NAMES.Bash)) {
+      tools.push(createBashTool({ runtime }) as RegisteredTool);
+    }
+    if (!disabled.has(TOOL_NAMES.TaskOutput)) {
+      tools.push(createTaskOutputTool() as RegisteredTool);
+    }
+    if (!disabled.has(TOOL_NAMES.WebFetch)) {
+      tools.push(createWebFetchTool({ runtime }) as RegisteredTool);
+    }
+
+    return tools;
+  }
+
+  /**
    * Normalize built-in tool instances so this agent owns fresh mutable state.
    */
   private normalizeRegisteredTools(tools: RegisteredTool[]): RegisteredTool[] {
@@ -2176,8 +2266,10 @@ export class CortexAgent {
         for (const handler of this.loopCompleteHandlers) {
           try {
             handler();
-          } catch {
-            // Swallow handler errors
+          } catch (err) {
+            this.logger.error('[CortexAgent] onLoopComplete handler threw', {
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       }),
@@ -2195,20 +2287,28 @@ export class CortexAgent {
         if (inputTokens > 0) {
           this.compactionManager.updateTokenCount(inputTokens);
         }
-        // Debug: always log extraction result and event structure
+        // Debug: log extraction result and event structure
         if (event.data && typeof event.data === 'object') {
           const d = event.data as Record<string, unknown>;
           const msg = d['message'] as Record<string, unknown> | undefined;
           const usage = msg?.['usage'] as Record<string, unknown> | undefined;
-          this.compactionManager._debugLog?.(`turn_end: extracted=${inputTokens}, raw.input=${usage?.['input']}, raw.cacheRead=${usage?.['cacheRead']}, raw.output=${usage?.['output']}, raw.totalTokens=${usage?.['totalTokens']}`);
+          this.logger.debug('[CortexAgent] turn_end token extraction', {
+            extracted: inputTokens,
+            rawInput: usage?.['input'],
+            rawCacheRead: usage?.['cacheRead'],
+            rawOutput: usage?.['output'],
+            rawTotalTokens: usage?.['totalTokens'],
+          });
         }
 
         if (event.textOutput) {
           for (const handler of this.turnCompleteHandlers) {
             try {
               handler(event.textOutput);
-            } catch {
-              // Swallow handler errors
+            } catch (err) {
+              this.logger.error('[CortexAgent] onTurnComplete handler threw', {
+                error: err instanceof Error ? err.message : String(err),
+              });
             }
           }
         } else {
@@ -2220,8 +2320,10 @@ export class CortexAgent {
             for (const handler of this.turnCompleteHandlers) {
               try {
                 handler(output);
-              } catch {
-                // Swallow handler errors
+              } catch (err) {
+                this.logger.error('[CortexAgent] onTurnComplete handler threw', {
+                  error: err instanceof Error ? err.message : String(err),
+                });
               }
             }
           }
@@ -2528,6 +2630,8 @@ export class CortexAgent {
     this.subAgentSpawnedHandlers = [];
     this.subAgentCompletedHandlers = [];
     this.subAgentFailedHandlers = [];
+    this.backgroundResultDeliveryHandlers = [];
+    this.pendingBackgroundResults = [];
   }
 
   /**
@@ -2726,8 +2830,11 @@ export class CortexAgent {
         for (const handler of this.subAgentSpawnedHandlers) {
           try {
             handler(taskId, instructions);
-          } catch {
-            // Swallow handler errors
+          } catch (err) {
+            this.logger.error('[CortexAgent] onSubAgentSpawned handler threw', {
+              taskId,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       },
@@ -2735,8 +2842,11 @@ export class CortexAgent {
         for (const handler of this.subAgentCompletedHandlers) {
           try {
             handler(taskId, result, status, usage);
-          } catch {
-            // Swallow handler errors
+          } catch (err) {
+            this.logger.error('[CortexAgent] onSubAgentCompleted handler threw', {
+              taskId,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       },
@@ -2744,8 +2854,11 @@ export class CortexAgent {
         for (const handler of this.subAgentFailedHandlers) {
           try {
             handler(taskId, error);
-          } catch {
-            // Swallow handler errors
+          } catch (err) {
+            this.logger.error('[CortexAgent] onSubAgentFailed handler threw', {
+              taskId,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       },
@@ -2852,12 +2965,95 @@ export class CortexAgent {
       throw new Error('Concurrency limit reached');
     }
 
-    // Run the sub-agent in the background (fire-and-forget)
-    this.runSubAgent(childAgent, params.instructions, taskId, startTime).catch((err) => {
-      this.subAgentManager.fail(taskId, err instanceof Error ? err.message : String(err));
-    });
+    // Run the sub-agent in the background. When it completes, deliver the
+    // result back to the parent agent and restart its agentic loop.
+    this.runSubAgent(childAgent, params.instructions, taskId, startTime)
+      .then((result) => this.handleBackgroundCompletion(taskId, result))
+      .catch((err) => {
+        this.subAgentManager.fail(taskId, err instanceof Error ? err.message : String(err));
+      });
 
     return { taskId };
+  }
+
+  /**
+   * Handle a background sub-agent completing. If the parent is currently
+   * prompting, queue the result for delivery after the current loop. If
+   * the parent is idle, deliver immediately by restarting the agentic loop.
+   */
+  private async handleBackgroundCompletion(
+    taskId: string,
+    result: SubAgentResult,
+  ): Promise<void> {
+    if (this._isPrompting) {
+      // Parent is in its agentic loop; queue for delivery when it finishes
+      this.pendingBackgroundResults.push({ taskId, result });
+      return;
+    }
+
+    // Parent is idle; deliver immediately by restarting the loop
+    const message = this.formatBackgroundResult(taskId, result);
+    this.fireBackgroundResultDeliveryHandlers([taskId]);
+    try {
+      await this.prompt(message);
+    } catch (err) {
+      // Emit through error handlers; there is no consumer-level caller to catch
+      const classified = classifyError(
+        err instanceof Error ? err : new Error(String(err)),
+        { wasAborted: this.isAborted() },
+      );
+      for (const handler of this.errorHandlers) {
+        try {
+          handler(classified);
+        } catch (err) {
+          this.logger.error('[CortexAgent] onError handler threw', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Drain all pending background sub-agent results by restarting the
+   * agentic loop with a combined message. Called at the end of prompt().
+   */
+  private async drainPendingBackgroundResults(): Promise<void> {
+    if (this.pendingBackgroundResults.length === 0) return;
+
+    const pending = this.pendingBackgroundResults.splice(0);
+    const parts = pending.map(p => this.formatBackgroundResult(p.taskId, p.result));
+    const message = parts.join('\n\n---\n\n');
+    const taskIds = pending.map(p => p.taskId);
+
+    this.fireBackgroundResultDeliveryHandlers(taskIds);
+    // Re-enters prompt(), which will drain again if more arrive
+    await this.prompt(message);
+  }
+
+  private formatBackgroundResult(taskId: string, result: SubAgentResult): string {
+    const header = result.status === 'completed'
+      ? `[Background sub-agent ${taskId} completed]`
+      : `[Background sub-agent ${taskId} failed]`;
+
+    const usage = `(${result.usage.turns} turns, $${result.usage.cost.toFixed(4)}, ${(result.usage.durationMs / 1000).toFixed(1)}s)`;
+
+    if (result.output) {
+      return `${header} ${usage}\n\n${result.output}`;
+    }
+    return `${header} ${usage}\n\nNo output was produced.`;
+  }
+
+  private fireBackgroundResultDeliveryHandlers(taskIds: string[]): void {
+    for (const handler of this.backgroundResultDeliveryHandlers) {
+      try {
+        handler(taskIds);
+      } catch (err) {
+        this.logger.error('[CortexAgent] onBackgroundResultDelivery handler threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   private async createChildAgent(params: {
@@ -2878,6 +3074,7 @@ export class CortexAgent {
         maxCost: childConfig.maxCost,
       },
       contextWindowLimit: this._contextWindowLimit,
+      logger: this.config.logger,
     };
     if (this.envOverrides) childCortexConfig.envOverrides = this.envOverrides;
     if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
@@ -2936,10 +3133,15 @@ export class CortexAgent {
     startTime: number,
   ): Promise<SubAgentResult> {
     try {
-      const response = await childAgent.prompt(instructions);
+      await childAgent.prompt(instructions);
 
-      // Extract text from response
-      const output = this.extractTextFromAssistantMessage(response);
+      // prompt() returns void; extract the last assistant message from
+      // the child's conversation history.
+      const history = childAgent.getConversationHistory();
+      const lastAssistant = [...history].reverse().find(
+        m => (m as unknown as Record<string, unknown>)['role'] === 'assistant',
+      );
+      const output = this.extractTextFromAssistantMessage(lastAssistant);
 
       const result: SubAgentResult = {
         output,
@@ -2948,6 +3150,7 @@ export class CortexAgent {
           turns: childAgent.getBudgetGuard().getTurnCount(),
           cost: childAgent.getBudgetGuard().getTotalCost(),
           durationMs: Date.now() - startTime,
+          totalTokens: childAgent.sessionTokenCount,
         },
       };
 
@@ -2971,6 +3174,7 @@ export class CortexAgent {
           turns: childAgent.getBudgetGuard().getTurnCount(),
           cost: childAgent.getBudgetGuard().getTotalCost(),
           durationMs: Date.now() - startTime,
+          totalTokens: childAgent.sessionTokenCount,
         },
       };
 

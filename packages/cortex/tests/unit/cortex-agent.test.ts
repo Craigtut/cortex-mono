@@ -1013,24 +1013,25 @@ You have 12 emotions.`;
       const setToolsFn = vi.fn();
       (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
 
-      const builtInTools = [
-        { name: 'Read', description: 'read', parameters: {}, execute: async () => 'ok' },
-      ];
       const agent = createTestCortexAgent(
         piAgent,
         config,
-        builtInTools,
+        [], // No additional tools; built-in tools auto-register
         { enableSubAgentTool: false, enableLoadSkillTool: false },
       );
       setToolsFn.mockClear();
 
-      // refreshTools merges built-in with MCP tools (empty in this test)
+      // refreshTools merges auto-registered built-in tools with MCP tools (empty in this test)
       agent.refreshTools();
 
       expect(setToolsFn).toHaveBeenCalledOnce();
       const allTools = setToolsFn.mock.calls[0]![0];
-      expect(allTools.length).toBe(1);
-      expect(allTools[0].name).toBe('Read');
+      // 8 built-in tools auto-registered: Read, Write, Edit, Glob, Grep, Bash, TaskOutput, WebFetch
+      expect(allTools.length).toBe(8);
+      const toolNames = allTools.map((t: { name: string }) => t.name);
+      expect(toolNames).toContain('Read');
+      expect(toolNames).toContain('Bash');
+      expect(toolNames).toContain('Glob');
     });
 
     it('does not throw when agent lacks setTools', () => {
