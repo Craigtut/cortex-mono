@@ -350,39 +350,45 @@ export class Session {
       }
     });
 
-    // Tool call lifecycle
+    // Tool call lifecycle (uses typed payloads from EventBridge)
     bridge.on('tool_call_start', (event: CortexEvent) => {
-      const data = event.data as Record<string, unknown> | undefined;
-      const toolCallId = String(data?.['toolCallId'] ?? data?.['id'] ?? Math.random());
-      const toolName = String(data?.['toolName'] ?? data?.['name'] ?? 'unknown');
-      const args = data?.['args'] ?? data?.['input'] ?? {};
-      const argsSummary = this.summarizeToolArgs(toolName, args);
+      // Skip child agent tool events (they flow through but we don't render them as top-level tools)
+      if (event.childTaskId) return;
 
-      // Child agent tool calls update the SubAgentComponent's activity line
-      if (event.childTaskId) {
-        this.app!.transcript.updateSubAgentActivity(event.childTaskId, toolName, argsSummary);
-        return;
+      const p = event.payload as import('@animus-labs/cortex').ToolCallStartPayload | undefined;
+      const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? Math.random());
+      const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
+      const args = p?.args ?? ((event.data as Record<string, unknown> | undefined)?.['args'] as Record<string, unknown> ?? {});
+
+      this.app!.transcript.startToolCall(toolCallId, toolName, args);
+    });
+
+    // Streaming tool updates (bash output, etc.)
+    bridge.on('tool_call_update', (event: CortexEvent) => {
+      if (event.childTaskId) return;
+
+      const p = event.payload as import('@animus-labs/cortex').ToolCallUpdatePayload | undefined;
+      const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
+      const partialResult = p?.partialResult ?? (event.data as Record<string, unknown> | undefined)?.['partialResult'];
+
+      if (partialResult) {
+        this.app!.transcript.updateToolCall(toolCallId, partialResult);
       }
-
-      this.app!.transcript.startToolCall(toolCallId, toolName, argsSummary);
     });
 
     bridge.on('tool_call_end', (event: CortexEvent) => {
-      // Child agent tool_call_end events are handled via the activity line;
-      // don't create/complete parent tool call components for them.
       if (event.childTaskId) return;
 
-      const data = event.data as Record<string, unknown> | undefined;
-      const toolCallId = String(data?.['toolCallId'] ?? data?.['id'] ?? '');
-      const error = data?.['error'] as string | undefined;
-      const rawResult = data?.['result'] ?? data?.['output'] ?? '';
-      const result = this.extractToolResultText(rawResult);
-      const durationMs = Number(data?.['durationMs'] ?? data?.['duration'] ?? 0);
+      const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
+      const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
+      const durationMs = p?.durationMs ?? Number((event.data as Record<string, unknown> | undefined)?.['durationMs'] ?? 0);
 
-      if (error) {
-        this.app!.transcript.failToolCall(toolCallId, typeof error === 'string' ? error : this.extractToolResultText(error), durationMs);
+      if (p?.isError && p.error) {
+        this.app!.transcript.failToolCall(toolCallId, p.error, durationMs);
       } else {
-        this.app!.transcript.completeToolCall(toolCallId, result, durationMs);
+        const result = p?.result ?? (event.data as Record<string, unknown> | undefined)?.['result'];
+        const details = (result as Record<string, unknown> | undefined)?.['details'];
+        this.app!.transcript.completeToolCall(toolCallId, result, details, durationMs);
       }
     });
 
@@ -466,24 +472,30 @@ export class Session {
       );
     });
 
-    // Sub-agent events with tree display
-    this.agent.onSubAgentSpawned((taskId, instructions) => {
-      this.app!.transcript.startSubAgent(taskId, instructions);
+    // Sub-agent events: rendered as tool calls via the SubAgent renderer
+    this.agent.onSubAgentSpawned((taskId, instructions, background) => {
+      this.app!.transcript.startToolCall(taskId, 'SubAgent', {
+        instructions,
+        background,
+      });
     });
 
     this.agent.onSubAgentCompleted((taskId, result, _status, usage) => {
       const u = typeof usage === 'object' && usage !== null
         ? usage as Record<string, unknown>
         : {};
-      this.app!.transcript.completeSubAgent(taskId, result, {
-        tokenCount: Number(u['totalTokens'] ?? 0),
+      this.app!.transcript.completeToolCall(taskId, result, {
+        background: true,
+        turns: Number(u['turns'] ?? 0),
         durationMs: Number(u['durationMs'] ?? 0),
         cost: Number(u['cost'] ?? 0),
-      });
+        status: _status,
+        toolCalls: (u as Record<string, unknown>)['toolCalls'],
+      }, Number(u['durationMs'] ?? 0));
     });
 
     this.agent.onSubAgentFailed((taskId, error) => {
-      this.app!.transcript.failSubAgent(taskId, error);
+      this.app!.transcript.failToolCall(taskId, error, 0);
     });
 
     // Background sub-agent result delivery: Cortex restarts the agentic loop
@@ -615,6 +627,12 @@ export class Session {
       saved.history as Parameters<typeof this.agent.restoreConversationHistory>[0],
     );
     this.createdAt = saved.meta.createdAt;
+
+    // Restore accumulated usage (cost, turns, tokens) from the saved session
+    if (saved.meta.usage) {
+      this.agent.restoreSessionUsage(saved.meta.usage);
+    }
+
     this.app?.transcript.addNotification(
       'Session Resumed',
       `Restored ${saved.history.length} messages from previous session`,
@@ -700,7 +718,7 @@ export class Session {
   }
 
   private buildSessionMeta(): SessionMeta {
-    return {
+    const meta: SessionMeta = {
       id: this.sessionId,
       mode: this.mode.name,
       provider: this.provider,
@@ -710,6 +728,10 @@ export class Session {
       updatedAt: Date.now(),
       tokenCount: this.agent?.sessionTokenCount ?? 0,
     };
+    if (this.agent) {
+      meta.usage = this.agent.getSessionUsage();
+    }
+    return meta;
   }
 
   private async getGitBranch(): Promise<string> {

@@ -8,6 +8,7 @@ export interface CustomEditorCallbacks {
   onExit: () => void;
   onExitHint: () => void;
   onToggleExpand: () => void;
+  onToggleExpandAll: () => void;
 }
 
 /**
@@ -88,7 +89,13 @@ export class CustomEditor extends Editor {
       }
     }
 
-    // Ctrl+E: toggle tool result expansion
+    // Ctrl+Shift+E: toggle all tool results expansion
+    if (matchesKey(data, Key.ctrlShift('e'))) {
+      this.callbacks.onToggleExpandAll();
+      return;
+    }
+
+    // Ctrl+E: toggle most recent tool result expansion
     if (matchesKey(data, Key.ctrl('e'))) {
       this.callbacks.onToggleExpand();
       return;

@@ -1,8 +1,17 @@
 import { Container, Text, Markdown, Spacer } from '@mariozechner/pi-tui';
 import type { TUI } from '@mariozechner/pi-tui';
 import { colors, markdownTheme } from './theme.js';
-import { ToolCallComponent } from './tool-display.js';
-import { SubAgentComponent } from './sub-agent-display.js';
+import { ToolExecutionComponent } from './renderers/tool-execution.js';
+// Import renderers to trigger their self-registration with the registry
+import './renderers/read-renderer.js';
+import './renderers/edit-renderer.js';
+import './renderers/write-renderer.js';
+import './renderers/bash-renderer.js';
+import './renderers/grep-renderer.js';
+import './renderers/glob-renderer.js';
+import './renderers/web-fetch-renderer.js';
+import './renderers/sub-agent-renderer.js';
+import './renderers/task-output-renderer.js';
 import type { PermissionPromptComponent } from './permissions.js';
 
 /**
@@ -19,9 +28,7 @@ export class TranscriptManager {
   /** Accumulated text for the current streaming assistant message. */
   private currentAssistantText = '';
   /** Map of active tool call components by tool call ID. */
-  private toolCalls = new Map<string, ToolCallComponent>();
-  /** Map of active sub-agent components by task ID. */
-  private subAgents = new Map<string, SubAgentComponent>();
+  private toolCalls = new Map<string, ToolExecutionComponent>();
   /** Throttle renders to avoid overwhelming the terminal during rapid events. */
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRenderTime = 0;
@@ -34,27 +41,23 @@ export class TranscriptManager {
 
   /**
    * Request a TUI render, throttled to avoid flooding the terminal with output
-   * during rapid event bursts (tool calls, streaming chunks). This prevents
-   * the terminal from force-scrolling to the bottom on every event.
+   * during rapid event bursts (tool calls, streaming chunks).
    */
   private throttledRender(): void {
     const now = Date.now();
     const elapsed = now - this.lastRenderTime;
 
     if (elapsed >= TranscriptManager.MIN_RENDER_INTERVAL_MS) {
-      // Enough time has passed, render immediately
       this.lastRenderTime = now;
-      this.throttledRender();
+      this.tui.requestRender();
     } else if (!this.renderTimer) {
-      // Schedule a render for when the throttle window expires
       const delay = TranscriptManager.MIN_RENDER_INTERVAL_MS - elapsed;
       this.renderTimer = setTimeout(() => {
         this.renderTimer = null;
         this.lastRenderTime = Date.now();
-        this.throttledRender();
+        this.tui.requestRender();
       }, delay);
     }
-    // If a timer is already pending, skip (the pending render will pick up all changes)
   }
 
   /** Force an immediate render (for user-initiated actions like submit). */
@@ -64,16 +67,13 @@ export class TranscriptManager {
       this.renderTimer = null;
     }
     this.lastRenderTime = Date.now();
-    this.throttledRender();
+    this.tui.requestRender();
   }
 
   /** Add the startup banner to the transcript. */
   addBanner(version: string, project: string, branch: string): void {
     this.chatContainer.addChild(new Spacer(1));
 
-    // Each line as its own Text component to prevent word-wrapping from breaking alignment.
-    // Block characters (U+2588 etc.) are full-width in some terminals, so each line
-    // must render independently.
     const artLines = [
       '   ██████╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗',
       '  ██╔════╝██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝',
@@ -117,10 +117,7 @@ export class TranscriptManager {
       this.startAssistantMessage();
     }
     this.currentAssistantText += chunk;
-    // Full re-render with accumulated text.
-    // Pi-tui's differential renderer only redraws changed lines.
     this.currentAssistantMarkdown!.setText(this.currentAssistantText);
-    // Request a TUI render so the update is visible immediately
     this.throttledRender();
   }
 
@@ -134,33 +131,35 @@ export class TranscriptManager {
   }
 
   /**
-   * Start a tool call display.
-   * Freezes the current assistant message and adds the tool call inline.
+   * Start a tool call display with per-tool rendering.
+   * Freezes the current assistant message and adds the tool execution inline.
    */
-  startToolCall(toolCallId: string, toolName: string, argsSummary: string): void {
-    // SubAgent tool calls are displayed via the SubAgentComponent (Agent line),
-    // not as a separate tool call line. Skip rendering to avoid duplication.
-    if (toolName === 'SubAgent') return;
-
+  startToolCall(toolCallId: string, toolName: string, args: Record<string, unknown>): void {
     // Freeze current assistant message (Mastra Code pattern)
     this.freezeCurrentAssistant();
 
-    const toolComponent = new ToolCallComponent(this.tui, toolName, argsSummary);
+    const toolComponent = new ToolExecutionComponent(toolName);
+    toolComponent.start(args);
     this.toolCalls.set(toolCallId, toolComponent);
     this.chatContainer.addChild(toolComponent);
     this.throttledRender();
   }
 
-  /** Complete a tool call with its result. */
-  completeToolCall(toolCallId: string, result: string, durationMs: number): void {
+  /** Update a tool call with streaming partial result. */
+  updateToolCall(toolCallId: string, partialResult: unknown): void {
     const tc = this.toolCalls.get(toolCallId);
     if (tc) {
-      tc.complete(result, durationMs);
+      tc.streamUpdate(partialResult);
+      this.throttledRender();
     }
-    // Reset assistant tracking. The next appendAssistantChunk() will
-    // lazily create a new Markdown component only when text arrives.
-    // This avoids adding empty components that grow the tree and
-    // cause unnecessary terminal scrolling.
+  }
+
+  /** Complete a tool call with its result. */
+  completeToolCall(toolCallId: string, result: unknown, details: unknown, durationMs: number): void {
+    const tc = this.toolCalls.get(toolCallId);
+    if (tc) {
+      tc.complete(result, details, durationMs);
+    }
     this.currentAssistantText = '';
     this.currentAssistantMarkdown = null;
     this.throttledRender();
@@ -172,47 +171,9 @@ export class TranscriptManager {
     if (tc) {
       tc.fail(error, durationMs);
     }
-    // Reset assistant tracking (lazy creation on next chunk).
     this.currentAssistantText = '';
     this.currentAssistantMarkdown = null;
     this.throttledRender();
-  }
-
-  /** Start a sub-agent display with tree-drawing characters. */
-  startSubAgent(taskId: string, description: string): void {
-    this.freezeCurrentAssistant();
-    const component = new SubAgentComponent(this.tui, taskId, description);
-    this.subAgents.set(taskId, component);
-    this.chatContainer.addChild(component);
-  }
-
-  /** Complete a sub-agent with its result and usage stats. */
-  completeSubAgent(
-    taskId: string,
-    result: string,
-    usage: { tokenCount: number; durationMs: number; cost: number },
-  ): void {
-    const sa = this.subAgents.get(taskId);
-    if (sa) {
-      sa.complete(result, usage);
-    }
-  }
-
-  /** Fail a sub-agent. */
-  failSubAgent(taskId: string, error: string): void {
-    const sa = this.subAgents.get(taskId);
-    if (sa) {
-      sa.fail(error);
-    }
-  }
-
-  /** Update a sub-agent's current activity (live tool status). */
-  updateSubAgentActivity(taskId: string, toolName: string, summary: string): void {
-    const sa = this.subAgents.get(taskId);
-    if (sa) {
-      sa.setActivity(toolName, summary);
-      this.throttledRender();
-    }
   }
 
   /** Add a system notification (compaction, error, etc.). */
@@ -234,12 +195,21 @@ export class TranscriptManager {
     this.chatContainer.removeChild(prompt);
   }
 
-  /** Toggle global expand/collapse for all tool results. */
-  toggleGlobalExpand(): void {
-    ToolCallComponent.globalExpanded = !ToolCallComponent.globalExpanded;
-    for (const tc of this.toolCalls.values()) {
-      tc.setExpanded(ToolCallComponent.globalExpanded);
+  /** Toggle expand/collapse for the most recent tool (Ctrl+E). */
+  toggleExpand(): void {
+    const lastFocused = ToolExecutionComponent.lastFocused;
+    if (lastFocused) {
+      lastFocused.toggleExpand();
+      this.tui.requestRender();
     }
+  }
+
+  /** Toggle expand/collapse for all tool results (Ctrl+Shift+E). */
+  toggleExpandAll(): void {
+    for (const tc of this.toolCalls.values()) {
+      tc.toggleExpand();
+    }
+    this.tui.requestRender();
   }
 
   /** Clear the transcript. */
@@ -248,14 +218,11 @@ export class TranscriptManager {
     this.currentAssistantMarkdown = null;
     this.currentAssistantText = '';
     this.toolCalls.clear();
-    this.subAgents.clear();
   }
 
   /** Freeze the current assistant message (stop updating it). */
   private freezeCurrentAssistant(): void {
     if (this.currentAssistantMarkdown) {
-      // The Markdown component stays in the container with its last content.
-      // We just stop tracking it so new text goes to a new component.
       this.currentAssistantMarkdown = null;
       this.currentAssistantText = '';
     }
@@ -264,7 +231,6 @@ export class TranscriptManager {
   /** Finalize and detach the current assistant message. */
   private finalizeCurrentAssistant(): void {
     if (this.currentAssistantMarkdown) {
-      // Remove empty trailing markdown components
       if (!this.currentAssistantText.trim()) {
         this.chatContainer.removeChild(this.currentAssistantMarkdown);
       } else {

@@ -51,7 +51,8 @@ export class App {
       onAbort: callbacks.onAbort,
       onExit: callbacks.onExit,
       onExitHint: () => this.statusBar.showHint('Press Ctrl+C again to exit', 500),
-      onToggleExpand: () => this.transcript.toggleGlobalExpand(),
+      onToggleExpand: () => this.transcript.toggleExpand(),
+      onToggleExpandAll: () => this.transcript.toggleExpandAll(),
     };
     this.editor = new CustomEditor(this.tui, editorTheme, editorCallbacks, cwd);
 
