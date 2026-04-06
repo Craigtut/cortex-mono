@@ -468,7 +468,8 @@ export class ProviderManager implements IProviderManager {
     }
 
     const rawCredentials = JSON.parse(credentials) as Record<string, unknown>;
-    const credMap = { [provider]: { type: 'oauth' as const, ...rawCredentials } };
+    // Security: spread rawCredentials first so Cortex-owned 'type' cannot be overridden
+    const credMap = { [provider]: { ...rawCredentials, type: 'oauth' as const } };
 
     const result = await (getOAuthApiKeyFn as (
       provider: string,

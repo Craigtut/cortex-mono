@@ -23,15 +23,20 @@ import {
   type ClassifiedError,
   type CompactionResult,
   type ThinkingLevel,
+  type McpStdioConfig,
   stripWorkingTags,
 } from '@animus-labs/cortex';
+import { SelectList, type SelectItem } from '@mariozechner/pi-tui';
 import { App, type AppCallbacks } from './tui/app.js';
+import { selectListTheme } from './tui/theme.js';
+import { OverlayBox } from './tui/overlay-box.js';
 import { type CortexCodeConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { PermissionRuleManager } from './permissions/rules.js';
 import { discoverProjectContext } from './discovery/context.js';
 import { discoverSkills } from './discovery/skills.js';
 import { discoverMcpServers } from './discovery/mcp.js';
+import { checkProjectMcpTrust, trustProjectMcpConfig } from './discovery/mcp-trust.js';
 import {
   generateSessionId,
   createDebouncedSaver,
@@ -147,18 +152,8 @@ export class Session {
     // Wire events
     this.wireEvents();
 
-    // Connect MCP servers
-    const mcpServers = await discoverMcpServers(this.cwd);
-    for (const server of mcpServers) {
-      try {
-        await this.agent.connectMcpServer(server.name, server.config);
-      } catch (err) {
-        this.app.transcript.addNotification(
-          'MCP Error',
-          `Failed to connect "${server.name}": ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
+    // Connect MCP servers (with trust-on-first-use for project-local configs)
+    await this.connectMcpServersWithTrust();
 
     // Register skills
     const skills = await discoverSkills(this.cwd);
@@ -241,6 +236,89 @@ export class Session {
       this.isRunning = false;
       this.app!.hideStatusSpinner();
       this.app!.focusEditor();
+    }
+  }
+
+  /**
+   * Discover and connect MCP servers, applying trust-on-first-use for
+   * project-local configs. Global servers (~/.cortex/mcp.json) connect
+   * immediately. Project servers require user approval if the config
+   * is new or has changed since last approval.
+   */
+  private async connectMcpServersWithTrust(): Promise<void> {
+    const allServers = await discoverMcpServers(this.cwd);
+    const globalServers = allServers.filter(s => s.source === 'global');
+    const projectServers = allServers.filter(s => s.source === 'project');
+
+    // Global servers are always trusted
+    for (const server of globalServers) {
+      await this.connectMcpServer(server);
+    }
+
+    // No project servers: nothing to trust-check
+    if (projectServers.length === 0) return;
+
+    // Check if the project MCP config is trusted
+    const trust = await checkProjectMcpTrust(this.cwd);
+    if (trust.trusted) {
+      for (const server of projectServers) {
+        await this.connectMcpServer(server);
+      }
+      return;
+    }
+
+    // Untrusted: prompt the user
+    const serverList = projectServers.map(s => `  ${s.name}: ${s.config.command}${s.config.args ? ' ' + s.config.args.join(' ') : ''}`).join('\n');
+
+    await new Promise<void>((resolve) => {
+      const items: SelectItem[] = [
+        { value: 'trust', label: 'Trust and connect', description: 'Approve these servers' },
+        { value: 'skip', label: 'Skip project servers', description: 'Only use global MCP servers' },
+      ];
+
+      const list = new SelectList(items, 2, selectListTheme);
+      const overlayBox = new OverlayBox(list, 'New Project MCP Servers');
+      const handle = this.app.tui.showOverlay(overlayBox, {
+        anchor: 'center',
+        width: '60%',
+        maxHeight: 12,
+      });
+
+      this.app.transcript.addNotification(
+        'MCP Trust Check',
+        `This project wants to connect MCP servers:\n${serverList}`,
+      );
+
+      list.onSelect = async (item) => {
+        handle.hide();
+        if (item.value === 'trust') {
+          await trustProjectMcpConfig(this.cwd);
+          for (const server of projectServers) {
+            await this.connectMcpServer(server);
+          }
+          this.app.transcript.addNotification('MCP', `Connected ${projectServers.length} project server(s).`);
+        } else {
+          this.app.transcript.addNotification('MCP', 'Skipped project MCP servers.');
+        }
+        resolve();
+      };
+
+      list.onCancel = () => {
+        handle.hide();
+        this.app.transcript.addNotification('MCP', 'Skipped project MCP servers.');
+        resolve();
+      };
+    });
+  }
+
+  private async connectMcpServer(server: { name: string; config: McpStdioConfig }): Promise<void> {
+    try {
+      await this.agent.connectMcpServer(server.name, server.config);
+    } catch (err) {
+      this.app.transcript.addNotification(
+        'MCP Error',
+        `Failed to connect "${server.name}": ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

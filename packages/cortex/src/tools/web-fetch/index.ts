@@ -54,9 +54,18 @@ const USER_AGENT = 'Cortex/1.0 (web-fetch tool)';
 /**
  * Hostname strings that always resolve to private/local addresses.
  * Checked before DNS resolution as a fast-path reject.
+ *
+ * Note: this list is a fast-path optimization, not the security boundary.
+ * The actual SSRF protection comes from validateResolvedIp(), which checks
+ * the DNS-resolved IP against private ranges before every fetch. A TOCTOU
+ * window exists between our DNS check and Node's internal fetch DNS lookup;
+ * mitigating DNS rebinding fully would require socket-level interception.
  */
 const PRIVATE_HOSTNAME_PATTERNS = [
   /^localhost$/i,
+  /^0\.0\.0\.0$/,
+  /^127\.\d+\.\d+\.\d+$/,
+  /^\[?::1\]?$/,
 ];
 
 /**

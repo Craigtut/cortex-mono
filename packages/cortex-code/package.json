@@ -25,6 +25,10 @@
     "test": "vitest",
     "test:run": "vitest run"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "engines": {
     "node": ">=24.0.0"
   },

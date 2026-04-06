@@ -21,6 +21,21 @@ export interface SavedSession {
   history: unknown[];
 }
 
+function isSessionMeta(v: unknown): v is SessionMeta {
+  if (typeof v !== 'object' || v === null) return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o['id'] === 'string' &&
+    typeof o['mode'] === 'string' &&
+    typeof o['provider'] === 'string' &&
+    typeof o['model'] === 'string' &&
+    typeof o['cwd'] === 'string' &&
+    typeof o['createdAt'] === 'number' &&
+    typeof o['updatedAt'] === 'number' &&
+    typeof o['tokenCount'] === 'number'
+  );
+}
+
 export function generateSessionId(): string {
   return randomUUID();
 }
@@ -46,10 +61,13 @@ export async function loadSession(sessionId: string): Promise<SavedSession | nul
       readFile(join(dir, 'history.json'), 'utf-8'),
       readFile(join(dir, 'meta.json'), 'utf-8'),
     ]);
-    return {
-      history: JSON.parse(historyRaw) as unknown[],
-      meta: JSON.parse(metaRaw) as SessionMeta,
-    };
+    const history: unknown = JSON.parse(historyRaw);
+    const meta: unknown = JSON.parse(metaRaw);
+
+    if (!Array.isArray(history)) return null;
+    if (!isSessionMeta(meta)) return null;
+
+    return { history, meta };
   } catch {
     return null;
   }
@@ -68,7 +86,8 @@ export async function listSessions(): Promise<SessionMeta[]> {
   for (const entry of entries) {
     try {
       const metaRaw = await readFile(join(SESSIONS_DIR, entry, 'meta.json'), 'utf-8');
-      sessions.push(JSON.parse(metaRaw) as SessionMeta);
+      const meta: unknown = JSON.parse(metaRaw);
+      if (isSessionMeta(meta)) sessions.push(meta);
     } catch {
       // Skip invalid session directories
     }

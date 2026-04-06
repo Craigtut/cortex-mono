@@ -630,7 +630,7 @@ function killProcessTree(proc: child_process.ChildProcess): void {
 
   try {
     if (process.platform === 'win32') {
-      child_process.execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: 'ignore' });
+      child_process.execFileSync('taskkill', ['/F', '/T', '/PID', String(proc.pid)], { stdio: 'ignore' });
     } else {
       // Kill the entire process group
       process.kill(-proc.pid, 'SIGKILL');

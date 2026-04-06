@@ -256,6 +256,12 @@ export async function executeScript(
     ? scriptPath
     : path.resolve(config.skillDir, scriptPath);
 
+  // Security: reject paths that escape the skill directory
+  const relative = path.relative(config.skillDir, absolutePath);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    return '[Error: script path must be within the skill directory]';
+  }
+
   // Parse extra args from "key: value, key2: value2" format
   const scriptArgs: Record<string, string> = {};
   if (extraArgsStr) {

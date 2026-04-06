@@ -15,6 +15,7 @@ interface McpConfigFile {
 export interface DiscoveredMcpServer {
   name: string;
   config: McpStdioConfig;
+  source: 'global' | 'project';
 }
 
 /**
@@ -26,8 +27,8 @@ export async function discoverMcpServers(cwd: string): Promise<DiscoveredMcpServ
   const projectPath = join(cwd, '.cortex', 'mcp.json');
 
   const [globalConfig, projectConfig] = await Promise.all([
-    loadMcpConfig(globalPath),
-    loadMcpConfig(projectPath),
+    loadMcpConfig(globalPath, 'global'),
+    loadMcpConfig(projectPath, 'project'),
   ]);
 
   // Merge: project overrides global for same-name servers
@@ -43,13 +44,13 @@ export async function discoverMcpServers(cwd: string): Promise<DiscoveredMcpServ
   return [...merged.values()];
 }
 
-async function loadMcpConfig(path: string): Promise<DiscoveredMcpServer[]> {
+async function loadMcpConfig(path: string, source: 'global' | 'project'): Promise<DiscoveredMcpServer[]> {
   try {
     const content = await readFile(path, 'utf-8');
-    const config = JSON.parse(content) as McpConfigFile;
+    const parsed = JSON.parse(content) as McpConfigFile;
     const servers: DiscoveredMcpServer[] = [];
 
-    for (const [name, entry] of Object.entries(config.servers ?? {})) {
+    for (const [name, entry] of Object.entries(parsed.servers ?? {})) {
       if (!entry.command) continue;
       const config: McpStdioConfig = {
         transport: 'stdio',
@@ -58,7 +59,7 @@ async function loadMcpConfig(path: string): Promise<DiscoveredMcpServer[]> {
       if (entry.args) config.args = entry.args;
       if (entry.env) config.env = entry.env;
       if (entry.cwd) config.cwd = entry.cwd;
-      servers.push({ name, config });
+      servers.push({ name, config, source });
     }
 
     return servers;

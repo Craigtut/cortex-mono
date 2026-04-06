@@ -70,6 +70,8 @@ function getMatchValue(toolName: string, toolArgs: unknown): string {
       return String(args['file_path'] ?? args['path'] ?? '');
     case 'Glob':
       return String(args['pattern'] ?? '');
+    case 'Grep':
+      return String(args['path'] ?? args['pattern'] ?? '');
     case 'WebFetch': {
       const url = String(args['url'] ?? '');
       try {
@@ -205,6 +207,6 @@ export class PermissionRuleManager {
     };
 
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, JSON.stringify(settings, null, 2));
+    await writeFile(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
   }
 }

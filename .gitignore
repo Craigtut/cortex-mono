@@ -38,6 +38,5 @@ tmp/
 temp/
 .cache/
 
-# Claude local settings
-.claude/settings.local.json
-.claude/worktrees/
+# Claude local settings and project memory
+.claude/
