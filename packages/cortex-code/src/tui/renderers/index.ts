@@ -38,3 +38,8 @@ export { readRenderer } from './read-renderer.js';
 export { editRenderer } from './edit-renderer.js';
 export { writeRenderer } from './write-renderer.js';
 export { bashRenderer } from './bash-renderer.js';
+export { grepRenderer } from './grep-renderer.js';
+export { globRenderer } from './glob-renderer.js';
+export { webFetchRenderer } from './web-fetch-renderer.js';
+export { subAgentRenderer } from './sub-agent-renderer.js';
+export { taskOutputRenderer } from './task-output-renderer.js';
