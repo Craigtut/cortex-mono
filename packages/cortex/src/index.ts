@@ -13,6 +13,7 @@
 
 // Types
 export type {
+  CortexLogger,
   CortexUsage,
   CortexLifecycleState,
   CortexToolPermissionDecision,
@@ -50,6 +51,9 @@ export type {
   SubAgentResult,
   TrackedSubAgent,
 } from './types.js';
+
+// Logger
+export { NOOP_LOGGER } from './noop-logger.js';
 
 // Schema Converter
 export { zodToTypebox } from './schema-converter.js';

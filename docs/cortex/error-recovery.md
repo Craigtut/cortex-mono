@@ -202,46 +202,135 @@ The LLM call fails with an auth error string (e.g., "Invalid API key"). The erro
 
 Both detection points result in the same consumer event. The backend emits `system:error` with `category: 'authentication'`, which the frontend renders as a SystemErrorCard with the suggested action to check API keys.
 
-## Rate Limit Backoff
+## Automatic Retry for Transient Errors
 
-When a `rate_limit` error is classified:
+Cortex provides built-in retry logic for transient errors (`rate_limit`, `server_error`, `network`). This runs inside `CortexAgent.prompt()`, wrapping the pi-agent-core agent loop. Retry is opt-in via the `retry` config field.
+
+### Why Cortex Owns This
+
+Provider-level retries exist but are inconsistent:
+- **Anthropic SDK**: 2 retries (built-in)
+- **Google Gemini CLI**: 3 retries with exponential backoff (custom in pi-ai)
+- **OpenAI Codex**: 3 retries (custom in pi-ai)
+- **OpenAI, Mistral, Google SDK**: SDK built-in (varies)
+- **Groq, xAI, Cerebras, OpenRouter, etc.**: No retry at all
+
+Pi-agent-core has no retry at the agent loop level. When an LLM call fails after provider-level retries are exhausted, the agent catches the error, appends an error message (`stopReason: "error"`), and stops. The consumer must handle retry.
+
+Cortex sits at the right layer: above the inconsistent provider behavior, below the consumer. Every consumer benefits from uniform retry behavior without duplicating logic.
 
 ### Mechanism
 
-The consumer (backend) delays the next tick using a backoff strategy:
-
-1. **First rate limit**: Delay next tick by 30 seconds.
-2. **Consecutive rate limits**: Exponential backoff: 30s, 60s, 120s, 240s (max 5 minutes).
-3. **Successful tick after backoff**: Reset the backoff counter to zero.
-
-### Implementation
-
-The backoff state lives in the backend (not cortex, since cortex doesn't know about ticks):
+Pi-agent-core provides `agent.continue()` for resuming after errors. Cortex wraps `prompt()` with retry logic that calls `continue()` after transient failures:
 
 ```typescript
-// In the heartbeat pipeline
-let rateLimitBackoffMs = 0;
-let consecutiveRateLimits = 0;
+// Inside CortexAgent.prompt()
+let attempt = 0;
+while (true) {
+  try {
+    const result = attempt === 0
+      ? await this.agent.prompt(input)
+      : await this.agent.continue();
+    return result;
+  } catch (err) {
+    const classified = classifyError(err);
 
-cortexAgent.onError((error) => {
+    if (classified.severity !== 'retry' || attempt >= this.retryConfig.maxRetries) {
+      // Not retryable, or retries exhausted: emit error and throw
+      this.emitError(classified);
+      throw err;
+    }
+
+    attempt++;
+    const delayMs = this.retryConfig.baseDelayMs * Math.pow(2, attempt - 1);
+
+    // Emit retry event so consumers can show UI feedback
+    this.emitRetry({ attempt, maxRetries: this.retryConfig.maxRetries, delayMs, error: classified });
+
+    await sleep(delayMs);
+  }
+}
+```
+
+### Configuration
+
+```typescript
+interface RetryConfig {
+  /** Maximum number of retry attempts. Default: 5. Set to 0 to disable. */
+  maxRetries: number;
+  /** Base delay in milliseconds for exponential backoff. Default: 2000. */
+  baseDelayMs: number;
+  /** Maximum delay in milliseconds. Default: 32000 (32 seconds). */
+  maxDelayMs: number;
+}
+```
+
+Default backoff schedule: 2s, 4s, 8s, 16s, 32s (5 retries, exponential with 32s cap).
+
+### Events
+
+Two new events on CortexAgent:
+
+- **`onRetry(handler)`**: Fired before each retry attempt. Receives `{ attempt, maxRetries, delayMs, error }`. Consumers use this for UI feedback (e.g., "Rate limited, retrying in 8s...").
+- **`onRetriesExhausted(handler)`**: Fired when all retries are exhausted. Receives the final `ClassifiedError`. Consumers use this to prompt the user (e.g., "Rate limited after 5 retries. Send another message to try again.").
+
+### Error Categories and Retry Behavior
+
+| Category | Severity | Retried? | Notes |
+|----------|----------|----------|-------|
+| `rate_limit` | retry | Yes | 429 or rate limit patterns |
+| `server_error` | retry | Yes | 500, 502, 503, 504 |
+| `network` | retry | Yes | Connection failure, DNS, timeout |
+| `authentication` | fatal | No | Invalid key, expired token |
+| `context_overflow` | recoverable | No | Handled by compaction, not retry |
+| `cancelled` | recoverable | No | User abort |
+| `unknown` | recoverable | No | Unclassified errors |
+
+### Interaction with Provider-Level Retries
+
+Provider SDKs retry internally before the error reaches Cortex. If a provider retries 2 times and Cortex retries 5 times, the total attempt count is higher. This is acceptable: the provider handles quick transient blips, and Cortex handles longer outages (e.g., a 30-second rate limit window that exceeds provider SDK retry budgets).
+
+The `maxRetryDelayMs` option in pi-ai (used by Google Gemini CLI) caps server-requested delays at 60 seconds. If the server requests a longer delay, pi-ai throws immediately rather than waiting. Cortex's retry catches this throw and applies its own backoff schedule.
+
+## Consumer-Specific Rate Limit Handling
+
+The automatic retry above handles transient errors within a single `prompt()` call. Consumers may also need higher-level backoff between prompts:
+
+### Heartbeat Consumers (e.g., Animus)
+
+For consumers with autonomous tick loops, rate limits should also delay the next tick:
+
+```typescript
+cortexAgent.onRetriesExhausted((error) => {
   if (error.category === 'rate_limit') {
     consecutiveRateLimits++;
-    rateLimitBackoffMs = Math.min(
+    const backoffMs = Math.min(
       30000 * Math.pow(2, consecutiveRateLimits - 1),
       300000  // max 5 minutes
     );
-    tickQueue.delayNext(rateLimitBackoffMs);
+    tickQueue.delayNext(backoffMs);
   }
 });
 
-// On successful tick completion
+// On successful prompt completion
 consecutiveRateLimits = 0;
-rateLimitBackoffMs = 0;
 ```
 
-### User Visibility
+### Interactive Consumers (e.g., Cortex Code)
 
-The `system:error` event with `category: 'rate_limit'` tells the user what happened. The suggested action includes the delay: "Rate limit hit. Next tick delayed by {backoffMs/1000}s."
+For TUI consumers, the retry events drive UI feedback:
+
+```typescript
+cortexAgent.onRetry(({ attempt, maxRetries, delayMs }) => {
+  tui.showRetryCountdown(attempt, maxRetries, delayMs);
+});
+
+cortexAgent.onRetriesExhausted((error) => {
+  tui.showError(`${error.suggestedAction} Send another message to retry.`);
+});
+```
+
+No additional retry logic needed in Cortex Code. The framework handles it.
 
 ## Integration with the 5-Phase Pipeline
 
@@ -250,7 +339,7 @@ Each phase of the pipeline (THOUGHT, AGENTIC LOOP, REFLECT) can fail independent
 | Phase | On Error | Classification Used For |
 |-------|----------|------------------------|
 | THOUGHT | Skip thought, continue to agentic loop with no thought in context | Log + surface to UI. Auth errors halt the tick. |
-| AGENTIC LOOP | Check if any turns completed. If yes, use partial results. If no, use safe fallback output. | Log + surface to UI. Auth/rate limit trigger their specific handlers. |
+| AGENTIC LOOP | Cortex automatic retry handles transient errors. If retries exhausted, check if any turns completed. If yes, use partial results. If no, use safe fallback output. | Log + surface to UI. Auth errors halt the tick. |
 | REFLECT | Retry up to 3 times. If all fail, skip reflection (emotions/decisions for this tick are lost). | Log + surface to UI. Auth errors halt the tick. |
 | Any phase | If `authentication`: halt the tick entirely, surface to UI, do not retry. | Auth is always fatal. |
 

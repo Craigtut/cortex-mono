@@ -20,7 +20,8 @@
  * Reference: cortex-architecture.md (Event Bridge section)
  */
 
-import type { AgentTextOutput } from './types.js';
+import type { AgentTextOutput, CortexLogger } from './types.js';
+import { NOOP_LOGGER } from './noop-logger.js';
 import { parseWorkingTags } from './working-tags.js';
 
 // ---------------------------------------------------------------------------
@@ -109,14 +110,17 @@ export class EventBridge {
   private readonly allListeners = new Set<CortexEventListener>();
   private unsubscribeFromPi: (() => void) | null = null;
   private workingTagsEnabled: boolean;
+  private readonly logger: CortexLogger;
 
   /**
    * Create an EventBridge.
    *
    * @param workingTagsEnabled - Whether to parse working tags on turn_end
+   * @param logger - Optional logger for diagnostics (defaults to silent no-op)
    */
-  constructor(workingTagsEnabled = true) {
+  constructor(workingTagsEnabled = true, logger?: CortexLogger) {
     this.workingTagsEnabled = workingTagsEnabled;
+    this.logger = logger ?? NOOP_LOGGER;
   }
 
   /**
@@ -279,8 +283,11 @@ export class EventBridge {
       for (const listener of typeListeners) {
         try {
           listener(event);
-        } catch {
-          // Swallow listener errors to prevent cascading failures
+        } catch (err) {
+          this.logger.error('[EventBridge] listener threw', {
+            eventType: event.type,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
     }
@@ -289,8 +296,11 @@ export class EventBridge {
     for (const listener of this.allListeners) {
       try {
         listener(event);
-      } catch {
-        // Swallow listener errors to prevent cascading failures
+      } catch (err) {
+        this.logger.error('[EventBridge] catch-all listener threw', {
+          eventType: event.type,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }

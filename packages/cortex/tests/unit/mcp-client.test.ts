@@ -643,11 +643,11 @@ describe('McpClientManager', () => {
   // -----------------------------------------------------------------------
 
   describe('logging', () => {
-    it('calls log callbacks when provided', async () => {
+    it('calls logger methods when provided', async () => {
       const logInfo = vi.fn();
       const logDebug = vi.fn();
 
-      manager.log = {
+      manager.logger = {
         info: logInfo,
         warn: vi.fn(),
         error: vi.fn(),
@@ -661,14 +661,16 @@ describe('McpClientManager', () => {
       });
 
       expect(logInfo).toHaveBeenCalled();
-      // Verify the log message mentions the server name
-      const calls = logInfo.mock.calls.map(c => c[0]);
-      expect(calls.some((msg: string) => msg.includes('weather'))).toBe(true);
+      // Verify the log data mentions the server name
+      const calls = logInfo.mock.calls;
+      expect(calls.some((args: unknown[]) => {
+        const data = args[1] as Record<string, unknown> | undefined;
+        return data?.serverName === 'weather';
+      })).toBe(true);
     });
 
-    it('works without log callbacks', async () => {
-      // No log set - should not throw
-      manager.log = undefined;
+    it('works with default NOOP_LOGGER', async () => {
+      // Default logger (NOOP_LOGGER) should not throw
 
       await manager.connect('weather', {
         transport: 'stdio',

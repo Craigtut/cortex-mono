@@ -323,4 +323,46 @@ describe('BudgetGuard', () => {
       expect(guard.getTurnCount()).toBe(1);
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Logger integration
+  // -----------------------------------------------------------------------
+
+  describe('logger', () => {
+    it('logs warn on turn limit breach', () => {
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const guard = new BudgetGuard({ maxTurns: 2 }, abortFn, logger);
+      guard.wire(bridge);
+
+      source.emit({ type: 'turn_end' });
+      expect(logger.warn).not.toHaveBeenCalled();
+
+      source.emit({ type: 'turn_end' });
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[BudgetGuard] turn limit breached',
+        expect.objectContaining({ turnCount: 2, maxTurns: 2 }),
+      );
+    });
+
+    it('logs warn on cost limit breach', () => {
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const guard = new BudgetGuard({ maxCost: 0.05 }, abortFn, logger);
+      guard.wire(bridge);
+
+      source.emit({ type: 'turn_end', message: { cost: { total: 0.06 } } });
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[BudgetGuard] cost limit breached',
+        expect.objectContaining({ totalCost: 0.06, maxCost: 0.05 }),
+      );
+    });
+
+    it('works without logger (default NOOP)', () => {
+      const guard = new BudgetGuard({ maxTurns: 1 }, abortFn);
+      guard.wire(bridge);
+
+      // Should not throw
+      expect(() => source.emit({ type: 'turn_end' })).not.toThrow();
+      expect(guard.isBreached()).toBe(true);
+    });
+  });
 });

@@ -10,7 +10,8 @@
  * Reference: cortex-architecture.md (Budget Guards section)
  */
 
-import type { BudgetGuardConfig } from './types.js';
+import type { BudgetGuardConfig, CortexLogger } from './types.js';
+import { NOOP_LOGGER } from './noop-logger.js';
 import type { EventBridge } from './event-bridge.js';
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,7 @@ export class BudgetGuard {
   private readonly maxTurns: number;
   private readonly maxCost: number;
   private readonly abortFn: () => void;
+  private readonly logger: CortexLogger;
 
   private turnCount = 0;
   private totalCost = 0;
@@ -33,11 +35,13 @@ export class BudgetGuard {
    *
    * @param config - Budget limits (maxTurns, maxCost). Both default to Infinity.
    * @param abortFn - Function to call when a limit is breached (typically agent.abort())
+   * @param logger - Optional logger for diagnostics (defaults to silent no-op)
    */
-  constructor(config: Partial<BudgetGuardConfig>, abortFn: () => void) {
+  constructor(config: Partial<BudgetGuardConfig>, abortFn: () => void, logger?: CortexLogger) {
     this.maxTurns = config.maxTurns ?? Infinity;
     this.maxCost = config.maxCost ?? Infinity;
     this.abortFn = abortFn;
+    this.logger = logger ?? NOOP_LOGGER;
   }
 
   /**
@@ -131,12 +135,20 @@ export class BudgetGuard {
 
     if (this.turnCount >= this.maxTurns) {
       this.breached = true;
+      this.logger.warn('[BudgetGuard] turn limit breached', {
+        turnCount: this.turnCount,
+        maxTurns: this.maxTurns,
+      });
       this.abortFn();
       return;
     }
 
     if (this.totalCost >= this.maxCost) {
       this.breached = true;
+      this.logger.warn('[BudgetGuard] cost limit breached', {
+        totalCost: this.totalCost,
+        maxCost: this.maxCost,
+      });
       this.abortFn();
     }
   }

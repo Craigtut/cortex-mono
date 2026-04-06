@@ -19,6 +19,7 @@
 
 import type { AgentMessage, AgentContext } from '../context-manager.js';
 import type {
+  CortexLogger,
   CortexCompactionConfig,
   AdaptiveThresholdConfig,
   CompactionResult,
@@ -26,6 +27,7 @@ import type {
   CompactionDegradedInfo,
   CompactionExhaustedInfo,
 } from '../types.js';
+import { NOOP_LOGGER } from '../noop-logger.js';
 import { estimateTokens } from '../token-estimator.js';
 import { MicrocompactionEngine, MICROCOMPACTION_DEFAULTS, extractTextContent, isToolResultMessage, capToolResult, extractToolName, getToolCategory, applyBookend } from './microcompaction.js';
 import {
@@ -194,8 +196,8 @@ export class CompactionManager {
   /** LLM completion function, set by CortexAgent. */
   private completeFn: CompleteFn | null = null;
 
-  /** Optional debug log callback, wired by consumer for diagnostics. */
-  _debugLog: ((msg: string) => void) | null = null;
+  /** Logger for compaction diagnostics. */
+  private logger: CortexLogger = NOOP_LOGGER;
 
   constructor(
     config: CortexCompactionConfig,
@@ -237,11 +239,10 @@ export class CompactionManager {
   }
 
   /**
-   * Set a debug log callback for compaction diagnostics.
-   * The consumer wires this to their logging system.
+   * Set a logger for compaction diagnostics.
    */
-  setDebugLog(fn: (msg: string) => void): void {
-    this._debugLog = fn;
+  setLogger(logger: CortexLogger): void {
+    this.logger = logger;
   }
 
   /**
@@ -284,7 +285,7 @@ export class CompactionManager {
    * Update the session token count from LLM usage data.
    */
   updateTokenCount(inputTokens: number): void {
-    this._debugLog?.(`updateTokenCount: ${inputTokens}`);
+    this.logger.debug('[Compaction] updateTokenCount', { inputTokens });
     this._sessionTokenCount = inputTokens;
   }
 
@@ -535,7 +536,13 @@ export class CompactionManager {
       ? Math.max(this._sessionTokenCount, estimatedCurrentTokens)
       : estimatedCurrentTokens;
 
-    this._debugLog?.(`transformContext: historyLen=${history.length}, sessionTokens=${this._sessionTokenCount}, heuristic=${estimatedCurrentTokens}, currentTokens=${currentTokens}, ctxWindow=${this._contextWindow}`);
+    this.logger.debug('[Compaction] transformContext', {
+      historyLen: history.length,
+      sessionTokens: this._sessionTokenCount,
+      heuristic: estimatedCurrentTokens,
+      currentTokens,
+      ctxWindow: this._contextWindow,
+    });
 
     // Layer 1: Microcompaction (always runs at threshold crossings)
     history = await this.microcompaction.apply(history, this._contextWindow, currentTokens);
@@ -551,7 +558,14 @@ export class CompactionManager {
 
     const effectiveThreshold = this.getEffectiveThreshold();
 
-    this._debugLog?.(`Layer2: totalAfterMicro=${totalAfterMicro}, threshold=${effectiveThreshold}, ratio=${(totalAfterMicro / this._contextWindow).toFixed(3)}, completeFn=${!!this.completeFn}, srcAccessors=${!!getSourceHistory && !!setSourceHistory}, shouldCompact=${shouldCompact(totalAfterMicro, this._contextWindow, effectiveThreshold)}`);
+    this.logger.debug('[Compaction] Layer2 evaluation', {
+      totalAfterMicro,
+      threshold: effectiveThreshold,
+      ratio: totalAfterMicro / this._contextWindow,
+      completeFn: !!this.completeFn,
+      srcAccessors: !!getSourceHistory && !!setSourceHistory,
+      shouldCompact: shouldCompact(totalAfterMicro, this._contextWindow, effectiveThreshold),
+    });
 
     let layer2Failed = false;
     let lastLayer2Error: Error | undefined;
@@ -591,8 +605,10 @@ export class CompactionManager {
           for (const handler of this.compactionResultHandlers) {
             try {
               handler(result);
-            } catch {
-              // Swallow handler errors
+            } catch (err) {
+              this.logger.error('[Compaction] compactionResult handler threw', {
+                error: err instanceof Error ? err.message : String(err),
+              });
             }
           }
 
@@ -608,7 +624,11 @@ export class CompactionManager {
         } catch (err) {
           this._consecutiveLayer2Failures++;
           lastLayer2Error = err instanceof Error ? err : new Error(String(err));
-          this._debugLog?.(`Layer2 attempt ${attempt}/${maxRetries} failed: ${lastLayer2Error.message}`);
+          this.logger.warn('[Compaction] Layer2 retry failed', {
+            attempt,
+            maxRetries,
+            error: lastLayer2Error.message,
+          });
 
           if (attempt < maxRetries) {
             await new Promise(resolve => setTimeout(resolve, retryDelayMs));
@@ -649,8 +669,10 @@ export class CompactionManager {
                 layer2Failures: failures,
                 turnsDropped: truncResult.turnsRemoved,
               });
-            } catch {
-              // Swallow handler errors
+            } catch (err) {
+              this.logger.error('[Compaction] compactionDegraded handler threw', {
+                error: err instanceof Error ? err.message : String(err),
+              });
             }
           }
         }
@@ -669,8 +691,10 @@ export class CompactionManager {
                 error: lastLayer2Error ?? new Error('Layer 2 compaction failed'),
                 layer2Failures: failures,
               });
-            } catch {
-              // Swallow handler errors
+            } catch (err) {
+              this.logger.error('[Compaction] compactionExhausted handler threw', {
+                error: err instanceof Error ? err.message : String(err),
+              });
             }
           }
         }

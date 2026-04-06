@@ -328,4 +328,46 @@ describe('EventBridge', () => {
       expect(startData.toolName).toBe('read');
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Logger integration
+  // -----------------------------------------------------------------------
+
+  describe('logger', () => {
+    it('logs error when a type-specific listener throws', () => {
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const loggedBridge = new EventBridge(false, logger);
+      const loggedSource = createMockSource();
+      loggedBridge.wire(loggedSource);
+
+      const goodListener = vi.fn();
+      loggedBridge.on('session_start', () => { throw new Error('boom'); });
+      loggedBridge.on('session_start', goodListener);
+
+      loggedSource.emit({ type: 'agent_start' });
+
+      expect(logger.error).toHaveBeenCalledWith(
+        '[EventBridge] listener threw',
+        expect.objectContaining({ eventType: 'session_start', error: 'boom' }),
+      );
+      // Subsequent listener still fires
+      expect(goodListener).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs error when a catch-all listener throws', () => {
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const loggedBridge = new EventBridge(false, logger);
+      const loggedSource = createMockSource();
+      loggedBridge.wire(loggedSource);
+
+      loggedBridge.onAll(() => { throw new Error('catch-all boom'); });
+
+      loggedSource.emit({ type: 'agent_start' });
+
+      expect(logger.error).toHaveBeenCalledWith(
+        '[EventBridge] catch-all listener threw',
+        expect.objectContaining({ error: 'catch-all boom' }),
+      );
+    });
+  });
 });

@@ -20,7 +20,8 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { Type } from '@sinclair/typebox';
-import type { McpTransportConfig, McpConnectionState, McpStdioConfig, McpHttpConfig } from './types.js';
+import type { McpTransportConfig, McpConnectionState, McpStdioConfig, McpHttpConfig, CortexLogger } from './types.js';
+import { NOOP_LOGGER } from './noop-logger.js';
 import { buildSafeEnv } from './tools/shared/safe-env.js';
 
 // ---------------------------------------------------------------------------
@@ -91,15 +92,8 @@ export class McpClientManager {
    */
   envOverrides?: Record<string, string>;
 
-  /**
-   * Optional logging callbacks. If not provided, messages are silently ignored.
-   */
-  log?: {
-    info: (message: string) => void;
-    warn: (message: string) => void;
-    error: (message: string, err?: unknown) => void;
-    debug: (message: string) => void;
-  };
+  /** Logger for MCP diagnostics. Set by CortexAgent after construction. */
+  logger: CortexLogger = NOOP_LOGGER;
 
   /**
    * Connect to an MCP server and discover its tools.
@@ -118,7 +112,7 @@ export class McpClientManager {
       await this.disconnect(serverName);
     }
 
-    this.log?.info(`Connecting to MCP server: ${serverName} (${config.transport})`);
+    this.logger.info('[MCP] connecting', { serverName, transport: config.transport });
 
     const transport = this.createTransport(config);
     const client = new Client(
@@ -129,7 +123,7 @@ export class McpClientManager {
     try {
       await client.connect(transport as Transport);
     } catch (err) {
-      this.log?.error(`Failed to connect to MCP server ${serverName}`, err);
+      this.logger.error('[MCP] connection failed', { serverName, error: err instanceof Error ? err.message : String(err) });
       throw new Error(`MCP connection failed for "${serverName}": ${err instanceof Error ? err.message : String(err)}`);
     }
 
@@ -147,7 +141,7 @@ export class McpClientManager {
     try {
       tools = await this.discoverTools(serverName, client);
     } catch (err) {
-      this.log?.error(`Failed to discover tools from MCP server ${serverName}`, err);
+      this.logger.error('[MCP] tool discovery failed', { serverName, error: err instanceof Error ? err.message : String(err) });
       // Close the connection since tool discovery failed
       try {
         await client.close();
@@ -177,7 +171,7 @@ export class McpClientManager {
     };
 
     this.connections.set(serverName, connection);
-    this.log?.info(`Connected to MCP server ${serverName}: ${tools.length} tools discovered [${tools.map(t => t.name).join(', ')}]`);
+    this.logger.info('[MCP] connected', { serverName, toolCount: tools.length, tools: tools.map(t => t.name) });
     this.onToolsChanged?.();
   }
 
@@ -191,13 +185,13 @@ export class McpClientManager {
     const conn = this.connections.get(serverName);
     if (!conn) return;
 
-    this.log?.info(`Disconnecting from MCP server: ${serverName}`);
+    this.logger.info('[MCP] disconnecting', { serverName });
     conn.connected = false;
 
     try {
       await conn.client.close();
     } catch (err) {
-      this.log?.warn(`Error closing MCP client for ${serverName}: ${err instanceof Error ? err.message : String(err)}`);
+      this.logger.warn('[MCP] error closing client', { serverName, error: err instanceof Error ? err.message : String(err) });
     }
 
     if (conn.pid != null) {
@@ -221,7 +215,7 @@ export class McpClientManager {
     for (let i = 0; i < results.length; i++) {
       const result = results[i]!;
       if (result.status === 'rejected') {
-        this.log?.warn(`Failed to disconnect ${names[i]}: ${(result as PromiseRejectedResult).reason}`);
+        this.logger.warn('[MCP] failed to disconnect', { serverName: names[i], error: String((result as PromiseRejectedResult).reason) });
       }
     }
   }
@@ -500,10 +494,10 @@ export class McpClientManager {
       conn.pid = null;
     }
 
-    this.log?.warn(`MCP server ${serverName} disconnected unexpectedly (attempt ${conn.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+    this.logger.warn('[MCP] unexpected disconnect', { serverName, attempt: conn.reconnectAttempts, maxAttempts: MAX_RECONNECT_ATTEMPTS });
 
     if (conn.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      this.log?.error(`MCP server ${serverName} failed to reconnect after ${MAX_RECONNECT_ATTEMPTS} attempts; deregistering tools`);
+      this.logger.error('[MCP] reconnect exhausted, deregistering', { serverName, maxAttempts: MAX_RECONNECT_ATTEMPTS });
       this.connections.delete(serverName);
       this.onToolsChanged?.();
       return;
@@ -511,7 +505,7 @@ export class McpClientManager {
 
     // Attempt reconnect asynchronously
     this.attemptReconnect(serverName, conn.config).catch((err) => {
-      this.log?.error(`Reconnect attempt for ${serverName} failed`, err);
+      this.logger.error('[MCP] reconnect attempt failed', { serverName, error: err instanceof Error ? err.message : String(err) });
     });
   }
 
@@ -562,7 +556,7 @@ export class McpClientManager {
       existing.pid = pid;
       // Keep reconnectAttempts as-is (reset only on fresh connect)
 
-      this.log?.info(`Reconnected to MCP server ${serverName}: ${tools.length} tools`);
+      this.logger.info('[MCP] reconnected', { serverName, toolCount: tools.length });
       this.onToolsChanged?.();
     } catch (err) {
       // Clean up resources from partial connection
@@ -573,16 +567,16 @@ export class McpClientManager {
         this.onSubprocessExited?.(pid);
       }
 
-      this.log?.warn(`Reconnect to ${serverName} failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.logger.warn('[MCP] reconnect failed', { serverName, error: err instanceof Error ? err.message : String(err) });
       existing.reconnectAttempts++;
       if (existing.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        this.log?.error(`MCP server ${serverName} exceeded max reconnect attempts; deregistering`);
+        this.logger.error('[MCP] max reconnect attempts exceeded, deregistering', { serverName });
         this.connections.delete(serverName);
         this.onToolsChanged?.();
       } else {
         // Schedule another attempt since transport.onclose may not fire
         this.attemptReconnect(serverName, config).catch((retryErr) => {
-          this.log?.error(`Subsequent reconnect for ${serverName} failed`, retryErr);
+          this.logger.error('[MCP] subsequent reconnect failed', { serverName, error: retryErr instanceof Error ? retryErr.message : String(retryErr) });
         });
       }
     }
