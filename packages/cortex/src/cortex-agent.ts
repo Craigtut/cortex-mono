@@ -47,6 +47,8 @@ import { wrapModel, unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
+import { assertValidCortexTool } from './tool-contract.js';
+import type { CortexTool } from './tool-contract.js';
 import type {
   CortexLogger,
   CortexAgentConfig,
@@ -164,6 +166,12 @@ function mapFromPiThinkingLevel(level: string): ThinkingLevel {
  */
 export const MINIMUM_CONTEXT_WINDOW = 16_384;
 
+/**
+ * Operational reminder appended to tool results when working tags are enabled.
+ * Exported so consumers (e.g., cortex-code TUI) can strip it from display text.
+ */
+export const TOOL_RESULT_WORKING_TAGS_REMINDER = '[Do not narrate. If analyzing these results, use <working> tags. Only text outside <working> tags is shown to the user.]';
+
 // ---------------------------------------------------------------------------
 // System prompt sections
 // ---------------------------------------------------------------------------
@@ -275,12 +283,7 @@ When encountering unexpected state (unfamiliar files, branches,
 or configurations), investigate before modifying or deleting.
 It may represent in-progress work.`;
 
-type RegisteredTool = {
-  name: string;
-  description: string;
-  parameters: unknown;
-  execute: (...args: any[]) => Promise<unknown>;
-};
+type RegisteredTool = CortexTool;
 
 interface CortexAgentConstructorOptions {
   enableSubAgentTool?: boolean;
@@ -349,7 +352,7 @@ export class CortexAgent {
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
 
-  // AbortController for the current agent session
+  // AbortController for the current agentic loop
   private abortController = new AbortController();
 
   // Whether a prompt() call is currently in progress
@@ -522,10 +525,8 @@ export class CortexAgent {
       this.registeredTools.push(this.loadSkillTool as RegisteredTool);
     }
 
-    // Apply execute signature adapter and sync tools to pi-agent-core.
-    // Tools are initially set via initialState.tools but without the arity
-    // adapter that maps (toolCallId, params) -> (params). This call wraps
-    // all arity-1 tools and pushes the full set to the agent.
+    // Adapt the normalized Cortex tool set to pi-agent-core's raw execute
+    // signature and sync the result to the underlying agent.
     this.refreshTools();
 
     // Set up CompactionManager
@@ -663,7 +664,7 @@ export class CortexAgent {
         durationMs: Date.now() - loopStartMs,
         turns: this.budgetGuard.getTurnCount(),
         totalCost: this.budgetGuard.getTotalCost(),
-        sessionTokens: this.compactionManager.sessionTokenCount,
+        currentContextTokens: this.compactionManager.currentContextTokenCount,
       });
 
       // Deliver any background sub-agent results that arrived while prompting.
@@ -926,17 +927,16 @@ export class CortexAgent {
 
   private static buildPiAgentConfig(params: {
     cortexConfig: CortexAgentConfig;
-    tools: RegisteredTool[];
     initialSystemPrompt?: string;
     cacheBreakpointState: { cortexAgent: CortexAgent | null };
   }): Record<string, unknown> {
-    const { cortexConfig, tools, initialSystemPrompt = '', cacheBreakpointState } = params;
+    const { cortexConfig, initialSystemPrompt = '', cacheBreakpointState } = params;
     const rawModel = unwrapModel(cortexConfig.model) as PiModel;
     const agentConfig: Record<string, unknown> = {
       initialState: {
         systemPrompt: initialSystemPrompt,
         model: rawModel,
-        tools,
+        tools: [],
         messages: [],
         ...(cortexConfig.thinkingLevel !== undefined && {
           thinkingLevel: mapToPiThinkingLevel(cortexConfig.thinkingLevel),
@@ -975,7 +975,7 @@ export class CortexAgent {
         };
         if (isError) return undefined;
 
-        const reminder = '\n\n[Do not narrate. If analyzing these results, use <working> tags. Only text outside <working> tags is shown to the user.]';
+        const reminder = '\n\n' + TOOL_RESULT_WORKING_TAGS_REMINDER;
         const content = result.content;
         if (typeof content === 'string') {
           return { content: content + reminder };
@@ -1104,12 +1104,10 @@ export class CortexAgent {
     const cacheBreakpointState = { cortexAgent: null as CortexAgent | null };
     const agentConfigParams: {
       cortexConfig: CortexAgentConfig;
-      tools: RegisteredTool[];
       initialSystemPrompt?: string;
       cacheBreakpointState: { cortexAgent: CortexAgent | null };
     } = {
       cortexConfig,
-      tools,
       cacheBreakpointState,
     };
     if (initialSystemPrompt !== undefined) {
@@ -1153,10 +1151,11 @@ export class CortexAgent {
     /**
      * Additional consumer-provided tools to register alongside the built-in tools.
      * Built-in tools (Read, Write, Edit, Glob, Grep, Bash, WebFetch, TaskOutput)
-     * are registered automatically. Use `disableTools` on CortexAgentConfig to
-     * exclude specific built-in tools.
+     * are registered automatically. Tools passed here must use Cortex's
+     * execute(params, context?) contract. Wrap raw pi-agent-core tools with
+     * fromPiAgentTool() before passing them to CortexAgent.create().
      */
-    tools?: RegisteredTool[];
+    tools?: CortexTool[];
     /** @deprecated Use initialBasePrompt instead. */
     systemPrompt?: string;
   }): Promise<CortexAgent> {
@@ -1509,33 +1508,15 @@ export class CortexAgent {
   }
 
   /**
-   * Update the agent's tool set. Merges built-in tools (registered at
-   * construction) with MCP-discovered tools from connected servers.
-   * Called after MCP server connections change (plugin install/uninstall).
-   *
-   * Adapts all tool execute functions to match pi-agent-core's signature:
-   *   execute(toolCallId, params, signal?, onUpdate?)
-   * Built-in cortex tools and consumer-provided tools may use the simpler
-   *   execute(params) signature, so this adapter ensures the validated
-   *   arguments (2nd parameter) are passed correctly.
+   * Update the agent's tool set by adapting Cortex's canonical in-process
+   * tool contract to pi-agent-core's raw execute signature.
    */
   refreshTools(): void {
     const mcpTools = this.mcpClientManager.getTools();
     const allTools = [...this.registeredTools, ...mcpTools].map(tool => {
-      const originalExecute = tool.execute;
-      // If the function already accepts 2+ params (toolCallId, params),
-      // it's already adapted. Check arity to avoid double-wrapping.
-      if (originalExecute.length >= 2) return tool;
       return {
         ...tool,
         label: (tool as Record<string, unknown>)['label'] ?? tool.name,
-        // Adapt: fix parameter order AND normalize return value.
-        // Pi-agent-core expects AgentToolResult { content: [...], details: T }.
-        // Tools may return plain strings, which have no .content property,
-        // causing toolResult messages with content: undefined.
-        //
-        // Also passes ToolExecuteContext as the second argument so tools
-        // can opt-in to streaming updates via context.onUpdate().
         execute: async (
           toolCallId: string,
           params: unknown,
@@ -1546,8 +1527,7 @@ export class CortexAgent {
           if (signal) context.signal = signal;
           if (onUpdate) context.onUpdate = onUpdate;
           const toolStartMs = Date.now();
-          // Pass context as optional second arg; tools that don't declare it ignore it.
-          const result = await (originalExecute as (p: unknown, ctx?: ToolExecuteContext) => Promise<unknown>)(params, context);
+          const result = await tool.execute(params, context);
           this.logger.debug('[Tool] executed', {
             name: tool.name,
             durationMs: Date.now() - toolStartMs,
@@ -1903,19 +1883,44 @@ export class CortexAgent {
   // -----------------------------------------------------------------------
 
   /**
-   * Update the session token count from LLM usage data.
+   * Update the post-hoc current-context token count from LLM usage data.
    * Called by the consumer after each LLM call with the input_tokens
    * from AssistantMessage.usage.
    */
-  updateSessionTokenCount(inputTokens: number): void {
-    this.compactionManager.updateTokenCount(inputTokens);
+  updateCurrentContextTokenCount(inputTokens: number): void {
+    this.compactionManager.updateCurrentContextTokenCount(inputTokens);
   }
 
   /**
-   * Get the current session token count.
+   * Get the post-hoc current-context token count from the most recent parent turn.
    */
-  get sessionTokenCount(): number {
-    return this.compactionManager.sessionTokenCount;
+  get currentContextTokenCount(): number {
+    return this.compactionManager.currentContextTokenCount;
+  }
+
+  /**
+   * Estimate the current context tokens Cortex would send on the next parent LLM call.
+   *
+   * This is a heuristic estimate of the transformed context snapshot built from:
+   * - the current system prompt
+   * - slots and conversation history
+   * - ephemeral context
+   * - background task state
+   * - loaded skills
+   *
+   * The estimate is compared against the most recent post-hoc parent turn usage
+   * and the larger value is returned. This matches the compaction manager's
+   * internal decision logic.
+   */
+  estimateCurrentContextTokens(): number {
+    const boundary = this._isPrompting
+      ? this._prePromptMessageCount
+      : this.agent.state.messages.length;
+    const snapshot = this.buildInjectedAndSanitizedContextSnapshot(
+      this.buildAgentContextSnapshot(),
+      boundary,
+    );
+    return this.compactionManager.estimateCurrentContextTokens(snapshot);
   }
 
   /**
@@ -2087,7 +2092,7 @@ export class CortexAgent {
    * Returns only the MCP-wrapped tools. Built-in tools are registered
    * directly on the Agent and are not included here.
    */
-  getMcpTools(): Array<{ name: string; description: string; parameters: unknown; execute: (args: unknown) => Promise<unknown> }> {
+  getMcpTools(): CortexTool[] {
     return this.mcpClientManager.getTools();
   }
 
@@ -2142,54 +2147,8 @@ export class CortexAgent {
       // it the "last user message" where pi-ai places BP4. That meant
       // the entire conversation history was cache-WRITTEN but never
       // cache-READ because the ephemeral prefix changed every tick.
-      let result = context;
-      const ephemeralContent = this.contextManager.getEphemeral();
       const boundary = this._prePromptMessageCount;
-
-      // Build injection messages (ephemeral + background state + skills)
-      const injections: AgentMessage[] = [];
-      if (ephemeralContent) {
-        injections.push({ role: 'user' as const, content: ephemeralContent });
-      }
-
-      // Inject background task state so the agent has visibility into
-      // running sub-agents and background bash processes.
-      const backgroundState = this.buildBackgroundTaskState();
-      if (backgroundState) {
-        injections.push({ role: 'user' as const, content: backgroundState });
-      }
-      if (this.skillBuffer.length > 0) {
-        const formatted = this.skillBuffer.map(s =>
-          `<skill-instructions name="${s.name}">\n${s.content}\n</skill-instructions>`,
-        ).join('\n\n');
-        injections.push({ role: 'user' as const, content: formatted });
-      }
-
-      if (injections.length > 0) {
-        // Insert at boundary: [...slots + old_history] [injections] [...new_tick_content]
-        const messages = [...result.messages];
-        // boundary may exceed array length on first tick or after reset
-        const insertIdx = Math.min(boundary, messages.length);
-        messages.splice(insertIdx, 0, ...injections);
-        result = { ...result, messages };
-      }
-
-      // Step 2: Sanitize messages BEFORE compaction.
-      // Pi-agent-core may append messages with content: undefined (bad tool
-      // results) or content: [] (empty API responses, error messages). These
-      // crash extractTextContent() in microcompaction and transform-messages
-      // in pi-ai. Must run before compaction touches the messages.
-      result = {
-        ...result,
-        messages: result.messages.map(msg => {
-          const content = (msg as unknown as Record<string, unknown>)['content'];
-          if (content === undefined || content === null ||
-              (Array.isArray(content) && content.length === 0)) {
-            return { ...msg, content: [{ type: 'text' as const, text: '(no output)' }] };
-          }
-          return msg;
-        }),
-      };
+      let result = this.buildInjectedAndSanitizedContextSnapshot(context, boundary);
 
       // Step 3: Compaction (all three layers integrated)
       // Layer 2 operates on agent.state.messages (the original transcript),
@@ -2231,6 +2190,67 @@ export class CortexAgent {
       );
 
       return result;
+    };
+  }
+
+  private buildAgentContextSnapshot(): AgentContext {
+    return {
+      systemPrompt: this.agent.state.systemPrompt ?? '',
+      model: this.agent.state.model ?? null,
+      messages: this.agent.state.messages,
+      tools: (this.agent.state.tools ?? []) as unknown[],
+      thinkingLevel: typeof this.agent.state.thinkingLevel === 'string'
+        ? this.agent.state.thinkingLevel
+        : 'medium',
+    };
+  }
+
+  private buildInjectedAndSanitizedContextSnapshot(
+    context: AgentContext,
+    boundary: number,
+  ): AgentContext {
+    let result = context;
+    const ephemeralContent = this.contextManager.getEphemeral();
+
+    // Build injection messages (ephemeral + background state + skills)
+    const injections: AgentMessage[] = [];
+    if (ephemeralContent) {
+      injections.push({ role: 'user' as const, content: ephemeralContent });
+    }
+
+    // Inject background task state so the agent has visibility into
+    // running sub-agents and background bash processes.
+    const backgroundState = this.buildBackgroundTaskState();
+    if (backgroundState) {
+      injections.push({ role: 'user' as const, content: backgroundState });
+    }
+    if (this.skillBuffer.length > 0) {
+      const formatted = this.skillBuffer.map(s =>
+        `<skill-instructions name="${s.name}">\n${s.content}\n</skill-instructions>`,
+      ).join('\n\n');
+      injections.push({ role: 'user' as const, content: formatted });
+    }
+
+    if (injections.length > 0) {
+      // Insert at boundary: [...slots + old_history] [injections] [...new_tick_content]
+      const messages = [...result.messages];
+      // boundary may exceed array length on first tick or after reset
+      const insertIdx = Math.min(boundary, messages.length);
+      messages.splice(insertIdx, 0, ...injections);
+      result = { ...result, messages };
+    }
+
+    // Sanitize messages before token estimation or compaction.
+    return {
+      ...result,
+      messages: result.messages.map(msg => {
+        const content = (msg as unknown as Record<string, unknown>)['content'];
+        if (content === undefined || content === null ||
+            (Array.isArray(content) && content.length === 0)) {
+          return { ...msg, content: [{ type: 'text' as const, text: '(no output)' }] };
+        }
+        return msg;
+      }),
     };
   }
 
@@ -2366,10 +2386,14 @@ export class CortexAgent {
   }
 
   /**
-   * Normalize built-in tool instances so this agent owns fresh mutable state.
+   * Normalize registered tools so this agent owns fresh mutable state and
+   * everything stored internally uses Cortex's canonical tool contract.
    */
   private normalizeRegisteredTools(tools: RegisteredTool[]): RegisteredTool[] {
-    return tools.map(tool => cloneRuntimeAwareTool(tool, this.toolRuntime) ?? tool);
+    return tools.map((tool) => {
+      const runtimeOwnedTool = cloneRuntimeAwareTool(tool, this.toolRuntime) ?? tool;
+      return assertValidCortexTool(runtimeOwnedTool);
+    });
   }
 
   private resolveModels(config: CortexAgentConfig): {
@@ -2508,13 +2532,13 @@ export class CortexAgent {
    * Maps bridge events to consumer-registered callbacks.
    */
   private wireInternalEvents(): void {
-    // Map session_end -> onLoopComplete
+    // Map loop_end -> onLoopComplete
     this.eventUnsubscribers.push(
-      this.eventBridge.on('session_end', () => {
-        this.logger.info('[CortexAgent] session_end', {
+      this.eventBridge.on('loop_end', () => {
+        this.logger.info('[CortexAgent] loop_end', {
           turns: this.budgetGuard.getTurnCount(),
           totalCost: this.budgetGuard.getTotalCost(),
-          sessionTokens: this.compactionManager.sessionTokenCount,
+          currentContextTokens: this.compactionManager.currentContextTokenCount,
         });
         this.skillBuffer = [];
         for (const handler of this.loopCompleteHandlers) {
@@ -2540,9 +2564,9 @@ export class CortexAgent {
         // from both parent and child events (total cost reporting).
         if (event.usage) {
           if (!isChildEvent) {
-            const inputTokens = event.usage.input + event.usage.cacheRead;
+            const inputTokens = event.usage.input + event.usage.cacheRead + event.usage.cacheWrite;
             if (inputTokens > 0) {
-              this.compactionManager.updateTokenCount(inputTokens);
+              this.compactionManager.updateCurrentContextTokenCount(inputTokens);
             }
           }
 
@@ -2568,7 +2592,7 @@ export class CortexAgent {
           // Only for parent events (child context is irrelevant here).
           const inputTokens = this.extractInputTokens(event.data);
           if (inputTokens > 0) {
-            this.compactionManager.updateTokenCount(inputTokens);
+            this.compactionManager.updateCurrentContextTokenCount(inputTokens);
           }
           this._sessionUsage.totalTurns += 1;
         }
@@ -2644,9 +2668,9 @@ export class CortexAgent {
     const event = data as Record<string, unknown>;
 
     // Pi-ai's Usage type has: input, output, cacheRead, cacheWrite, totalTokens.
-    // With prefix caching, most input tokens are reported as cacheRead, not input.
+    // With prefix caching, tokens shift between input/cacheRead/cacheWrite.
     // For compaction, we need the TOTAL context size the model saw:
-    // input + cacheRead = total input tokens (both cached and uncached).
+    // input + cacheRead + cacheWrite = total input tokens.
     // Fallback to totalTokens - output if individual fields are unavailable.
 
     // Pattern 1: message.usage (pi-ai AssistantMessage structure, most common)
@@ -2681,17 +2705,18 @@ export class CortexAgent {
 
   /**
    * Compute total input tokens from a pi-ai Usage object.
-   * With prefix caching, `input` only reflects uncached tokens.
-   * The real context size is `input + cacheRead`.
+   * With prefix caching, tokens shift between input/cacheRead/cacheWrite.
+   * The real context size is `input + cacheRead + cacheWrite`.
    * Falls back to `totalTokens - output` if individual fields are missing.
    */
   private computeTotalInput(usage: Record<string, unknown>): number {
     const input = typeof usage['input'] === 'number' ? usage['input'] : 0;
     const cacheRead = typeof usage['cacheRead'] === 'number' ? usage['cacheRead'] : 0;
+    const cacheWrite = typeof usage['cacheWrite'] === 'number' ? usage['cacheWrite'] : 0;
 
-    // Primary: input + cacheRead = total tokens the model saw as input
-    if (input + cacheRead > 0) {
-      return input + cacheRead;
+    // Primary: input + cacheRead + cacheWrite = total tokens the model saw as input
+    if (input + cacheRead + cacheWrite > 0) {
+      return input + cacheRead + cacheWrite;
     }
 
     // Fallback: totalTokens - output
@@ -3212,7 +3237,7 @@ export class CortexAgent {
 
       const durationSec = Math.round((now - entry.spawnedAt) / 1000);
       const childAgent = entry.agent as CortexAgent;
-      const tokens = (childAgent.sessionTokenCount / 1000).toFixed(1);
+      const tokens = (childAgent.currentContextTokenCount / 1000).toFixed(1);
       const budget = childAgent.getBudgetGuard();
       const turnsUsed = budget.getTurnCount();
       const turnsMax = budget.getMaxTurns();
@@ -3644,7 +3669,7 @@ export class CortexAgent {
           turns: childAgent.getBudgetGuard().getTurnCount(),
           cost: childAgent.getBudgetGuard().getTotalCost(),
           durationMs: Date.now() - startTime,
-          totalTokens: childAgent.sessionTokenCount,
+          contextTokens: childAgent.currentContextTokenCount,
         },
         toolCalls: this.extractToolCallSummary(history),
       };
@@ -3669,7 +3694,7 @@ export class CortexAgent {
           turns: childAgent.getBudgetGuard().getTurnCount(),
           cost: childAgent.getBudgetGuard().getTotalCost(),
           durationMs: Date.now() - startTime,
-          totalTokens: childAgent.sessionTokenCount,
+          contextTokens: childAgent.currentContextTokenCount,
         },
       };
 

@@ -8,7 +8,7 @@
  */
 
 import type { Component, TUI } from '@mariozechner/pi-tui';
-import { estimateTokens } from '@animus-labs/cortex';
+import { estimateTokens, TOOL_RESULT_WORKING_TAGS_REMINDER } from '@animus-labs/cortex';
 import { BorderedBox } from './bordered-box.js';
 import { getRenderer } from './registry.js';
 import { getToolTheme } from '../theme.js';
@@ -80,8 +80,10 @@ export class ToolExecutionComponent implements Component {
    * Mark as completed. Called on tool_call_end (success).
    */
   complete(result: unknown, details: unknown, durationMs: number): void {
-    this.durationMs = durationMs;
-    this.lastResult = result;
+    // Use event duration, but fall back to tool-reported duration from details
+    // (pi-agent-core events may not carry durationMs; tools like Bash track it internally)
+    this.durationMs = durationMs || this.extractDurationFromDetails(details) || (Date.now() - this.startTime);
+    this.lastResult = this.stripOperationalText(result);
     this.lastDetails = details;
     this.lastStreamUpdate = undefined;
     this.resultTokens = this.estimateResultTokens(result);
@@ -205,6 +207,46 @@ export class ToolExecutionComponent implements Component {
       const display = this.renderer.renderStreamUpdate(this.lastStreamUpdate, context);
       this.box.setContent(display.headerText, display.contentLines, display.footerText, this.status);
     }
+  }
+
+  /**
+   * Extract duration from tool-specific details.
+   * Tools like Bash track duration internally as details.duration.
+   */
+  private extractDurationFromDetails(details: unknown): number {
+    if (!details || typeof details !== 'object') return 0;
+    const d = details as Record<string, unknown>;
+    // Bash: details.duration (ms), SubAgent: details.durationMs
+    const duration = Number(d['duration'] ?? d['durationMs'] ?? 0);
+    return duration > 0 ? duration : 0;
+  }
+
+  /**
+   * Strip operational text (working tags reminder) from tool results.
+   * This text is injected by Cortex for the LLM but should not be displayed.
+   */
+  private stripOperationalText(result: unknown): unknown {
+    if (typeof result === 'string') {
+      return result.replace('\n\n' + TOOL_RESULT_WORKING_TAGS_REMINDER, '').replace(TOOL_RESULT_WORKING_TAGS_REMINDER, '');
+    }
+    if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
+      const r = result as Record<string, unknown>;
+      if (Array.isArray(r['content'])) {
+        const cleaned = (r['content'] as Array<Record<string, unknown>>).map(part => {
+          if (part['type'] === 'text' && typeof part['text'] === 'string') {
+            return {
+              ...part,
+              text: (part['text'] as string)
+                .replace('\n\n' + TOOL_RESULT_WORKING_TAGS_REMINDER, '')
+                .replace(TOOL_RESULT_WORKING_TAGS_REMINDER, ''),
+            };
+          }
+          return part;
+        });
+        return { ...r, content: cleaned };
+      }
+    }
+    return result;
   }
 
   /**

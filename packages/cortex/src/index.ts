@@ -102,8 +102,12 @@ export type {
 export { BudgetGuard } from './budget-guard.js';
 
 // CortexAgent (Phase 1B)
-export { CortexAgent, MINIMUM_CONTEXT_WINDOW } from './cortex-agent.js';
+export { CortexAgent, MINIMUM_CONTEXT_WINDOW, TOOL_RESULT_WORKING_TAGS_REMINDER } from './cortex-agent.js';
 export type { PiAgent, PiModel } from './cortex-agent.js';
+
+// Tool Contracts
+export { fromPiAgentTool, assertValidCortexTool } from './tool-contract.js';
+export type { CortexTool, PiAgentTool } from './tool-contract.js';
 
 // MCP Client Manager (Phase 3)
 export { McpClientManager } from './mcp-client.js';
