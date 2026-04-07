@@ -100,9 +100,17 @@ npm run test:coverage
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 
-**Format (single line only, no body, no footer):**
+**Format (single line only, no body, no footer, no co-authors):**
 ```
 <type>(<scope>): <description>
+```
+
+**Examples:**
+```
+feat(cortex): add adaptive threshold to compaction manager
+fix(cortex-code): show rejected edits as errors in TUI
+docs(cortex): sync documentation with implemented codebase
+refactor(cortex): extract provider registry into separate module
 ```
 
 **Types:** `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `style`
@@ -110,6 +118,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 **Scopes:** `cortex`, `cortex-code`, `docs`, `ci`, `release`
 
 **Rules:**
+- Single line only. No message body, no footer, no `Co-Authored-By`.
 - Commit early and often. Small, focused commits are preferred.
 - Each commit should be one logical change.
 - Write in imperative mood: "add feature" not "added feature".
