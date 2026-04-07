@@ -2525,13 +2525,18 @@ export class CortexAgent {
     // Map turn_end -> onTurnComplete with AgentTextOutput
     this.eventUnsubscribers.push(
       this.eventBridge.on('turn_end', (event) => {
+        const isChildEvent = Boolean(event.childTaskId);
+
         // Read typed usage from EventBridge (centralized extraction).
-        // Updates both CompactionManager (context window tracking) and
-        // session-lifetime usage accumulation.
+        // CompactionManager only gets parent events (child tokens don't
+        // affect this agent's context window). Session usage accumulates
+        // from both parent and child events (total cost reporting).
         if (event.usage) {
-          const inputTokens = event.usage.input + event.usage.cacheRead;
-          if (inputTokens > 0) {
-            this.compactionManager.updateTokenCount(inputTokens);
+          if (!isChildEvent) {
+            const inputTokens = event.usage.input + event.usage.cacheRead;
+            if (inputTokens > 0) {
+              this.compactionManager.updateTokenCount(inputTokens);
+            }
           }
 
           // Accumulate session-lifetime usage (does not reset per loop)
@@ -2548,10 +2553,12 @@ export class CortexAgent {
             cacheRead: event.usage.cacheRead,
             cost: event.usage.cost.total,
             sessionTotalCost: this._sessionUsage.totalCost,
+            childTaskId: event.childTaskId,
           });
-        } else {
+        } else if (!isChildEvent) {
           // Fallback: extract input tokens from raw event data if EventBridge
           // could not build typed usage (e.g., provider returned partial data).
+          // Only for parent events (child context is irrelevant here).
           const inputTokens = this.extractInputTokens(event.data);
           if (inputTokens > 0) {
             this.compactionManager.updateTokenCount(inputTokens);
