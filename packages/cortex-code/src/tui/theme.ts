@@ -116,6 +116,23 @@ export const colors = {
   userMessageBg: (s: string) => chalk.bgHex('#0D2926')(s),
 };
 
+// Lazy-loaded syntax highlighter (cli-highlight wraps highlight.js)
+let highlightFn: ((code: string, options?: { language?: string }) => string) | null = null;
+let highlightLoaded = false;
+
+function loadHighlighter(): typeof highlightFn {
+  if (highlightLoaded) return highlightFn;
+  highlightLoaded = true;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require('cli-highlight') as { highlight: typeof highlightFn };
+    highlightFn = mod.highlight;
+  } catch {
+    highlightFn = null;
+  }
+  return highlightFn;
+}
+
 export const markdownTheme: MarkdownTheme = {
   heading: (s) => chalk.bold.hex('#00E5CC')(s),
   link: (s) => chalk.hex('#00E5CC')(s),
@@ -131,6 +148,21 @@ export const markdownTheme: MarkdownTheme = {
   italic: (s) => chalk.italic(s),
   strikethrough: (s) => chalk.strikethrough(s),
   underline: (s) => chalk.underline(s),
+  highlightCode: (code: string, lang?: string): string[] => {
+    const highlight = loadHighlighter();
+    if (!highlight) {
+      return code.split('\n');
+    }
+    try {
+      const opts: { language?: string } = {};
+      if (lang) opts.language = lang;
+      const highlighted = highlight(code, opts);
+      return highlighted.split('\n');
+    } catch {
+      // Fallback: return unhighlighted lines
+      return code.split('\n');
+    }
+  },
 };
 
 export const selectListTheme: SelectListTheme = {
