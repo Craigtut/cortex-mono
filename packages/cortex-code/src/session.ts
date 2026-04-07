@@ -353,20 +353,13 @@ export class Session {
 
     // Tool call lifecycle (uses typed payloads from EventBridge)
     bridge.on('tool_call_start', (event: CortexEvent) => {
+      // Drop child agent tool events entirely; sub-agent internals are not shown
+      if (event.childTaskId) return;
+
       const p = event.payload as import('@animus-labs/cortex').ToolCallStartPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
 
-      // Child agent tool events: route to the parent sub-agent's renderer for nested visibility
-      if (event.childTaskId) {
-        this.app!.transcript.updateToolCall(event.childTaskId, {
-          toolCalls: [{ name: toolName, status: 'pending', summary: '' }],
-        });
-        return;
-      }
-
-      // SubAgent tool calls are displayed via the onSubAgentSpawned lifecycle hook,
-      // which provides richer context (instructions, background flag). Skip here
-      // to avoid duplicate rendering.
+      // SubAgent tool calls are displayed via the onSubAgentSpawned lifecycle hook
       if (toolName === 'SubAgent') return;
 
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? Math.random());
@@ -377,7 +370,7 @@ export class Session {
 
     // Streaming tool updates (bash output, etc.)
     bridge.on('tool_call_update', (event: CortexEvent) => {
-      if (event.childTaskId) return; // child streaming updates are noise at the parent level
+      if (event.childTaskId) return;
 
       const p = event.payload as import('@animus-labs/cortex').ToolCallUpdatePayload | undefined;
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
@@ -389,16 +382,8 @@ export class Session {
     });
 
     bridge.on('tool_call_end', (event: CortexEvent) => {
-      // Child agent tool_call_end: update the nested tool's status icon
-      if (event.childTaskId) {
-        const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
-        const toolName = p?.toolName ?? 'unknown';
-        const status = p?.isError ? 'error' : 'success';
-        this.app!.transcript.updateToolCall(event.childTaskId, {
-          toolCalls: [{ name: toolName, status, summary: '' }],
-        });
-        return;
-      }
+      // Drop child agent tool events entirely
+      if (event.childTaskId) return;
 
       const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
