@@ -316,7 +316,7 @@ export class EventBridge {
     if (cortexType === 'tool_call_end') {
       const result = piEvent['result'] as ToolContentDetails<unknown> | undefined;
       const isError = Boolean(piEvent['isError']);
-      const error = piEvent['error'] as string | undefined;
+      const explicitError = piEvent['error'];
       const payload: ToolCallEndPayload = {
         toolCallId: String(piEvent['toolCallId'] ?? piEvent['id'] ?? ''),
         toolName: String(piEvent['toolName'] ?? piEvent['name'] ?? 'unknown'),
@@ -325,7 +325,31 @@ export class EventBridge {
         isError,
       };
       if (isError) {
-        payload.error = error ?? 'unknown error';
+        // Extract error text from multiple possible sources:
+        // 1. Explicit error string field
+        // 2. Error object with message
+        // 3. Result content text (pi-agent-core puts error details here)
+        // 4. Fallback
+        let errorText: string | undefined;
+        if (typeof explicitError === 'string') {
+          errorText = explicitError;
+        } else if (explicitError instanceof Error) {
+          errorText = explicitError.message;
+        } else if (typeof explicitError === 'object' && explicitError !== null && 'message' in (explicitError as Record<string, unknown>)) {
+          errorText = String((explicitError as Record<string, unknown>)['message']);
+        }
+
+        // If no explicit error, extract from result content
+        if (!errorText && result?.content) {
+          const textParts = result.content
+            .filter((c): c is { type: 'text'; text: string } => c.type === 'text')
+            .map(c => c.text);
+          if (textParts.length > 0) {
+            errorText = textParts.join('\n');
+          }
+        }
+
+        payload.error = errorText ?? 'unknown error';
       }
       return payload;
     }

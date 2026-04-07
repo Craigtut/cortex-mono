@@ -3444,7 +3444,6 @@ export class CortexAgent {
         return this.handleBackgroundCompletion(taskId, result);
       })
       .catch((err) => {
-        unsubForward();
         this.logger.error('[CortexAgent] subagent failed', {
           taskId,
           background: true,

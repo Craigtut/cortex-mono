@@ -253,6 +253,7 @@ export function createReadTool(config: ReadToolConfig): {
               truncated: false,
               truncatedLines: false,
               truncatedChars: false,
+              startLine: 1,
             },
           };
         }
@@ -266,6 +267,7 @@ export function createReadTool(config: ReadToolConfig): {
               truncated: false,
               truncatedLines: false,
               truncatedChars: false,
+              startLine: 1,
             },
           };
         }
@@ -345,6 +347,7 @@ export function createReadTool(config: ReadToolConfig): {
               truncated: false,
               truncatedLines: false,
               truncatedChars: false,
+              startLine: 1,
             },
           };
         }
