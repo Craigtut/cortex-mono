@@ -531,8 +531,10 @@ export class Session {
       this.app!.showStatusSpinner('Processing background results...');
     });
 
-    // Auto-save on turn_end for crash resilience
+    // Update tokens and auto-save on turn_end (fires after each LLM turn,
+    // including mid-loop turns between tool calls)
     bridge.on('turn_end', () => {
+      this.updateFooterTokens();
       this.triggerAutoSave();
     });
   }
