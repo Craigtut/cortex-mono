@@ -85,18 +85,28 @@ export class App {
     this.statusBar.setState(state);
   }
 
+  private savedPositionHardwareCursor: ((...args: unknown[]) => void) | null = null;
+
   /** Show a loading spinner in the status area (during agent execution). */
   showStatusSpinner(message: string): void {
     this.hideStatusSpinner();
     this.statusLoader = new Loader(this.tui, colors.primary, colors.muted, message);
     this.statusContainer.addChild(this.statusLoader);
     this.statusLoader.start();
-    // Unfocus the editor so pi-tui stops emitting CURSOR_MARKER.
-    // Without this, positionHardwareCursor() moves the terminal cursor
-    // to the editor position on every render cycle (80ms spinner tick),
-    // which forces the terminal viewport to the bottom and prevents
-    // the user from scrolling up during agent execution.
-    this.tui.setFocus(null);
+    // Suppress cursor positioning during agent execution.
+    // pi-tui's positionHardwareCursor() moves the terminal cursor to the
+    // focused editor's position on every render cycle (80ms spinner tick).
+    // This forces the terminal viewport to the bottom, preventing the user
+    // from scrolling up. We replace it with a no-op that just hides the
+    // cursor. The editor stays focused so input routing (permissions, etc.)
+    // still works.
+    const tui = this.tui as unknown as Record<string, unknown>;
+    if (!this.savedPositionHardwareCursor) {
+      this.savedPositionHardwareCursor = tui['positionHardwareCursor'] as (...args: unknown[]) => void;
+      tui['positionHardwareCursor'] = () => {
+        this.terminal.hideCursor();
+      };
+    }
   }
 
   /** Hide the status spinner. */
@@ -106,8 +116,12 @@ export class App {
       this.statusContainer.removeChild(this.statusLoader);
       this.statusLoader = null;
     }
-    // Restore editor focus so the user can type
-    this.tui.setFocus(this.editor);
+    // Restore cursor positioning
+    if (this.savedPositionHardwareCursor) {
+      const tui = this.tui as unknown as Record<string, unknown>;
+      tui['positionHardwareCursor'] = this.savedPositionHardwareCursor;
+      this.savedPositionHardwareCursor = null;
+    }
   }
 
   /**
