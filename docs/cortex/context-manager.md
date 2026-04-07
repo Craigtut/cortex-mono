@@ -13,17 +13,17 @@ The message array has four regions. The ContextManager owns the first and third;
 │  SLOT REGION (positions 0..N-1)                 │  Owned by ContextManager
 │  Persistent, named, stability-ordered           │  Updated immediately via setSlot()
 ├─────────────────────────────────────────────────┤
-│  CONVERSATION HISTORY (positions N..M)          │  Owned by pi-agent-core
+│  CONVERSATION HISTORY (old, positions N..M)      │  Owned by pi-agent-core
 │  Grows organically as agent runs                │  ContextManager does NOT touch this
 │  User messages, assistant responses,            │
 │  tool_use/tool_result pairs                     │
 ├ ─ ─ ─ ─ ─ ─ PREFIX CACHE BOUNDARY ─ ─ ─ ─ ─ ─ ┤
-│  EPHEMERAL CONTEXT (appended in transformContext)│  Owned by ContextManager
-│  Never stored in agent.state.messages           │  Rebuilt every LLM call
+│  EPHEMERAL CONTEXT (injected in transformContext)│  Owned by ContextManager + Cortex
+│  Consumer ephemeral, background task state,     │  Rebuilt every LLM call
+│  loaded skill instructions                      │  Never stored in agent.state.messages
 ├─────────────────────────────────────────────────┤
-│  USER PROMPT (position M+2)                     │  The input to agent.prompt()
-│  The actual tick prompt or user message          │  Appended by pi-agent-core
-│  Becomes conversation history on the next turn  │
+│  CURRENT TICK CONTENT + USER PROMPT             │  New tool results + prompt
+│  Content from the current agentic loop turn     │  Appended by pi-agent-core
 └─────────────────────────────────────────────────┘
 ```
 
@@ -183,13 +183,17 @@ Ephemeral context is per-call content that the LLM should see but that should NO
 
 ### What Goes in Ephemeral Context
 
-Ephemeral context includes anything that changes every tick or depends on runtime state that shifts between ticks:
+There are two sources of ephemeral content, injected as separate user-role messages at the boundary position:
 
-- **Active contact**: Which contact triggered or is relevant to this tick. This is why the contacts slot itself has no `(current)` marker; the active contact identity lives here.
-- **Emotional state and energy level**: Current emotion values, energy band.
-- **Tick trigger details**: What triggered this tick (message, interval, scheduled task, etc.).
-- **Retrieved memories**: Semantically relevant long-term memories for this tick's context.
-- **Tick interval magnitude calibration**: The energy guidance magnitude table depends on the current tick interval, which changes during sleep transitions. The static energy band guidance (what each band means behaviorally) stays in the system prompt since it is constant. The magnitude calibration (how strongly to apply that guidance, scaled by tick interval) belongs in ephemeral context because it varies at runtime.
+**1. Consumer ephemeral content** (via `setEphemeral()`): Anything the consumer wants the LLM to see per-call. Examples: environment info (cwd, git branch, model), runtime state, active contact context, emotional state, retrieved memories.
+
+**2. Background task state** (automatic, framework-level): Cortex automatically builds and injects a `<background-tasks>` block describing running sub-agents and background bash processes. This gives the parent agent visibility into long-running work without requiring a tool call. Only running tasks are included; completed tasks deliver their results through the normal completion flow.
+
+The background task block includes:
+- **Running sub-agents**: task ID, instructions, duration, tool count, current tool activity (with "started N seconds ago" for hang detection), token usage, turn count with budget ceiling, and whether the sub-agent is waiting on a permission prompt
+- **Running bash processes**: task ID, command, duration, last few lines of stdout
+
+This block is omitted entirely when no background tasks are running.
 
 ### Composability
 
