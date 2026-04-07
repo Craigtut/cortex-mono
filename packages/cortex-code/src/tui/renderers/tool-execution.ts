@@ -80,12 +80,16 @@ export class ToolExecutionComponent implements Component {
    * Mark as completed. Called on tool_call_end (success).
    */
   complete(result: unknown, details: unknown, durationMs: number): void {
-    this.status = 'success';
     this.durationMs = durationMs;
     this.lastResult = result;
     this.lastDetails = details;
     this.lastStreamUpdate = undefined;
     this.resultTokens = this.estimateResultTokens(result);
+
+    // Detect soft rejections (e.g., read-before-edit enforcement)
+    // where the tool returns "success" but the operation was not performed.
+    this.status = this.detectRejection(details) ? 'error' : 'success';
+
     this.stopSpinner();
     this.rebuildDisplay();
   }
@@ -201,6 +205,28 @@ export class ToolExecutionComponent implements Component {
       const display = this.renderer.renderStreamUpdate(this.lastStreamUpdate, context);
       this.box.setContent(display.headerText, display.contentLines, display.footerText, this.status);
     }
+  }
+
+  /**
+   * Detect soft rejections: tools that return "success" but the operation
+   * was not actually performed (e.g., read-before-edit enforcement).
+   */
+  private detectRejection(details: unknown): boolean {
+    if (!details || typeof details !== 'object') return false;
+    const d = details as Record<string, unknown>;
+
+    // Edit: replacementCount 0 with no diff means rejected
+    if (this.toolName === 'Edit' && d['replacementCount'] === 0 &&
+        (!d['diff'] || (Array.isArray(d['diff']) && (d['diff'] as unknown[]).length === 0))) {
+      return true;
+    }
+
+    // Write: bytesWritten 0 for an existing file means rejected
+    if (this.toolName === 'Write' && d['bytesWritten'] === 0 && d['isCreate'] === false) {
+      return true;
+    }
+
+    return false;
   }
 
   /**

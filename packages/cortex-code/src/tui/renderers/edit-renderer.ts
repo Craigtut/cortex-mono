@@ -13,6 +13,20 @@ import { registerRenderer } from './registry.js';
 const COLLAPSED_LINES = 15;
 const CONTEXT_LINES_BEFORE = 3;
 
+function extractResultText(result: unknown): string {
+  if (typeof result === 'string') return result;
+  if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
+    const content = (result as Record<string, unknown>)['content'];
+    if (Array.isArray(content)) {
+      return content
+        .filter((c: unknown) => c && typeof c === 'object' && (c as Record<string, unknown>)['type'] === 'text')
+        .map((c: unknown) => (c as Record<string, string>)['text'])
+        .join('\n');
+    }
+  }
+  return '';
+}
+
 function renderDiffHunks(hunks: DiffHunk[], theme: ToolRenderContext['theme']): string[] {
   const lines: string[] = [];
   const addColor = chalk.hex(theme.diffAdd);
@@ -67,14 +81,26 @@ const editRenderer: ToolRenderer = {
     const d = details as EditDetails | undefined;
     const filePath = d?.filePath ?? '';
 
+    // Detect read-before-edit rejection: replacementCount 0 with no diff
+    // means the edit was rejected, not applied. Show as a warning.
+    const resultText = extractResultText(result);
+    const isRejection = d?.replacementCount === 0 && (!d?.diff || d.diff.length === 0);
+
+    if (isRejection && resultText) {
+      const shortPath = shortenPath(filePath);
+      return {
+        headerText: `edit ${shortPath}`,
+        contentLines: [chalk.hex(context.theme.muted)(resultText)],
+        footerText: 'rejected',
+      };
+    }
+
     let diffLines: string[];
     if (d?.diff && d.diff.length > 0) {
       diffLines = renderDiffHunks(d.diff, context.theme);
       diffLines = windowAroundFirstChange(diffLines, CONTEXT_LINES_BEFORE);
     } else {
-      // No diff available, show a summary
-      const text = typeof result === 'string' ? result : '';
-      diffLines = text ? text.split('\n') : ['(edit applied)'];
+      diffLines = resultText ? resultText.split('\n') : ['(edit applied)'];
     }
 
     // Collapse
@@ -88,7 +114,7 @@ const editRenderer: ToolRenderer = {
     const shortPath = shortenPath(filePath);
     const linkedPath = fileLink(filePath, shortPath);
     const lineInfo = d?.diff?.[0] ? `:${d.diff[0].newStart}` : '';
-    const countInfo = d && d.replacementCount > 1 ? ` (${d.replacementCount} replacements)` : '';
+    const countInfo = d && d.replacementCount > 1 ? `(${d.replacementCount} replacements)` : '';
 
     return {
       headerText: `edit ${linkedPath}${lineInfo}`,
