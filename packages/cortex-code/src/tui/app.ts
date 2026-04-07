@@ -91,6 +91,12 @@ export class App {
     this.statusLoader = new Loader(this.tui, colors.primary, colors.muted, message);
     this.statusContainer.addChild(this.statusLoader);
     this.statusLoader.start();
+    // Unfocus the editor so pi-tui stops emitting CURSOR_MARKER.
+    // Without this, positionHardwareCursor() moves the terminal cursor
+    // to the editor position on every render cycle (80ms spinner tick),
+    // which forces the terminal viewport to the bottom and prevents
+    // the user from scrolling up during agent execution.
+    this.tui.setFocus(null);
   }
 
   /** Hide the status spinner. */
@@ -100,6 +106,8 @@ export class App {
       this.statusContainer.removeChild(this.statusLoader);
       this.statusLoader = null;
     }
+    // Restore editor focus so the user can type
+    this.tui.setFocus(this.editor);
   }
 
   /**
