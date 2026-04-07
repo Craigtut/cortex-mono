@@ -1,6 +1,6 @@
 # Error Recovery
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 How Cortex classifies, surfaces, and recovers from errors. Covers the error classifier module, auth failure detection, rate limit backoff, and integration with the 5-phase pipeline.
 

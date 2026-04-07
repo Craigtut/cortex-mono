@@ -1,6 +1,6 @@
 # MCP Tool Integration
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 How Cortex bridges the gap between pi-agent-core's native `AgentTool` interface and the MCP protocol used by consumer domain tools and plugin tools. All external tool sources are consumed through a unified MCP client pattern, while a small set of built-in tools remain as direct in-process registrations.
 
@@ -26,7 +26,7 @@ CortexAgent
 │       └── HTTP transport (for HTTP-based plugins)
 │       └── tools/list -> AgentTool wrappers
 │
-└── beforeToolCall hook
+└── beforeToolCall hook (wired by CortexAgent, not McpClientManager)
     └── Permission gate (resolvePermission) for all tools
 ```
 
@@ -213,7 +213,7 @@ This is the same conversion used for Zod-defined tools (Zod -> JSON Schema -> Ty
 
 ### Tool Call Errors
 
-MCP tool call errors are caught and returned as AgentTool results with `isError: true`. The agent receives the error as a tool result and can retry or adjust its approach.
+MCP tool call errors are re-thrown as standard `Error` instances for pi-agent-core to handle. If the MCP result has `isError: true`, the error text is extracted from the content blocks and thrown. Non-`Error` exceptions are wrapped in a new `Error` with the tool name for traceability. This lets pi-agent-core's built-in error handling (retry, surface to model, etc.) govern the behavior rather than returning a silent error result.
 
 ### Connection Errors
 
@@ -239,12 +239,14 @@ Sub-Agent
 
 Child agents inherit the parent's live MCP wrappers at spawn time instead of reconnecting their own MCP subprocesses. This preserves access to currently connected tools while avoiding duplicate built-in runtime state.
 
+## Design Decisions
+
+1. **Connection persistence**: Connections are persistent (kept alive between ticks). The `McpClientManager` includes health monitoring via transport `onclose` handlers and automatic reconnection with up to 3 retry attempts before deregistering a server's tools. A brief delay separates retry attempts.
+
+2. **MCP resources and prompts**: Cortex intentionally supports only `tools/list` and `tools/call`. Resources and prompts are deferred. The current scope focuses on tool integration, which covers all consumer and plugin use cases. Resources could enable richer plugin context injection in a future iteration.
+
 ## Open Questions
 
-1. **Connection persistence**: Should MCP client connections be persistent (kept alive between ticks) or reconnected per tick? Persistent is more efficient but requires health monitoring. Reconnecting per tick is simpler but adds latency.
+1. **Connection error surfacing**: How should MCP client connection errors be surfaced to the user? Tool errors are visible in agent logs, but connection-level failures (subprocess crash, HTTP server down) may need a dedicated notification path.
 
-2. **MCP resources and prompts**: Should Cortex support MCP resources and prompts in addition to tools? Currently only `tools/list` and `tools/call` are used. Resources could enable richer plugin context injection.
-
-3. **Connection error surfacing**: How should MCP client connection errors be surfaced to the user? Tool errors are visible in agent logs, but connection-level failures (subprocess crash, HTTP server down) may need a dedicated notification path.
-
-4. **Tool count scaling**: As plugins accumulate, the total tool count could grow large. Should Cortex implement tool filtering or pagination, or rely on the LLM's ability to handle large tool lists?
+2. **Tool count scaling**: As plugins accumulate, the total tool count could grow large. Should Cortex implement tool filtering or pagination, or rely on the LLM's ability to handle large tool lists?

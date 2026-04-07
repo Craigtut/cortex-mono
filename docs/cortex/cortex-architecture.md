@@ -1,6 +1,6 @@
 # Cortex Architecture
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 `@animus-labs/cortex` is a standalone package that wraps `@mariozechner/pi-agent-core` into a production-grade agent. It adds the capabilities pi-agent-core deliberately omits: MCP tool support, tool permissions, budget guards, context compaction, skill system, and event logging. Session persistence is the consumer's responsibility; cortex provides lifecycle hooks and serialization helpers.
 

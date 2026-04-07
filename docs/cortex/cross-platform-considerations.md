@@ -133,42 +133,33 @@ The key is that cortex doesn't need explicit dock icon awareness. As long as it 
 
 **Verify:** Ensure `DYLD_INSERT_LIBRARIES` is NOT in the Bash tool's env var blocklist (it shouldn't be; it IS in the list as a security-blocked var). This creates a conflict: dock suppression on macOS uses `DYLD_INSERT_LIBRARIES`, but the Bash safety layer strips it for library injection prevention.
 
-**Resolution:** The consumer should explicitly add any required environment variables (e.g., `DYLD_INSERT_LIBRARIES` for dock suppression) to a cortex config `envOverrides` field that gets merged into ALL subprocess environments, bypassing the security blocklist for these specific vars. Add `envOverrides?: Record<string, string>` to `CortexAgentConfig`.
+**Resolution (IMPLEMENTED):** The consumer explicitly adds any required environment variables (e.g., `DYLD_INSERT_LIBRARIES` for dock suppression) to the `envOverrides` config field, which gets merged into ALL subprocess environments, bypassing the security blocklist for these specific vars. `CortexAgentConfig` includes `envOverrides?: Record<string, string>`, stored as a private readonly field on `CortexAgent` and propagated to the MCP client manager, sub-agents, and built-in tools.
 
 ### Implementation Phase
 
-Add `envOverrides` config field in Phase 1A (types), implement in Phase 1C (Bash tool) and Phase 3 (MCP client).
+The `envOverrides` config field is implemented in `CortexAgentConfig` (types.ts), stored and propagated by `CortexAgent` (cortex-agent.ts), and passed through to the MCP client manager and child agent configs.
 
-## Docker Shutdown Grace Period (MEDIUM)
+## Docker Shutdown Grace Period (MEDIUM, IMPLEMENTED)
 
 ### Problem
 
 Docker's default `stop_grace_period` is 10 seconds. Cortex's `destroy()` sequence could exceed this if tools don't check the AbortSignal (a long-running bash command blocks `waitForIdle()`).
 
-### Solution
+### Solution (IMPLEMENTED)
 
-Add a configurable timeout to `destroy()`:
+`CortexAgent.destroy()` accepts a configurable timeout parameter:
 
 ```typescript
-async destroy(timeoutMs: number = 8000): Promise<void> {
-  const deadline = setTimeout(() => {
-    // Force-kill remaining processes synchronously
-    this.forceKillAll();
-  }, timeoutMs);
-
-  try {
-    // Normal ordered cleanup...
-  } finally {
-    clearTimeout(deadline);
-  }
-}
+async destroy(timeoutMs = 8000): Promise<void>
 ```
 
-Document that Docker users should set `stop_grace_period: 15s` in `docker-compose.yml` if they experience orphaned processes.
+When the timeout elapses, `forceKillAll()` terminates all remaining tracked processes. The implementation lives in `cortex-agent.ts`.
+
+Docker users should set `stop_grace_period: 15s` in `docker-compose.yml` if they experience orphaned processes.
 
 ### Implementation Phase
 
-Add to Phase 1B (CortexAgent lifecycle). Update `cortex-architecture.md` Lifecycle section.
+Implemented in `CortexAgent` (cortex-agent.ts). The `destroy()` method accepts `timeoutMs` (default 8000ms) and force-kills all tracked processes via `forceKillAll()` if cleanup exceeds the deadline.
 
 ## Custom Endpoint Docker Networking (MEDIUM)
 

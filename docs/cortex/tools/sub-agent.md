@@ -2,7 +2,7 @@
 
 Spawn independent cortex-based sub-agents for delegated work.
 
-> **Priority: P1** - Ships after the core tools foundation.
+> **Priority: P0** - Fully implemented and shipped.
 
 ## Parameters
 

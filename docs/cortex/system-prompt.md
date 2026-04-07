@@ -1,6 +1,6 @@
 # Cortex Default System Prompt
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 The `CortexAgent` assembles a system prompt from two layers: a **consumer layer** (identity, persona, domain-specific instructions) followed by a **cortex operational layer** (rules, tool guidance, safety, environment). The consumer's content comes first to establish the strongest foundation for the agent's identity and behavior.
 

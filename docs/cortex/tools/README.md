@@ -21,18 +21,14 @@ Application-specific tools (domain-specific tools, cognitive tools, etc.) are re
 | Tool | Description |
 |------|-------------|
 | [Bash](./bash.md) | Execute shell commands |
+| [TaskOutput](./task-output.md) | Poll, send input to, or kill backgrounded processes |
 | [Read](./read.md) | Read file contents |
 | [Write](./write.md) | Create or overwrite files |
 | [Edit](./edit.md) | Make precise edits to existing files |
 | [Glob](./glob.md) | Find files by pattern |
 | [Grep](./grep.md) | Search file contents with regex (ripgrep) |
 | [WebFetch](./web-fetch.md) | Fetch and parse web content |
-
-### P1: Important (ship shortly after foundation)
-
-| Tool | Description | Notes |
-|------|-------------|-------|
-| [SubAgent](./sub-agent.md) | Spawn cortex-based sub-agents | Cortex sub-agents with restricted tool sets |
+| [SubAgent](./sub-agent.md) | Spawn cortex-based sub-agents |
 
 ### P3: Future (deferred)
 

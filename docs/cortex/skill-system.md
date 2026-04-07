@@ -1,6 +1,6 @@
 # Skill System
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 How Cortex discovers, loads, and injects skill content into the agent's context. Skills are SKILL.md files that teach the agent how to perform specific tasks or follow specific guidelines. They are loaded on demand (not all at once) and injected into ephemeral context to keep conversation history clean.
 
@@ -52,7 +52,7 @@ Cortex follows the open [Agent Skills specification](https://agentskills.io/spec
 | `compatibility` | No | Max 500 chars, environment requirements |
 | `metadata` | No | Arbitrary key-value map (author, version, etc.) |
 
-**Note on `allowed-tools`:** In Claude Code, this field hard-restricts which tools are sent to the API when a skill is active (reducing context size). In Cortex, skills inject into an existing agentic loop where all tools are already registered. Restricting tools mid-loop after a skill loads would be complex and behaviorally surprising. This field is **stored in frontmatter but not enforced in v1**. It becomes meaningful with sub-agent skill execution (`context: fork`), where tool restriction is natural: the sub-agent is created with only the allowed tools. Until then, `allowed-tools` serves as documentation for skill authors about which tools the skill expects to use.
+**Note on `allowed-tools`:** In some production coding agents, this field hard-restricts which tools are sent to the API when a skill is active (reducing context size). In Cortex, skills inject into an existing agentic loop where all tools are already registered. Restricting tools mid-loop after a skill loads would be complex and behaviorally surprising. This field is **stored in frontmatter but not enforced in v1**. It becomes meaningful with sub-agent skill execution (`context: fork`), where tool restriction is natural: the sub-agent is created with only the allowed tools. Until then, `allowed-tools` serves as documentation for skill authors about which tools the skill expects to use.
 
 ### Cortex Extension Fields
 
@@ -192,7 +192,7 @@ This mirrors the pattern used for MCP tool lifecycle in `mcp-integration.md`: dy
 
 ## Skill Advertisement
 
-The available skills list is embedded in the `load_skill` tool's description parameter, not directly in the system prompt body. This follows the Claude Code pattern where the Skill tool's description contains the available skills index.
+The available skills list is embedded in the `load_skill` tool's description parameter, not directly in the system prompt body. This follows the pattern used by production coding agents where the Skill tool's description contains the available skills index.
 
 ### Format
 
@@ -218,7 +218,7 @@ a new plugin or modifying plugin architecture.
 
 ### Token Budget
 
-Each skill in the advertisement consumes approximately 100 tokens (name + description). The total budget for the available skills list should not exceed 2% of the model's context window (following Claude Code's approach). With a 200K context window, this allows approximately 40 skills before hitting the budget. With a 1M context window, approximately 200 skills.
+Each skill in the advertisement consumes approximately 100 tokens (name + description). The total budget for the available skills list should not exceed 2% of the model's context window (following established patterns from production coding agents). With a 200K context window, this allows approximately 40 skills before hitting the budget. With a 1M context window, approximately 200 skills.
 
 **Filtering:**
 - Skills with `disable-model-invocation: true` (`modelInvocable: false`) are **excluded** from the summary. The agent cannot see or auto-load them. They remain loadable via consumer pre-loading (`cortexAgent.loadSkill()`).
@@ -238,6 +238,16 @@ Placing the skills list in the `load_skill` tool description rather than the sys
 ### The load_skill Tool
 
 A native `AgentTool` registered on the pi-agent-core Agent. This is the primary mechanism for getting skill content into context.
+
+**Configuration:** Registration of the `load_skill` tool is controlled by `CortexAgentConfig.enableLoadSkillTool`, which defaults to `true`. Set it to `false` to disable the tool entirely (for example, if the consumer does not use the skill system or manages skill loading through its own mechanism).
+
+```typescript
+const agent = await CortexAgent.create({
+  model,
+  workingDirectory: cwd,
+  enableLoadSkillTool: false, // Disable load_skill tool registration
+});
+```
 
 ```typescript
 const loadSkillTool: AgentTool = {

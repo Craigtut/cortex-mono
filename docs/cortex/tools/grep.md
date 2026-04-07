@@ -47,7 +47,7 @@ All modes respect `offset` and `head_limit` for pagination.
 - The `offset` + `head_limit` pattern enables pagination through large result sets without loading everything into context.
 
 ### Ripgrep Distribution
-The 6 platform-specific binaries (arm64-darwin, x64-darwin, x64-linux, arm64-linux, x64-win32, arm64-win32) are bundled as optional dependencies in the cortex npm package, one per platform. At install time, npm installs only the binary matching the current platform. At runtime, cortex resolves the binary path from the package's install location. This follows the same pattern Claude Code uses.
+The 6 platform-specific binaries (arm64-darwin, x64-darwin, x64-linux, arm64-linux, x64-win32, arm64-win32) are bundled as optional dependencies in the cortex npm package, one per platform. At install time, npm installs only the binary matching the current platform. At runtime, cortex resolves the binary path from the package's install location.
 
 ### Error Handling
 

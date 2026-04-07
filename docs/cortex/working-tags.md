@@ -1,6 +1,6 @@
 # Working Tags
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 Working tags are an optional Cortex feature that separates an agent's internal reasoning from user-facing communication during agentic loops. When enabled, the agent wraps internal working content in `<working>` XML tags. Text outside these tags is direct communication intended for the user.
 

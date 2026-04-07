@@ -20,7 +20,7 @@ Additionally, a consumer may have domain-specific compaction (e.g., compressing 
 
 1. **Cortex is general-purpose; the backend is domain-specific.** Cortex handles conversation history compaction (summarizing old turns). The backend handles observational memory compaction (compressing thoughts/experiences/messages into structured summaries). Cortex provides the hooks; the backend decides what domain-specific work to do.
 
-2. **Layered compression, not a single strategy.** Following the Claude Code pattern: cheap operations first (clearing old tool results), then summarization only when needed. Each layer buys time before the next kicks in.
+2. **Layered compression, not a single strategy.** Following established patterns from production coding agents: cheap operations first (clearing old tool results), then summarization only when needed. Each layer buys time before the next kicks in.
 
 3. **Slots are sacred.** Context slots (persona, contacts, core-self, working-memory, observations, goals, tasks) are never touched by compaction. They are managed independently by the backend and rebuilt from database sources on startup.
 
@@ -155,7 +155,7 @@ interface MicrocompactionConfig {
 
 - **JetBrains (NeurIPS 2025)**: Simple observation masking matches LLM summarization at zero cost for SE agents, reducing cost ~50% without performance degradation. But the masking should be graduated, not all-or-nothing.
 - **OpenClaw**: Uses semantic bookends (first/last 1,500 chars) as soft-trim before hard-clearing. In-memory only; disk transcript stays intact. This preserves the most structurally useful parts of tool output.
-- **Claude Code**: Only clears tool results, never assistant text. The agent's own synthesis is the natural "distillation" that survives clearing.
+- **Production coding agents (e.g., Anthropic's CLI)**: Only clear tool results, never assistant text. The agent's own synthesis is the natural "distillation" that survives clearing.
 - **LangChain Deep Agents**: Prioritizes offloading over lossy summarization. Three-tier graduated strategy.
 
 ### Layer 2: Conversation Summarization ("Compaction")
@@ -196,7 +196,7 @@ interface MicrocompactionConfig {
 </compaction-summary>
 ```
 
-**Summarization prompt**: The default prompt is general-purpose (Cortex is a standalone framework used by any consumer). It follows Claude Code's proven pattern: require an `<analysis>` scratchpad first (stripped from the final output), then a structured `<summary>` with explicit sections. Consumers can override via `customPrompt`.
+**Summarization prompt**: The default prompt is general-purpose (Cortex is a standalone framework used by any consumer). It follows a proven pattern used by production coding agents: require an `<analysis>` scratchpad first (stripped from the final output), then a structured `<summary>` with explicit sections. Consumers can override via `customPrompt`.
 
 The prompt requires 11 sections:
 1. **Primary Request and Intent** - All user requests, preserved verbatim
@@ -224,7 +224,7 @@ interface CompactionConfig {
 }
 ```
 
-**Rationale**: Claude Code's pattern of structured summarization with post-compaction rehydration is the most battle-tested approach. Factory.ai's evaluation across 36,000+ messages confirmed that domain-structured summarization outperforms generic compression. The 70% threshold is earlier than Claude Code's ~75-83% and Codex's 95%, deliberately trading some context capacity for quality preservation (models degrade before hitting the limit).
+**Rationale**: Structured summarization with post-compaction rehydration is the most battle-tested approach across production coding agents. Factory.ai's evaluation across 36,000+ messages confirmed that domain-structured summarization outperforms generic compression. The 70% threshold is earlier than the ~75-83% used by some production agents and Codex's 95%, deliberately trading some context capacity for quality preservation (models degrade before hitting the limit).
 
 ### Layer 3: Emergency Truncation ("Failsafe")
 
@@ -527,7 +527,7 @@ The backend's `onPostCompaction` handler re-seeds the **gap** between the observ
 
 ### Summarization Model
 
-Compaction should use the same model as the main session. The conversation history summary is the only record of what happened during agentic loops (tool calls, decisions, reasoning chains). Quality matters significantly here, unlike observational memory compression where the Observer/Reflector use Haiku because they are compressing simple timestamped items into date-grouped summaries. Conversation history is structurally complex (interleaved tool calls, multi-turn reasoning) and a lower-tier model would lose critical details. This aligns with Claude Code's approach of using the same model for summarization.
+Compaction should use the same model as the main session. The conversation history summary is the only record of what happened during agentic loops (tool calls, decisions, reasoning chains). Quality matters significantly here, unlike observational memory compression where the Observer/Reflector use Haiku because they are compressing simple timestamped items into date-grouped summaries. Conversation history is structurally complex (interleaved tool calls, multi-turn reasoning) and a lower-tier model would lose critical details. This aligns with the approach taken by most production coding agents, which use the same model for summarization.
 
 ### Sub-Agent Compaction
 

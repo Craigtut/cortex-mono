@@ -1,6 +1,6 @@
 # Context Manager
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 The `ContextManager` is the core abstraction in `@animus-labs/cortex` for managing the content an agent sees. It owns two distinct responsibilities: **slots** (persistent, named content blocks in the message array) and **ephemeral context** (per-call content injected via `transformContext`, never stored). These are separate concepts with different lifecycles and APIs.
 
@@ -62,7 +62,9 @@ class ContextManager {
   // Content is the raw string (including any formatting the consumer chooses).
   setSlot(name: string, content: string): void;
 
-  // Read current slot content.
+  // Read current slot content. If the underlying message uses a content
+  // array (rather than a plain string), text parts are concatenated.
+  // Returns null if the slot has not been set.
   getSlot(name: string): string | null;
 
   // Set ephemeral content for the next LLM call(s).
@@ -71,12 +73,19 @@ class ContextManager {
   // Pass null to clear.
   setEphemeral(content: string | null): void;
 
+  // Read the current ephemeral content.
+  getEphemeral(): string | null;
+
   // Returns a transformContext hook function that appends the ephemeral
   // content. The consumer registers this with the Agent (or composes it
   // with other transformContext logic like compaction).
   getTransformContextHook(): (context: AgentContext) => AgentContext;
 }
 ```
+
+### Constructor Initialization
+
+When the ContextManager is constructed, it automatically reserves space for all declared slots by pushing empty user-role messages (`{ role: 'user', content: '' }`) into `agent.state.messages` at positions 0 through N-1 (where N is the number of slots). This ensures the message array always has the correct length from the start, so `setSlot()` can safely overwrite any position without gaps.
 
 ### Usage: How a Consumer Configures Slots
 
@@ -87,6 +96,7 @@ The consumer defines slots at startup and populates them with content built from
 ```typescript
 const cm = new ContextManager(agent, {
   // Order = position. Most stable first for best prefix caching.
+  // The constructor pre-initializes all slot positions with empty messages.
   slots: ['credentials', 'user-profile', 'project-context', 'history']
 });
 
@@ -161,7 +171,7 @@ If all three were combined in a single `observations` slot, any one stream updat
 
 ### How setSlot() Works
 
-`setSlot()` directly updates the message at the corresponding position in `agent.state.messages`. The array always reflects the latest content.
+`setSlot()` replaces the entire message object at the corresponding position in `agent.state.messages` with a new `{ role: 'user', content }` object. This is a full replacement, not a merge. Because the constructor pre-initializes all slot positions with empty messages, there is always a valid entry at every slot index before the first `setSlot()` call.
 
 ### Content Formatting
 

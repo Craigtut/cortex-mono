@@ -1,6 +1,6 @@
 # Provider Manager
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 The `ProviderManager` is a standalone class in `@animus-labs/cortex` that wraps `pi-ai`'s provider registry, model resolution, and OAuth flows into a clean, typed API. It is the sole boundary through which consumers interact with pi-ai's provider ecosystem. Consumers never import `@mariozechner/pi-ai` directly.
 
@@ -176,7 +176,7 @@ interface OAuthMeta {
   provider: string;
   /** Display name, email, or account identifier (if available from the provider) */
   displayName?: string;
-  /** When the access token expires (Unix timestamp ms). Null if non-expiring. */
+  /** When the access token expires (Unix timestamp ms). Undefined if non-expiring. */
   expiresAt?: number;
   /** Whether the credential supports automatic refresh */
   refreshable: boolean;
@@ -250,39 +250,90 @@ interface ApiKeyValidationResult {
 ```typescript
 // packages/cortex/src/provider-manager.ts
 
-import { getModel, createModel, getModels, getEnvApiKey } from '@mariozechner/pi-ai';
 import {
-  loginAnthropic,
-  loginOpenAICodex,
-  loginGitHubCopilot,
-  loginGeminiCli,
-  loginAntigravity,
-  refreshOAuthToken,
-  getOAuthApiKey,
-  type OAuthProvider,
-} from '@mariozechner/pi-ai/oauth';
+  PROVIDER_REGISTRY,
+  OAUTH_PROVIDER_IDS,
+  LOGIN_FUNCTION_NAMES,
+  UTILITY_MODEL_DEFAULTS,
+} from './provider-registry.js';
+
+// Pi-ai is an optional peer dependency. All pi-ai functions are imported
+// dynamically via loadPiAi() and loadPiAiOAuth(). If pi-ai is not installed,
+// methods that require it throw clear errors.
+
+async function loadPiAi(): Promise<PiAiModule> {
+  try {
+    const modulePath = '@mariozechner/pi-ai';
+    return await import(modulePath) as PiAiModule;
+  } catch {
+    throw new Error(
+      'pi-ai is not installed. Install @mariozechner/pi-ai to use ProviderManager.'
+    );
+  }
+}
+
+async function loadPiAiOAuth(): Promise<Record<string, unknown>> {
+  try {
+    const modulePath = '@mariozechner/pi-ai/oauth';
+    return await import(modulePath) as Record<string, unknown>;
+  } catch {
+    throw new Error(
+      'pi-ai is not installed. Install @mariozechner/pi-ai to use OAuth features.'
+    );
+  }
+}
 
 class ProviderManager implements IProviderManager {
   private activeOAuthAbort: AbortController | null = null;
 
   listProviders(): ProviderInfo[] {
-    // Combines pi-ai's provider registry with static UX metadata
     return PROVIDER_REGISTRY;
   }
 
   listOAuthProviders(): string[] {
-    return ['anthropic', 'openai-codex', 'github-copilot', 'google-gemini-cli', 'google-antigravity'];
+    return OAUTH_PROVIDER_IDS;
   }
 
   async listModels(provider: string): Promise<ModelInfo[]> {
-    // Delegates to pi-ai's getModels(), maps to ModelInfo
-    const models = getModels(provider);
-    return models.map(mapToModelInfo);
+    const piAi = await loadPiAi();
+    const rawModels = piAi.getModels(provider);
+    const models = rawModels.map(mapRawToModelInfo);
+
+    // Filter pipeline:
+    // 1. Remove legacy/deprecated generation models (see LEGACY_MODEL_PREFIXES)
+    // 2. Remove "-latest" alias duplicates (keep pinned version if it exists)
+    // 3. Remove duplicate display names (first occurrence wins)
+    const legacyPrefixes = LEGACY_MODEL_PREFIXES[provider];
+    const filtered = legacyPrefixes
+      ? models.filter(m => !legacyPrefixes.some(prefix => m.id.startsWith(prefix)))
+      : models;
+
+    const seen = new Set<string>();
+    return filtered.filter(m => {
+      const baseName = m.id.replace(/-latest$/, '');
+      if (m.id.endsWith('-latest')) {
+        return !filtered.some(other => other.id === baseName);
+      }
+      if (seen.has(m.name)) return false;
+      seen.add(m.name);
+      return true;
+    });
   }
 
   async initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult> {
-    const loginFn = LOGIN_FUNCTIONS[provider as OAuthProvider];
-    if (!loginFn) throw new Error(`Provider "${provider}" does not support OAuth`);
+    // LOGIN_FUNCTION_NAMES maps provider IDs to pi-ai function names (strings).
+    // The actual function is resolved via dynamic import of pi-ai/oauth.
+    const functionName = LOGIN_FUNCTION_NAMES[provider];
+    if (!functionName) throw new Error(`Provider "${provider}" does not support OAuth`);
+
+    const oauthModule = await loadPiAiOAuth();
+    const loginFn = oauthModule[functionName];
+    if (typeof loginFn !== 'function') {
+      throw new Error(
+        `OAuth login function "${functionName}" not found in pi-ai. ` +
+        `Ensure @mariozechner/pi-ai is up to date.`
+      );
+    }
 
     this.activeOAuthAbort = new AbortController();
 
@@ -295,106 +346,90 @@ class ProviderManager implements IProviderManager {
 
     this.activeOAuthAbort = null;
 
-    // Serialize credentials (opaque to consumer)
     const credentials = JSON.stringify(rawCredentials);
-
-    // Extract display-safe metadata
-    const meta: OAuthMeta = {
-      provider,
-      displayName: extractDisplayName(rawCredentials),
-      expiresAt: rawCredentials.expiresAt ?? undefined,
-      refreshable: !!rawCredentials.refreshToken,
-    };
+    const meta = buildOAuthMeta(provider, rawCredentials);
 
     return { credentials, meta };
   }
 
   cancelOAuth(): void {
-    this.activeOAuthAbort?.abort();
-    this.activeOAuthAbort = null;
+    if (this.activeOAuthAbort) {
+      this.activeOAuthAbort.abort();
+      this.activeOAuthAbort = null;
+    }
   }
 
   async resolveOAuthApiKey(provider: string, credentials: string): Promise<OAuthRefreshResult> {
-    const rawCredentials = JSON.parse(credentials);
-    const credMap = { [provider]: { type: 'oauth' as const, ...rawCredentials } };
+    const oauthModule = await loadPiAiOAuth();
+    const getOAuthApiKeyFn = oauthModule['getOAuthApiKey'];
+    if (typeof getOAuthApiKeyFn !== 'function') {
+      throw new Error('getOAuthApiKey not found in pi-ai/oauth');
+    }
 
-    const result = await getOAuthApiKey(provider as OAuthProvider, credMap);
+    const rawCredentials = JSON.parse(credentials);
+    const credMap = { [provider]: { ...rawCredentials, type: 'oauth' as const } };
+
+    const result = await getOAuthApiKeyFn(provider, credMap);
     if (!result) throw new Error(`OAuth resolution failed for provider "${provider}"`);
 
-    const changed = result.newCredentials !== rawCredentials;
-    const newCredentials = changed ? JSON.stringify(result.newCredentials) : credentials;
+    const newSerialized = JSON.stringify(result.newCredentials);
+    const changed = newSerialized !== credentials;
+    const meta = buildOAuthMeta(provider, result.newCredentials);
 
-    const meta: OAuthMeta = {
-      provider,
-      displayName: extractDisplayName(result.newCredentials),
-      expiresAt: result.newCredentials.expiresAt ?? undefined,
-      refreshable: !!result.newCredentials.refreshToken,
+    return {
+      apiKey: result.apiKey,
+      credentials: changed ? newSerialized : credentials,
+      meta,
+      changed,
     };
-
-    return { apiKey: result.apiKey, credentials: newCredentials, meta, changed };
   }
 
   async validateApiKey(
     provider: string,
     apiKey: string,
   ): Promise<ApiKeyValidationResult> {
-    const modelId = this.getSmallestModel(provider);
-    if (!modelId) {
-      return {
-        provider,
-        modelId: null,
-        valid: false,
-        retryable: false,
-        status: 'resolution_error',
-        message: `No validation model available for provider "${provider}"`,
-      };
-    }
+    const piAi = await loadPiAi();
 
-    try {
-      const model = getModel(provider, modelId);
-      await completeSimple(model, {
-        messages: [{ role: 'user', content: 'hi' }],
-      }, { apiKey, maxTokens: 1 });
-      return {
-        provider,
-        modelId,
-        valid: true,
-        retryable: false,
-        status: 'valid',
-      };
-    } catch (error) {
-      if (isInvalidCredentialError(error)) {
+    // Use the cheapest known model from UTILITY_MODEL_DEFAULTS
+    const cheapestModelId = this.getSmallestModelId(provider);
+    if (!cheapestModelId) {
+      // Fallback: try the first available model from the provider
+      const models = piAi.getModels(provider);
+      if (models.length === 0) {
         return {
           provider,
-          modelId,
+          modelId: null,
           valid: false,
           retryable: false,
-          status: 'invalid_credentials',
-          message: error instanceof Error ? error.message : String(error),
+          status: 'resolution_error',
+          message: `No models found for provider "${provider}"`,
         };
       }
-
-      return {
-        provider,
-        modelId,
-        valid: false,
-        retryable: true,
-        status: 'transient_error',
-        message: error instanceof Error ? error.message : String(error),
-      };
+      const firstModelId = models[0].id ?? models[0].name;
+      return this.tryValidation(piAi, provider, firstModelId, apiKey);
     }
+
+    return this.tryValidation(piAi, provider, cheapestModelId, apiKey);
   }
 
   checkEnvApiKey(provider: string): string | null {
-    return getEnvApiKey(provider) ?? null;
+    // Looks up the provider's envVar from PROVIDER_REGISTRY and checks process.env
+    const entry = PROVIDER_REGISTRY.find(p => p.id === provider);
+    if (entry?.envVar) {
+      const value = process.env[entry.envVar];
+      if (value && value.length > 0) return value;
+    }
+    return null;
   }
 
   async resolveModel(provider: string, modelId: string): Promise<CortexModel> {
-    const piModel = getModel(provider, modelId);
+    const piAi = await loadPiAi();
+    const piModel = piAi.getModel(provider, modelId);
     return wrapModel(piModel, provider, modelId);
   }
 
   async createCustomModel(config: CustomModelConfig): Promise<CortexModel> {
+    const piAi = await loadPiAi();
     const piModel = createModel({
       baseUrl: config.baseUrl,
       modelId: config.modelId,
@@ -402,6 +437,30 @@ class ProviderManager implements IProviderManager {
       compat: config.compat,
     });
     return wrapModel(piModel, 'custom', config.modelId);
+  }
+
+  // ── Private helpers ──
+
+  private getSmallestModelId(provider: string): string | null {
+    return UTILITY_MODEL_DEFAULTS[provider] ?? null;
+  }
+
+  private async tryValidation(
+    piAi: PiAiModule,
+    provider: string,
+    modelId: string,
+    apiKey: string,
+  ): Promise<ApiKeyValidationResult> {
+    try {
+      const model = piAi.getModel(provider, modelId);
+      const completeFn = piAi.completeSimple ?? piAi.complete;
+      await completeFn(model, {
+        messages: [{ role: 'user', content: 'hi' }],
+      }, { apiKey, maxTokens: 1 });
+      return { provider, modelId, valid: true, retryable: false, status: 'valid' };
+    } catch (err) {
+      return this.classifyValidationError(provider, modelId, err);
+    }
   }
 }
 ```
@@ -446,6 +505,11 @@ const PROVIDER_REGISTRY: ProviderInfo[] = [
     name: 'Google Gemini',
     authMethods: ['oauth'],
     // Free tier or paid subscription OAuth
+  },
+  {
+    id: 'google-antigravity',
+    name: 'Google Antigravity',
+    authMethods: ['oauth'],
   },
   {
     id: 'github-copilot',
@@ -494,15 +558,19 @@ const PROVIDER_REGISTRY: ProviderInfo[] = [
 
 This registry is maintained manually. When pi-ai adds a new provider, a corresponding entry is added here. Providers not in the registry can still be used via `resolveModel()` and `createCustomModel()` with direct API keys; they just won't appear in the discovery UI.
 
-### OAuth Login Functions Map
+### OAuth Login Function Names
+
+Since pi-ai is an optional peer dependency, login functions are referenced by name (not by direct import). `ProviderManager.initiateOAuth()` dynamically imports `@mariozechner/pi-ai/oauth` and looks up the function by name at runtime.
 
 ```typescript
-const LOGIN_FUNCTIONS: Record<string, (opts: any) => Promise<any>> = {
-  'anthropic': loginAnthropic,
-  'openai-codex': loginOpenAICodex,
-  'github-copilot': loginGitHubCopilot,
-  'google-gemini-cli': loginGeminiCli,
-  'google-antigravity': loginAntigravity,
+// packages/cortex/src/provider-registry.ts
+
+const LOGIN_FUNCTION_NAMES: Record<string, string> = {
+  'anthropic': 'loginAnthropic',
+  'openai-codex': 'loginOpenAICodex',
+  'github-copilot': 'loginGitHubCopilot',
+  'google-gemini-cli': 'loginGeminiCli',
+  'google-antigravity': 'loginAntigravity',
 };
 ```
 
@@ -525,6 +593,37 @@ function extractDisplayName(credentials: Record<string, unknown>): string | unde
   return undefined;
 }
 ```
+
+### Legacy Model Filtering
+
+Pi-ai does not flag models as deprecated, so `ProviderManager` maintains a `LEGACY_MODEL_PREFIXES` map to keep the model picker clean. These prefixes identify older model generations that produce poor results with modern tool-use patterns. Models matching any prefix are excluded from `listModels()` results.
+
+```typescript
+// packages/cortex/src/provider-manager.ts
+
+const LEGACY_MODEL_PREFIXES: Record<string, string[]> = {
+  anthropic: [
+    'claude-3-',      // Claude 3.x family (Haiku/Sonnet/Opus from 2024)
+    'claude-3.',      // Alternate naming
+  ],
+  openai: [
+    'gpt-3.5-',      // GPT-3.5 family
+    'gpt-4-',        // GPT-4 original (not 4o/4.1)
+  ],
+  google: [
+    'gemini-1.',      // Gemini 1.x family
+    'gemini-pro',     // Original Gemini Pro
+  ],
+};
+```
+
+The filtering pipeline in `listModels()` applies three steps in sequence:
+
+1. **Remove legacy models**: Any model whose ID starts with a legacy prefix for that provider is excluded.
+2. **Remove "-latest" alias duplicates**: If both `model-name` and `model-name-latest` exist, only the pinned version is kept. The `-latest` alias is only included when no pinned version exists.
+3. **Remove duplicate display names**: If multiple model IDs share the same display name, only the first occurrence is kept.
+
+Providers not listed in `LEGACY_MODEL_PREFIXES` (e.g., Mistral, Groq) have no filtering applied; all their models pass through unchanged.
 
 ## CortexAgent Integration
 

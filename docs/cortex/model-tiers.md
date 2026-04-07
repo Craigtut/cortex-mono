@@ -1,6 +1,6 @@
 # Model Tiers
 
-> **STATUS: RESEARCH** - Not yet implemented.
+> **STATUS: IMPLEMENTED**
 
 Cortex uses two model tiers: a **primary model** for all consumer-facing work and a **utility model** for internal operations the user never directly sees.
 
