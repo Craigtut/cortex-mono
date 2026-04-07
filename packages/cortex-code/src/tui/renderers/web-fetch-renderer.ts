@@ -1,29 +1,15 @@
 /**
- * WebFetchToolRenderer: renders web fetch results with HTTP status,
- * content type, size, and content preview.
+ * WebFetchToolRenderer: compact single-line renderer for web fetches.
+ *
+ * Shows URL/domain, HTTP status, and size on a single line.
+ * The fetched content goes to LLM context; the user just needs
+ * to see what was fetched and whether it succeeded.
  */
 
 import chalk from 'chalk';
 import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDisplay } from './types.js';
 import type { WebFetchDetails } from '@animus-labs/cortex';
-import { collapseContent } from './collapsible-content.js';
 import { registerRenderer } from './registry.js';
-
-const COLLAPSED_LINES = 8;
-
-function extractTextContent(result: unknown): string {
-  if (typeof result === 'string') return result;
-  if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
-    const content = (result as Record<string, unknown>)['content'];
-    if (Array.isArray(content)) {
-      return content
-        .filter((c: unknown) => c && typeof c === 'object' && (c as Record<string, unknown>)['type'] === 'text')
-        .map((c: unknown) => (c as Record<string, string>)['text'])
-        .join('\n');
-    }
-  }
-  return String(result ?? '');
-}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -51,37 +37,19 @@ const webFetchRenderer: ToolRenderer = {
     };
   },
 
-  renderResult(result: unknown, details: unknown, context: ToolRenderContext): ToolResultDisplay {
+  renderResult(_result: unknown, details: unknown, _context: ToolRenderContext): ToolResultDisplay {
     const d = details as WebFetchDetails | undefined;
-    const text = extractTextContent(result);
-    const contentLines: string[] = [];
-
-    // HTTP status and size header
-    if (d) {
-      const status = `HTTP ${d.statusCode}`;
-      const size = formatBytes(d.markdownSize || d.rawSize);
-      const cacheHit = d.cacheHit ? ' (cached)' : '';
-      contentLines.push(chalk.hex(context.theme.muted)(`${status} (${size})${cacheHit}`));
-      contentLines.push('');
-    }
-
-    // Content preview
-    const textLines = text.split('\n');
-    contentLines.push(...textLines);
-
-    const { lines } = collapseContent(contentLines, {
-      mode: 'head',
-      limit: COLLAPSED_LINES,
-      expanded: context.expanded,
-    });
-
-    // Footer
     const domain = d ? extractDomain(d.finalUrl) : '';
+    const status = d ? `${d.statusCode}` : '';
+    const size = d ? formatBytes(d.markdownSize || d.rawSize) : '';
+    const cacheHit = d?.cacheHit ? ' cached' : '';
+
+    const statsParts = [status, size + cacheHit].filter(Boolean);
 
     return {
       headerText: `fetch ${domain}`,
-      contentLines: lines,
-      footerText: '',
+      contentLines: [],
+      footerText: statsParts.join(', '),
     };
   },
 
@@ -90,20 +58,18 @@ const webFetchRenderer: ToolRenderer = {
     const domain = extractDomain(url);
     const errorColor = chalk.hex(context.theme.error);
 
-    let errorLines: string[];
+    let errorText: string;
     if (error.includes('timeout') || error.includes('ETIMEDOUT')) {
-      errorLines = [errorColor(`Request timed out: ${domain}`)];
+      errorText = 'timed out';
     } else if (error.includes('ENOTFOUND') || error.includes('DNS')) {
-      errorLines = [errorColor(`DNS lookup failed: ${domain}`)];
-    } else if (error.includes('status')) {
-      errorLines = [errorColor(error)];
+      errorText = 'DNS lookup failed';
     } else {
-      errorLines = [errorColor(error)];
+      errorText = error.split('\n')[0] ?? 'failed';
     }
 
     return {
       headerText: `fetch ${domain}`,
-      contentLines: errorLines,
+      contentLines: [errorColor(errorText)],
       footerText: '',
     };
   },
