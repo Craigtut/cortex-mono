@@ -45,8 +45,9 @@ const webFetchRenderer: ToolRenderer = {
     const domain = extractDomain(url);
 
     return {
+      headerText: `fetch ${domain}`,
       contentLines: [],
-      footerText: `fetch ${domain}`,
+      footerText: '',
     };
   },
 
@@ -78,8 +79,9 @@ const webFetchRenderer: ToolRenderer = {
     const domain = d ? extractDomain(d.finalUrl) : '';
 
     return {
+      headerText: `fetch ${domain}`,
       contentLines: lines,
-      footerText: `fetch ${domain}`,
+      footerText: '',
     };
   },
 
@@ -100,8 +102,9 @@ const webFetchRenderer: ToolRenderer = {
     }
 
     return {
+      headerText: `fetch ${domain}`,
       contentLines: errorLines,
-      footerText: `fetch ${domain}`,
+      footerText: '',
     };
   },
 };

@@ -47,8 +47,9 @@ const subAgentRenderer: ToolRenderer = {
       : '';
 
     return {
+      headerText: `subagent${modelLabel}${modeLabel}`,
       contentLines: descLines,
-      footerText: `subagent${modelLabel}${modeLabel}`,
+      footerText: '',
     };
   },
 
@@ -88,31 +89,37 @@ const subAgentRenderer: ToolRenderer = {
       contentLines.push(...lines);
     }
 
-    // Footer with stats: subagent (model-id) [background] N turns 1.2s completed
-    const parts: string[] = ['subagent'];
+    // Model ID from details or args
     const modelId = d?.modelId ?? (context.args['modelId'] as string | undefined);
+
+    // Header: identity parts (subagent + model + background)
+    const headerParts: string[] = ['subagent'];
     if (modelId) {
-      parts.push(chalk.hex(context.theme.muted)(`(${modelId})`));
+      headerParts.push(chalk.hex(context.theme.muted)(`(${modelId})`));
     }
     if (d?.background) {
-      parts.push(chalk.hex(context.theme.muted)('[background]'));
+      headerParts.push(chalk.hex(context.theme.muted)('[background]'));
     }
+
+    // Footer: stats only (turns, duration, status)
+    const statsParts: string[] = [];
     if (d?.turns) {
-      parts.push(`${d.turns} turns`);
+      statsParts.push(`${d.turns} turns`);
     }
     if (d?.durationMs) {
       const sec = (d.durationMs / 1000).toFixed(1);
-      parts.push(`${sec}s`);
+      statsParts.push(`${sec}s`);
     }
     if (d?.status && d.status !== 'completed') {
-      parts.push(d.status);
+      statsParts.push(d.status);
     }
 
     return {
+      headerText: headerParts.join(' '),
       contentLines: contentLines.length > 0
         ? contentLines
         : [chalk.hex(context.theme.muted)('(no output)')],
-      footerText: parts.join(' '),
+      footerText: statsParts.join(' '),
     };
   },
 
@@ -147,17 +154,19 @@ const subAgentRenderer: ToolRenderer = {
     }
 
     return {
+      headerText: 'subagent',
       contentLines: contentLines.length > 0
         ? contentLines
         : [chalk.hex(context.theme.muted)('Working...')],
-      footerText: 'subagent',
+      footerText: '',
     };
   },
 
   renderError(error: string, _args: Record<string, unknown>, context: ToolRenderContext): ToolResultDisplay {
     return {
+      headerText: 'subagent',
       contentLines: [chalk.hex(context.theme.error)(error)],
-      footerText: 'subagent',
+      footerText: '',
     };
   },
 };

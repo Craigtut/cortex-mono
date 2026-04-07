@@ -48,9 +48,11 @@ export interface ToolRenderContext {
  * Output from renderCall: what to show when the tool starts.
  */
 export interface ToolCallDisplay {
+  /** Header text shown in the top border (tool name + key args). */
+  headerText: string;
   /** Lines to show inside the bordered box (above the footer). */
   contentLines: string[];
-  /** Footer summary text (tool name + args summary). */
+  /** Footer summary text (stats, counts). */
   footerText: string;
 }
 
@@ -58,9 +60,11 @@ export interface ToolCallDisplay {
  * Output from renderResult: what to show when the tool completes.
  */
 export interface ToolResultDisplay {
+  /** Header text shown in the top border (tool name + key args). */
+  headerText: string;
   /** Lines to show inside the bordered box. */
   contentLines: string[];
-  /** Updated footer text (may include duration, match count, etc.). */
+  /** Updated footer text (stats, duration, match count, etc.). */
   footerText: string;
   /** Lines to show below the box (e.g., LSP diagnostics, exit codes). */
   belowBoxLines?: string[];

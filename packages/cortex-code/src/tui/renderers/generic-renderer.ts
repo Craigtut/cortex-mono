@@ -35,8 +35,9 @@ export const genericRenderer: ToolRenderer = {
       : '';
 
     return {
+      headerText: formatToolName(context.toolName),
       contentLines: argsText ? [argsText] : [],
-      footerText: formatToolName(context.toolName),
+      footerText: '',
     };
   },
 
@@ -66,8 +67,9 @@ export const genericRenderer: ToolRenderer = {
     });
 
     return {
+      headerText: formatToolName(context.toolName),
       contentLines: lines,
-      footerText: formatToolName(context.toolName),
+      footerText: '',
     };
   },
 };

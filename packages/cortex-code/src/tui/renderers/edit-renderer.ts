@@ -57,8 +57,9 @@ const editRenderer: ToolRenderer = {
     const linkedPath = fileLink(filePath, shortPath);
 
     return {
+      headerText: `edit ${linkedPath}`,
       contentLines: [],
-      footerText: `edit ${linkedPath}`,
+      footerText: '',
     };
   },
 
@@ -90,8 +91,9 @@ const editRenderer: ToolRenderer = {
     const countInfo = d && d.replacementCount > 1 ? ` (${d.replacementCount} replacements)` : '';
 
     return {
+      headerText: `edit ${linkedPath}${lineInfo}`,
       contentLines: lines,
-      footerText: `edit ${linkedPath}${lineInfo}${countInfo}`,
+      footerText: countInfo.trim(),
     };
   },
 
@@ -112,8 +114,9 @@ const editRenderer: ToolRenderer = {
     }
 
     return {
+      headerText: `edit ${shortPath}`,
       contentLines: errorLines,
-      footerText: `edit ${shortPath}`,
+      footerText: '',
     };
   },
 };

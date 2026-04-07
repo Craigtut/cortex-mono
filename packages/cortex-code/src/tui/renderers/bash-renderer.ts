@@ -48,8 +48,9 @@ const bashRenderer: ToolRenderer = {
     const displayCmd = command.length > 80 ? command.slice(0, 77) + '...' : command;
 
     return {
+      headerText: `$ ${displayCmd}`,
       contentLines: [],
-      footerText: `$ ${displayCmd}`,
+      footerText: '',
     };
   },
 
@@ -71,9 +72,9 @@ const bashRenderer: ToolRenderer = {
       expanded: context.expanded,
     });
 
-    // Footer: use command from original args
+    // Header and footer
     const commandStr = String(context.args['command'] ?? 'command');
-    const footer = `$ ${commandStr.length > 57 ? commandStr.slice(0, 54) + '...' : commandStr}`;
+    const header = `$ ${commandStr.length > 77 ? commandStr.slice(0, 74) + '...' : commandStr}`;
 
     // Below-box lines for error state
     const belowBoxLines: string[] = [];
@@ -85,8 +86,9 @@ const bashRenderer: ToolRenderer = {
     }
 
     const display: ToolResultDisplay = {
+      headerText: header,
       contentLines: lines,
-      footerText: footer,
+      footerText: '',
     };
     if (belowBoxLines.length > 0) {
       display.belowBoxLines = belowBoxLines;
@@ -108,14 +110,16 @@ const bashRenderer: ToolRenderer = {
 
     const visibleLines = buffer.getLines(STREAMING_WINDOW);
 
+    const commandStr = String(context.args['command'] ?? 'command');
     return {
+      headerText: `$ ${commandStr.length > 77 ? commandStr.slice(0, 74) + '...' : commandStr}`,
       contentLines: visibleLines,
-      footerText: `$ ... (${totalLines} lines)`,
+      footerText: `${totalLines} lines`,
     };
   },
 
   renderError(error: string, args: Record<string, unknown>, context: ToolRenderContext): ToolResultDisplay {
-    const command = String(args['command'] ?? '').slice(0, 60);
+    const command = String(args['command'] ?? '').slice(0, 77);
     const errorLines = error.split('\n');
 
     const { lines } = collapseContent(errorLines, {
@@ -125,8 +129,9 @@ const bashRenderer: ToolRenderer = {
     });
 
     return {
+      headerText: `$ ${command}`,
       contentLines: lines,
-      footerText: `$ ${command}`,
+      footerText: '',
       belowBoxLines: [chalk.hex(context.theme.error)(error.split('\n')[0] ?? 'Command failed')],
     };
   },

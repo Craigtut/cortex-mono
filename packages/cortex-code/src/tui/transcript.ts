@@ -138,7 +138,7 @@ export class TranscriptManager {
     // Freeze current assistant message (Mastra Code pattern)
     this.freezeCurrentAssistant();
 
-    const toolComponent = new ToolExecutionComponent(toolName);
+    const toolComponent = new ToolExecutionComponent(toolName, this.tui);
     toolComponent.start(args);
     this.toolCalls.set(toolCallId, toolComponent);
     this.chatContainer.addChild(toolComponent);
