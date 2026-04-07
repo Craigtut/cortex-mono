@@ -428,6 +428,64 @@ describe('WebFetch tool', () => {
     });
   });
 
+  describe('HTML to markdown conversion', () => {
+    it('converts headings and body text', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('<html><body><h1>Title</h1><h2>Subtitle</h2><p>Body text</p></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+
+      const result = await webFetchTool.execute({ url: 'https://example.com/page', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(text).toContain('Title');
+      expect(text).toContain('Subtitle');
+      expect(text).toContain('Body text');
+    });
+
+    it('converts links to markdown format', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('<html><body><a href="https://example.com">Click here</a></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+
+      const result = await webFetchTool.execute({ url: 'https://example.com/page', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(text).toContain('Click here');
+    });
+
+    it('strips boilerplate elements before conversion', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('<html><body><nav>Navigation</nav><main><p>Main content</p></main><footer>Footer</footer></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+
+      const result = await webFetchTool.execute({ url: 'https://example.com/page', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(text).toContain('Main content');
+      expect(text).not.toContain('Navigation');
+      expect(text).not.toContain('Footer');
+    });
+
+    it('decodes HTML entities', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('<html><body><p>A &amp; B &lt; C &gt; D</p></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+
+      const result = await webFetchTool.execute({ url: 'https://example.com/page', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(text).toContain('A & B');
+    });
+  });
+
   // Cross-host redirect detection tests
   describe('redirect handling', () => {
     it('returns redirect message for cross-host 301 redirect', async () => {

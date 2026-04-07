@@ -39,6 +39,7 @@
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@sinclair/typebox": "^0.34.0",
     "@vscode/ripgrep": "^1.17.1",
+    "turndown": "^7.2.0",
     "zod-to-json-schema": "^3.25.1"
   },
   "peerDependencies": {
@@ -51,6 +52,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/turndown": "^5.0.5",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0",
     "zod": "^4.0.0"

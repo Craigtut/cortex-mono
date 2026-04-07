@@ -20,7 +20,7 @@ This document covers how production coding agents render tool call results in th
 |-------|---------------|----------|-----------------|
 | Mastra Code | pi-tui | TypeScript | Imperative, component-based |
 | pi-coding-agent | pi-tui | TypeScript | Imperative, pluggable renderers per tool |
-| Claude Code | Custom Ink fork (React) | TypeScript | Declarative, React component tree |
+| Anthropic CLI | Custom Ink fork (React) | TypeScript | Declarative, React component tree |
 | Codex | ratatui | Rust | Immediate-mode, widget-based |
 
 ### 1. Mastra Code (github.com/mastra-ai/mastra, `mastracode/`)
@@ -158,9 +158,9 @@ Every tool result follows the same expand/collapse pattern controlled by the `To
 
 ---
 
-### 3. Claude Code (Anthropic's CLI)
+### 3. Anthropic CLI
 
-Claude Code's source was built on a custom fork of Ink (React-based terminal rendering). While not open-source, details are available from the March 2026 source disclosure and public documentation.
+Anthropic's CLI agent was built on a custom fork of Ink (React-based terminal rendering). While not open-source, details are available from the March 2026 source disclosure and public documentation.
 
 #### Architecture
 
@@ -282,7 +282,7 @@ Codex uses ratatui (Rust) for its TUI, with a fundamentally different approach b
 
 ### Patterns That Work Well Across All Agents
 
-1. **Bordered boxes for tool output**: Mastra Code's bordered box pattern (`╭──`/`│`/`╰──` with footer summary) is the most visually clean and information-dense approach. The pi-coding-agent and Claude Code use background color blocks instead, which can be harder to distinguish at a glance.
+1. **Bordered boxes for tool output**: Mastra Code's bordered box pattern (`╭──`/`│`/`╰──` with footer summary) is the most visually clean and information-dense approach. The pi-coding-agent and Anthropic's CLI use background color blocks instead, which can be harder to distinguish at a glance.
 
 2. **Streaming args display**: Both Mastra Code and pi-coding-agent stream partial tool arguments as they arrive, so the user sees the file path or command before execution begins. This significantly improves perceived responsiveness.
 

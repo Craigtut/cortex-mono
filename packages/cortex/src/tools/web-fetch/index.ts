@@ -47,7 +47,7 @@ export interface WebFetchDetails {
 // ---------------------------------------------------------------------------
 
 const REQUEST_TIMEOUT = 30_000;
-const DEFAULT_MAX_PER_LOOP = 20;
+const DEFAULT_MAX_PER_LOOP = 300;
 const MAX_CONTENT_TOKENS = 25_000; // approximate token limit for summarization
 const USER_AGENT = 'Cortex/1.0 (web-fetch tool)';
 
@@ -154,6 +154,24 @@ export interface WebFetchToolConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Lazy Turndown singleton
+// ---------------------------------------------------------------------------
+
+type TurndownCtor = typeof import('turndown');
+let turndownServicePromise: Promise<InstanceType<TurndownCtor>> | undefined;
+
+function getTurndownService(): Promise<InstanceType<TurndownCtor>> {
+  return (turndownServicePromise ??= import('turndown').then(m => {
+    const Turndown = (m as unknown as { default: TurndownCtor }).default;
+    return new Turndown({
+      headingStyle: 'atx',
+      codeBlockStyle: 'fenced',
+      bulletListMarker: '-',
+    });
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -215,64 +233,6 @@ function stripBoilerplateHtml(html: string): string {
     cleaned = cleaned.replace(new RegExp(`<${tag}[^>]*/>`, 'gi'), '');
   }
   return cleaned;
-}
-
-/**
- * Convert HTML to plain text markdown-like format.
- * Simple built-in converter (Turndown would be better but requires a dependency).
- */
-function htmlToText(html: string): string {
-  let text = html;
-
-  // Remove all tags except some structural ones
-  // First handle headings
-  text = text.replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_match, level, content) => {
-    const prefix = '#'.repeat(Number(level));
-    return `\n${prefix} ${content.trim()}\n`;
-  });
-
-  // Handle links
-  text = text.replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)');
-
-  // Handle lists
-  text = text.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, '\n- $1');
-  text = text.replace(/<[uo]l[^>]*>/gi, '\n');
-  text = text.replace(/<\/[uo]l>/gi, '\n');
-
-  // Handle paragraphs and line breaks
-  text = text.replace(/<p[^>]*>/gi, '\n\n');
-  text = text.replace(/<\/p>/gi, '');
-  text = text.replace(/<br\s*\/?>/gi, '\n');
-  text = text.replace(/<hr\s*\/?>/gi, '\n---\n');
-
-  // Handle emphasis
-  text = text.replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, '**$2**');
-  text = text.replace(/<(em|i)[^>]*>([\s\S]*?)<\/\1>/gi, '*$2*');
-
-  // Handle code blocks
-  text = text.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, '\n```\n$1\n```\n');
-  text = text.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, '`$1`');
-
-  // Handle tables minimally
-  text = text.replace(/<tr[^>]*>/gi, '\n');
-  text = text.replace(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi, '$1 | ');
-
-  // Strip remaining HTML tags
-  text = text.replace(/<[^>]+>/g, '');
-
-  // Decode common HTML entities
-  text = text.replace(/&amp;/g, '&');
-  text = text.replace(/&lt;/g, '<');
-  text = text.replace(/&gt;/g, '>');
-  text = text.replace(/&quot;/g, '"');
-  text = text.replace(/&#39;/g, "'");
-  text = text.replace(/&nbsp;/g, ' ');
-
-  // Clean up whitespace
-  text = text.replace(/\n{3,}/g, '\n\n');
-  text = text.trim();
-
-  return text;
 }
 
 /**
@@ -540,9 +500,9 @@ export function createWebFetchTool(config: WebFetchToolConfig): {
         // Plain text: return as-is
         markdown = rawBody;
       } else {
-        // HTML: strip boilerplate and convert
+        // HTML: strip boilerplate and convert via Turndown
         const cleaned = stripBoilerplateHtml(rawBody);
-        markdown = htmlToText(cleaned);
+        markdown = (await getTurndownService()).turndown(cleaned);
       }
 
       // Check for JavaScript-only pages
