@@ -285,8 +285,17 @@ export class CompactionManager {
    * Update the session token count from LLM usage data.
    */
   updateTokenCount(inputTokens: number): void {
-    this.logger.debug('[Compaction] updateTokenCount', { inputTokens });
+    const prev = this._sessionTokenCount;
     this._sessionTokenCount = inputTokens;
+    this.logger.debug('[Compaction] updateTokenCount', { prev, inputTokens });
+    // Log significant drops to help diagnose token count display issues
+    if (prev > 0 && inputTokens < prev * 0.5) {
+      this.logger.warn('[Compaction] sessionTokenCount dropped >50%', {
+        prev,
+        inputTokens,
+        drop: `${((1 - inputTokens / prev) * 100).toFixed(1)}%`,
+      });
+    }
   }
 
   /**
