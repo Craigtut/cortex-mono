@@ -16,10 +16,17 @@ export const costCommand: Command = {
 
     const usage = agent.getSessionUsage();
 
+    // Cache hit rate: what percentage of total input tokens were served from cache
+    const totalInput = usage.tokens.input + usage.tokens.cacheRead;
+    const cacheHitRate = totalInput > 0
+      ? ((usage.tokens.cacheRead / totalInput) * 100).toFixed(1)
+      : '0.0';
+
     const lines = [
       `Token usage: ${ctxUsage}k / ${limit}k (${percentage}%)`,
       `Turns: ${usage.totalTurns}`,
       usage.totalCost > 0 ? `Estimated cost: $${usage.totalCost.toFixed(4)}` : '',
+      totalInput > 0 ? `Cache hit rate: ${cacheHitRate}%` : '',
       `Context window: ${limit}k tokens`,
     ].filter(Boolean);
 
