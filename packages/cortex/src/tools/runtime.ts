@@ -16,6 +16,8 @@ import { WebFetchCache } from './web-fetch/cache.js';
 
 export interface BackgroundTask {
   id: string;
+  /** The command that was executed (for status display). */
+  command: string;
   process: child_process.ChildProcess;
   stdout: string;
   stderr: string;

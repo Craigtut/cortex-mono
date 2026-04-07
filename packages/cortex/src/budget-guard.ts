@@ -103,6 +103,20 @@ export class BudgetGuard {
   }
 
   /**
+   * Get the maximum turn limit.
+   */
+  getMaxTurns(): number {
+    return this.maxTurns;
+  }
+
+  /**
+   * Get the maximum cost limit.
+   */
+  getMaxCost(): number {
+    return this.maxCost;
+  }
+
+  /**
    * Whether any limit has been breached.
    */
   isBreached(): boolean {

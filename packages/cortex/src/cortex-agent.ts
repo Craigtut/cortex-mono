@@ -2146,10 +2146,17 @@ export class CortexAgent {
       const ephemeralContent = this.contextManager.getEphemeral();
       const boundary = this._prePromptMessageCount;
 
-      // Build injection messages (ephemeral + skills)
+      // Build injection messages (ephemeral + background state + skills)
       const injections: AgentMessage[] = [];
       if (ephemeralContent) {
         injections.push({ role: 'user' as const, content: ephemeralContent });
+      }
+
+      // Inject background task state so the agent has visibility into
+      // running sub-agents and background bash processes.
+      const backgroundState = this.buildBackgroundTaskState();
+      if (backgroundState) {
+        injections.push({ role: 'user' as const, content: backgroundState });
       }
       if (this.skillBuffer.length > 0) {
         const formatted = this.skillBuffer.map(s =>
@@ -3160,6 +3167,104 @@ export class CortexAgent {
         }
       },
     });
+
+    // Track child tool activity for background state visibility.
+    // Forwarded child events arrive on the parent's EventBridge with childTaskId set.
+    this.eventBridge.on('tool_call_start', (event) => {
+      if (!event.childTaskId) return;
+      const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
+      const toolName = payload?.toolName ?? 'unknown';
+      const args = payload?.args ?? {};
+      const summary = this.summarizeToolArgs(toolName, args);
+      this.subAgentManager.updateToolActivity(event.childTaskId, toolName, summary);
+    });
+  }
+
+  /**
+   * Build a short summary of tool args for background state display.
+   */
+  private summarizeToolArgs(toolName: string, args: Record<string, unknown>): string {
+    switch (toolName) {
+      case 'Bash': return String(args['command'] ?? '').slice(0, 60);
+      case 'Read': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
+      case 'Write': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
+      case 'Edit': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
+      case 'Glob': return String(args['pattern'] ?? '');
+      case 'Grep': return String(args['pattern'] ?? '');
+      case 'WebFetch': return String(args['url'] ?? '').slice(0, 60);
+      default: return '';
+    }
+  }
+
+  /**
+   * Build a <background-tasks> block describing running sub-agents and
+   * background bash processes. Returns null if nothing is running.
+   * Called from transformContext before each LLM call.
+   */
+  private buildBackgroundTaskState(): string | null {
+    const sections: string[] = [];
+    const now = Date.now();
+
+    // Running sub-agents
+    for (const taskId of this.subAgentManager.getActiveTaskIds()) {
+      const entry = this.subAgentManager.get(taskId);
+      if (!entry) continue;
+
+      const durationSec = Math.round((now - entry.spawnedAt) / 1000);
+      const childAgent = entry.agent as CortexAgent;
+      const tokens = (childAgent.sessionTokenCount / 1000).toFixed(1);
+      const budget = childAgent.getBudgetGuard();
+      const turnsUsed = budget.getTurnCount();
+      const turnsMax = budget.getMaxTurns();
+      const turnsStr = turnsMax < Infinity ? `${turnsUsed}/${turnsMax}` : `${turnsUsed}`;
+      const instructions = entry.instructions.slice(0, 120);
+
+      let status = 'running';
+      let activityLine = '';
+
+      if (entry.pendingPermission) {
+        status = 'waiting-for-permission';
+        activityLine = `  Waiting for permission: ${entry.pendingPermission.toolName}`;
+      } else if (entry.lastToolName && entry.lastToolStartedAt) {
+        const activityAgeSec = Math.round((now - entry.lastToolStartedAt) / 1000);
+        const summary = entry.lastToolSummary ? ` ${entry.lastToolSummary}` : '';
+        activityLine = `  Current: ${entry.lastToolName}${summary} (started ${activityAgeSec}s ago)`;
+      }
+
+      sections.push(
+        `<sub-agent id="${taskId}" status="${status}" duration="${durationSec}s" tools="${entry.toolCount}" tokens="${tokens}k" turns="${turnsStr}">\n` +
+        `  Instructions: ${instructions}\n` +
+        (activityLine ? `${activityLine}\n` : '') +
+        `</sub-agent>`,
+      );
+    }
+
+    // Running background bash processes
+    const bgTasks = this.toolRuntime.backgroundTasks.getAll();
+    for (const [taskId, task] of bgTasks) {
+      if (task.completed) continue;
+
+      const durationSec = Math.round((now - task.startTime) / 1000);
+      const command = task.command || taskId;
+      const lastLines = task.stdout
+        ? task.stdout.split('\n').filter(Boolean).slice(-3).join('\n  ')
+        : '';
+
+      let content = '';
+      if (lastLines) {
+        content = `  Last output:\n  ${lastLines}\n`;
+      }
+
+      sections.push(
+        `<bash id="${taskId}" status="running" duration="${durationSec}s" command="${String(command).slice(0, 80)}">\n` +
+        content +
+        `</bash>`,
+      );
+    }
+
+    if (sections.length === 0) return null;
+
+    return `<background-tasks>\n${sections.join('\n\n')}\n</background-tasks>`;
   }
 
   /**
@@ -3191,7 +3296,7 @@ export class CortexAgent {
     });
 
     try {
-      const childAgent = await this.createChildAgent(params);
+      const childAgent = await this.createChildAgent({ ...params, taskId });
 
       // Track the sub-agent
       const tracked: TrackedSubAgent = {
@@ -3202,6 +3307,11 @@ export class CortexAgent {
         spawnedAt: startTime,
         completion,
         resolve: resolveCompletion,
+        toolCount: 0,
+        lastToolName: null,
+        lastToolSummary: null,
+        lastToolStartedAt: null,
+        pendingPermission: null,
       };
 
       if (!this.subAgentManager.track(tracked)) {
@@ -3288,7 +3398,7 @@ export class CortexAgent {
       resolveCompletion = resolve;
     });
 
-    const childAgent = await this.createChildAgent(params);
+    const childAgent = await this.createChildAgent({ ...params, taskId });
 
     // Track the sub-agent
     const tracked: TrackedSubAgent = {
@@ -3299,6 +3409,11 @@ export class CortexAgent {
       spawnedAt: startTime,
       completion,
       resolve: resolveCompletion,
+      toolCount: 0,
+      lastToolName: null,
+      lastToolSummary: null,
+      lastToolStartedAt: null,
+      pendingPermission: null,
     };
 
     if (!this.subAgentManager.track(tracked)) {
@@ -3422,6 +3537,7 @@ export class CortexAgent {
   }
 
   private async createChildAgent(params: {
+    taskId: string;
     tools?: string[];
     systemPrompt?: string;
     maxTurns?: number;
@@ -3443,7 +3559,21 @@ export class CortexAgent {
     if (this.config.logger) childCortexConfig.logger = this.config.logger;
     if (this.envOverrides) childCortexConfig.envOverrides = this.envOverrides;
     if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
-    if (this.config.resolvePermission) childCortexConfig.resolvePermission = this.config.resolvePermission;
+    if (this.config.resolvePermission) {
+      const parentResolver = this.config.resolvePermission;
+      const subAgentMgr = this.subAgentManager;
+      const childTaskId = params.taskId;
+      childCortexConfig.resolvePermission = async (toolName, toolArgs) => {
+        const entry = subAgentMgr.get(childTaskId);
+        if (entry) entry.pendingPermission = { toolName, args: toolArgs };
+        try {
+          return await parentResolver(toolName, toolArgs);
+        } finally {
+          const e = subAgentMgr.get(childTaskId);
+          if (e) e.pendingPermission = null;
+        }
+      };
+    }
 
     const childCreateParams: {
       cortexConfig: CortexAgentConfig;

@@ -375,6 +375,7 @@ export function createBashTool(config: BashToolConfig): {
         const taskId = backgroundTasks.nextTaskId();
         const task: BackgroundTask = {
           id: taskId,
+          command: command.slice(0, 120),
           process: proc,
           stdout: '',
           stderr: '',
@@ -478,6 +479,7 @@ export function createBashTool(config: BashToolConfig): {
             taskId = backgroundTasks.nextTaskId();
             const task: BackgroundTask = {
               id: taskId,
+              command: command.slice(0, 120),
               process: proc,
               stdout,
               stderr,

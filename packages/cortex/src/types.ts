@@ -846,4 +846,16 @@ export interface TrackedSubAgent {
   completion: Promise<SubAgentResult>;
   /** Resolve function for the completion promise. */
   resolve: (result: SubAgentResult) => void;
+
+  // Live activity tracking (updated via EventBridge forwarding)
+  /** Number of tool calls executed so far. */
+  toolCount: number;
+  /** Name of the most recently started tool. */
+  lastToolName: string | null;
+  /** Summary/args of the most recently started tool. */
+  lastToolSummary: string | null;
+  /** Timestamp when the most recent tool started. */
+  lastToolStartedAt: number | null;
+  /** Set while the sub-agent is blocked awaiting a permission decision. */
+  pendingPermission: { toolName: string; args: unknown } | null;
 }

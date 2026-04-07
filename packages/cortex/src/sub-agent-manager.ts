@@ -151,6 +151,19 @@ export class SubAgentManager {
   }
 
   /**
+   * Update tool activity for a running sub-agent.
+   * Called when child tool_call_start events are forwarded via EventBridge.
+   */
+  updateToolActivity(taskId: string, toolName: string, summary: string): void {
+    const entry = this.agents.get(taskId);
+    if (!entry) return;
+    entry.toolCount++;
+    entry.lastToolName = toolName;
+    entry.lastToolSummary = summary;
+    entry.lastToolStartedAt = Date.now();
+  }
+
+  /**
    * Get all active sub-agent task IDs.
    */
   getActiveTaskIds(): string[] {
