@@ -36,8 +36,10 @@ export class App {
   readonly transcript: TranscriptManager;
 
   private statusLoader: Loader | null = null;
+  private readonly cwd: string;
 
   constructor(callbacks: AppCallbacks, cwd: string) {
+    this.cwd = cwd;
     this.terminal = new ProcessTerminal();
     this.tui = new TUI(this.terminal);
 
@@ -134,7 +136,7 @@ export class App {
     toolArgs: unknown,
   ): Promise<PermissionResult> {
     return new Promise<PermissionResult>((resolve) => {
-      const prompt = new PermissionPromptComponent(toolName, toolArgs, (result) => {
+      const prompt = new PermissionPromptComponent(toolName, toolArgs, this.cwd, (result) => {
         this.transcript.removePermissionPrompt(prompt);
         this.editor.activePermissionPrompt = null;
         resolve(result);

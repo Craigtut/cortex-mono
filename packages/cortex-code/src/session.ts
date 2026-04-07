@@ -44,6 +44,7 @@ import {
 } from './persistence/sessions.js';
 import { getCommand, registerBuiltinCommands } from './commands/index.js';
 import type { Mode } from './modes/types.js';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { log } from './logger.js';
@@ -553,6 +554,9 @@ export class Session {
   ): Promise<boolean | CortexToolPermissionResult> {
     if (this.yoloMode) return true;
 
+    // Auto-allow read-only tools within the project directory
+    if (this.isReadOnlyInProject(toolName, toolArgs)) return true;
+
     // Fast path: check rules before acquiring the lock
     const rule = this.rules.matchRule(toolName, toolArgs);
     if (rule === 'allow') return true;
@@ -578,7 +582,12 @@ export class Session {
     try {
       const result = await this.app.showPermissionPrompt(toolName, toolArgs);
 
-      if (result.pattern && result.scope) {
+      if (result.scope === 'project-edits') {
+        // Project-wide edit/write permission: add rules for both tools
+        const cwdPattern = `${this.cwd}/*`;
+        await this.rules.addRule('project', 'allow', 'Edit', cwdPattern);
+        await this.rules.addRule('project', 'allow', 'Write', cwdPattern);
+      } else if (result.pattern && result.scope) {
         await this.rules.addRule(result.scope, result.decision, toolName, result.pattern);
       }
 
@@ -589,6 +598,32 @@ export class Session {
       this.permissionLockRelease = null;
       release?.();
     }
+  }
+
+  /** Check if a tool call is a read-only operation within the project directory. */
+  private isReadOnlyInProject(toolName: string, toolArgs: unknown): boolean {
+    const args = toolArgs as Record<string, unknown>;
+    switch (toolName) {
+      case 'Read': {
+        const filePath = String(args['file_path'] ?? '');
+        return this.isWithinCwd(filePath);
+      }
+      case 'Glob':
+      case 'Grep': {
+        const searchPath = String(args['path'] ?? this.cwd);
+        return this.isWithinCwd(searchPath);
+      }
+      default:
+        return false;
+    }
+  }
+
+  /** Check if an absolute path is within the current working directory. */
+  private isWithinCwd(targetPath: string): boolean {
+    if (!targetPath) return false;
+    const resolved = path.resolve(targetPath);
+    const cwdWithSep = this.cwd.endsWith(path.sep) ? this.cwd : this.cwd + path.sep;
+    return resolved === this.cwd || resolved.startsWith(cwdWithSep);
   }
 
   /** Credential resolution: stored API key or OAuth refresh. */

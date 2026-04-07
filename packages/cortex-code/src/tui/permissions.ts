@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Box, Text, SelectList, type SelectItem, type Component } from '@mariozechner/pi-tui';
 import { colors, selectListTheme } from './theme.js';
 import { extractPattern, formatRule } from '../permissions/patterns.js';
@@ -6,7 +7,7 @@ import type { PermissionDecision } from '../permissions/rules.js';
 export interface PermissionResult {
   decision: PermissionDecision;
   pattern?: string;
-  scope?: 'session' | 'project' | 'user';
+  scope?: 'session' | 'project' | 'user' | 'project-edits';
 }
 
 type PermissionCallback = (result: PermissionResult) => void;
@@ -25,10 +26,12 @@ export class PermissionPromptComponent implements Component {
   constructor(
     private toolName: string,
     private toolArgs: unknown,
+    private cwd: string,
     private callback: PermissionCallback,
   ) {
     this.suggestedPattern = extractPattern(toolName, toolArgs);
     const argsSummary = this.getArgsSummary();
+    const isEditInProject = this.isEditWithinCwd();
 
     // Build the prompt box
     this.box = new Box(1, 0);
@@ -47,7 +50,13 @@ export class PermissionPromptComponent implements Component {
       { value: 'allow', label: 'Allow' },
     ];
 
-    if (this.suggestedPattern) {
+    if (isEditInProject) {
+      // For Edit/Write within the project, offer project-wide edit access
+      items.push({
+        value: 'always-allow-edits',
+        label: 'Always allow edits in this project',
+      });
+    } else if (this.suggestedPattern) {
       items.push({
         value: 'always-allow',
         label: `Always allow  ${formatRule(toolName, this.suggestedPattern)}`,
@@ -66,11 +75,17 @@ export class PermissionPromptComponent implements Component {
         case 'allow':
           this.callback({ decision: 'allow' });
           break;
+        case 'always-allow-edits':
+          this.callback({
+            decision: 'allow',
+            scope: 'project-edits',
+          });
+          break;
         case 'always-allow':
           this.callback({
             decision: 'allow',
             pattern: this.suggestedPattern,
-            scope: 'session',
+            scope: 'project',
           });
           break;
         case 'deny':
@@ -108,6 +123,16 @@ export class PermissionPromptComponent implements Component {
 
   render(width: number): string[] {
     return this.box.render(width);
+  }
+
+  private isEditWithinCwd(): boolean {
+    if (this.toolName !== 'Edit' && this.toolName !== 'Write') return false;
+    const args = this.toolArgs as Record<string, unknown>;
+    const filePath = String(args['file_path'] ?? args['path'] ?? '');
+    if (!filePath) return false;
+    const resolved = path.resolve(filePath);
+    const cwdWithSep = this.cwd.endsWith(path.sep) ? this.cwd : this.cwd + path.sep;
+    return resolved === this.cwd || resolved.startsWith(cwdWithSep);
   }
 
   private getArgsSummary(): string {
