@@ -28,6 +28,13 @@ const STATUS_ICONS: Record<ToolStatus, string> = {
 
 const SPINNER_FRAMES = ['\u280B', '\u2819', '\u2839', '\u2838', '\u283C', '\u2834', '\u2826', '\u2827', '\u2807', '\u280F'];
 
+/** Format token count as compact string: "150", "1.2k", "15k". */
+function formatTokenCount(tokens: number): string {
+  if (tokens < 1000) return `${tokens} tokens`;
+  if (tokens < 10000) return `${(tokens / 1000).toFixed(1)}k tokens`;
+  return `${Math.round(tokens / 1000)}k tokens`;
+}
+
 export class BorderedBox implements Component {
   private headerText = '';
   private contentLines: string[] = [];
@@ -36,6 +43,7 @@ export class BorderedBox implements Component {
   private durationMs?: number;
   private belowBoxLines: string[] = [];
   private spinnerFrame = 0;
+  private resultTokens?: number;
 
   /**
    * Update the box content.
@@ -46,6 +54,7 @@ export class BorderedBox implements Component {
     footer: string,
     status: ToolStatus,
     durationMs?: number,
+    resultTokens?: number,
   ): void {
     this.headerText = header;
     this.contentLines = lines;
@@ -53,6 +62,9 @@ export class BorderedBox implements Component {
     this.status = status;
     if (durationMs !== undefined) {
       this.durationMs = durationMs;
+    }
+    if (resultTokens !== undefined) {
+      this.resultTokens = resultTokens;
     }
   }
 
@@ -84,9 +96,12 @@ export class BorderedBox implements Component {
     const hasContent = this.contentLines.length > 0;
     const isPending = this.status === 'pending' || this.status === 'streaming';
 
-    // Status icon and duration
+    // Status icon, duration, and token count
     const icon = this.getStatusIcon(theme);
     const duration = this.durationMs !== undefined ? ` ${formatDuration(this.durationMs)}` : '';
+    const tokens = this.resultTokens !== undefined
+      ? chalk.hex(theme.muted)(` ~${formatTokenCount(this.resultTokens)}`)
+      : '';
 
     // Border prefix is 4 visible chars ("╭── " or "╰── "), leaving the rest for content
     const borderPrefixWidth = 4;
@@ -97,7 +112,7 @@ export class BorderedBox implements Component {
       // ╰── read ~/path/to/file.ts  ✓ 42ms
       const footerParts = [this.headerText];
       if (this.footerText) footerParts.push(this.footerText);
-      const footerContent = `${footerParts.join('  ')} ${icon}${duration}`;
+      const footerContent = `${footerParts.join('  ')} ${icon}${duration}${tokens}`;
       lines.push(borderColor('\u2570\u2500\u2500 ') + truncateToWidth(footerContent, maxLineContent));
     } else if (!hasContent && isPending) {
       // Compact pending: single line with spinner
@@ -134,10 +149,10 @@ export class BorderedBox implements Component {
         lines.push(mutedBorder('\u2502') + '  ' + spinner + chalk.hex(theme.muted)(' Working...'));
       }
 
-      // Footer: ╰── stats ✓ 42ms
+      // Footer: ╰── stats ✓ 42ms ~1.2k tokens
       const footerContent = this.footerText
-        ? `${this.footerText} ${icon}${duration}`
-        : `${icon}${duration}`;
+        ? `${this.footerText} ${icon}${duration}${tokens}`
+        : `${icon}${duration}${tokens}`;
       lines.push(borderColor('\u2570\u2500\u2500 ') + truncateToWidth(footerContent, maxLineContent));
     }
 

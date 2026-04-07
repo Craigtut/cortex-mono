@@ -8,6 +8,7 @@
  */
 
 import type { Component, TUI } from '@mariozechner/pi-tui';
+import { estimateTokens } from '@animus-labs/cortex';
 import { BorderedBox } from './bordered-box.js';
 import { getRenderer } from './registry.js';
 import { getToolTheme } from '../theme.js';
@@ -39,6 +40,7 @@ export class ToolExecutionComponent implements Component {
   private lastDetails?: unknown;
   private lastError?: string;
   private lastStreamUpdate?: unknown;
+  private resultTokens?: number;
 
   constructor(toolName: string, tui?: TUI) {
     this.toolName = toolName;
@@ -83,6 +85,7 @@ export class ToolExecutionComponent implements Component {
     this.lastResult = result;
     this.lastDetails = details;
     this.lastStreamUpdate = undefined;
+    this.resultTokens = this.estimateResultTokens(result);
     this.stopSpinner();
     this.rebuildDisplay();
   }
@@ -186,7 +189,7 @@ export class ToolExecutionComponent implements Component {
 
     if (this.lastResult !== undefined) {
       const display = this.renderer.renderResult(this.lastResult, this.lastDetails, context);
-      this.box.setContent(display.headerText, display.contentLines, display.footerText, this.status, this.durationMs);
+      this.box.setContent(display.headerText, display.contentLines, display.footerText, this.status, this.durationMs, this.resultTokens);
       if (display.belowBoxLines) {
         this.box.setBelowBox(display.belowBoxLines);
       }
@@ -198,5 +201,25 @@ export class ToolExecutionComponent implements Component {
       const display = this.renderer.renderStreamUpdate(this.lastStreamUpdate, context);
       this.box.setContent(display.headerText, display.contentLines, display.footerText, this.status);
     }
+  }
+
+  /**
+   * Estimate the token count of a tool result by extracting text content.
+   */
+  private estimateResultTokens(result: unknown): number {
+    if (typeof result === 'string') {
+      return estimateTokens(result);
+    }
+    if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
+      const content = (result as Record<string, unknown>)['content'];
+      if (Array.isArray(content)) {
+        const text = content
+          .filter((c: unknown) => c && typeof c === 'object' && (c as Record<string, unknown>)['type'] === 'text')
+          .map((c: unknown) => (c as Record<string, string>)['text'])
+          .join('\n');
+        return estimateTokens(text);
+      }
+    }
+    return 0;
   }
 }
