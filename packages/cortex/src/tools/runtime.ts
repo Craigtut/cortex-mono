@@ -7,6 +7,7 @@
 
 import type * as child_process from 'node:child_process';
 import { CwdTracker } from './shared/cwd-tracker.js';
+import { FileMutationLock } from './shared/file-mutation-lock.js';
 import { ReadRegistry } from './shared/read-registry.js';
 import { WebFetchCache } from './web-fetch/cache.js';
 
@@ -99,12 +100,14 @@ export class WebFetchRuntimeState {
 export class CortexToolRuntime {
   readonly cwdTracker: CwdTracker;
   readonly readRegistry: ReadRegistry;
+  readonly fileMutationLock: FileMutationLock;
   readonly backgroundTasks: BackgroundTaskStore;
   readonly webFetch: WebFetchRuntimeState;
 
   constructor(workingDirectory: string) {
     this.cwdTracker = new CwdTracker(workingDirectory);
     this.readRegistry = new ReadRegistry();
+    this.fileMutationLock = new FileMutationLock();
     this.backgroundTasks = new BackgroundTaskStore();
     this.webFetch = new WebFetchRuntimeState();
   }
@@ -112,11 +115,13 @@ export class CortexToolRuntime {
   resetForLoop(): void {
     this.cwdTracker.reset();
     this.readRegistry.clear();
+    this.fileMutationLock.clear();
     this.webFetch.resetLoop();
   }
 
   destroy(): void {
     this.readRegistry.clear();
+    this.fileMutationLock.clear();
     this.backgroundTasks.clear();
     this.webFetch.destroy();
   }

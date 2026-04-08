@@ -12,6 +12,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { Type, type Static } from '@sinclair/typebox';
+import type { FileMutationLock } from './shared/file-mutation-lock.js';
 import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';
@@ -55,6 +56,7 @@ export interface WriteDetails {
 export interface WriteToolConfig {
   runtime?: CortexToolRuntime | undefined;
   readRegistry?: ReadRegistry | undefined;
+  fileMutationLock?: FileMutationLock | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +159,7 @@ export function createWriteTool(config: WriteToolConfig): {
   if (!readRegistry) {
     throw new Error('createWriteTool requires either runtime or readRegistry');
   }
+  const fileMutationLock = config.runtime?.fileMutationLock ?? config.fileMutationLock;
 
   const tool = {
     name: 'Write',
@@ -167,9 +170,8 @@ export function createWriteTool(config: WriteToolConfig): {
       const filePath = path.resolve(params.file_path);
       const newContent = params.content;
 
-      // Check if file exists
+      // Check if file exists (before acquiring lock)
       let fileExists = false;
-      let originalContent: string | null = null;
       try {
         const stat = await fs.promises.stat(filePath);
         fileExists = stat.isFile();
@@ -177,134 +179,150 @@ export function createWriteTool(config: WriteToolConfig): {
         // File does not exist - that's fine for creation
       }
 
-      // Enforce read-before-write for existing files
-      if (fileExists && !readRegistry.hasBeenRead(filePath)) {
-        return {
-          content: [{ type: 'text', text: 'You must Read this file before overwriting it.' }],
-          details: {
-            filePath,
-            isCreate: false,
-            bytesWritten: 0,
-            diff: null,
-            originalContent: null,
-          },
-        };
-      }
-
-      // Read original content for diff (existing files only)
-      if (fileExists) {
-        try {
-          originalContent = await fs.promises.readFile(filePath, 'utf8');
-        } catch {
-          // If we can't read for diff, continue without it
-        }
-      }
-
-      // Create parent directories
-      const parentDir = path.dirname(filePath);
+      // Acquire per-file mutation lock (serializes concurrent same-file writes)
+      const release = fileMutationLock ? await fileMutationLock.acquire(filePath) : undefined;
       try {
-        await fs.promises.mkdir(parentDir, { recursive: true });
-      } catch (err: unknown) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code === 'EACCES') {
+        let originalContent: string | null = null;
+
+        // Re-check existence after acquiring lock (another tool may have created/deleted it)
+        try {
+          const stat = await fs.promises.stat(filePath);
+          fileExists = stat.isFile();
+        } catch {
+          fileExists = false;
+        }
+
+        // Enforce read-before-write for existing files
+        if (fileExists && !readRegistry.hasBeenRead(filePath)) {
           return {
-            content: [{ type: 'text', text: `Cannot create directory: ${parentDir}` }],
+            content: [{ type: 'text', text: 'You must Read this file before overwriting it.' }],
             details: {
               filePath,
-              isCreate: !fileExists,
+              isCreate: false,
               bytesWritten: 0,
               diff: null,
-              originalContent,
+              originalContent: null,
             },
           };
         }
-        throw err;
-      }
 
-      // Atomic write: write to temp file, then rename
-      const tempPath = path.join(parentDir, `.write-${crypto.randomUUID()}.tmp`);
-      try {
-        await fs.promises.writeFile(tempPath, newContent, 'utf8');
+        // Read original content for diff (existing files only)
+        if (fileExists) {
+          try {
+            originalContent = await fs.promises.readFile(filePath, 'utf8');
+          } catch {
+            // If we can't read for diff, continue without it
+          }
+        }
+
+        // Create parent directories
+        const parentDir = path.dirname(filePath);
         try {
-          await fs.promises.rename(tempPath, filePath);
-        } catch {
-          // Rename may fail on Windows if target is open. Fall back to direct write.
-          await fs.promises.writeFile(filePath, newContent, 'utf8');
-          // Clean up temp file
+          await fs.promises.mkdir(parentDir, { recursive: true });
+        } catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === 'EACCES') {
+            return {
+              content: [{ type: 'text', text: `Cannot create directory: ${parentDir}` }],
+              details: {
+                filePath,
+                isCreate: !fileExists,
+                bytesWritten: 0,
+                diff: null,
+                originalContent,
+              },
+            };
+          }
+          throw err;
+        }
+
+        // Atomic write: write to temp file, then rename
+        const tempPath = path.join(parentDir, `.write-${crypto.randomUUID()}.tmp`);
+        try {
+          await fs.promises.writeFile(tempPath, newContent, 'utf8');
+          try {
+            await fs.promises.rename(tempPath, filePath);
+          } catch {
+            // Rename may fail on Windows if target is open. Fall back to direct write.
+            await fs.promises.writeFile(filePath, newContent, 'utf8');
+            // Clean up temp file
+            try {
+              await fs.promises.unlink(tempPath);
+            } catch {
+              // Ignore cleanup errors
+            }
+          }
+        } catch (err: unknown) {
+          // Clean up temp file on error
           try {
             await fs.promises.unlink(tempPath);
           } catch {
             // Ignore cleanup errors
           }
-        }
-      } catch (err: unknown) {
-        // Clean up temp file on error
-        try {
-          await fs.promises.unlink(tempPath);
-        } catch {
-          // Ignore cleanup errors
+
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === 'EACCES') {
+            return {
+              content: [{ type: 'text', text: `Permission denied: ${filePath}` }],
+              details: {
+                filePath,
+                isCreate: !fileExists,
+                bytesWritten: 0,
+                diff: null,
+                originalContent,
+              },
+            };
+          }
+          if (code === 'ENOSPC') {
+            return {
+              content: [{ type: 'text', text: `Disk full. Cannot write to: ${filePath}` }],
+              details: {
+                filePath,
+                isCreate: !fileExists,
+                bytesWritten: 0,
+                diff: null,
+                originalContent,
+              },
+            };
+          }
+          if (code === 'ENAMETOOLONG') {
+            return {
+              content: [{ type: 'text', text: `Path exceeds system limit: ${filePath}` }],
+              details: {
+                filePath,
+                isCreate: !fileExists,
+                bytesWritten: 0,
+                diff: null,
+                originalContent,
+              },
+            };
+          }
+          throw err;
         }
 
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code === 'EACCES') {
-          return {
-            content: [{ type: 'text', text: `Permission denied: ${filePath}` }],
-            details: {
-              filePath,
-              isCreate: !fileExists,
-              bytesWritten: 0,
-              diff: null,
-              originalContent,
-            },
-          };
-        }
-        if (code === 'ENOSPC') {
-          return {
-            content: [{ type: 'text', text: `Disk full. Cannot write to: ${filePath}` }],
-            details: {
-              filePath,
-              isCreate: !fileExists,
-              bytesWritten: 0,
-              diff: null,
-              originalContent,
-            },
-          };
-        }
-        if (code === 'ENAMETOOLONG') {
-          return {
-            content: [{ type: 'text', text: `Path exceeds system limit: ${filePath}` }],
-            details: {
-              filePath,
-              isCreate: !fileExists,
-              bytesWritten: 0,
-              diff: null,
-              originalContent,
-            },
-          };
-        }
-        throw err;
+        // Invalidate read state so the next mutation must re-read
+        readRegistry.invalidate(filePath);
+
+        const bytesWritten = Buffer.byteLength(newContent, 'utf8');
+        const isCreate = !fileExists;
+
+        // Compute diff for updates
+        const diff = originalContent !== null ? computeDiff(originalContent, newContent) : null;
+
+        const verb = isCreate ? 'Created' : 'Updated';
+        return {
+          content: [{ type: 'text', text: `${verb} ${filePath} (${bytesWritten} bytes)` }],
+          details: {
+            filePath,
+            isCreate,
+            bytesWritten,
+            diff,
+            originalContent,
+          },
+        };
+      } finally {
+        release?.();
       }
-
-      // Mark as read (so subsequent edits work)
-      readRegistry.markRead(filePath);
-
-      const bytesWritten = Buffer.byteLength(newContent, 'utf8');
-      const isCreate = !fileExists;
-
-      // Compute diff for updates
-      const diff = originalContent !== null ? computeDiff(originalContent, newContent) : null;
-
-      const verb = isCreate ? 'Created' : 'Updated';
-      return {
-        content: [{ type: 'text', text: `${verb} ${filePath} (${bytesWritten} bytes)` }],
-        details: {
-          filePath,
-          isCreate,
-          bytesWritten,
-          diff,
-          originalContent,
-        },
-      };
     },
   };
 
@@ -314,6 +332,7 @@ export function createWriteTool(config: WriteToolConfig): {
       ...config,
       runtime,
       readRegistry: runtime.readRegistry,
+      fileMutationLock: runtime.fileMutationLock,
     }),
   });
 }

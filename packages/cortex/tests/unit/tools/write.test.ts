@@ -3,16 +3,30 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { ReadRegistry } from '../../../src/tools/shared/read-registry.js';
+import { FileMutationLock } from '../../../src/tools/shared/file-mutation-lock.js';
 import { createWriteTool } from '../../../src/tools/write.js';
+import { createEditTool } from '../../../src/tools/edit.js';
+
+/** Mark a file as read with its actual mtime (mirrors what the Read tool does). */
+function markFileRead(registry: ReadRegistry, filePath: string): void {
+  const stat = fs.statSync(filePath);
+  registry.markRead(filePath, { timestamp: stat.mtimeMs });
+}
+
+function getText(result: { content: Array<{ type: string; text?: string }> }): string {
+  return (result.content[0] as { type: 'text'; text: string }).text;
+}
 
 describe('Write tool', () => {
   let registry: ReadRegistry;
+  let lock: FileMutationLock;
   let writeTool: ReturnType<typeof createWriteTool>;
   let tmpDir: string;
 
   beforeEach(() => {
     registry = new ReadRegistry();
-    writeTool = createWriteTool({ readRegistry: registry });
+    lock = new FileMutationLock();
+    writeTool = createWriteTool({ readRegistry: registry, fileMutationLock: lock });
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-write-test-'));
   });
 
@@ -40,15 +54,14 @@ describe('Write tool', () => {
   it('overwrites an existing file after read', async () => {
     const filePath = path.join(tmpDir, 'existing.txt');
     fs.writeFileSync(filePath, 'original content');
-    registry.markRead(filePath);
+    markFileRead(registry, filePath);
 
     const result = await writeTool.execute({
       file_path: filePath,
       content: 'new content',
     });
 
-    const text = (result.content[0] as { type: 'text'; text: string }).text;
-    expect(text).toContain('Updated');
+    expect(getText(result)).toContain('Updated');
     expect(result.details.isCreate).toBe(false);
     expect(result.details.originalContent).toBe('original content');
     expect(result.details.diff).not.toBeNull();
@@ -64,9 +77,7 @@ describe('Write tool', () => {
       content: 'new content',
     });
 
-    const text = (result.content[0] as { type: 'text'; text: string }).text;
-    expect(text).toContain('You must Read this file before overwriting it');
-    // File should not have been modified
+    expect(getText(result)).toContain('You must Read this file before overwriting it');
     expect(fs.readFileSync(filePath, 'utf8')).toBe('original content');
   });
 
@@ -82,21 +93,23 @@ describe('Write tool', () => {
     expect(fs.readFileSync(filePath, 'utf8')).toBe('nested content');
   });
 
-  it('marks the written file as read in the registry', async () => {
-    const filePath = path.join(tmpDir, 'new.txt');
+  it('invalidates read state after successful write', async () => {
+    const filePath = path.join(tmpDir, 'existing.txt');
+    fs.writeFileSync(filePath, 'original');
+    markFileRead(registry, filePath);
 
     await writeTool.execute({
       file_path: filePath,
-      content: 'content',
+      content: 'updated',
     });
 
-    expect(registry.hasBeenRead(filePath)).toBe(true);
+    expect(registry.hasBeenRead(filePath)).toBe(false);
   });
 
   it('computes diff for updates', async () => {
     const filePath = path.join(tmpDir, 'diff-test.txt');
     fs.writeFileSync(filePath, 'line 1\nline 2\nline 3\n');
-    registry.markRead(filePath);
+    markFileRead(registry, filePath);
 
     const result = await writeTool.execute({
       file_path: filePath,
@@ -117,5 +130,52 @@ describe('Write tool', () => {
 
     expect(result.details.diff).toBeNull();
     expect(result.details.originalContent).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Edit after Write without re-read
+  // -------------------------------------------------------------------------
+
+  it('rejects Edit after Write without re-read', async () => {
+    const editTool = createEditTool({ readRegistry: registry, fileMutationLock: lock });
+    const filePath = path.join(tmpDir, 'combo.txt');
+    fs.writeFileSync(filePath, 'original content');
+    markFileRead(registry, filePath);
+
+    // Write overwrites the file and invalidates read state
+    await writeTool.execute({ file_path: filePath, content: 'new content' });
+
+    // Edit without re-reading should be rejected
+    const result = await editTool.execute({
+      file_path: filePath,
+      old_string: 'new',
+      new_string: 'fresh',
+    });
+
+    expect(getText(result)).toContain('You must Read this file before editing it');
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('new content');
+  });
+
+  // -------------------------------------------------------------------------
+  // Concurrent mutation safety (FileMutationLock)
+  // -------------------------------------------------------------------------
+
+  it('serializes concurrent writes on the same file via lock', async () => {
+    const filePath = path.join(tmpDir, 'race.txt');
+    fs.writeFileSync(filePath, 'original');
+    markFileRead(registry, filePath);
+
+    // Launch two writes concurrently. Lock serializes them:
+    // first succeeds, second is rejected (read state invalidated by first).
+    const [r1, r2] = await Promise.all([
+      writeTool.execute({ file_path: filePath, content: 'version-A' }),
+      writeTool.execute({ file_path: filePath, content: 'version-B' }),
+    ]);
+
+    const succeeded = [r1, r2].filter(r => r.details.bytesWritten > 0);
+    const rejected = [r1, r2].filter(r => r.details.bytesWritten === 0);
+    expect(succeeded).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(getText(rejected[0])).toContain('You must Read this file before overwriting it');
   });
 });

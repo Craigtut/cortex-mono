@@ -93,4 +93,26 @@ describe('ReadRegistry', () => {
 
     expect(registry.getState('/file.txt')).toBeUndefined();
   });
+
+  // -----------------------------------------------------------------------
+  // invalidate()
+  // -----------------------------------------------------------------------
+
+  it('invalidates a single file without affecting others', () => {
+    registry.markRead('/a.txt', { timestamp: 1000 });
+    registry.markRead('/b.txt', { timestamp: 2000 });
+
+    registry.invalidate('/a.txt');
+
+    expect(registry.hasBeenRead('/a.txt')).toBe(false);
+    expect(registry.getState('/a.txt')).toBeUndefined();
+    expect(registry.hasBeenRead('/b.txt')).toBe(true);
+    expect(registry.size).toBe(1);
+  });
+
+  it('invalidate on untracked file is a no-op', () => {
+    registry.markRead('/a.txt');
+    registry.invalidate('/untracked.txt');
+    expect(registry.size).toBe(1);
+  });
 });

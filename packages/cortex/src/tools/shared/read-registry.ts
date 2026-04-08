@@ -50,6 +50,15 @@ export class ReadRegistry {
   }
 
   /**
+   * Invalidate a single file's read state.
+   * Called after a mutation (Edit/Write) so the next mutation
+   * on the same file must re-read first.
+   */
+  invalidate(filePath: string): void {
+    this.entries.delete(this.normalize(filePath));
+  }
+
+  /**
    * Clear all read tracking. Called at the start of each agentic loop.
    */
   clear(): void {
