@@ -19,18 +19,22 @@ export const costCommand: Command = {
 
     const usage = agent.getSessionUsage();
 
-    // Cache hit rate: what percentage of total input tokens were served from cache
-    const totalInput = usage.tokens.input + usage.tokens.cacheRead;
+    // Total input = uncached + cache reads + cache writes (all tokens sent to the model)
+    const totalInput = usage.tokens.input + usage.tokens.cacheRead + usage.tokens.cacheWrite;
+    const totalOutput = usage.tokens.output;
+
+    // Cache hit rate: of all input tokens, what percentage were served from cache (cheap)?
+    // Denominator includes cacheWrite because those are new writes at full price.
     const cacheHitRate = totalInput > 0
       ? ((usage.tokens.cacheRead / totalInput) * 100).toFixed(1)
       : '0.0';
 
     const lines = [
-      `Current context usage: ${ctxUsage}k / ${limit}k (${percentage}%)`,
+      `Current context: ${ctxUsage}k / ${limit}k (${percentage}%)`,
+      `Session tokens: ${(totalInput / 1000).toFixed(1)}k in / ${(totalOutput / 1000).toFixed(1)}k out`,
       `Turns: ${usage.totalTurns}`,
       usage.totalCost > 0 ? `Estimated cost: $${usage.totalCost.toFixed(4)}` : '',
       totalInput > 0 ? `Cache hit rate: ${cacheHitRate}%` : '',
-      `Context window: ${limit}k tokens`,
     ].filter(Boolean);
 
     app.transcript.addNotification('Cost Summary', lines.join('\n'));
