@@ -10,6 +10,7 @@ import { TranscriptManager } from './transcript.js';
 import { PermissionPromptComponent, type PermissionResult } from './permissions.js';
 import { StatusSpinner } from './spinner.js';
 import { editorTheme } from './theme.js';
+import type { FreezeDiagnostics } from '../diagnostics/freeze.js';
 
 export interface AppCallbacks {
   /** Called when user submits a message or slash command. */
@@ -36,10 +37,13 @@ export class App {
   readonly transcript: TranscriptManager;
 
   private statusIndicator: StatusSpinner | null = null;
+  private statusSpacer: Spacer | null = null;
   private readonly cwd: string;
+  private readonly diagnostics: FreezeDiagnostics | undefined;
 
-  constructor(callbacks: AppCallbacks, cwd: string) {
+  constructor(callbacks: AppCallbacks, cwd: string, diagnostics?: FreezeDiagnostics) {
     this.cwd = cwd;
+    this.diagnostics = diagnostics;
     this.terminal = new ProcessTerminal();
     this.tui = new TUI(this.terminal);
 
@@ -68,6 +72,7 @@ export class App {
       onExitHint: () => this.statusBar.showHint('Press Ctrl+C again to exit', 500),
       onToggleExpand: () => this.transcript.toggleExpand(),
       onToggleExpandAll: () => this.transcript.toggleExpandAll(),
+      onInputActivity: (kind) => this.diagnostics?.recordKeypress(kind),
     };
     this.editor = new CustomEditor(this.tui, editorTheme, editorCallbacks, cwd);
 
@@ -82,11 +87,17 @@ export class App {
     this.tui.setFocus(this.editor);
 
     // Create transcript manager
-    this.transcript = new TranscriptManager(this.chatContainer, this.tui, this.activityContainer);
+    this.transcript = new TranscriptManager(
+      this.chatContainer,
+      this.tui,
+      this.activityContainer,
+      this.diagnostics,
+    );
   }
 
   /** Start the TUI event loop. */
   start(): void {
+    this.diagnostics?.start();
     this.tui.start();
   }
 
@@ -94,6 +105,7 @@ export class App {
   stop(): void {
     this.transcript.clear();
     this.hideStatusSpinner();
+    this.diagnostics?.stop();
     this.tui.stop();
   }
 
@@ -105,6 +117,9 @@ export class App {
   /** Show a loading spinner in the status area (during agent execution). */
   showStatusSpinner(message: string): void {
     this.hideStatusSpinner();
+    // Breathing room above the spinner
+    this.statusSpacer = new Spacer(1);
+    this.statusContainer.addChild(this.statusSpacer);
     // Keep the top-level spinner low-frequency. Tool and subagent rows animate
     // through their own shared low-frequency ticker.
     this.statusIndicator = new StatusSpinner(this.tui, message);
@@ -114,6 +129,11 @@ export class App {
 
   /** Hide the status spinner. */
   hideStatusSpinner(): void {
+    this.removeWorkingTagSubtitle();
+    if (this.statusSpacer) {
+      this.statusContainer.removeChild(this.statusSpacer);
+      this.statusSpacer = null;
+    }
     if (this.statusIndicator) {
       this.statusIndicator.stop();
       this.statusContainer.removeChild(this.statusIndicator);
@@ -158,6 +178,20 @@ export class App {
     this.editor.refreshCommands(cwd);
   }
 
+  // ---------------------------------------------------------------------------
+  // Working tag queue (rendered inline on the spinner line at reading pace)
+  // ---------------------------------------------------------------------------
+
+  /** Enqueue a completed working tag message for display at reading pace. */
+  enqueueWorkingTagText(text: string): void {
+    this.statusIndicator?.enqueueWorkingText(text);
+  }
+
+  /** Immediately clear the working tag queue and display. */
+  removeWorkingTagSubtitle(): void {
+    this.statusIndicator?.clearWorkingQueue();
+  }
+
   /**
    * pi-tui schedules renders with process.nextTick(), which can starve stdin
    * under heavy repaint load. Yield with setImmediate() instead so Ctrl+C and
@@ -169,6 +203,7 @@ export class App {
     if (typeof doRender !== 'function') return;
 
     tui['requestRender'] = (force = false) => {
+      this.diagnostics?.recordRenderRequested(force);
       if (force) {
         tui['previousLines'] = [];
         tui['previousWidth'] = -1;
@@ -183,9 +218,11 @@ export class App {
       tui['renderRequested'] = true;
 
       setImmediate(() => {
+        const startedAt = Date.now();
         tui['renderRequested'] = false;
         if (tui['stopped']) return;
         (doRender as () => void).call(this.tui);
+        this.diagnostics?.recordRenderCompleted(Date.now() - startedAt);
       });
     };
   }

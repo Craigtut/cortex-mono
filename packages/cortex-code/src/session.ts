@@ -28,6 +28,7 @@ import {
 } from '@animus-labs/cortex';
 import { SelectList, type SelectItem } from '@mariozechner/pi-tui';
 import { App, type AppCallbacks } from './tui/app.js';
+import { randomThinkingLabel } from './tui/spinner.js';
 import { selectListTheme } from './tui/theme.js';
 import { OverlayBox } from './tui/overlay-box.js';
 import { type CortexCodeConfig } from './config/config.js';
@@ -49,6 +50,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { log } from './logger.js';
 import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
+import { FreezeDiagnostics } from './diagnostics/freeze.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -81,6 +83,7 @@ export class Session {
   private createdAt: number;
   private permissionLockPromise: Promise<void> | null = null;
   private permissionLockRelease: (() => void) | null = null;
+  private readonly freezeDiagnostics: FreezeDiagnostics;
 
   private readonly config: CortexCodeConfig;
   private readonly mode: Mode;
@@ -107,6 +110,7 @@ export class Session {
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.saver = createDebouncedSaver(this.sessionId);
     this.createdAt = Date.now();
+    this.freezeDiagnostics = new FreezeDiagnostics(this.config.diagnostics?.freeze);
   }
 
   /** Start the session: create agent, set up context, wire events, start TUI. */
@@ -124,7 +128,7 @@ export class Session {
       onAbort: () => this.abort(),
       onExit: () => this.shutdown(),
     };
-    this.app = new App(callbacks, this.cwd);
+    this.app = new App(callbacks, this.cwd, this.freezeDiagnostics);
 
     // Create agent (built-in tools are auto-registered by Cortex)
     this.agent = await CortexAgent.create({
@@ -137,6 +141,7 @@ export class Session {
       getApiKey: (provider) => this.getApiKey(provider),
       contextWindowLimit: this.config.contextWindowLimit ?? null,
       logger: log,
+      ...this.buildDiagnosticsConfig() ? { diagnostics: this.buildDiagnosticsConfig()! } : {},
     });
 
     // Set up context slots
@@ -222,8 +227,9 @@ export class Session {
     await this.updateEphemeralContext();
 
     // Show spinner
-    this.app!.showStatusSpinner('Thinking...');
+    this.app!.showStatusSpinner(randomThinkingLabel());
     this.isRunning = true;
+    this.freezeDiagnostics.setSessionRunning(true);
 
     try {
       await this.agent.prompt(text);
@@ -243,6 +249,7 @@ export class Session {
       }
     } finally {
       this.isRunning = false;
+      this.freezeDiagnostics.setSessionRunning(false);
       this.app!.hideStatusSpinner();
       this.app!.focusEditor();
     }
@@ -338,9 +345,15 @@ export class Session {
 
     // Streaming response chunks
     let assistantStarted = false;
+    let rawStreamText = '';
+    let workingTagOpen = false;
+
     bridge.on('response_start', (event: CortexEvent) => {
       if (event.childTaskId) return;
       assistantStarted = false;
+      rawStreamText = '';
+      workingTagOpen = false;
+      this.app!.removeWorkingTagSubtitle();
     });
 
     bridge.on('response_chunk', (event: CortexEvent) => {
@@ -355,6 +368,8 @@ export class Session {
       const data = event.data as Record<string, unknown> | undefined;
       const delta = this.extractTextDelta(data);
       if (delta) {
+        rawStreamText += delta;
+        this.updateWorkingTagDisplay(rawStreamText, workingTagOpen, (open) => { workingTagOpen = open; });
         this.app!.transcript.appendAssistantChunk(delta);
       }
     });
@@ -415,6 +430,8 @@ export class Session {
     this.agent.onTurnComplete((output: AgentTextOutput) => {
       this.app!.transcript.finalizeAssistantMessage(output.userFacing);
       assistantStarted = false;
+      rawStreamText = '';
+      workingTagOpen = false;
     });
 
     // Loop complete (auto-save, update footer, hide spinner)
@@ -493,29 +510,19 @@ export class Session {
 
     // Sub-agent events: rendered as tool calls via the SubAgent renderer
     this.agent.onSubAgentSpawned((taskId, instructions, background) => {
-      this.app!.transcript.startToolCall(taskId, 'SubAgent', {
+      this.app!.transcript.startSubAgentCall(taskId, {
         instructions,
         background,
         modelId: this.agent!.getModel().modelId,
       });
     });
 
-    this.agent.onSubAgentCompleted((taskId, result, _status, usage) => {
-      const u = typeof usage === 'object' && usage !== null
-        ? usage as Record<string, unknown>
-        : {};
-      this.app!.transcript.completeToolCall(taskId, result, {
-        background: true,
-        turns: Number(u['turns'] ?? 0),
-        durationMs: Number(u['durationMs'] ?? 0),
-        cost: Number(u['cost'] ?? 0),
-        status: _status,
-        toolCalls: (u as Record<string, unknown>)['toolCalls'],
-      }, Number(u['durationMs'] ?? 0));
+    this.agent.onSubAgentCompleted((taskId, result, status, usage) => {
+      this.app!.transcript.completeSubAgentCall(taskId, result, status, usage);
     });
 
     this.agent.onSubAgentFailed((taskId, error) => {
-      this.app!.transcript.failToolCall(taskId, error, 0);
+      this.app!.transcript.failSubAgentCall(taskId, error);
     });
 
     // Background sub-agent result delivery: Cortex restarts the agentic loop
@@ -698,10 +705,12 @@ export class Session {
 
   /** Abort the current agent loop without destroying. */
   async abort(): Promise<void> {
+    this.freezeDiagnostics.recordAbortRequested('session.abort');
     if (this.agent && this.isRunning) {
       await this.agent.abort();
     }
     this.isRunning = false;
+    this.freezeDiagnostics.setSessionRunning(false);
     this.app?.hideStatusSpinner();
     this.app?.focusEditor();
   }
@@ -753,6 +762,15 @@ export class Session {
     this.agent.getContextManager().setEphemeral(
       `<environment>\n${lines.join('\n')}\n</environment>`,
     );
+  }
+
+  private buildDiagnosticsConfig(): import('@animus-labs/cortex').CortexDiagnosticsConfig | undefined {
+    const freeze = this.config.diagnostics?.freeze;
+    if (!freeze?.enabled) return undefined;
+    const watchdog: import('@animus-labs/cortex').PromptWatchdogDiagnosticsConfig = { enabled: true };
+    if (freeze.promptWatchdogIntervalMs !== undefined) watchdog.heartbeatIntervalMs = freeze.promptWatchdogIntervalMs;
+    if (freeze.abortWaitWarningMs !== undefined) watchdog.abortWaitWarningMs = freeze.abortWaitWarningMs;
+    return { promptWatchdog: watchdog };
   }
 
   private updateFooterContextUsage(): void {
@@ -814,15 +832,46 @@ export class Session {
   /** Extract text delta from a pi-agent-core message_update event. */
   private extractTextDelta(data: Record<string, unknown> | undefined): string | null {
     if (!data) return null;
-    // Pi-agent-core message_update events contain text deltas in various shapes
-    // depending on the provider. Try common patterns:
+
+    // Pi-agent-core message_update events carry the streaming delta inside assistantMessageEvent
+    const assistantEvent = data['assistantMessageEvent'] as Record<string, unknown> | undefined;
+    if (assistantEvent && assistantEvent['type'] === 'text_delta') {
+      const delta = assistantEvent['delta'];
+      if (typeof delta === 'string') return delta;
+    }
+
+    // Fallback patterns for other provider shapes
     if (typeof data['text'] === 'string') return data['text'];
     if (typeof data['delta'] === 'string') return data['delta'];
     if (typeof data['content'] === 'string') return data['content'];
-    // Nested: data.delta.text or data.content_block_delta.delta.text
     const delta = data['delta'] as Record<string, unknown> | undefined;
     if (delta && typeof delta['text'] === 'string') return delta['text'];
     return null;
+  }
+
+  /**
+   * Detect working tag close transitions and enqueue completed messages
+   * for display at reading pace on the spinner line.
+   */
+  private updateWorkingTagDisplay(
+    rawText: string,
+    wasOpen: boolean,
+    setOpen: (open: boolean) => void,
+  ): void {
+    const lastOpenIdx = rawText.lastIndexOf('<working>');
+    const lastCloseIdx = rawText.lastIndexOf('</working>');
+
+    if (lastOpenIdx > lastCloseIdx) {
+      // Inside an unclosed working tag (streaming)
+      setOpen(true);
+    } else if (wasOpen && lastCloseIdx >= lastOpenIdx) {
+      // Working tag just closed: extract content and enqueue for display
+      const content = rawText.slice(lastOpenIdx + '<working>'.length, lastCloseIdx).trim();
+      if (content) {
+        this.app!.enqueueWorkingTagText(content);
+      }
+      setOpen(false);
+    }
   }
 
   /** Extract readable text from a tool result (may be string, object, or content array). */
