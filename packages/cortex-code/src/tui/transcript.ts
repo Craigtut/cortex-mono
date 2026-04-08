@@ -29,14 +29,19 @@ export class TranscriptManager {
   private currentAssistantText = '';
   /** Map of active tool call components by tool call ID. */
   private toolCalls = new Map<string, ToolExecutionComponent>();
+  /** Live background sub-agent rows pinned near the bottom of the layout. */
+  private backgroundSubAgents = new Map<string, { component: ToolExecutionComponent; completed: boolean }>();
+  private backgroundOrder: string[] = [];
   /** Throttle renders to avoid overwhelming the terminal during rapid events. */
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRenderTime = 0;
   private static readonly MIN_RENDER_INTERVAL_MS = 100;
+  private static readonly MAX_BACKGROUND_ROWS = 4;
 
   constructor(
     private chatContainer: Container,
     private tui: TUI,
+    private activityContainer: Container,
   ) {}
 
   /**
@@ -99,7 +104,8 @@ export class TranscriptManager {
   /** Add a user message to the transcript. */
   addUserMessage(text: string): void {
     this.finalizeCurrentAssistant();
-    this.chatContainer.addChild(new Text(text, 2, 0, colors.userMessageBg));
+    this.chatContainer.addChild(new Spacer(1));
+    this.chatContainer.addChild(new Text(text, 2, 1, colors.userMessageBg));
     this.chatContainer.addChild(new Spacer(1));
   }
 
@@ -128,6 +134,7 @@ export class TranscriptManager {
       this.currentAssistantMarkdown.setText(finalText);
     }
     this.finalizeCurrentAssistant();
+    this.immediateRender();
   }
 
   /**
@@ -142,6 +149,22 @@ export class TranscriptManager {
     toolComponent.start(args);
     this.toolCalls.set(toolCallId, toolComponent);
     this.chatContainer.addChild(toolComponent);
+    this.throttledRender();
+  }
+
+  /** Start a sub-agent call, routing background work to the activity panel. */
+  startSubAgentCall(toolCallId: string, args: Record<string, unknown>): void {
+    if (!args['background']) {
+      this.startToolCall(toolCallId, 'SubAgent', args);
+      return;
+    }
+
+    const toolComponent = new ToolExecutionComponent('SubAgent', this.tui);
+    toolComponent.start(args);
+    this.backgroundSubAgents.set(toolCallId, { component: toolComponent, completed: false });
+    this.backgroundOrder.push(toolCallId);
+    this.activityContainer.addChild(toolComponent);
+    this.pruneBackgroundSubAgents();
     this.throttledRender();
   }
 
@@ -165,6 +188,38 @@ export class TranscriptManager {
     this.throttledRender();
   }
 
+  /** Complete a sub-agent call from either the transcript or background panel. */
+  completeSubAgentCall(
+    toolCallId: string,
+    result: unknown,
+    status: string,
+    usage: unknown,
+  ): void {
+    const u = typeof usage === 'object' && usage !== null
+      ? usage as Record<string, unknown>
+      : {};
+    const details = {
+      background: this.backgroundSubAgents.has(toolCallId),
+      turns: Number(u['turns'] ?? 0),
+      durationMs: Number(u['durationMs'] ?? 0),
+      cost: Number(u['cost'] ?? 0),
+      status,
+      toolCalls: u['toolCalls'],
+    };
+    const durationMs = Number(u['durationMs'] ?? 0);
+
+    const background = this.backgroundSubAgents.get(toolCallId);
+    if (background) {
+      background.component.complete(result, details, durationMs);
+      background.completed = true;
+      this.pruneBackgroundSubAgents();
+      this.throttledRender();
+      return;
+    }
+
+    this.completeToolCall(toolCallId, result, details, durationMs);
+  }
+
   /** Fail a tool call with an error. */
   failToolCall(toolCallId: string, error: string, durationMs: number): void {
     const tc = this.toolCalls.get(toolCallId);
@@ -174,6 +229,20 @@ export class TranscriptManager {
     this.currentAssistantText = '';
     this.currentAssistantMarkdown = null;
     this.throttledRender();
+  }
+
+  /** Fail a sub-agent call from either the transcript or background panel. */
+  failSubAgentCall(toolCallId: string, error: string): void {
+    const background = this.backgroundSubAgents.get(toolCallId);
+    if (background) {
+      background.component.fail(error, 0);
+      background.completed = true;
+      this.pruneBackgroundSubAgents();
+      this.throttledRender();
+      return;
+    }
+
+    this.failToolCall(toolCallId, error, 0);
   }
 
   /** Add a system notification (compaction, error, etc.). */
@@ -208,7 +277,7 @@ export class TranscriptManager {
   toggleExpandAll(): void {
     // Detect majority state: if any are collapsed, expand all; otherwise collapse all
     let anyCollapsed = false;
-    for (const tc of this.toolCalls.values()) {
+    for (const tc of this.getAllToolComponents()) {
       if (!tc.isExpanded) {
         anyCollapsed = true;
         break;
@@ -216,7 +285,7 @@ export class TranscriptManager {
     }
     const targetState = anyCollapsed; // expand if any collapsed, collapse if all expanded
 
-    for (const tc of this.toolCalls.values()) {
+    for (const tc of this.getAllToolComponents()) {
       if (tc.isExpanded !== targetState) {
         tc.toggleExpand();
       }
@@ -226,10 +295,61 @@ export class TranscriptManager {
 
   /** Clear the transcript. */
   clear(): void {
+    if (this.renderTimer) {
+      clearTimeout(this.renderTimer);
+      this.renderTimer = null;
+    }
+    for (const tc of this.toolCalls.values()) {
+      tc.dispose();
+    }
+    for (const activity of this.backgroundSubAgents.values()) {
+      activity.component.dispose();
+    }
     this.chatContainer.clear();
+    this.activityContainer.clear();
     this.currentAssistantMarkdown = null;
     this.currentAssistantText = '';
     this.toolCalls.clear();
+    this.backgroundSubAgents.clear();
+    this.backgroundOrder = [];
+  }
+
+  private *getAllToolComponents(): Iterable<ToolExecutionComponent> {
+    yield* this.toolCalls.values();
+    for (const activity of this.backgroundSubAgents.values()) {
+      yield activity.component;
+    }
+  }
+
+  private pruneBackgroundSubAgents(): void {
+    // Remove completed background sub-agents from the activity panel immediately.
+    // The parent agent processes the result in the normal chat flow, so the
+    // completed box doesn't need to stay pinned at the bottom.
+    for (const taskId of [...this.backgroundOrder]) {
+      const activity = this.backgroundSubAgents.get(taskId);
+      if (!activity?.completed) continue;
+
+      activity.component.dispose();
+      this.activityContainer.removeChild(activity.component);
+      this.backgroundSubAgents.delete(taskId);
+      this.backgroundOrder = this.backgroundOrder.filter(id => id !== taskId);
+    }
+
+    // Prune oldest running sub-agents if over the limit
+    while (this.backgroundOrder.length > TranscriptManager.MAX_BACKGROUND_ROWS) {
+      const removableIndex = this.backgroundOrder.findIndex((id) => this.backgroundSubAgents.get(id)?.completed);
+      if (removableIndex === -1) break;
+
+      const [taskId] = this.backgroundOrder.splice(removableIndex, 1);
+      if (!taskId) break;
+
+      const activity = this.backgroundSubAgents.get(taskId);
+      if (!activity) continue;
+
+      activity.component.dispose();
+      this.activityContainer.removeChild(activity.component);
+      this.backgroundSubAgents.delete(taskId);
+    }
   }
 
   /** Freeze the current assistant message (stop updating it). */
