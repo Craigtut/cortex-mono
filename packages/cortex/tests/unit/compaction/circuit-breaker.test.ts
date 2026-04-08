@@ -85,7 +85,7 @@ describe('CompactionManager circuit breaker', () => {
   beforeEach(() => {
     manager = createManagerForLayer2();
     manager.setContextWindow(200_000);
-    manager.updateTokenCount(150_000); // 75% > 70% threshold
+    manager.updateCurrentContextTokenCount(150_000); // 75% > 70% threshold
 
     slots = [makeUserMsg('slot1'), makeUserMsg('slot2')];
     history = buildHistory(10); // 20 messages
@@ -131,7 +131,7 @@ describe('CompactionManager circuit breaker', () => {
     // Set up a high token count so Layer 3 (90% of model context) will fire
     manager.setContextWindow(200_000);
     manager.setModelContextWindow(200_000);
-    manager.updateTokenCount(185_000); // 92.5% > 90% failsafe
+    manager.updateCurrentContextTokenCount(185_000); // 92.5% > 90% failsafe
 
     const mockComplete = vi.fn().mockRejectedValue(new Error('LLM always fails'));
 
@@ -159,7 +159,7 @@ describe('CompactionManager circuit breaker', () => {
     // This means Layer 2 should fire but Layer 3 won't trigger
     manager.setContextWindow(200_000);
     manager.setModelContextWindow(200_000);
-    manager.updateTokenCount(150_000); // 75% > 70% L2 but < 90% L3
+    manager.updateCurrentContextTokenCount(150_000); // 75% > 70% L2 but < 90% L3
 
     const mockComplete = vi.fn().mockRejectedValue(new Error('LLM always fails'));
 
@@ -198,7 +198,7 @@ describe('CompactionManager circuit breaker', () => {
 
     // Reset state for second episode
     sourceHistory = buildHistory(10);
-    manager.updateTokenCount(150_000);
+    manager.updateCurrentContextTokenCount(150_000);
 
     // Second episode: fail 3 times
     // If counter wasn't reset, we'd have 4 failures total, but the degraded
@@ -207,7 +207,7 @@ describe('CompactionManager circuit breaker', () => {
 
     // Set up for Layer 3 to fire so degraded is emitted
     manager.setModelContextWindow(200_000);
-    manager.updateTokenCount(185_000);
+    manager.updateCurrentContextTokenCount(185_000);
 
     const degradedHandler = vi.fn();
     manager.onCompactionDegraded(degradedHandler);
@@ -243,7 +243,7 @@ describe('CompactionManager circuit breaker', () => {
     });
     singleRetryManager.setContextWindow(200_000);
     singleRetryManager.setModelContextWindow(200_000);
-    singleRetryManager.updateTokenCount(150_000);
+    singleRetryManager.updateCurrentContextTokenCount(150_000);
 
     const mockComplete = vi.fn().mockRejectedValue(new Error('always fails'));
     singleRetryManager.setCompleteFn(mockComplete);

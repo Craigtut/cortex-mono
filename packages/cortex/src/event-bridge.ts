@@ -6,8 +6,8 @@
  * logging, monitoring, and lifecycle hooks.
  *
  * Key mappings:
- *   agent_start  -> session_start
- *   agent_end    -> session_end (onLoopComplete fires here)
+ *   agent_start  -> loop_start
+ *   agent_end    -> loop_end (onLoopComplete fires here)
  *   turn_start   -> turn_start
  *   turn_end     -> turn_end + AgentTextOutput (parse working tags)
  *   message_start  -> response_start
@@ -42,8 +42,8 @@ import { parseWorkingTags } from './working-tags.js';
 // ---------------------------------------------------------------------------
 
 export type CortexEventType =
-  | 'session_start'
-  | 'session_end'
+  | 'loop_start'
+  | 'loop_end'
   | 'turn_start'
   | 'turn_end'
   | 'response_start'
@@ -121,8 +121,8 @@ export interface PiEventSource {
 // ---------------------------------------------------------------------------
 
 const PI_TO_CORTEX_MAP: Partial<Record<PiEventType, CortexEventType>> = {
-  agent_start: 'session_start',
-  agent_end: 'session_end',
+  agent_start: 'loop_start',
+  agent_end: 'loop_end',
   turn_start: 'turn_start',
   turn_end: 'turn_end',
   message_start: 'response_start',

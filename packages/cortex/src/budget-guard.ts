@@ -46,7 +46,7 @@ export class BudgetGuard {
 
   /**
    * Wire the guard to an event bridge.
-   * Subscribes to turn_end (for turn counting and cost) and session_start (for reset).
+   * Subscribes to turn_end (for turn counting and cost) and loop_start (for reset).
    *
    * @param bridge - The EventBridge to subscribe to
    */
@@ -56,7 +56,7 @@ export class BudgetGuard {
 
     // Reset counters on agent_start (beginning of a new agentic loop)
     this.unsubscribers.push(
-      bridge.on('session_start', () => {
+      bridge.on('loop_start', () => {
         this.reset();
       }),
     );
@@ -124,7 +124,7 @@ export class BudgetGuard {
   }
 
   /**
-   * Reset counters. Called automatically on session_start.
+   * Reset counters. Called automatically on loop_start.
    */
   reset(): void {
     this.turnCount = 0;

@@ -14,7 +14,7 @@ export interface SessionMeta {
   cwd: string;
   createdAt: number;
   updatedAt: number;
-  tokenCount: number;
+  contextTokenCount: number;
   /** Accumulated session usage (cost, turns, tokens). Optional for backward compat. */
   usage?: SessionUsage;
 }
@@ -24,19 +24,40 @@ export interface SavedSession {
   history: unknown[];
 }
 
-function isSessionMeta(v: unknown): v is SessionMeta {
-  if (typeof v !== 'object' || v === null) return false;
+function parseSessionMeta(v: unknown): SessionMeta | null {
+  if (typeof v !== 'object' || v === null) return null;
   const o = v as Record<string, unknown>;
-  return (
-    typeof o['id'] === 'string' &&
-    typeof o['mode'] === 'string' &&
-    typeof o['provider'] === 'string' &&
-    typeof o['model'] === 'string' &&
-    typeof o['cwd'] === 'string' &&
-    typeof o['createdAt'] === 'number' &&
-    typeof o['updatedAt'] === 'number' &&
-    typeof o['tokenCount'] === 'number'
-  );
+  const contextTokenCount = typeof o['contextTokenCount'] === 'number'
+    ? o['contextTokenCount']
+    : typeof o['tokenCount'] === 'number'
+      ? o['tokenCount']
+      : null;
+  if (
+    typeof o['id'] !== 'string' ||
+    typeof o['mode'] !== 'string' ||
+    typeof o['provider'] !== 'string' ||
+    typeof o['model'] !== 'string' ||
+    typeof o['cwd'] !== 'string' ||
+    typeof o['createdAt'] !== 'number' ||
+    typeof o['updatedAt'] !== 'number' ||
+    contextTokenCount === null
+  ) {
+    return null;
+  }
+
+  const usage = o['usage'] as SessionUsage | undefined;
+
+  return {
+    id: o['id'],
+    mode: o['mode'],
+    provider: o['provider'],
+    model: o['model'],
+    cwd: o['cwd'],
+    createdAt: o['createdAt'],
+    updatedAt: o['updatedAt'],
+    contextTokenCount,
+    ...(usage ? { usage } : {}),
+  };
 }
 
 export function generateSessionId(): string {
@@ -68,9 +89,10 @@ export async function loadSession(sessionId: string): Promise<SavedSession | nul
     const meta: unknown = JSON.parse(metaRaw);
 
     if (!Array.isArray(history)) return null;
-    if (!isSessionMeta(meta)) return null;
+    const parsedMeta = parseSessionMeta(meta);
+    if (!parsedMeta) return null;
 
-    return { history, meta };
+    return { history, meta: parsedMeta };
   } catch {
     return null;
   }
@@ -90,7 +112,8 @@ export async function listSessions(): Promise<SessionMeta[]> {
     try {
       const metaRaw = await readFile(join(SESSIONS_DIR, entry, 'meta.json'), 'utf-8');
       const meta: unknown = JSON.parse(metaRaw);
-      if (isSessionMeta(meta)) sessions.push(meta);
+      const parsedMeta = parseSessionMeta(meta);
+      if (parsedMeta) sessions.push(parsedMeta);
     } catch {
       // Skip invalid session directories
     }

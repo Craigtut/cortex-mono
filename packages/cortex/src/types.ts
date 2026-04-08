@@ -822,7 +822,7 @@ export interface SubAgentResult {
     turns: number;
     cost: number;
     durationMs: number;
-    totalTokens: number;
+    contextTokens: number;
   };
   /** Summary of tool calls made by the sub-agent (extracted from conversation history on completion). */
   toolCalls?: Array<{ name: string; durationMs: number; error?: string }>;

@@ -165,8 +165,8 @@ export class CompactionManager {
   private readonly microcompaction: MicrocompactionEngine;
   private readonly slotCount: number;
 
-  /** Running session token count, updated after each LLM call. */
-  private _sessionTokenCount = 0;
+  /** Post-hoc current-context token count, updated after each parent LLM call. */
+  private _currentContextTokenCount = 0;
 
   /** Context budget for Layer 1/2 compaction decisions (may be artificially limited). */
   private _contextWindow = 0;
@@ -282,15 +282,15 @@ export class CompactionManager {
   // -----------------------------------------------------------------------
 
   /**
-   * Update the session token count from LLM usage data.
+   * Update the post-hoc current-context token count from LLM usage data.
    */
-  updateTokenCount(inputTokens: number): void {
-    const prev = this._sessionTokenCount;
-    this._sessionTokenCount = inputTokens;
-    this.logger.debug('[Compaction] updateTokenCount', { prev, inputTokens });
+  updateCurrentContextTokenCount(inputTokens: number): void {
+    const prev = this._currentContextTokenCount;
+    this._currentContextTokenCount = inputTokens;
+    this.logger.debug('[Compaction] updateCurrentContextTokenCount', { prev, inputTokens });
     // Log significant drops to help diagnose token count display issues
     if (prev > 0 && inputTokens < prev * 0.5) {
-      this.logger.warn('[Compaction] sessionTokenCount dropped >50%', {
+      this.logger.warn('[Compaction] currentContextTokenCount dropped >50%', {
         prev,
         inputTokens,
         drop: `${((1 - inputTokens / prev) * 100).toFixed(1)}%`,
@@ -299,10 +299,10 @@ export class CompactionManager {
   }
 
   /**
-   * Get the current session token count.
+   * Get the post-hoc current-context token count from the most recent parent turn.
    */
-  get sessionTokenCount(): number {
-    return this._sessionTokenCount;
+  get currentContextTokenCount(): number {
+    return this._currentContextTokenCount;
   }
 
   /**
@@ -324,7 +324,24 @@ export class CompactionManager {
    */
   get usageRatio(): number {
     if (this._contextWindow <= 0) return 0;
-    return this._sessionTokenCount / this._contextWindow;
+    return this._currentContextTokenCount / this._contextWindow;
+  }
+
+  /**
+   * Estimate current context tokens from a transformed AgentContext snapshot.
+   *
+   * Returns the larger of:
+   * - the heuristic estimate of the provided context snapshot
+   * - the post-hoc token count from the most recent parent turn
+   *
+   * This mirrors the compaction decision logic so consumers can reason about
+   * context pressure using the same semantics Cortex uses internally.
+   */
+  estimateCurrentContextTokens(context: AgentContext): number {
+    const estimated = this.estimateContextTokens(context);
+    return this._currentContextTokenCount > 0
+      ? Math.max(this._currentContextTokenCount, estimated)
+      : estimated;
   }
 
   // -----------------------------------------------------------------------
@@ -541,13 +558,11 @@ export class CompactionManager {
     // Post-hoc token tracking from the previous turn is useful, but it can be
     // stale when transformContext injects large ephemeral content on this turn.
     const estimatedCurrentTokens = this.estimateContextTokens(context);
-    const currentTokens = this._sessionTokenCount > 0
-      ? Math.max(this._sessionTokenCount, estimatedCurrentTokens)
-      : estimatedCurrentTokens;
+    const currentTokens = this.estimateCurrentContextTokens(context);
 
     this.logger.debug('[Compaction] transformContext', {
       historyLen: history.length,
-      sessionTokens: this._sessionTokenCount,
+      currentContextTokens: this._currentContextTokenCount,
       heuristic: estimatedCurrentTokens,
       currentTokens,
       ctxWindow: this._contextWindow,
@@ -608,7 +623,7 @@ export class CompactionManager {
           // Success: update state and reset failure counter
           setSourceHistory(compactedSource);
           this.microcompaction.resetCache();
-          this._sessionTokenCount = result.tokensAfter;
+          this._currentContextTokenCount = result.tokensAfter;
           this._consecutiveLayer2Failures = 0;
 
           for (const handler of this.compactionResultHandlers) {
@@ -744,7 +759,7 @@ export class CompactionManager {
     const effectiveThreshold = this.getEffectiveThreshold();
 
     // Check Layer 2 threshold
-    if (!shouldCompact(this._sessionTokenCount, this._contextWindow, effectiveThreshold)) {
+    if (!shouldCompact(this._currentContextTokenCount, this._contextWindow, effectiveThreshold)) {
       // Also check using heuristic estimation as fallback
       if (!shouldCompact(estimatedTokens, this._contextWindow, effectiveThreshold)) {
         return null;
@@ -769,7 +784,7 @@ export class CompactionManager {
         this.microcompaction.resetCache();
 
         // Update token count estimate
-        this._sessionTokenCount = result.tokensAfter;
+        this._currentContextTokenCount = result.tokensAfter;
 
         // Emit result
         for (const handler of this.compactionResultHandlers) {
@@ -789,8 +804,8 @@ export class CompactionManager {
 
     // Layer 3 fallback: emergency truncation (uses model's actual window)
     const failsafeWindow = this._modelContextWindow > 0 ? this._modelContextWindow : this._contextWindow;
-    const slotTokens = this._sessionTokenCount - estimatedTokens;
-    if (shouldTruncate(this._sessionTokenCount, failsafeWindow, this.config.failsafe.threshold)) {
+    const slotTokens = this._currentContextTokenCount - estimatedTokens;
+    if (shouldTruncate(this._currentContextTokenCount, failsafeWindow, this.config.failsafe.threshold)) {
       const result = emergencyTruncate(
         history,
         failsafeWindow,
@@ -799,7 +814,7 @@ export class CompactionManager {
       );
       setHistory(result.newHistory);
       this.microcompaction.resetCache();
-      this._sessionTokenCount = result.tokensAfter;
+      this._currentContextTokenCount = result.tokensAfter;
     }
 
     return null;
@@ -826,7 +841,7 @@ export class CompactionManager {
     // API returned overflow error, so use the model's actual window
     const failsafeWindow = this._modelContextWindow > 0 ? this._modelContextWindow : this._contextWindow;
     const estimatedTokens = this.estimateHistoryTokens(history);
-    const slotTokens = Math.max(0, this._sessionTokenCount - estimatedTokens);
+    const slotTokens = Math.max(0, this._currentContextTokenCount - estimatedTokens);
 
     const result = emergencyTruncate(
       history,
@@ -837,7 +852,7 @@ export class CompactionManager {
 
     setHistory(result.newHistory);
     this.microcompaction.resetCache();
-    this._sessionTokenCount = result.tokensAfter;
+    this._currentContextTokenCount = result.tokensAfter;
   }
 
   // -----------------------------------------------------------------------
@@ -856,7 +871,7 @@ export class CompactionManager {
     this.compactionDegradedHandlers = [];
     this.compactionExhaustedHandlers = [];
     this.completeFn = null;
-    this._sessionTokenCount = 0;
+    this._currentContextTokenCount = 0;
     this._consecutiveLayer2Failures = 0;
     this._lastInteractionTime = null;
   }

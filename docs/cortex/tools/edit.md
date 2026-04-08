@@ -30,7 +30,7 @@ Make precise string replacements in existing files.
 When `replace_all` is false, `old_string` must appear exactly once in the file. If it matches multiple locations, the tool returns an error asking the model to provide more surrounding context to make the match unique. This is a deliberate safety mechanism that forces the model to be precise about where it's editing.
 
 ### Read-Before-Edit Contract
-The file must have been Read in the current session before it can be edited. The tool fails if the file hasn't been Read first. This ensures the model has seen the current state of the file.
+The file must have been Read in the current agentic loop before it can be edited. The tool fails if the file hasn't been Read first. This ensures the model has seen the current state of the file.
 
 ### Matching
 - Exact string matching, NOT regex

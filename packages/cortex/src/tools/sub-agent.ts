@@ -115,7 +115,8 @@ export const SUB_AGENT_TOOL_NAME = 'SubAgent';
 /**
  * Create the SubAgent tool.
  *
- * Returns an AgentTool object for registration with pi-agent-core.
+ * Returns a Cortex-native tool. CortexAgent adapts it to pi-agent-core's
+ * execute signature when synchronizing the tool inventory.
  */
 export function createSubAgentTool(config: SubAgentToolConfig): {
   name: string;

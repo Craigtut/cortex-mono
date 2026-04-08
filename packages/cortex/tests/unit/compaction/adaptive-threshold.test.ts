@@ -281,7 +281,7 @@ describe('checkAndRunCompaction with adaptive threshold', () => {
     manager.setContextWindow(200_000);
 
     // 60% usage: below static 0.70 but above adaptive idle 0.50
-    manager.updateTokenCount(120_000);
+    manager.updateCurrentContextTokenCount(120_000);
 
     const mockComplete = vi.fn().mockResolvedValue('Summary of conversation');
     manager.setCompleteFn(mockComplete);
@@ -307,7 +307,7 @@ describe('checkAndRunCompaction with adaptive threshold', () => {
     manager.setContextWindow(200_000);
 
     // 60% usage: below static 0.70
-    manager.updateTokenCount(120_000);
+    manager.updateCurrentContextTokenCount(120_000);
 
     // Recent interaction: threshold stays at 0.70
     manager.setLastInteractionTime(Date.now() - 30_000); // 30 seconds ago

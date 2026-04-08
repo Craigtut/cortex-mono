@@ -23,7 +23,7 @@ export const resumeCommand: Command = {
       return {
         value: s.id,
         label: `${s.mode} - ${s.model}`,
-        description: `${date} ${time} (${(s.tokenCount / 1000).toFixed(1)}k tokens)`,
+        description: `${date} ${time} (${(s.contextTokenCount / 1000).toFixed(1)}k context tokens)`,
       };
     });
 

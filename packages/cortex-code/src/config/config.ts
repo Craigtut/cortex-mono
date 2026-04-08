@@ -9,9 +9,9 @@ export interface CortexCodeConfig {
   defaultProvider?: string;
   /** Artificial context window limit. */
   contextWindowLimit?: number | null;
-  /** Max cost budget per session. */
+  /** Max cost budget per agentic loop. */
   maxCost?: number;
-  /** Max turns budget per session. */
+  /** Max turns budget per agentic loop. */
   maxTurns?: number;
   /** Default thinking effort level. Default: 'medium'. */
   defaultEffort?: string;

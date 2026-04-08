@@ -5,8 +5,8 @@ export interface StatusBarState {
   mode: string;
   provider: string;
   model: string;
-  tokenCount: number;
-  tokenLimit: number;
+  contextTokenCount: number;
+  contextTokenLimit: number;
   gitBranch: string;
   yoloMode: boolean;
   effortLevel: string;
@@ -21,8 +21,8 @@ export class StatusBar implements Component {
     mode: 'build',
     provider: '',
     model: '',
-    tokenCount: 0,
-    tokenLimit: 200_000,
+    contextTokenCount: 0,
+    contextTokenLimit: 200_000,
     gitBranch: '',
     yoloMode: false,
     effortLevel: '',
@@ -59,7 +59,7 @@ export class StatusBar implements Component {
       ? ` E:${s.effortLevel.charAt(0).toUpperCase() + s.effortLevel.slice(1)} `
       : '';
     const modelStr = this.hintText ?? (s.provider ? `${s.provider}/${s.model}` : s.model);
-    const tokenStr = this.formatTokens(s.tokenCount, s.tokenLimit);
+    const tokenStr = this.formatTokens(s.contextTokenCount, s.contextTokenLimit);
     const branchStr = s.gitBranch;
 
     // Try layouts from most detailed to most minimal
@@ -133,8 +133,8 @@ export class StatusBar implements Component {
   }
 
   private colorizeTokens(tokenStr: string): string {
-    const ratio = this.state.tokenLimit > 0
-      ? this.state.tokenCount / this.state.tokenLimit
+    const ratio = this.state.contextTokenLimit > 0
+      ? this.state.contextTokenCount / this.state.contextTokenLimit
       : 0;
 
     if (ratio >= 0.9) return colors.error(tokenStr);

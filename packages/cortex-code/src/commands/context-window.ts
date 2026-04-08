@@ -38,7 +38,7 @@ export const contextWindowCommand: Command = {
       const limit = parseInt(item.value, 10);
       agent.setContextWindowLimit(limit);
       handle.hide();
-      app.updateStatus({ tokenLimit: limit });
+      app.updateStatus({ contextTokenLimit: limit });
       app.transcript.addNotification(
         'Context Window',
         `Limit set to ${(limit / 1000).toFixed(0)}k tokens`,

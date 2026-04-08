@@ -8,11 +8,14 @@ export const costCommand: Command = {
     const app = session.getApp();
     if (!agent || !app) return;
 
-    const tokenCount = agent.sessionTokenCount;
+    const currentContextTokens = Math.max(
+      agent.currentContextTokenCount,
+      agent.estimateCurrentContextTokens(),
+    );
     const contextWindow = agent.effectiveContextWindow;
-    const ctxUsage = (tokenCount / 1000).toFixed(1);
+    const ctxUsage = (currentContextTokens / 1000).toFixed(1);
     const limit = (contextWindow / 1000).toFixed(0);
-    const percentage = contextWindow > 0 ? ((tokenCount / contextWindow) * 100).toFixed(1) : '0';
+    const percentage = contextWindow > 0 ? ((currentContextTokens / contextWindow) * 100).toFixed(1) : '0';
 
     const usage = agent.getSessionUsage();
 
@@ -23,7 +26,7 @@ export const costCommand: Command = {
       : '0.0';
 
     const lines = [
-      `Token usage: ${ctxUsage}k / ${limit}k (${percentage}%)`,
+      `Current context usage: ${ctxUsage}k / ${limit}k (${percentage}%)`,
       `Turns: ${usage.totalTurns}`,
       usage.totalCost > 0 ? `Estimated cost: $${usage.totalCost.toFixed(4)}` : '',
       totalInput > 0 ? `Cache hit rate: ${cacheHitRate}%` : '',

@@ -132,7 +132,7 @@ export class SubAgentManager {
     entry.resolve({
       output: '',
       status: 'failed',
-      usage: { turns: 0, cost: 0, durationMs: Date.now() - entry.spawnedAt, totalTokens: 0 },
+      usage: { turns: 0, cost: 0, durationMs: Date.now() - entry.spawnedAt, contextTokens: 0 },
     });
 
     // Fire lifecycle hook
@@ -206,7 +206,7 @@ export class SubAgentManager {
         entry.resolve({
           output: '',
           status: 'cancelled',
-          usage: { turns: 0, cost: 0, durationMs: Date.now() - entry.spawnedAt, totalTokens: 0 },
+          usage: { turns: 0, cost: 0, durationMs: Date.now() - entry.spawnedAt, contextTokens: 0 },
         });
 
         // Fire failure hook

@@ -50,7 +50,18 @@ packages/cortex/
 
 ## Context Management
 
-### Always-Warm Session
+### Temporal Model
+
+Cortex uses four distinct time scales:
+
+- **Session**: the long-lived logical conversation/runtime continuity that can be persisted and resumed across many prompts.
+- **Loop**: one `prompt()` execution, including all internal turns, tool calls, and follow-up work.
+- **Turn**: one LLM call/response inside a loop.
+- **Context**: the working prompt footprint sent to the model on a given turn.
+
+These terms are intentionally not interchangeable. Session persistence is a consumer concern. Loop orchestration, turn handling, and current-context pressure are Cortex concerns.
+
+### Always-Warm Agent
 
 There is no cold/warm/active state machine. A single `Agent` instance persists for the lifetime of the process. The system prompt is set once and rarely changes. Context is managed through two complementary mechanisms:
 
@@ -80,6 +91,7 @@ These are capabilities pi-agent-core deliberately omits that cortex implements.
 ### MCP Tool Support
 
 Pi-agent-core has no MCP support. Tools are direct `AgentTool` objects with `execute()` functions.
+Cortex owns its own in-process tool contract and adapts it to pi-agent-core only at the final registration boundary.
 
 Cortex acts as a **unified MCP client**, connecting to all tool sources through standard MCP protocol. It uses the MCP SDK `Client` class with the appropriate transport for each server:
 
@@ -88,11 +100,11 @@ Cortex acts as a **unified MCP client**, connecting to all tool sources through 
 - **Dynamic lifecycle**: Tools are added and removed as plugins install or uninstall, without tearing down the agent session. On plugin install, Cortex opens a new MCP client connection and registers the discovered tools. On uninstall, it closes the connection and removes those tools.
 - **Dynamic discovery**: On each MCP client connection, Cortex calls `tools/list` to discover the server's available tools. This means tool inventories are always derived from the server, not hardcoded.
 
-Built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent) are NOT delivered via MCP. They are native in-process `AgentTool` registrations. See the Built-in Tools section below.
+Built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent) are NOT delivered via MCP. They are native in-process Cortex tools that Cortex adapts to pi-agent-core when synchronizing the tool inventory. See the Built-in Tools section below.
 
 ### Built-in Tools
 
-Built-in tools are native `AgentTool` registrations defined directly in Cortex. These run in-process with no MCP overhead.
+Built-in tools are native Cortex tools defined directly in Cortex. These run in-process with no MCP overhead and are adapted to pi-agent-core at the registration boundary.
 
 - **Bash**: Execute shell commands and return output.
 - **Read**: Read file contents from the filesystem.
@@ -159,7 +171,7 @@ Pi-agent-core has no compaction. Only the `transformContext` hook.
 
 Cortex implements compaction in `transformContext`:
 
-- **Token tracking**: Running `sessionTokenCount` from per-turn `AssistantMessage.usage`. Compare against `model.contextWindow`.
+- **Token tracking**: Running `currentContextTokenCount` from per-turn `AssistantMessage.usage`. Compare against `model.contextWindow`.
 - **Trigger**: When token count exceeds a configurable threshold, compact the conversation history.
 - **Strategy**: Consumer-configurable. Default: summarize old conversation turns via a separate LLM call. Preserve context slots untouched.
 - **Adaptive threshold**: Optionally flex the threshold based on consumer-provided signals (e.g., user interaction recency).
@@ -233,8 +245,8 @@ Pi-agent-core emits 10 events across 4 scopes. Cortex normalizes these into a co
 
 | Pi Event | Consumer Event | Notes |
 |----------|-------------|-------|
-| `agent_start` | `session_start` | Direct mapping |
-| `agent_end` | `session_end` | Direct mapping |
+| `agent_start` | `loop_start` | Direct mapping |
+| `agent_end` | `loop_end` | Direct mapping |
 | `turn_start` | *(none)* | New; can be added or omitted |
 | `turn_end` | `turn_end` | Direct mapping |
 | `message_start` | `response_start` | Direct mapping |
@@ -266,8 +278,8 @@ Pi-agent-core has no pre-request token counting. Pi-ai reports `Usage` (inputTok
 
 Cortex tracks tokens through two complementary mechanisms:
 
-- **Post-hoc tracking**: Running `sessionTokenCount` from per-turn `AssistantMessage.usage`. Updated after every LLM call.
-- **Heuristic estimation**: A built-in `estimateTokens(text)` function (word-count * 1.3 multiplier) for estimating context size before the first LLM call and between calls. This is critical for compaction: if the heuristic estimate of the current message array is approaching `model.contextWindow`, cortex can trigger compaction proactively rather than waiting for the next post-hoc usage report.
+- **Post-hoc tracking**: Running `currentContextTokenCount` from per-turn `AssistantMessage.usage`. Updated after every LLM call.
+- **Heuristic estimation**: A built-in `estimateCurrentContextTokens()` API uses `estimateTokens(text)` internally to estimate context size before the first LLM call and between calls. This is critical for compaction and consumer UIs: if the heuristic estimate of the current message array is approaching `model.contextWindow`, Cortex can trigger compaction proactively and consumers can show current context pressure without waiting for the next post-hoc usage report.
 
 The heuristic is a duplicate of the same utility in `@animus-labs/shared` (4 lines), kept inline to avoid a dependency.
 

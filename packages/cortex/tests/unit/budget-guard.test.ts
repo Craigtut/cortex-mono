@@ -193,11 +193,11 @@ describe('BudgetGuard', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Reset on agent_start
+  // Reset on loop_start
   // -----------------------------------------------------------------------
 
-  describe('reset on agent_start', () => {
-    it('resets counters on session_start', () => {
+  describe('reset on loop_start', () => {
+    it('resets counters on loop_start', () => {
       const guard = new BudgetGuard({ maxTurns: Infinity, maxCost: Infinity }, abortFn);
       guard.wire(bridge);
 
@@ -207,7 +207,7 @@ describe('BudgetGuard', () => {
       expect(guard.getTurnCount()).toBe(2);
       expect(guard.getTotalCost()).toBeCloseTo(0.10);
 
-      // Reset via agent_start
+      // Reset via agent_start -> loop_start
       source.emit({ type: 'agent_start' });
 
       expect(guard.getTurnCount()).toBe(0);
@@ -224,7 +224,7 @@ describe('BudgetGuard', () => {
       expect(abortFn).toHaveBeenCalledTimes(1);
       expect(guard.isBreached()).toBe(true);
 
-      // Reset via agent_start
+      // Reset via agent_start -> loop_start
       source.emit({ type: 'agent_start' });
       expect(guard.isBreached()).toBe(false);
 

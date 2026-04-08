@@ -245,7 +245,10 @@ async function showModelPicker(
 
       // Check context window warning
       const selectedModel = models.find(m => m.id === item.value);
-      const currentTokens = agent.sessionTokenCount;
+      const currentTokens = Math.max(
+        agent.currentContextTokenCount,
+        agent.estimateCurrentContextTokens(),
+      );
 
       if (selectedModel && currentTokens > selectedModel.contextWindow) {
         await showModelSwitchWarning(session, provider, item.value, currentTokens, selectedModel.contextWindow);
@@ -288,7 +291,7 @@ async function showModelSwitchWarning(
 
   const container = new Container();
   container.addChild(new Text(
-    `Current usage (${currentK}k tokens) exceeds the new model's context window (${newK}k).`,
+    `Current context usage (${currentK}k tokens) exceeds the new model's context window (${newK}k).`,
     0, 0,
   ));
   container.addChild(new Text('', 0, 0));

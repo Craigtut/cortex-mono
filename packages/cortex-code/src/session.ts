@@ -177,8 +177,8 @@ export class Session {
       mode: this.mode.name,
       provider: this.provider,
       model: this.modelId,
-      tokenCount: 0,
-      tokenLimit: this.agent.effectiveContextWindow,
+      contextTokenCount: this.getDisplayedCurrentContextTokens(),
+      contextTokenLimit: this.agent.effectiveContextWindow,
       gitBranch: branch,
       yoloMode: this.yoloMode,
       effortLevel: initialEffort,
@@ -203,7 +203,15 @@ export class Session {
       }
     }
 
-    if (!this.agent || this.isRunning) return;
+    if (!this.agent) return;
+
+    // If the agent is already running, steer it with the new message
+    if (this.isRunning) {
+      log.info('Steering agent with user message', { text: text.slice(0, 100) });
+      this.app!.transcript.addUserMessage(text);
+      this.agent.steer(text);
+      return;
+    }
 
     log.info('User prompt', { text: text.slice(0, 100) });
 
@@ -413,7 +421,7 @@ export class Session {
     this.agent.onLoopComplete(() => {
       this.isRunning = false;
       this.triggerAutoSave();
-      this.updateFooterTokens();
+      this.updateFooterContextUsage();
       this.app?.hideStatusSpinner();
       this.app?.focusEditor();
     });
@@ -464,7 +472,7 @@ export class Session {
         'Context Compacted',
         `Reduced from ${beforeK}k to ${afterK}k tokens`,
       );
-      this.updateFooterTokens();
+      this.updateFooterContextUsage();
     });
 
     // Compaction degraded (Layer 2 failed, Layer 3 used as fallback)
@@ -520,7 +528,7 @@ export class Session {
     // Update tokens and auto-save on turn_end (fires after each LLM turn,
     // including mid-loop turns between tool calls)
     bridge.on('turn_end', () => {
-      this.updateFooterTokens();
+      this.updateFooterContextUsage();
       this.triggerAutoSave();
     });
   }
@@ -685,7 +693,7 @@ export class Session {
       'Session Resumed',
       `Restored ${saved.history.length} messages from previous session`,
     );
-    this.updateFooterTokens();
+    this.updateFooterContextUsage();
   }
 
   /** Abort the current agent loop without destroying. */
@@ -730,14 +738,15 @@ export class Session {
     if (!this.agent) return;
 
     const branch = await this.getGitBranch();
+    const currentContextTokens = this.getDisplayedCurrentContextTokens();
     const lines = [
       `Current date: ${new Date().toISOString().split('T')[0]}`,
       `Current working directory: ${this.cwd}`,
       branch ? `Git branch: ${branch}` : '',
       `Model: ${this.provider}/${this.modelId}`,
       this.yoloMode ? 'YOLO mode is active: all tools auto-approved' : '',
-      this.agent.sessionTokenCount > 0
-        ? `Token usage: ${(this.agent.sessionTokenCount / 1000).toFixed(1)}k / ${(this.agent.effectiveContextWindow / 1000).toFixed(0)}k`
+      currentContextTokens > 0
+        ? `Current context usage: ${(currentContextTokens / 1000).toFixed(1)}k / ${(this.agent.effectiveContextWindow / 1000).toFixed(0)}k`
         : '',
     ].filter(Boolean);
 
@@ -746,12 +755,20 @@ export class Session {
     );
   }
 
-  private updateFooterTokens(): void {
+  private updateFooterContextUsage(): void {
     if (!this.agent || !this.app) return;
     this.app.updateStatus({
-      tokenCount: this.agent.sessionTokenCount,
-      tokenLimit: this.agent.effectiveContextWindow,
+      contextTokenCount: this.getDisplayedCurrentContextTokens(),
+      contextTokenLimit: this.agent.effectiveContextWindow,
     });
+  }
+
+  private getDisplayedCurrentContextTokens(): number {
+    if (!this.agent) return 0;
+    return Math.max(
+      this.agent.currentContextTokenCount,
+      this.agent.estimateCurrentContextTokens(),
+    );
   }
 
   private triggerAutoSave(): void {
@@ -774,7 +791,7 @@ export class Session {
       cwd: this.cwd,
       createdAt: this.createdAt,
       updatedAt: Date.now(),
-      tokenCount: this.agent?.sessionTokenCount ?? 0,
+      contextTokenCount: this.getDisplayedCurrentContextTokens(),
     };
     if (this.agent) {
       meta.usage = this.agent.getSessionUsage();
@@ -988,7 +1005,7 @@ export class Session {
     this.modelId = modelId;
     // Reconcile effort with new model's capabilities
     const { clamped, reason, effective } = await this.reconcileEffort();
-    this.app?.updateStatus({ model: modelId, effortLevel: effective, tokenLimit: this.agent!.effectiveContextWindow });
+    this.app?.updateStatus({ model: modelId, effortLevel: effective, contextTokenLimit: this.agent!.effectiveContextWindow });
     if (clamped && reason) {
       this.app?.transcript.addNotification('Effort', reason);
     }
@@ -1016,7 +1033,7 @@ export class Session {
     this.modelId = newModelId;
     // Reconcile effort with new model's capabilities
     const { clamped, reason, effective } = await this.reconcileEffort();
-    this.app?.updateStatus({ provider: newProvider, model: newModelId, effortLevel: effective, tokenLimit: this.agent!.effectiveContextWindow });
+    this.app?.updateStatus({ provider: newProvider, model: newModelId, effortLevel: effective, contextTokenLimit: this.agent!.effectiveContextWindow });
     if (clamped && reason) {
       this.app?.transcript.addNotification('Effort', reason);
     }

@@ -108,16 +108,16 @@ describe('CompactionManager', () => {
   // -----------------------------------------------------------------------
 
   describe('token tracking', () => {
-    it('tracks session token count', () => {
-      expect(manager.sessionTokenCount).toBe(0);
+    it('tracks current context token count', () => {
+      expect(manager.currentContextTokenCount).toBe(0);
 
-      manager.updateTokenCount(50_000);
-      expect(manager.sessionTokenCount).toBe(50_000);
+      manager.updateCurrentContextTokenCount(50_000);
+      expect(manager.currentContextTokenCount).toBe(50_000);
     });
 
     it('calculates usage ratio', () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(100_000);
+      manager.updateCurrentContextTokenCount(100_000);
 
       expect(manager.usageRatio).toBe(0.5);
     });
@@ -246,7 +246,7 @@ describe('CompactionManager', () => {
 
     it('applies microcompaction when above soft threshold', async () => {
       manager.setContextWindow(100_000);
-      manager.updateTokenCount(45_000); // 45% > 40% threshold
+      manager.updateCurrentContextTokenCount(45_000); // 45% > 40% threshold
 
       const slots = [makeUserMsg('slot1'), makeUserMsg('slot2')];
       const toolResult: AgentMessage = {
@@ -278,7 +278,7 @@ describe('CompactionManager', () => {
 
     it('triggers Layer 3 when tokens exceed 90% threshold', async () => {
       manager.setContextWindow(100_000);
-      manager.updateTokenCount(95_000); // 95% > 90% threshold
+      manager.updateCurrentContextTokenCount(95_000); // 95% > 90% threshold
 
       const slots = [makeUserMsg('slot1'), makeUserMsg('slot2')];
       const history = buildHistory(5);
@@ -298,7 +298,7 @@ describe('CompactionManager', () => {
 
     it('runs Layer 2 when completeFn and source accessors are provided and above 70%', async () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(150_000); // 75% > 70% threshold
+      manager.updateCurrentContextTokenCount(150_000); // 75% > 70% threshold
 
       const mockComplete = vi.fn().mockResolvedValue('Summary of conversation');
       manager.setCompleteFn(mockComplete);
@@ -328,7 +328,7 @@ describe('CompactionManager', () => {
 
     it('does not run Layer 2 when source accessors are not provided', async () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(150_000); // 75% > 70% threshold
+      manager.updateCurrentContextTokenCount(150_000); // 75% > 70% threshold
 
       const mockComplete = vi.fn().mockResolvedValue('Summary');
       manager.setCompleteFn(mockComplete);
@@ -349,7 +349,7 @@ describe('CompactionManager', () => {
 
     it('fires onBeforeCompaction handlers during Layer 2 in transformContext', async () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(150_000);
+      manager.updateCurrentContextTokenCount(150_000);
       manager.setCompleteFn(vi.fn().mockResolvedValue('Summary'));
 
       const callOrder: string[] = [];
@@ -375,7 +375,7 @@ describe('CompactionManager', () => {
 
     it('uses the current transformed-context estimate when it exceeds the stale session token count', async () => {
       manager.setContextWindow(1_000);
-      manager.updateTokenCount(100);
+      manager.updateCurrentContextTokenCount(100);
       const mockComplete = vi.fn().mockResolvedValue('Fresh summary');
       manager.setCompleteFn(mockComplete);
 
@@ -414,7 +414,7 @@ describe('CompactionManager', () => {
   describe('checkAndRunCompaction', () => {
     it('returns null when below threshold', async () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(100_000); // 50% < 70%
+      manager.updateCurrentContextTokenCount(100_000); // 50% < 70%
 
       const history = buildHistory(5);
       const result = await manager.checkAndRunCompaction(
@@ -427,7 +427,7 @@ describe('CompactionManager', () => {
 
     it('runs Layer 2 when threshold is exceeded', async () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(150_000); // 75% > 70%
+      manager.updateCurrentContextTokenCount(150_000); // 75% > 70%
 
       const mockComplete = vi.fn().mockResolvedValue('Summary of conversation');
       manager.setCompleteFn(mockComplete);
@@ -448,7 +448,7 @@ describe('CompactionManager', () => {
 
     it('fires onBeforeCompaction handlers before summarization', async () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(150_000);
+      manager.updateCurrentContextTokenCount(150_000);
       manager.setCompleteFn(vi.fn().mockResolvedValue('Summary'));
 
       const callOrder: string[] = [];
@@ -467,7 +467,7 @@ describe('CompactionManager', () => {
 
     it('fires onPostCompaction and onCompactionResult handlers', async () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(150_000);
+      manager.updateCurrentContextTokenCount(150_000);
       manager.setCompleteFn(vi.fn().mockResolvedValue('Summary'));
 
       const postHandler = vi.fn();
@@ -486,7 +486,7 @@ describe('CompactionManager', () => {
     });
 
     it('returns null when contextWindow is 0', async () => {
-      manager.updateTokenCount(150_000);
+      manager.updateCurrentContextTokenCount(150_000);
       const result = await manager.checkAndRunCompaction(
         () => buildHistory(10),
         () => {},
@@ -496,7 +496,7 @@ describe('CompactionManager', () => {
 
     it('returns null for empty history', async () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(150_000);
+      manager.updateCurrentContextTokenCount(150_000);
 
       const result = await manager.checkAndRunCompaction(
         () => [],
@@ -513,7 +513,7 @@ describe('CompactionManager', () => {
   describe('handleOverflowError', () => {
     it('performs emergency truncation on overflow', () => {
       manager.setContextWindow(100_000);
-      manager.updateTokenCount(95_000);
+      manager.updateCurrentContextTokenCount(95_000);
 
       const history = buildHistory(20);
       let replacedHistory: AgentMessage[] | null = null;
@@ -529,7 +529,7 @@ describe('CompactionManager', () => {
 
     it('is a no-op for empty history', () => {
       manager.setContextWindow(100_000);
-      manager.updateTokenCount(95_000);
+      manager.updateCurrentContextTokenCount(95_000);
 
       let setCalled = false;
       manager.handleOverflowError(
@@ -548,11 +548,11 @@ describe('CompactionManager', () => {
   describe('destroy', () => {
     it('resets all state', () => {
       manager.setContextWindow(200_000);
-      manager.updateTokenCount(100_000);
+      manager.updateCurrentContextTokenCount(100_000);
 
       manager.destroy();
 
-      expect(manager.sessionTokenCount).toBe(0);
+      expect(manager.currentContextTokenCount).toBe(0);
     });
   });
 });

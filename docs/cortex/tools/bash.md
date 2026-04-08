@@ -70,7 +70,7 @@ The tool parses the marker from stdout, extracts the final working directory, an
 
 **Default directory:** The consumer-configured workspace directory (default: `data/workspace/`). This is where the agent starts on first use.
 
-**Session boundary:** Working directory resets to the default when a new agentic loop starts (new tick). It persists across multiple bash calls within the same loop.
+**Loop boundary:** Working directory resets to the default when a new agentic loop starts (new tick). It persists across multiple bash calls within the same loop.
 
 **Shell state:** Each call spawns a new shell process. Shell state (env vars, aliases, functions) does NOT persist between calls. Only the working directory persists via the tracking mechanism.
 

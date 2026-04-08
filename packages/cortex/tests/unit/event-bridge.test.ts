@@ -40,8 +40,8 @@ describe('EventBridge', () => {
 
   describe('event mapping', () => {
     const mappings: Array<[string, CortexEventType]> = [
-      ['agent_start', 'session_start'],
-      ['agent_end', 'session_end'],
+      ['agent_start', 'loop_start'],
+      ['agent_end', 'loop_end'],
       ['turn_start', 'turn_start'],
       ['turn_end', 'turn_end'],
       ['message_start', 'response_start'],
@@ -271,7 +271,7 @@ describe('EventBridge', () => {
 
     it('does not extract usage for non-turn_end events', () => {
       const listener = vi.fn();
-      bridge.on('session_start', listener);
+      bridge.on('loop_start', listener);
 
       source.emit({ type: 'agent_start' });
 
@@ -288,8 +288,8 @@ describe('EventBridge', () => {
     it('supports multiple listeners for the same event type', () => {
       const listener1 = vi.fn();
       const listener2 = vi.fn();
-      bridge.on('session_start', listener1);
-      bridge.on('session_start', listener2);
+      bridge.on('loop_start', listener1);
+      bridge.on('loop_start', listener2);
 
       source.emit({ type: 'agent_start' });
 
@@ -299,7 +299,7 @@ describe('EventBridge', () => {
 
     it('unsubscribes individual listeners', () => {
       const listener = vi.fn();
-      const unsub = bridge.on('session_start', listener);
+      const unsub = bridge.on('loop_start', listener);
 
       source.emit({ type: 'agent_start' });
       expect(listener).toHaveBeenCalledTimes(1);
@@ -319,9 +319,9 @@ describe('EventBridge', () => {
       source.emit({ type: 'agent_end' });
 
       expect(allListener).toHaveBeenCalledTimes(3);
-      expect(allListener.mock.calls[0][0].type).toBe('session_start');
+      expect(allListener.mock.calls[0][0].type).toBe('loop_start');
       expect(allListener.mock.calls[1][0].type).toBe('turn_end');
-      expect(allListener.mock.calls[2][0].type).toBe('session_end');
+      expect(allListener.mock.calls[2][0].type).toBe('loop_end');
     });
 
     it('onAll unsubscribes correctly', () => {
@@ -345,7 +345,7 @@ describe('EventBridge', () => {
   describe('lifecycle', () => {
     it('unwire disconnects from the source', () => {
       const listener = vi.fn();
-      bridge.on('session_start', listener);
+      bridge.on('loop_start', listener);
 
       bridge.unwire();
 
@@ -355,7 +355,7 @@ describe('EventBridge', () => {
 
     it('wire replaces previous connection', () => {
       const listener = vi.fn();
-      bridge.on('session_start', listener);
+      bridge.on('loop_start', listener);
 
       const source2 = createMockSource();
       bridge.wire(source2);
@@ -372,7 +372,7 @@ describe('EventBridge', () => {
     it('destroy cleans up all listeners and connection', () => {
       const typeListener = vi.fn();
       const allListener = vi.fn();
-      bridge.on('session_start', typeListener);
+      bridge.on('loop_start', typeListener);
       bridge.onAll(allListener);
 
       bridge.destroy();
@@ -390,7 +390,7 @@ describe('EventBridge', () => {
   describe('event data passthrough', () => {
     it('includes original pi event data in the cortex event', () => {
       const listener = vi.fn();
-      bridge.on('session_start', listener);
+      bridge.on('loop_start', listener);
 
       const piEvent: PiEvent = {
         type: 'agent_start',
@@ -442,14 +442,14 @@ describe('EventBridge', () => {
       loggedBridge.wire(loggedSource);
 
       const goodListener = vi.fn();
-      loggedBridge.on('session_start', () => { throw new Error('boom'); });
-      loggedBridge.on('session_start', goodListener);
+      loggedBridge.on('loop_start', () => { throw new Error('boom'); });
+      loggedBridge.on('loop_start', goodListener);
 
       loggedSource.emit({ type: 'agent_start' });
 
       expect(logger.error).toHaveBeenCalledWith(
         '[EventBridge] listener threw',
-        expect.objectContaining({ eventType: 'session_start', error: 'boom' }),
+        expect.objectContaining({ eventType: 'loop_start', error: 'boom' }),
       );
       // Subsequent listener still fires
       expect(goodListener).toHaveBeenCalledTimes(1);
@@ -564,7 +564,7 @@ describe('EventBridge', () => {
 
     it('returns no payload for non-tool events', () => {
       const listener = vi.fn();
-      bridge.on('session_start', listener);
+      bridge.on('loop_start', listener);
 
       source.emit({ type: 'agent_start' });
 

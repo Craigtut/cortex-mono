@@ -34,7 +34,7 @@ Read the contents of a file from the local filesystem.
 - Should handle common encodings (UTF-8, UTF-16, Latin-1)
 
 ### Read-Before-Write/Edit Contract
-The Read tool tracks which files have been read in the current session. The Write and Edit tools enforce that a file must be Read before it can be modified. This prevents blind overwrites and ensures the model has seen the current state of a file before changing it.
+The Read tool tracks which files have been read in the current agentic loop. The Write and Edit tools enforce that a file must be Read before it can be modified. This prevents blind overwrites and ensures the model has seen the current state of a file before changing it.
 
 ### Special File Types
 - **Images** (PNG, JPG, GIF, WebP): Return as base64 in an `ImageContent` block. For vision-capable models, the image is presented visually.

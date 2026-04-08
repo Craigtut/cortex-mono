@@ -1514,9 +1514,14 @@ export class CortexAgent {
   refreshTools(): void {
     const mcpTools = this.mcpClientManager.getTools();
     const allTools = [...this.registeredTools, ...mcpTools].map(tool => {
+      const toolWithOptionalLabel = tool as unknown as { label?: unknown; name: string };
+      const label = typeof toolWithOptionalLabel.label === 'string'
+        ? toolWithOptionalLabel.label
+        : tool.name;
+
       return {
         ...tool,
-        label: (tool as Record<string, unknown>)['label'] ?? tool.name,
+        label,
         execute: async (
           toolCallId: string,
           params: unknown,

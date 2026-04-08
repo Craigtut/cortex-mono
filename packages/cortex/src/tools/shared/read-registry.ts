@@ -1,5 +1,5 @@
 /**
- * Session-scoped file read tracking.
+ * Loop-scoped file read tracking.
  *
  * Shared by the Read, Write, and Edit tools to enforce
  * the read-before-write/edit contract. Tracks which files
@@ -36,7 +36,7 @@ export class ReadRegistry {
   }
 
   /**
-   * Check whether a file has been read in the current session.
+   * Check whether a file has been read in the current agentic loop.
    */
   hasBeenRead(filePath: string): boolean {
     return this.entries.has(this.normalize(filePath));

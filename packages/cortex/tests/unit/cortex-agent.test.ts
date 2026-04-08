@@ -5,6 +5,8 @@ import type { PiEvent } from '../../src/event-bridge.js';
 import type { CortexAgentConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
+import { fromPiAgentTool } from '../../src/tool-contract.js';
+import type { CortexTool } from '../../src/tool-contract.js';
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent factory
@@ -110,12 +112,7 @@ function createMockPiAgent(options?: {
 type TestCortexAgentConstructor = new (
   agent: PiAgent,
   config: CortexAgentConfig,
-  tools?: Array<{
-    name: string;
-    description: string;
-    parameters: unknown;
-    execute: (...args: any[]) => Promise<unknown>;
-  }>,
+  tools?: CortexTool[],
   options?: {
     enableSubAgentTool?: boolean;
     enableLoadSkillTool?: boolean;
@@ -125,12 +122,7 @@ type TestCortexAgentConstructor = new (
 function createTestCortexAgent(
   agent: PiAgent,
   config: CortexAgentConfig,
-  tools?: Array<{
-    name: string;
-    description: string;
-    parameters: unknown;
-    execute: (...args: any[]) => Promise<unknown>;
-  }>,
+  tools?: CortexTool[],
   options?: {
     enableSubAgentTool?: boolean;
     enableLoadSkillTool?: boolean;
@@ -699,14 +691,14 @@ You have 12 emotions.`;
   // -----------------------------------------------------------------------
 
   describe('events', () => {
-    it('onLoopComplete fires on session_end (agent_end)', async () => {
+    it('onLoopComplete fires on loop_end (agent_end)', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const handler = vi.fn();
       agent.onLoopComplete(handler);
 
       await agent.prompt('Hello');
 
-      // agent.run() emits agent_end which maps to session_end -> onLoopComplete
+      // agent.run() emits agent_end which maps to loop_end -> onLoopComplete
       expect(handler).toHaveBeenCalled();
     });
 
@@ -750,13 +742,13 @@ You have 12 emotions.`;
       expect(handler2).toHaveBeenCalled();
     });
 
-    it('auto-wires token tracking from turn_end usage data', () => {
+    it('auto-wires current-context token tracking from turn_end usage data', () => {
       const agent = createTestCortexAgent(piAgent, {
         ...config,
         model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
       });
 
-      expect(agent.sessionTokenCount).toBe(0);
+      expect(agent.currentContextTokenCount).toBe(0);
 
       // Emit a turn_end event with usage data (pattern: event.usage.input)
       piAgent.emitEvent({
@@ -765,10 +757,10 @@ You have 12 emotions.`;
         usage: { input: 85_000 },
       });
 
-      expect(agent.sessionTokenCount).toBe(85_000);
+      expect(agent.currentContextTokenCount).toBe(85_000);
     });
 
-    it('auto-wires token tracking from message.usage.input pattern', () => {
+    it('auto-wires current-context token tracking from message.usage.input pattern', () => {
       const agent = createTestCortexAgent(piAgent, {
         ...config,
         model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
@@ -782,7 +774,7 @@ You have 12 emotions.`;
         },
       });
 
-      expect(agent.sessionTokenCount).toBe(42_000);
+      expect(agent.currentContextTokenCount).toBe(42_000);
     });
 
     it('does not update token count when turn_end has no usage data', () => {
@@ -792,7 +784,7 @@ You have 12 emotions.`;
       });
 
       // Manually set a known value
-      agent.updateSessionTokenCount(50_000);
+      agent.updateCurrentContextTokenCount(50_000);
 
       // Emit a turn_end with no usage data
       piAgent.emitEvent({
@@ -801,7 +793,28 @@ You have 12 emotions.`;
       });
 
       // Should remain unchanged since no usage data was available
-      expect(agent.sessionTokenCount).toBe(50_000);
+      expect(agent.currentContextTokenCount).toBe(50_000);
+    });
+
+    it('estimates current context tokens from the live agent snapshot', () => {
+      const agent = createTestCortexAgent(piAgent, {
+        ...config,
+        slots: ['project-context'],
+      });
+
+      agent.getContextManager().setSlot('project-context', 'Project context goes here');
+      agent.getContextManager().setEphemeral('Ephemeral context');
+
+      const estimate = agent.estimateCurrentContextTokens();
+
+      expect(estimate).toBeGreaterThan(0);
+    });
+
+    it('uses the larger of the post-hoc count and heuristic estimate', () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      agent.updateCurrentContextTokenCount(50_000);
+
+      expect(agent.estimateCurrentContextTokens()).toBe(50_000);
     });
   });
 
@@ -1032,6 +1045,96 @@ You have 12 emotions.`;
       expect(toolNames).toContain('Read');
       expect(toolNames).toContain('Bash');
       expect(toolNames).toContain('Glob');
+    });
+
+    it('adapts Bash using the canonical Cortex tool contract', async () => {
+      const setToolsFn = vi.fn();
+      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
+
+      const agent = createTestCortexAgent(
+        piAgent,
+        createDefaultConfig({ workingDirectory: process.cwd() }),
+        [],
+        { enableSubAgentTool: false, enableLoadSkillTool: false },
+      );
+      setToolsFn.mockClear();
+
+      agent.refreshTools();
+
+      const allTools = setToolsFn.mock.calls[0]![0] as Array<{
+        name: string;
+        execute: (toolCallId: string, params: unknown) => Promise<{
+          content: Array<{ type: string; text?: string }>;
+        }>;
+      }>;
+      const bashTool = allTools.find((tool) => tool.name === 'Bash');
+
+      expect(bashTool).toBeDefined();
+
+      const result = await bashTool!.execute('tc-bash', { command: 'echo "adapter ok"' });
+      expect(result.content[0]?.text).toContain('adapter ok');
+    });
+
+    it('supports raw pi-agent-core tools when explicitly wrapped', async () => {
+      const setToolsFn = vi.fn();
+      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
+
+      const legacyTool = fromPiAgentTool({
+        name: 'LegacyTool',
+        description: 'Legacy execution contract',
+        parameters: {},
+        execute: vi.fn(async (toolCallId: string, params: unknown) => ({
+          content: [{ type: 'text', text: `${toolCallId}:${String((params as { value: string }).value)}` }],
+          details: {},
+        })),
+      });
+
+      const agent = createTestCortexAgent(
+        piAgent,
+        config,
+        [legacyTool],
+        { enableSubAgentTool: false, enableLoadSkillTool: false },
+      );
+      setToolsFn.mockClear();
+
+      agent.refreshTools();
+
+      const allTools = setToolsFn.mock.calls[0]![0] as Array<{
+        name: string;
+        execute: (toolCallId: string, params: unknown) => Promise<{
+          content: Array<{ type: string; text?: string }>;
+        }>;
+      }>;
+      const tool = allTools.find((entry) => entry.name === 'LegacyTool');
+
+      expect(tool).toBeDefined();
+
+      const result = await tool!.execute('legacy-call', { value: 'ok' });
+      expect(result.content[0]?.text).toBe('legacy-call:ok');
+    });
+
+    it('rejects raw pi-agent-core tools unless explicitly wrapped', () => {
+      const legacyTool = {
+        name: 'LegacyTool',
+        description: 'Legacy execution contract',
+        parameters: {},
+        execute: async (
+          toolCallId: string,
+          params: unknown,
+          _signal?: AbortSignal,
+          _onUpdate?: (partialResult: unknown) => void,
+        ) => ({
+          content: [{ type: 'text', text: `${toolCallId}:${String(params)}` }],
+          details: {},
+        }),
+      };
+
+      expect(() => createTestCortexAgent(
+        piAgent,
+        config,
+        [legacyTool as unknown as CortexTool],
+        { enableSubAgentTool: false, enableLoadSkillTool: false },
+      )).toThrow(/fromPiAgentTool/);
     });
 
     it('does not throw when agent lacks setTools', () => {

@@ -23,7 +23,7 @@ describe('createDebouncedSaver', () => {
     cwd: '/test',
     createdAt: Date.now(),
     updatedAt: Date.now(),
-    tokenCount: 1000,
+    contextTokenCount: 1000,
   };
 
   it('batches rapid saves', async () => {

@@ -30,7 +30,7 @@ Create a new file or overwrite an existing file.
 - Writes atomically (write to temp file, then rename) to prevent partial writes on crash
 
 ### Read-Before-Write Contract
-If the file already exists, the model must have Read it in the current session before writing. The tool fails if an existing file hasn't been Read first. This prevents blind overwrites.
+If the file already exists, the model must have Read it in the current agentic loop before writing. The tool fails if an existing file hasn't been Read first. This prevents blind overwrites.
 
 ### Structured Diffs
 For updates (not creates), the tool computes a structured patch internally. This is returned in `details` for the UI to render a rich diff view. The model does not need to see the diff in its context since it authored the content.

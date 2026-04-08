@@ -176,7 +176,7 @@ interface MicrocompactionConfig {
    - Trigger observational memory processing for any unprocessed raw items (synchronous, awaited)
    - Flush any other critical state to disk/database
 
-4. **Generate summary**: Make a direct `pi-ai` call (not through the agent loop) with the compaction target and the summarization prompt. Uses the same model as the main agent session. The compaction target is sourced from the **original session transcript** (not the in-memory microcompacted version), so the summarizer has access to full tool result content for high-quality compression. The summarization response is not added to the agent's conversation history.
+4. **Generate summary**: Make a direct `pi-ai` call (not through the agent loop) with the compaction target and the summarization prompt. Uses the same model as the main agent. The compaction target is sourced from the **original transcript** (not the in-memory microcompacted version), so the summarizer has access to full tool result content for high-quality compression. The summarization response is not added to the agent's conversation history.
 
 5. **Replace history**: Replace the compaction target in the agent's conversation history with a single `user`-role message containing the tagged summary. The new conversation history becomes: `[summary message] + [preserved tail]`.
 
@@ -184,7 +184,7 @@ interface MicrocompactionConfig {
    - Re-seed messages from `messages.db` that fall in the gap between the observation watermark and the preserved tail's oldest timestamp
    - Update any internal state that depends on conversation history
 
-7. **Update token tracking**: Reset `sessionTokenCount` based on the new history size.
+7. **Update token tracking**: Reset `currentContextTokenCount` based on the new history size.
 
 **Why a preserved tail**: Tool call/result pairs only exist in conversation history. `messages.db` stores user-facing messages and agent replies, not tool calls. Without a preserved tail, the agent would lose all recent tool context after compaction, retaining only the summary's prose description. The preserved tail keeps the last 1-2 ticks of full-fidelity context including structured tool data.
 
@@ -342,7 +342,7 @@ Cortex tracks tokens through two complementary mechanisms:
 After every LLM call, read `AssistantMessage.usage` to get the actual token count. This is authoritative but only available after the call completes. Cortex auto-wires this internally: the EventBridge intercepts `turn_end` events from pi-agent-core, extracts usage data, and updates the compaction manager's token count. No consumer wiring is needed.
 
 ```typescript
-sessionTokenCount = response.usage.input_tokens;
+currentContextTokenCount = response.usage.input_tokens;
 ```
 
 Note: this is an assignment, not an addition. `usage.input_tokens` reflects the total input size for that call, not a delta.
@@ -599,7 +599,7 @@ A successful Layer 2 compaction resets the consecutive failure counter.
 
 When microcompaction clears or replaces a non-reproducible or computational tool result (at the `placeholder` or `clear` threshold), the original content can optionally be persisted to disk via a consumer-provided callback.
 
-**Motivation:** Non-reproducible results (WebFetch, Bash) cannot be re-fetched. Once cleared from the model's view, the content is lost. Disk persistence lets the agent Read the content back if it needs to reference it during the current session. The persisted files also survive Layer 2 compaction, which replaces the source transcript entirely.
+**Motivation:** Non-reproducible results (WebFetch, Bash) cannot be re-fetched. Once cleared from the model's view, the content is lost. Disk persistence lets the agent Read the content back if it needs to reference it later in the same long-lived session. The persisted files also survive Layer 2 compaction, which replaces the source transcript entirely.
 
 **Configuration** (in `MicrocompactionConfig`):
 - `persistResult`: `PersistResultFn` callback (optional). The consumer implements the I/O and returns the file path.
