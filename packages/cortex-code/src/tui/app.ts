@@ -3,14 +3,13 @@ import {
   ProcessTerminal,
   Container,
   Spacer,
-  Text,
-  Loader,
 } from '@mariozechner/pi-tui';
 import { CustomEditor, type CustomEditorCallbacks } from './editor.js';
 import { StatusBar, type StatusBarState } from './status.js';
 import { TranscriptManager } from './transcript.js';
 import { PermissionPromptComponent, type PermissionResult } from './permissions.js';
-import { editorTheme, colors } from './theme.js';
+import { StatusSpinner } from './spinner.js';
+import { editorTheme } from './theme.js';
 
 export interface AppCallbacks {
   /** Called when user submits a message or slash command. */
@@ -30,12 +29,13 @@ export class App {
   readonly tui: TUI;
   readonly terminal: ProcessTerminal;
   readonly chatContainer: Container;
+  readonly activityContainer: Container;
   readonly statusContainer: Container;
   readonly editor: CustomEditor;
   readonly statusBar: StatusBar;
   readonly transcript: TranscriptManager;
 
-  private statusLoader: Loader | null = null;
+  private statusIndicator: StatusSpinner | null = null;
   private readonly cwd: string;
 
   constructor(callbacks: AppCallbacks, cwd: string) {
@@ -53,9 +53,11 @@ export class App {
     (this.tui as unknown as Record<string, unknown>)['positionHardwareCursor'] = () => {
       this.terminal.hideCursor();
     };
+    this.patchRenderScheduler();
 
     // Build component tree
     this.chatContainer = new Container();
+    this.activityContainer = new Container();
     this.statusContainer = new Container();
     this.statusBar = new StatusBar();
 
@@ -71,6 +73,7 @@ export class App {
 
     // Assemble layout: flat vertical stack, terminal native scrollback
     this.tui.addChild(this.chatContainer);         // Messages, tool calls, prompts
+    this.tui.addChild(this.activityContainer);     // Compact "N subagents running" indicator
     this.tui.addChild(this.statusContainer);        // Loading spinner
     this.tui.addChild(this.editor);                 // User input (has its own border)
     this.tui.addChild(this.statusBar);              // Footer
@@ -79,7 +82,7 @@ export class App {
     this.tui.setFocus(this.editor);
 
     // Create transcript manager
-    this.transcript = new TranscriptManager(this.chatContainer, this.tui);
+    this.transcript = new TranscriptManager(this.chatContainer, this.tui, this.activityContainer);
   }
 
   /** Start the TUI event loop. */
@@ -89,6 +92,7 @@ export class App {
 
   /** Stop the TUI and clean up. */
   stop(): void {
+    this.transcript.clear();
     this.hideStatusSpinner();
     this.tui.stop();
   }
@@ -101,17 +105,20 @@ export class App {
   /** Show a loading spinner in the status area (during agent execution). */
   showStatusSpinner(message: string): void {
     this.hideStatusSpinner();
-    this.statusLoader = new Loader(this.tui, colors.primary, colors.muted, message);
-    this.statusContainer.addChild(this.statusLoader);
-    this.statusLoader.start();
+    // Keep the top-level spinner low-frequency. Tool and subagent rows animate
+    // through their own shared low-frequency ticker.
+    this.statusIndicator = new StatusSpinner(this.tui, message);
+    this.statusContainer.addChild(this.statusIndicator);
+    this.tui.requestRender();
   }
 
   /** Hide the status spinner. */
   hideStatusSpinner(): void {
-    if (this.statusLoader) {
-      this.statusLoader.stop();
-      this.statusContainer.removeChild(this.statusLoader);
-      this.statusLoader = null;
+    if (this.statusIndicator) {
+      this.statusIndicator.stop();
+      this.statusContainer.removeChild(this.statusIndicator);
+      this.statusIndicator = null;
+      this.tui.requestRender();
     }
   }
 
@@ -149,5 +156,37 @@ export class App {
   /** Refresh slash command autocomplete (e.g., after skills discovered). */
   refreshCommands(cwd: string): void {
     this.editor.refreshCommands(cwd);
+  }
+
+  /**
+   * pi-tui schedules renders with process.nextTick(), which can starve stdin
+   * under heavy repaint load. Yield with setImmediate() instead so Ctrl+C and
+   * other input still get a chance to run between renders.
+   */
+  private patchRenderScheduler(): void {
+    const tui = this.tui as unknown as Record<string, unknown>;
+    const doRender = tui['doRender'];
+    if (typeof doRender !== 'function') return;
+
+    tui['requestRender'] = (force = false) => {
+      if (force) {
+        tui['previousLines'] = [];
+        tui['previousWidth'] = -1;
+        tui['previousHeight'] = -1;
+        tui['cursorRow'] = 0;
+        tui['hardwareCursorRow'] = 0;
+        tui['maxLinesRendered'] = 0;
+        tui['previousViewportTop'] = 0;
+      }
+
+      if (tui['renderRequested']) return;
+      tui['renderRequested'] = true;
+
+      setImmediate(() => {
+        tui['renderRequested'] = false;
+        if (tui['stopped']) return;
+        (doRender as () => void).call(this.tui);
+      });
+    };
   }
 }

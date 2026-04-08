@@ -55,30 +55,30 @@ const subAgentRenderer: ToolRenderer = {
 
   renderResult(result: unknown, details: unknown, context: ToolRenderContext): ToolResultDisplay {
     const d = details as SubAgentDetails | undefined;
-    const text = extractTextContent(result);
+    let text = extractTextContent(result);
+
+    // Strip <working> tags from sub-agent output (LLM reasoning, not for display)
+    text = text.replace(/<working>[\s\S]*?<\/working>/g, '').trim();
 
     const contentLines: string[] = [];
 
-    // For background agents, show tool call summary if available
-    // toolCalls come from SubAgentResult, surfaced via the result details
+    // Compact tool summary: "Read x14, Bash x2" instead of vertical list
     const resultObj = result as Record<string, unknown> | undefined;
     const toolCalls = (resultObj?.['toolCalls'] ?? (details as Record<string, unknown> | undefined)?.['toolCalls']) as
-      Array<{ name: string; durationMs?: number; error?: string }> | undefined;
+      Array<{ name: string; error?: string }> | undefined;
 
     if (toolCalls && toolCalls.length > 0) {
-      contentLines.push(chalk.hex(context.theme.muted)('Tools used:'));
-      for (const tc of toolCalls.slice(-MAX_ACTIVITY_LINES)) {
-        const icon = tc.error
-          ? chalk.hex(context.theme.statusError)('\u2717')
-          : chalk.hex(context.theme.statusSuccess)('\u2713');
-        contentLines.push(`  ${icon} ${tc.name}`);
+      const counts = new Map<string, number>();
+      for (const tc of toolCalls) {
+        counts.set(tc.name, (counts.get(tc.name) ?? 0) + 1);
       }
-      if (text) {
-        contentLines.push(chalk.hex(context.theme.borderMuted)('\u2500'.repeat(20)));
-      }
+      const summary = [...counts.entries()]
+        .map(([name, count]) => count > 1 ? `${name} x${count}` : name)
+        .join(', ');
+      contentLines.push(chalk.hex(context.theme.muted)(summary));
     }
 
-    // Show result text
+    // Show result text (stripped of working tags)
     if (text) {
       const textLines = text.split('\n');
       const { lines } = collapseContent(textLines, {
@@ -92,16 +92,13 @@ const subAgentRenderer: ToolRenderer = {
     // Model ID from details or args
     const modelId = d?.modelId ?? (context.args['modelId'] as string | undefined);
 
-    // Header: identity parts (subagent + model + background)
+    // Header
     const headerParts: string[] = ['subagent'];
     if (modelId) {
       headerParts.push(chalk.hex(context.theme.muted)(`(${modelId})`));
     }
-    if (d?.background) {
-      headerParts.push(chalk.hex(context.theme.muted)('[background]'));
-    }
 
-    // Footer: stats only (turns, duration, status)
+    // Footer: stats
     const statsParts: string[] = [];
     if (d?.turns) {
       statsParts.push(`${d.turns} turns`);
