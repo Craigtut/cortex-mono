@@ -13,8 +13,8 @@
     "test": "vitest",
     "test:run": "vitest run",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint packages --ext .ts,.tsx",
-    "lint:fix": "eslint packages --ext .ts,.tsx --fix",
+    "lint": "eslint packages/*/src packages/*/tests",
+    "lint:fix": "eslint packages/*/src packages/*/tests --fix",
     "clean": "rm -rf packages/*/dist node_modules/.cache"
   },
   "engines": {
@@ -32,6 +32,7 @@
     "husky": "^9.1.7",
     "prettier": "^3.3.0",
     "typescript": "^5.6.0",
+    "typescript-eslint": "^8.58.1",
     "vitest": "^2.1.0"
   }
 }
