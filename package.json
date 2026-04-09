@@ -6,12 +6,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Animus-Labs/cortex-mono.git"
+    "url": "https://github.com/Craigtut/cortex-mono.git"
   },
   "bugs": {
-    "url": "https://github.com/Animus-Labs/cortex-mono/issues"
+    "url": "https://github.com/Craigtut/cortex-mono/issues"
   },
-  "homepage": "https://github.com/Animus-Labs/cortex-mono",
+  "homepage": "https://github.com/Craigtut/cortex-mono",
   "workspaces": [
     "packages/*"
   ],

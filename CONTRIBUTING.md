@@ -23,7 +23,7 @@ We review every PR carefully. Contributions that don't align with the project vi
 
 ```bash
 # Clone the repo
-git clone https://github.com/animus-labs/cortex-mono.git
+git clone https://github.com/Craigtut/cortex-mono.git
 cd cortex-mono
 
 # Install dependencies
