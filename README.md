@@ -10,7 +10,7 @@ Built on [`pi-agent-core`](https://github.com/nickmarchandpm/pi-agent-core) for 
 
 | Package | Description | Status |
 |---------|-------------|--------|
-| [`@animus-labs/cortex`](packages/cortex/) | Core agent framework | Published |
+| [`@animus-labs/cortex`](packages/cortex/) | Core agent framework | 0.1.0 |
 | [`@animus-labs/cortex-code`](packages/cortex-code/) | Terminal-based coding agent | In development |
 
 ## Getting Started
