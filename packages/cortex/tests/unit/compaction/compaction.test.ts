@@ -424,4 +424,22 @@ describe('runCompaction', () => {
     // Index should be total messages - preserved turns
     expect(result.oldestPreservedIndex).toBe(8);
   });
+
+  it('uses actualContextTokens for tokensBefore when provided', async () => {
+    const history = buildHistory(5);
+    const config = { ...COMPACTION_DEFAULTS, preserveRecentTurns: 2 };
+
+    // Without actualContextTokens: tokensBefore is text-only heuristic
+    const { result: withoutActual } = await runCompaction(history, config, complete);
+
+    // With actualContextTokens: tokensBefore should be the provided value
+    const { result: withActual } = await runCompaction(
+      history, config, complete, {}, 150_000,
+    );
+
+    expect(withActual.tokensBefore).toBe(150_000);
+    expect(withoutActual.tokensBefore).not.toBe(150_000);
+    // The heuristic should be much smaller than the full context value
+    expect(withoutActual.tokensBefore).toBeLessThan(150_000);
+  });
 });

@@ -618,12 +618,19 @@ export class CompactionManager {
               onPostCompaction: this.postCompactionHandlers,
               onCompactionError: this.compactionErrorHandlers,
             },
+            currentTokens, // pass actual full-context token count for accurate reporting
           );
 
           // Success: update state and reset failure counter
           setSourceHistory(compactedSource);
           this.microcompaction.resetCache();
+
+          // result.tokensAfter now includes overhead (system prompt, slots,
+          // tool definitions) since we passed actualContextTokens to
+          // runCompaction. Use it directly to prevent the stale low value
+          // that would cause re-triggering compaction on the next call.
           this._currentContextTokenCount = result.tokensAfter;
+
           this._consecutiveLayer2Failures = 0;
 
           for (const handler of this.compactionResultHandlers) {
@@ -640,7 +647,7 @@ export class CompactionManager {
           history = await this.microcompaction.apply(
             compactedSource,
             this._contextWindow,
-            result.tokensAfter,
+            this._currentContextTokenCount,
           );
 
           succeeded = true;
@@ -769,6 +776,7 @@ export class CompactionManager {
     // Attempt Layer 2 (summarization)
     if (this.completeFn) {
       try {
+        const actualTokens = Math.max(this._currentContextTokenCount, estimatedTokens);
         const { newHistory, result } = await runCompaction(
           history,
           this.config.compaction,
@@ -778,12 +786,13 @@ export class CompactionManager {
             onPostCompaction: this.postCompactionHandlers,
             onCompactionError: this.compactionErrorHandlers,
           },
+          actualTokens, // pass full-context token count for accurate reporting
         );
 
         setHistory(newHistory);
         this.microcompaction.resetCache();
 
-        // Update token count estimate
+        // result.tokensAfter includes overhead since we passed actualTokens
         this._currentContextTokenCount = result.tokensAfter;
 
         // Emit result

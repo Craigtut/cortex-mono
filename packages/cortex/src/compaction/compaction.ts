@@ -233,6 +233,8 @@ export async function runCompaction(
     onPostCompaction?: PostCompactionHandler[];
     onCompactionError?: CompactionErrorHandler[];
   } = {},
+  /** Actual full-context token count (includes system prompt, slots, tools). When provided, used as tokensBefore instead of text-only heuristic. */
+  actualContextTokens?: number,
 ): Promise<{ newHistory: AgentMessage[]; result: CompactionResult }> {
   const [target, preserved] = partitionHistory(history, config.preserveRecentTurns);
 
@@ -241,10 +243,18 @@ export async function runCompaction(
     throw new Error('Not enough conversation history to compact');
   }
 
-  // Estimate tokens before compaction
-  const tokensBefore = estimateTokens(
+  // Compute text-only heuristic for history content.
+  const historyTextTokens = estimateTokens(
     history.map(m => extractTextContent(m)).join('\n'),
   );
+
+  // Use actual full-context token count when provided (includes system prompt,
+  // slots, tool definitions); fall back to text-only heuristic for backward compat.
+  const tokensBefore = actualContextTokens ?? historyTextTokens;
+
+  // Overhead = system prompt + slots + tool definitions (everything except history text).
+  // Used to compute tokensAfter on the same basis as tokensBefore.
+  const overhead = actualContextTokens ? Math.max(0, actualContextTokens - historyTextTokens) : 0;
 
   // Build compaction target info for the event
   const targetInfo: CompactionTarget = {
@@ -298,10 +308,12 @@ export async function runCompaction(
   const summaryMessage = buildSummaryMessage(parsedSummary, target.length);
   const newHistory = [summaryMessage, ...preserved];
 
-  // Calculate result metrics
-  const tokensAfter = estimateTokens(
+  // Calculate result metrics. Include the same overhead (system prompt, slots,
+  // tool definitions) so tokensBefore and tokensAfter are on the same basis.
+  const newHistoryTextTokens = estimateTokens(
     newHistory.map(m => extractTextContent(m)).join('\n'),
   );
+  const tokensAfter = overhead + newHistoryTextTokens;
   const summaryTokens = estimateTokens(parsedSummary);
 
   // The oldest preserved turn's index in the original history.
