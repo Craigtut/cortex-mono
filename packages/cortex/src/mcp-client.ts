@@ -21,23 +21,18 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { Type } from '@sinclair/typebox';
 import type { McpTransportConfig, McpConnectionState, McpStdioConfig, McpHttpConfig, CortexLogger } from './types.js';
+import type { CortexTool } from './tool-contract.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { buildSafeEnv } from './tools/shared/safe-env.js';
 
 // ---------------------------------------------------------------------------
-// AgentTool interface (pi-agent-core minimal contract)
+// Tool contract
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal AgentTool interface matching pi-agent-core's tool registration.
- * Defined inline to avoid a hard runtime dependency on pi-agent-core types.
+ * Backward-compatible export name for Cortex's canonical tool contract.
  */
-export interface AgentTool {
-  name: string;
-  description: string;
-  parameters: unknown;
-  execute: (args: unknown) => Promise<unknown>;
-}
+export type AgentTool = CortexTool;
 
 // ---------------------------------------------------------------------------
 // Internal connection record

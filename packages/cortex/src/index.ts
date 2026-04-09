@@ -20,6 +20,7 @@ export type {
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
   CortexAgentConfig,
+  CortexDiagnosticsConfig,
   ContextManagerConfig,
   ErrorCategory,
   ErrorSeverity,
@@ -57,6 +58,7 @@ export type {
   ToolCallStartPayload,
   ToolCallUpdatePayload,
   ToolCallEndPayload,
+  PromptWatchdogDiagnosticsConfig,
 } from './types.js';
 
 // Logger

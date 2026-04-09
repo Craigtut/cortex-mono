@@ -2,20 +2,20 @@
 
 > **STATUS: IMPLEMENTED**
 
-How Cortex bridges the gap between pi-agent-core's native `AgentTool` interface and the MCP protocol used by consumer domain tools and plugin tools. All external tool sources are consumed through a unified MCP client pattern, while a small set of built-in tools remain as direct in-process registrations.
+How Cortex bridges the gap between pi-agent-core's native `AgentTool` interface and the MCP protocol used by consumer domain tools and plugin tools. All external tool sources are consumed through a unified MCP client pattern, while a small set of built-in tools remain as direct in-process Cortex tools that are adapted to pi-agent-core at the final registration boundary.
 
 ## Overview
 
 Pi-agent-core has no MCP support. Tools are direct `AgentTool` objects with an `execute()` function registered on the `Agent` instance. Cortex bridges this gap by acting as an MCP client that connects to MCP servers, discovers their tools via `tools/list`, and wraps each discovered tool as an `AgentTool`.
 
-This is a unified approach: both consumer domain tools (e.g., memory, tasks, messaging) and plugin tools (weather, browser, home automation) are consumed through the same MCP client pattern. The only exceptions are built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent) which are native `AgentTool` registrations that run in-process without MCP.
+This is a unified approach: both consumer domain tools (e.g., memory, tasks, messaging) and plugin tools (weather, browser, home automation) are consumed through the same MCP client pattern. The only exceptions are built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent) which are native in-process Cortex tools without MCP transport overhead.
 
 ## Architecture
 
 ```
 CortexAgent
 ├── Built-in Tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent)
-│   └── Direct AgentTool registrations, in-process
+│   └── Cortex-native tools, adapted to AgentTool at registration time
 │
 ├── MCP Client Manager
 │   ├── Consumer Domain Tools (consumer's MCP tool server)

@@ -1,5 +1,5 @@
 /**
- * load_skill AgentTool: loads a skill's full instructions into the agent's
+ * load_skill tool: loads a skill's full instructions into the agent's
  * active context.
  *
  * The skill body is read from the SkillRegistry, preprocessed (variable
@@ -59,7 +59,8 @@ export interface LoadSkillToolConfig {
 /**
  * Create the load_skill tool.
  *
- * Returns an AgentTool object for registration with pi-agent-core.
+ * Returns a Cortex-native tool. CortexAgent adapts it to pi-agent-core's
+ * execute signature when synchronizing the tool inventory.
  * The tool description includes the available skills summary, which
  * updates when skills are added or removed from the registry.
  */
