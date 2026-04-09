@@ -9,7 +9,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -40,6 +40,7 @@ async function loadTrustStore(): Promise<TrustStore> {
 async function saveTrustStore(store: TrustStore): Promise<void> {
   await mkdir(dirname(TRUST_STORE_PATH), { recursive: true });
   await writeFile(TRUST_STORE_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
+  await chmod(TRUST_STORE_PATH, 0o600);
 }
 
 function hashContent(content: string): string {

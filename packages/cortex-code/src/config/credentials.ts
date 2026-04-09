@@ -63,6 +63,7 @@ async function writeCredentialFile(data: CredentialFile): Promise<void> {
   await writeFile(CREDENTIALS_PATH, JSON.stringify(data, null, 2), {
     mode: 0o600,
   });
+  await chmod(CREDENTIALS_PATH, 0o600);
 }
 
 // Opportunistic macOS Keychain integration via `security` CLI.
