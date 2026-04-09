@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require('../package.json');
+
 /**
  * @animus-labs/cortex-code
  *
@@ -51,7 +55,7 @@ function parseArgs(argv: string[]): CliArgs {
         break;
       case '--version':
       case '-v':
-        console.log('cortex v0.1.0');
+        console.log(`cortex v${PKG_VERSION}`);
         process.exit(0);
         break;
       default:

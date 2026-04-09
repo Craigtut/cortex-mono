@@ -11,6 +11,10 @@
  * - Lifecycle: start, abort, resume, shutdown
  */
 
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require('../package.json');
+
 import {
   CortexAgent,
   ProviderManager,
@@ -176,7 +180,7 @@ export class Session {
     // Show banner
     const branch = await this.getGitBranch();
     const project = this.cwd.split('/').pop() ?? '';
-    this.app.transcript.addBanner('0.1.0', project, branch);
+    this.app.transcript.addBanner(PKG_VERSION, project, branch);
 
     // Update footer
     this.app.updateStatus({
