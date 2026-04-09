@@ -395,30 +395,56 @@ export function applyBookend(
 }
 
 /**
+ * Compute the replacement text for a trim action.
+ */
+function getTrimmedText(content: string, action: TrimAction): string {
+  if (action.kind === 'bookend') {
+    return applyBookend(content, action.headChars, action.tailChars, action.originalTokens);
+  }
+  if (action.kind === 'placeholder') {
+    return `[Tool result trimmed -- ${action.toolName}: "${action.preview}" -- see assistant response below for findings]`;
+  }
+  if (action.kind === 'clear') {
+    return '[Tool result cleared]';
+  }
+  return content;
+}
+
+/**
  * Apply a trim action to a message, returning a new message.
+ *
+ * Preserves the content array structure for tool_result messages so that
+ * tool_use_id linkage is maintained. The Anthropic API requires every
+ * tool_use block to have a matching tool_result with the same tool_use_id;
+ * replacing the content with a plain string would break this contract.
  */
 export function applyTrimAction(message: AgentMessage, action: TrimAction): AgentMessage {
   if (action.kind === 'full') {
     return message;
   }
 
-  const content = extractTextContent(message);
-
-  if (action.kind === 'bookend') {
-    const trimmed = applyBookend(content, action.headChars, action.tailChars, action.originalTokens);
-    return { role: message.role, content: trimmed };
+  // If the message has a structured content array (e.g., tool_result parts),
+  // preserve the array structure and only replace text within each part.
+  if (Array.isArray(message.content) && message.content.length > 0) {
+    const newContent = message.content.map(part => {
+      if (part.type === 'tool_result' && typeof part.text === 'string') {
+        const trimmed = getTrimmedText(part.text, action);
+        return { ...part, text: trimmed };
+      }
+      // For text parts in a tool_result message, also trim
+      if (part.type === 'text' && typeof part.text === 'string') {
+        const trimmed = getTrimmedText(part.text, action);
+        return { ...part, text: trimmed };
+      }
+      return part;
+    });
+    return { role: message.role, content: newContent };
   }
 
-  if (action.kind === 'placeholder') {
-    const placeholder = `[Tool result trimmed -- ${action.toolName}: "${action.preview}" -- see assistant response below for findings]`;
-    return { role: message.role, content: placeholder };
-  }
-
-  if (action.kind === 'clear') {
-    return { role: message.role, content: '[Tool result cleared]' };
-  }
-
-  return message;
+  // Plain string content: replace directly (backward compat for non-tool messages)
+  const content = typeof message.content === 'string' ? message.content : '';
+  const trimmed = getTrimmedText(content, action);
+  return { role: message.role, content: trimmed };
 }
 
 /**
@@ -574,6 +600,16 @@ export class MicrocompactionEngine {
 
       const preview = content.slice(0, 80).replace(/\n/g, ' ').trim();
       const persistedText = `[Tool result persisted -- ${toolName ?? 'unknown'}: "${preview}" -- use Read on ${path} for full content]`;
+
+      // Preserve content array structure for tool_result messages
+      if (Array.isArray(message.content) && message.content.length > 0) {
+        const newContent = message.content.map(part =>
+          (part.type === 'tool_result' || part.type === 'text') && typeof part.text === 'string'
+            ? { ...part, text: persistedText }
+            : part,
+        );
+        return { role: message.role, content: newContent };
+      }
       return { role: message.role, content: persistedText };
     } catch {
       // Persist failed, fall back to standard trim

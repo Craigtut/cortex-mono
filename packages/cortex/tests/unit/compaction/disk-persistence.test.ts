@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   MicrocompactionEngine,
+  extractTextContent,
 } from '../../../src/compaction/microcompaction.js';
 import type { AgentMessage } from '../../../src/context-manager.js';
 import type { MicrocompactionConfig, PersistResultFn } from '../../../src/types.js';
@@ -103,11 +104,13 @@ describe('MicrocompactionEngine disk persistence', () => {
     expect(metadata.messageIndex).toBe(0);
     expect(metadata.category).toBe('non-reproducible');
 
-    // The replacement message should include the file path
+    // The replacement message should include the file path in the text
     const replaced = result[0]!;
-    expect(typeof replaced.content).toBe('string');
-    expect(replaced.content as string).toContain('/tmp/compaction/result-0.txt');
-    expect(replaced.content as string).toContain('Tool result persisted');
+    const text = extractTextContent(replaced);
+    expect(text).toContain('/tmp/compaction/result-0.txt');
+    expect(text).toContain('Tool result persisted');
+    // Content structure should be preserved (array with tool_result parts)
+    expect(Array.isArray(replaced.content)).toBe(true);
   });
 
   // -----------------------------------------------------------------------
@@ -135,10 +138,12 @@ describe('MicrocompactionEngine disk persistence', () => {
     // Persist callback should NOT be invoked for rereadable category
     expect(persistResult).not.toHaveBeenCalled();
 
-    // The result should be cleared with standard text
+    // The result should be cleared with standard text but preserve structure
     const replaced = result[0]!;
-    expect(typeof replaced.content).toBe('string');
-    expect(replaced.content as string).toBe('[Tool result cleared]');
+    const text = extractTextContent(replaced);
+    expect(text).toBe('[Tool result cleared]');
+    // Content structure should be preserved (array with tool_result parts)
+    expect(Array.isArray(replaced.content)).toBe(true);
   });
 
   // -----------------------------------------------------------------------
@@ -164,12 +169,13 @@ describe('MicrocompactionEngine disk persistence', () => {
 
     // Without persist callback, should use standard placeholder format
     const replaced = result[0]!;
-    expect(typeof replaced.content).toBe('string');
-    const text = replaced.content as string;
+    const text = extractTextContent(replaced);
     expect(text).toContain('Tool result trimmed');
     expect(text).toContain('WebFetch');
     // Should NOT contain any file path reference
     expect(text).not.toContain('persisted');
+    // Content structure should be preserved
+    expect(Array.isArray(replaced.content)).toBe(true);
   });
 
   // -----------------------------------------------------------------------
@@ -199,12 +205,13 @@ describe('MicrocompactionEngine disk persistence', () => {
 
     // Should fall back to standard placeholder without propagating error
     const replaced = result[0]!;
-    expect(typeof replaced.content).toBe('string');
-    const text = replaced.content as string;
+    const text = extractTextContent(replaced);
     // Standard placeholder format (from applyTrimAction)
     expect(text).toContain('Tool result trimmed');
     expect(text).toContain('WebFetch');
     // Should NOT contain any file path since persist failed
     expect(text).not.toContain('persisted');
+    // Content structure should be preserved
+    expect(Array.isArray(replaced.content)).toBe(true);
   });
 });

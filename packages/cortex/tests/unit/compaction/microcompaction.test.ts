@@ -398,6 +398,94 @@ describe('applyTrimAction', () => {
     const text = extractTextContent(result);
     expect(text).toBe('[Tool result cleared]');
   });
+
+  it('preserves tool_result content structure with tool_use_id for clear action', () => {
+    const msg: AgentMessage = {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_abc123', text: 'file contents here', name: 'Read' },
+      ],
+    };
+    const result = applyTrimAction(msg, { kind: 'clear' });
+
+    // Content must remain a structured array, not a plain string
+    expect(Array.isArray(result.content)).toBe(true);
+    const parts = result.content as Array<Record<string, unknown>>;
+    expect(parts.length).toBe(1);
+    expect(parts[0]!.type).toBe('tool_result');
+    expect(parts[0]!.tool_use_id).toBe('toolu_abc123');
+    expect(parts[0]!.text).toBe('[Tool result cleared]');
+  });
+
+  it('preserves tool_result content structure with tool_use_id for placeholder action', () => {
+    const msg: AgentMessage = {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_xyz789', text: 'original content', name: 'Grep' },
+      ],
+    };
+    const result = applyTrimAction(msg, {
+      kind: 'placeholder',
+      toolName: 'Grep',
+      preview: 'original con',
+    });
+
+    expect(Array.isArray(result.content)).toBe(true);
+    const parts = result.content as Array<Record<string, unknown>>;
+    expect(parts[0]!.type).toBe('tool_result');
+    expect(parts[0]!.tool_use_id).toBe('toolu_xyz789');
+    expect(typeof parts[0]!.text).toBe('string');
+    expect(parts[0]!.text as string).toContain('Tool result trimmed');
+  });
+
+  it('preserves tool_result content structure with tool_use_id for bookend action', () => {
+    const longContent = 'A'.repeat(500);
+    const msg: AgentMessage = {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_def456', text: longContent, name: 'Read' },
+      ],
+    };
+    const result = applyTrimAction(msg, {
+      kind: 'bookend',
+      headChars: 50,
+      tailChars: 50,
+      originalTokens: 125,
+    });
+
+    expect(Array.isArray(result.content)).toBe(true);
+    const parts = result.content as Array<Record<string, unknown>>;
+    expect(parts[0]!.type).toBe('tool_result');
+    expect(parts[0]!.tool_use_id).toBe('toolu_def456');
+    expect(typeof parts[0]!.text).toBe('string');
+    expect(parts[0]!.text as string).toContain('tokens trimmed');
+  });
+
+  it('handles multiple tool_result parts in a single message', () => {
+    const msg: AgentMessage = {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_1', text: 'result one', name: 'Read' },
+        { type: 'tool_result', tool_use_id: 'toolu_2', text: 'result two', name: 'Glob' },
+      ],
+    };
+    const result = applyTrimAction(msg, { kind: 'clear' });
+
+    expect(Array.isArray(result.content)).toBe(true);
+    const parts = result.content as Array<Record<string, unknown>>;
+    expect(parts.length).toBe(2);
+    expect(parts[0]!.tool_use_id).toBe('toolu_1');
+    expect(parts[0]!.text).toBe('[Tool result cleared]');
+    expect(parts[1]!.tool_use_id).toBe('toolu_2');
+    expect(parts[1]!.text).toBe('[Tool result cleared]');
+  });
+
+  it('falls back to plain string for non-array content', () => {
+    const msg: AgentMessage = { role: 'user', content: 'plain string content' };
+    const result = applyTrimAction(msg, { kind: 'clear' });
+
+    expect(result.content).toBe('[Tool result cleared]');
+  });
 });
 
 describe('applyBookend', () => {
