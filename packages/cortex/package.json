@@ -1,9 +1,33 @@
 {
   "name": "@animus-labs/cortex",
   "version": "0.1.0",
+  "description": "Production-grade agent framework with structured context management, compaction, tools, and MCP support",
   "license": "MIT",
-  "author": "Craigtut",
+  "author": "Animus Labs",
   "private": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Animus-Labs/cortex-mono.git",
+    "directory": "packages/cortex"
+  },
+  "bugs": {
+    "url": "https://github.com/Animus-Labs/cortex-mono/issues"
+  },
+  "homepage": "https://github.com/Animus-Labs/cortex-mono/tree/main/packages/cortex",
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "context-management",
+    "compaction",
+    "mcp",
+    "tools",
+    "anthropic",
+    "openai"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",

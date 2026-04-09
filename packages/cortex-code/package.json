@@ -2,9 +2,30 @@
   "name": "@animus-labs/cortex-code",
   "version": "0.1.0",
   "license": "MIT",
-  "author": "Craigtut",
-  "description": "A terminal-based coding agent built on the Cortex agent framework",
+  "author": "Animus Labs",
+  "description": "Terminal-based coding agent built on the Cortex agent framework",
   "private": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Animus-Labs/cortex-mono.git",
+    "directory": "packages/cortex-code"
+  },
+  "bugs": {
+    "url": "https://github.com/Animus-Labs/cortex-mono/issues"
+  },
+  "homepage": "https://github.com/Animus-Labs/cortex-mono/tree/main/packages/cortex-code",
+  "keywords": [
+    "ai",
+    "agent",
+    "coding-agent",
+    "cli",
+    "terminal",
+    "llm",
+    "cortex"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
