@@ -12,7 +12,7 @@ Cortex implements a regex-based error classifier (`error-classifier.ts`) that ma
 
 ### Categories
 
-Adapted from the existing `AgentErrorCategory` in `@animus-labs/agents`, simplified to categories that are actionable:
+Simplified to categories that are actionable at the framework level:
 
 | Category | Severity | Description |
 |----------|----------|-------------|

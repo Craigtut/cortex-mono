@@ -149,4 +149,4 @@ The orchestrator is consumer-level logic. Cortex provides the substrate.
 
 ## Claude/Codex Sub-Agents (Future)
 
-For tasks that benefit from Claude's built-in tools (coding with native file system integration, Claude's compaction, etc.), the consumer can bridge to the existing `@animus-labs/agents` package. This is consumer-level orchestration, not built into cortex. The SubAgent tool only spawns cortex-based agents.
+For tasks that benefit from external agent runtimes (Claude CLI, Codex CLI, etc.), the consumer can bridge to subprocess-based SDKs at the application level. This is consumer-level orchestration, not built into Cortex. The SubAgent tool only spawns Cortex-based agents.

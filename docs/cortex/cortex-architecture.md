@@ -44,9 +44,9 @@ packages/cortex/
 
 ## Why a Separate Package
 
-- The existing `@animus-labs/agents` package abstracts SDK differences behind `IAgentAdapter`/`IAgentSession`. Pi Agent Core does not fit this abstraction: its value is direct control over the loop, not conforming to a normalized interface.
+- Previous agent abstractions (e.g., adapter/session interfaces) normalized SDK differences. Pi Agent Core does not fit that abstraction: its value is direct control over the loop, not conforming to a normalized interface.
 - A standalone package can be reused across future Animus Labs projects.
-- The existing `@animus-labs/agents` package remains available for sub-agent orchestration where subprocess-based SDKs may still be useful.
+- Subprocess-based SDK orchestration (e.g., Claude CLI, Codex CLI) remains available as a consumer-level concern, not built into Cortex.
 
 ## Context Management
 

@@ -35,7 +35,7 @@ Application-specific tools (domain-specific tools, cognitive tools, etc.) are re
 | Tool | Description | Notes |
 |------|-------------|-------|
 | WebSearch | Search the web | Needs a search backend (Brave API, SearXNG, etc.) |
-| Claude/Codex SubAgent | Spawn sub-agents via existing `@animus-labs/agents` | Bridge to subprocess-based SDKs |
+| Claude/Codex SubAgent | Spawn sub-agents via subprocess-based SDKs | Bridge to external agent runtimes |
 
 ### Not in cortex (consumer's responsibility)
 

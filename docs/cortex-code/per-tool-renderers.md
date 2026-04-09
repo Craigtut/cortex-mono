@@ -1,5 +1,7 @@
 # Per-Tool Renderers: Research and Implementation Plan
 
+> **STATUS: DESIGN/PLANNING** - This document is a design and planning reference, not a description of implemented behavior. It captures research findings and a proposed implementation plan for Cortex Code's per-tool renderer system.
+
 This document covers how production coding agents render tool call results in their terminal UIs, distills best practices, and provides a detailed implementation plan for Cortex Code's per-tool renderer system.
 
 ## Table of Contents

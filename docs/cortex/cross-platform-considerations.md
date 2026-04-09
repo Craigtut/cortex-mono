@@ -57,7 +57,7 @@ Node.js doesn't expose Job Objects natively. Options:
 
 OAuth authorization code flows spin up a local HTTP server on `localhost:PORT` to receive the callback. Inside Docker, `localhost` is the container's network, not reachable from the host's browser.
 
-The `backend-auth-integration.md` has `isHeadless()` detection and device-code-style UI. But whether this works depends on pi-ai's OAuth login functions supporting device code flow (stateless, no callback server) vs. authorization code flow (needs localhost callback).
+Headless detection and device-code-style UI will need to account for whether pi-ai's OAuth login functions support device code flow (stateless, no callback server) vs. authorization code flow (needs localhost callback).
 
 ### Solution
 
@@ -74,7 +74,7 @@ The `backend-auth-integration.md` has `isHeadless()` detection and device-code-s
 **Action items:**
 1. Read pi-ai's OAuth login function source code to determine each flow type
 2. For providers using authorization code flow: document that Docker users must use API key auth (Layer 2 in the progressive disclosure)
-3. Add a "Docker OAuth Compatibility" section to `backend-auth-integration.md`
+3. Document Docker OAuth compatibility in the provider documentation
 
 ### Implementation Phase
 
@@ -84,9 +84,9 @@ Add to Phase 2B (auth integration). The verification step should happen early in
 
 ### Problem
 
-The current Dockerfile builds workspace packages in dependency order. Adding `@animus-labs/cortex` requires Dockerfile updates.
+A future Docker deployment would need to build workspace packages in dependency order and include `@animus-labs/cortex`.
 
-### Changes Needed
+### Changes Needed (when Docker support is added)
 
 1. Package file copy: `COPY packages/cortex/package.json packages/cortex/`
 2. Source copy: `COPY packages/cortex/ packages/cortex/`
@@ -96,7 +96,7 @@ The current Dockerfile builds workspace packages in dependency order. Adding `@a
 
 ### Implementation Phase
 
-Add to Phase 1A (package scaffolding) as a task: update the Dockerfile to include the cortex package in the build pipeline. The ripgrep binary concern is addressed in Phase 1C (Grep tool).
+Deferred until Docker deployment is implemented. The ripgrep binary concern should be addressed alongside the Grep tool integration.
 
 ## Skill Preprocessor Shell Commands on Windows (HIGH)
 
