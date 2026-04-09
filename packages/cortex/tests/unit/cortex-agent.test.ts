@@ -399,6 +399,75 @@ describe('CortexAgent', () => {
       // Should still throw the original error, not the handler error
       await expect(agent.prompt('Hello')).rejects.toThrow('Rate limit exceeded');
     });
+
+    it('emits prompt watchdog lifecycle logs when diagnostics are enabled', async () => {
+      const logger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      };
+      const agent = createTestCortexAgent(piAgent, {
+        ...config,
+        logger,
+        diagnostics: {
+          promptWatchdog: {
+            enabled: true,
+            heartbeatIntervalMs: 1000,
+          },
+        },
+      });
+
+      await agent.prompt('Hello');
+
+      expect(logger.info).toHaveBeenCalledWith(
+        '[Diagnostics] prompt_started',
+        expect.objectContaining({
+          inputLength: 5,
+          provider: 'anthropic',
+        }),
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        '[Diagnostics] prompt_finished',
+        expect.objectContaining({
+          status: 'resolved',
+        }),
+      );
+    });
+
+    it('emits abort watchdog logs when diagnostics are enabled', async () => {
+      const logger = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      };
+      const agent = createTestCortexAgent(piAgent, {
+        ...config,
+        logger,
+        diagnostics: {
+          promptWatchdog: {
+            enabled: true,
+            abortWaitWarningMs: 1000,
+          },
+        },
+      });
+
+      await agent.abort();
+
+      expect(logger.info).toHaveBeenCalledWith(
+        '[Diagnostics] abort_requested',
+        expect.objectContaining({
+          isPrompting: false,
+        }),
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        '[Diagnostics] abort_wait_finished',
+        expect.objectContaining({
+          elapsedMs: expect.any(Number),
+        }),
+      );
+    });
   });
 
   // -----------------------------------------------------------------------

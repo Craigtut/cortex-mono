@@ -274,6 +274,38 @@ export interface CortexAgentConfig {
    * Compatible with `console` for quick development: `{ logger: console }`.
    */
   logger?: CortexLogger;
+
+  /**
+   * Optional diagnostics for investigating prompt or provider stalls.
+   * All diagnostics are opt-in and should remain disabled in normal use.
+   */
+  diagnostics?: CortexDiagnosticsConfig;
+}
+
+/**
+ * Prompt watchdog diagnostics configuration.
+ *
+ * Emits bounded lifecycle and heartbeat logs around prompt() and abort().
+ * Intended for investigating freezes or hung provider calls.
+ */
+export interface PromptWatchdogDiagnosticsConfig {
+  /** Whether prompt watchdog diagnostics are enabled. Default: false. */
+  enabled?: boolean;
+  /** Heartbeat interval while a prompt is in flight. Default: 1000ms. */
+  heartbeatIntervalMs?: number;
+  /** Warn if abort waits longer than this for idle. Default: 2000ms. */
+  abortWaitWarningMs?: number;
+}
+
+/**
+ * Optional diagnostics for Cortex internals.
+ *
+ * These are intentionally narrow and structured so consumers can opt into
+ * targeted investigations without turning normal debug logging into trace spam.
+ */
+export interface CortexDiagnosticsConfig {
+  /** Prompt and abort watchdog logs for freeze investigation. */
+  promptWatchdog?: PromptWatchdogDiagnosticsConfig;
 }
 
 // ---------------------------------------------------------------------------

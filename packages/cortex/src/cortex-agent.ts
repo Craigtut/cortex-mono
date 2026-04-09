@@ -47,6 +47,7 @@ import { wrapModel, unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
+import { PromptWatchdogDiagnostics } from './prompt-diagnostics.js';
 import { assertValidCortexTool } from './tool-contract.js';
 import type { CortexTool } from './tool-contract.js';
 import type {
@@ -231,6 +232,10 @@ const TOOL_USAGE_SECTION = `# Tool Usage
     tool covers.
 - You can call multiple tools in a single response. When multiple
   independent operations are needed, make all calls in parallel.
+- Multiple Edit or Write calls targeting the same file are NOT
+  independent. Never emit more than one file-mutating call per
+  file in a single response. Edit or Write different files in
+  parallel, but serialize changes to the same file across turns.
 - Do not poll, loop, or sleep-wait for backgrounded tasks. You
   will be notified when they complete.
 
@@ -304,6 +309,7 @@ export class CortexAgent {
   private readonly budgetGuard: BudgetGuard;
   private readonly config: CortexAgentConfig;
   private readonly logger: CortexLogger;
+  private readonly promptDiagnostics: PromptWatchdogDiagnostics;
   private readonly workingTagsEnabled: boolean;
   private readonly workingDirectory: string;
   private readonly envOverrides: Record<string, string> | undefined;
@@ -421,6 +427,14 @@ export class CortexAgent {
     this.agent = agent;
     this.config = config;
     this.logger = config.logger ?? NOOP_LOGGER;
+    this.promptDiagnostics = new PromptWatchdogDiagnostics(
+      config.diagnostics?.promptWatchdog,
+      this.logger,
+      {
+        isPrompting: () => this._isPrompting,
+        isAbortRequested: () => this.isAborted(),
+      },
+    );
     this.workingTagsEnabled = config.workingTags?.enabled ?? true;
     this.workingDirectory = config.workingDirectory;
     this.envOverrides = config.envOverrides;
@@ -611,6 +625,14 @@ export class CortexAgent {
       inputLength: input.length,
     });
 
+    this.promptDiagnostics.startPrompt({
+      inputLength: input.length,
+      messageCount: this._prePromptMessageCount,
+      provider: this.primaryModel.provider,
+      modelId: this.primaryModel.modelId,
+    });
+
+    let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
     try {
       const result = await this.agent.prompt(input);
 
@@ -625,6 +647,7 @@ export class CortexAgent {
       return result;
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
+      promptStatus = this.isAborted() ? 'cancelled' : 'rejected';
 
       // Reactive overflow detection: if the API returns a context overflow
       // error, perform emergency truncation and let the consumer retry
@@ -665,6 +688,15 @@ export class CortexAgent {
         turns: this.budgetGuard.getTurnCount(),
         totalCost: this.budgetGuard.getTotalCost(),
         currentContextTokens: this.compactionManager.currentContextTokenCount,
+      });
+
+      this.promptDiagnostics.finishPrompt({
+        status: promptStatus,
+        durationMs: Date.now() - loopStartMs,
+        turns: this.budgetGuard.getTurnCount(),
+        totalCost: this.budgetGuard.getTotalCost(),
+        currentContextTokens: this.compactionManager.currentContextTokenCount,
+        pendingBackgroundResults: this.pendingBackgroundResults.length,
       });
 
       // Deliver any background sub-agent results that arrived while prompting.
@@ -1637,10 +1669,16 @@ export class CortexAgent {
    * The agent remains usable for subsequent prompts.
    */
   async abort(): Promise<void> {
+    this.promptDiagnostics.recordAbortRequested();
     this.logger.info('[CortexAgent] abort requested', { isPrompting: this._isPrompting });
     this.abortController.abort();
     this.agent.abort();
-    await this.agent.waitForIdle();
+    this.promptDiagnostics.startAbortWait();
+    try {
+      await this.agent.waitForIdle();
+    } finally {
+      this.promptDiagnostics.finishAbortWait();
+    }
     // Reset the controller so the agent can be reused for subsequent prompts
     this.abortController = new AbortController();
     this.logger.info('[CortexAgent] abort complete');
@@ -1692,6 +1730,7 @@ export class CortexAgent {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
       }
+      this.promptDiagnostics.stop();
       this.lifecycleState = 'destroyed';
       this.logger.info('[CortexAgent] destroy complete');
     }
@@ -2537,6 +2576,12 @@ export class CortexAgent {
    * Maps bridge events to consumer-registered callbacks.
    */
   private wireInternalEvents(): void {
+    this.eventUnsubscribers.push(
+      this.eventBridge.onAll((event) => {
+        this.promptDiagnostics.recordEvent(event);
+      }),
+    );
+
     // Map loop_end -> onLoopComplete
     this.eventUnsubscribers.push(
       this.eventBridge.on('loop_end', () => {
