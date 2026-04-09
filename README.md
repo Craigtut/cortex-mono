@@ -36,7 +36,7 @@ const result = await agent.runLoop('What files are in this directory?');
 
 ## Key Capabilities
 
-- **Context Slots**: Named, ordered content blocks optimized for prompt cache stability
+- **Context Slots**: Named, stability-ordered content blocks optimized for prompt cache hit rates. Ephemeral slots provide per-turn context injection that updates every message, giving the agent fresh situational awareness without polluting the persistent context.
 - **Three-Layer Compaction**: Microcompaction, summarization, and emergency truncation
 - **Built-in Tools**: Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent
 - **MCP Support**: Integrate external tool servers via the Model Context Protocol

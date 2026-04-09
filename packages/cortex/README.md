@@ -31,7 +31,7 @@ const result = await agent.runLoop('What files are in this directory?');
 
 ## Key Features
 
-- **Context Slots**: Named, ordered content blocks with stability-based layout for prompt cache optimization
+- **Context Slots**: Named, stability-ordered content blocks for prompt cache optimization. Ephemeral slots update every message, providing fresh per-turn context (environment state, recent observations) without accumulating in the persistent context.
 - **Three-Layer Compaction**: Microcompaction (string trimming), summarization, and emergency truncation
 - **Built-in Tools**: Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent, TaskOutput
 - **MCP Support**: Integrate external tool servers via the Model Context Protocol
