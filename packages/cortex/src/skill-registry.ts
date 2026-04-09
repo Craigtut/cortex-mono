@@ -62,7 +62,7 @@ function parseFrontmatter(content: string): { frontmatter: Record<string, unknow
 
     // Handle metadata block (indented key-value pairs)
     if (inMetadata) {
-      const metaMatch = line.match(/^  (\w[\w-]*)\s*:\s*(.*)$/);
+      const metaMatch = line.match(/^ {2}(\w[\w-]*)\s*:\s*(.*)$/);
       if (metaMatch) {
         metadataMap[metaMatch[1]!] = metaMatch[2]!.trim();
         continue;

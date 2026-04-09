@@ -44,7 +44,7 @@ const COMMAND_TIMEOUT_MS = 10_000;
 // ---------------------------------------------------------------------------
 
 /** Match !`command` patterns (shell command markers). */
-const SHELL_COMMAND_PATTERN = /^!\`([^`]+)\`$/gm;
+const SHELL_COMMAND_PATTERN = /^!`([^`]+)`$/gm;
 
 /** Match !{script: path} or !{script: path, key: value, ...} patterns. */
 const SCRIPT_PATTERN = /^!\{script:\s*([^,}]+)(?:,\s*([^}]+))?\}$/gm;
