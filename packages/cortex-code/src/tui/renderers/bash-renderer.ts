@@ -42,13 +42,17 @@ function getOrCreateBuffer(key: object): StreamingBuffer {
   return buf;
 }
 
+/** Extract the first line of a command for display (heredocs/multi-line commands must not leak newlines into headers). */
+function commandHeader(command: string, maxLen = 77): string {
+  const firstLine = command.split('\n')[0] ?? command;
+  const display = firstLine.length > maxLen ? firstLine.slice(0, maxLen - 3) + '...' : firstLine;
+  return `$ ${display}`;
+}
+
 const bashRenderer: ToolRenderer = {
   renderCall(args: Record<string, unknown>, _context: ToolRenderContext): ToolCallDisplay {
-    const command = String(args['command'] ?? '');
-    const displayCmd = command.length > 80 ? command.slice(0, 77) + '...' : command;
-
     return {
-      headerText: `$ ${displayCmd}`,
+      headerText: commandHeader(String(args['command'] ?? '')),
       contentLines: [],
       footerText: '',
     };
@@ -73,8 +77,7 @@ const bashRenderer: ToolRenderer = {
     });
 
     // Header and footer
-    const commandStr = String(context.args['command'] ?? 'command');
-    const header = `$ ${commandStr.length > 77 ? commandStr.slice(0, 74) + '...' : commandStr}`;
+    const header = commandHeader(String(context.args['command'] ?? 'command'));
 
     // Below-box lines for error state
     const belowBoxLines: string[] = [];
@@ -101,25 +104,23 @@ const bashRenderer: ToolRenderer = {
     const stdout = u?.details?.stdout ?? '';
     const totalLines = u?.details?.totalLines ?? 0;
 
-    // Use a singleton buffer for streaming display
-    const bufferKey = context; // Use context as weak reference key
-    const buffer = getOrCreateBuffer(bufferKey);
+    // Use args object as stable WeakMap key (same reference across all updates for one tool call)
+    const buffer = getOrCreateBuffer(context.args);
     if (stdout) {
       buffer.append(stdout);
     }
 
     const visibleLines = buffer.getLines(STREAMING_WINDOW);
 
-    const commandStr = String(context.args['command'] ?? 'command');
     return {
-      headerText: `$ ${commandStr.length > 77 ? commandStr.slice(0, 74) + '...' : commandStr}`,
+      headerText: commandHeader(String(context.args['command'] ?? 'command')),
       contentLines: visibleLines,
       footerText: `${totalLines} lines`,
     };
   },
 
   renderError(error: string, args: Record<string, unknown>, context: ToolRenderContext): ToolResultDisplay {
-    const command = String(args['command'] ?? '').slice(0, 77);
+    const command = String(args['command'] ?? '').split('\n')[0]?.slice(0, 77) ?? '';
     const errorLines = error.split('\n');
 
     const { lines } = collapseContent(errorLines, {
