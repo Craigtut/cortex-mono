@@ -15,7 +15,7 @@ import { Type, type Static } from '@sinclair/typebox';
 import type { FileMutationLock } from './shared/file-mutation-lock.js';
 import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
-import type { DiffHunk } from './write.js';
+import { computeDiff, type DiffHunk } from './write.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
 
@@ -77,80 +77,6 @@ function countOccurrences(haystack: string, needle: string): number {
     pos += needle.length;
   }
   return count;
-}
-
-/**
- * Compute a line-level diff between old and new content.
- */
-function computeEditDiff(oldContent: string, newContent: string): DiffHunk[] {
-  const oldLines = oldContent.split('\n');
-  const newLines = newContent.split('\n');
-  const hunks: DiffHunk[] = [];
-
-  let oldIdx = 0;
-  let newIdx = 0;
-
-  while (oldIdx < oldLines.length || newIdx < newLines.length) {
-    if (oldIdx < oldLines.length && newIdx < newLines.length && oldLines[oldIdx] === newLines[newIdx]) {
-      oldIdx++;
-      newIdx++;
-      continue;
-    }
-
-    const hunkOldStart = oldIdx + 1;
-    const hunkNewStart = newIdx + 1;
-    const hunkLines: string[] = [];
-
-    const contextLookAhead = 3;
-    let matchFound = false;
-
-    while (!matchFound && (oldIdx < oldLines.length || newIdx < newLines.length)) {
-      if (oldIdx < oldLines.length && newIdx < newLines.length) {
-        let allMatch = true;
-        for (let k = 0; k < contextLookAhead; k++) {
-          if (oldIdx + k >= oldLines.length || newIdx + k >= newLines.length) {
-            break;
-          }
-          if (oldLines[oldIdx + k] !== newLines[newIdx + k]) {
-            allMatch = false;
-            break;
-          }
-        }
-        if (allMatch && oldLines[oldIdx] === newLines[newIdx]) {
-          matchFound = true;
-          break;
-        }
-      }
-
-      if (oldIdx < oldLines.length && (newIdx >= newLines.length || oldLines[oldIdx] !== newLines[newIdx])) {
-        hunkLines.push(`-${oldLines[oldIdx]}`);
-        oldIdx++;
-      }
-
-      if (newIdx < newLines.length && (oldIdx >= oldLines.length || oldLines[oldIdx] !== newLines[newIdx])) {
-        hunkLines.push(`+${newLines[newIdx]}`);
-        newIdx++;
-      }
-
-      if (oldIdx >= oldLines.length && newIdx >= newLines.length) {
-        break;
-      }
-    }
-
-    if (hunkLines.length > 0) {
-      const removedCount = hunkLines.filter((l) => l.startsWith('-')).length;
-      const addedCount = hunkLines.filter((l) => l.startsWith('+')).length;
-      hunks.push({
-        oldStart: hunkOldStart,
-        oldLines: removedCount,
-        newStart: hunkNewStart,
-        newLines: addedCount,
-        lines: hunkLines,
-      });
-    }
-  }
-
-  return hunks;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +216,7 @@ export function createEditTool(config: EditToolConfig): {
           : newNormalizedContent;
 
         // Compute diff
-        const diff = computeEditDiff(originalContent, finalContent);
+        const diff = computeDiff(originalContent, finalContent);
 
         // Atomic write: write to temp file, then rename
         const tempPath = path.join(path.dirname(filePath), `.edit-${crypto.randomUUID()}.tmp`);

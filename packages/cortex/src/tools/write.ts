@@ -64,85 +64,53 @@ export interface WriteToolConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Compute a simple line-level diff between two strings.
- * Returns an array of diff hunks suitable for UI rendering.
+ * Compute a safe line-level diff between two strings.
+ *
+ * This intentionally emits at most one changed hunk. The UI only needs a
+ * compact, deterministic summary of the mutation, not a minimal diff.
  */
-function computeDiff(oldContent: string, newContent: string): DiffHunk[] {
+export function computeDiff(oldContent: string, newContent: string): DiffHunk[] {
   const oldLines = oldContent.split('\n');
   const newLines = newContent.split('\n');
-  const hunks: DiffHunk[] = [];
 
-  let oldIdx = 0;
-  let newIdx = 0;
-
-  while (oldIdx < oldLines.length || newIdx < newLines.length) {
-    // Skip matching lines
-    if (oldIdx < oldLines.length && newIdx < newLines.length && oldLines[oldIdx] === newLines[newIdx]) {
-      oldIdx++;
-      newIdx++;
-      continue;
-    }
-
-    // Found a difference - collect the hunk
-    const hunkOldStart = oldIdx + 1;
-    const hunkNewStart = newIdx + 1;
-    const hunkLines: string[] = [];
-
-    // Collect all differing lines until we find a match
-    const contextLookAhead = 3;
-    let matchFound = false;
-
-    while (!matchFound && (oldIdx < oldLines.length || newIdx < newLines.length)) {
-      // Check if the next few lines match
-      if (oldIdx < oldLines.length && newIdx < newLines.length) {
-        let allMatch = true;
-        for (let k = 0; k < contextLookAhead; k++) {
-          if (oldIdx + k >= oldLines.length || newIdx + k >= newLines.length) {
-            break;
-          }
-          if (oldLines[oldIdx + k] !== newLines[newIdx + k]) {
-            allMatch = false;
-            break;
-          }
-        }
-        if (allMatch && oldLines[oldIdx] === newLines[newIdx]) {
-          matchFound = true;
-          break;
-        }
-      }
-
-      // Record removed lines from old
-      if (oldIdx < oldLines.length && (newIdx >= newLines.length || oldLines[oldIdx] !== newLines[newIdx])) {
-        hunkLines.push(`-${oldLines[oldIdx]}`);
-        oldIdx++;
-      }
-
-      // Record added lines from new
-      if (newIdx < newLines.length && (oldIdx >= oldLines.length || oldLines[oldIdx] !== newLines[newIdx])) {
-        hunkLines.push(`+${newLines[newIdx]}`);
-        newIdx++;
-      }
-
-      // Safety: prevent infinite loop on edge cases
-      if (oldIdx >= oldLines.length && newIdx >= newLines.length) {
-        break;
-      }
-    }
-
-    if (hunkLines.length > 0) {
-      const removedCount = hunkLines.filter((l) => l.startsWith('-')).length;
-      const addedCount = hunkLines.filter((l) => l.startsWith('+')).length;
-      hunks.push({
-        oldStart: hunkOldStart,
-        oldLines: removedCount,
-        newStart: hunkNewStart,
-        newLines: addedCount,
-        lines: hunkLines,
-      });
-    }
+  let prefix = 0;
+  while (
+    prefix < oldLines.length &&
+    prefix < newLines.length &&
+    oldLines[prefix] === newLines[prefix]
+  ) {
+    prefix += 1;
   }
 
-  return hunks;
+  if (prefix === oldLines.length && prefix === newLines.length) {
+    return [];
+  }
+
+  let oldSuffix = oldLines.length - 1;
+  let newSuffix = newLines.length - 1;
+  while (
+    oldSuffix >= prefix &&
+    newSuffix >= prefix &&
+    oldLines[oldSuffix] === newLines[newSuffix]
+  ) {
+    oldSuffix -= 1;
+    newSuffix -= 1;
+  }
+
+  const removedLines = oldSuffix >= prefix
+    ? oldLines.slice(prefix, oldSuffix + 1).map((line) => `-${line}`)
+    : [];
+  const addedLines = newSuffix >= prefix
+    ? newLines.slice(prefix, newSuffix + 1).map((line) => `+${line}`)
+    : [];
+
+  return [{
+    oldStart: prefix + 1,
+    oldLines: removedLines.length,
+    newStart: prefix + 1,
+    newLines: addedLines.length,
+    lines: [...removedLines, ...addedLines],
+  }];
 }
 
 // ---------------------------------------------------------------------------

@@ -120,6 +120,28 @@ describe('Write tool', () => {
     expect(result.details.diff!.length).toBeGreaterThan(0);
   });
 
+  it('computes diff for shifted matching lines without hanging', async () => {
+    const filePath = path.join(tmpDir, 'shifted-diff.txt');
+    fs.writeFileSync(filePath, 'A\nB\nC\nD\n');
+    markFileRead(registry, filePath);
+
+    const result = await writeTool.execute({
+      file_path: filePath,
+      content: 'A\nX\nC\nY\n',
+    });
+
+    expect(result.details.diff).not.toBeNull();
+    expect(result.details.diff!.length).toBe(1);
+    expect(result.details.diff![0]!.lines).toEqual([
+      '-B',
+      '-C',
+      '-D',
+      '+X',
+      '+C',
+      '+Y',
+    ]);
+  });
+
   it('returns null diff for new files', async () => {
     const filePath = path.join(tmpDir, 'brand-new.txt');
 

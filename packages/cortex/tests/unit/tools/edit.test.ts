@@ -177,6 +177,27 @@ describe('Edit tool', () => {
     expect(result.details.originalContent).toBe('hello world\n');
   });
 
+  it('computes diff for shifted matching lines without hanging', async () => {
+    const filePath = path.join(tmpDir, 'shifted-edit.txt');
+    fs.writeFileSync(filePath, 'A\nB\nC\nD\n');
+    markFileRead(registry, filePath);
+
+    const result = await editTool.execute({
+      file_path: filePath,
+      old_string: 'B\nC\nD',
+      new_string: 'X\nC\nY',
+    });
+
+    expect(result.details.replacementCount).toBe(1);
+    expect(result.details.diff).toEqual([{
+      oldStart: 2,
+      oldLines: 3,
+      newStart: 2,
+      newLines: 3,
+      lines: ['-B', '-C', '-D', '+X', '+C', '+Y'],
+    }]);
+  });
+
   // -------------------------------------------------------------------------
   // Mtime freshness check
   // -------------------------------------------------------------------------
