@@ -18,22 +18,28 @@ import type {
   ToolStatus,
 } from './types.js';
 
-const SPINNER_INTERVAL_MS = 80;
+const SPINNER_INTERVAL_MS = 250;
+
+interface SpinnerGroup {
+  components: Set<ToolExecutionComponent>;
+  timer: ReturnType<typeof setInterval> | null;
+}
 
 export class ToolExecutionComponent implements Component {
   /** Tracks the most recently started tool for Ctrl+E toggle. */
   static lastFocused: ToolExecutionComponent | null = null;
+  private static readonly spinnerGroups = new Map<TUI, SpinnerGroup>();
 
   private readonly box = new BorderedBox();
   private readonly renderer: ToolRenderer;
   private readonly toolName: string;
-  private tui: TUI | null = null;
+  private readonly tui: TUI | null;
   private args: Record<string, unknown> = {};
   private status: ToolStatus = 'pending';
   private expanded = false;
   private durationMs?: number;
   private startTime = Date.now();
-  private spinnerTimer: ReturnType<typeof setInterval> | null = null;
+  private spinnerRegistered = false;
 
   // Stored for re-rendering after expand/collapse toggle
   private lastResult?: unknown;
@@ -129,23 +135,79 @@ export class ToolExecutionComponent implements Component {
     return this.box.render(width);
   }
 
+  dispose(): void {
+    this.stopSpinner();
+  }
+
   // -----------------------------------------------------------------------
   // Spinner management
   // -----------------------------------------------------------------------
 
   private startSpinner(): void {
-    if (this.spinnerTimer) return;
-    this.spinnerTimer = setInterval(() => {
-      this.box.advanceSpinner();
-      this.tui?.requestRender();
-    }, SPINNER_INTERVAL_MS);
+    if (!this.tui || this.spinnerRegistered) {
+      return;
+    }
+
+    const group = ToolExecutionComponent.getOrCreateSpinnerGroup(this.tui);
+    group.components.add(this);
+    this.spinnerRegistered = true;
   }
 
   private stopSpinner(): void {
-    if (this.spinnerTimer) {
-      clearInterval(this.spinnerTimer);
-      this.spinnerTimer = null;
+    if (!this.tui || !this.spinnerRegistered) {
+      return;
     }
+
+    const group = ToolExecutionComponent.spinnerGroups.get(this.tui);
+    this.spinnerRegistered = false;
+    if (!group) {
+      return;
+    }
+
+    group.components.delete(this);
+    if (group.components.size === 0) {
+      ToolExecutionComponent.destroySpinnerGroup(this.tui);
+    }
+  }
+
+  private static getOrCreateSpinnerGroup(tui: TUI): SpinnerGroup {
+    let group = ToolExecutionComponent.spinnerGroups.get(tui);
+    if (!group) {
+      group = {
+        components: new Set<ToolExecutionComponent>(),
+        timer: null,
+      };
+      ToolExecutionComponent.spinnerGroups.set(tui, group);
+    }
+
+    if (!group.timer) {
+      group.timer = setInterval(() => {
+        if (group.components.size === 0) {
+          ToolExecutionComponent.destroySpinnerGroup(tui);
+          return;
+        }
+
+        for (const component of group.components) {
+          component.box.advanceSpinner();
+        }
+        tui.requestRender();
+      }, SPINNER_INTERVAL_MS);
+    }
+
+    return group;
+  }
+
+  private static destroySpinnerGroup(tui: TUI): void {
+    const group = ToolExecutionComponent.spinnerGroups.get(tui);
+    if (!group) {
+      return;
+    }
+
+    if (group.timer) {
+      clearInterval(group.timer);
+      group.timer = null;
+    }
+    ToolExecutionComponent.spinnerGroups.delete(tui);
   }
 
   // -----------------------------------------------------------------------

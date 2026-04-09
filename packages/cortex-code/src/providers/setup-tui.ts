@@ -128,9 +128,9 @@ class SetupRenderer {
       }
 
       case 'api-key-validation': {
+        // pi-tui Loader auto-starts in its constructor.
         const loader = new Loader(this.tui, colors.primary, colors.muted, step.message ?? 'Validating...');
         this.contentContainer.addChild(loader);
-        loader.start();
 
         const provider = step.provider ?? '';
         if (this.apiKeyInput) {
@@ -184,9 +184,9 @@ class SetupRenderer {
       }
 
       case 'oauth-auth': {
+        // pi-tui Loader auto-starts in its constructor.
         const loader = new Loader(this.tui, colors.primary, colors.muted, step.message ?? 'Waiting for browser...');
         this.contentContainer.addChild(loader);
-        loader.start();
 
         const provider = step.provider ?? '';
         this.providerManager.initiateOAuth(provider, {
@@ -277,9 +277,9 @@ class SetupRenderer {
       }
 
       case 'custom-validation': {
+        // pi-tui Loader auto-starts in its constructor.
         const loader = new Loader(this.tui, colors.primary, colors.muted, 'Testing connection...');
         this.contentContainer.addChild(loader);
-        loader.start();
 
         this.providerManager.createCustomModel({
           baseUrl: this.customBaseUrl ?? '',
