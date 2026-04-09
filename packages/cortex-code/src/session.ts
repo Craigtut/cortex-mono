@@ -51,6 +51,7 @@ import { promisify } from 'node:util';
 import { log } from './logger.js';
 import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
+import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -387,8 +388,31 @@ export class Session {
 
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? Math.random());
       const args = p?.args ?? ((event.data as Record<string, unknown> | undefined)?.['args'] as Record<string, unknown> ?? {});
+      const displayArgs = buildToolDisplayArgs(toolName, args);
+      const summary = summarizeToolStartArgs(toolName, toolCallId, args);
+      const traceToolStarts = this.freezeDiagnostics.isEnabled;
 
-      this.app!.transcript.startToolCall(toolCallId, toolName, args);
+      if (traceToolStarts) {
+        log.debug('[TUI] tool_call_start received', summary);
+        this.app!.traceNextRender(`tool-start:${toolName}:${toolCallId}`);
+      }
+
+      try {
+        this.app!.transcript.startToolCall(toolCallId, toolName, displayArgs);
+        if (traceToolStarts) {
+          log.debug('[TUI] tool_call_start queued', {
+            ...summary,
+            displayArgKeys: Object.keys(displayArgs),
+          });
+        }
+      } catch (error) {
+        log.error('[TUI] tool_call_start failed', {
+          ...summary,
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        });
+        throw error;
+      }
     });
 
     // Streaming tool updates (bash output, etc.)

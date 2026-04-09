@@ -27,41 +27,44 @@ function extractResultText(result: unknown): string {
   return '';
 }
 
-function renderDiffHunks(hunks: DiffHunk[], theme: ToolRenderContext['theme']): string[] {
+function flattenDiffHunks(hunks: DiffHunk[]): string[] {
   const lines: string[] = [];
+  for (const hunk of hunks) {
+    lines.push(...hunk.lines);
+  }
+  return lines;
+}
+
+function colorizeDiffLines(lines: string[], theme: ToolRenderContext['theme']): string[] {
+  const rendered: string[] = [];
   const addColor = chalk.hex(theme.diffAdd);
   const removeColor = chalk.hex(theme.diffRemove);
   const contextColor = chalk.hex(theme.diffContext);
 
-  for (const hunk of hunks) {
-    for (const line of hunk.lines) {
-      if (line.startsWith('+')) {
-        lines.push(addColor('+ ' + line.slice(1)));
-      } else if (line.startsWith('-')) {
-        lines.push(removeColor('- ' + line.slice(1)));
-      } else {
-        lines.push(contextColor('  ' + line.slice(1)));
-      }
+  for (const line of lines) {
+    if (line.startsWith('+')) {
+      rendered.push(addColor('+ ' + line.slice(1)));
+    } else if (line.startsWith('-')) {
+      rendered.push(removeColor('- ' + line.slice(1)));
+    } else {
+      rendered.push(contextColor('  ' + line.slice(1)));
     }
   }
 
-  return lines;
+  return rendered;
 }
 
 function windowAroundFirstChange(
-  diffLines: string[],
+  rawDiffLines: string[],
   contextBefore: number,
 ): string[] {
-  // Find the first non-context line (actual change).
-  // Context lines start with two spaces; changed lines start with colored +/- symbols.
-  const firstChangeIdx = diffLines.findIndex(line => !line.startsWith('  '));
+  const firstChangeIdx = rawDiffLines.findIndex(line => !line.startsWith(' '));
 
   if (firstChangeIdx <= contextBefore) {
-    return diffLines;
+    return rawDiffLines;
   }
 
-  // Skip lines before the context window
-  return diffLines.slice(firstChangeIdx - contextBefore);
+  return rawDiffLines.slice(firstChangeIdx - contextBefore);
 }
 
 const editRenderer: ToolRenderer = {
@@ -97,18 +100,25 @@ const editRenderer: ToolRenderer = {
 
     let diffLines: string[];
     if (d?.diff && d.diff.length > 0) {
-      diffLines = renderDiffHunks(d.diff, context.theme);
-      diffLines = windowAroundFirstChange(diffLines, CONTEXT_LINES_BEFORE);
+      const rawDiffLines = flattenDiffHunks(d.diff);
+      const windowedDiffLines = windowAroundFirstChange(rawDiffLines, CONTEXT_LINES_BEFORE);
+
+      const { lines } = collapseContent(windowedDiffLines, {
+        mode: 'head',
+        limit: COLLAPSED_LINES,
+        expanded: context.expanded,
+      });
+
+      diffLines = colorizeDiffLines(lines, context.theme);
     } else {
       diffLines = resultText ? resultText.split('\n') : ['(edit applied)'];
+      const { lines } = collapseContent(diffLines, {
+        mode: 'head',
+        limit: COLLAPSED_LINES,
+        expanded: context.expanded,
+      });
+      diffLines = lines;
     }
-
-    // Collapse
-    const { lines } = collapseContent(diffLines, {
-      mode: 'head',
-      limit: COLLAPSED_LINES,
-      expanded: context.expanded,
-    });
 
     // Footer
     const shortPath = shortenPath(filePath);
@@ -118,7 +128,7 @@ const editRenderer: ToolRenderer = {
 
     return {
       headerText: `edit ${linkedPath}${lineInfo}`,
-      contentLines: lines,
+      contentLines: diffLines,
       footerText: countInfo.trim(),
     };
   },

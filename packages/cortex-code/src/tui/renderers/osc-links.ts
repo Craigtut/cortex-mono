@@ -6,6 +6,8 @@
  * ignore the sequences.
  */
 
+import { pathToFileURL } from 'node:url';
+
 /**
  * Wrap a file path in an OSC 8 hyperlink.
  *
@@ -15,6 +17,6 @@
  */
 export function fileLink(path: string, displayText?: string): string {
   const display = displayText ?? path;
-  const uri = `file://${path}`;
+  const uri = pathToFileURL(path).href;
   return `\x1b]8;;${uri}\x07${display}\x1b]8;;\x07`;
 }

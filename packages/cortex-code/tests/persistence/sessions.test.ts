@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createDebouncedSaver, generateSessionId } from '../../src/persistence/sessions.js';
+import {
+  createDebouncedSaver,
+  generateSessionId,
+  sanitizeHistoryForSave,
+} from '../../src/persistence/sessions.js';
 import type { SessionMeta } from '../../src/persistence/sessions.js';
 
 describe('generateSessionId', () => {
@@ -53,5 +57,43 @@ describe('createDebouncedSaver', () => {
     } catch {
       // Expected: no ~/.cortex/sessions directory in test env
     }
+  });
+});
+
+describe('sanitizeHistoryForSave', () => {
+  it('strips bulky tool result details while preserving message content', () => {
+    const history = [
+      {
+        role: 'toolResult',
+        toolName: 'Edit',
+        toolCallId: 'call-1',
+        details: {
+          filePath: '/tmp/file.ts',
+          diff: [{ lines: ['-old', '+new'] }],
+          originalContent: 'old',
+        },
+        content: [{ type: 'text', text: 'Made 1 replacement in /tmp/file.ts' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'done' }],
+      },
+    ];
+
+    const sanitized = sanitizeHistoryForSave(history);
+
+    expect(sanitized).toEqual([
+      {
+        role: 'toolResult',
+        toolName: 'Edit',
+        toolCallId: 'call-1',
+        content: [{ type: 'text', text: 'Made 1 replacement in /tmp/file.ts' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'done' }],
+      },
+    ]);
+    expect((history[0] as { details: unknown }).details).toBeDefined();
   });
 });

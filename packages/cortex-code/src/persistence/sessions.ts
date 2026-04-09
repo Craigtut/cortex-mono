@@ -24,6 +24,23 @@ export interface SavedSession {
   history: unknown[];
 }
 
+/**
+ * Session history is restored into Cortex for model context, not replayed into
+ * the transcript. Tool result `details` payloads are often bulky and can
+ * duplicate file contents or diffs, especially for Edit/Write. Strip them
+ * before persistence so autosave stays cheap during edit-heavy sessions.
+ */
+export function sanitizeHistoryForSave(history: unknown[]): unknown[] {
+  return history.map((entry) => {
+    if (typeof entry !== 'object' || entry === null || !('details' in entry)) {
+      return entry;
+    }
+
+    const { details: _details, ...rest } = entry as Record<string, unknown>;
+    return rest;
+  });
+}
+
 function parseSessionMeta(v: unknown): SessionMeta | null {
   if (typeof v !== 'object' || v === null) return null;
   const o = v as Record<string, unknown>;
@@ -71,9 +88,10 @@ export async function saveSession(
 ): Promise<void> {
   const dir = join(SESSIONS_DIR, sessionId);
   await mkdir(dir, { recursive: true });
+  const sanitizedHistory = sanitizeHistoryForSave(history);
 
   await Promise.all([
-    writeFile(join(dir, 'history.json'), JSON.stringify(history)),
+    writeFile(join(dir, 'history.json'), JSON.stringify(sanitizedHistory)),
     writeFile(join(dir, 'meta.json'), JSON.stringify(meta, null, 2)),
   ]);
 }

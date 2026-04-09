@@ -11,6 +11,7 @@ import { PermissionPromptComponent, type PermissionResult } from './permissions.
 import { StatusSpinner } from './spinner.js';
 import { editorTheme } from './theme.js';
 import type { FreezeDiagnostics } from '../diagnostics/freeze.js';
+import { log } from '../logger.js';
 
 export interface AppCallbacks {
   /** Called when user submits a message or slash command. */
@@ -38,6 +39,7 @@ export class App {
 
   private statusIndicator: StatusSpinner | null = null;
   private statusSpacer: Spacer | null = null;
+  private pendingRenderTraceReasons: string[] = [];
   private readonly cwd: string;
   private readonly diagnostics: FreezeDiagnostics | undefined;
 
@@ -178,6 +180,14 @@ export class App {
     this.editor.refreshCommands(cwd);
   }
 
+  /** Trace the next coalesced render for targeted freeze diagnostics. */
+  traceNextRender(reason: string): void {
+    if (this.pendingRenderTraceReasons.length >= 10) {
+      this.pendingRenderTraceReasons.shift();
+    }
+    this.pendingRenderTraceReasons.push(reason);
+  }
+
   // ---------------------------------------------------------------------------
   // Working tag queue (rendered inline on the spinner line at reading pace)
   // ---------------------------------------------------------------------------
@@ -219,11 +229,74 @@ export class App {
 
       setImmediate(() => {
         const startedAt = Date.now();
+        const traceReasons = this.pendingRenderTraceReasons.splice(0);
         tui['renderRequested'] = false;
         if (tui['stopped']) return;
-        (doRender as () => void).call(this.tui);
-        this.diagnostics?.recordRenderCompleted(Date.now() - startedAt);
+        if (traceReasons.length > 0) {
+          log.debug('[TUI] render start', {
+            reasons: traceReasons,
+            force,
+            childCount: this.chatContainer.children.length,
+          });
+        }
+        try {
+          (doRender as () => void).call(this.tui);
+          const durationMs = Date.now() - startedAt;
+          this.diagnostics?.recordRenderCompleted(durationMs);
+          if (traceReasons.length > 0) {
+            log.debug('[TUI] render end', {
+              reasons: traceReasons,
+              force,
+              durationMs,
+            });
+          }
+        } catch (error) {
+          log.error('[TUI] render failed', {
+            ...this.buildRenderErrorData(error, tui),
+            reasons: traceReasons,
+          });
+
+          try {
+            this.resetRenderState(tui);
+            (doRender as () => void).call(this.tui);
+            const durationMs = Date.now() - startedAt;
+            this.diagnostics?.recordRenderCompleted(durationMs);
+            log.warn('[TUI] render recovered via forced redraw');
+          } catch (retryError) {
+            log.error('[TUI] forced redraw failed', {
+              ...this.buildRenderErrorData(retryError, tui),
+              reasons: traceReasons,
+            });
+          }
+        }
       });
+    };
+  }
+
+  private resetRenderState(tui: Record<string, unknown>): void {
+    tui['previousLines'] = [];
+    tui['previousWidth'] = -1;
+    tui['previousHeight'] = -1;
+    tui['cursorRow'] = 0;
+    tui['hardwareCursorRow'] = 0;
+    tui['maxLinesRendered'] = 0;
+    tui['previousViewportTop'] = 0;
+  }
+
+  private buildRenderErrorData(
+    error: unknown,
+    tui: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      terminalColumns: this.terminal.columns,
+      terminalRows: this.terminal.rows,
+      previousLines: Array.isArray(tui['previousLines']) ? tui['previousLines'].length : undefined,
+      previousWidth: tui['previousWidth'],
+      previousHeight: tui['previousHeight'],
+      maxLinesRendered: tui['maxLinesRendered'],
+      previousViewportTop: tui['previousViewportTop'],
     };
   }
 }

@@ -28,6 +28,21 @@ const STATUS_ICONS: Record<ToolStatus, string> = {
 
 const SPINNER_FRAMES = ['\u280B', '\u2819', '\u2839', '\u2838', '\u283C', '\u2834', '\u2826', '\u2827', '\u2807', '\u280F'];
 
+function normalizeSingleLine(text: string): string {
+  return text.replace(/\r?\n+/g, ' ').replace(/\t/g, '   ');
+}
+
+function normalizeLines(lines: string[]): string[] {
+  const normalized: string[] = [];
+
+  for (const line of lines) {
+    const parts = line.replace(/\t/g, '   ').split(/\r?\n/);
+    normalized.push(...parts);
+  }
+
+  return normalized;
+}
+
 /** Format token count as compact string: "150", "1.2k", "15k". */
 function formatTokenCount(tokens: number): string {
   if (tokens < 1000) return `${tokens} tokens`;
@@ -56,9 +71,9 @@ export class BorderedBox implements Component {
     durationMs?: number,
     resultTokens?: number,
   ): void {
-    this.headerText = header;
-    this.contentLines = lines;
-    this.footerText = footer;
+    this.headerText = normalizeSingleLine(header);
+    this.contentLines = normalizeLines(lines);
+    this.footerText = normalizeSingleLine(footer);
     this.status = status;
     if (durationMs !== undefined) {
       this.durationMs = durationMs;
@@ -72,7 +87,7 @@ export class BorderedBox implements Component {
    * Set lines to display below the box (e.g., exit codes, diagnostics).
    */
   setBelowBox(lines: string[]): void {
-    this.belowBoxLines = lines;
+    this.belowBoxLines = normalizeLines(lines);
   }
 
   /**
@@ -162,7 +177,7 @@ export class BorderedBox implements Component {
       lines.push('    ' + truncated);
     }
 
-    return lines;
+    return lines.map((line) => visibleWidth(line) > width ? truncateToWidth(line, width) : line);
   }
 
   private getStatusIcon(theme: ReturnType<typeof getToolTheme>): string {

@@ -9,6 +9,7 @@ export interface CustomEditorCallbacks {
   onExitHint: () => void;
   onToggleExpand: () => void;
   onToggleExpandAll: () => void;
+  onInputActivity?: (kind: string) => void;
 }
 
 /**
@@ -57,12 +58,14 @@ export class CustomEditor extends Editor {
   override handleInput(data: string): void {
     // Route to permission prompt if active
     if (this.activePermissionPrompt) {
+      this.callbacks.onInputActivity?.('permission');
       this.activePermissionPrompt.handleInput(data);
       return;
     }
 
     // Ctrl+C: clear editor or exit
     if (matchesKey(data, Key.ctrl('c'))) {
+      this.callbacks.onInputActivity?.('ctrl-c');
       const now = Date.now();
       if (now - this.lastCtrlCTime < 500) {
         this.callbacks.onExit();
@@ -82,6 +85,7 @@ export class CustomEditor extends Editor {
 
     // Escape: abort current operation
     if (matchesKey(data, Key.escape)) {
+      this.callbacks.onInputActivity?.('escape');
       // Don't intercept if autocomplete is showing (let Editor handle it)
       if (!this.isShowingAutocomplete()) {
         this.callbacks.onAbort();
@@ -91,17 +95,20 @@ export class CustomEditor extends Editor {
 
     // Ctrl+Shift+E: toggle all tool results expansion
     if (matchesKey(data, Key.ctrlShift('e'))) {
+      this.callbacks.onInputActivity?.('toggle-expand-all');
       this.callbacks.onToggleExpandAll();
       return;
     }
 
     // Ctrl+E: toggle most recent tool result expansion
     if (matchesKey(data, Key.ctrl('e'))) {
+      this.callbacks.onInputActivity?.('toggle-expand');
       this.callbacks.onToggleExpand();
       return;
     }
 
     // Default: pass to pi-tui Editor
+    this.callbacks.onInputActivity?.('text');
     super.handleInput(data);
   }
 }

@@ -45,4 +45,39 @@ describe('loadConfig', () => {
     expect(config.defaultModel).toBe('gpt-4');
     expect(config.maxCost).toBe(10);
   });
+
+  it('merges nested freeze diagnostics config', async () => {
+    mockReadFile.mockImplementation(async (path) => {
+      const p = String(path);
+      if (p.includes('/test/project/.cortex/config.json')) {
+        return JSON.stringify({
+          diagnostics: {
+            freeze: {
+              enabled: true,
+              slowRenderThresholdMs: 48,
+            },
+          },
+        });
+      }
+      if (p.includes('.cortex/config.json')) {
+        return JSON.stringify({
+          diagnostics: {
+            freeze: {
+              heartbeatIntervalMs: 1500,
+              promptWatchdogIntervalMs: 1200,
+            },
+          },
+        });
+      }
+      throw new Error('ENOENT');
+    });
+
+    const config = await loadConfig('/test/project');
+    expect(config.diagnostics?.freeze).toEqual({
+      enabled: true,
+      heartbeatIntervalMs: 1500,
+      promptWatchdogIntervalMs: 1200,
+      slowRenderThresholdMs: 48,
+    });
+  });
 });

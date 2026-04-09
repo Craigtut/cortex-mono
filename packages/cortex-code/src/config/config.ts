@@ -15,6 +15,27 @@ export interface CortexCodeConfig {
   maxTurns?: number;
   /** Default thinking effort level. Default: 'medium'. */
   defaultEffort?: string;
+  /** Optional diagnostics for investigating TUI or prompt freezes. */
+  diagnostics?: CortexCodeDiagnosticsConfig;
+}
+
+export interface FreezeDiagnosticsConfig {
+  /** Whether freeze diagnostics are enabled. Default: false. */
+  enabled?: boolean;
+  /** Heartbeat interval for TUI diagnostics. Default: 1000ms. */
+  heartbeatIntervalMs?: number;
+  /** Event-loop delay monitor resolution in milliseconds. Default: 20ms. */
+  eventLoopResolutionMs?: number;
+  /** Log renders slower than this threshold in milliseconds. Default: 32ms. */
+  slowRenderThresholdMs?: number;
+  /** Cortex prompt watchdog heartbeat interval in milliseconds. Default: 1000ms. */
+  promptWatchdogIntervalMs?: number;
+  /** Warn if abort is still waiting after this many milliseconds. Default: 2000ms. */
+  abortWaitWarningMs?: number;
+}
+
+export interface CortexCodeDiagnosticsConfig {
+  freeze?: FreezeDiagnosticsConfig;
 }
 
 const GLOBAL_CONFIG_PATH = join(homedir(), '.cortex', 'config.json');
@@ -39,8 +60,23 @@ export async function loadConfig(cwd: string): Promise<CortexCodeConfig> {
     readJsonFile<CortexCodeConfig>(join(cwd, PROJECT_CONFIG_NAME)),
   ]);
 
+  const globalDiagnostics = globalConfig?.diagnostics;
+  const projectDiagnostics = projectConfig?.diagnostics;
+
+  const diagnostics = globalDiagnostics || projectDiagnostics
+    ? {
+        ...globalDiagnostics,
+        ...projectDiagnostics,
+        freeze: {
+          ...globalDiagnostics?.freeze,
+          ...projectDiagnostics?.freeze,
+        },
+      }
+    : undefined;
+
   return {
     ...globalConfig,
     ...projectConfig,
+    ...(diagnostics ? { diagnostics } : {}),
   };
 }
