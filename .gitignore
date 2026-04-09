@@ -40,3 +40,6 @@ temp/
 
 # Claude local settings and project memory
 .claude/
+
+# Cortex local settings
+.cortex/
