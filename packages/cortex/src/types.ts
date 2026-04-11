@@ -14,6 +14,11 @@
  */
 
 import type { CortexModel } from './model-wrapper.js';
+import type {
+  ObservationalMemoryConfig,
+  ObservationEvent,
+  ReflectionEvent,
+} from './compaction/observational/types.js';
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -582,14 +587,38 @@ export interface AdaptiveThresholdConfig {
 
 /**
  * Full compaction configuration for CortexAgent.
- * All three layers are always active; there are no enabled toggles.
+ *
+ * Supports two strategies:
+ * - `'observational'` (default): Observer/Reflector background compression
+ *   replaces L1 threshold trimming and L2 summarization. L3 emergency
+ *   truncation remains active as a safety valve.
+ * - `'classic'`: The existing L1 + L2 + L3 system operates unchanged.
+ *
+ * The failsafe (L3) is always active regardless of strategy.
  */
 export interface CortexCompactionConfig {
+  /**
+   * Compaction strategy selection.
+   * - `'observational'`: Background observer/reflector compression (default).
+   * - `'classic'`: Traditional L1 microcompaction + L2 summarization.
+   * @default 'observational'
+   */
+  strategy?: 'observational' | 'classic';
+
+  /** Microcompaction (L1) configuration. Used when strategy is 'classic'. */
   microcompaction: MicrocompactionConfig;
+  /** Conversation summarization (L2) configuration. Used when strategy is 'classic'. */
   compaction: CompactionConfig;
+  /** Emergency truncation (L3) configuration. Always active regardless of strategy. */
   failsafe: FailsafeConfig;
-  /** Adaptive threshold configuration. Adjusts Layer 2 trigger based on interaction recency. */
+  /** Adaptive threshold configuration. Adjusts Layer 2 trigger based on interaction recency. Used when strategy is 'classic'. */
   adaptive: AdaptiveThresholdConfig;
+
+  /**
+   * Observational memory configuration. Used when strategy is 'observational'
+   * (or omitted, since observational is the default).
+   */
+  observational?: Partial<ObservationalMemoryConfig>;
 }
 
 /**
@@ -683,6 +712,10 @@ export interface CortexEvents {
   onSubAgentCompleted: (taskId: string, result: string, status: string, usage: unknown) => void;
   /** Fired when a sub-agent fails. */
   onSubAgentFailed: (taskId: string, error: string) => void;
+  /** Fired when observational memory activates (messages compressed and removed). Only fires when strategy is 'observational'. */
+  onObservation: (event: ObservationEvent) => void;
+  /** Fired when the reflector condenses observations. Only fires when strategy is 'observational'. */
+  onReflection: (event: ReflectionEvent) => void;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,10 @@
 # Cortex Compaction Strategy
 
-**STATUS**: Research / Proposal
+**STATUS**: Implemented (classic strategy)
 **Date**: 2026-03-14
-**Related docs**: [context-manager.md](./context-manager.md), [cortex-architecture.md](./cortex-architecture.md)
+**Related docs**: [context-manager.md](./context-manager.md), [cortex-architecture.md](./cortex-architecture.md), [observational-memory-architecture.md](./observational-memory-architecture.md)
+
+> **Note**: This document describes the "classic" compaction strategy (`strategy: 'classic'`). As of 2026-04-10, the default compaction strategy is **observational memory**, which replaces Layers 1 and 2 described here. See [observational-memory-architecture.md](./observational-memory-architecture.md) for the default system. Consumers can opt into the classic strategy documented here via `compaction: { strategy: 'classic' }`.
 
 ---
 

@@ -71,6 +71,7 @@ export interface SessionOptions {
   yoloMode: boolean;
   initialEffort: ThinkingLevel;
   resumeSessionId: string | undefined;
+  compactionStrategy?: 'observational' | 'classic';
 }
 
 export class Session {
@@ -98,6 +99,7 @@ export class Session {
   private readonly providerManager: ProviderManager;
   private readonly credentialStore: CredentialStore;
   private readonly cwd: string;
+  private readonly compactionStrategy: 'observational' | 'classic';
 
   constructor(options: SessionOptions) {
     this.config = options.config;
@@ -114,6 +116,7 @@ export class Session {
     this.rules = new PermissionRuleManager(options.cwd);
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.saver = createDebouncedSaver(this.sessionId);
+    this.compactionStrategy = options.compactionStrategy ?? 'observational';
     this.createdAt = Date.now();
     this.freezeDiagnostics = new FreezeDiagnostics(this.config.diagnostics?.freeze);
   }
@@ -145,6 +148,7 @@ export class Session {
       resolvePermission: (toolName, toolArgs) => this.resolvePermission(toolName, toolArgs),
       getApiKey: (provider) => this.getApiKey(provider),
       contextWindowLimit: this.config.contextWindowLimit ?? null,
+      compaction: { strategy: this.compactionStrategy },
       logger: log,
       ...this.buildDiagnosticsConfig() ? { diagnostics: this.buildDiagnosticsConfig()! } : {},
     });
@@ -192,6 +196,7 @@ export class Session {
       gitBranch: branch,
       yoloMode: this.yoloMode,
       effortLevel: initialEffort,
+      observationalMode: this.compactionStrategy === 'observational',
     });
 
     // Start TUI event loop
@@ -536,6 +541,14 @@ export class Session {
       );
     });
 
+    // Observational memory events (only fire when strategy is 'observational')
+    this.agent.onObservation(() => {
+      this.updateObservationalMemoryStatus();
+    });
+    this.agent.onReflection(() => {
+      this.updateObservationalMemoryStatus();
+    });
+
     // Sub-agent events: rendered as tool calls via the SubAgent renderer
     this.agent.onSubAgentSpawned((taskId, instructions, background) => {
       this.app!.transcript.startSubAgentCall(taskId, {
@@ -564,6 +577,7 @@ export class Session {
     // including mid-loop turns between tool calls)
     bridge.on('turn_end', () => {
       this.updateFooterContextUsage();
+      this.updateObservationalMemoryStatus();
       this.triggerAutoSave();
     });
   }
@@ -809,6 +823,17 @@ export class Session {
     });
   }
 
+  private updateObservationalMemoryStatus(): void {
+    if (!this.agent || !this.app) return;
+    if (this.compactionStrategy !== 'observational') return;
+    const cm = this.agent.getCompactionManager();
+    this.app.updateStatus({
+      observationTokenCount: cm.getObservationTokenCount(),
+      observerActive: cm.isObserverInFlight(),
+      reflectorActive: cm.isReflectorInFlight(),
+    });
+  }
+
   private getDisplayedCurrentContextTokens(): number {
     if (!this.agent) return 0;
     return Math.max(
@@ -1016,6 +1041,7 @@ export class Session {
   getAgent(): CortexAgent | null { return this.agent; }
   getApp(): App | null { return this.app; }
   getYoloMode(): boolean { return this.yoloMode; }
+  getCompactionStrategy(): 'observational' | 'classic' { return this.compactionStrategy; }
   setYoloMode(enabled: boolean): void {
     this.yoloMode = enabled;
     this.app?.updateStatus({ yoloMode: enabled });

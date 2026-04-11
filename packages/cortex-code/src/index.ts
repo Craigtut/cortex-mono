@@ -29,10 +29,11 @@ interface CliArgs {
   resume: string | true | undefined;
   model: string | undefined;
   yolo: boolean;
+  compaction: 'observational' | 'classic' | undefined;
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { resume: undefined, model: undefined, yolo: false };
+  const args: CliArgs = { resume: undefined, model: undefined, yolo: false, compaction: undefined };
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -45,6 +46,15 @@ function parseArgs(argv: string[]): CliArgs {
       case '--model':
         args.model = argv[++i];
         break;
+      case '--compaction': {
+        const value = argv[++i];
+        if (value !== 'observational' && value !== 'classic') {
+          console.error(`Invalid compaction strategy: ${value}. Must be 'observational' or 'classic'.`);
+          process.exit(1);
+        }
+        args.compaction = value;
+        break;
+      }
       case '--yolo':
         args.yolo = true;
         break;
@@ -73,12 +83,13 @@ function printUsage(): void {
 cortex v0.1.0 - Terminal-based coding agent
 
 Usage:
-  cortex                          Start interactive session
-  cortex --resume [session-id]    Resume last (or specific) session
-  cortex --model <model>          Override default model
-  cortex --yolo                   Start in YOLO mode
-  cortex --help                   Show this help
-  cortex --version                Show version
+  cortex                                    Start interactive session
+  cortex --resume [session-id]              Resume last (or specific) session
+  cortex --model <model>                    Override default model
+  cortex --compaction <observational|classic>  Compaction strategy (default: observational)
+  cortex --yolo                             Start in YOLO mode
+  cortex --help                             Show this help
+  cortex --version                          Show version
 `.trim());
 }
 
@@ -169,6 +180,7 @@ async function main(): Promise<void> {
     yoloMode: args.yolo,
     initialEffort,
     resumeSessionId,
+    compactionStrategy: args.compaction,
   });
 
   await session.start();

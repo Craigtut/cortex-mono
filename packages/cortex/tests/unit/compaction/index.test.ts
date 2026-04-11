@@ -89,7 +89,7 @@ describe('CompactionManager', () => {
   let manager: CompactionManager;
 
   beforeEach(() => {
-    manager = new CompactionManager(DEFAULT_COMPACTION_CONFIG, 2);
+    manager = new CompactionManager({ ...DEFAULT_COMPACTION_CONFIG, strategy: 'classic' }, 2);
   });
 
   // -----------------------------------------------------------------------

@@ -85,6 +85,9 @@ export class App {
     this.tui.addChild(this.editor);                 // User input (has its own border)
     this.tui.addChild(this.statusBar);              // Footer
 
+    // Wire TUI to status bar for pulse animation
+    this.statusBar.setTui(this.tui);
+
     // Set focus to editor
     this.tui.setFocus(this.editor);
 
@@ -107,6 +110,7 @@ export class App {
   stop(): void {
     this.transcript.clear();
     this.hideStatusSpinner();
+    this.statusBar.destroy();
     this.diagnostics?.stop();
     this.tui.stop();
   }

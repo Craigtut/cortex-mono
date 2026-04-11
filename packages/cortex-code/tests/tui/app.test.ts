@@ -123,7 +123,9 @@ vi.mock('../../src/tui/editor.js', () => ({
 vi.mock('../../src/tui/status.js', () => ({
   StatusBar: class MockStatusBar {
     setState(): void {}
+    setTui(): void {}
     showHint(): void {}
+    destroy(): void {}
   },
 }));
 

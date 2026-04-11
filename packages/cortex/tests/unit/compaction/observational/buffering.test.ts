@@ -1,0 +1,650 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { BufferingCoordinator } from '../../../../src/compaction/observational/buffering.js';
+import type { CompleteFn } from '../../../../src/compaction/compaction.js';
+import type { AgentMessage } from '../../../../src/context-manager.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const userMsg = (content: string): AgentMessage => ({ role: 'user', content });
+const assistantMsg = (content: string): AgentMessage => ({ role: 'assistant', content });
+
+const VALID_OBSERVER_OUTPUT =
+  '<observations>\nDate: Apr 10, 2026\n\n* \u{1F7E1} (14:30) Test observation\n</observations>\n\n' +
+  '<current-task>\n- Primary: Testing\n</current-task>\n\n' +
+  '<suggested-response>\nContinue testing.\n</suggested-response>';
+
+const VALID_REFLECTOR_OUTPUT =
+  '<observations>\nDate: Apr 10, 2026\n\n* \u{1F7E1} (14:30) Consolidated observation\n</observations>';
+
+function flushPromises(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Tests: computeBufferInterval
+// ---------------------------------------------------------------------------
+
+describe('BufferingCoordinator', () => {
+  let coordinator: BufferingCoordinator;
+
+  beforeEach(() => {
+    coordinator = new BufferingCoordinator();
+  });
+
+  describe('computeBufferInterval', () => {
+    it('divides tokens until activation by target cycles', () => {
+      const interval = coordinator.computeBufferInterval(40_000, {
+        bufferTargetCycles: 4,
+        bufferTokenCap: 30_000,
+        bufferMinTokens: 5_000,
+        utilityModelContextWindow: 200_000,
+      });
+
+      // 40000 / 4 = 10000, clamped between 5000 and min(30000, 200000*0.6=120000)
+      expect(interval).toBe(10_000);
+    });
+
+    it('respects the cap (bufferTokenCap)', () => {
+      const interval = coordinator.computeBufferInterval(200_000, {
+        bufferTargetCycles: 2,
+        bufferTokenCap: 30_000,
+        bufferMinTokens: 5_000,
+        utilityModelContextWindow: 200_000,
+      });
+
+      // 200000 / 2 = 100000, but capped at min(30000, 120000) = 30000
+      expect(interval).toBe(30_000);
+    });
+
+    it('respects the floor (bufferMinTokens)', () => {
+      const interval = coordinator.computeBufferInterval(10_000, {
+        bufferTargetCycles: 4,
+        bufferTokenCap: 30_000,
+        bufferMinTokens: 5_000,
+        utilityModelContextWindow: 200_000,
+      });
+
+      // 10000 / 4 = 2500, but floor is 5000
+      expect(interval).toBe(5_000);
+    });
+
+    it('clamps effective cap to utility model context window', () => {
+      const interval = coordinator.computeBufferInterval(200_000, {
+        bufferTargetCycles: 2,
+        bufferTokenCap: 100_000,
+        bufferMinTokens: 5_000,
+        utilityModelContextWindow: 30_000, // small utility model
+      });
+
+      // 200000 / 2 = 100000, effective cap = min(100000, 30000*0.6=18000) = 18000
+      expect(interval).toBe(18_000);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: shouldBuffer
+  // -------------------------------------------------------------------------
+
+  describe('shouldBuffer', () => {
+    it('returns true when tokens exceed interval and no observer in flight', () => {
+      expect(coordinator.shouldBuffer(10_000, 5_000)).toBe(true);
+    });
+
+    it('returns false when tokens are below interval', () => {
+      expect(coordinator.shouldBuffer(3_000, 5_000)).toBe(false);
+    });
+
+    it('returns true when tokens equal interval', () => {
+      expect(coordinator.shouldBuffer(5_000, 5_000)).toBe(true);
+    });
+
+    it('returns false when observer is in flight', async () => {
+      const neverResolve = new Promise<string>(() => {});
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(neverResolve);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      expect(coordinator.shouldBuffer(10_000, 5_000)).toBe(false);
+    });
+
+    it('returns false when aborted', () => {
+      coordinator.abort();
+      expect(coordinator.shouldBuffer(10_000, 5_000)).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: launchObserver
+  // -------------------------------------------------------------------------
+
+  describe('launchObserver', () => {
+    it('stores chunk on completion and advances watermark', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(VALID_OBSERVER_OUTPUT);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('Hello'), assistantMsg('Hi')],
+        10,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      expect(coordinator.isObserverInFlight()).toBe(true);
+      await flushPromises();
+
+      expect(coordinator.isObserverInFlight()).toBe(false);
+      expect(coordinator.hasCompletedChunks()).toBe(true);
+
+      const { chunks, watermark } = coordinator.getCompletedChunks();
+      expect(chunks.length).toBe(1);
+      expect(chunks[0]!.observations).toContain('Test observation');
+      expect(chunks[0]!.currentTask).toContain('Testing');
+      expect(chunks[0]!.suggestedResponse).toContain('Continue testing');
+      expect(watermark).toBe(10);
+    });
+
+    it('handles errors without crashing', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockRejectedValue(new Error('API failure'));
+      const logger = { warn: vi.fn() };
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('Hello')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+        logger,
+      );
+
+      await flushPromises();
+
+      expect(coordinator.isObserverInFlight()).toBe(false);
+      expect(coordinator.hasCompletedChunks()).toBe(false);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Observer buffer call failed'),
+      );
+    });
+
+    it('enforces at-most-one-in-flight by tracking state', () => {
+      const neverResolve = new Promise<string>(() => {});
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(neverResolve);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      expect(coordinator.isObserverInFlight()).toBe(true);
+      // shouldBuffer prevents launching another
+      expect(coordinator.shouldBuffer(10_000, 5_000)).toBe(false);
+    });
+
+    it('discards result if aborted before completion', async () => {
+      let resolvePromise: ((value: string) => void) | undefined;
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(
+        new Promise<string>((resolve) => { resolvePromise = resolve; }),
+      );
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      coordinator.abort();
+      resolvePromise!(VALID_OBSERVER_OUTPUT);
+      await flushPromises();
+
+      expect(coordinator.hasCompletedChunks()).toBe(false);
+    });
+
+    it('does not launch when aborted', () => {
+      const mockComplete = vi.fn<CompleteFn>();
+      coordinator.abort();
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      expect(mockComplete).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: chunk lifecycle
+  // -------------------------------------------------------------------------
+
+  describe('hasCompletedChunks / getCompletedChunks / commitActivation', () => {
+    it('has no chunks initially', () => {
+      expect(coordinator.hasCompletedChunks()).toBe(false);
+      const { chunks } = coordinator.getCompletedChunks();
+      expect(chunks.length).toBe(0);
+    });
+
+    it('getCompletedChunks returns copies of chunks', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(VALID_OBSERVER_OUTPUT);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+      await flushPromises();
+
+      const first = coordinator.getCompletedChunks();
+      const second = coordinator.getCompletedChunks();
+
+      // Should return different array instances
+      expect(first.chunks).not.toBe(second.chunks);
+      // But same content
+      expect(first.chunks.length).toBe(second.chunks.length);
+    });
+
+    it('commitActivation clears chunks and resets watermark', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(VALID_OBSERVER_OUTPUT);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+      await flushPromises();
+
+      expect(coordinator.hasCompletedChunks()).toBe(true);
+      expect(coordinator.getWatermark()).toBe(5);
+
+      coordinator.commitActivation();
+
+      expect(coordinator.hasCompletedChunks()).toBe(false);
+      expect(coordinator.getWatermark()).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: shouldReflect
+  // -------------------------------------------------------------------------
+
+  describe('shouldReflect', () => {
+    it('returns "none" when tokens are below both thresholds', () => {
+      // asyncTrigger = 1000 * 0.5 = 500
+      expect(coordinator.shouldReflect(100, 1000, 0.5)).toBe('none');
+    });
+
+    it('returns "async" at buffer activation point', () => {
+      // asyncTrigger = 1000 * 0.5 = 500; tokens = 600 is between 500 and 1000
+      expect(coordinator.shouldReflect(600, 1000, 0.5)).toBe('async');
+    });
+
+    it('returns "sync" at or above threshold', () => {
+      expect(coordinator.shouldReflect(1000, 1000, 0.5)).toBe('sync');
+      expect(coordinator.shouldReflect(1500, 1000, 0.5)).toBe('sync');
+    });
+
+    it('returns "none" for async when reflector is already in flight', () => {
+      const neverResolve = new Promise<string>(() => {});
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(neverResolve);
+
+      coordinator.launchReflector(
+        mockComplete,
+        'observations',
+        { reflectionThreshold: 1000 },
+      );
+
+      // asyncTrigger = 1000 * 0.5 = 500; tokens = 600
+      expect(coordinator.shouldReflect(600, 1000, 0.5)).toBe('none');
+    });
+
+    it('returns "none" for async when aborted', () => {
+      coordinator.abort();
+      expect(coordinator.shouldReflect(600, 1000, 0.5)).toBe('none');
+    });
+
+    it('still returns "sync" even when reflector is in flight', () => {
+      const neverResolve = new Promise<string>(() => {});
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(neverResolve);
+
+      coordinator.launchReflector(
+        mockComplete,
+        'observations',
+        { reflectionThreshold: 1000 },
+      );
+
+      expect(coordinator.shouldReflect(1000, 1000, 0.5)).toBe('sync');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: launchReflector
+  // -------------------------------------------------------------------------
+
+  describe('launchReflector', () => {
+    it('stores buffered reflection on completion', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(VALID_REFLECTOR_OUTPUT);
+
+      coordinator.launchReflector(
+        mockComplete,
+        'observations to consolidate',
+        { reflectionThreshold: 100_000 }, // generous so it passes validation
+      );
+
+      expect(coordinator.isReflectorInFlight()).toBe(true);
+      await flushPromises();
+
+      expect(coordinator.isReflectorInFlight()).toBe(false);
+      expect(coordinator.hasBufferedReflection()).toBe(true);
+    });
+
+    it('handles errors without crashing', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockRejectedValue(new Error('Reflector failed'));
+      const logger = { warn: vi.fn() };
+
+      coordinator.launchReflector(
+        mockComplete,
+        'observations',
+        { reflectionThreshold: 1000 },
+        logger,
+      );
+
+      await flushPromises();
+
+      expect(coordinator.isReflectorInFlight()).toBe(false);
+      expect(coordinator.hasBufferedReflection()).toBe(false);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Reflector buffer call failed'),
+      );
+    });
+
+    it('does not launch when aborted', () => {
+      const mockComplete = vi.fn<CompleteFn>();
+      coordinator.abort();
+
+      coordinator.launchReflector(
+        mockComplete,
+        'observations',
+        { reflectionThreshold: 1000 },
+      );
+
+      expect(mockComplete).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: reflection lifecycle
+  // -------------------------------------------------------------------------
+
+  describe('hasBufferedReflection / consumeBufferedReflection', () => {
+    it('has no buffered reflection initially', () => {
+      expect(coordinator.hasBufferedReflection()).toBe(false);
+      expect(coordinator.consumeBufferedReflection()).toBeNull();
+    });
+
+    it('consumeBufferedReflection returns data and clears it', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(VALID_REFLECTOR_OUTPUT);
+
+      coordinator.launchReflector(
+        mockComplete,
+        'observations',
+        { reflectionThreshold: 100_000 },
+      );
+      await flushPromises();
+
+      expect(coordinator.hasBufferedReflection()).toBe(true);
+
+      const result = coordinator.consumeBufferedReflection();
+      expect(result).not.toBeNull();
+      expect(result!.observations).toContain('Consolidated observation');
+      expect(result!.compressionLevel).toBe(0);
+
+      // Should be cleared after consumption
+      expect(coordinator.hasBufferedReflection()).toBe(false);
+      expect(coordinator.consumeBufferedReflection()).toBeNull();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: state persistence
+  // -------------------------------------------------------------------------
+
+  describe('getState / restoreState', () => {
+    it('returns empty state initially', () => {
+      const state = coordinator.getState();
+      expect(state.chunks).toEqual([]);
+      expect(state.watermark).toBe(0);
+    });
+
+    it('returns current chunks and watermark', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(VALID_OBSERVER_OUTPUT);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        7,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+      await flushPromises();
+
+      const state = coordinator.getState();
+      expect(state.chunks.length).toBe(1);
+      expect(state.watermark).toBe(7);
+    });
+
+    it('excludes in-flight operations from state', () => {
+      const neverResolve = new Promise<string>(() => {});
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(neverResolve);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      const state = coordinator.getState();
+      // In-flight observer should not appear in state
+      expect(state.chunks.length).toBe(0);
+    });
+
+    it('round-trips state through save and restore', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(VALID_OBSERVER_OUTPUT);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        7,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+      await flushPromises();
+
+      const savedState = coordinator.getState();
+
+      // Create a new coordinator and restore
+      const newCoordinator = new BufferingCoordinator();
+      newCoordinator.restoreState(savedState);
+
+      const restoredState = newCoordinator.getState();
+      expect(restoredState.chunks.length).toBe(savedState.chunks.length);
+      expect(restoredState.chunks[0]!.observations).toBe(savedState.chunks[0]!.observations);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: abort
+  // -------------------------------------------------------------------------
+
+  describe('abort', () => {
+    it('discards in-flight observer results', async () => {
+      let resolvePromise: ((value: string) => void) | undefined;
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(
+        new Promise<string>((resolve) => { resolvePromise = resolve; }),
+      );
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      coordinator.abort();
+      resolvePromise!(VALID_OBSERVER_OUTPUT);
+      await flushPromises();
+
+      expect(coordinator.hasCompletedChunks()).toBe(false);
+    });
+
+    it('discards in-flight reflector results', async () => {
+      let resolvePromise: ((value: string) => void) | undefined;
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(
+        new Promise<string>((resolve) => { resolvePromise = resolve; }),
+      );
+
+      coordinator.launchReflector(
+        mockComplete,
+        'observations',
+        { reflectionThreshold: 1000 },
+      );
+
+      coordinator.abort();
+      resolvePromise!(VALID_REFLECTOR_OUTPUT);
+      await flushPromises();
+
+      expect(coordinator.hasBufferedReflection()).toBe(false);
+    });
+
+    it('prevents new launches after abort', () => {
+      coordinator.abort();
+
+      const mockComplete = vi.fn<CompleteFn>();
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        5,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      coordinator.launchReflector(
+        mockComplete,
+        'observations',
+        { reflectionThreshold: 1000 },
+      );
+
+      expect(mockComplete).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: watermark
+  // -------------------------------------------------------------------------
+
+  describe('watermark', () => {
+    it('starts at 0', () => {
+      expect(coordinator.getWatermark()).toBe(0);
+    });
+
+    it('can be set manually', () => {
+      coordinator.setWatermark(42);
+      expect(coordinator.getWatermark()).toBe(42);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests: activation epoch (race condition guard)
+  // -------------------------------------------------------------------------
+
+  describe('activation epoch', () => {
+    it('discards in-flight observer result after commitActivation', async () => {
+      let resolvePromise: ((value: string) => void) | undefined;
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(
+        new Promise<string>((resolve) => { resolvePromise = resolve; }),
+      );
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        10,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      // Simulate activation consuming chunks (advances epoch)
+      coordinator.commitActivation();
+
+      // Now the in-flight observer completes
+      resolvePromise!(VALID_OBSERVER_OUTPUT);
+      await flushPromises();
+
+      // The stale result should be discarded
+      expect(coordinator.hasCompletedChunks()).toBe(false);
+      expect(coordinator.getWatermark()).toBe(0);
+    });
+
+    it('discards in-flight observer result after advanceEpoch', async () => {
+      let resolvePromise: ((value: string) => void) | undefined;
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(
+        new Promise<string>((resolve) => { resolvePromise = resolve; }),
+      );
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        10,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      // Simulate sync activation advancing epoch
+      coordinator.advanceEpoch();
+
+      resolvePromise!(VALID_OBSERVER_OUTPUT);
+      await flushPromises();
+
+      expect(coordinator.hasCompletedChunks()).toBe(false);
+      expect(coordinator.getWatermark()).toBe(0);
+    });
+
+    it('accepts in-flight result when epoch has not changed', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(VALID_OBSERVER_OUTPUT);
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('test')],
+        10,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      await flushPromises();
+
+      // No epoch change, so the result should land normally
+      expect(coordinator.hasCompletedChunks()).toBe(true);
+      expect(coordinator.getWatermark()).toBe(10);
+    });
+  });
+});

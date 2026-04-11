@@ -30,6 +30,8 @@ import { UTILITY_MODEL_DEFAULTS } from './provider-registry.js';
 import { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
 import { isContextOverflow } from './compaction/failsafe.js';
+import type { ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './compaction/observational/types.js';
+import { createRecallTool } from './compaction/observational/recall-tool.js';
 import { SubAgentManager } from './sub-agent-manager.js';
 import { SkillRegistry } from './skill-registry.js';
 import { createLoadSkillTool, buildLoadSkillDescription, LOAD_SKILL_TOOL_NAME } from './skill-tool.js';
@@ -455,9 +457,18 @@ export class CortexAgent {
     this.registeredTools = this.normalizeRegisteredTools([...builtinTools, ...(tools ?? [])]);
     (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
 
+    // Build the slot list. When using observational memory, append the
+    // internal observation slot so it occupies the last slot position.
+    const compactionConfig = buildCompactionConfig(config.compaction);
+    const compactionStrategy = compactionConfig.strategy ?? 'observational';
+    const slots = [...(config.slots ?? [])];
+    if (compactionStrategy === 'observational') {
+      slots.push('_observations');
+    }
+
     // Set up ContextManager
     this.contextManager = new ContextManager(agent, {
-      slots: config.slots ?? [],
+      slots,
     });
 
     // Set up EventBridge
@@ -543,11 +554,10 @@ export class CortexAgent {
     // signature and sync the result to the underlying agent.
     this.refreshTools();
 
-    // Set up CompactionManager
-    const compactionConfig = buildCompactionConfig(config.compaction);
+    // Set up CompactionManager (reuse compactionConfig from slot registration above)
     this.compactionManager = new CompactionManager(
       compactionConfig,
-      (config.slots ?? []).length,
+      slots.length,
     );
     this.compactionManager.setLogger(this.logger);
 
@@ -569,12 +579,30 @@ export class CortexAgent {
       return this.directComplete(context);
     });
 
+    // Wire utility model completion for observer/reflector
+    this.compactionManager.setObservationalCompleteFn(async (context) => {
+      return this.utilityComplete({
+        systemPrompt: context.systemPrompt,
+        messages: context.messages as Array<{ role: string; content: string }>,
+      });
+    });
+
     // Wire compaction result -> onPostCompaction handlers on the manager.
     // The CompactionManager also calls postCompactionHandlers registered
     // directly via onPostCompaction(); the onCompactionResult handler here
     // is the bridge for results that come through the manager's internal
     // checkAndRunCompaction() path (which already calls its own handlers).
     // No additional bridging needed; consumers register via onPostCompaction().
+
+    // Register recall tool if observational memory has one configured
+    if (this.compactionManager.hasRecallTool()) {
+      const recallConfig = this.compactionManager.getRecallConfig();
+      if (recallConfig) {
+        const recallTool = createRecallTool(recallConfig);
+        this.registeredTools.push(recallTool as RegisteredTool);
+        this.refreshTools();
+      }
+    }
 
     // Set up process exit safety net for orphaned subprocesses
     this.setupExitHandler();
@@ -1450,6 +1478,7 @@ export class CortexAgent {
     this.resolvedUtilityModel = model;
     this.resolvedUtilityPiModel = unwrapModel(model) as PiModel;
     this.utilityModelManualOverride = true;
+    this.compactionManager.setUtilityModelContextWindow(model.contextWindow);
   }
 
   /**
@@ -1465,6 +1494,7 @@ export class CortexAgent {
     );
     this.resolvedUtilityModel = utilityModels.utilityModel;
     this.resolvedUtilityPiModel = utilityModels.utilityPiModel;
+    this.compactionManager.setUtilityModelContextWindow(utilityModels.utilityModel.contextWindow);
   }
 
   /**
@@ -2046,6 +2076,12 @@ export class CortexAgent {
     const limit = this._contextWindowLimit ?? modelWindow;
     const clamped = Math.min(limit, modelWindow);
     this.compactionManager.setContextWindow(Math.max(MINIMUM_CONTEXT_WINDOW, clamped));
+
+    // Set utility model context window for observational memory clamps
+    const utilityModel = this.getUtilityModel();
+    if (utilityModel) {
+      this.compactionManager.setUtilityModelContextWindow(utilityModel.contextWindow);
+    }
   }
 
   /**
@@ -2069,6 +2105,63 @@ export class CortexAgent {
    */
   capToolResult(content: string): string {
     return this.compactionManager.capToolResult(content);
+  }
+
+  // -----------------------------------------------------------------------
+  // Observational Memory
+  // -----------------------------------------------------------------------
+
+  /**
+   * Get the observational memory state for session persistence.
+   * Returns null if not using the observational strategy.
+   */
+  getObservationalMemoryState(): ObservationalMemoryState | null {
+    return this.compactionManager.getObservationalMemoryState();
+  }
+
+  /**
+   * Restore observational memory state from a previous session.
+   * Must be called after restoreConversationHistory().
+   */
+  restoreObservationalMemoryState(state: ObservationalMemoryState): void {
+    this.compactionManager.restoreObservationalMemoryState(state);
+    // Update the observation slot with restored content
+    const slotContent = this.compactionManager.getObservationSlotContent();
+    if (slotContent) {
+      this.contextManager.setSlot('_observations', slotContent);
+    }
+    // Kick off initial async buffer for hot resumption
+    this.compactionManager.kickstartBuffer(this.agent.state.messages, this.contextManager.slotCount);
+  }
+
+  /**
+   * Force a synchronous observation cycle.
+   * Useful after critical user corrections.
+   */
+  async triggerObservation(): Promise<void> {
+    const slotCount = this.contextManager.slotCount;
+    await this.compactionManager.triggerObservation(this.agent.state.messages, slotCount);
+    // Update the slot after the observer completes
+    const slotContent = this.compactionManager.getObservationSlotContent();
+    if (slotContent) {
+      this.contextManager.setSlot('_observations', slotContent);
+    }
+  }
+
+  /**
+   * Register a handler for observation events.
+   * Fires when messages are compressed into observations.
+   */
+  onObservation(handler: (event: ObservationEvent) => void): void {
+    this.compactionManager.onObservation(handler);
+  }
+
+  /**
+   * Register a handler for reflection events.
+   * Fires when the reflector condenses observations.
+   */
+  onReflection(handler: (event: ReflectionEvent) => void): void {
+    this.compactionManager.onReflection(handler);
   }
 
   /**
@@ -2224,6 +2317,22 @@ export class CortexAgent {
           );
         },
       );
+
+      // After compaction/observation runs, update the observation slot
+      if (this.compactionManager.strategy === 'observational') {
+        const slotContent = this.compactionManager.getObservationSlotContent();
+        if (slotContent) {
+          this.contextManager.setSlot('_observations', slotContent);
+          // Also update the in-memory context for this LLM call so the
+          // returned context reflects post-reflection observation content
+          if (this.compactionManager.hasObservations()) {
+            const obsSlotIndex = this.contextManager.slotCount - 1;
+            if (obsSlotIndex >= 0 && obsSlotIndex < result.messages.length) {
+              result.messages[obsSlotIndex] = { role: 'user', content: slotContent };
+            }
+          }
+        }
+      }
 
       // Step 4: Compute API message indices for cache breakpoints.
       // Count how messages map from our array to the Anthropic API format
@@ -2618,6 +2727,17 @@ export class CortexAgent {
             if (inputTokens > 0) {
               this.compactionManager.updateCurrentContextTokenCount(inputTokens);
             }
+
+            // Trigger observational memory buffer check
+            if (this.compactionManager.strategy === 'observational') {
+              const totalInput = event.usage.input + event.usage.cacheRead + event.usage.cacheWrite;
+              this.compactionManager.onTurnEnd(
+                totalInput,
+                this.effectiveContextWindow,
+                this.agent.state.messages,
+                this.contextManager.slotCount,
+              );
+            }
           }
 
           // Accumulate session-lifetime usage (does not reset per loop)
@@ -2643,6 +2763,16 @@ export class CortexAgent {
           const inputTokens = this.extractInputTokens(event.data);
           if (inputTokens > 0) {
             this.compactionManager.updateCurrentContextTokenCount(inputTokens);
+
+            // Trigger observational memory buffer check (fallback path)
+            if (this.compactionManager.strategy === 'observational') {
+              this.compactionManager.onTurnEnd(
+                inputTokens,
+                this.effectiveContextWindow,
+                this.agent.state.messages,
+                this.contextManager.slotCount,
+              );
+            }
           }
           this._sessionUsage.totalTurns += 1;
         }

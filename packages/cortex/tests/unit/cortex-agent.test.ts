@@ -202,6 +202,7 @@ describe('CortexAgent', () => {
       const agent = createTestCortexAgent(piAgent, {
         ...config,
         slots: ['a', 'b'],
+        compaction: { strategy: 'classic' },
       });
 
       const cm = agent.getContextManager();
@@ -644,6 +645,7 @@ You have 12 emotions.`;
       const agent = createTestCortexAgent(piAgent, {
         ...config,
         slots: ['slot1', 'slot2'],
+        compaction: { strategy: 'classic' },
       });
 
       const cm = agent.getContextManager();

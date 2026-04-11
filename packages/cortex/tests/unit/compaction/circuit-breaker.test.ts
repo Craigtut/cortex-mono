@@ -45,6 +45,7 @@ function createManagerForLayer2(
   overrides?: Partial<CortexCompactionConfig>,
 ): CompactionManager {
   const config = buildCompactionConfig({
+    strategy: 'classic',
     compaction: {
       threshold: 0.70,
       preserveRecentTurns: 4,

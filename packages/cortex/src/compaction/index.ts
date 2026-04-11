@@ -41,6 +41,8 @@ import {
   shouldTruncate,
   FAILSAFE_DEFAULTS,
 } from './failsafe.js';
+import { ObservationalMemoryEngine } from './observational/index.js';
+import type { ObservationalMemoryConfig, ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './observational/types.js';
 
 // ---------------------------------------------------------------------------
 // Re-exports for consumer convenience
@@ -52,6 +54,9 @@ export { runCompaction, shouldCompact, partitionHistory, buildSummaryMessage } f
 export type { CompleteFn } from './compaction.js';
 export { emergencyTruncate, shouldTruncate, isContextOverflow } from './failsafe.js';
 export type { FailsafeTruncationResult } from './failsafe.js';
+export { ObservationalMemoryEngine } from './observational/index.js';
+export type { ObservationalMemoryConfig, ObservationalMemoryState, ObservationChunk, ObservationEvent, ReflectionEvent, RecallResult, RecallConfig } from './observational/types.js';
+export { createRecallTool } from './observational/recall-tool.js';
 // computeAdaptiveThreshold is defined below in this file and exported at the declaration site
 
 // ---------------------------------------------------------------------------
@@ -82,7 +87,7 @@ export function buildCompactionConfig(
 ): CortexCompactionConfig {
   if (!partial) return DEFAULT_COMPACTION_CONFIG;
 
-  return {
+  const config: CortexCompactionConfig = {
     microcompaction: {
       ...MICROCOMPACTION_DEFAULTS,
       ...partial.microcompaction,
@@ -100,6 +105,16 @@ export function buildCompactionConfig(
       ...partial.adaptive,
     },
   };
+
+  if (partial.strategy !== undefined) {
+    config.strategy = partial.strategy;
+  }
+
+  if (partial.observational !== undefined) {
+    config.observational = partial.observational;
+  }
+
+  return config;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +179,8 @@ export class CompactionManager {
   private readonly config: CortexCompactionConfig;
   private readonly microcompaction: MicrocompactionEngine;
   private readonly slotCount: number;
+  private readonly _strategy: 'observational' | 'classic';
+  private observationalEngine: ObservationalMemoryEngine | null = null;
 
   /** Post-hoc current-context token count, updated after each parent LLM call. */
   private _currentContextTokenCount = 0;
@@ -206,11 +223,22 @@ export class CompactionManager {
     this.config = config;
     this.slotCount = slotCount;
     this.microcompaction = new MicrocompactionEngine(config.microcompaction);
+    this._strategy = config.strategy ?? 'observational';
+
+    if (this._strategy === 'observational') {
+      this.observationalEngine = new ObservationalMemoryEngine(
+        config.observational ?? {},
+        slotCount - 1,
+      );
+    }
   }
 
   // -----------------------------------------------------------------------
   // Configuration
   // -----------------------------------------------------------------------
+
+  /** Get the compaction strategy. */
+  get strategy(): 'observational' | 'classic' { return this._strategy; }
 
   /**
    * Set the context budget (the effective limit for Layer 1/2 compaction).
@@ -219,6 +247,7 @@ export class CompactionManager {
    */
   setContextWindow(contextWindow: number): void {
     this._contextWindow = contextWindow;
+    this.observationalEngine?.setContextWindow(contextWindow);
   }
 
   /**
@@ -226,9 +255,13 @@ export class CompactionManager {
    * Layer 3 emergency truncation uses this to avoid dropping messages
    * when the model still has capacity, even if the user-configured
    * budget has been exceeded.
+   *
+   * Also used as a proxy for the utility model context window until the
+   * actual utility model window is set via setUtilityModelContextWindow().
    */
   setModelContextWindow(modelContextWindow: number): void {
     this._modelContextWindow = modelContextWindow;
+    this.observationalEngine?.setUtilityModelContextWindow(modelContextWindow);
   }
 
   /**
@@ -239,10 +272,25 @@ export class CompactionManager {
   }
 
   /**
+   * Set the LLM completion function for observational memory (utility model).
+   */
+  setObservationalCompleteFn(fn: CompleteFn): void {
+    this.observationalEngine?.setCompleteFn(fn);
+  }
+
+  /**
+   * Update the utility model context window for observer/reflector clamps.
+   */
+  setUtilityModelContextWindow(utilityModelContextWindow: number): void {
+    this.observationalEngine?.setUtilityModelContextWindow(utilityModelContextWindow);
+  }
+
+  /**
    * Set a logger for compaction diagnostics.
    */
   setLogger(logger: CortexLogger): void {
     this.logger = logger;
+    this.observationalEngine?.setLogger(logger);
   }
 
   /**
@@ -388,6 +436,118 @@ export class CompactionManager {
    */
   onCompactionExhausted(handler: (info: CompactionExhaustedInfo) => void): void {
     this.compactionExhaustedHandlers.push(handler);
+  }
+
+  // -----------------------------------------------------------------------
+  // Observational Memory
+  // -----------------------------------------------------------------------
+
+  /**
+   * Called at turn_end to trigger async buffer checks.
+   */
+  onTurnEnd(totalTokens: number, contextWindow: number, messages: AgentMessage[], slotCount: number): void {
+    this.observationalEngine?.onTurnEnd(totalTokens, contextWindow, messages, slotCount);
+  }
+
+  /**
+   * Register observation event handler.
+   */
+  onObservation(handler: (event: ObservationEvent) => void): void {
+    this.observationalEngine?.onObservation(handler);
+  }
+
+  /**
+   * Register reflection event handler.
+   */
+  onReflection(handler: (event: ReflectionEvent) => void): void {
+    this.observationalEngine?.onReflection(handler);
+  }
+
+  /**
+   * Get observational memory state for persistence.
+   */
+  getObservationalMemoryState(): ObservationalMemoryState | null {
+    return this.observationalEngine?.getState() ?? null;
+  }
+
+  /**
+   * Restore observational memory state from a previous session.
+   */
+  restoreObservationalMemoryState(state: ObservationalMemoryState): void {
+    this.observationalEngine?.restoreState(state);
+  }
+
+  /**
+   * Force a synchronous observation cycle.
+   */
+  async triggerObservation(messages: AgentMessage[], slotCount: number): Promise<void> {
+    await this.observationalEngine?.triggerObservation(messages, slotCount);
+  }
+
+  /**
+   * Kick off an initial async buffer on unobserved messages.
+   * Called during session resumption for a head start before the first prompt().
+   */
+  kickstartBuffer(messages: AgentMessage[], slotCount: number): void {
+    this.observationalEngine?.kickstartBuffer(messages, slotCount);
+  }
+
+  /**
+   * Get the observation slot content string (for ContextManager.setSlot).
+   */
+  getObservationSlotContent(): string {
+    return this.observationalEngine?.getSlotContent() ?? '';
+  }
+
+  /**
+   * Whether observations have been produced (non-empty observation text).
+   */
+  hasObservations(): boolean {
+    return (this.observationalEngine?.getObservations() ?? '').length > 0;
+  }
+
+  /**
+   * Whether the recall tool should be registered.
+   */
+  hasRecallTool(): boolean {
+    return this.observationalEngine?.hasRecall() ?? false;
+  }
+
+  /**
+   * Get the recall config if available.
+   */
+  getRecallConfig() {
+    return this.observationalEngine?.getRecallConfig();
+  }
+
+  /**
+   * Current token count of the observational memory content.
+   * Returns 0 when not using the observational strategy.
+   */
+  getObservationTokenCount(): number {
+    return this.observationalEngine?.getObservationTokenCount() ?? 0;
+  }
+
+  /**
+   * Whether the observer or reflector is currently running in the background.
+   * Returns false when not using the observational strategy.
+   */
+  isObservationalProcessing(): boolean {
+    return this.observationalEngine?.isProcessing() ?? false;
+  }
+
+  /**
+   * Whether the observer specifically is in-flight.
+   */
+  isObserverInFlight(): boolean {
+    return this.observationalEngine?.isObserverInFlight() ?? false;
+  }
+
+  /**
+   * Whether the reflector specifically is in-flight.
+   */
+  isReflectorInFlight(): boolean {
+    return this.observationalEngine?.isReflectorInFlight() ?? false;
   }
 
   // -----------------------------------------------------------------------
@@ -568,107 +728,123 @@ export class CompactionManager {
       ctxWindow: this._contextWindow,
     });
 
-    // Layer 1: Microcompaction (always runs at threshold crossings)
-    history = await this.microcompaction.apply(history, this._contextWindow, currentTokens);
-
-    // Layer 2: Conversation summarization (70% threshold)
-    // Operates on the original transcript (agent.state.messages), not the
-    // in-memory microcompacted context. After Layer 2 modifies the source,
-    // we rebuild the context from the updated messages.
+    // Compute utilization and slot tokens (shared by both strategies and L3)
     const originalHistoryTokens = this.estimateHistoryTokens(getHistory(context));
-    const postMicroTokens = this.estimateHistoryTokens(history);
     const slotTokens = Math.max(0, currentTokens - originalHistoryTokens);
-    const totalAfterMicro = slotTokens + postMicroTokens;
-
-    const effectiveThreshold = this.getEffectiveThreshold();
-
-    this.logger.debug('[Compaction] Layer2 evaluation', {
-      totalAfterMicro,
-      threshold: effectiveThreshold,
-      ratio: totalAfterMicro / this._contextWindow,
-      completeFn: !!this.completeFn,
-      srcAccessors: !!getSourceHistory && !!setSourceHistory,
-      shouldCompact: shouldCompact(totalAfterMicro, this._contextWindow, effectiveThreshold),
-    });
+    const utilization = this._contextWindow > 0 ? currentTokens / this._contextWindow : 0;
 
     let layer2Failed = false;
     let lastLayer2Error: Error | undefined;
+    let effectiveThreshold = 0;
 
-    if (
-      this.completeFn &&
-      getSourceHistory &&
-      setSourceHistory &&
-      shouldCompact(totalAfterMicro, this._contextWindow, effectiveThreshold)
-    ) {
-      const maxRetries = this.config.compaction.maxRetries ?? 3;
-      const retryDelayMs = this.config.compaction.retryDelayMs ?? 2000;
-      let succeeded = false;
+    if (this._strategy === 'observational' && this.observationalEngine && getSourceHistory && setSourceHistory) {
+      // Observational memory path: observer/reflector handle compression.
+      // L1 threshold trimming and L2 summarization are skipped.
+      context = await this.observationalEngine.applyInTransformContext(
+        context, utilization, this.slotCount, getHistory, setHistory, getSourceHistory, setSourceHistory,
+      );
+      // Re-derive history from the potentially updated context
+      history = getHistory(context);
+    } else {
+      // Classic path: L1 + L2 (existing code, unchanged)
 
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-          const sourceHistory = getSourceHistory();
-          if (sourceHistory.length === 0) break;
+      // Layer 1: Microcompaction (always runs at threshold crossings)
+      history = await this.microcompaction.apply(history, this._contextWindow, currentTokens);
 
-          const { newHistory: compactedSource, result } = await runCompaction(
-            sourceHistory,
-            this.config.compaction,
-            this.completeFn,
-            {
-              onBeforeCompaction: this.beforeCompactionHandlers,
-              onPostCompaction: this.postCompactionHandlers,
-              onCompactionError: this.compactionErrorHandlers,
-            },
-            currentTokens, // pass actual full-context token count for accurate reporting
-          );
+      // Layer 2: Conversation summarization (70% threshold)
+      // Operates on the original transcript (agent.state.messages), not the
+      // in-memory microcompacted context. After Layer 2 modifies the source,
+      // we rebuild the context from the updated messages.
+      const postMicroTokens = this.estimateHistoryTokens(history);
+      const totalAfterMicro = slotTokens + postMicroTokens;
 
-          // Success: update state and reset failure counter
-          setSourceHistory(compactedSource);
-          this.microcompaction.resetCache();
+      effectiveThreshold = this.getEffectiveThreshold();
 
-          // result.tokensAfter now includes overhead (system prompt, slots,
-          // tool definitions) since we passed actualContextTokens to
-          // runCompaction. Use it directly to prevent the stale low value
-          // that would cause re-triggering compaction on the next call.
-          this._currentContextTokenCount = result.tokensAfter;
+      this.logger.debug('[Compaction] Layer2 evaluation', {
+        totalAfterMicro,
+        threshold: effectiveThreshold,
+        ratio: totalAfterMicro / this._contextWindow,
+        completeFn: !!this.completeFn,
+        srcAccessors: !!getSourceHistory && !!setSourceHistory,
+        shouldCompact: shouldCompact(totalAfterMicro, this._contextWindow, effectiveThreshold),
+      });
 
-          this._consecutiveLayer2Failures = 0;
+      if (
+        this.completeFn &&
+        getSourceHistory &&
+        setSourceHistory &&
+        shouldCompact(totalAfterMicro, this._contextWindow, effectiveThreshold)
+      ) {
+        const maxRetries = this.config.compaction.maxRetries ?? 3;
+        const retryDelayMs = this.config.compaction.retryDelayMs ?? 2000;
+        let succeeded = false;
 
-          for (const handler of this.compactionResultHandlers) {
-            try {
-              handler(result);
-            } catch (err) {
-              this.logger.error('[Compaction] compactionResult handler threw', {
-                error: err instanceof Error ? err.message : String(err),
-              });
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          try {
+            const sourceHistory = getSourceHistory();
+            if (sourceHistory.length === 0) break;
+
+            const { newHistory: compactedSource, result } = await runCompaction(
+              sourceHistory,
+              this.config.compaction,
+              this.completeFn,
+              {
+                onBeforeCompaction: this.beforeCompactionHandlers,
+                onPostCompaction: this.postCompactionHandlers,
+                onCompactionError: this.compactionErrorHandlers,
+              },
+              currentTokens, // pass actual full-context token count for accurate reporting
+            );
+
+            // Success: update state and reset failure counter
+            setSourceHistory(compactedSource);
+            this.microcompaction.resetCache();
+
+            // result.tokensAfter now includes overhead (system prompt, slots,
+            // tool definitions) since we passed actualContextTokens to
+            // runCompaction. Use it directly to prevent the stale low value
+            // that would cause re-triggering compaction on the next call.
+            this._currentContextTokenCount = result.tokensAfter;
+
+            this._consecutiveLayer2Failures = 0;
+
+            for (const handler of this.compactionResultHandlers) {
+              try {
+                handler(result);
+              } catch (err) {
+                this.logger.error('[Compaction] compactionResult handler threw', {
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            }
+
+            // Rebuild context from updated source
+            history = await this.microcompaction.apply(
+              compactedSource,
+              this._contextWindow,
+              this._currentContextTokenCount,
+            );
+
+            succeeded = true;
+            break;
+          } catch (err) {
+            this._consecutiveLayer2Failures++;
+            lastLayer2Error = err instanceof Error ? err : new Error(String(err));
+            this.logger.warn('[Compaction] Layer2 retry failed', {
+              attempt,
+              maxRetries,
+              error: lastLayer2Error.message,
+            });
+
+            if (attempt < maxRetries) {
+              await new Promise(resolve => setTimeout(resolve, retryDelayMs));
             }
           }
-
-          // Rebuild context from updated source
-          history = await this.microcompaction.apply(
-            compactedSource,
-            this._contextWindow,
-            this._currentContextTokenCount,
-          );
-
-          succeeded = true;
-          break;
-        } catch (err) {
-          this._consecutiveLayer2Failures++;
-          lastLayer2Error = err instanceof Error ? err : new Error(String(err));
-          this.logger.warn('[Compaction] Layer2 retry failed', {
-            attempt,
-            maxRetries,
-            error: lastLayer2Error.message,
-          });
-
-          if (attempt < maxRetries) {
-            await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-          }
         }
-      }
 
-      if (!succeeded) {
-        layer2Failed = true;
+        if (!succeeded) {
+          layer2Failed = true;
+        }
       }
     }
 
@@ -676,12 +852,23 @@ export class CompactionManager {
     // Uses the MODEL's actual context window, not the budget. Emergency
     // truncation should only fire when we're near the model's real limit,
     // not the user's artificial budget. Layer 1/2 handle the budget.
+    // When observational memory is active, L3 operates on the post-slot
+    // history (raw messages only). The observation slot lives in the slot
+    // region and is naturally protected by slotCount.
     {
       const failsafeWindow = this._modelContextWindow > 0 ? this._modelContextWindow : this._contextWindow;
       const postLayerTokens = this.estimateHistoryTokens(history);
       const totalNow = slotTokens + postLayerTokens;
 
       if (shouldTruncate(totalNow, failsafeWindow, this.config.failsafe.threshold)) {
+        // Force sync observation before L3 truncation to capture unobserved
+        // content before it is dropped. The source history from getSourceHistory
+        // is already post-slot, so pass 0 as slotCount.
+        if (this._strategy === 'observational' && this.observationalEngine && getSourceHistory) {
+          const sourceHistory = getSourceHistory();
+          await this.observationalEngine.triggerObservation(sourceHistory, 0);
+        }
+
         const truncResult = emergencyTruncate(
           history,
           failsafeWindow,
@@ -873,6 +1060,8 @@ export class CompactionManager {
    */
   destroy(): void {
     this.microcompaction.resetCache();
+    this.observationalEngine?.abort();
+    this.observationalEngine = null;
     this.beforeCompactionHandlers = [];
     this.postCompactionHandlers = [];
     this.compactionErrorHandlers = [];

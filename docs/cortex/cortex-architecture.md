@@ -169,16 +169,12 @@ These are safety rails for runaway loops, not user-facing budget enforcement. Ap
 
 Pi-agent-core has no compaction. Only the `transformContext` hook.
 
-Cortex implements compaction in `transformContext`:
+Cortex implements compaction in `transformContext` with two selectable strategies:
 
-- **Token tracking**: Running `currentContextTokenCount` from per-turn `AssistantMessage.usage`. Compare against `model.contextWindow`.
-- **Trigger**: When token count exceeds a configurable threshold, compact the conversation history.
-- **Strategy**: Consumer-configurable. Default: summarize old conversation turns via a separate LLM call. Preserve context slots untouched.
-- **Adaptive threshold**: Optionally flex the threshold based on consumer-provided signals (e.g., user interaction recency).
+- **Observational memory** (default): Two background LLM agents (Observer and Reflector) continuously compress conversation history into structured event logs stored in a dedicated context slot. Non-blocking, cache-friendly, and suitable for long-running sessions. See [observational-memory-architecture.md](./observational-memory-architecture.md).
+- **Classic** (`strategy: 'classic'`): Three-layer system with microcompaction (tool result trimming), LLM-based conversation summarization, and emergency truncation. See [compaction-strategy.md](./compaction-strategy.md).
 
-Cortex emits an `onCompaction` event when compaction occurs, allowing the consumer to coordinate related work (e.g., triggering observational memory processing).
-
-Full compaction strategy design is deferred.
+Both strategies preserve context slots untouched and use Layer 3 emergency truncation as a safety valve. The consumer selects the strategy via `compaction.strategy` in the agent config.
 
 ### Skill System
 

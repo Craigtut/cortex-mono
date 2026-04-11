@@ -159,15 +159,15 @@ await agent.prompt(tickPrompt);
 
 The `build*Context()` functions are the mind's responsibility (they live in the backend's context builder). The ContextManager does not know or care what content goes into each slot. It just places the string at the correct position in the message array.
 
-### Why Observations Are Split Into Three Slots
+### Cortex-Managed Observation Slot
 
-The observational memory system has three distinct streams (thoughts, experiences, messages), each with its own watermark and compression cycle. Splitting them into separate slots gives finer-grained cache preservation:
+When the observational memory compaction strategy is active (the default), Cortex automatically appends a `_observations` slot as the last slot position. This slot is managed internally by Cortex's `ObservationalMemoryEngine` and consumers never interact with it directly. See [observational-memory-architecture.md](./observational-memory-architecture.md) for details.
 
-- **Thought observations** update when the thought observer compresses recent thoughts.
-- **Experience observations** update when the experience observer compresses recent experiences. Thought and experience compression run independently, so one can update without affecting the other's cache.
-- **Message observations** are per-contact scoped and update when the observer processes a specific contact's messages. They change on a completely different cadence from the other two.
+### Consumer Observation Slots (Example: Animus)
 
-If all three were combined in a single `observations` slot, any one stream updating would invalidate the cache for the entire block. With separate slots, only the changed slot forces a cache miss; the other two remain cached.
+Consumers may define their own observation-related slots for domain-specific needs. For example, Animus splits its observations into three consumer-owned slots (thought-observations, experience-observations, message-observations) for finer-grained cache preservation: each stream updates on a different cadence, so splitting them means only the changed slot forces a cache miss while the others remain cached.
+
+These consumer slots are independent of Cortex's `_observations` slot and are managed entirely by the consumer via `setSlot()`.
 
 ### How setSlot() Works
 

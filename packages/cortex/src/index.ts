@@ -219,6 +219,12 @@ export type {
   TrimState,
   CompleteFn,
   FailsafeTruncationResult,
+  ObservationalMemoryConfig,
+  ObservationalMemoryState,
+  ObservationEvent,
+  ReflectionEvent,
+  RecallConfig,
+  RecallResult,
 } from './compaction/index.js';
 
 // Model Wrapper (Phase 1D)
