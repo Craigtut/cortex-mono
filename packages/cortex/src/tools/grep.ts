@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
 import type { ToolContentDetails } from '../types.js';
+import { estimateTokens } from '../token-estimator.js';
 import {
   readGitignorePatterns,
   DEFAULT_IGNORE_PATTERNS,
@@ -51,7 +52,7 @@ export const GrepParams = Type.Object({
     Type.Boolean({ description: 'Case insensitive search. Default: false.' }),
   ),
   head_limit: Type.Optional(
-    Type.Number({ description: 'Limit number of results. Default: 250. Pass 0 for unlimited.' }),
+    Type.Number({ description: 'Limit number of results. Default: 250. Pass 0 for maximum (1000). Output is also capped at ~25,000 tokens.' }),
   ),
   offset: Type.Optional(
     Type.Number({ description: 'Skip first N results. Default: 0.' }),
@@ -72,6 +73,8 @@ export interface GrepDetails {
   totalMatches: number;
   durationMs: number;
   truncated: boolean;
+  /** When truncated is true, explains the cause. */
+  truncationReason?: 'head_limit' | 'token_budget' | 'both';
   usingFallback: boolean;
 }
 
@@ -81,6 +84,12 @@ export interface GrepDetails {
 
 const DEFAULT_IGNORE = new Set(DEFAULT_IGNORE_PATTERNS);
 const DEFAULT_HEAD_LIMIT = 250;
+
+/** Ceiling for head_limit=0 ("unlimited"). */
+const MAX_HEAD_LIMIT = 1000;
+
+/** Post-pagination token ceiling on formatted output. */
+const MAX_OUTPUT_TOKENS = 25_000;
 
 /** VCS directories to exclude from ripgrep searches. */
 const VCS_DIRECTORIES = ['.git', '.svn', '.hg', '.bzr', '.jj', '.sl'];
@@ -212,17 +221,66 @@ function applyHeadLimit<T>(
   limit: number | undefined,
   offset: number = 0,
 ): { items: T[]; truncated: boolean } {
-  // Explicit 0 = unlimited
-  if (limit === 0) {
-    return { items: items.slice(offset), truncated: false };
-  }
-  const effectiveLimit = limit ?? DEFAULT_HEAD_LIMIT;
+  // Explicit 0 = use maximum ceiling (not truly unlimited)
+  const effectiveLimit = limit === 0
+    ? MAX_HEAD_LIMIT
+    : (limit ?? DEFAULT_HEAD_LIMIT);
   const afterOffset = items.slice(offset);
   const truncated = afterOffset.length > effectiveLimit;
   return {
     items: afterOffset.slice(0, effectiveLimit),
     truncated,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Token budget helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Truncate formatted output to the token budget at line boundaries.
+ * Returns the text unchanged if within budget. Otherwise truncates and
+ * appends a notice telling the model how to narrow the search.
+ */
+function truncateToTokenBudget(
+  text: string,
+  totalBeforePagination: number,
+  outputMode: string,
+): { text: string; truncatedByTokens: boolean } {
+  const tokens = estimateTokens(text);
+  if (tokens <= MAX_OUTPUT_TOKENS) {
+    return { text, truncatedByTokens: false };
+  }
+
+  // Truncate to last complete line within budget
+  const maxChars = MAX_OUTPUT_TOKENS * 4; // estimateTokens uses chars/4
+  const slice = text.slice(0, maxChars);
+  const lastNewline = slice.lastIndexOf('\n');
+  const cleanTruncated = lastNewline > 0 ? slice.slice(0, lastNewline) : slice;
+
+  const label = outputMode === 'content' ? 'lines' : 'entries';
+  const notice =
+    `\n\n[Output truncated: ~${tokens.toLocaleString()} tokens exceeded ` +
+    `${MAX_OUTPUT_TOKENS.toLocaleString()} token limit. ` +
+    `${totalBeforePagination.toLocaleString()} total ${label} found. ` +
+    `Narrow your search with a more specific pattern, glob filter, or file type.]`;
+
+  return { text: cleanTruncated + notice, truncatedByTokens: true };
+}
+
+/**
+ * Compute the truncation reason spread from the head_limit and token budget flags.
+ * Returns an object to spread into details: either `{ truncationReason: '...' }` or `{}`.
+ * This avoids assigning `undefined` to an optional property under exactOptionalPropertyTypes.
+ */
+function truncationReasonField(
+  truncatedByHeadLimit: boolean,
+  truncatedByTokens: boolean,
+): { truncationReason: 'head_limit' | 'token_budget' | 'both' } | Record<string, never> {
+  if (truncatedByHeadLimit && truncatedByTokens) return { truncationReason: 'both' };
+  if (truncatedByTokens) return { truncationReason: 'token_budget' };
+  if (truncatedByHeadLimit) return { truncationReason: 'head_limit' };
+  return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +397,8 @@ async function searchWithRipgrep(
       return line;
     });
 
-    const text = finalLines.length > 0 ? finalLines.join('\n') : 'No matches found.';
+    const joined = finalLines.length > 0 ? finalLines.join('\n') : 'No matches found.';
+    const { text, truncatedByTokens } = truncateToTokenBudget(joined, rawLines.length, 'content');
 
     return {
       content: [{ type: 'text', text }],
@@ -347,7 +406,8 @@ async function searchWithRipgrep(
         totalFiles: 0,
         totalMatches: finalLines.length,
         durationMs,
-        truncated,
+        truncated: truncated || truncatedByTokens,
+        ...truncationReasonField(truncated, truncatedByTokens),
         usingFallback: false,
       },
     };
@@ -376,7 +436,8 @@ async function searchWithRipgrep(
       return line;
     });
 
-    const text = finalLines.length > 0 ? finalLines.join('\n') : 'No matches found.';
+    const joined = finalLines.length > 0 ? finalLines.join('\n') : 'No matches found.';
+    const { text, truncatedByTokens } = truncateToTokenBudget(joined, rawLines.length, 'count');
 
     return {
       content: [{ type: 'text', text }],
@@ -384,7 +445,8 @@ async function searchWithRipgrep(
         totalFiles: finalLines.length,
         totalMatches,
         durationMs,
-        truncated,
+        truncated: truncated || truncatedByTokens,
+        ...truncationReasonField(truncated, truncatedByTokens),
         usingFallback: false,
       },
     };
@@ -412,9 +474,10 @@ async function searchWithRipgrep(
   );
 
   const relativeMatches = limited.map(f => toRelativePath(f, cwd));
-  const text = relativeMatches.length > 0
+  const joined = relativeMatches.length > 0
     ? relativeMatches.join('\n')
     : 'No matches found.';
+  const { text, truncatedByTokens } = truncateToTokenBudget(joined, results.length, 'files_with_matches');
 
   return {
     content: [{ type: 'text', text }],
@@ -422,7 +485,8 @@ async function searchWithRipgrep(
       totalFiles: relativeMatches.length,
       totalMatches: results.length,
       durationMs,
-      truncated,
+      truncated: truncated || truncatedByTokens,
+      ...truncationReasonField(truncated, truncatedByTokens),
       usingFallback: false,
     },
   };
@@ -731,12 +795,14 @@ async function searchWithFallback(
   // Format output with relative paths and pagination
   let text: string;
   let truncated = false;
+  let totalForBudget: number;
 
   if (outputMode === 'files_with_matches') {
     const result = applyHeadLimit(matchingFiles, headLimit, offset);
     truncated = result.truncated;
     const relPaths = result.items.map(f => toRelativePath(f, cwd));
     text = relPaths.length > 0 ? relPaths.join('\n') : 'No matches found.';
+    totalForBudget = matchingFiles.length;
   } else if (outputMode === 'content') {
     let lines: string[] = [];
     let lastFile = '';
@@ -753,13 +819,21 @@ async function searchWithFallback(
     const result = applyHeadLimit(lines, headLimit, offset);
     truncated = result.truncated;
     text = result.items.length > 0 ? result.items.join('\n') : 'No matches found.';
+    totalForBudget = contentMatches.length;
   } else {
     const result = applyHeadLimit(fileCounts, headLimit, offset);
     truncated = result.truncated;
     text = result.items.length > 0
       ? result.items.map((fc) => `${toRelativePath(fc.file, cwd)}:${fc.count}`).join('\n')
       : 'No matches found.';
+    totalForBudget = fileCounts.length;
   }
+
+  // Apply token budget
+  const truncatedByHeadLimit = truncated;
+  const { text: cappedText, truncatedByTokens } = truncateToTokenBudget(text, totalForBudget, outputMode);
+  text = cappedText;
+  truncated = truncatedByHeadLimit || truncatedByTokens;
 
   return {
     content: [{ type: 'text', text }],
@@ -768,6 +842,7 @@ async function searchWithFallback(
       totalMatches,
       durationMs,
       truncated,
+      ...truncationReasonField(truncatedByHeadLimit, truncatedByTokens),
       usingFallback: true,
     },
   };
@@ -787,7 +862,7 @@ export function createGrepTool(config: GrepToolConfig): {
 
   return {
     name: 'Grep',
-    description: 'Search file contents using regex patterns.',
+    description: 'Search file contents using regex patterns. Three output modes: files_with_matches (default), content (matching lines), count (match counts). Results capped at ~25,000 tokens. Use glob, type, or a more specific pattern to narrow large result sets.',
     parameters: GrepParams,
 
     async execute(params: GrepParamsType): Promise<ToolContentDetails<GrepDetails>> {

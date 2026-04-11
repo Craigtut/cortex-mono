@@ -298,4 +298,147 @@ describe('Read tool', () => {
       expect(secondText).not.toContain('unchanged');
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Size and token gates
+  // -----------------------------------------------------------------------
+
+  describe('size and token gates', () => {
+    it('Gate 1: rejects files over 10 MB', async () => {
+      const filePath = path.join(tmpDir, 'huge.txt');
+      // Create a file just over 10 MB using sparse write
+      const fd = fs.openSync(filePath, 'w');
+      fs.writeSync(fd, 'x', 10 * 1024 * 1024 + 1);
+      fs.closeSync(fd);
+
+      const result = await readTool.execute({ file_path: filePath });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('too large to read');
+      expect(text).toContain('10.0 MB');
+      expect(text).toContain('Bash');
+      expect(result.details.rejected).toBe(true);
+    });
+
+    it('Gate 1: rejects files over 10 MB even with offset/limit', async () => {
+      const filePath = path.join(tmpDir, 'huge2.txt');
+      const fd = fs.openSync(filePath, 'w');
+      fs.writeSync(fd, 'x', 10 * 1024 * 1024 + 1);
+      fs.closeSync(fd);
+
+      const result = await readTool.execute({ file_path: filePath, offset: 1, limit: 10 });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('too large to read');
+      expect(result.details.rejected).toBe(true);
+    });
+
+    it('Gate 2: rejects full reads of files over 256 KB', async () => {
+      const filePath = path.join(tmpDir, 'medium.txt');
+      // Create a file just over 256 KB
+      const content = 'a'.repeat(256 * 1024 + 100) + '\n';
+      fs.writeFileSync(filePath, content);
+
+      const result = await readTool.execute({ file_path: filePath });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('too large to read in full');
+      expect(text).toContain('256 KB');
+      expect(text).toContain('offset and limit');
+      expect(text).toContain('Grep');
+      expect(result.details.rejected).toBe(true);
+    });
+
+    it('Gate 2: allows files over 256 KB when offset/limit is provided', async () => {
+      const filePath = path.join(tmpDir, 'medium-ranged.txt');
+      // Create a file over 256 KB with identifiable content
+      const lines = Array.from({ length: 5000 }, (_, i) => `line ${i + 1}: ${'x'.repeat(60)}`);
+      fs.writeFileSync(filePath, lines.join('\n'));
+
+      const result = await readTool.execute({ file_path: filePath, offset: 1, limit: 10 });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('line 1:');
+      expect(text).toContain('line 10:');
+      expect(result.details.rejected).toBeUndefined();
+    });
+
+    it('Gate 3: rejects output exceeding 25K estimated tokens', async () => {
+      const filePath = path.join(tmpDir, 'dense.txt');
+      // Create content that fits in 256 KB but produces >25K tokens
+      // Each line ~120 chars, 2000 lines (default limit) = 240K chars ~ 60K tokens
+      const lines = Array.from({ length: 2000 }, (_, i) => `${i}: ${'abcdefghij'.repeat(11)}`);
+      fs.writeFileSync(filePath, lines.join('\n'));
+
+      // Verify it's under 256 KB so Gate 2 doesn't fire
+      const stat = fs.statSync(filePath);
+      expect(stat.size).toBeLessThan(256 * 1024);
+
+      const result = await readTool.execute({ file_path: filePath });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('too large');
+      expect(text).toContain('tokens');
+      expect(text).toContain('smaller limit');
+      expect(text).toContain('Grep');
+      expect(result.details.rejected).toBe(true);
+    });
+
+    it('Gate 3: suggests a reduced limit in rejection message', async () => {
+      const filePath = path.join(tmpDir, 'suggest.txt');
+      // Create content that will produce ~50K tokens with limit 2000
+      const lines = Array.from({ length: 2000 }, (_, i) => `${i}: ${'abcdefghij'.repeat(11)}`);
+      fs.writeFileSync(filePath, lines.join('\n'));
+
+      const result = await readTool.execute({ file_path: filePath });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      // Should suggest a limit roughly half of 2000 (since tokens are ~2x over)
+      expect(text).toMatch(/try limit: \d+/);
+    });
+
+    it('Gate 3: does not mark file as read on rejection', async () => {
+      const filePath = path.join(tmpDir, 'nomark.txt');
+      const lines = Array.from({ length: 2000 }, (_, i) => `${i}: ${'abcdefghij'.repeat(11)}`);
+      fs.writeFileSync(filePath, lines.join('\n'));
+
+      await readTool.execute({ file_path: filePath });
+
+      // File should NOT be marked as read since Gate 3 rejected it
+      expect(registry.hasBeenRead(filePath)).toBe(false);
+    });
+
+    it('allows files under all gate thresholds', async () => {
+      const filePath = path.join(tmpDir, 'small.txt');
+      const lines = Array.from({ length: 50 }, (_, i) => `line ${i + 1}`);
+      fs.writeFileSync(filePath, lines.join('\n'));
+
+      const result = await readTool.execute({ file_path: filePath });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('line 1');
+      expect(text).toContain('line 50');
+      expect(result.details.rejected).toBeUndefined();
+      expect(registry.hasBeenRead(filePath)).toBe(true);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Tool description
+  // -----------------------------------------------------------------------
+
+  describe('tool description', () => {
+    it('includes size guidance', () => {
+      expect(readTool.description).toContain('256 KB');
+      expect(readTool.description).toContain('10.0 MB');
+    });
+
+    it('mentions Grep for searching', () => {
+      expect(readTool.description).toContain('Grep');
+    });
+
+    it('mentions token limit', () => {
+      expect(readTool.description).toContain('25,000 tokens');
+    });
+  });
 });

@@ -285,4 +285,86 @@ describe('Grep tool', () => {
       expect(text).not.toContain('dep.js');
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Token budget and output limits
+  // -----------------------------------------------------------------------
+
+  describe('token budget', () => {
+    it('truncates content mode output exceeding token budget', async () => {
+      // Create content that will exceed 25K tokens (~100K chars)
+      // 300 lines of ~400 chars each = ~120K chars
+      const longLine = 'x'.repeat(390);
+      const lines = Array.from({ length: 300 }, (_, i) => `match_${i}_${longLine}`);
+      fs.writeFileSync(path.join(tmpDir, 'big.ts'), lines.join('\n'));
+
+      const result = await grepTool.execute({
+        pattern: 'match_',
+        output_mode: 'content',
+      });
+
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(text).toContain('[Output truncated');
+      expect(text).toContain('token limit');
+      expect(result.details.truncated).toBe(true);
+    });
+
+    it('does not truncate output within token budget', async () => {
+      fs.writeFileSync(path.join(tmpDir, 'small.ts'), 'findme here\n');
+
+      const result = await grepTool.execute({
+        pattern: 'findme',
+        output_mode: 'content',
+      });
+
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(text).not.toContain('[Output truncated');
+      expect(result.details.truncated).toBe(false);
+    });
+
+    it('sets truncationReason to token_budget when truncated by tokens', async () => {
+      const longLine = 'y'.repeat(390);
+      const lines = Array.from({ length: 300 }, (_, i) => `hit_${i}_${longLine}`);
+      fs.writeFileSync(path.join(tmpDir, 'huge.ts'), lines.join('\n'));
+
+      const result = await grepTool.execute({
+        pattern: 'hit_',
+        output_mode: 'content',
+        head_limit: 0,
+      });
+
+      expect(result.details.truncated).toBe(true);
+      expect(result.details.truncationReason).toBe('token_budget');
+    });
+
+    it('includes guidance to narrow search in truncation notice', async () => {
+      const longLine = 'z'.repeat(390);
+      const lines = Array.from({ length: 300 }, (_, i) => `item_${i}_${longLine}`);
+      fs.writeFileSync(path.join(tmpDir, 'wide.ts'), lines.join('\n'));
+
+      const result = await grepTool.execute({
+        pattern: 'item_',
+        output_mode: 'content',
+      });
+
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      expect(text).toContain('Narrow your search');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Tool description
+  // -----------------------------------------------------------------------
+
+  describe('tool description', () => {
+    it('includes token limit info', () => {
+      expect(grepTool.description).toContain('25,000 tokens');
+    });
+
+    it('describes output modes', () => {
+      expect(grepTool.description).toContain('files_with_matches');
+      expect(grepTool.description).toContain('content');
+      expect(grepTool.description).toContain('count');
+    });
+  });
 });

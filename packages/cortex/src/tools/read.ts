@@ -15,6 +15,7 @@ import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
+import { estimateTokens } from '../token-estimator.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -41,6 +42,15 @@ export type ReadParamsType = Static<typeof ReadParams>;
 
 const DEFAULT_LIMIT = 2000;
 const MAX_LINE_LENGTH = 2000;
+
+/** Pre-read gate for full reads (no offset/limit provided). */
+const MAX_FULL_READ_BYTES = 256 * 1024; // 256 KB
+
+/** Hard ceiling even with offset/limit. Beyond this, use Bash. */
+const MAX_READABLE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+/** Post-read token ceiling on formatted output. */
+const MAX_OUTPUT_TOKENS = 25_000;
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
 const IMAGE_MIME_TYPES: Record<string, string> = {
@@ -100,6 +110,8 @@ export interface ReadDetails {
   truncatedChars: boolean;
   /** Starting line number (1-based) for the content returned. */
   startLine: number;
+  /** True when the read was rejected by a size/token gate (content is an error message, not file data). */
+  rejected?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +205,36 @@ function formatWithLineNumbers(
     .join('\n');
 }
 
+/**
+ * Format byte count as a human-readable string (KB or MB).
+ */
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${Math.round(bytes / 1024)} KB`;
+}
+
+/**
+ * Build a rejection result for size/token gate failures.
+ * Returns an error message as tool content with `rejected: true` in details.
+ */
+function makeRejection(filePath: string, byteSize: number, message: string): ToolContentDetails<ReadDetails> {
+  return {
+    content: [{ type: 'text', text: message }],
+    details: {
+      filePath,
+      totalLines: 0,
+      byteSize,
+      truncated: false,
+      truncatedLines: false,
+      truncatedChars: false,
+      startLine: 1,
+      rejected: true,
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tool factory
 // ---------------------------------------------------------------------------
@@ -210,7 +252,18 @@ export function createReadTool(config: ReadToolConfig): {
 
   const tool = {
     name: 'Read',
-    description: 'Read the contents of a file from the local filesystem.',
+    description: [
+      'Read file contents from the local filesystem.',
+      'Returns content with line numbers in cat -n format.',
+      '',
+      'Size limits:',
+      `- Files up to ${formatBytes(MAX_FULL_READ_BYTES)}: read in full (no offset/limit needed)`,
+      `- Files ${formatBytes(MAX_FULL_READ_BYTES)} to ${formatBytes(MAX_READABLE_BYTES)}: must provide offset and limit`,
+      `- Files over ${formatBytes(MAX_READABLE_BYTES)}: use Bash (head, tail, sed) instead`,
+      `- Output capped at ~${MAX_OUTPUT_TOKENS.toLocaleString()} tokens; reduce limit if exceeded`,
+      '',
+      'For searching file contents, use Grep instead of reading the whole file.',
+    ].join('\n'),
     parameters: ReadParams,
 
     async execute(params: ReadParamsType): Promise<ToolContentDetails<ReadDetails>> {
@@ -287,6 +340,15 @@ export function createReadTool(config: ReadToolConfig): {
         };
       }
 
+      // Gate 1: Absolute size ceiling - reject files > 10 MB entirely
+      if (stat.size > MAX_READABLE_BYTES) {
+        return makeRejection(
+          filePath,
+          stat.size,
+          `File is too large to read (${formatBytes(stat.size)}, limit ${formatBytes(MAX_READABLE_BYTES)}). Use Bash with head, tail, or sed to extract specific sections.`,
+        );
+      }
+
       const ext = path.extname(filePath).toLowerCase();
 
       // Handle image files
@@ -325,6 +387,16 @@ export function createReadTool(config: ReadToolConfig): {
             startLine: 1,
           },
         };
+      }
+
+      // Gate 2: Full-read size gate - reject full reads of files > 256 KB
+      const hasExplicitRange = params.offset !== undefined || params.limit !== undefined;
+      if (!hasExplicitRange && stat.size > MAX_FULL_READ_BYTES) {
+        return makeRejection(
+          filePath,
+          stat.size,
+          `File is too large to read in full (${formatBytes(stat.size)}, limit ${formatBytes(MAX_FULL_READ_BYTES)}). Provide offset and limit to read a specific range, or use Grep to search for specific content.`,
+        );
       }
 
       // File-unchanged dedup: if we already read this exact range and the
@@ -402,6 +474,21 @@ export function createReadTool(config: ReadToolConfig): {
       // Format with line numbers
       const formatted = formatWithLineNumbers(selectedLines, startIdx + 1);
 
+      // Gate 3: Post-read token estimation
+      const estimatedTokenCount = estimateTokens(formatted);
+      if (estimatedTokenCount > MAX_OUTPUT_TOKENS) {
+        const suggestedLimit = Math.floor(limit * MAX_OUTPUT_TOKENS / estimatedTokenCount);
+        return makeRejection(
+          filePath,
+          stat.size,
+          `Read result too large (estimated ~${estimatedTokenCount.toLocaleString()} tokens, limit ${MAX_OUTPUT_TOKENS.toLocaleString()}). ` +
+          `The file has ${totalLines} lines. Use a smaller limit (try limit: ${Math.max(1, suggestedLimit)}) ` +
+          `or use Grep to find the specific content you need.`,
+        );
+      }
+
+      // Only mark as read after passing all gates, so rejected reads
+      // can be retried without hitting the dedup stub.
       readRegistry.markRead(filePath, { timestamp: stat.mtimeMs, offset, limit });
 
       let text = formatted;
