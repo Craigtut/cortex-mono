@@ -305,6 +305,7 @@ export class ObservationalMemoryEngine {
     const observationSlotMessage: AgentMessage = {
       role: 'user',
       content: slotContent,
+      timestamp: Date.now(),
     };
     // Messages after the slot region that are not part of the observation slot
     const postSlotMessages = updatedSourceHistory;
@@ -580,11 +581,12 @@ export class ObservationalMemoryEngine {
   }
 
   /**
-   * Current token count of the observation content.
+   * Token count of activated observations only.
    */
   getObservationTokenCount(): number {
     return this.observationTokenCount;
   }
+
 
   /**
    * Whether the observer or reflector is currently running in the background.

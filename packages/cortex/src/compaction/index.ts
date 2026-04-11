@@ -521,12 +521,13 @@ export class CompactionManager {
   }
 
   /**
-   * Current token count of the observational memory content.
+   * Current token count of activated observations only.
    * Returns 0 when not using the observational strategy.
    */
   getObservationTokenCount(): number {
     return this.observationalEngine?.getObservationTokenCount() ?? 0;
   }
+
 
   /**
    * Whether the observer or reflector is currently running in the background.

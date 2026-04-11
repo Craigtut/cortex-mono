@@ -17,6 +17,8 @@ export interface SessionMeta {
   contextTokenCount: number;
   /** Accumulated session usage (cost, turns, tokens). Optional for backward compat. */
   usage?: SessionUsage;
+  /** Compaction strategy used by this session. Optional for backward compat. */
+  compactionStrategy?: 'observational' | 'classic';
 }
 
 export interface SavedSession {
@@ -63,6 +65,9 @@ function parseSessionMeta(v: unknown): SessionMeta | null {
   }
 
   const usage = o['usage'] as SessionUsage | undefined;
+  const compactionStrategy = o['compactionStrategy'] === 'observational' || o['compactionStrategy'] === 'classic'
+    ? o['compactionStrategy']
+    : undefined;
 
   return {
     id: o['id'],
@@ -74,6 +79,7 @@ function parseSessionMeta(v: unknown): SessionMeta | null {
     updatedAt: o['updatedAt'],
     contextTokenCount,
     ...(usage ? { usage } : {}),
+    ...(compactionStrategy ? { compactionStrategy } : {}),
   };
 }
 
@@ -111,6 +117,26 @@ export async function loadSession(sessionId: string): Promise<SavedSession | nul
     if (!parsedMeta) return null;
 
     return { history, meta: parsedMeta };
+  } catch {
+    return null;
+  }
+}
+
+export async function saveObservationalState(
+  sessionId: string,
+  state: unknown,
+): Promise<void> {
+  const dir = join(SESSIONS_DIR, sessionId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'observations.json'), JSON.stringify(state));
+}
+
+export async function loadObservationalState(
+  sessionId: string,
+): Promise<unknown | null> {
+  try {
+    const raw = await readFile(join(SESSIONS_DIR, sessionId, 'observations.json'), 'utf-8');
+    return JSON.parse(raw) as unknown;
   } catch {
     return null;
   }

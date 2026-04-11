@@ -180,7 +180,7 @@ async function main(): Promise<void> {
     yoloMode: args.yolo,
     initialEffort,
     resumeSessionId,
-    compactionStrategy: args.compaction,
+    ...(args.compaction ? { compactionStrategy: args.compaction } : {}),
   });
 
   await session.start();

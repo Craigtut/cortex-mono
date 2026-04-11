@@ -719,7 +719,7 @@ export class Session {
 
   /** Resume a previous session by loading and restoring its history. */
   async resume(sessionId: string): Promise<void> {
-    const { loadSession: load } = await import('./persistence/sessions.js');
+    const { loadSession: load, loadObservationalState } = await import('./persistence/sessions.js');
     const saved = await load(sessionId);
     if (!saved) {
       this.app?.transcript.addNotification('Resume Failed', `Session ${sessionId} not found.`);
@@ -736,6 +736,17 @@ export class Session {
     // Restore accumulated usage (cost, turns, tokens) from the saved session
     if (saved.meta.usage) {
       this.agent.restoreSessionUsage(saved.meta.usage);
+    }
+
+    // Restore observational memory state if the session used observational compaction
+    if (this.compactionStrategy === 'observational') {
+      const omState = await loadObservationalState(sessionId);
+      if (omState) {
+        this.agent.restoreObservationalMemoryState(
+          omState as Parameters<typeof this.agent.restoreObservationalMemoryState>[0],
+        );
+        this.updateObservationalMemoryStatus();
+      }
     }
 
     this.app?.transcript.addNotification(
@@ -767,8 +778,15 @@ export class Session {
       try {
         const history = this.agent.getConversationHistory();
         const meta = this.buildSessionMeta();
-        const { saveSession } = await import('./persistence/sessions.js');
-        await saveSession(this.sessionId, history, meta);
+        const { saveSession, saveObservationalState } = await import('./persistence/sessions.js');
+        const saves: Promise<void>[] = [saveSession(this.sessionId, history, meta)];
+        if (this.compactionStrategy === 'observational') {
+          const omState = this.agent.getObservationalMemoryState();
+          if (omState) {
+            saves.push(saveObservationalState(this.sessionId, omState));
+          }
+        }
+        await Promise.all(saves);
       } catch {
         // Best-effort save during shutdown
       }
@@ -848,9 +866,20 @@ export class Session {
       const history = this.agent.getConversationHistory();
       const meta = this.buildSessionMeta();
       this.saver.save(history, meta);
+      this.saveObservationalState();
     } catch {
       // Swallow auto-save errors silently
     }
+  }
+
+  private saveObservationalState(): void {
+    if (!this.agent || this.compactionStrategy !== 'observational') return;
+    const omState = this.agent.getObservationalMemoryState();
+    if (!omState) return;
+    // Fire-and-forget; observational state save is best-effort
+    import('./persistence/sessions.js').then(({ saveObservationalState: save }) => {
+      save(this.sessionId, omState).catch(() => {});
+    }).catch(() => {});
   }
 
   private buildSessionMeta(): SessionMeta {
@@ -863,6 +892,7 @@ export class Session {
       createdAt: this.createdAt,
       updatedAt: Date.now(),
       contextTokenCount: this.getDisplayedCurrentContextTokens(),
+      compactionStrategy: this.compactionStrategy,
     };
     if (this.agent) {
       meta.usage = this.agent.getSessionUsage();
