@@ -108,7 +108,9 @@ export function createEditTool(config: EditToolConfig): {
 
   const tool = {
     name: 'Edit',
-    description: 'Make precise string replacements in an existing file.',
+    description:
+      'Make precise string replacements in an existing file. ' +
+      'You MUST Read the file before using this tool. The edit will be rejected if the file has not been read first.',
     parameters: EditParams,
 
     async execute(params: EditParamsType): Promise<ToolContentDetails<EditDetails>> {

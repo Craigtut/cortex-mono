@@ -11,7 +11,7 @@ import type { MicrocompactionConfig, PersistResultFn } from '../../../src/types.
 // ---------------------------------------------------------------------------
 
 function makeAssistantMsg(content: string): AgentMessage {
-  return { role: 'assistant', content };
+  return { role: 'assistant', content, timestamp: 0 };
 }
 
 function makeToolResult(content: string, toolName: string): AgentMessage {
@@ -20,6 +20,7 @@ function makeToolResult(content: string, toolName: string): AgentMessage {
     content: [
       { type: 'tool_result', text: content, name: toolName },
     ],
+    timestamp: 0,
   };
 }
 

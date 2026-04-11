@@ -28,6 +28,8 @@ import type { ContextManagerConfig } from './types.js';
 export interface AgentMessage {
   role: 'user' | 'assistant';
   content: string | Array<{ type: string; text?: string; [key: string]: unknown }>;
+  /** Epoch milliseconds when this message was created. Stamped by Cortex at turn boundaries. */
+  timestamp: number;
 }
 
 /**
@@ -124,6 +126,7 @@ export class ContextManager {
     this.agent.state.messages[index] = {
       role: 'user',
       content,
+      timestamp: Date.now(),
     };
   }
 
@@ -205,6 +208,7 @@ export class ContextManager {
           {
             role: 'user' as const,
             content: this.ephemeralContent,
+            timestamp: Date.now(),
           },
         ],
       };
@@ -221,6 +225,7 @@ export class ContextManager {
       this.agent.state.messages.push({
         role: 'user',
         content: '',
+        timestamp: 0,
       });
     }
   }

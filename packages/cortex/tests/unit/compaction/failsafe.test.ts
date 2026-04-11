@@ -11,11 +11,11 @@ import type { AgentMessage } from '../../../src/context-manager.js';
 // ---------------------------------------------------------------------------
 
 function makeUserMsg(content: string): AgentMessage {
-  return { role: 'user', content };
+  return { role: 'user', content, timestamp: 0 };
 }
 
 function makeAssistantMsg(content: string): AgentMessage {
-  return { role: 'assistant', content };
+  return { role: 'assistant', content, timestamp: 0 };
 }
 
 function makeToolUse(toolName: string): AgentMessage {
@@ -24,6 +24,7 @@ function makeToolUse(toolName: string): AgentMessage {
     content: [
       { type: 'tool_use', name: toolName },
     ],
+    timestamp: 0,
   };
 }
 
@@ -33,6 +34,7 @@ function makeToolResult(content: string, toolName?: string): AgentMessage {
     content: [
       { type: 'tool_result', text: content, ...(toolName ? { name: toolName } : {}) },
     ],
+    timestamp: 0,
   };
 }
 

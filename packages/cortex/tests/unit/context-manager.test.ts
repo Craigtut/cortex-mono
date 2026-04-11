@@ -82,10 +82,11 @@ describe('ContextManager', () => {
 
       cm.setSlot('second', 'Hello from second slot');
 
-      expect(agent.state.messages[1]).toEqual({
+      expect(agent.state.messages[1]).toMatchObject({
         role: 'user',
         content: 'Hello from second slot',
       });
+      expect(agent.state.messages[1]!.timestamp).toEqual(expect.any(Number));
     });
 
     it('updates position 0 for the first slot', () => {
@@ -95,10 +96,11 @@ describe('ContextManager', () => {
 
       cm.setSlot('alpha', 'First slot content');
 
-      expect(agent.state.messages[0]).toEqual({
+      expect(agent.state.messages[0]).toMatchObject({
         role: 'user',
         content: 'First slot content',
       });
+      expect(agent.state.messages[0]!.timestamp).toEqual(expect.any(Number));
     });
 
     it('overwrites previous content when called multiple times', () => {
@@ -306,10 +308,11 @@ describe('ContextManager', () => {
       const result = hook(context);
 
       expect(result.messages.length).toBe(3);
-      expect(result.messages[2]).toEqual({
+      expect(result.messages[2]).toMatchObject({
         role: 'user',
         content: 'Current emotional state: calm',
       });
+      expect(result.messages[2]!.timestamp).toEqual(expect.any(Number));
     });
 
     it('ephemeral content appears AFTER conversation history', () => {

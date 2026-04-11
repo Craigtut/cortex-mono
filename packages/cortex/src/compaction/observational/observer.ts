@@ -29,17 +29,44 @@ import { estimateTokens } from '../../token-estimator.js';
  * with content arrays (tool calls/results) receive structured formatting
  * so the observer can extract meaningful takeaways.
  *
- * Messages are grouped by date when date information can be inferred.
+ * Messages with timestamps are formatted with their actual date and time.
+ * Messages without timestamps fall back to sequential labels.
+ * Messages are grouped by date when timestamps are available.
  */
 export function formatMessagesForObserver(messages: AgentMessage[]): string {
   if (messages.length === 0) return '';
 
   const lines: string[] = [];
+  let currentDateHeader: string | null = null;
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
-    const label = `Message ${i + 1}`;
     const roleLabel = msg.role;
+
+    // Build the timestamp label from message metadata
+    let label: string;
+    if (msg.timestamp !== 0) {
+      const date = new Date(msg.timestamp);
+      const dateHeader = formatDateHeader(date);
+
+      // Insert a date header when the date changes
+      if (dateHeader !== currentDateHeader) {
+        if (currentDateHeader !== null) {
+          lines.push(''); // blank line between date groups
+        }
+        lines.push(`Date: ${dateHeader}`);
+        currentDateHeader = dateHeader;
+      }
+
+      label = formatTime(date);
+    } else {
+      // No timestamp available; use a sequential fallback
+      if (currentDateHeader === null) {
+        lines.push('Date: (not specified)');
+        currentDateHeader = '(not specified)';
+      }
+      label = `Message ${i + 1}`;
+    }
 
     if (typeof msg.content === 'string') {
       lines.push(`**${roleLabel} (${label})**: ${msg.content}`);
@@ -56,6 +83,30 @@ export function formatMessagesForObserver(messages: AgentMessage[]): string {
   }
 
   return lines.join('\n\n');
+}
+
+/**
+ * Format a date for the observer date header.
+ * Example: "April 11, 2026"
+ */
+function formatDateHeader(date: Date): string {
+  return date.toLocaleDateString('en-US', {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+/**
+ * Format a time for a message label.
+ * Example: "2:30 PM"
+ */
+function formatTime(date: Date): string {
+  return date.toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
 }
 
 /**
@@ -301,7 +352,7 @@ export function buildObserverMessages(
     result.push({ role: 'user', content: preamble + truncated });
   }
 
-  // 2. Formatted message history
+  // 2. Formatted message history (timestamps from message metadata)
   const formatted = formatMessagesForObserver(messages);
   result.push({ role: 'user', content: formatted });
 

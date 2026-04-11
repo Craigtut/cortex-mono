@@ -438,13 +438,13 @@ export function applyTrimAction(message: AgentMessage, action: TrimAction): Agen
       }
       return part;
     });
-    return { role: message.role, content: newContent };
+    return { role: message.role, content: newContent, timestamp: message.timestamp };
   }
 
   // Plain string content: replace directly (backward compat for non-tool messages)
   const content = typeof message.content === 'string' ? message.content : '';
   const trimmed = getTrimmedText(content, action);
-  return { role: message.role, content: trimmed };
+  return { role: message.role, content: trimmed, timestamp: message.timestamp };
 }
 
 /**
@@ -608,9 +608,9 @@ export class MicrocompactionEngine {
             ? { ...part, text: persistedText }
             : part,
         );
-        return { role: message.role, content: newContent };
+        return { role: message.role, content: newContent, timestamp: message.timestamp };
       }
-      return { role: message.role, content: persistedText };
+      return { role: message.role, content: persistedText, timestamp: message.timestamp };
     } catch {
       // Persist failed, fall back to standard trim
       return applyTrimAction(message, action);

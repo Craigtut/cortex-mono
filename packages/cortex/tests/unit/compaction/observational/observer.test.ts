@@ -15,8 +15,8 @@ import type { AgentMessage } from '../../../../src/context-manager.js';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const userMsg = (content: string): AgentMessage => ({ role: 'user', content });
-const assistantMsg = (content: string): AgentMessage => ({ role: 'assistant', content });
+const userMsg = (content: string): AgentMessage => ({ role: 'user', content, timestamp: 0 });
+const assistantMsg = (content: string): AgentMessage => ({ role: 'assistant', content, timestamp: 0 });
 
 function makeToolUseMsg(name: string): AgentMessage {
   return {
@@ -24,6 +24,7 @@ function makeToolUseMsg(name: string): AgentMessage {
     content: [
       { type: 'tool_use', id: 'toolu_123', name, input: { path: '/tmp/test.txt' } },
     ],
+    timestamp: 0,
   } as AgentMessage;
 }
 
@@ -33,6 +34,7 @@ function makeToolResultMsg(text: string): AgentMessage {
     content: [
       { type: 'tool_result', tool_use_id: 'toolu_123', text },
     ],
+    timestamp: 0,
   } as AgentMessage;
 }
 
@@ -85,7 +87,34 @@ describe('formatMessagesForObserver', () => {
     const result = formatMessagesForObserver(messages);
 
     const parts = result.split('\n\n');
-    expect(parts.length).toBe(3);
+    // 4 parts: date header + 3 messages (messages without timestamps get a fallback date header)
+    expect(parts.length).toBe(4);
+    expect(parts[0]).toContain('Date:');
+  });
+
+  it('uses real timestamps from messages', () => {
+    const ts = new Date('2026-04-11T14:30:00Z').getTime();
+    const messages: AgentMessage[] = [
+      { role: 'user', content: 'Hello', timestamp: ts },
+      { role: 'assistant', content: 'Hi there', timestamp: ts + 60_000 },
+    ];
+    const result = formatMessagesForObserver(messages);
+
+    expect(result).toContain('Date: April 11, 2026');
+    expect(result).not.toContain('Message 1');
+  });
+
+  it('groups messages by date when timestamps span multiple days', () => {
+    const day1 = new Date('2026-04-10T10:00:00Z').getTime();
+    const day2 = new Date('2026-04-11T14:00:00Z').getTime();
+    const messages: AgentMessage[] = [
+      { role: 'user', content: 'Day one', timestamp: day1 },
+      { role: 'user', content: 'Day two', timestamp: day2 },
+    ];
+    const result = formatMessagesForObserver(messages);
+
+    expect(result).toContain('Date: April 10, 2026');
+    expect(result).toContain('Date: April 11, 2026');
   });
 });
 

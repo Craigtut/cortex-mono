@@ -1404,13 +1404,19 @@ export class CortexAgent {
     this.agent.state.messages.splice(slotCount);
     // Sanitize restored messages: fix undefined/null/empty content that may
     // have been checkpointed from previous sessions with tool execution bugs.
+    const now = Date.now();
     const sanitized = messages.map(msg => {
       const content = (msg as unknown as Record<string, unknown>)['content'];
+      let patched = msg;
       if (content === undefined || content === null ||
           (Array.isArray(content) && content.length === 0)) {
-        return { ...msg, content: [{ type: 'text' as const, text: '(no output)' }] };
+        patched = { ...patched, content: [{ type: 'text' as const, text: '(no output)' }] };
       }
-      return msg;
+      // Migrate messages from old sessions that predate the timestamp field
+      if (patched.timestamp == null) {
+        patched = { ...patched, timestamp: now };
+      }
+      return patched;
     });
     // Append restored messages
     this.agent.state.messages.push(...sanitized);
@@ -2328,7 +2334,7 @@ export class CortexAgent {
           if (this.compactionManager.hasObservations()) {
             const obsSlotIndex = this.contextManager.slotCount - 1;
             if (obsSlotIndex >= 0 && obsSlotIndex < result.messages.length) {
-              result.messages[obsSlotIndex] = { role: 'user', content: slotContent };
+              result.messages[obsSlotIndex] = { role: 'user', content: slotContent, timestamp: Date.now() };
             }
           }
         }
@@ -2368,20 +2374,20 @@ export class CortexAgent {
     // Build injection messages (ephemeral + background state + skills)
     const injections: AgentMessage[] = [];
     if (ephemeralContent) {
-      injections.push({ role: 'user' as const, content: ephemeralContent });
+      injections.push({ role: 'user' as const, content: ephemeralContent, timestamp: Date.now() });
     }
 
     // Inject background task state so the agent has visibility into
     // running sub-agents and background bash processes.
     const backgroundState = this.buildBackgroundTaskState();
     if (backgroundState) {
-      injections.push({ role: 'user' as const, content: backgroundState });
+      injections.push({ role: 'user' as const, content: backgroundState, timestamp: Date.now() });
     }
     if (this.skillBuffer.length > 0) {
       const formatted = this.skillBuffer.map(s =>
         `<skill-instructions name="${s.name}">\n${s.content}\n</skill-instructions>`,
       ).join('\n\n');
-      injections.push({ role: 'user' as const, content: formatted });
+      injections.push({ role: 'user' as const, content: formatted, timestamp: Date.now() });
     }
 
     if (injections.length > 0) {
@@ -2717,6 +2723,22 @@ export class CortexAgent {
       this.eventBridge.on('turn_end', (event) => {
         const isChildEvent = Boolean(event.childTaskId);
 
+        // Stamp any new messages that lack a timestamp. Messages are added
+        // by pi-agent-core during the agentic loop (user prompts, assistant
+        // responses, tool results). Cortex stamps them here at the turn
+        // boundary so they carry temporal metadata for observational memory.
+        if (!isChildEvent) {
+          const now = Date.now();
+          const messages = this.agent.state.messages;
+          const slotCount = this.contextManager.slotCount;
+          for (let i = slotCount; i < messages.length; i++) {
+            const msg = messages[i];
+            if (msg && msg.timestamp == null) {
+              msg.timestamp = now;
+            }
+          }
+        }
+
         // Read typed usage from EventBridge (centralized extraction).
         // CompactionManager only gets parent events (child tokens don't
         // affect this agent's context window). Session usage accumulates
@@ -2777,29 +2799,35 @@ export class CortexAgent {
           this._sessionUsage.totalTurns += 1;
         }
 
-        if (event.textOutput) {
-          for (const handler of this.turnCompleteHandlers) {
-            try {
-              handler(event.textOutput);
-            } catch (err) {
-              this.logger.error('[CortexAgent] onTurnComplete handler threw', {
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          }
-        } else {
-          // If the bridge did not parse (working tags disabled), still emit
-          // with raw text for non-tag scenarios
-          const text = this.extractTurnTextFromEvent(event.data);
-          if (text) {
-            const output = parseWorkingTags(text);
+        // Only dispatch onTurnComplete for parent events. Child turn_end
+        // events are forwarded by EventBridge.forwardFrom() but must not
+        // surface in the parent's TUI; doing so leaks raw subagent text
+        // (including XML tags and metadata) into the main chat thread.
+        if (!isChildEvent) {
+          if (event.textOutput) {
             for (const handler of this.turnCompleteHandlers) {
               try {
-                handler(output);
+                handler(event.textOutput);
               } catch (err) {
                 this.logger.error('[CortexAgent] onTurnComplete handler threw', {
                   error: err instanceof Error ? err.message : String(err),
                 });
+              }
+            }
+          } else {
+            // If the bridge did not parse (working tags disabled), still emit
+            // with raw text for non-tag scenarios
+            const text = this.extractTurnTextFromEvent(event.data);
+            if (text) {
+              const output = parseWorkingTags(text);
+              for (const handler of this.turnCompleteHandlers) {
+                try {
+                  handler(output);
+                } catch (err) {
+                  this.logger.error('[CortexAgent] onTurnComplete handler threw', {
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
               }
             }
           }

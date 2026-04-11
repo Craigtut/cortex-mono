@@ -131,7 +131,9 @@ export function createWriteTool(config: WriteToolConfig): {
 
   const tool = {
     name: 'Write',
-    description: 'Create a new file or overwrite an existing file on the local filesystem.',
+    description:
+      'Create a new file or overwrite an existing file on the local filesystem. ' +
+      'If the file already exists, you MUST Read it before using this tool. The write will be rejected if an existing file has not been read first.',
     parameters: WriteParams,
 
     async execute(params: WriteParamsType): Promise<ToolContentDetails<WriteDetails>> {

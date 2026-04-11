@@ -16,8 +16,8 @@ import type {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const userMsg = (content: string): AgentMessage => ({ role: 'user', content });
-const assistantMsg = (content: string): AgentMessage => ({ role: 'assistant', content });
+const userMsg = (content: string): AgentMessage => ({ role: 'user', content, timestamp: 0 });
+const assistantMsg = (content: string): AgentMessage => ({ role: 'assistant', content, timestamp: 0 });
 
 const OBSERVER_OUTPUT =
   '<observations>\nDate: Apr 10, 2026\n\n* \u{1F7E1} (14:30) Test observation\n</observations>\n\n' +

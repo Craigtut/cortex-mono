@@ -164,7 +164,7 @@ export function buildSummaryMessage(
 ): AgentMessage {
   const timestamp = new Date().toISOString();
   const content = `<compaction-summary generated="${timestamp}" turns-summarized="${turnsCompacted}">\n${summary}\n</compaction-summary>`;
-  return { role: 'user', content };
+  return { role: 'user', content, timestamp: Date.now() };
 }
 
 /**
