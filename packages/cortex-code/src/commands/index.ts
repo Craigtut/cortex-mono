@@ -5,7 +5,7 @@ import { compactCommand } from './compact.js';
 import { modelCommand, providerCommand, utilityModelCommand } from './model.js';
 import { costCommand } from './cost.js';
 import { contextWindowCommand } from './context-window.js';
-import { resumeCommand } from './resume.js';
+import { resumeCommand, resumeAllCommand } from './resume.js';
 import { loginCommand } from './login.js';
 import { logoutCommand } from './logout.js';
 import { yoloCommand } from './yolo.js';
@@ -63,6 +63,7 @@ export function registerBuiltinCommands(): void {
   registerCommand(costCommand);
   registerCommand(contextWindowCommand);
   registerCommand(resumeCommand);
+  registerCommand(resumeAllCommand);
   registerCommand(loginCommand);
   registerCommand(logoutCommand);
   registerCommand(yoloCommand);

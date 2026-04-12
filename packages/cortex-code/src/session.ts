@@ -45,6 +45,7 @@ import { checkProjectMcpTrust, trustProjectMcpConfig } from './discovery/mcp-tru
 import {
   generateSessionId,
   createDebouncedSaver,
+  createToolResultPersistor,
   type SessionMeta,
 } from './persistence/sessions.js';
 import { getCommand, registerBuiltinCommands } from './commands/index.js';
@@ -149,6 +150,7 @@ export class Session {
       getApiKey: (provider) => this.getApiKey(provider),
       contextWindowLimit: this.config.contextWindowLimit ?? null,
       compaction: { strategy: this.compactionStrategy },
+      persistResult: createToolResultPersistor(this.sessionId),
       logger: log,
       ...this.buildDiagnosticsConfig() ? { diagnostics: this.buildDiagnosticsConfig()! } : {},
     });
@@ -749,10 +751,17 @@ export class Session {
       }
     }
 
-    this.app?.transcript.addNotification(
-      'Session Resumed',
-      `Restored ${saved.history.length} messages from previous session`,
-    );
+    // Replay message history into the transcript so the user sees the
+    // previous conversation. Cortex already has the history in context; this
+    // is purely visual rehydration.
+    if (this.app) {
+      const { replayHistoryToTranscript } = await import('./utils/replay-history.js');
+      this.app.transcript.addNotification(
+        'Session Resumed',
+        `Replaying ${saved.history.length} messages from previous session.`,
+      );
+      replayHistoryToTranscript(saved.history, this.app.transcript);
+    }
     this.updateFooterContextUsage();
   }
 
