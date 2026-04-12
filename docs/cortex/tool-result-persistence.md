@@ -68,7 +68,7 @@ const agent = await CortexAgent.create({
   systemPrompt: ...,
   
   persistResult: async (content, { toolName, toolCallId }) => {
-    const filename = `${toolName}-${toolCallId ?? Date.now()}.txt`;
+    const filename = `${toolName}-${toolCallId ?? Date.now()}.md`;
     const fullPath = path.join(myToolResultsDir, filename);
     await fs.promises.writeFile(fullPath, content);
     return fullPath;
@@ -83,6 +83,49 @@ That single callback flows down to:
 
 If both `config.persistResult` and `config.compaction.microcompaction.persistResult`
 are set, the top-level wins (and the override is logged at debug level).
+
+## Consumer Integration Guide
+
+Cortex doesn't prescribe *where* to write files, only that the returned path
+is absolute and readable for the remainder of the conversation. A few
+practices make life easier for consumers:
+
+**Session-segment the output directory.** Tool results belong to the
+conversation that produced them. Write under a per-session subdirectory
+(e.g. `~/.cortex/sessions/{sessionId}/tool-results/`) so they're easy to
+garbage-collect when a session is deleted and trivially scoped during
+debugging.
+
+**Pick filenames that are stable when you have a `toolCallId` and
+content-derived when you don't.**
+
+- **Proactive path** (`toolCallId` present): `{toolName}-{toolCallId}.md` is
+  stable and idempotent. If the same tool call is persisted twice, the
+  second write overwrites the first with identical content.
+- **Reactive path** (`messageIndex` present, `toolCallId` absent):
+  `messageIndex` alone is not unique — a single message can contain multiple
+  tool results. Suffix with a short hash of the content (e.g.
+  `{toolName}-msg{messageIndex}-{sha8}.md`) to avoid collisions.
+
+**Lazy-create the directory on first call.** Don't pre-create an empty
+`tool-results/` dir for sessions that never persist anything; `mkdir
+{ recursive: true }` on the first invocation is enough.
+
+**Returned paths must survive your session save/load cycle.** Cortex embeds
+the path in the message `content` (not in a sidecar field), so as long as
+your persistence layer preserves message content, the path survives reload
+and the agent can continue to Read it in later turns.
+
+**Cleanup is your concern.** Cortex never deletes files it didn't create.
+If you delete a session, delete its `tool-results/` subdirectory along with
+it; a recursive `rm` of the session directory handles this naturally.
+
+**`.md` vs `.txt`.** Either works. Markdown renders nicely if the file is
+ever opened by a human, and the agent (which is most often the reader) is
+comfortable with either.
+
+A reference implementation lives in
+`packages/cortex-code/src/persistence/sessions.ts` (`createToolResultPersistor`).
 
 ## Preview Format
 

@@ -1,6 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { readFile, rm, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import {
   createDebouncedSaver,
+  createToolResultPersistor,
   generateSessionId,
   sanitizeHistoryForSave,
 } from '../../src/persistence/sessions.js';
@@ -57,6 +61,122 @@ describe('createDebouncedSaver', () => {
     } catch {
       // Expected: no ~/.cortex/sessions directory in test env
     }
+  });
+});
+
+describe('createToolResultPersistor', () => {
+  const createdSessionDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of createdSessionDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  function uniqueSession(): { id: string; dir: string; toolResultsDir: string } {
+    const id = `__test__-${generateSessionId()}`;
+    const dir = join(homedir(), '.cortex', 'sessions', id);
+    const toolResultsDir = join(dir, 'tool-results');
+    createdSessionDirs.push(dir);
+    return { id, dir, toolResultsDir };
+  }
+
+  it('writes content to tool-results and returns an absolute path', async () => {
+    const { id, toolResultsDir } = uniqueSession();
+    const persist = createToolResultPersistor(id);
+
+    const content = 'x'.repeat(50_000);
+    const path = await persist(content, {
+      toolName: 'Bash',
+      category: 'non-reproducible',
+      toolCallId: 'call-abc123',
+    });
+
+    expect(path.startsWith('/')).toBe(true);
+    expect(path).toBe(join(toolResultsDir, 'Bash-call-abc123.md'));
+    const roundTripped = await readFile(path, 'utf-8');
+    expect(roundTripped).toBe(content);
+  });
+
+  it('uses toolCallId naming when provided (proactive path)', async () => {
+    const { id, toolResultsDir } = uniqueSession();
+    const persist = createToolResultPersistor(id);
+
+    const path = await persist('hello', {
+      toolName: 'SubAgent',
+      category: 'non-reproducible',
+      toolCallId: 'tc-42',
+    });
+
+    expect(path).toBe(join(toolResultsDir, 'SubAgent-tc-42.md'));
+  });
+
+  it('uses messageIndex + content hash when toolCallId is absent (reactive path)', async () => {
+    const { id, toolResultsDir } = uniqueSession();
+    const persist = createToolResultPersistor(id);
+
+    const pathA = await persist('content-a', {
+      toolName: 'Grep',
+      category: 'computational',
+      messageIndex: 7,
+    });
+    const pathB = await persist('content-b', {
+      toolName: 'Grep',
+      category: 'computational',
+      messageIndex: 7,
+    });
+
+    expect(pathA).toMatch(new RegExp(`${toolResultsDir}/Grep-msg7-[0-9a-f]{8}\\.md$`));
+    expect(pathB).toMatch(new RegExp(`${toolResultsDir}/Grep-msg7-[0-9a-f]{8}\\.md$`));
+    expect(pathA).not.toBe(pathB);
+  });
+
+  it('is idempotent for the same toolCallId (overwrites with same path)', async () => {
+    const { id } = uniqueSession();
+    const persist = createToolResultPersistor(id);
+
+    const path1 = await persist('first', {
+      toolName: 'Bash',
+      category: 'non-reproducible',
+      toolCallId: 'same-id',
+    });
+    const path2 = await persist('second', {
+      toolName: 'Bash',
+      category: 'non-reproducible',
+      toolCallId: 'same-id',
+    });
+
+    expect(path1).toBe(path2);
+    expect(await readFile(path1, 'utf-8')).toBe('second');
+  });
+
+  it('sanitizes MCP-style tool names into filename-safe segments', async () => {
+    const { id, toolResultsDir } = uniqueSession();
+    const persist = createToolResultPersistor(id);
+
+    const path = await persist('payload', {
+      toolName: 'mcp__playwright__browser_snapshot',
+      category: 'ephemeral',
+      toolCallId: 'tc-1',
+    });
+
+    expect(path).toBe(join(toolResultsDir, 'mcp__playwright__browser_snapshot-tc-1.md'));
+  });
+
+  it('lazily creates the tool-results directory on first call', async () => {
+    const { id, toolResultsDir } = uniqueSession();
+    const persist = createToolResultPersistor(id);
+
+    await expect(stat(toolResultsDir)).rejects.toThrow();
+
+    await persist('payload', {
+      toolName: 'Bash',
+      category: 'non-reproducible',
+      toolCallId: 'tc-1',
+    });
+
+    const info = await stat(toolResultsDir);
+    expect(info.isDirectory()).toBe(true);
   });
 });
 

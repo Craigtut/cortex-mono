@@ -1,8 +1,8 @@
 import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { randomUUID } from 'node:crypto';
-import type { SessionUsage } from '@animus-labs/cortex';
+import { createHash, randomUUID } from 'node:crypto';
+import type { PersistResultFn, SessionUsage } from '@animus-labs/cortex';
 
 const SESSIONS_DIR = join(homedir(), '.cortex', 'sessions');
 
@@ -140,6 +140,49 @@ export async function loadObservationalState(
   } catch {
     return null;
   }
+}
+
+/**
+ * Sanitize a tool name for use in a filename. Tool names can include MCP
+ * namespacing (e.g. `mcp__playwright__browser_snapshot`), which is already
+ * filename-safe, but we still strip anything outside [A-Za-z0-9_-] to be safe.
+ */
+function safeToolName(toolName: string): string {
+  return toolName.replace(/[^A-Za-z0-9_-]/g, '_');
+}
+
+/**
+ * Build a persistor that writes oversized tool results to
+ * `~/.cortex/sessions/{sessionId}/tool-results/`. The returned absolute path
+ * is embedded in the replacement text Cortex writes into the conversation, so
+ * the agent can re-read the full content via the Read tool. Paths live in
+ * message `content`, which survives `sanitizeHistoryForSave`, so they remain
+ * valid across session reload.
+ */
+export function createToolResultPersistor(sessionId: string): PersistResultFn {
+  const dir = join(SESSIONS_DIR, sessionId, 'tool-results');
+  let dirReady: Promise<void> | null = null;
+
+  return async (content, metadata) => {
+    if (!dirReady) {
+      dirReady = mkdir(dir, { recursive: true }).then(() => undefined);
+    }
+    await dirReady;
+
+    const tool = safeToolName(metadata.toolName);
+    let filename: string;
+    if (metadata.toolCallId) {
+      filename = `${tool}-${metadata.toolCallId}.md`;
+    } else {
+      const hash = createHash('sha256').update(content).digest('hex').slice(0, 8);
+      const idx = metadata.messageIndex ?? 0;
+      filename = `${tool}-msg${idx}-${hash}.md`;
+    }
+
+    const fullPath = join(dir, filename);
+    await writeFile(fullPath, content, 'utf-8');
+    return fullPath;
+  };
 }
 
 export async function listSessions(): Promise<SessionMeta[]> {
