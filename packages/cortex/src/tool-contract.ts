@@ -12,6 +12,32 @@ export interface CortexTool<TParams = unknown, TResult = unknown> {
   description: string;
   parameters: unknown;
   execute: (params: TParams, context?: ToolExecuteContext) => Promise<TResult>;
+
+  /**
+   * Marks this tool as eligible for deferred loading. When the agent has
+   * `deferredTools.enabled = true`, deferred tools are NOT included in the
+   * `tools` array sent to the model on every turn. Instead, only their names
+   * appear in the `_available_tools` slot, and the model uses ToolSearch to
+   * load full schemas on demand.
+   *
+   * MCP tools get `isMcp: true` set automatically by the MCP client and are
+   * deferred when `deferredTools.deferMcp` is true (default). Built-in or
+   * consumer-supplied tools can opt in via `shouldDefer: true`.
+   */
+  shouldDefer?: boolean;
+
+  /**
+   * Forces this tool to always be sent in the `tools` array, even if it
+   * matches deferral criteria (e.g., an MCP tool the consumer wants always
+   * available). Overrides `shouldDefer` and the `deferMcp` config.
+   */
+  alwaysLoad?: boolean;
+
+  /**
+   * Marker indicating this tool was wrapped from an MCP server. Set
+   * automatically by the MCP client. Consumers should not set this manually.
+   */
+  isMcp?: boolean;
 }
 
 /**

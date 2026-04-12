@@ -45,6 +45,8 @@ import { createBashTool } from './tools/bash/index.js';
 import { createTaskOutputTool } from './tools/task-output.js';
 import { createWebFetchTool } from './tools/web-fetch/index.js';
 import { TOOL_NAMES } from './tools/index.js';
+import { DeferredToolRegistry } from './tools/tool-search/registry.js';
+import { createToolSearchTool, TOOL_SEARCH_TOOL_NAME } from './tools/tool-search/index.js';
 import { wrapModel, unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime } from './tools/runtime.js';
@@ -340,6 +342,15 @@ export class CortexAgent {
   private readonly registeredTools: RegisteredTool[];
   private readonly toolRuntime: CortexToolRuntime;
 
+  // Deferred tool loading. When `_deferredToolsEnabled` is true, tools that
+  // match deferral criteria are pulled out of the per-turn tools array and
+  // announced by name via the `_available_tools` slot. The agent uses the
+  // ToolSearch tool to load specific tools on demand.
+  private readonly _deferredToolsEnabled: boolean;
+  private readonly _deferMcp: boolean;
+  private readonly _deferredAlwaysLoad: ReadonlySet<string>;
+  private readonly deferredToolRegistry: DeferredToolRegistry;
+
   // Tool result persistence (proactive, at execution boundary).
   // Same callback flows to compaction (reactive) via MicrocompactionConfig.
   private readonly persistResult?: PersistResultFn;
@@ -460,6 +471,15 @@ export class CortexAgent {
     this.primaryPiModel = primaryPiModel;
     this.resolvedUtilityModel = utilityModel;
     this.resolvedUtilityPiModel = utilityPiModel;
+
+    // Resolve deferred tools config and create the registry up-front. Built-in
+    // tool creation needs the registry so it can wire ToolSearch's
+    // onAfterDiscovery callback to refreshTools().
+    this._deferredToolsEnabled = config.deferredTools?.enabled ?? false;
+    this._deferMcp = config.deferredTools?.deferMcp ?? true;
+    this._deferredAlwaysLoad = new Set(config.deferredTools?.alwaysLoad ?? []);
+    this.deferredToolRegistry = new DeferredToolRegistry();
+
     // Auto-register built-in tools, filtered by disableTools config
     const disabledSet = new Set(config.disableTools ?? []);
     const builtinTools = this.createBuiltinTools(disabledSet);
@@ -493,7 +513,15 @@ export class CortexAgent {
     }
 
     const compactionStrategy = compactionConfig.strategy ?? 'observational';
-    const slots = [...(config.slots ?? [])];
+    // Slot ordering by stability (most stable first):
+    //   1. `_available_tools` (changes only on MCP server connect/disconnect)
+    //   2. consumer slots (consumer decides their own ordering)
+    //   3. `_observations`   (changes potentially every turn)
+    const slots: string[] = [];
+    if (this._deferredToolsEnabled) {
+      slots.push('_available_tools');
+    }
+    slots.push(...(config.slots ?? []));
     if (compactionStrategy === 'observational') {
       slots.push('_observations');
     }
@@ -1643,10 +1671,25 @@ export class CortexAgent {
   /**
    * Update the agent's tool set by adapting Cortex's canonical in-process
    * tool contract to pi-agent-core's raw execute signature.
+   *
+   * When deferred tools are enabled, this also partitions the union of
+   * registered + MCP tools into a "loaded" set (sent to the API) and a
+   * "deferred" set (announced by name in the `_available_tools` slot).
    */
   refreshTools(): void {
     const mcpTools = this.mcpClientManager.getTools();
-    const allTools = [...this.registeredTools, ...mcpTools].map(tool => {
+    const candidateTools: CortexTool[] = [...this.registeredTools, ...mcpTools];
+
+    const { loaded, deferred } = this._deferredToolsEnabled
+      ? this.partitionDeferredTools(candidateTools)
+      : { loaded: candidateTools, deferred: [] as CortexTool[] };
+
+    if (this._deferredToolsEnabled) {
+      this.deferredToolRegistry.setDeferredPool(deferred);
+      this.updateAvailableToolsSlot();
+    }
+
+    const allTools = loaded.map(tool => {
       const toolWithOptionalLabel = tool as unknown as { label?: unknown; name: string };
       const label = typeof toolWithOptionalLabel.label === 'string'
         ? toolWithOptionalLabel.label
@@ -1693,6 +1736,56 @@ export class CortexAgent {
       this.agent.setTools(allTools as Parameters<typeof this.agent.setTools>[0]);
     }
     this.refreshPromptState();
+  }
+
+  /**
+   * Partition candidate tools into "loaded" (sent on every turn) and
+   * "deferred" (announced by name in the `_available_tools` slot).
+   *
+   * A tool is deferred when:
+   *   - It is not in the consumer's `alwaysLoad` allowlist, AND
+   *   - Its `alwaysLoad` field is not true, AND
+   *   - It has not been discovered via ToolSearch this session, AND
+   *   - Either `tool.shouldDefer === true` OR
+   *     (`tool.isMcp === true` AND `_deferMcp` is true)
+   */
+  private partitionDeferredTools(
+    candidates: readonly CortexTool[],
+  ): { loaded: CortexTool[]; deferred: CortexTool[] } {
+    const discovered = this.deferredToolRegistry.getDiscovered();
+    const loaded: CortexTool[] = [];
+    const deferred: CortexTool[] = [];
+
+    for (const tool of candidates) {
+      if (this.shouldDeferTool(tool, discovered)) {
+        deferred.push(tool);
+      } else {
+        loaded.push(tool);
+      }
+    }
+    return { loaded, deferred };
+  }
+
+  private shouldDeferTool(tool: CortexTool, discovered: ReadonlySet<string>): boolean {
+    if (tool.alwaysLoad === true) return false;
+    if (this._deferredAlwaysLoad.has(tool.name)) return false;
+    if (discovered.has(tool.name)) return false;
+    if (tool.shouldDefer === true) return true;
+    if (tool.isMcp === true && this._deferMcp) return true;
+    return false;
+  }
+
+  /**
+   * Update the `_available_tools` slot if its content has actually changed.
+   * Skipping no-op writes preserves the prompt cache: identical bytes mean
+   * the cached prefix stays valid for the next API call.
+   */
+  private updateAvailableToolsSlot(): void {
+    const newContent = this.deferredToolRegistry.formatSlotContent();
+    const current = this.contextManager.getSlot('_available_tools');
+    if (newContent !== current) {
+      this.contextManager.setSlot('_available_tools', newContent);
+    }
   }
 
   /**
@@ -2604,6 +2697,15 @@ export class CortexAgent {
           systemPrompt: string;
           messages: Array<{ role: string; content: string }>;
         }),
+      }) as RegisteredTool);
+    }
+    // ToolSearch is auto-registered when deferred tools are enabled. The
+    // consumer cannot disable it via disableTools (the agent has no other way
+    // to load deferred tool schemas).
+    if (this._deferredToolsEnabled) {
+      tools.push(createToolSearchTool({
+        registry: this.deferredToolRegistry,
+        onAfterDiscovery: () => this.refreshTools(),
       }) as RegisteredTool);
     }
 

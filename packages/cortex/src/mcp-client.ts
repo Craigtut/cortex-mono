@@ -378,6 +378,9 @@ export class McpClientManager {
       name: namespacedName,
       description: mcpTool.description ?? '',
       parameters,
+      // Marks this tool as MCP-sourced so CortexAgent's deferred-tool
+      // partitioning can identify it without rechecking by name prefix.
+      isMcp: true,
       execute: async (args: unknown): Promise<unknown> => {
         try {
           const result = await client.callTool({

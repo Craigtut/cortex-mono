@@ -197,6 +197,21 @@ export { LoadSkillParams } from './skill-tool.js';
 export { SubAgentManager } from './sub-agent-manager.js';
 export type { SubAgentManagerConfig, SubAgentLifecycleHooks } from './sub-agent-manager.js';
 
+// Deferred Tool Loading / ToolSearch
+export { DeferredToolRegistry } from './tools/tool-search/registry.js';
+export type { ToolSearchResult } from './tools/tool-search/registry.js';
+export {
+  createToolSearchTool,
+  TOOL_SEARCH_TOOL_NAME,
+  ToolSearchParams,
+} from './tools/tool-search/index.js';
+export type {
+  ToolSearchToolConfig,
+  ToolSearchDetails,
+  ToolSearchParamsType,
+} from './tools/tool-search/index.js';
+export type { DeferredToolsConfig } from './types.js';
+
 // Compaction (Phase 5)
 export {
   CompactionManager,

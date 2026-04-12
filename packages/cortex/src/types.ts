@@ -260,6 +260,18 @@ export interface CortexAgentConfig {
   compaction?: Partial<CortexCompactionConfig>;
 
   /**
+   * Deferred tool loading. When enabled, tools marked for deferral are NOT
+   * included in the `tools` array sent on every API turn. Instead, their
+   * names appear in an internally-managed `_available_tools` slot, and the
+   * agent uses the auto-registered `ToolSearch` tool to load specific tools
+   * on demand.
+   *
+   * Useful when consumers connect MCP servers with many tools: schemas are
+   * only paid for once a tool is actually needed, instead of every turn.
+   */
+  deferredTools?: DeferredToolsConfig;
+
+  /**
    * Persists oversized tool results to disk and returns the file path.
    *
    * When configured, large tool results (>25K tokens by default) are
@@ -341,6 +353,38 @@ export interface PromptWatchdogDiagnosticsConfig {
 export interface CortexDiagnosticsConfig {
   /** Prompt and abort watchdog logs for freeze investigation. */
   promptWatchdog?: PromptWatchdogDiagnosticsConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Deferred Tools
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration for deferred tool loading.
+ *
+ * Reference: docs/cortex/tools/tool-search.md (TBD)
+ */
+export interface DeferredToolsConfig {
+  /**
+   * Master switch. When false (default), all tools are sent on every turn
+   * exactly as before. When true, tools marked for deferral are pulled out
+   * of the per-turn tools array and announced by name in the
+   * `_available_tools` slot instead.
+   */
+  enabled?: boolean;
+
+  /**
+   * When true (default), all MCP tools are deferred. When false, MCP tools
+   * are sent in full like built-ins. Has no effect when `enabled` is false.
+   */
+  deferMcp?: boolean;
+
+  /**
+   * Tool names that should never be deferred even if they match deferral
+   * criteria (overrides `shouldDefer` and `deferMcp` for the named tools).
+   * Use this to keep specific MCP tools always loaded.
+   */
+  alwaysLoad?: string[];
 }
 
 // ---------------------------------------------------------------------------
