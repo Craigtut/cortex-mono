@@ -4,7 +4,7 @@
 **Date**: 2026-03-14
 **Related docs**: [context-manager.md](./context-manager.md), [cortex-architecture.md](./cortex-architecture.md), [observational-memory-architecture.md](./observational-memory-architecture.md)
 
-> **Note**: This document describes the "classic" compaction strategy (`strategy: 'classic'`). As of 2026-04-10, the default compaction strategy is **observational memory**, which replaces Layers 1 and 2 described here. See [observational-memory-architecture.md](./observational-memory-architecture.md) for the default system. Consumers can opt into the classic strategy documented here via `compaction: { strategy: 'classic' }`.
+> **Note**: This document describes the "classic" compaction strategy (`strategy: 'classic'`). As of 2026-04-10, the default compaction strategy is **observational memory**, which replaces Layer 2 described here. See [observational-memory-architecture.md](./observational-memory-architecture.md) for the default system. Layer 1 (microcompaction) is shared by both strategies and operates in **cache-aware mode**: it only trims tool results when the prompt cache has expired, preventing cache invalidation during active use. See the "Cache-Aware Microcompaction" section below.
 
 ---
 
@@ -62,94 +62,161 @@ Compaction operates exclusively on the **CONVERSATION HISTORY** region. Everythi
 
 **When**: Before every LLM call, inside the `transformContext` hook. Runs as an in-memory pre-pass before token counting. The conversation history on disk / in the session transcript is **never modified** by microcompaction (following OpenClaw's pattern). Only the context sent to the model is affected.
 
-**Critical insight**: The agent's own text responses (assistant messages where it reasons about, synthesizes, and discusses tool results) are **never touched** by microcompaction. Only tool_result content blocks are candidates. This means that research findings, analysis, and conclusions the agent has already articulated in its own words survive regardless of what happens to the raw tool output. 
+**Critical insight**: The agent's own text responses (assistant messages where it reasons about, synthesizes, and discusses tool results) are **never touched** by microcompaction. Only tool_result content blocks are candidates. This means that research findings, analysis, and conclusions the agent has already articulated in its own words survive regardless of what happens to the raw tool output.
 
-**How** (three tiers, applied per tool result based on age and size):
+**How** (cache-aware, token-offset-based, progressive degradation):
 
-**Tier 1: Insertion-time cap** (always active)
+#### Tier 1: Insertion-time cap (always active)
+
 Large tool results are truncated at insertion time before entering conversation history. Results exceeding `maxResultTokens` (default: 50,000 tokens) are truncated to head + tail with a marker in between. This prevents a single enormous result from destabilizing the context. This tier has zero cache impact since it runs at insertion, not in `transformContext`.
 
-**Tier 2: Semantic bookends** (soft trim, threshold-triggered)
-When total context usage crosses `softTrimThreshold` (default: 40% of context window), a batch re-evaluation fires. All tool results outside the recency window are assigned tiers based on their distance from the current turn:
+#### Tier 2: Cache-aware token-offset trimming (in `transformContext`)
 
-- **Recent window** (last N turns): Full, untouched
-- **Bookend window** (next N turns beyond recent): Reduced to first `bookendSize` chars + last `bookendSize` chars, joined by a token count note
-- **Old window** (beyond bookend window): Replaced with placeholder
+L1's reactive trimming is gated on two checks before any work happens:
+
+1. **Cache check**: Is the prompt cache still warm? If the time since the last LLM call is less than the active provider's cache TTL, L1 is **dormant** and history is returned untouched. This preserves cache hits during active use, which is where the biggest cost savings live.
+2. **Trim floor check**: Is context utilization at least `trimFloorRatio` (default 25%)? Below this, trimming offers little benefit even when the cache is cold.
+
+When both gates pass, L1 walks history from the most recent message backwards, accumulating token offsets. Each tool result lands in one of three zones based on its distance from the end:
 
 ```
-[First 2,000 chars of original result]
+[Most recent message]
+        |
+        |  Hot zone — full content, no trimming
+        |  size = max(hotZoneMinTokens, contextWindow * hotZoneRatio)
+        |
+        |---[hot zone boundary]
+        |
+        |  Degradation span — bookended with shrinking sizes
+        |  size = contextWindow * degradationSpanRatio
+        |  bookend chars: bookendMaxChars (at boundary) → bookendMinChars (at far end), interpolated linearly
+        |
+        |---[degradation span boundary]
+        |
+        |  Beyond — placeholder (most categories) or clear (ephemeral only)
+        |
+[Oldest message]
+```
+
+**Hot zone defaults**: `hotZoneMinTokens = 16_000`, `hotZoneRatio = 0.05`. The floor wins on small/medium windows; the ratio wins above ~320k. Non-reproducible tools get an extended hot zone via `extendedRetentionMultiplier` (resolves to 1.0 with persister, 1.5 without).
+
+**Hot zone + degradation span coverage**:
+
+| Context Window | Hot Zone | Degradation Span | "Still bookended" Total | % of Window |
+|---|---|---|---|---|
+| 32k | 16,000 | 12,800 | 28,800 | 90% |
+| 200k | 16,000 | 80,000 | 96,000 | 48% |
+| 1M | 50,000 | 400,000 | 450,000 | 45% |
+
+Tool results only become placeholder/clear after exiting the bookended region.
+
+**Bookend formats** (defaults: `bookendMaxChars = 2_000`, `bookendMinChars = 256`):
+
+Without persister:
+```
+[First N chars of original result]
 
 ... [~8,500 tokens trimmed] ...
 
-[Last 2,000 chars of original result]
+[Last N chars of original result]
 ```
 
-**Tier 3: Placeholder replacement** (hard clear)
-The oldest tool results (beyond the bookend window) are replaced with a one-line placeholder preserving only the tool name and a brief preview:
-
+With persister (full content saved to disk, path embedded in replacement):
 ```
-[Tool result trimmed — web_search: "context compaction techniques 2026" — see assistant response below for findings]
-```
+[Result persisted: /path/to/file.txt (45,230 chars, ~11,308 tokens) -- WebFetch]
 
-### Threshold-Triggered Batch Processing
+[First N chars of original result]
 
-Microcompaction does NOT modify history on every LLM call. It checks the threshold on every `transformContext` call but only **acts** at discrete threshold crossings. Between crossings, the previously computed trim state is replayed identically, preserving prefix cache.
+... [~8,500 tokens trimmed; full content at /path/to/file.txt] ...
 
-**Thresholds**: Derived from the two config values: `softTrimThreshold` (default: 0.40), a midpoint at `(softTrimThreshold + hardClearThreshold) / 2` (default: 0.50), and `hardClearThreshold` (default: 0.60). At each crossing, a full re-evaluation pass assigns tiers to all tool results based on their distance from the current turn. The tier boundaries naturally advance as more turns accumulate.
-
-```
-Tick 1-9:   Context < 40%. All tool results full. Cache builds.
-
-Tick 10:    Context crosses 40%. Batch re-evaluation fires.
-            Oldest results → placeholder. Middle → bookends. Recent → full.
-            Cache invalidated once, then rebuilds.
-
-Tick 11-17: Content stable. Cache rebuilds on trimmed history.
-
-Tick 18:    Context crosses 50%. Batch re-evaluation fires.
-            Tier boundaries advance. More results bookended/placeholdered.
-            Cache invalidated once, then rebuilds.
-
-Tick 19-24: Content stable. Cache rebuilds.
-
-Tick 25:    Context crosses 60%. Batch re-evaluation fires.
-            Most old results are now placeholders.
-            Cache invalidated once, then rebuilds.
-
-Tick 26-33: Content stable. Cache rebuilds.
-
-Tick 34:    Context crosses 70%. Layer 2 (full summarization) fires.
+[Last N chars of original result]
 ```
 
-Between threshold crossings, the entire trimmed conversation is identical on every call. The provider caches all of it. Cache invalidation happens once per threshold crossing, then rebuilds immediately.
+**Beyond the degradation span** — placeholder (preserves the "this was tried" breadcrumb):
+```
+[Tool result trimmed -- WebFetch: "context compaction techniques 2026" -- see assistant response below for findings]
+```
 
-**Recency window**: The most recent `microcompaction.preserveRecentTurns` assistant turns (default: 5) are fully protected from all trimming at every re-evaluation. Only tool results older than this window are candidates. Note: this is a separate config from `compaction.preserveRecentTurns` (default: 6), which controls how many turns are kept as the preserved tail during Layer 2 summarization. The microcompaction recency window is typically slightly smaller since it only protects tool results, while the compaction preserved tail protects entire turns including user messages.
+Or with persister (non-reproducible/computational only):
+```
+[Tool result persisted -- WebFetch: "context compaction" -- use Read on /path/to/file.txt for full content]
+```
 
-**Tool-type-aware retention**: Different tool types have different retention value based on whether their output is reproducible:
+For ephemeral tools (SubAgent, TaskOutput) beyond the degradation span:
+```
+[Tool result cleared]
+```
 
-| Category | Examples | Retention | Rationale |
-|----------|----------|-----------|-----------|
-| Re-readable | File reads, directory listings | Shorter (standard window) | Agent can re-read the file if needed |
-| Non-reproducible | Web searches, web fetches, API calls, Bash commands | Longer (2x standard window) | Cannot be re-fetched; page may change, costs an API call, or may have side effects |
-| Ephemeral | Sub-agent results, task output | Shorter (standard window) | Stale quickly, re-runnable |
-| Computational | Math, code execution results | Standard window | Small, but non-reproducible without re-running |
+#### Action selection by tool category
 
-The consumer (backend) can register tool categories when configuring Cortex. Unregistered tools default to standard retention.
+| Distance from end | rereadable | non-reproducible | computational | ephemeral |
+|---|---|---|---|---|
+| Within hot zone | full | full (extended hot zone) | full | full |
+| Within degradation span | bookend (shrinking) | bookend (shrinking, persisted) | bookend (shrinking, persisted) | bookend (shrinking) |
+| Beyond degradation span | placeholder | placeholder (persisted) | placeholder (persisted) | clear |
 
-**Cost**: Zero LLM calls. Pure string operations.
+- **bookend**: Default for tool results within the degradation span. Head+tail gives the LLM enough context to recognize what was read and decide whether to dig deeper.
+- **placeholder**: Used beyond the degradation span for `non-reproducible`, `computational`, `rereadable`, and unknown tools. Strips all bookend tokens but preserves a one-line breadcrumb so the agent doesn't redo work.
+- **clear**: Used beyond the degradation span for `ephemeral` tools only. No record needed because re-running is the right recovery path.
+
+#### Cache-aware gating (per-provider TTLs)
+
+Cortex reads the active cache TTL from `PROVIDER_CACHE_CONFIG` based on the current provider and `CacheRetention` setting:
+
+| Provider | Short TTL | Long TTL |
+|---|---|---|
+| Anthropic / Bedrock | 5 minutes | 1 hour |
+| OpenAI | 10 minutes | 24 hours |
+| Google / Mistral / Azure | no caching (L1 runs freely) | no caching |
+
+The consumer's `CacheRetention` setting is set via `setCacheRetention()` on `CortexAgent`. CortexAgent automatically wires it (and the active provider) into `CompactionManager.setCacheInfo()`. The CompactionManager records `lastLlmCallTimestamp` automatically inside `updateCurrentContextTokenCount()`, so cache-coldness is computed without any consumer-side bookkeeping.
+
+**Result**:
+- During rapid tool calls (cache warm): L1 stays dormant. Tool results stay full. Cache hit rates maximized.
+- During idle periods: L1 fires once when the cache has naturally expired, reducing the size of the prompt that gets cached on the next call.
+- All subsequent calls within the cache TTL hit the trimmed (smaller) cached content.
+
+#### Trim state caching
+
+L1 caches trim decisions across consecutive calls when `(historyLength, utilizationBand)` is unchanged. When either changes, the engine recomputes. This is mostly redundant with the cache-aware gate (L1 only runs when the cache is cold, and immediately after running the cache will be warm again until the next TTL expiry), but the cache is cheap to keep as a safety net.
+
+#### Persistence model
+
+When a `persistResult` callback is configured (typically via the top-level `CortexAgentConfig.persistResult`, which propagates into `MicrocompactionConfig`), L1 saves the **full original content to disk** before any destructive trim action (bookend, placeholder, clear) for non-reproducible and computational tools. The in-context replacement includes the disk path so the agent can `Read` it back if needed.
+
+- `rereadable` tools: no persistence (agent can re-read source files directly)
+- `ephemeral` tools: no persistence (re-running is trivial)
+- `non-reproducible` and `computational`: persisted on every destructive trim
+
+**Cost**: Zero LLM calls. Pure string operations plus an optional disk write.
 
 **Configuration**:
 ```typescript
 interface MicrocompactionConfig {
-  maxResultTokens: number;             // default: 50_000 (insertion-time cap)
-  softTrimThreshold: number;           // default: 0.40 (40% of context window)
-  hardClearThreshold: number;          // default: 0.60 (60% of context window)
-  bookendSize: number;                 // default: 2_000 (chars kept at each end)
-  preserveRecentTurns: number;         // default: 5
-  extendedRetentionMultiplier: number; // default: 2 (for non-reproducible tools)
+  // Insertion-time cap
+  maxResultTokens: number;              // default: 50_000
+
+  // Cache-aware gating
+  trimFloorRatio: number;               // default: 0.25 (25% of context window)
+
+  // Hot zone (token-offset recency)
+  hotZoneMinTokens: number;             // default: 16_000
+  hotZoneRatio: number;                 // default: 0.05 (5% of context window)
+  extendedRetentionMultiplier?: number; // default: 1.0 with persister, 1.5 without
+
+  // Progressive bookend degradation
+  bookendMaxChars: number;              // default: 2_000 (at hot zone boundary)
+  bookendMinChars: number;              // default: 256 (at far end)
+  degradationSpanRatio: number;         // default: 0.40 (40% of context window)
+
+  // Tool categorization
   toolCategories?: Record<string, 'rereadable' | 'non-reproducible' | 'ephemeral' | 'computational'>;
-  persistResult?: PersistResultFn;     // optional callback for disk persistence of cleared results
-  maxAggregateTurnTokens?: number;     // default: 150_000 (per-message aggregate cap)
+
+  // Persistence (typically set at top-level CortexAgentConfig.persistResult)
+  persistResult?: PersistResultFn;
+
+  // Aggregate budget enforcement
+  maxAggregateTurnTokens?: number;      // default: 150_000
 }
 ```
 
@@ -597,19 +664,22 @@ A successful Layer 2 compaction resets the consecutive failure counter.
 
 ---
 
-## Disk Persistence for Cleared Tool Results
+## Disk Persistence for Tool Results
 
-When microcompaction clears or replaces a non-reproducible or computational tool result (at the `placeholder` or `clear` threshold), the original content can optionally be persisted to disk via a consumer-provided callback.
+The same `PersistResultFn` callback drives disk persistence in three places: the proactive [tool result persistence interceptor](tool-result-persistence.md) (per-tool, at execution time), microcompaction trim/clear of historic results, and aggregate per-turn budget enforcement. Configure once; all three layers use it.
 
-**Motivation:** Non-reproducible results (WebFetch, Bash) cannot be re-fetched. Once cleared from the model's view, the content is lost. Disk persistence lets the agent Read the content back if it needs to reference it later in the same long-lived session. The persisted files also survive Layer 2 compaction, which replaces the source transcript entirely.
+**Motivation:** Non-reproducible results (WebFetch, Bash, SubAgent) cannot be re-fetched. Truncating loses information; persistence to disk lets the agent Read the content back if it needs to reference it later in the same long-lived session. The persisted files also survive Layer 2 compaction, which replaces the source transcript entirely.
 
-**Configuration** (in `MicrocompactionConfig`):
-- `persistResult`: `PersistResultFn` callback (optional). The consumer implements the I/O and returns the file path.
+**Recommended configuration** (top-level on `CortexAgentConfig`):
+- `persistResult`: `PersistResultFn` callback. The consumer implements the I/O and returns the file path. Cortex propagates this to the proactive interceptor and to `MicrocompactionConfig.persistResult` automatically.
 
-**Behavior:**
-- When `persistResult` is set and a `placeholder` or `clear` action is applied to a non-reproducible or computational result, the callback is invoked with the full original content.
+**Legacy configuration** (`MicrocompactionConfig.persistResult`):
+- Still accepted for backwards compatibility. If both top-level and `MicrocompactionConfig` settings are present, the top-level wins (logged at debug level).
+
+**Microcompaction trim/clear behavior:**
+- When a `placeholder` or `clear` action is applied to a non-reproducible or computational result, the callback is invoked with the full original content.
 - The replacement text includes the file path: `[Tool result persisted -- {toolName}: "{preview}" -- use Read on {path} for full content]`
-- Rereadable results (Read, Glob, Grep) are NOT persisted since the agent can re-invoke the tool.
+- Rereadable results (Read, Glob, Grep) are NOT persisted in this path since the agent can re-invoke the tool. (Note: at the proactive interceptor layer, only Read, Edit, Write, and Glob skip persistence by name; Grep is persisted there because grep results are not trivially re-derivable from the tool name alone.)
 - If the callback throws, standard placeholder/clear text is used as fallback.
 
 ---

@@ -45,6 +45,7 @@ All modes respect `offset` and `head_limit` for pagination.
 ### Token Economy
 - Default output mode is `files_with_matches` (paths only). This is deliberately the most token-efficient option. The model should switch to `content` mode only when it needs the actual matching lines.
 - The `offset` + `head_limit` pattern enables pagination through large result sets without loading everything into context.
+- Grep itself does not truncate output. Oversized results are handled by the agent's [tool result persistence interceptor](../tool-result-persistence.md), which bookends and (when configured) persists the full content to disk so the model can Read specific sections.
 
 ### Ripgrep Distribution
 The 6 platform-specific binaries (arm64-darwin, x64-darwin, x64-linux, arm64-linux, x64-win32, arm64-win32) are bundled as optional dependencies in the cortex npm package, one per platform. At install time, npm installs only the binary matching the current platform. At runtime, cortex resolves the binary path from the package's install location.

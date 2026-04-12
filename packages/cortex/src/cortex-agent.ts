@@ -75,7 +75,10 @@ import type {
   ThinkingLevel,
   ModelThinkingCapabilities,
   ToolExecuteContext,
+  PersistResultFn,
+  ToolCategory,
 } from './types.js';
+import { processToolResult } from './tool-result-persistence.js';
 
 // ---------------------------------------------------------------------------
 // Minimal pi-agent-core/pi-ai type contracts
@@ -337,6 +340,12 @@ export class CortexAgent {
   private readonly registeredTools: RegisteredTool[];
   private readonly toolRuntime: CortexToolRuntime;
 
+  // Tool result persistence (proactive, at execution boundary).
+  // Same callback flows to compaction (reactive) via MicrocompactionConfig.
+  private readonly persistResult?: PersistResultFn;
+  private readonly toolCategories?: Record<string, ToolCategory>;
+  private readonly toolResultThresholds?: Record<string, number>;
+
   // Compaction Manager
   private readonly compactionManager: CompactionManager;
 
@@ -460,6 +469,29 @@ export class CortexAgent {
     // Build the slot list. When using observational memory, append the
     // internal observation slot so it occupies the last slot position.
     const compactionConfig = buildCompactionConfig(config.compaction);
+
+    // Tool result persistence: top-level config.persistResult wins.
+    // Propagate it into MicrocompactionConfig so reactive paths (compaction
+    // trim, aggregate budget enforcement) and the proactive interceptor share
+    // the same callback.
+    if (config.persistResult) {
+      this.persistResult = config.persistResult;
+      if (compactionConfig.microcompaction.persistResult && compactionConfig.microcompaction.persistResult !== config.persistResult) {
+        this.logger.debug('[CortexAgent] top-level persistResult overrides compaction.microcompaction.persistResult');
+      }
+      compactionConfig.microcompaction.persistResult = config.persistResult;
+    } else if (compactionConfig.microcompaction.persistResult) {
+      // Backwards compatibility: consumer set it only on compaction config.
+      // Use it for the proactive interceptor as well.
+      this.persistResult = compactionConfig.microcompaction.persistResult;
+    }
+    if (compactionConfig.microcompaction.toolCategories) {
+      this.toolCategories = compactionConfig.microcompaction.toolCategories;
+    }
+    if (config.toolResultThresholds) {
+      this.toolResultThresholds = config.toolResultThresholds;
+    }
+
     const compactionStrategy = compactionConfig.strategy ?? 'observational';
     const slots = [...(config.slots ?? [])];
     if (compactionStrategy === 'observational') {
@@ -560,6 +592,13 @@ export class CortexAgent {
       slots.length,
     );
     this.compactionManager.setLogger(this.logger);
+    // Wire cache info into CompactionManager so L1 can gate trimming on
+    // whether the prompt cache has gone cold. Initial retention defaults to
+    // 'none' until the consumer calls setCacheRetention().
+    this.compactionManager.setCacheInfo(
+      this.primaryModel.provider,
+      this._cacheRetention ?? 'none',
+    );
 
     // Apply context window limit from config and model
     this._contextWindowLimit = config.contextWindowLimit ?? null;
@@ -1459,6 +1498,11 @@ export class CortexAgent {
     // Recompute effective context window (applies limit if set)
     this._updateEffectiveContextWindow();
     this.rebuildLoadSkillDescription();
+    // Update L1 cache-aware gating with the new provider's TTL.
+    this.compactionManager.setCacheInfo(
+      this.primaryModel.provider,
+      this._cacheRetention ?? 'none',
+    );
     // Update the pi-agent-core agent's model if it exposes setModel
     if (typeof this.agent.setModel === 'function') {
       this.agent.setModel(this.primaryPiModel);
@@ -1565,6 +1609,8 @@ export class CortexAgent {
    */
   setCacheRetention(value: 'none' | 'short' | 'long'): void {
     this._cacheRetention = value;
+    // Update L1 cache-aware gating with the new TTL.
+    this.compactionManager.setCacheInfo(this.primaryModel.provider, value);
   }
 
   /**
@@ -1573,6 +1619,25 @@ export class CortexAgent {
    */
   getCacheRetention(): 'none' | 'short' | 'long' | null {
     return this._cacheRetention;
+  }
+
+  /**
+   * Process a tool result through the result-persistence interceptor.
+   * Delegates to the shared `processToolResult` helper, supplying instance
+   * state (persistResult callback, tool categories, threshold overrides).
+   */
+  private applyToolResultPersistence(
+    toolName: string,
+    toolCallId: string,
+    result: unknown,
+  ): Promise<unknown> {
+    return processToolResult(result, {
+      toolName,
+      toolCallId,
+      persistResult: this.persistResult,
+      toolCategories: this.toolCategories,
+      thresholds: this.toolResultThresholds,
+    });
   }
 
   /**
@@ -1610,16 +1675,17 @@ export class CortexAgent {
           if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
             const asObj = result as Record<string, unknown>;
             if (Array.isArray(asObj['content']) && asObj['content'].length > 0) {
-              return result;
+              return await this.applyToolResultPersistence(tool.name, toolCallId, result);
             }
             // Has 'content' key but it's undefined, null, empty, or non-array.
             // Fall through to wrap as text.
           }
           // Wrap string/primitive return values
-          return {
+          const wrapped = {
             content: [{ type: 'text', text: typeof result === 'string' ? result : String(result ?? '') }],
             details: {},
           };
+          return await this.applyToolResultPersistence(tool.name, toolCallId, wrapped);
         },
       };
     });
@@ -3791,6 +3857,10 @@ export class CortexAgent {
     if (this.config.logger) childCortexConfig.logger = this.config.logger;
     if (this.envOverrides) childCortexConfig.envOverrides = this.envOverrides;
     if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
+    // Inherit tool result persistence so child tool calls (Bash, Grep, WebFetch
+    // inside a sub-agent doing research) get the same protection as the parent.
+    if (this.persistResult) childCortexConfig.persistResult = this.persistResult;
+    if (this.toolResultThresholds) childCortexConfig.toolResultThresholds = this.toolResultThresholds;
     if (this.config.resolvePermission) {
       const parentResolver = this.config.resolvePermission;
       const subAgentMgr = this.subAgentManager;

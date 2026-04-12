@@ -29,6 +29,8 @@ For **background** sub-agents:
 - A task ID for polling via the TaskOutput tool
 - Confirmation that the sub-agent was spawned
 
+Sub-agent outputs flow through the agent's [tool result persistence interceptor](../tool-result-persistence.md). When a sub-agent returns a large research result, the interceptor bookends it (head + tail preview) and, when a `persistResult` callback is configured, persists the full content to disk. The parent agent can then use the Read tool to pull in specific sections on demand. This protects the parent's context window without losing access to the sub-agent's findings.
+
 **`details`** (sent to UI/logs only):
 - Full sub-agent conversation history (all turns, tool calls, results)
 - Detailed token usage breakdown

@@ -214,6 +214,21 @@ export {
   shouldTruncate,
   isContextOverflow,
 } from './compaction/index.js';
+
+// Tool Result Persistence (proactive interceptor at the tool execution boundary)
+export {
+  applyResultPersistence,
+  processToolResult,
+  resolveThreshold,
+  MAX_RESULT_TOKENS,
+  BOOKEND_CHARS,
+  SKIP_RESULT_PERSISTENCE,
+  DEFAULT_TOOL_THRESHOLDS,
+} from './tool-result-persistence.js';
+export type {
+  ApplyPersistenceOptions,
+  ProcessResultOptions,
+} from './tool-result-persistence.js';
 export type {
   TrimAction,
   TrimState,

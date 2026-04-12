@@ -81,7 +81,7 @@ describe('CompactionManager.applyInsertionCap aggregate budget', () => {
       microcompaction: {
         maxResultTokens: 100_000, // high individual cap so Phase 1 doesn't interfere
         maxAggregateTurnTokens: 150_000,
-        bookendSize: 200,
+        bookendMaxChars: 200,
       } as MicrocompactionConfig,
     });
     const manager = new CompactionManager(config, 0);
@@ -125,7 +125,7 @@ describe('CompactionManager.applyInsertionCap aggregate budget', () => {
       microcompaction: {
         maxResultTokens: 100_000,
         maxAggregateTurnTokens: 150_000,
-        bookendSize: 200,
+        bookendMaxChars: 200,
       } as MicrocompactionConfig,
     });
     const manager = new CompactionManager(config, 0);
@@ -165,7 +165,7 @@ describe('CompactionManager.applyInsertionCap aggregate budget', () => {
       microcompaction: {
         maxResultTokens: 100_000,
         maxAggregateTurnTokens: 150_000,
-        bookendSize: 200,
+        bookendMaxChars: 200,
         persistResult,
       } as MicrocompactionConfig,
     });
@@ -206,7 +206,7 @@ describe('CompactionManager.applyInsertionCap aggregate budget', () => {
       microcompaction: {
         maxResultTokens: 100_000,
         maxAggregateTurnTokens: 150_000,
-        bookendSize: 200,
+        bookendMaxChars: 200,
       } as MicrocompactionConfig,
     });
     const manager = new CompactionManager(config, 0);

@@ -33,11 +33,21 @@ The system is modeled on human cognition: a "subconscious" observer watches the 
 
 These decisions were made during architecture review and override any conflicting assumptions in the earlier strategy proposal.
 
-### 1. Replaces Both L1 and L2
+### 1. Replaces L2, L1 Becomes Cache-Aware
 
-When observational memory is active, both microcompaction (L1) and conversation summarization (L2) are disabled. The observer subsumes L1's job of compressing tool results (the 5-40x compression on tool-heavy workloads comes from the observer extracting takeaways from tool output). L2 is directly replaced.
+When observational memory is active, conversation summarization (L2) is replaced by the observer/reflector system. L1 (microcompaction) remains active in both strategies and operates in a **cache-aware, token-offset-based** mode: trimming is gated on whether the prompt cache has expired, and trim decisions are based on each tool result's token distance from the most recent message rather than discrete percentage thresholds.
 
-**Exception**: The insertion-time cap (Phase 0 of L1, which caps individual tool results at `maxResultTokens` and enforces `maxAggregateTurnTokens`) always runs regardless of strategy. This is a safety mechanism that prevents a single massive tool result from blowing up context before the observer can process it.
+**L1 behavior** (applies to both classic and observational strategies; see [compaction-strategy.md](./compaction-strategy.md#layer-1-tool-result-trimming-microcompaction) for the full algorithm):
+
+- **Cache check**: Cortex resolves the active provider's cache TTL from `PROVIDER_CACHE_CONFIG` based on the current `CacheRetention` setting (Anthropic short: 5 min / long: 1 hr; OpenAI short: 10 min / long: 24 hr; Google/Mistral/Azure: no caching, L1 runs freely). On each `transformContext`, L1 checks whether the elapsed time since the last LLM call exceeds the TTL.
+- **Trim floor**: Even when the cache is cold, L1 only runs above 25% context utilization. This prevents pointless work on nearly empty contexts.
+- **Hot zone**: When trimming runs, tool results within `max(hotZoneMinTokens, contextWindow * hotZoneRatio)` tokens of the most recent message stay full. Defaults: 16,000 tokens floor, 5% ratio. Non-reproducible tools get an extended hot zone.
+- **Progressive bookend degradation**: Beyond the hot zone, bookend size shrinks linearly across the degradation span (default 40% of context window) from `bookendMaxChars` (2,000) down to `bookendMinChars` (256).
+- **Beyond the degradation span**: Tool results become placeholder (most categories) or clear (ephemeral only).
+
+In the observational strategy, L1 runs **after** the observer/reflector activates buffered chunks and trims observed messages from the source history. L1 then trims any remaining tool results in the unobserved tail before the prompt is sent to the LLM. This lets the observer process full-fidelity source messages while the LLM prompt benefits from tool result trimming.
+
+**Phase 0** (insertion-time cap) always runs regardless of strategy or cache state. It caps individual tool results at `maxResultTokens` and enforces `maxAggregateTurnTokens`. This is a safety mechanism that prevents a single massive tool result from blowing up context.
 
 Layer 3 (emergency truncation) is unchanged and serves as the safety valve.
 
@@ -647,6 +657,7 @@ async applyInTransformContext(context, getHistory, setHistory, getSourceHistory,
 ### What Stays the Same
 
 - Phase 0 insertion-time cap: unchanged, always runs
+- L1 cache-aware microcompaction: active in both strategies (only runs when cache is cold)
 - Layer 3 emergency truncation: unchanged, always active
 - `_currentContextTokenCount` tracking via `turn_end` events: unchanged
 - `_contextWindow` / `_modelContextWindow` distinction: unchanged
@@ -655,9 +666,8 @@ async applyInTransformContext(context, getHistory, setHistory, getSourceHistory,
 ### What Is Disabled
 
 When `strategy === 'observational'`:
-- L1 threshold-triggered trimming (`microcompaction.apply()`): disabled
-- L2 summarization (`runCompaction()`): disabled
-- Adaptive threshold system: not applicable
+- L2 summarization (`runCompaction()`): disabled, replaced by observer/reflector
+- Adaptive threshold system: not applicable (observational memory uses its own threshold system)
 - `onBeforeCompaction` / `onPostCompaction`: not fired (replaced by `onObservation` / `onReflection`)
 
 ### Migration Path

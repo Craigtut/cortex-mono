@@ -260,6 +260,36 @@ export interface CortexAgentConfig {
   compaction?: Partial<CortexCompactionConfig>;
 
   /**
+   * Persists oversized tool results to disk and returns the file path.
+   *
+   * When configured, large tool results (>25K tokens by default) are
+   * replaced in the conversation with a bookend preview (head + tail)
+   * plus a file reference, so the model can use the Read tool to access
+   * the full content on demand.
+   *
+   * Used by both the proactive tool execution interceptor and the
+   * reactive compaction paths (microcompaction trim, aggregate budget
+   * enforcement). Consumer owns the storage location and cleanup.
+   *
+   * If both this and `compaction.microcompaction.persistResult` are set,
+   * this top-level setting wins (and is propagated to microcompaction).
+   */
+  persistResult?: PersistResultFn;
+
+  /**
+   * Per-tool token threshold overrides for the result-persistence interceptor.
+   *
+   * Tools not listed here use the built-in defaults (Bash: 7,500 to keep
+   * verbose command output tight; everything else: 25,000).
+   *
+   * Useful for tuning specific MCP tools or custom tools whose output has
+   * unusual size characteristics (e.g., a tool that returns large JSON payloads
+   * where you want a smaller cap, or a research tool whose output you want to
+   * keep more of in context).
+   */
+  toolResultThresholds?: Record<string, number>;
+
+  /**
    * Consumer-set environment variables that propagate to ALL subprocesses
    * (Bash tool, MCP stdio servers), bypassing the security blocklist.
    *
@@ -503,30 +533,78 @@ export type ToolCategory = 'rereadable' | 'non-reproducible' | 'ephemeral' | 'co
  */
 export type PersistResultFn = (
   content: string,
-  metadata: { toolName: string; messageIndex: number; category: ToolCategory },
+  metadata: {
+    toolName: string;
+    category: ToolCategory;
+    /** Present when called from the proactive tool execution interceptor. */
+    toolCallId?: string;
+    /** Present when called from compaction (reactive paths). */
+    messageIndex?: number;
+  },
 ) => Promise<string>;
 
 export interface MicrocompactionConfig {
   /** Maximum tokens for a single tool result at insertion time. Default: 50000. */
   maxResultTokens: number;
-  /** Context usage ratio that triggers soft trim (bookending). Default: 0.40. */
-  softTrimThreshold: number;
-  /** Context usage ratio that triggers hard clear. Default: 0.60. */
-  hardClearThreshold: number;
-  /** Characters kept at each end in bookend format. Default: 2000. */
-  bookendSize: number;
-  /** Number of recent assistant turns protected from trimming. Default: 5. */
-  preserveRecentTurns: number;
-  /** Retention multiplier for non-reproducible tools. Default: 2. */
-  extendedRetentionMultiplier: number;
+
+  // --- Cache-aware gating ---
+  /**
+   * Minimum context utilization ratio below which L1 never trims, even when
+   * the cache is cold. Prevents pointless work on nearly empty contexts.
+   * Default: 0.25 (25%).
+   */
+  trimFloorRatio: number;
+
+  // --- Hot zone (token-offset recency window) ---
+  /**
+   * Absolute floor for the hot zone size (in tokens). Tool results within the
+   * hot zone of the most recent message are never trimmed. The effective hot
+   * zone is `max(hotZoneMinTokens, contextWindow * hotZoneRatio)`.
+   * Default: 16000.
+   */
+  hotZoneMinTokens: number;
+  /**
+   * Hot zone as a fraction of the context window. Wins over the floor on
+   * very large windows. Default: 0.05 (5%).
+   */
+  hotZoneRatio: number;
+  /**
+   * Multiplier applied to the hot zone for non-reproducible tools. When
+   * undefined, resolves to 1.0 if a persistResult callback is configured
+   * (full content recoverable from disk) or 1.5 if not (some buffer since
+   * content is lost on trim).
+   */
+  extendedRetentionMultiplier?: number;
+
+  // --- Progressive bookend degradation ---
+  /** Bookend size at the hot zone boundary (chars per side). Default: 2000. */
+  bookendMaxChars: number;
+  /** Bookend size at the far end of the degradation span (chars per side). Default: 256. */
+  bookendMinChars: number;
+  /**
+   * The degradation span as a fraction of the context window. Bookend size
+   * interpolates linearly from bookendMaxChars to bookendMinChars across this
+   * span. Beyond the span, results become placeholder or clear based on tool
+   * category. Default: 0.40 (40%).
+   */
+  degradationSpanRatio: number;
+
+  // --- Tool categorization ---
   /** Tool name to category mapping. Unregistered tools default to standard retention. */
   toolCategories?: Record<string, ToolCategory>;
+
+  // --- Persistence ---
   /**
-   * Callback to persist cleared non-reproducible tool results to disk.
-   * When set, cleared results include a file path reference the agent can Read.
-   * If not set, standard placeholder/clear text is used (no persistence).
+   * Callback to persist tool results to disk before destructive trim actions
+   * (bookend, placeholder, clear). When set, the in-context replacement
+   * includes a file path reference the agent can Read to recover full content.
+   * Only fires for non-reproducible and computational tools.
+   *
+   * Typically set at the top-level CortexAgentConfig.persistResult and
+   * propagated here automatically.
    */
   persistResult?: PersistResultFn;
+
   /** Maximum aggregate tokens for all tool results in a single turn. Default: 150000. */
   maxAggregateTurnTokens?: number;
 }

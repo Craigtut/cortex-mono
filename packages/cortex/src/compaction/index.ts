@@ -43,6 +43,7 @@ import {
 } from './failsafe.js';
 import { ObservationalMemoryEngine } from './observational/index.js';
 import type { ObservationalMemoryConfig, ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './observational/types.js';
+import { PROVIDER_CACHE_CONFIG, type CacheRetention } from '../provider-registry.js';
 
 // ---------------------------------------------------------------------------
 // Re-exports for consumer convenience
@@ -199,6 +200,21 @@ export class CompactionManager {
    */
   private _lastInteractionTime: number | null = null;
 
+  /**
+   * Timestamp (ms) of the last LLM call. Used by L1 to decide whether the
+   * prompt cache has gone cold. Updated automatically in
+   * updateCurrentContextTokenCount() (which fires after every LLM response).
+   * Null means no LLM call has been recorded yet (treated as cold).
+   */
+  private _lastLlmCallTimestamp: number | null = null;
+
+  /**
+   * Effective cache TTL (ms) for the current provider + cache retention.
+   * Zero means caching is unsupported or disabled, in which case L1 treats
+   * the cache as perpetually cold (trim freely). Set via setCacheInfo().
+   */
+  private _providerCacheTtlMs = 0;
+
   /** Consumer handlers for compaction lifecycle events. */
   private beforeCompactionHandlers: BeforeCompactionHandler[] = [];
   private postCompactionHandlers: PostCompactionHandler[] = [];
@@ -311,6 +327,55 @@ export class CompactionManager {
   }
 
   /**
+   * Set the active provider and cache retention. Resolves the effective
+   * cache TTL from PROVIDER_CACHE_CONFIG and stores it for L1's cache-aware
+   * gating. Called by CortexAgent at construction, on provider changes, and
+   * on cache retention changes.
+   *
+   * @param provider - The active provider name (e.g., "anthropic", "openai")
+   * @param cacheRetention - The configured cache retention ('none' | 'short' | 'long')
+   */
+  setCacheInfo(provider: string, cacheRetention: CacheRetention): void {
+    const cfg = PROVIDER_CACHE_CONFIG[provider];
+    if (!cfg || !cfg.supported || cacheRetention === 'none') {
+      this._providerCacheTtlMs = 0;
+      return;
+    }
+    this._providerCacheTtlMs = cacheRetention === 'long' ? cfg.longTtlMs : cfg.shortTtlMs;
+  }
+
+  /**
+   * Check whether the prompt cache has gone cold (or is unused).
+   *
+   * Returns true when:
+   *   - Caching is unsupported / disabled (TTL <= 0), OR
+   *   - No LLM call has been recorded yet, OR
+   *   - The elapsed time since the last LLM call >= the cache TTL.
+   *
+   * @param now - Current timestamp (ms), injectable for testing
+   */
+  isCacheCold(now: number = Date.now()): boolean {
+    if (this._providerCacheTtlMs <= 0) return true;
+    if (this._lastLlmCallTimestamp === null) return true;
+    return (now - this._lastLlmCallTimestamp) >= this._providerCacheTtlMs;
+  }
+
+  /**
+   * Get the effective cache TTL (ms) for the current provider + retention.
+   * Zero means caching is unsupported or disabled.
+   */
+  get providerCacheTtlMs(): number {
+    return this._providerCacheTtlMs;
+  }
+
+  /**
+   * Get the timestamp of the last LLM call, or null if none recorded.
+   */
+  get lastLlmCallTimestamp(): number | null {
+    return this._lastLlmCallTimestamp;
+  }
+
+  /**
    * Compute the effective Layer 2 compaction threshold, adjusted for
    * interaction recency when adaptive thresholds are enabled.
    *
@@ -335,6 +400,10 @@ export class CompactionManager {
   updateCurrentContextTokenCount(inputTokens: number): void {
     const prev = this._currentContextTokenCount;
     this._currentContextTokenCount = inputTokens;
+    // Track the LLM call timestamp so L1 can decide whether the prompt cache
+    // is still warm. updateCurrentContextTokenCount() is called after every
+    // parent LLM call, so this is the natural point to record it.
+    this._lastLlmCallTimestamp = Date.now();
     this.logger.debug('[Compaction] updateCurrentContextTokenCount', { prev, inputTokens });
     // Log significant drops to help diagnose token count display issues
     if (prev > 0 && inputTokens < prev * 0.5) {
@@ -653,13 +722,13 @@ export class CompactionManager {
               messageIndex: i,
               category: category ?? 'rereadable',
             });
-            const bookended = applyBookend(info.text, config.bookendSize, config.bookendSize, info.tokens);
+            const bookended = applyBookend(info.text, config.bookendMaxChars, config.bookendMaxChars, info.tokens);
             replacement = `${bookended}\n\n[Full content persisted to ${path} -- use Read to access]`;
           } catch {
-            replacement = applyBookend(info.text, config.bookendSize, config.bookendSize, info.tokens);
+            replacement = applyBookend(info.text, config.bookendMaxChars, config.bookendMaxChars, info.tokens);
           }
         } else {
-          replacement = applyBookend(info.text, config.bookendSize, config.bookendSize, info.tokens);
+          replacement = applyBookend(info.text, config.bookendMaxChars, config.bookendMaxChars, info.tokens);
         }
 
         const newTokens = estimateTokens(replacement);
@@ -738,19 +807,39 @@ export class CompactionManager {
     let lastLayer2Error: Error | undefined;
     let effectiveThreshold = 0;
 
+    const cacheCold = this.isCacheCold();
+
     if (this._strategy === 'observational' && this.observationalEngine && getSourceHistory && setSourceHistory) {
-      // Observational memory path: observer/reflector handle compression.
-      // L1 threshold trimming and L2 summarization are skipped.
+      // Observational memory path: observer/reflector handle conversation
+      // compression. L2 summarization is skipped, but L1 still runs in
+      // cache-aware mode on the unobserved tail to trim large tool results
+      // before they hit the LLM.
       context = await this.observationalEngine.applyInTransformContext(
         context, utilization, this.slotCount, getHistory, setHistory, getSourceHistory, setSourceHistory,
       );
-      // Re-derive history from the potentially updated context
       history = getHistory(context);
-    } else {
-      // Classic path: L1 + L2 (existing code, unchanged)
 
-      // Layer 1: Microcompaction (always runs at threshold crossings)
-      history = await this.microcompaction.apply(history, this._contextWindow, currentTokens);
+      // Run L1 on the surviving (post-observation) history. Cache-aware
+      // gating ensures we only trim when the prompt cache has gone cold,
+      // preserving cache hits during active use. Re-estimate from the
+      // updated context so the observation slot's new size is reflected.
+      const postObsTotal = this.estimateCurrentContextTokens(context);
+      const trimmedHistory = await this.microcompaction.apply(
+        history, this._contextWindow, postObsTotal, { cacheCold },
+      );
+      if (trimmedHistory !== history) {
+        context = setHistory(context, trimmedHistory);
+        history = trimmedHistory;
+      }
+    } else {
+      // Classic path: L1 + L2
+
+      // Layer 1: Microcompaction. Cache-aware gating: only trims when the
+      // prompt cache is cold (or unsupported). When warm, returns history
+      // untouched to preserve cache hits.
+      history = await this.microcompaction.apply(
+        history, this._contextWindow, currentTokens, { cacheCold },
+      );
 
       // Layer 2: Conversation summarization (70% threshold)
       // Operates on the original transcript (agent.state.messages), not the
@@ -819,11 +908,14 @@ export class CompactionManager {
               }
             }
 
-            // Rebuild context from updated source
+            // Rebuild context from updated source. L2 just rewrote history
+            // wholesale, so any existing cache prefix is invalidated; treat as
+            // cold so L1 can trim the rebuilt history if warranted.
             history = await this.microcompaction.apply(
               compactedSource,
               this._contextWindow,
               this._currentContextTokenCount,
+              { cacheCold: true },
             );
 
             succeeded = true;

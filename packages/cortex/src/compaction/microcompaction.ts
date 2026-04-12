@@ -7,15 +7,22 @@
  *
  * Two sub-mechanisms:
  *   1. Insertion-time cap: Truncate large tool results at insertion time.
- *   2. Threshold-triggered batch processing: At 40%/50%/60% of context
- *      window, batch re-evaluate all tool results by age and category.
+ *   2. Cache-aware token-offset trimming: When the prompt cache has gone
+ *      cold and context utilization is above the trim floor, walk history
+ *      from newest to oldest accumulating token offsets. Tool results
+ *      within the hot zone stay full; beyond it, bookend size shrinks
+ *      linearly across the degradation span; beyond the span, results
+ *      become placeholder or clear based on tool category.
  *
- * Between threshold crossings, the cached trim state is replayed
- * identically to preserve prefix caching.
+ * When a persistResult callback is configured, full content is persisted
+ * to disk before any destructive trim (bookend, placeholder, clear) for
+ * non-reproducible and computational tools, and the in-context replacement
+ * includes the disk path so the agent can Read the content back.
  *
  * References:
  *   - compaction-strategy.md (Layer 1: Tool Result Trimming)
- *   - phase-5-compaction.md (5.2)
+ *   - observational-memory-architecture.md (cache-aware L1)
+ *   - tool-result-persistence.md (proactive persistence at execution)
  */
 
 import type { AgentMessage } from '../context-manager.js';
@@ -28,18 +35,20 @@ import { estimateTokens } from '../token-estimator.js';
 
 export const MICROCOMPACTION_DEFAULTS: MicrocompactionConfig = {
   maxResultTokens: 50_000,
-  softTrimThreshold: 0.40,
-  hardClearThreshold: 0.60,
-  bookendSize: 2_000,
-  preserveRecentTurns: 5,
-  extendedRetentionMultiplier: 2,
+  trimFloorRatio: 0.25,
+  hotZoneMinTokens: 16_000,
+  hotZoneRatio: 0.05,
+  bookendMaxChars: 2_000,
+  bookendMinChars: 256,
+  degradationSpanRatio: 0.40,
+  // extendedRetentionMultiplier intentionally undefined; resolved per-engine
+  // based on whether a persister is configured (1.0 with, 1.5 without).
 };
 
-/**
- * The three threshold levels at which batch re-evaluation fires.
- * 40% = soft trim, 50% = advance to placeholder, 60% = hard clear.
- */
-const THRESHOLD_LEVELS = [0.40, 0.50, 0.60] as const;
+/** Default extended retention multiplier when no persister is configured. */
+const EXTENDED_RETENTION_NO_PERSISTER = 1.5;
+/** Default extended retention multiplier when a persister is configured. */
+const EXTENDED_RETENTION_WITH_PERSISTER = 1.0;
 
 // ---------------------------------------------------------------------------
 // Tool category defaults
@@ -74,13 +83,16 @@ export type TrimAction =
   | { kind: 'clear' };
 
 /**
- * Cached trim state: maps message index (in the conversation history region)
- * to the trim action that should be applied. Only includes entries for
- * tool_result messages that need transformation.
+ * Cached trim state. Keyed on history length and a coarse utilization band
+ * so the engine can replay identical trim decisions across consecutive
+ * transformContext calls when the underlying conversation hasn't changed
+ * meaningfully.
  */
 export interface TrimState {
-  /** The threshold level that produced this state (0.40, 0.50, or 0.60). */
-  thresholdLevel: number;
+  /** History length at the time the state was computed. */
+  historyLength: number;
+  /** Coarse utilization band: floor(usageRatio * 10). */
+  utilizationBand: number;
   /** Map from conversation history index to trim action. */
   actions: Map<number, TrimAction>;
 }
@@ -91,26 +103,22 @@ export interface TrimState {
 
 /**
  * Cap a tool result at insertion time. If the result exceeds maxResultTokens,
- * truncate to head + tail bookend format.
+ * truncate to head + tail bookend format using bookendMaxChars per side.
  *
  * This runs at insertion, NOT in transformContext. The truncated result is
  * stored in conversation history.
- *
- * @param content - The tool result content string
- * @param config - Microcompaction config (only maxResultTokens and bookendSize used)
- * @returns The potentially truncated content
  */
 export function capToolResult(
   content: string,
-  config: Pick<MicrocompactionConfig, 'maxResultTokens' | 'bookendSize'>,
+  config: Pick<MicrocompactionConfig, 'maxResultTokens' | 'bookendMaxChars'>,
 ): string {
   const tokens = estimateTokens(content);
   if (tokens <= config.maxResultTokens) {
     return content;
   }
 
-  const headSize = config.bookendSize;
-  const tailSize = config.bookendSize;
+  const headSize = config.bookendMaxChars;
+  const tailSize = config.bookendMaxChars;
 
   // Ensure we don't exceed the content length
   if (headSize + tailSize >= content.length) {
@@ -212,127 +220,95 @@ export function getToolCategory(
 }
 
 // ---------------------------------------------------------------------------
-// Threshold-triggered batch processing (Tier 2-4)
+// Token-offset trimming (cache-aware, progressive degradation)
 // ---------------------------------------------------------------------------
 
 /**
- * Count the number of assistant turns in conversation history.
- * Used to determine recency windows.
+ * Compute the effective hot zone size in tokens.
+ * `max(hotZoneMinTokens, contextWindow * hotZoneRatio)`.
  */
-function countAssistantTurns(history: AgentMessage[]): number {
-  return history.filter(m => m.role === 'assistant').length;
+export function computeHotZone(
+  contextWindow: number,
+  config: Pick<MicrocompactionConfig, 'hotZoneMinTokens' | 'hotZoneRatio'>,
+): number {
+  return Math.max(config.hotZoneMinTokens, contextWindow * config.hotZoneRatio);
 }
 
 /**
- * Get the assistant turn index for each message in conversation history.
- * Returns an array parallel to history where each entry is the 0-based
- * assistant turn number (counting from the end).
- * For non-assistant messages, returns the turn number of the nearest
- * preceding assistant message.
+ * Resolve the effective extended retention multiplier. When the config value
+ * is undefined, use 1.0 if a persister is configured (content recoverable
+ * from disk) or 1.5 if not (content is truly lost on trim).
  */
-function getAssistantTurnDistances(history: AgentMessage[]): number[] {
-  const totalTurns = countAssistantTurns(history);
-  const distances = new Array<number>(history.length).fill(totalTurns);
-  let currentTurn = 0;
-
-  for (let i = 0; i < history.length; i++) {
-    if (history[i]!.role === 'assistant') {
-      currentTurn++;
-    }
-    // Distance from end = totalTurns - currentTurn
-    distances[i] = totalTurns - currentTurn;
+export function resolveExtendedRetentionMultiplier(config: MicrocompactionConfig): number {
+  if (typeof config.extendedRetentionMultiplier === 'number') {
+    return config.extendedRetentionMultiplier;
   }
-
-  return distances;
+  return config.persistResult
+    ? EXTENDED_RETENTION_WITH_PERSISTER
+    : EXTENDED_RETENTION_NO_PERSISTER;
 }
 
 /**
- * Determine the trim action for a tool result based on its distance
- * from the current turn and the current threshold level.
+ * Determine the trim action for a tool result based on its token offset
+ * from the most recent message.
+ *
+ * @param message - The tool result message
+ * @param tokenOffset - Cumulative tokens between this message and the end of history
+ * @param hotZone - Hot zone size in tokens (preserved fully)
+ * @param degradationSpan - Degradation span in tokens (bookend size shrinks across this span)
+ * @param config - Microcompaction config
+ * @param extendedMultiplier - Resolved extended retention multiplier for non-reproducible tools
  */
-function determineTrimAction(
+export function computeAction(
   message: AgentMessage,
-  distanceFromEnd: number,
-  thresholdIndex: number,
+  tokenOffset: number,
+  hotZone: number,
+  degradationSpan: number,
   config: MicrocompactionConfig,
+  extendedMultiplier: number,
 ): TrimAction {
   const toolName = extractToolName(message);
   const category = toolName ? getToolCategory(toolName, config.toolCategories) : undefined;
 
-  // Determine the recency window for this tool category
-  const baseWindow = config.preserveRecentTurns;
-  const retentionWindow = (category === 'non-reproducible')
-    ? baseWindow * config.extendedRetentionMultiplier
-    : baseWindow;
+  // Non-reproducible tools get an extended hot zone
+  const effectiveHotZone = category === 'non-reproducible'
+    ? hotZone * extendedMultiplier
+    : hotZone;
 
-  // Recent turns are always preserved
-  if (distanceFromEnd < retentionWindow) {
+  // Within hot zone: keep full
+  if (tokenOffset < effectiveHotZone) {
     return { kind: 'full' };
   }
 
-  const content = extractTextContent(message);
+  const distanceBeyondHotZone = tokenOffset - effectiveHotZone;
+  const t = degradationSpan > 0
+    ? Math.min(distanceBeyondHotZone / degradationSpan, 1.0)
+    : 1.0;
 
-  // Threshold 0 (40%): soft trim to bookend
-  if (thresholdIndex === 0) {
-    if (category === 'rereadable' || category === 'ephemeral' || category === 'computational' || !category) {
-      const tokens = estimateTokens(content);
-      return {
-        kind: 'bookend',
-        headChars: config.bookendSize,
-        tailChars: config.bookendSize,
-        originalTokens: tokens,
-      };
-    }
-    // Non-reproducible gets more time at 40%
-    if (distanceFromEnd >= retentionWindow) {
-      const tokens = estimateTokens(content);
-      return {
-        kind: 'bookend',
-        headChars: config.bookendSize,
-        tailChars: config.bookendSize,
-        originalTokens: tokens,
-      };
-    }
-    return { kind: 'full' };
-  }
-
-  // Threshold 1 (50%): advance bookend to placeholder
-  if (thresholdIndex === 1) {
-    if (category === 'non-reproducible' && distanceFromEnd < retentionWindow * 2) {
-      // Non-reproducible still gets bookend at 50% if within extended window
-      const tokens = estimateTokens(content);
-      return {
-        kind: 'bookend',
-        headChars: config.bookendSize,
-        tailChars: config.bookendSize,
-        originalTokens: tokens,
-      };
-    }
-    const preview = content.slice(0, 80).replace(/\n/g, ' ').trim();
-    return {
-      kind: 'placeholder',
-      toolName: toolName ?? 'unknown',
-      preview,
-    };
-  }
-
-  // Threshold 2 (60%): hard clear
-  // Clear rereadable entirely, clear ephemeral, keep non-reproducible in bookend
-  if (category === 'non-reproducible') {
+  // Within degradation span: interpolated bookend
+  if (t < 1.0) {
+    const bookendChars = Math.max(
+      config.bookendMinChars,
+      Math.round(config.bookendMaxChars * (1 - t) + config.bookendMinChars * t),
+    );
+    const content = extractTextContent(message);
     const tokens = estimateTokens(content);
     return {
       kind: 'bookend',
-      headChars: config.bookendSize,
-      tailChars: config.bookendSize,
+      headChars: bookendChars,
+      tailChars: bookendChars,
       originalTokens: tokens,
     };
   }
 
-  if (category === 'rereadable' || category === 'ephemeral') {
+  // Beyond degradation span: placeholder or clear based on tool category
+  if (category === 'ephemeral') {
     return { kind: 'clear' };
   }
 
-  // Default: placeholder for unknown tools at 60%
+  // Default for rereadable, non-reproducible, computational, and unknown:
+  // placeholder preserves the breadcrumb of what was tried.
+  const content = extractTextContent(message);
   const preview = content.slice(0, 80).replace(/\n/g, ' ').trim();
   return {
     kind: 'placeholder',
@@ -342,34 +318,48 @@ function determineTrimAction(
 }
 
 /**
- * Compute the full trim state for conversation history at a given threshold.
+ * Compute the full trim state by walking history from newest to oldest,
+ * accumulating token offsets.
  */
 export function computeTrimState(
   history: AgentMessage[],
-  thresholdIndex: number,
+  contextWindow: number,
+  usageRatio: number,
   config: MicrocompactionConfig,
 ): TrimState {
-  const distances = getAssistantTurnDistances(history);
   const actions = new Map<number, TrimAction>();
+  const hotZone = computeHotZone(contextWindow, config);
+  const degradationSpan = contextWindow * config.degradationSpanRatio;
+  const extendedMultiplier = resolveExtendedRetentionMultiplier(config);
 
-  for (let i = 0; i < history.length; i++) {
+  let tokenOffset = 0;
+
+  for (let i = history.length - 1; i >= 0; i--) {
     const message = history[i]!;
 
-    // Only trim tool result messages
-    if (!isToolResultMessage(message)) {
-      continue;
+    if (isToolResultMessage(message)) {
+      const action = computeAction(
+        message,
+        tokenOffset,
+        hotZone,
+        degradationSpan,
+        config,
+        extendedMultiplier,
+      );
+      if (action.kind !== 'full') {
+        actions.set(i, action);
+      }
     }
 
-    const action = determineTrimAction(message, distances[i]!, thresholdIndex, config);
-
-    // Only store non-full actions (full means no transformation needed)
-    if (action.kind !== 'full') {
-      actions.set(i, action);
-    }
+    // Accumulate tokens regardless of message type so non-tool-result
+    // messages (assistant text, user messages) push older results further
+    // down the timeline correctly.
+    tokenOffset += estimateTokens(extractTextContent(message));
   }
 
   return {
-    thresholdLevel: THRESHOLD_LEVELS[thresholdIndex] ?? 0,
+    historyLength: history.length,
+    utilizationBand: Math.floor(usageRatio * 10),
     actions,
   };
 }
@@ -395,7 +385,33 @@ export function applyBookend(
 }
 
 /**
- * Compute the replacement text for a trim action.
+ * Apply a bookend trim with a persisted file reference. The agent can
+ * Read the path to recover the trimmed middle portion.
+ */
+export function applyBookendWithPersistence(
+  content: string,
+  headChars: number,
+  tailChars: number,
+  originalTokens: number,
+  toolName: string,
+  path: string,
+): string {
+  const totalChars = content.length;
+  const header = `[Result persisted: ${path} (${totalChars} chars, ~${originalTokens} tokens) -- ${toolName}]`;
+
+  if (headChars + tailChars >= content.length) {
+    return `${header}\n\n${content}`;
+  }
+
+  const head = content.slice(0, headChars);
+  const tail = content.slice(-tailChars);
+  const trimmedTokens = originalTokens - estimateTokens(head) - estimateTokens(tail);
+
+  return `${header}\n\n${head}\n\n... [~${trimmedTokens} tokens trimmed; full content at ${path}] ...\n\n${tail}`;
+}
+
+/**
+ * Compute the replacement text for a trim action (no persistence).
  */
 function getTrimmedText(content: string, action: TrimAction): string {
   if (action.kind === 'bookend') {
@@ -447,32 +463,14 @@ export function applyTrimAction(message: AgentMessage, action: TrimAction): Agen
   return { role: message.role, content: trimmed, timestamp: message.timestamp };
 }
 
-/**
- * Determine which threshold level is active based on context usage ratio.
- * Returns -1 if below all thresholds (no trimming needed).
- */
-export function getActiveThresholdIndex(usageRatio: number, config: MicrocompactionConfig): number {
-  if (usageRatio >= config.hardClearThreshold) {
-    return 2;
-  }
-  // Use the midpoint between soft and hard as the 50% threshold
-  const midThreshold = (config.softTrimThreshold + config.hardClearThreshold) / 2;
-  if (usageRatio >= midThreshold) {
-    return 1;
-  }
-  if (usageRatio >= config.softTrimThreshold) {
-    return 0;
-  }
-  return -1;
-}
-
 // ---------------------------------------------------------------------------
 // MicrocompactionEngine
 // ---------------------------------------------------------------------------
 
 /**
- * Stateful engine for microcompaction. Caches trim state between threshold
- * crossings to preserve prefix cache optimization.
+ * Stateful engine for microcompaction. Caches trim state across consecutive
+ * calls with the same history length and utilization band so the same trim
+ * decisions are replayed when the conversation hasn't changed.
  */
 export class MicrocompactionEngine {
   private readonly config: MicrocompactionConfig;
@@ -507,42 +505,62 @@ export class MicrocompactionEngine {
    * Apply microcompaction to conversation history messages.
    * Called inside transformContext. Returns a new array; never modifies the input.
    *
-   * When a persistResult callback is configured, non-reproducible and computational
-   * tool results that are being cleared or replaced with a placeholder will be
-   * persisted to disk first, and the replacement text will include the file path
-   * so the agent can Read the content back if needed.
+   * Cache-aware gating:
+   *   - When `cacheCold` is false (cache warm), L1 is dormant and history
+   *     is returned untouched. This preserves cache hits during active use.
+   *   - When `cacheCold` is true, L1 may run if utilization is at or above
+   *     `trimFloorRatio` (default 25%).
+   *
+   * Token-offset trimming:
+   *   Walks history from newest to oldest. Tool results within the hot zone
+   *   stay full. Beyond the hot zone, bookend size shrinks linearly across
+   *   the degradation span. Beyond the span, results become placeholder or
+   *   clear based on tool category.
+   *
+   * Persistence:
+   *   When a persistResult callback is configured, full content is saved to
+   *   disk before any destructive action (bookend, placeholder, clear) for
+   *   non-reproducible and computational tools. The in-context replacement
+   *   includes the disk path so the agent can Read the content back.
    *
    * @param history - Conversation history messages (post-slot region)
    * @param contextWindow - Total context window size in tokens
    * @param currentTokens - Current estimated token count
+   * @param options.cacheCold - Whether the prompt cache has expired (or is unused)
    * @returns Potentially trimmed conversation history
    */
   async apply(
     history: AgentMessage[],
     contextWindow: number,
     currentTokens: number,
+    options: { cacheCold: boolean } = { cacheCold: true },
   ): Promise<AgentMessage[]> {
     if (contextWindow <= 0 || history.length === 0) {
       return history;
     }
 
-    const usageRatio = currentTokens / contextWindow;
-    const thresholdIndex = getActiveThresholdIndex(usageRatio, this.config);
-
-    // Below all thresholds: return untouched
-    if (thresholdIndex < 0) {
+    // Gate 1: Cache awareness. When the cache is warm, L1 is dormant.
+    if (!options.cacheCold) {
       return history;
     }
 
-    // Check if we need to recompute or can replay cached state
-    const needRecompute = !this.cachedState
-      || this.cachedState.thresholdLevel < (THRESHOLD_LEVELS[thresholdIndex] ?? 0);
-
-    if (needRecompute) {
-      this.cachedState = computeTrimState(history, thresholdIndex, this.config);
+    // Gate 2: Trim floor. Below this utilization, no trimming even if cold.
+    const usageRatio = currentTokens / contextWindow;
+    if (usageRatio < this.config.trimFloorRatio) {
+      return history;
     }
 
-    // Apply cached actions
+    const utilizationBand = Math.floor(usageRatio * 10);
+
+    // Replay cached state when nothing meaningful has changed.
+    const canReplay = this.cachedState
+      && this.cachedState.historyLength === history.length
+      && this.cachedState.utilizationBand === utilizationBand;
+
+    if (!canReplay) {
+      this.cachedState = computeTrimState(history, contextWindow, usageRatio, this.config);
+    }
+
     if (!this.cachedState || this.cachedState.actions.size === 0) {
       return history;
     }
@@ -562,59 +580,78 @@ export class MicrocompactionEngine {
   }
 
   /**
-   * If a persistResult callback is configured and the action is clearing a
-   * non-reproducible or computational result, persist the original content
-   * to disk and return a message with the file path reference.
-   * Otherwise, apply the standard trim action.
+   * If a persistResult callback is configured and the action is destructive
+   * (bookend, placeholder, or clear), persist each non-reproducible or
+   * computational tool_result part's content to disk individually and
+   * replace each part's text with a path-referencing representation.
+   *
+   * Multi-part messages (from parallel tool calls) get per-part treatment so
+   * each part's disk path maps back to its own content.
+   *
+   * Parts that don't qualify for persistence (rereadable, ephemeral, no
+   * callback, or non-tool-result parts) still get the standard trim action
+   * applied to their own text.
    */
   private async maybePersistBeforeTrim(
     message: AgentMessage,
     action: TrimAction,
     messageIndex: number,
   ): Promise<AgentMessage> {
-    // Only persist for destructive actions (placeholder/clear), not bookend/full
-    if (action.kind !== 'placeholder' && action.kind !== 'clear') {
-      return applyTrimAction(message, action);
+    if (action.kind === 'full') {
+      return message;
     }
 
-    // Only persist if callback exists
+    // No persister: fall back entirely to the standard per-part trim.
     if (!this.config.persistResult) {
       return applyTrimAction(message, action);
     }
 
-    // Only persist non-reproducible and computational results
-    const toolName = extractToolName(message);
-    const category = toolName ? getToolCategory(toolName, this.config.toolCategories) : undefined;
-    if (category !== 'non-reproducible' && category !== 'computational') {
+    // String content: treat as a single unit (non-tool-result message).
+    if (!Array.isArray(message.content) || message.content.length === 0) {
       return applyTrimAction(message, action);
     }
 
-    // Persist the original content to disk
-    const content = extractTextContent(message);
-    try {
-      const path = await this.config.persistResult(content, {
-        toolName: toolName ?? 'unknown',
-        messageIndex,
-        category,
-      });
-
-      const preview = content.slice(0, 80).replace(/\n/g, ' ').trim();
-      const persistedText = `[Tool result persisted -- ${toolName ?? 'unknown'}: "${preview}" -- use Read on ${path} for full content]`;
-
-      // Preserve content array structure for tool_result messages
-      if (Array.isArray(message.content) && message.content.length > 0) {
-        const newContent = message.content.map(part =>
-          (part.type === 'tool_result' || part.type === 'text') && typeof part.text === 'string'
-            ? { ...part, text: persistedText }
-            : part,
-        );
-        return { role: message.role, content: newContent, timestamp: message.timestamp };
+    // Per-part processing: each tool_result part gets its own persistence
+    // decision and its own replacement text.
+    const newParts = await Promise.all(message.content.map(async part => {
+      const isToolResult = part.type === 'tool_result' && typeof part.text === 'string';
+      const isTextPart = part.type === 'text' && typeof part.text === 'string';
+      if (!isToolResult && !isTextPart) {
+        return part;
       }
-      return { role: message.role, content: persistedText, timestamp: message.timestamp };
-    } catch {
-      // Persist failed, fall back to standard trim
-      return applyTrimAction(message, action);
-    }
+
+      const partText = part.text as string;
+      const toolName = typeof part['name'] === 'string' ? part['name'] as string : null;
+      const category = toolName ? getToolCategory(toolName, this.config.toolCategories) : undefined;
+
+      // Only persist non-reproducible and computational parts.
+      const shouldPersist = category === 'non-reproducible' || category === 'computational';
+      if (!shouldPersist) {
+        return { ...part, text: getTrimmedText(partText, action) };
+      }
+
+      let path: string;
+      try {
+        path = await this.config.persistResult!(partText, {
+          toolName: toolName ?? 'unknown',
+          messageIndex,
+          category,
+        });
+      } catch {
+        // Persist failed; fall back to standard trim for this part.
+        return { ...part, text: getTrimmedText(partText, action) };
+      }
+
+      const persistedText = formatPersistedReplacement(
+        partText,
+        action,
+        toolName ?? 'unknown',
+        path,
+      );
+      return { ...part, text: persistedText };
+    }));
+
+    return { role: message.role, content: newParts, timestamp: message.timestamp };
   }
 
   /**
@@ -632,3 +669,32 @@ export class MicrocompactionEngine {
     return this.cachedState;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Persistence formatting helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Format the in-context replacement when content has been persisted to disk.
+ * - bookend: header + head + middle marker + tail
+ * - placeholder: one-line breadcrumb with disk path
+ * - clear: minimal marker with disk path
+ */
+function formatPersistedReplacement(
+  content: string,
+  action: TrimAction,
+  toolName: string,
+  path: string,
+): string {
+  if (action.kind === 'bookend') {
+    return applyBookendWithPersistence(
+      content, action.headChars, action.tailChars, action.originalTokens, toolName, path,
+    );
+  }
+  if (action.kind === 'placeholder') {
+    return `[Tool result persisted -- ${toolName}: "${action.preview}" -- use Read on ${path} for full content]`;
+  }
+  // clear
+  return `[Tool result persisted -- ${toolName} -- use Read on ${path} for full content]`;
+}
+

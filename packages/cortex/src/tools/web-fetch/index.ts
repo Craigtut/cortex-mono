@@ -48,8 +48,18 @@ export interface WebFetchDetails {
 
 const REQUEST_TIMEOUT = 30_000;
 const DEFAULT_MAX_PER_LOOP = 300;
-const MAX_CONTENT_TOKENS = 25_000; // approximate token limit for summarization
 const USER_AGENT = 'Cortex/1.0 (web-fetch tool)';
+
+/**
+ * Maximum tokens of page content sent to the utility model for summarization.
+ *
+ * Distinct from the agent-side result-persistence interceptor: this cap is
+ * about cost/latency on the summarization step, not main-agent context. We
+ * pick a value generous enough to let the utility model see most of a page
+ * (utility models typically have 200K+ context windows) while preventing
+ * pathological cases where a 1MB page burns excessive tokens on every fetch.
+ */
+const MAX_UTILITY_MODEL_INPUT_TOKENS = 100_000;
 
 /**
  * Hostname strings that always resolve to private/local addresses.
@@ -233,16 +243,6 @@ function stripBoilerplateHtml(html: string): string {
     cleaned = cleaned.replace(new RegExp(`<${tag}[^>]*/>`, 'gi'), '');
   }
   return cleaned;
-}
-
-/**
- * Truncate text to approximately maxTokens tokens.
- * Uses a rough estimate of 1 token per 4 characters.
- */
-function truncateToTokens(text: string, maxTokens: number): string {
-  const maxChars = maxTokens * 4;
-  if (text.length <= maxChars) return text;
-  return text.slice(0, maxChars) + '\n\n[Content truncated for summarization]';
 }
 
 // ---------------------------------------------------------------------------
@@ -554,17 +554,29 @@ export function createWebFetchTool(config: WebFetchToolConfig): {
  * Summarize page content using the utility model.
  * Falls back to truncated content if the utility model is unavailable.
  */
+/**
+ * Cap content sent to the utility model. This is purely a cost/latency
+ * guard for the summarization step and is independent of the agent-side
+ * result-persistence interceptor (which protects main-agent context).
+ */
+function capForUtilityModel(content: string): string {
+  const maxChars = MAX_UTILITY_MODEL_INPUT_TOKENS * 4;
+  if (content.length <= maxChars) return content;
+  return content.slice(0, maxChars) + '\n\n[Content truncated for summarization input]';
+}
+
 async function summarize(
   content: string,
   prompt: string,
   utilityComplete?: (context: unknown) => Promise<unknown>,
 ): Promise<string> {
-  const truncated = truncateToTokens(content, MAX_CONTENT_TOKENS);
-
   if (!utilityComplete) {
-    // No utility model available; return truncated content directly
-    return `[WebFetch: utility model not available. Returning raw content.]\n\n${truncated}`;
+    // No utility model available; return raw content. The agent's
+    // result-persistence interceptor will bookend/persist if oversized.
+    return `[WebFetch: utility model not available. Returning raw content.]\n\n${content}`;
   }
+
+  const summarizationInput = capForUtilityModel(content);
 
   try {
     const result = await utilityComplete({
@@ -572,7 +584,7 @@ async function summarize(
       messages: [
         {
           role: 'user',
-          content: `Question: ${prompt}\n\nWeb page content:\n${truncated}`,
+          content: `Question: ${prompt}\n\nWeb page content:\n${summarizationInput}`,
         },
       ],
     });
@@ -583,9 +595,10 @@ async function summarize(
       if (typeof textValue === 'string') return textValue;
     }
 
-    return `[Summarization produced unexpected result type]\n\n${truncated.slice(0, 2000)}`;
+    return `[Summarization produced unexpected result type]\n\n${content.slice(0, 2000)}`;
   } catch {
-    // Summarization failed, return truncated content
-    return `[WebFetch: summarization failed. Returning raw content.]\n\n${truncated}`;
+    // Summarization failed, return raw content. The agent's
+    // result-persistence interceptor will bookend/persist if oversized.
+    return `[WebFetch: summarization failed. Returning raw content.]\n\n${content}`;
   }
 }

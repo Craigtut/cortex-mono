@@ -24,37 +24,32 @@ function makeToolResult(content: string, toolName: string): AgentMessage {
   };
 }
 
+// Content of approximately N tokens (estimateTokens uses chars/4).
+function makeContentOfTokens(tokens: number): string {
+  return 'x'.repeat(tokens * 4);
+}
+
 /**
- * Build history with a tool result at the start followed by enough
- * assistant turns to push it outside the recency/retention window.
+ * Build a history with an OLD tool result followed by a big assistant
+ * message that pushes it back beyond the hot zone, plus a recent tail.
+ *
+ * The microcompaction algorithm walks newest -> oldest accumulating token
+ * offsets, so the older result lands at tokenOffset ≈ pushTokens.
  */
 function buildHistoryWithOldToolResult(
   toolContent: string,
   toolName: string,
-  assistantTurns: number,
+  pushTokens: number,
 ): AgentMessage[] {
-  const history: AgentMessage[] = [];
-  history.push(makeToolResult(toolContent, toolName));
-  for (let i = 0; i < assistantTurns; i++) {
-    history.push(makeAssistantMsg(`Assistant turn ${i}`));
-  }
-  return history;
+  return [
+    makeToolResult(toolContent, toolName),                 // index 0: pushed back
+    makeAssistantMsg(makeContentOfTokens(pushTokens)),     // index 1: pushes 0
+    makeAssistantMsg('recent'),                            // index 2: tokenOffset = 0
+  ];
 }
 
-/**
- * Create a MicrocompactionEngine configured for testing.
- *
- * preserveRecentTurns=2, extendedRetentionMultiplier=2.
- * Non-reproducible retention window = 2 * 2 = 4.
- * At threshold 1 (50%), non-reproducible outside retentionWindow * 2 (= 8) gets placeholder.
- * At threshold 2 (60%), rereadable gets clear.
- */
 function createEngine(persistResult?: PersistResultFn): MicrocompactionEngine {
   const config: Partial<MicrocompactionConfig> = {
-    preserveRecentTurns: 2,
-    bookendSize: 100,
-    softTrimThreshold: 0.40,
-    hardClearThreshold: 0.60,
     toolCategories: {
       WebFetch: 'non-reproducible',
       Bash: 'non-reproducible',
@@ -73,31 +68,25 @@ function createEngine(persistResult?: PersistResultFn): MicrocompactionEngine {
 // ---------------------------------------------------------------------------
 
 describe('MicrocompactionEngine disk persistence', () => {
+  // Push the old tool result well beyond the degradation span so it gets a
+  // placeholder action. With persister: extendedHotZone = 16k * 1.0 = 16k.
+  // Degradation span at contextWindow=200k = 80k. So pushTokens > 96k.
+  const PUSH_TO_PLACEHOLDER = 120_000;
+  // Push just past the hot zone so the result gets a bookend action.
+  const PUSH_TO_BOOKEND = 30_000;
 
-  // -----------------------------------------------------------------------
-  // Test 1: Non-reproducible result persisted via callback
-  //
-  // At threshold 1 (50%), non-reproducible tools outside the extended
-  // retention window (retentionWindow * 2 = 8) receive a `placeholder`
-  // action, which is destructive and triggers maybePersistBeforeTrim.
-  // -----------------------------------------------------------------------
-
-  it('persists non-reproducible results via callback and includes path in placeholder', async () => {
+  it('persists non-reproducible results on placeholder action with disk path', async () => {
     const persistResult = vi.fn().mockResolvedValue('/tmp/compaction/result-0.txt');
     const engine = createEngine(persistResult);
 
     const toolContent = 'WebFetch result content that is substantial enough to test persistence behavior';
-    // Need 9+ assistant turns so the tool result at index 0 has distance >= 8
-    // (retentionWindow * 2 = 2 * 2 * 2 = 8 at threshold 1 for non-reproducible)
-    const history = buildHistoryWithOldToolResult(toolContent, 'WebFetch', 9);
+    const history = buildHistoryWithOldToolResult(toolContent, 'WebFetch', PUSH_TO_PLACEHOLDER);
 
-    // 55% usage: above 50% midpoint threshold, triggers threshold index 1
-    const contextWindow = 100_000;
-    const currentTokens = 55_000;
+    const contextWindow = 200_000;
+    const currentTokens = 130_000; // > 25% trim floor
 
-    const result = await engine.apply(history, contextWindow, currentTokens);
+    const result = await engine.apply(history, contextWindow, currentTokens, { cacheCold: true });
 
-    // The persist callback should have been invoked for the non-reproducible WebFetch result
     expect(persistResult).toHaveBeenCalledOnce();
     const [content, metadata] = persistResult.mock.calls[0]!;
     expect(content).toBe(toolContent);
@@ -105,114 +94,160 @@ describe('MicrocompactionEngine disk persistence', () => {
     expect(metadata.messageIndex).toBe(0);
     expect(metadata.category).toBe('non-reproducible');
 
-    // The replacement message should include the file path in the text
     const replaced = result[0]!;
     const text = extractTextContent(replaced);
     expect(text).toContain('/tmp/compaction/result-0.txt');
-    expect(text).toContain('Tool result persisted');
-    // Content structure should be preserved (array with tool_result parts)
+    expect(text).toContain('persisted');
     expect(Array.isArray(replaced.content)).toBe(true);
   });
 
-  // -----------------------------------------------------------------------
-  // Test 2: Rereadable result cleared without callback
-  //
-  // At threshold 2 (60%), rereadable tools get a `clear` action. This is
-  // destructive, but maybePersistBeforeTrim explicitly skips rereadable
-  // category (only persists non-reproducible and computational).
-  // -----------------------------------------------------------------------
+  it('persists non-reproducible results on bookend action with disk path', async () => {
+    const persistResult = vi.fn().mockResolvedValue('/tmp/compaction/bookend.txt');
+    const engine = createEngine(persistResult);
+
+    const toolContent = 'A'.repeat(20_000);
+    const history = buildHistoryWithOldToolResult(toolContent, 'Bash', PUSH_TO_BOOKEND);
+
+    const result = await engine.apply(history, 200_000, 100_000, { cacheCold: true });
+
+    expect(persistResult).toHaveBeenCalledOnce();
+    const replaced = result[0]!;
+    const text = extractTextContent(replaced);
+    // Bookend with persistence: header + head + middle marker + tail
+    expect(text).toContain('Result persisted');
+    expect(text).toContain('/tmp/compaction/bookend.txt');
+    expect(text).toContain('tokens trimmed');
+  });
 
   it('does not invoke persist callback for rereadable results', async () => {
     const persistResult = vi.fn().mockResolvedValue('/tmp/compaction/result-0.txt');
     const engine = createEngine(persistResult);
 
     const toolContent = 'Read file content that can be re-read from disk';
-    // 6 assistant turns: distance = 6 > preserveRecentTurns (2) for rereadable
-    const history = buildHistoryWithOldToolResult(toolContent, 'Read', 6);
+    const history = buildHistoryWithOldToolResult(toolContent, 'Read', PUSH_TO_PLACEHOLDER);
 
-    // 65% usage: above 60% threshold, triggers threshold index 2 (hard clear)
-    const contextWindow = 100_000;
-    const currentTokens = 65_000;
+    const result = await engine.apply(history, 200_000, 130_000, { cacheCold: true });
 
-    const result = await engine.apply(history, contextWindow, currentTokens);
-
-    // Persist callback should NOT be invoked for rereadable category
     expect(persistResult).not.toHaveBeenCalled();
 
-    // The result should be cleared with standard text but preserve structure
     const replaced = result[0]!;
     const text = extractTextContent(replaced);
-    expect(text).toBe('[Tool result cleared]');
-    // Content structure should be preserved (array with tool_result parts)
+    // Rereadable beyond degradation span -> placeholder (not clear)
+    expect(text).toContain('Tool result trimmed');
+    expect(text).toContain('Read');
     expect(Array.isArray(replaced.content)).toBe(true);
   });
 
-  // -----------------------------------------------------------------------
-  // Test 3: No callback set = standard behavior
-  //
-  // Without a persistResult callback, maybePersistBeforeTrim falls through
-  // to the standard applyTrimAction. A non-reproducible tool at threshold 1
-  // with enough distance gets a placeholder action (standard placeholder text).
-  // -----------------------------------------------------------------------
+  it('does not invoke persist callback for ephemeral results (cleared)', async () => {
+    const persistResult = vi.fn().mockResolvedValue('/tmp/compaction/result-0.txt');
+    const engine = createEngine(persistResult);
+
+    const toolContent = 'SubAgent output - re-runnable';
+    const history = buildHistoryWithOldToolResult(toolContent, 'SubAgent', PUSH_TO_PLACEHOLDER);
+
+    const result = await engine.apply(history, 200_000, 130_000, { cacheCold: true });
+
+    expect(persistResult).not.toHaveBeenCalled();
+
+    const replaced = result[0]!;
+    const text = extractTextContent(replaced);
+    expect(text).toBe('[Tool result cleared]');
+    expect(Array.isArray(replaced.content)).toBe(true);
+  });
 
   it('uses standard placeholder when no persist callback is configured', async () => {
     const engine = createEngine(); // no persistResult
 
     const toolContent = 'WebFetch result with no persistence configured on this engine';
-    // 9 assistant turns: distance = 9 >= retentionWindow * 2 = 8 at threshold 1
-    const history = buildHistoryWithOldToolResult(toolContent, 'WebFetch', 9);
+    // No persister: extendedHotZone = 16k * 1.5 = 24k. Push beyond 24k + 80k = 104k.
+    const history = buildHistoryWithOldToolResult(toolContent, 'WebFetch', 130_000);
 
-    // 55% usage: threshold index 1 (50%)
-    const contextWindow = 100_000;
-    const currentTokens = 55_000;
+    const result = await engine.apply(history, 200_000, 140_000, { cacheCold: true });
 
-    const result = await engine.apply(history, contextWindow, currentTokens);
-
-    // Without persist callback, should use standard placeholder format
     const replaced = result[0]!;
     const text = extractTextContent(replaced);
     expect(text).toContain('Tool result trimmed');
     expect(text).toContain('WebFetch');
-    // Should NOT contain any file path reference
     expect(text).not.toContain('persisted');
-    // Content structure should be preserved
     expect(Array.isArray(replaced.content)).toBe(true);
   });
 
-  // -----------------------------------------------------------------------
-  // Test 4: Callback error = graceful fallback
-  //
-  // When the persist callback throws, maybePersistBeforeTrim catches the
-  // error and falls back to the standard trim action (placeholder).
-  // No error should propagate.
-  // -----------------------------------------------------------------------
+  it('persists each part separately in multi-part tool_result messages', async () => {
+    // Parallel tool calls produce a single message with multiple tool_result
+    // parts. Each part must be persisted independently so its disk path maps
+    // to its own content, not a concatenation of all parts.
+    const paths: string[] = [];
+    const persistedContents: string[] = [];
+    const persistResult = vi.fn().mockImplementation(async (content: string) => {
+      const path = `/tmp/part-${paths.length}.txt`;
+      paths.push(path);
+      persistedContents.push(content);
+      return path;
+    });
+    const engine = createEngine(persistResult);
+
+    const partA = 'WebFetch A content unique to first parallel call';
+    const partB = 'Bash B content totally different from A';
+    const multiPart: AgentMessage = {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_a', text: partA, name: 'WebFetch' },
+        { type: 'tool_result', tool_use_id: 'toolu_b', text: partB, name: 'Bash' },
+      ],
+      timestamp: 0,
+    };
+    const history: AgentMessage[] = [
+      multiPart,
+      makeAssistantMsg(makeContentOfTokens(PUSH_TO_PLACEHOLDER)),
+      makeAssistantMsg('recent'),
+    ];
+
+    const result = await engine.apply(history, 200_000, 130_000, { cacheCold: true });
+
+    // Both parts should have been persisted separately
+    expect(persistResult).toHaveBeenCalledTimes(2);
+    expect(persistedContents).toContain(partA);
+    expect(persistedContents).toContain(partB);
+
+    // Each part's replacement should reference its own disk path
+    const replaced = result[0]!;
+    expect(Array.isArray(replaced.content)).toBe(true);
+    const parts = replaced.content as Array<Record<string, unknown>>;
+    expect(parts.length).toBe(2);
+
+    const textA = parts[0]!.text as string;
+    const textB = parts[1]!.text as string;
+
+    // tool_use_id linkage preserved
+    expect(parts[0]!.tool_use_id).toBe('toolu_a');
+    expect(parts[1]!.tool_use_id).toBe('toolu_b');
+
+    // Each part references its own path, not the other's
+    expect(textA).toContain('persisted');
+    expect(textB).toContain('persisted');
+    // Because persist is called per-part with its own content, paths differ
+    const aHasOwnPath = textA.includes(paths[persistedContents.indexOf(partA)]!);
+    const bHasOwnPath = textB.includes(paths[persistedContents.indexOf(partB)]!);
+    expect(aHasOwnPath).toBe(true);
+    expect(bHasOwnPath).toBe(true);
+  });
 
   it('falls back to standard trim when persist callback throws', async () => {
     const persistResult = vi.fn().mockRejectedValue(new Error('disk full'));
     const engine = createEngine(persistResult);
 
     const toolContent = 'WebFetch result that fails to persist to disk due to error';
-    // 9 assistant turns: distance = 9 >= 8 so placeholder action at threshold 1
-    const history = buildHistoryWithOldToolResult(toolContent, 'WebFetch', 9);
+    const history = buildHistoryWithOldToolResult(toolContent, 'WebFetch', PUSH_TO_PLACEHOLDER);
 
-    // 55% usage: threshold index 1 (50%)
-    const contextWindow = 100_000;
-    const currentTokens = 55_000;
+    const result = await engine.apply(history, 200_000, 130_000, { cacheCold: true });
 
-    const result = await engine.apply(history, contextWindow, currentTokens);
-
-    // Persist was attempted
     expect(persistResult).toHaveBeenCalledOnce();
 
-    // Should fall back to standard placeholder without propagating error
     const replaced = result[0]!;
     const text = extractTextContent(replaced);
-    // Standard placeholder format (from applyTrimAction)
     expect(text).toContain('Tool result trimmed');
     expect(text).toContain('WebFetch');
-    // Should NOT contain any file path since persist failed
     expect(text).not.toContain('persisted');
-    // Content structure should be preserved
     expect(Array.isArray(replaced.content)).toBe(true);
   });
 });

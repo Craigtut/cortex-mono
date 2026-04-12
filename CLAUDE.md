@@ -45,7 +45,7 @@ Two main exports, fully independent:
 - **Context Management**: Named slots for organizing context, slot-based composition, prefix caching optimization
 - **Built-in Tools**: Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent, TaskOutput (auto-registered, disable via `disableTools` config)
 - **Tool Permissions**: Per-tool permission modes (off/ask/always_allow), pre-execution callbacks
-- **Compaction**: Observational memory (default: background observer/reflector with async buffering) or classic three-layer strategy (microcompaction, summarization, emergency truncation)
+- **Compaction**: Observational memory (default: background observer/reflector with async buffering) or classic strategy (summarization, emergency truncation). Cache-aware microcompaction (tool result trimming) is shared by both strategies.
 - **Skills**: Progressive disclosure system (advertise/load/use), SKILL.md format, dynamic context injection
 - **MCP**: Unified MCP client for integrating external tool servers
 - **Budget Guards**: Token and cost limits to prevent runaway execution
@@ -135,6 +135,7 @@ Detailed documentation lives in `/docs/cortex/`. Use `/doc-explorer <topic>` to 
 - **Architecture**: `docs/cortex/cortex-architecture.md` (core design, exports, patterns)
 - **Context**: `docs/cortex/context-manager.md` (slots, prefix caching, ephemeral context)
 - **Compaction**: `docs/cortex/observational-memory-architecture.md` (default: observational memory), `docs/cortex/compaction-strategy.md` (classic strategy)
+- **Tool Result Persistence**: `docs/cortex/tool-result-persistence.md` (proactive bookend + persist for oversized tool results)
 - **Skills**: `docs/cortex/skill-system.md` (progressive disclosure, SKILL.md format, registry)
 - **Providers**: `docs/cortex/provider-manager.md` (discovery, OAuth, model resolution)
 - **MCP**: `docs/cortex/mcp-integration.md` (MCP client, tool wrapping, namespacing)

@@ -44,8 +44,18 @@ The summarization call uses the cortex **utility model** (see `model-tiers.md`).
 ### Content Processing
 
 - Strip navigation, ads, scripts, and boilerplate elements before Turndown conversion
-- Truncate converted markdown that exceeds a configurable token limit (~25,000 tokens) before sending to the summarization model
+- Cap content sent to the utility model at ~100,000 tokens (`MAX_UTILITY_MODEL_INPUT_TOKENS`). This is a cost/latency guard for the summarization step, separate from main-agent context protection. Most pages fit well under this cap; pathologically large pages get truncated with a `[Content truncated for summarization input]` marker.
 - Handle non-HTML content types: JSON and plain text returned as-is, PDFs via text extraction
+- When summarization succeeds the result returned to the main agent is a short answer. When the utility model is unavailable or fails, the raw markdown flows back instead. Either path is then size-checked by the agent's [tool result persistence interceptor](../tool-result-persistence.md), which bookends and optionally persists oversized content.
+
+### Two Layers of Size Protection
+
+WebFetch is unique among tools in having two distinct downstream consumers:
+
+1. **Utility model** (input to summarization). Bounded internally by `MAX_UTILITY_MODEL_INPUT_TOKENS` (~100K). Concern: cost and latency on every fetch.
+2. **Main agent** (output of the tool call). Bounded by the [tool result persistence interceptor](../tool-result-persistence.md) (~25K by default). Concern: main-agent context window.
+
+Normal path: the main agent receives a short summary that easily fits in its budget. Fallback path (utility model unavailable or fails): the full markdown flows back and the interceptor bookends/persists it. The two caps protect against different failure modes and operate independently.
 
 ### Redirect Handling
 

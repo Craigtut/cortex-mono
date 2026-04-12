@@ -14,13 +14,15 @@ Execute shell commands in the host environment. Cross-platform: bash/zsh on macO
 ## Returns
 
 **`content`** (sent to the LLM):
-- Truncated stdout (max ~30,000 characters). For larger outputs, a truncation notice tells the model it can use Read or Grep to inspect specific parts.
+- Stdout (full output as produced by the command)
 - stderr if non-empty
 - Exit code and timeout/interrupt status
 - For backgrounded commands: a task ID for polling via the TaskOutput tool
 
+Oversized output is handled by the agent's [tool result persistence interceptor](../tool-result-persistence.md), which bookends large results and (when configured) persists the full content to disk. Bash itself no longer truncates.
+
 **`details`** (sent to UI/logs only):
-- Full stdout and stderr (untruncated)
+- Full stdout and stderr (always untruncated; not sent to the LLM)
 - Exit code
 - Duration
 - Whether the command was interrupted/timed out/backgrounded
@@ -100,11 +102,10 @@ On agent abort (the entire agentic loop is cancelled), all running bash processe
 
 ### Output Handling
 
-- Output truncated at ~30,000 characters in `content` (what the model sees)
-- Full output preserved in `details` (what the UI shows)
-- Uses pi-agent-core's native `AgentToolResult<T>` split
-- **Truncation strategy:** Keep the first ~15,000 and last ~15,000 characters, elide the middle with: `\n[... truncated ${elided} characters. Use Read or Grep to inspect specific parts. ...]\n`
-- Binary output is sanitized: control characters (except tab/newline/CR), surrogate pairs, and format characters are stripped
+- Bash no longer self-truncates. Output flows untouched to the agent's [tool result persistence interceptor](../tool-result-persistence.md), which bookends and (optionally) persists oversized results.
+- Full output is always preserved in `details` (sent to UI/logs only, never to the LLM).
+- Uses pi-agent-core's native `AgentToolResult<T>` split.
+- Binary output is sanitized: control characters (except tab/newline/CR), surrogate pairs, and format characters are stripped.
 
 ### Output Encoding
 

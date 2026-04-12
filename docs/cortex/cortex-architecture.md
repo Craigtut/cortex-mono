@@ -129,6 +129,10 @@ const agent = await CortexAgent.create({
 
 Permissions are enforced through the `beforeToolCall` hook used for both built-in and MCP tools. Built-in tool schemas use TypeBox directly since they are defined within Cortex. SubAgent is a special case: it delegates work to a child Cortex agent.
 
+#### Tool Result Persistence
+
+Every tool's output flows through a result-size interceptor at the registration boundary in `refreshTools()`. Oversized results (>25K tokens) are bookended (head + tail preview) and, when a `persistResult` callback is configured on `CortexAgentConfig`, persisted to disk with a file reference the agent can Read for the full content. This applies uniformly to built-in tools, MCP tools, and consumer-provided tools, with a small skip set (Read, Edit, Write, Glob) for tools that produce inherently bounded output. See [tool-result-persistence.md](tool-result-persistence.md) for the full design.
+
 ### Schema Conversion (Zod -> TypeBox)
 
 Pi-agent-core uses TypeBox + AJV for tool parameter schemas. Cortex provides a conversion utility:

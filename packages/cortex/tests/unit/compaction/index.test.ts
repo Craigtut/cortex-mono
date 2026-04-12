@@ -59,7 +59,7 @@ describe('buildCompactionConfig', () => {
     });
 
     expect(config.microcompaction.maxResultTokens).toBe(25_000);
-    expect(config.microcompaction.softTrimThreshold).toBe(0.40); // default
+    expect(config.microcompaction.trimFloorRatio).toBe(0.25); // default
     expect(config.compaction.threshold).toBe(0.70); // default
   });
 
@@ -100,6 +100,77 @@ describe('CompactionManager', () => {
     it('tracks context window size', () => {
       manager.setContextWindow(200_000);
       expect(manager.contextWindow).toBe(200_000);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Cache-aware gating
+  // -----------------------------------------------------------------------
+
+  describe('cache-aware gating', () => {
+    it('reports cache cold when no provider info is set', () => {
+      expect(manager.isCacheCold()).toBe(true);
+    });
+
+    it('reports cache cold when caching is unsupported', () => {
+      manager.setCacheInfo('google', 'long');
+      expect(manager.providerCacheTtlMs).toBe(0);
+      expect(manager.isCacheCold()).toBe(true);
+    });
+
+    it('reports cache cold when retention is none', () => {
+      manager.setCacheInfo('anthropic', 'none');
+      expect(manager.providerCacheTtlMs).toBe(0);
+      expect(manager.isCacheCold()).toBe(true);
+    });
+
+    it('resolves Anthropic short TTL to 5 minutes', () => {
+      manager.setCacheInfo('anthropic', 'short');
+      expect(manager.providerCacheTtlMs).toBe(300_000);
+    });
+
+    it('resolves Anthropic long TTL to 1 hour', () => {
+      manager.setCacheInfo('anthropic', 'long');
+      expect(manager.providerCacheTtlMs).toBe(3_600_000);
+    });
+
+    it('resolves OpenAI short TTL to 10 minutes', () => {
+      manager.setCacheInfo('openai', 'short');
+      expect(manager.providerCacheTtlMs).toBe(600_000);
+    });
+
+    it('resolves OpenAI long TTL to 24 hours', () => {
+      manager.setCacheInfo('openai', 'long');
+      expect(manager.providerCacheTtlMs).toBe(86_400_000);
+    });
+
+    it('reports cache cold when no LLM call has been recorded', () => {
+      manager.setCacheInfo('anthropic', 'short');
+      expect(manager.lastLlmCallTimestamp).toBeNull();
+      expect(manager.isCacheCold()).toBe(true);
+    });
+
+    it('reports cache warm immediately after an LLM call', () => {
+      manager.setCacheInfo('anthropic', 'short');
+      manager.updateCurrentContextTokenCount(1000);
+      expect(manager.lastLlmCallTimestamp).not.toBeNull();
+      expect(manager.isCacheCold()).toBe(false);
+    });
+
+    it('reports cache cold after the TTL has elapsed', () => {
+      manager.setCacheInfo('anthropic', 'short'); // 5 min TTL
+      manager.updateCurrentContextTokenCount(1000);
+      const callTime = manager.lastLlmCallTimestamp!;
+      // Simulate 6 minutes passing
+      expect(manager.isCacheCold(callTime + 360_000)).toBe(true);
+    });
+
+    it('reports cache warm just before the TTL boundary', () => {
+      manager.setCacheInfo('anthropic', 'short'); // 5 min TTL
+      manager.updateCurrentContextTokenCount(1000);
+      const callTime = manager.lastLlmCallTimestamp!;
+      // 4 minutes 59 seconds: still warm
+      expect(manager.isCacheCold(callTime + 299_000)).toBe(false);
     });
   });
 

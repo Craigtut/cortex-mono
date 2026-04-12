@@ -74,8 +74,6 @@ export interface BashStreamUpdate {
 
 const DEFAULT_TIMEOUT = 120_000;
 const MAX_TIMEOUT = 600_000;
-const MAX_OUTPUT_CHARS = 30_000;
-const TRUNCATION_HALF = 15_000;
 const AUTO_YIELD_THRESHOLD = 10_000; // 10 seconds
 const CWD_MARKER = '___CWD___';
 
@@ -216,19 +214,6 @@ function selectWindowsShell(): ShellConfig {
 // ---------------------------------------------------------------------------
 // Output handling
 // ---------------------------------------------------------------------------
-
-/**
- * Truncate output to MAX_OUTPUT_CHARS keeping first and last halves.
- */
-function truncateOutput(output: string): string {
-  if (output.length <= MAX_OUTPUT_CHARS) return output;
-
-  const first = output.slice(0, TRUNCATION_HALF);
-  const last = output.slice(-TRUNCATION_HALF);
-  const elided = output.length - TRUNCATION_HALF * 2;
-
-  return `${first}\n[... truncated ${elided} characters. Use Read or Grep to inspect specific parts. ...]\n${last}`;
-}
 
 /**
  * Sanitize output by stripping binary control characters.
@@ -511,7 +496,7 @@ export function createBashTool(config: BashToolConfig): {
 
             const [cleanedOutput] = extractCwd(sanitizeOutput(stdout));
             resolve({
-              content: [{ type: 'text', text: `${truncateOutput(cleanedOutput)}\n\n[Command auto-yielded after ${autoYieldThreshold}ms. Task ID: ${taskId}]` }],
+              content: [{ type: 'text', text: `${cleanedOutput}\n\n[Command auto-yielded after ${autoYieldThreshold}ms. Task ID: ${taskId}]` }],
               details: {
                 stdout: cleanedOutput,
                 stderr,
@@ -552,9 +537,9 @@ export function createBashTool(config: BashToolConfig): {
 
           const duration = Date.now() - startTime;
 
-          let text = truncateOutput(cleanedOutput);
+          let text = cleanedOutput;
           if (stderr) {
-            text += `\nstderr: ${truncateOutput(stderr)}`;
+            text += `\nstderr: ${stderr}`;
           }
           if (timedOut) {
             text += `\nCommand timed out after ${timeout}ms.`;
