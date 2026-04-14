@@ -6,7 +6,9 @@ import {
   createDebouncedSaver,
   createToolResultPersistor,
   generateSessionId,
+  loadSession,
   sanitizeHistoryForSave,
+  saveSession,
 } from '../../src/persistence/sessions.js';
 import type { SessionMeta } from '../../src/persistence/sessions.js';
 
@@ -177,6 +179,68 @@ describe('createToolResultPersistor', () => {
 
     const info = await stat(toolResultsDir);
     expect(info.isDirectory()).toBe(true);
+  });
+
+  it('preserves persisted previews in history while keeping full content on disk across save/load', async () => {
+    const { id, dir } = uniqueSession();
+    const persist = createToolResultPersistor(id);
+    const rawContent = 'x'.repeat(50_000);
+    const persistedPath = await persist(rawContent, {
+      toolName: 'Bash',
+      category: 'non-reproducible',
+      toolCallId: 'tc-history',
+    });
+    const previewText = [
+      `[Result persisted: ${persistedPath} (${rawContent.length.toLocaleString()} chars, ~12,500 tokens)]`,
+      '',
+      'HEAD',
+      '',
+      '... [~11,750 tokens trimmed] ...',
+      '',
+      'TAIL',
+      '',
+      'Use the Read tool with offset/limit to examine specific sections.',
+    ].join('\n');
+    const history = [
+      {
+        role: 'toolResult',
+        toolName: 'Bash',
+        toolCallId: 'tc-history',
+        details: {
+          stdout: rawContent,
+        },
+        content: [{ type: 'text', text: previewText }],
+      },
+    ];
+    const meta: SessionMeta = {
+      id,
+      mode: 'build',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      cwd: '/test',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      contextTokenCount: 1000,
+    };
+
+    await saveSession(id, history, meta);
+
+    const savedHistoryRaw = await readFile(join(dir, 'history.json'), 'utf-8');
+    expect(savedHistoryRaw).toContain(persistedPath);
+    expect(savedHistoryRaw).toContain('Use the Read tool with offset/limit');
+    expect(savedHistoryRaw).not.toContain(rawContent.slice(0, 1000));
+    expect(await readFile(persistedPath, 'utf-8')).toBe(rawContent);
+
+    const loaded = await loadSession(id);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.history).toEqual([
+      {
+        role: 'toolResult',
+        toolName: 'Bash',
+        toolCallId: 'tc-history',
+        content: [{ type: 'text', text: previewText }],
+      },
+    ]);
   });
 });
 

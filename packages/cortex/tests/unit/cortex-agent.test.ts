@@ -5,6 +5,7 @@ import type { PiEvent } from '../../src/event-bridge.js';
 import type { CortexAgentConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
+import { DEFAULT_TOOL_THRESHOLDS, MAX_RESULT_TOKENS } from '../../src/tool-result-persistence.js';
 import { fromPiAgentTool } from '../../src/tool-contract.js';
 import type { CortexTool } from '../../src/tool-contract.js';
 
@@ -1144,6 +1145,121 @@ You have 12 emotions.`;
 
       const result = await bashTool!.execute('tc-bash', { command: 'echo "adapter ok"' });
       expect(result.content[0]?.text).toContain('adapter ok');
+    });
+
+    it('persists oversized Bash output before it reaches conversation history', async () => {
+      const setToolsFn = vi.fn();
+      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
+      const persistResult = vi.fn().mockResolvedValue('/tmp/bash-oversized.txt');
+
+      const agent = createTestCortexAgent(
+        piAgent,
+        createDefaultConfig({
+          workingDirectory: process.cwd(),
+          persistResult,
+        }),
+        [],
+        { enableSubAgentTool: false, enableLoadSkillTool: false },
+      );
+      setToolsFn.mockClear();
+
+      agent.refreshTools();
+
+      const allTools = setToolsFn.mock.calls[0]![0] as Array<{
+        name: string;
+        execute: (toolCallId: string, params: unknown) => Promise<{
+          content: Array<{ type: string; text?: string }>;
+        }>;
+      }>;
+      const bashTool = allTools.find((tool) => tool.name === 'Bash');
+
+      expect(bashTool).toBeDefined();
+
+      const result = await bashTool!.execute('tc-bash-oversized', {
+        command: `node -e "process.stdout.write('x'.repeat(${DEFAULT_TOOL_THRESHOLDS.Bash * 4 + 5_000}))"`,
+      });
+      const text = result.content[0]?.text ?? '';
+
+      expect(persistResult).toHaveBeenCalledOnce();
+      expect(persistResult).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          toolName: 'Bash',
+          toolCallId: 'tc-bash-oversized',
+        }),
+      );
+      expect(text).toContain('[Result persisted: /tmp/bash-oversized.txt');
+      expect(text).toContain('Use the Read tool with offset/limit');
+      expect(text).toContain('tokens trimmed');
+
+      piAgent.state.messages.push({
+        role: 'tool',
+        content: [{ type: 'tool_result', name: 'Bash', toolCallId: 'tc-bash-oversized', text }],
+      });
+
+      const history = agent.getConversationHistory();
+      expect(history).toHaveLength(1);
+      expect(((history[0]!.content as Array<{ text?: string }>)[0]?.text) ?? '').toContain(
+        '[Result persisted: /tmp/bash-oversized.txt',
+      );
+      expect(((history[0]!.content as Array<{ text?: string }>)[0]?.text) ?? '').toContain('tokens trimmed');
+    });
+
+    it('persists oversized WebFetch output before returning from the wrapped tool', async () => {
+      const setToolsFn = vi.fn();
+      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
+      const persistResult = vi.fn().mockResolvedValue('/tmp/webfetch-oversized.txt');
+
+      const agent = createTestCortexAgent(
+        piAgent,
+        createDefaultConfig({
+          workingDirectory: process.cwd(),
+          persistResult,
+        }),
+        [],
+        { enableSubAgentTool: false, enableLoadSkillTool: false },
+      );
+      vi.spyOn(agent, 'utilityComplete').mockResolvedValue('y'.repeat(MAX_RESULT_TOKENS * 4 + 5_000));
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        status: 200,
+        headers: {
+          get(name: string) {
+            return name.toLowerCase() === 'content-type' ? 'text/plain' : null;
+          },
+        },
+        text: async () => 'small page body',
+      } as unknown as Response);
+      setToolsFn.mockClear();
+
+      agent.refreshTools();
+
+      const allTools = setToolsFn.mock.calls[0]![0] as Array<{
+        name: string;
+        execute: (toolCallId: string, params: unknown) => Promise<{
+          content: Array<{ type: string; text?: string }>;
+        }>;
+      }>;
+      const webFetchTool = allTools.find((tool) => tool.name === 'WebFetch');
+
+      expect(webFetchTool).toBeDefined();
+
+      const result = await webFetchTool!.execute('tc-webfetch-oversized', {
+        url: 'https://1.1.1.1/test',
+        prompt: 'Summarize the page',
+      });
+      const text = result.content[0]?.text ?? '';
+
+      expect(persistResult).toHaveBeenCalledOnce();
+      expect(persistResult).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          toolName: 'WebFetch',
+          toolCallId: 'tc-webfetch-oversized',
+        }),
+      );
+      expect(text).toContain('[Result persisted: /tmp/webfetch-oversized.txt');
+      expect(text).toContain('Use the Read tool with offset/limit');
+      expect(text).toContain('tokens trimmed');
     });
 
     it('supports raw pi-agent-core tools when explicitly wrapped', async () => {
