@@ -231,6 +231,16 @@ describe('CompactionManager', () => {
       };
     }
 
+    function makeRuntimeToolResultMsg(text: string, toolName?: string): AgentMessage {
+      return {
+        role: 'toolResult',
+        toolName,
+        content: [
+          { type: 'text', text },
+        ],
+      };
+    }
+
     it('caps oversized tool results in place', () => {
       // ~40000 words * 1.3 = ~52000 tokens, exceeding 50000 default
       const largeContent = generateLargeContent(40_000);
@@ -241,6 +251,21 @@ describe('CompactionManager', () => {
       manager.applyInsertionCap(messages, 1);
 
       // The tool result should have been capped
+      const capped = messages[1]!;
+      expect(Array.isArray(capped.content)).toBe(true);
+      const part = (capped.content as Array<{ text?: string }>)[0]!;
+      expect(part.text).toContain('tokens trimmed at insertion');
+      expect(part.text!.length).toBeLessThan(largeContent.length);
+    });
+
+    it('caps oversized runtime toolResult messages in place', async () => {
+      const largeContent = generateLargeContent(40_000);
+      const slot = makeUserMsg('slot content');
+      const toolResult = makeRuntimeToolResultMsg(largeContent, 'Read');
+      const messages: AgentMessage[] = [slot, toolResult, makeAssistantMsg('analysis')];
+
+      await manager.applyInsertionCap(messages, 1);
+
       const capped = messages[1]!;
       expect(Array.isArray(capped.content)).toBe(true);
       const part = (capped.content as Array<{ text?: string }>)[0]!;

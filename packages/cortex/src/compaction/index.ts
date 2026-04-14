@@ -655,14 +655,16 @@ export class CompactionManager {
 
       let modified = false;
       const newContent = msg.content.map(part => {
-        if (part.type !== 'tool_result' || typeof part.text !== 'string') {
+        const isLegacyToolResult = part.type === 'tool_result' && typeof part.text === 'string';
+        const isRuntimeToolResultText = msg.role === 'toolResult' && part.type === 'text' && typeof part.text === 'string';
+        if (!isLegacyToolResult && !isRuntimeToolResultText) {
           return part;
         }
         // Skip already-capped content
-        if (part.text.includes('tokens trimmed at insertion')) {
+        if ((part.text as string).includes('tokens trimmed at insertion')) {
           return part;
         }
-        const capped = capToolResult(part.text, config);
+        const capped = capToolResult(part.text as string, config);
         if (capped !== part.text) {
           modified = true;
           return { ...part, text: capped };
@@ -690,15 +692,19 @@ export class CompactionManager {
 
       for (let p = 0; p < parts.length; p++) {
         const part = parts[p]!;
-        if (part.type === 'tool_result' && typeof part.text === 'string') {
-          const tokens = estimateTokens(part.text);
-          // Resolve tool name from the part itself (tool_result parts may have a name field)
-          const name = (typeof (part as Record<string, unknown>)['name'] === 'string'
-            ? (part as Record<string, unknown>)['name'] as string
-            : null) ?? extractToolName(msg) ?? 'unknown';
-          partInfos.push({ index: p, tokens, text: part.text, toolName: name });
-          totalTokens += tokens;
+        const isLegacyToolResult = part.type === 'tool_result' && typeof part.text === 'string';
+        const isRuntimeToolResultText = msg.role === 'toolResult' && part.type === 'text' && typeof part.text === 'string';
+        if (!isLegacyToolResult && !isRuntimeToolResultText) {
+          continue;
         }
+
+        const text = part.text as string;
+        const tokens = estimateTokens(text);
+        const name = (typeof (part as Record<string, unknown>)['name'] === 'string'
+          ? (part as Record<string, unknown>)['name'] as string
+          : null) ?? extractToolName(msg) ?? 'unknown';
+        partInfos.push({ index: p, tokens, text, toolName: name });
+        totalTokens += tokens;
       }
 
       if (totalTokens <= aggregateLimit) continue;

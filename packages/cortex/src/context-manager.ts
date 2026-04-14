@@ -26,8 +26,12 @@ import type { ContextManagerConfig } from './types.js';
  * only what we need to avoid a hard dependency.
  */
 export interface AgentMessage {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'toolResult';
   content: string | Array<{ type: string; text?: string; [key: string]: unknown }>;
+  toolCallId?: string;
+  toolName?: string;
+  details?: unknown;
+  isError?: boolean;
   /** Epoch milliseconds when this message was created. Stamped by Cortex at turn boundaries. */
   timestamp: number;
 }

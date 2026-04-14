@@ -48,6 +48,16 @@ function makeToolResultMsg(text: string, toolName: string): AgentMessage {
   };
 }
 
+function makeRuntimeToolResultMsg(text: string, toolName: string): AgentMessage {
+  return {
+    role: 'toolResult',
+    toolName,
+    content: [
+      { type: 'text', text },
+    ],
+  };
+}
+
 /**
  * Generate a string of approximately the given token count.
  * estimateTokens uses chars/4, so we generate chars = tokens * 4.
@@ -114,6 +124,26 @@ describe('CompactionManager.applyInsertionCap aggregate budget', () => {
       return sum;
     }, 0);
     expect(totalAfter).toBeLessThan(180_000);
+  });
+
+  it('bookends oversized runtime toolResult messages when aggregate exceeds budget', async () => {
+    const config = buildCompactionConfig({
+      microcompaction: {
+        maxResultTokens: 100_000,
+        maxAggregateTurnTokens: 150_000,
+        bookendMaxChars: 200,
+      } as MicrocompactionConfig,
+    });
+    const manager = new CompactionManager(config, 0);
+
+    const largeContent = generateContent(180_000);
+    const messages: AgentMessage[] = [makeRuntimeToolResultMsg(largeContent, 'Bash')];
+
+    await manager.applyInsertionCap(messages, 0);
+
+    const parts = messages[0]!.content as Array<{ type: string; text?: string }>;
+    expect(parts[0]!.text).toContain('tokens trimmed');
+    expect(estimateTokens(parts[0]!.text!)).toBeLessThan(180_000);
   });
 
   // -----------------------------------------------------------------------

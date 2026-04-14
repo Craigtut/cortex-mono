@@ -40,6 +40,16 @@ function makeToolResult(content: string, toolName?: string): AgentMessage {
   };
 }
 
+function makeRuntimeToolResult(content: string, toolName?: string): AgentMessage {
+  return {
+    role: 'toolResult',
+    toolName,
+    content: [
+      { type: 'text', text: content },
+    ],
+  };
+}
+
 function makeToolUse(toolName: string): AgentMessage {
   return {
     role: 'assistant',
@@ -127,8 +137,12 @@ describe('extractTextContent', () => {
 });
 
 describe('isToolResultMessage', () => {
-  it('returns true for tool result messages', () => {
+  it('returns true for legacy tool result messages', () => {
     expect(isToolResultMessage(makeToolResult('result'))).toBe(true);
+  });
+
+  it('returns true for runtime toolResult messages', () => {
+    expect(isToolResultMessage(makeRuntimeToolResult('result', 'Read'))).toBe(true);
   });
 
   it('returns false for string content messages', () => {
@@ -163,8 +177,12 @@ describe('extractToolName', () => {
     expect(extractToolName(makeToolUse('Read'))).toBe('Read');
   });
 
-  it('extracts name from tool_result message with name', () => {
+  it('extracts name from legacy tool_result message with name', () => {
     expect(extractToolName(makeToolResult('content', 'Glob'))).toBe('Glob');
+  });
+
+  it('extracts name from runtime toolResult message metadata', () => {
+    expect(extractToolName(makeRuntimeToolResult('content', 'Bash'))).toBe('Bash');
   });
 
   it('returns null for string content messages', () => {
@@ -522,6 +540,26 @@ describe('applyTrimAction', () => {
     expect(parts[0]!.text as string).toContain('tokens trimmed');
   });
 
+  it('preserves runtime toolResult structure for text parts', () => {
+    const msg: AgentMessage = {
+      role: 'toolResult',
+      toolCallId: 'call_123',
+      toolName: 'Bash',
+      content: [
+        { type: 'text', text: 'runtime output' },
+      ],
+    };
+    const result = applyTrimAction(msg, { kind: 'clear' });
+
+    expect(result.role).toBe('toolResult');
+    expect(result.toolCallId).toBe('call_123');
+    expect(result.toolName).toBe('Bash');
+    expect(Array.isArray(result.content)).toBe(true);
+    const parts = result.content as Array<Record<string, unknown>>;
+    expect(parts[0]!.type).toBe('text');
+    expect(parts[0]!.text).toBe('[Tool result cleared]');
+  });
+
   it('handles multiple tool_result parts in a single message', () => {
     const msg: AgentMessage = {
       role: 'user',
@@ -646,6 +684,20 @@ describe('MicrocompactionEngine', () => {
       const trimmed = extractTextContent(result[1]!);
       expect(trimmed).toContain('tokens trimmed');
     });
+
+    it('trims runtime toolResult messages', async () => {
+      const longContent = makeContentOfTokens(20_000);
+      const history: AgentMessage[] = [
+        makeToolUse('Read'),
+        makeRuntimeToolResult(longContent, 'Read'),
+        makeAssistantMsg(makeContentOfTokens(30_000)),
+        makeAssistantMsg('recent'),
+      ];
+      const result = await engine.apply(history, 200_000, 100_000, { cacheCold: true });
+      const trimmed = extractTextContent(result[1]!);
+      expect(trimmed).not.toBe(longContent);
+      expect(trimmed).toContain('tokens trimmed');
+    });
   });
 
   describe('progressive degradation', () => {
@@ -717,6 +769,32 @@ describe('MicrocompactionEngine', () => {
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
       ];
+      const result = await engine.apply(history, 200_000, 100_000, { cacheCold: true });
+      const trimmed = extractTextContent(result[1]!);
+
+      expect(persisted.length).toBe(1);
+      expect(persisted[0]!.content).toBe(longContent);
+      expect(trimmed).toContain('Result persisted');
+      expect(trimmed).toContain(persisted[0]!.path);
+    });
+
+    it('persists runtime toolResult content using message metadata', async () => {
+      const persisted: Array<{ content: string; path: string }> = [];
+      const engine = new MicrocompactionEngine({
+        persistResult: async (content) => {
+          const path = `/tmp/runtime-${persisted.length}.txt`;
+          persisted.push({ content, path });
+          return path;
+        },
+      });
+      const longContent = 'runtime' + 'x'.repeat(20_000);
+      const history: AgentMessage[] = [
+        makeToolUse('WebFetch'),
+        makeRuntimeToolResult(longContent, 'WebFetch'),
+        makeAssistantMsg(makeContentOfTokens(30_000)),
+        makeAssistantMsg('recent'),
+      ];
+
       const result = await engine.apply(history, 200_000, 100_000, { cacheCold: true });
       const trimmed = extractTextContent(result[1]!);
 

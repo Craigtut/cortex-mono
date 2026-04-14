@@ -165,6 +165,9 @@ export function extractTextContent(message: AgentMessage): string {
  * containing tool_result type parts.
  */
 export function isToolResultMessage(message: AgentMessage): boolean {
+  if (message.role === 'toolResult') {
+    return true;
+  }
   if (!Array.isArray(message.content)) {
     return false;
   }
@@ -189,6 +192,10 @@ export function isToolUseMessage(message: AgentMessage): boolean {
  * Returns null if the message is not a tool-related message.
  */
 export function extractToolName(message: AgentMessage): string | null {
+  if (typeof message.toolName === 'string') {
+    return message.toolName;
+  }
+
   if (!Array.isArray(message.content)) {
     return null;
   }
@@ -439,28 +446,28 @@ export function applyTrimAction(message: AgentMessage, action: TrimAction): Agen
     return message;
   }
 
-  // If the message has a structured content array (e.g., tool_result parts),
-  // preserve the array structure and only replace text within each part.
+  // If the message has a structured content array (e.g., runtime toolResult
+  // messages with text parts, or legacy tool_result parts), preserve the array
+  // structure and only replace text within each part.
   if (Array.isArray(message.content) && message.content.length > 0) {
     const newContent = message.content.map(part => {
-      if (part.type === 'tool_result' && typeof part.text === 'string') {
-        const trimmed = getTrimmedText(part.text, action);
-        return { ...part, text: trimmed };
+      const shouldTrim = typeof part.text === 'string' && (
+        part.type === 'tool_result' ||
+        (part.type === 'text' && isToolResultMessage(message))
+      );
+      if (!shouldTrim) {
+        return part;
       }
-      // For text parts in a tool_result message, also trim
-      if (part.type === 'text' && typeof part.text === 'string') {
-        const trimmed = getTrimmedText(part.text, action);
-        return { ...part, text: trimmed };
-      }
-      return part;
+      const trimmed = getTrimmedText(part.text as string, action);
+      return { ...part, text: trimmed };
     });
-    return { role: message.role, content: newContent, timestamp: message.timestamp };
+    return { ...message, content: newContent };
   }
 
   // Plain string content: replace directly (backward compat for non-tool messages)
   const content = typeof message.content === 'string' ? message.content : '';
   const trimmed = getTrimmedText(content, action);
-  return { role: message.role, content: trimmed, timestamp: message.timestamp };
+  return { ...message, content: trimmed };
 }
 
 // ---------------------------------------------------------------------------
@@ -611,17 +618,19 @@ export class MicrocompactionEngine {
       return applyTrimAction(message, action);
     }
 
-    // Per-part processing: each tool_result part gets its own persistence
+    // Per-part processing: each tool result text part gets its own persistence
     // decision and its own replacement text.
+    const messageToolName = typeof message.toolName === 'string' ? message.toolName : null;
     const newParts = await Promise.all(message.content.map(async part => {
-      const isToolResult = part.type === 'tool_result' && typeof part.text === 'string';
-      const isTextPart = part.type === 'text' && typeof part.text === 'string';
-      if (!isToolResult && !isTextPart) {
+      const isLegacyToolResult = part.type === 'tool_result' && typeof part.text === 'string';
+      const isRuntimeToolResultText = message.role === 'toolResult' && part.type === 'text' && typeof part.text === 'string';
+      const isToolResultText = isLegacyToolResult || isRuntimeToolResultText;
+      if (!isToolResultText) {
         return part;
       }
 
       const partText = part.text as string;
-      const toolName = typeof part['name'] === 'string' ? part['name'] as string : null;
+      const toolName = typeof part['name'] === 'string' ? part['name'] as string : messageToolName;
       const category = toolName ? getToolCategory(toolName, this.config.toolCategories) : undefined;
 
       // Only persist non-reproducible and computational parts.
@@ -651,7 +660,7 @@ export class MicrocompactionEngine {
       return { ...part, text: persistedText };
     }));
 
-    return { role: message.role, content: newParts, timestamp: message.timestamp };
+    return { ...message, content: newParts };
   }
 
   /**
