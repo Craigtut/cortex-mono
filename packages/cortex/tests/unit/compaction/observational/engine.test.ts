@@ -21,8 +21,8 @@ const assistantMsg = (content: string): AgentMessage => ({ role: 'assistant', co
 
 const OBSERVER_OUTPUT =
   '<observations>\nDate: Apr 10, 2026\n\n* \u{1F7E1} (14:30) Test observation\n</observations>\n\n' +
-  '<current-task>\n- Primary: Testing\n</current-task>\n\n' +
-  '<suggested-response>\nContinue testing.\n</suggested-response>';
+  '<current-task>\nTesting the observational memory engine with sample fixtures.\n</current-task>\n\n' +
+  '<suggested-response>\nContinue testing the engine with the next scenario.\n</suggested-response>';
 
 function flushPromises(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));

@@ -200,7 +200,7 @@ Good:
 
 ## Output Format
 
-You MUST output your observations in the following XML format. All three sections are required, though current-task and suggested-response may be empty if not applicable.
+You MUST output your observations in the following XML format. All three sections are required AND must contain meaningful content. Do not leave sections empty or with placeholder labels only. The current-task and suggested-response sections are critical: after activation, the raw conversation messages are removed from context, and these hints are the ONLY way the agent knows what it was doing and how to continue. Treat them as mission-critical.
 
 <observations>
 Date: [date in "Mon DD, YYYY" format, e.g., "Apr 10, 2026"]
@@ -214,12 +214,11 @@ Date: [date in "Mon DD, YYYY" format, e.g., "Apr 10, 2026"]
 </observations>
 
 <current-task>
-- Primary: [What the agent is currently working on, or "None" if idle]
-- Secondary: [Other pending tasks, if any]
+[REQUIRED: A full-sentence description of what the agent is actively working on right now. Be specific and actionable. Include file paths, feature names, or specific goals. This is a SENTENCE, not a label. Example: "Implementing cache-aware L1 microcompaction in packages/cortex/src/compaction/microcompaction.ts. The user has approved the design and is waiting for the implementation to be committed." If the agent is genuinely idle with no active task, write "Idle. Awaiting user input." Never output just "Primary:" or "Secondary:" with nothing after.]
 </current-task>
 
 <suggested-response>
-[A brief hint for what the agent should say or do next when it resumes after observation activation. This helps the agent maintain conversational flow even after raw messages are removed from context. Leave empty if no specific continuation is needed.]
+[REQUIRED: Concrete guidance for the agent's next message after activation. Write this as if you are briefing the agent on exactly what to say or do. Include enough context that the agent can resume naturally without having access to the raw conversation. Example: "Acknowledge that you have finished the research phase and confirm with the user that you should proceed with writing the implementation. Reference the three design decisions they approved: A, B, and C." Never leave this empty.]
 </suggested-response>
 
 ### Priority Markers
@@ -492,7 +491,16 @@ Guidelines for using your observations:
 - Treat the user's most recent message as the highest priority input. Your observations provide context, but the current request drives your response.
 - If your observations mention a planned action with a date that has passed, assume the action was completed unless the user indicates otherwise.
 - Do not mention the observation system itself to the user. Use the information naturally as if you remember it from prior conversations.
-- Pay attention to priority markers: items marked with \\u{1F534} are critical facts and preferences that should strongly influence your responses.`;
+- Pay attention to priority markers: items marked with \\u{1F534} are critical facts and preferences that should strongly influence your responses.
+
+### Current Task and Suggested Response
+
+After your observations you will find two additional sections: <current-task> and <suggested-response>. These are briefing notes from your memory system about the active work.
+
+- <current-task> describes what you were working on at the moment the raw conversation was compressed into these observations. Use this to maintain continuity: you should know what you were doing and pick it back up, not ask the user to re-explain.
+- <suggested-response> is concrete guidance for your next message. Use it as a starting point for what to say or do. You can adapt it to fit the user's most recent input, but do not ignore it. If the user's latest message is a direct request that supersedes the suggested response, address the request first while still preserving the context from the suggested response.
+
+These sections exist because after memory compaction you do not have the raw conversation to refer to. Without them you would sound like you had forgotten what you were doing.`;
 
 // ---------------------------------------------------------------------------
 // Recall Instructions (appended when recall is configured)

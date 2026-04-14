@@ -764,19 +764,35 @@ export class ObservationalMemoryEngine {
     chunks: ObservationChunk[],
   ): { observations: string; hint: ContinuationHint | null } {
     const observationParts: string[] = [];
-    let hint: ContinuationHint | null = null;
+
+    // Find the latest chunk that produced at least one meaningful hint field.
+    // Each observer only sees its own batch of messages, so the latest chunk
+    // reflects the most recent state of the conversation. We do NOT mix fields
+    // across chunks: that would risk injecting a stale currentTask from an
+    // earlier chunk when the conversation has since moved on to something else.
+    //
+    // The parser already rejects placeholder-only content, so an observer that
+    // echoed the prompt template without filling it in will have undefined
+    // hint fields (not empty strings).
+    let latestHintChunk: ObservationChunk | null = null;
 
     for (const chunk of chunks) {
       observationParts.push(chunk.observations);
-
-      // Latest chunk wins for continuation hint
       if (chunk.currentTask || chunk.suggestedResponse) {
-        hint = {
-          currentTask: chunk.currentTask ?? '',
-          suggestedResponse: chunk.suggestedResponse ?? '',
-        };
+        latestHintChunk = chunk;
       }
     }
+
+    // If no chunk produced hints, preserve the existing hint from prior
+    // activation cycles. That hint is still more relevant than nothing, since
+    // it came from the observer that ran at the end of the previous cycle
+    // (itself more recent than anything older in this cycle).
+    const hint: ContinuationHint | null = latestHintChunk
+      ? {
+          currentTask: latestHintChunk.currentTask ?? '',
+          suggestedResponse: latestHintChunk.suggestedResponse ?? '',
+        }
+      : this.continuationHint;
 
     return {
       observations: observationParts.join('\n\n'),
@@ -818,3 +834,4 @@ export class ObservationalMemoryEngine {
     }
   }
 }
+

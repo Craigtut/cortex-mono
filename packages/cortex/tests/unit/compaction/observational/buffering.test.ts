@@ -12,8 +12,8 @@ const assistantMsg = (content: string): AgentMessage => ({ role: 'assistant', co
 
 const VALID_OBSERVER_OUTPUT =
   '<observations>\nDate: Apr 10, 2026\n\n* \u{1F7E1} (14:30) Test observation\n</observations>\n\n' +
-  '<current-task>\n- Primary: Testing\n</current-task>\n\n' +
-  '<suggested-response>\nContinue testing.\n</suggested-response>';
+  '<current-task>\nTesting the buffering coordinator with mock observer output.\n</current-task>\n\n' +
+  '<suggested-response>\nContinue testing the next coordinator scenario.\n</suggested-response>';
 
 const VALID_REFLECTOR_OUTPUT =
   '<observations>\nDate: Apr 10, 2026\n\n* \u{1F7E1} (14:30) Consolidated observation\n</observations>';

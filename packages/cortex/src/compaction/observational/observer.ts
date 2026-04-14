@@ -259,16 +259,42 @@ export function parseObserverOutput(raw: string): ObserverOutput {
   };
 
   const trimmedTask = rawTask?.trim();
-  if (trimmedTask) {
+  if (trimmedTask && hasMeaningfulContent(trimmedTask)) {
     result.currentTask = trimmedTask;
   }
 
   const trimmedSuggested = rawSuggested?.trim();
-  if (trimmedSuggested) {
+  if (trimmedSuggested && hasMeaningfulContent(trimmedSuggested)) {
     result.suggestedResponse = trimmedSuggested;
   }
 
   return result;
+}
+
+/**
+ * Check whether extracted tag content is meaningful (not just placeholder
+ * labels echoed from the prompt template).
+ *
+ * The observer prompt shows a structure like "- Primary:" and "- Secondary:"
+ * as a template. Some model outputs echo the template without filling in
+ * real content. This check rejects such outputs so the caller can fall back
+ * to prior hints or mark the field as missing.
+ */
+function hasMeaningfulContent(value: string): boolean {
+  const contentOnly = value
+    .split('\n')
+    .map(line =>
+      line
+        .replace(/^\s*[-*]\s*/, '')
+        .replace(/^Primary\s*:\s*/i, '')
+        .replace(/^Secondary\s*:\s*/i, '')
+        .trim(),
+    )
+    .filter(line => line.length > 0)
+    .join(' ')
+    .trim();
+
+  return contentOnly.length >= 8;
 }
 
 /**
