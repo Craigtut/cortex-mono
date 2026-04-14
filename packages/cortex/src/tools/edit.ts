@@ -151,19 +151,37 @@ export function createEditTool(config: EditToolConfig): {
             'You must Read this file before editing it.');
         }
 
-        // Mtime freshness check: reject if file changed since last Read
+        // Mtime freshness check: reject if file changed since last Read.
+        // Using strict greater-than (not !==) to tolerate Windows/cloud-sync
+        // quirks where mtime can go backwards without a real modification.
+        // When mtime does indicate a change, fall back to a content-hash
+        // comparison (only possible for full reads) so formatter-style
+        // touches that don't change bytes still allow the edit.
         const readState = readRegistry.getState(filePath);
+        let originalBuffer: Buffer | undefined;
         if (readState) {
           const currentStat = await fs.promises.stat(filePath);
-          if (currentStat.mtimeMs !== readState.timestamp) {
-            readRegistry.invalidate(filePath);
-            return noChange(filePath, oldString, newString, replaceAll,
-              'File was modified since last Read. Read the file again before editing.');
+          if (currentStat.mtimeMs > readState.timestamp) {
+            let contentUnchanged = false;
+            if (readState.contentHash) {
+              originalBuffer = await fs.promises.readFile(filePath);
+              const currentHash = crypto.createHash('sha256')
+                .update(originalBuffer).digest('hex');
+              contentUnchanged = currentHash === readState.contentHash;
+            }
+            if (!contentUnchanged) {
+              readRegistry.invalidate(filePath);
+              return noChange(filePath, oldString, newString, replaceAll,
+                'File was modified since last Read. Read the file again before editing.');
+            }
           }
         }
 
-        // Read the file content
-        const originalContent = await fs.promises.readFile(filePath, 'utf8');
+        // Read the file content (reusing the buffer if we already loaded it
+        // for the content-hash fallback).
+        const originalContent = originalBuffer
+          ? originalBuffer.toString('utf8')
+          : await fs.promises.readFile(filePath, 'utf8');
 
         // Normalize line endings for matching: \r\n -> \n
         // We'll do matching on normalized content but track whether the
@@ -236,8 +254,21 @@ export function createEditTool(config: EditToolConfig): {
           throw writeErr;
         }
 
-        // Invalidate read state so the next mutation must re-read
-        readRegistry.invalidate(filePath);
+        // Refresh read state: the agent's own edit is authoritative knowledge
+        // of current file contents, so subsequent edits don't require a re-read.
+        // We record the new mtime and a content hash of what we just wrote so
+        // external modifications still trigger the freshness check above.
+        try {
+          const postStat = await fs.promises.stat(filePath);
+          const postHash = crypto.createHash('sha256')
+            .update(finalContent, 'utf8').digest('hex');
+          readRegistry.markRead(filePath, {
+            timestamp: postStat.mtimeMs,
+            contentHash: postHash,
+          });
+        } catch {
+          readRegistry.invalidate(filePath);
+        }
 
         const plural = replacementCount === 1 ? 'replacement' : 'replacements';
         return {

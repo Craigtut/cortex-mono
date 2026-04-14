@@ -1,10 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { ReadRegistry } from '../../../src/tools/shared/read-registry.js';
 import { FileMutationLock } from '../../../src/tools/shared/file-mutation-lock.js';
 import { createEditTool } from '../../../src/tools/edit.js';
+
+function hashFile(filePath: string): string {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
 
 /** Mark a file as read with its actual mtime (mirrors what the Read tool does). */
 function markFileRead(registry: ReadRegistry, filePath: string): void {
@@ -205,10 +210,77 @@ describe('Edit tool', () => {
   it('rejects edit when file was modified externally after Read', async () => {
     const filePath = path.join(tmpDir, 'test.txt');
     fs.writeFileSync(filePath, 'hello world\n');
+    // Read with a real content hash so the fallback has something to compare against.
+    const stat = fs.statSync(filePath);
+    registry.markRead(filePath, {
+      timestamp: stat.mtimeMs,
+      contentHash: hashFile(filePath),
+    });
+
+    // External modification that actually changes the bytes
+    await new Promise(resolve => setTimeout(resolve, 50));
+    fs.writeFileSync(filePath, 'different content\n');
+
+    const result = await editTool.execute({
+      file_path: filePath,
+      old_string: 'different',
+      new_string: 'hi',
+    });
+
+    expect(getText(result)).toContain('File was modified since last Read');
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('different content\n');
+  });
+
+  it('allows edit when mtime moved backwards (no real change)', async () => {
+    const filePath = path.join(tmpDir, 'test.txt');
+    fs.writeFileSync(filePath, 'hello world\n');
     markFileRead(registry, filePath);
 
-    // Simulate external modification (change file content, which updates mtime)
-    // Need a small delay to ensure mtime actually changes
+    // Simulate a filesystem/cloud-sync quirk that moves mtime backwards
+    const state = registry.getState(filePath);
+    const pastMtimeSec = (state!.timestamp - 60_000) / 1000;
+    fs.utimesSync(filePath, pastMtimeSec, pastMtimeSec);
+
+    const result = await editTool.execute({
+      file_path: filePath,
+      old_string: 'hello',
+      new_string: 'hi',
+    });
+
+    expect(result.details.replacementCount).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('hi world\n');
+  });
+
+  it('allows edit when mtime changed but content is byte-identical', async () => {
+    const filePath = path.join(tmpDir, 'test.txt');
+    fs.writeFileSync(filePath, 'hello world\n');
+    const stat = fs.statSync(filePath);
+    registry.markRead(filePath, {
+      timestamp: stat.mtimeMs,
+      contentHash: hashFile(filePath),
+    });
+
+    // Simulate a formatter/antivirus touching mtime without changing bytes
+    await new Promise(resolve => setTimeout(resolve, 50));
+    fs.writeFileSync(filePath, 'hello world\n');
+
+    const result = await editTool.execute({
+      file_path: filePath,
+      old_string: 'hello',
+      new_string: 'hi',
+    });
+
+    expect(result.details.replacementCount).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('hi world\n');
+  });
+
+  it('rejects edit on mtime change with no contentHash (partial read)', async () => {
+    const filePath = path.join(tmpDir, 'test.txt');
+    fs.writeFileSync(filePath, 'hello world\n');
+    // Partial read: no contentHash stored, so no fallback is possible.
+    const stat = fs.statSync(filePath);
+    registry.markRead(filePath, { timestamp: stat.mtimeMs, offset: 1, limit: 1 });
+
     await new Promise(resolve => setTimeout(resolve, 50));
     fs.writeFileSync(filePath, 'hello world\n');
 
@@ -219,14 +291,13 @@ describe('Edit tool', () => {
     });
 
     expect(getText(result)).toContain('File was modified since last Read');
-    expect(fs.readFileSync(filePath, 'utf8')).toBe('hello world\n');
   });
 
   // -------------------------------------------------------------------------
-  // Read invalidation after mutation
+  // Read state refresh after mutation
   // -------------------------------------------------------------------------
 
-  it('invalidates read state after successful edit', async () => {
+  it('refreshes read state with new mtime after successful edit', async () => {
     const filePath = path.join(tmpDir, 'test.txt');
     fs.writeFileSync(filePath, 'hello world\n');
     markFileRead(registry, filePath);
@@ -237,15 +308,18 @@ describe('Edit tool', () => {
       new_string: 'hi',
     });
 
-    expect(registry.hasBeenRead(filePath)).toBe(false);
+    // State preserved, now reflecting the new on-disk mtime
+    expect(registry.hasBeenRead(filePath)).toBe(true);
+    const state = registry.getState(filePath);
+    const newMtime = fs.statSync(filePath).mtimeMs;
+    expect(state?.timestamp).toBe(newMtime);
   });
 
-  it('rejects second edit without re-read', async () => {
+  it('allows consecutive edits without re-read', async () => {
     const filePath = path.join(tmpDir, 'test.txt');
     fs.writeFileSync(filePath, 'aaa bbb ccc\n');
     markFileRead(registry, filePath);
 
-    // First edit succeeds
     const r1 = await editTool.execute({
       file_path: filePath,
       old_string: 'aaa',
@@ -253,15 +327,15 @@ describe('Edit tool', () => {
     });
     expect(r1.details.replacementCount).toBe(1);
 
-    // Second edit (without re-read) should be rejected
+    // Second edit without re-reading should succeed: the agent's own
+    // edit is authoritative knowledge of current file contents.
     const r2 = await editTool.execute({
       file_path: filePath,
       old_string: 'bbb',
       new_string: 'yyy',
     });
-    expect(getText(r2)).toContain('You must Read this file before editing it');
-    // File should only have the first edit
-    expect(fs.readFileSync(filePath, 'utf8')).toBe('xxx bbb ccc\n');
+    expect(r2.details.replacementCount).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('xxx yyy ccc\n');
   });
 
   // -------------------------------------------------------------------------
@@ -273,19 +347,17 @@ describe('Edit tool', () => {
     fs.writeFileSync(filePath, 'alpha beta gamma\n');
     markFileRead(registry, filePath);
 
-    // Launch two edits concurrently. The lock serializes them:
-    // first succeeds, second is rejected (read state invalidated by first).
+    // Launch two edits concurrently. The lock serializes them, and
+    // each successful edit refreshes the read state with the new
+    // mtime so the next edit still sees a fresh read.
     const [r1, r2] = await Promise.all([
       editTool.execute({ file_path: filePath, old_string: 'alpha', new_string: 'ALPHA' }),
       editTool.execute({ file_path: filePath, old_string: 'beta', new_string: 'BETA' }),
     ]);
 
-    // Exactly one should succeed, one should be rejected
-    const succeeded = [r1, r2].filter(r => r.details.replacementCount > 0);
-    const rejected = [r1, r2].filter(r => r.details.replacementCount === 0);
-    expect(succeeded).toHaveLength(1);
-    expect(rejected).toHaveLength(1);
-    expect(getText(rejected[0])).toMatch(/Read|modified/);
+    expect(r1.details.replacementCount).toBe(1);
+    expect(r2.details.replacementCount).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('ALPHA BETA gamma\n');
   });
 
   it('allows concurrent edits on different files', async () => {

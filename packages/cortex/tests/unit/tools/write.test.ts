@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -6,6 +7,10 @@ import { ReadRegistry } from '../../../src/tools/shared/read-registry.js';
 import { FileMutationLock } from '../../../src/tools/shared/file-mutation-lock.js';
 import { createWriteTool } from '../../../src/tools/write.js';
 import { createEditTool } from '../../../src/tools/edit.js';
+
+function hashFile(filePath: string): string {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
 
 /** Mark a file as read with its actual mtime (mirrors what the Read tool does). */
 function markFileRead(registry: ReadRegistry, filePath: string): void {
@@ -93,7 +98,7 @@ describe('Write tool', () => {
     expect(fs.readFileSync(filePath, 'utf8')).toBe('nested content');
   });
 
-  it('invalidates read state after successful write', async () => {
+  it('refreshes read state with new mtime after successful write', async () => {
     const filePath = path.join(tmpDir, 'existing.txt');
     fs.writeFileSync(filePath, 'original');
     markFileRead(registry, filePath);
@@ -103,7 +108,10 @@ describe('Write tool', () => {
       content: 'updated',
     });
 
-    expect(registry.hasBeenRead(filePath)).toBe(false);
+    expect(registry.hasBeenRead(filePath)).toBe(true);
+    const state = registry.getState(filePath);
+    const newMtime = fs.statSync(filePath).mtimeMs;
+    expect(state?.timestamp).toBe(newMtime);
   });
 
   it('computes diff for updates', async () => {
@@ -155,27 +163,93 @@ describe('Write tool', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Mtime freshness + content-hash fallback
+  // -------------------------------------------------------------------------
+
+  it('rejects write when file was modified externally after Read', async () => {
+    const filePath = path.join(tmpDir, 'existing.txt');
+    fs.writeFileSync(filePath, 'original');
+    const stat = fs.statSync(filePath);
+    registry.markRead(filePath, {
+      timestamp: stat.mtimeMs,
+      contentHash: hashFile(filePath),
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+    fs.writeFileSync(filePath, 'changed externally');
+
+    const result = await writeTool.execute({
+      file_path: filePath,
+      content: 'overwrite',
+    });
+
+    expect(getText(result)).toContain('File was modified since last Read');
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('changed externally');
+  });
+
+  it('allows write when mtime moved backwards (no real change)', async () => {
+    const filePath = path.join(tmpDir, 'existing.txt');
+    fs.writeFileSync(filePath, 'original');
+    markFileRead(registry, filePath);
+
+    const state = registry.getState(filePath);
+    const pastMtimeSec = (state!.timestamp - 60_000) / 1000;
+    fs.utimesSync(filePath, pastMtimeSec, pastMtimeSec);
+
+    const result = await writeTool.execute({
+      file_path: filePath,
+      content: 'updated',
+    });
+
+    expect(result.details.bytesWritten).toBeGreaterThan(0);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('updated');
+  });
+
+  it('allows write when mtime changed but content is byte-identical', async () => {
+    const filePath = path.join(tmpDir, 'existing.txt');
+    fs.writeFileSync(filePath, 'original');
+    const stat = fs.statSync(filePath);
+    registry.markRead(filePath, {
+      timestamp: stat.mtimeMs,
+      contentHash: hashFile(filePath),
+    });
+
+    // Formatter-style touch: same bytes, new mtime
+    await new Promise(resolve => setTimeout(resolve, 50));
+    fs.writeFileSync(filePath, 'original');
+
+    const result = await writeTool.execute({
+      file_path: filePath,
+      content: 'updated',
+    });
+
+    expect(result.details.bytesWritten).toBeGreaterThan(0);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('updated');
+  });
+
+  // -------------------------------------------------------------------------
   // Edit after Write without re-read
   // -------------------------------------------------------------------------
 
-  it('rejects Edit after Write without re-read', async () => {
+  it('allows Edit after Write without re-read', async () => {
     const editTool = createEditTool({ readRegistry: registry, fileMutationLock: lock });
     const filePath = path.join(tmpDir, 'combo.txt');
     fs.writeFileSync(filePath, 'original content');
     markFileRead(registry, filePath);
 
-    // Write overwrites the file and invalidates read state
+    // Write refreshes read state with the new mtime
     await writeTool.execute({ file_path: filePath, content: 'new content' });
 
-    // Edit without re-reading should be rejected
+    // Edit without a fresh Read should still succeed: the Write is
+    // authoritative knowledge of current file contents.
     const result = await editTool.execute({
       file_path: filePath,
       old_string: 'new',
       new_string: 'fresh',
     });
 
-    expect(getText(result)).toContain('You must Read this file before editing it');
-    expect(fs.readFileSync(filePath, 'utf8')).toBe('new content');
+    expect(result.details.replacementCount).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('fresh content');
   });
 
   // -------------------------------------------------------------------------
@@ -187,17 +261,18 @@ describe('Write tool', () => {
     fs.writeFileSync(filePath, 'original');
     markFileRead(registry, filePath);
 
-    // Launch two writes concurrently. Lock serializes them:
-    // first succeeds, second is rejected (read state invalidated by first).
+    // Launch two writes concurrently. The lock serializes them,
+    // and each successful write refreshes the read state so the
+    // next write still passes the freshness check.
     const [r1, r2] = await Promise.all([
       writeTool.execute({ file_path: filePath, content: 'version-A' }),
       writeTool.execute({ file_path: filePath, content: 'version-B' }),
     ]);
 
-    const succeeded = [r1, r2].filter(r => r.details.bytesWritten > 0);
-    const rejected = [r1, r2].filter(r => r.details.bytesWritten === 0);
-    expect(succeeded).toHaveLength(1);
-    expect(rejected).toHaveLength(1);
-    expect(getText(rejected[0])).toContain('You must Read this file before overwriting it');
+    expect(r1.details.bytesWritten).toBeGreaterThan(0);
+    expect(r2.details.bytesWritten).toBeGreaterThan(0);
+    // One of the two wrote last; the file must be a valid version.
+    const final = fs.readFileSync(filePath, 'utf8');
+    expect(['version-A', 'version-B']).toContain(final);
   });
 });

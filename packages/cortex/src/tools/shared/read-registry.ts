@@ -19,6 +19,14 @@ export interface ReadState {
   offset?: number;
   /** Line limit used for the read (undefined = default/full). */
   limit?: number;
+  /**
+   * SHA-256 hex digest of the raw file bytes at the time of read.
+   * Populated only for non-truncated, full reads; used as a fallback
+   * on mtime mismatch to allow writes when the on-disk bytes are
+   * actually unchanged (e.g. a formatter or cloud-sync tool touched
+   * the mtime without modifying content).
+   */
+  contentHash?: string;
 }
 
 export class ReadRegistry {
@@ -51,8 +59,11 @@ export class ReadRegistry {
 
   /**
    * Invalidate a single file's read state.
-   * Called after a mutation (Edit/Write) so the next mutation
-   * on the same file must re-read first.
+   * Called when the on-disk mtime diverges from the recorded read
+   * state (external modification), forcing a fresh Read before
+   * the next mutation. Successful Edit/Write calls instead call
+   * markRead() with the new mtime, since the agent's own mutation
+   * is authoritative knowledge of current file contents.
    */
   invalidate(filePath: string): void {
     this.entries.delete(this.normalize(filePath));

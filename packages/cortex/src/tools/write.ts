@@ -176,10 +176,56 @@ export function createWriteTool(config: WriteToolConfig): {
           };
         }
 
-        // Read original content for diff (existing files only)
+        // Mtime freshness check: reject if file changed on disk since last Read.
+        // Using strict greater-than (not !==) to tolerate Windows/cloud-sync
+        // quirks where mtime can go backwards without a real modification.
+        // When mtime does indicate a change, fall back to a content-hash
+        // comparison (only possible for full reads) so formatter-style
+        // touches that don't change bytes still allow the write.
+        let originalBuffer: Buffer | undefined;
+        if (fileExists) {
+          const readState = readRegistry.getState(filePath);
+          if (readState) {
+            const currentStat = await fs.promises.stat(filePath);
+            if (currentStat.mtimeMs > readState.timestamp) {
+              let contentUnchanged = false;
+              if (readState.contentHash) {
+                try {
+                  originalBuffer = await fs.promises.readFile(filePath);
+                  const currentHash = crypto.createHash('sha256')
+                    .update(originalBuffer).digest('hex');
+                  contentUnchanged = currentHash === readState.contentHash;
+                } catch {
+                  // If we can't read, fall through to the rejection path.
+                }
+              }
+              if (!contentUnchanged) {
+                readRegistry.invalidate(filePath);
+                return {
+                  content: [{
+                    type: 'text',
+                    text: 'File was modified since last Read. Read the file again before overwriting it.',
+                  }],
+                  details: {
+                    filePath,
+                    isCreate: false,
+                    bytesWritten: 0,
+                    diff: null,
+                    originalContent: null,
+                  },
+                };
+              }
+            }
+          }
+        }
+
+        // Read original content for diff (existing files only). Reuse the
+        // buffer from the content-hash check if we already loaded it.
         if (fileExists) {
           try {
-            originalContent = await fs.promises.readFile(filePath, 'utf8');
+            originalContent = originalBuffer
+              ? originalBuffer.toString('utf8')
+              : await fs.promises.readFile(filePath, 'utf8');
           } catch {
             // If we can't read for diff, continue without it
           }
@@ -270,8 +316,21 @@ export function createWriteTool(config: WriteToolConfig): {
           throw err;
         }
 
-        // Invalidate read state so the next mutation must re-read
-        readRegistry.invalidate(filePath);
+        // Refresh read state: the agent's own write is authoritative knowledge
+        // of current file contents, so subsequent mutations don't require a re-read.
+        // We record the new mtime and a content hash of what we just wrote so
+        // external modifications still trigger the freshness check above.
+        try {
+          const postStat = await fs.promises.stat(filePath);
+          const postHash = crypto.createHash('sha256')
+            .update(newContent, 'utf8').digest('hex');
+          readRegistry.markRead(filePath, {
+            timestamp: postStat.mtimeMs,
+            contentHash: postHash,
+          });
+        } catch {
+          readRegistry.invalidate(filePath);
+        }
 
         const bytesWritten = Buffer.byteLength(newContent, 'utf8');
         const isCreate = !fileExists;

@@ -8,6 +8,7 @@
  * Reference: docs/cortex/tools/read.md
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
@@ -489,7 +490,19 @@ export function createReadTool(config: ReadToolConfig): {
 
       // Only mark as read after passing all gates, so rejected reads
       // can be retried without hitting the dedup stub.
-      readRegistry.markRead(filePath, { timestamp: stat.mtimeMs, offset, limit });
+      // For full, non-truncated reads, record a content hash so the
+      // Edit/Write tools can distinguish real file modifications from
+      // mtime-only changes (formatters, cloud sync, antivirus, etc.).
+      const isFullRead = !hasExplicitRange && !truncatedLines;
+      const contentHash = isFullRead
+        ? crypto.createHash('sha256').update(buffer).digest('hex')
+        : undefined;
+      readRegistry.markRead(filePath, {
+        timestamp: stat.mtimeMs,
+        offset,
+        limit,
+        ...(contentHash !== undefined ? { contentHash } : {}),
+      });
 
       let text = formatted;
       if (truncatedLines) {
