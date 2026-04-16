@@ -57,7 +57,6 @@ npm run test:run
 - Prefer composition over inheritance.
 - Validate external input with Zod schemas.
 - Add comments only for non-obvious logic.
-- Never use em dashes in written copy. Use commas, colons, semicolons, parentheses, or separate sentences instead.
 
 ### Commit Conventions
 
