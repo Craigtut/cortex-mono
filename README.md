@@ -4,7 +4,7 @@ Production-grade agent framework with structured context management. By [Animus 
 
 Cortex treats the LLM context window as a managed surface, not a flat chat log. Named slots with stability-ordered layout maximize prompt cache hit rates. Three-layer compaction (string trimming, summarization, emergency truncation) keeps long-running agents within context limits without cliff-edge failures.
 
-Built on [`pi-agent-core`](https://github.com/nickmarchandpm/pi-agent-core) for the agentic loop and model access.
+Built on [`pi-agent-core`](https://github.com/badlogic/pi-mono) for the agentic loop and model access.
 
 ## Packages
 
