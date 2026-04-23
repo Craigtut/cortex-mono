@@ -39,6 +39,7 @@ import { createSubAgentTool, SUB_AGENT_TOOL_NAME } from './tools/sub-agent.js';
 import { createReadTool } from './tools/read.js';
 import { createWriteTool } from './tools/write.js';
 import { createEditTool } from './tools/edit.js';
+import { createUndoEditTool } from './tools/undo-edit.js';
 import { createGlobTool } from './tools/glob.js';
 import { createGrepTool } from './tools/grep.js';
 import { createBashTool } from './tools/bash/index.js';
@@ -689,7 +690,7 @@ export class CortexAgent {
    * @returns The agent's response (opaque, from pi-agent-core)
    * @throws Error if the agent has been destroyed
    */
-  async prompt(input: string): Promise<unknown> {
+  async prompt(input: string, options?: { cacheRetention?: 'none' | 'short' | 'long' }): Promise<unknown> {
     if (this.lifecycleState === 'destroyed') {
       throw new Error('Agent has been destroyed');
     }
@@ -703,6 +704,17 @@ export class CortexAgent {
     // Transition to ACTIVE on first prompt
     if (this.lifecycleState === 'created') {
       this.lifecycleState = 'active';
+    }
+
+    // Set cache retention for the loop. Pi-ai reads PI_CACHE_RETENTION on
+    // each API call within the agentic loop. This encapsulates the env var
+    // swap so consumers don't have to manage process-global state.
+    const effectiveRetention = options?.cacheRetention ?? this._cacheRetention;
+    const prevCacheRetention = process.env['PI_CACHE_RETENTION'];
+    if (effectiveRetention && effectiveRetention !== 'none') {
+      process.env['PI_CACHE_RETENTION'] = effectiveRetention;
+    } else {
+      delete process.env['PI_CACHE_RETENTION'];
     }
 
     this.toolRuntime.resetForLoop();
@@ -776,6 +788,13 @@ export class CortexAgent {
 
       throw error;
     } finally {
+      // Restore previous cache retention env var
+      if (prevCacheRetention !== undefined) {
+        process.env['PI_CACHE_RETENTION'] = prevCacheRetention;
+      } else {
+        delete process.env['PI_CACHE_RETENTION'];
+      }
+
       this._isPrompting = false;
 
       this.logger.debug('[CortexAgent] loop complete', {
@@ -1176,6 +1195,7 @@ export class CortexAgent {
       case 'Read': return { path: p['file_path'] };
       case 'Write': return { path: p['file_path'] };
       case 'Edit': return { path: p['file_path'] };
+      case 'UndoEdit': return { path: p['file_path'] };
       case 'Glob': return { pattern: p['pattern'], path: p['path'] };
       case 'Grep': return { pattern: p['pattern'], path: p['path'] };
       case 'WebFetch': return { url: p['url'] };
@@ -1736,6 +1756,35 @@ export class CortexAgent {
       this.agent.setTools(allTools as Parameters<typeof this.agent.setTools>[0]);
     }
     this.refreshPromptState();
+  }
+
+  /**
+   * Register an additional consumer-provided tool at runtime.
+   * Useful for dynamic tool management (e.g., enabling a tool after agent
+   * creation based on user permission changes).
+   */
+  addConsumerTool(tool: CortexTool): void {
+    const normalized = this.normalizeRegisteredTools([tool]);
+    if (normalized.length === 0) return;
+    const existing = this.registeredTools.findIndex(t => t.name === tool.name);
+    if (existing >= 0) {
+      this.registeredTools[existing] = normalized[0]!;
+    } else {
+      this.registeredTools.push(normalized[0]!);
+    }
+    this.refreshTools();
+  }
+
+  /**
+   * Remove a consumer-provided tool by name at runtime.
+   * Built-in tools cannot be removed.
+   */
+  removeConsumerTool(toolName: string): void {
+    const idx = this.registeredTools.findIndex(t => t.name === toolName);
+    if (idx >= 0) {
+      this.registeredTools.splice(idx, 1);
+      this.refreshTools();
+    }
   }
 
   /**
@@ -2675,6 +2724,9 @@ export class CortexAgent {
     if (!disabled.has(TOOL_NAMES.Edit)) {
       tools.push(createEditTool({ runtime }) as RegisteredTool);
     }
+    if (!disabled.has(TOOL_NAMES.UndoEdit)) {
+      tools.push(createUndoEditTool({ runtime }) as RegisteredTool);
+    }
     if (!disabled.has(TOOL_NAMES.Glob)) {
       tools.push(createGlobTool({ defaultCwd: cwd }) as RegisteredTool);
     }
@@ -3590,6 +3642,7 @@ export class CortexAgent {
       case 'Read': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
       case 'Write': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
       case 'Edit': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
+      case 'UndoEdit': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
       case 'Glob': return String(args['pattern'] ?? '');
       case 'Grep': return String(args['pattern'] ?? '');
       case 'WebFetch': return String(args['url'] ?? '').slice(0, 60);
