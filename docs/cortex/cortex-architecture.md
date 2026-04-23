@@ -55,7 +55,7 @@ packages/cortex/
 Cortex uses four distinct time scales:
 
 - **Session**: the long-lived logical conversation/runtime continuity that can be persisted and resumed across many prompts.
-- **Loop**: one `prompt()` execution, including all internal turns, tool calls, and follow-up work.
+- **Loop**: one `prompt(input, options?)` execution, including all internal turns, tool calls, and follow-up work. Accepts optional `{ cacheRetention }` to set per-call prompt cache behavior.
 - **Turn**: one LLM call/response inside a loop.
 - **Context**: the working prompt footprint sent to the model on a given turn.
 
@@ -128,6 +128,22 @@ const agent = await CortexAgent.create({
 ```
 
 Permissions are enforced through the `beforeToolCall` hook used for both built-in and MCP tools. Built-in tool schemas use TypeBox directly since they are defined within Cortex. SubAgent is a special case: it delegates work to a child Cortex agent.
+
+#### Dynamic Consumer Tool Management
+
+Consumer-provided tools (passed via `tools` in `CortexAgent.create()`) can be added and removed at runtime without restarting the agent:
+
+```typescript
+// Add a tool dynamically (e.g., after a permission change enables it)
+cortexAgent.addConsumerTool(myTool);
+
+// Remove a tool by name (e.g., after a permission change disables it)
+cortexAgent.removeConsumerTool('my_tool');
+```
+
+Both methods call `refreshTools()` internally, which re-syncs the full tool list (built-in + consumer + MCP) to pi-agent-core. If the tool already exists (by name), `addConsumerTool` replaces it. Tools are normalized and validated via `assertValidCortexTool` on registration.
+
+This complements the existing MCP dynamic lifecycle (connect/disconnect servers), providing the same hot-swap capability for in-process consumer tools.
 
 #### Tool Result Persistence
 

@@ -169,7 +169,7 @@ Cortex reads the active cache TTL from `PROVIDER_CACHE_CONFIG` based on the curr
 | OpenAI | 10 minutes | 24 hours |
 | Google / Mistral / Azure | no caching (L1 runs freely) | no caching |
 
-The consumer's `CacheRetention` setting is set via `setCacheRetention()` on `CortexAgent`. CortexAgent automatically wires it (and the active provider) into `CompactionManager.setCacheInfo()`. The CompactionManager records `lastLlmCallTimestamp` automatically inside `updateCurrentContextTokenCount()`, so cache-coldness is computed without any consumer-side bookkeeping.
+The consumer's `CacheRetention` setting is set via `setCacheRetention()` on `CortexAgent` for the default retention level. For per-call overrides, `prompt()`, `directComplete()`, and `structuredComplete()` all accept `{ cacheRetention }` in their options parameter. This lets consumers use different retention levels for different call types (e.g., short retention for cheap thought-generation calls, long retention for expensive multi-turn agentic loops). CortexAgent automatically wires the effective retention (and the active provider) into `CompactionManager.setCacheInfo()`. The CompactionManager records `lastLlmCallTimestamp` automatically inside `updateCurrentContextTokenCount()`, so cache-coldness is computed without any consumer-side bookkeeping.
 
 **Result**:
 - During rapid tool calls (cache warm): L1 stays dormant. Tool results stay full. Cache hit rates maximized.
