@@ -127,7 +127,7 @@ On agent abort (the entire agentic loop is cancelled), all running bash processe
 
 ## Safety Architecture
 
-Safety is implemented in seven layers. All layers ship in the foundation phase except kernel-level sandboxing.
+Safety is implemented in seven security layers plus a UX gate (Layer 6.5) that catches interactive commands before they burn the timeout budget. All layers ship in the foundation phase except kernel-level sandboxing.
 
 ### Layer 1: Environment Variable Security
 
@@ -261,6 +261,32 @@ Detect obfuscation and injection patterns before execution. Commands matching th
 Before executing scripts (Python, Node, etc.) via the shell, scan the script file for common agent mistakes:
 - **Shell variable injection**: Bare `$VARS` in Python/JS files (the agent generated shell syntax in the wrong language)
 - **Shell syntax bleed**: JS/Python files starting with shell commands (the agent mixed up file contexts)
+
+### Layer 6.5: Interactive Command Detection (UX gate)
+
+A UX gate, not a security layer: rejects commands that would block waiting for TTY input, before they consume the entire timeout budget. Runs after all security layers pass and before the (expensive) auto-mode classifier. Implementation: `packages/cortex/src/tools/bash/interactive.ts`.
+
+Rejection produces an actionable suggestion, not just a block. Example: `vim foo.txt` → "vim is a terminal editor and will block waiting for input. Use the Edit or Write tools to modify files instead."
+
+**Always-interactive programs** (no safe form for agent use):
+- Editors: `vim`, `vi`, `nvim`, `emacs`, `emacsclient`, `nano`, `pico`, `ed`, `joe`
+- Pagers: `less`, `more`, `most` — blocked even when piped (they paginate on keypress)
+- Monitors: `top`, `htop`, `atop`, `btop`, `watch` — block on continuous output
+
+**Conditionally interactive** (safe when given explicit input):
+- `python` / `python3`: safe with a script file, `-c`, `-m`, or `-V`/`-h`
+- `node`: safe with a script file, `-e`, `-p`, or `-v`/`-h`
+- `ruby`: safe with a `.rb` file or `-e`. `irb` is always blocked.
+- `mongo` / `mongosh`: safe with `--eval` or a `.js` script file
+- `sqlite3`: safe with a SQL string after the DB file, or `-cmd`/`-batch`
+- `psql`: safe with `-c`/`--command`, `-f`/`--file`, `-l`/`--list`, or `--version`
+- `mysql` / `mariadb`: safe with `-e`/`--execute` or `--version`
+
+**Quote-awareness:** tokens inside single or double quotes are not treated as program names, so `echo "use vim"` and `grep 'less' file` are not flagged. Basename-match only, so `bashvim --help` or `topup` are not false-positives.
+
+**Sub-command handling:** the command is split on shell operators (`;`, `&&`, `||`, `|`) and each sub-command is inspected independently. `ls | less | wc -l` is rejected because the `less` sub-command is interactive.
+
+**Wrappers:** leading `KEY=VALUE` env-var prefixes and the `env` wrapper (including its arg-taking flags like `-u`, `-C`, `-S`) are skipped before the program token is identified, so `env TERM=xterm vim foo` is still caught.
 
 ### Layer 7: Auto-Mode Classifier
 

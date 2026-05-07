@@ -1,13 +1,16 @@
 /**
  * Bash tool safety layers.
  *
- * Seven layers of defense-in-depth for shell command execution:
+ * Seven layers of defense-in-depth for shell command execution, plus a
+ * final UX gate:
  * 1. Environment variable stripping
  * 2. Critical path protection
  * 3. Command classification
  * 4. Path validation for write commands
  * 5. Obfuscation and injection detection
  * 6. Script preflight
+ * 6.5. Interactive command detection (UX gate — prevents silent timeouts
+ *      on editors, pagers, REPLs, and interactive DB clients)
  * 7. Auto-mode classifier (utility model LLM call)
  *
  * Reference: docs/cortex/tools/bash.md (Safety Architecture)
@@ -16,6 +19,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { buildSafeEnv as buildSafeEnvShared } from '../shared/safe-env.js';
+import { checkInteractive } from './interactive.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1269,6 +1273,13 @@ export async function runSafetyChecks(
   // Layer 6: Script preflight
   const scriptResult = await checkScriptPreflight(command, currentCwd);
   if (!scriptResult.allowed) return scriptResult;
+
+  // Layer 6.5: Interactive command detection (UX gate, not security).
+  // Sits after all security layers so obviously-malicious commands are
+  // blocked first; prevents silent timeout loss on editors, pagers, and
+  // REPLs.
+  const interactiveResult = checkInteractive(command);
+  if (!interactiveResult.allowed) return interactiveResult;
 
   // Layer 7: Auto-mode classifier
   const classifierResult = await checkAutoModeClassifier(
