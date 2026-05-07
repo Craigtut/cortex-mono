@@ -32,6 +32,9 @@ Create a new file or overwrite an existing file.
 ### Read-Before-Write Contract
 If the file already exists, the model must have Read it in the current agentic loop before writing. The tool fails if an existing file hasn't been Read first. This prevents blind overwrites.
 
+### Undo snapshot
+After every successful write, the tool pushes a snapshot onto the per-file `EditHistory` stack. For a create, `originalContent` is `null` and [UndoEdit](./undo-edit.md) will delete the file; for an overwrite, the prior content is captured so UndoEdit can restore it. History is per-loop and bounded (5 entries per file).
+
 ### Structured Diffs
 For updates (not creates), the tool computes a structured patch internally. This is returned in `details` for the UI to render a rich diff view. The model does not need to see the diff in its context since it authored the content.
 

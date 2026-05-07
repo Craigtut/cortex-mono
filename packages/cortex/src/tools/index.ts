@@ -9,6 +9,8 @@
 // Shared infrastructure
 export { ReadRegistry } from './shared/read-registry.js';
 export type { ReadState } from './shared/read-registry.js';
+export { EditHistory, MAX_STACK_DEPTH as EDIT_HISTORY_MAX_STACK_DEPTH } from './shared/edit-history.js';
+export type { EditHistoryEntry } from './shared/edit-history.js';
 export { CwdTracker } from './shared/cwd-tracker.js';
 export {
   CortexToolRuntime,
@@ -36,6 +38,14 @@ export { WriteParams } from './write.js';
 export { createEditTool } from './edit.js';
 export type { EditToolConfig, EditDetails, EditParamsType } from './edit.js';
 export { EditParams } from './edit.js';
+
+export { createUndoEditTool } from './undo-edit.js';
+export type {
+  UndoEditToolConfig,
+  UndoEditDetails,
+  UndoEditParamsType,
+} from './undo-edit.js';
+export { UndoEditParams } from './undo-edit.js';
 
 export { createGlobTool } from './glob.js';
 export type { GlobToolConfig, GlobDetails, GlobParamsType } from './glob.js';
@@ -88,6 +98,7 @@ export const TOOL_NAMES = {
   Read: 'Read',
   Write: 'Write',
   Edit: 'Edit',
+  UndoEdit: 'UndoEdit',
   Glob: 'Glob',
   Grep: 'Grep',
   Bash: 'Bash',

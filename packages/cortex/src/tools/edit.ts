@@ -12,12 +12,19 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Type, type Static } from '@sinclair/typebox';
+import type { EditHistory } from './shared/edit-history.js';
 import type { FileMutationLock } from './shared/file-mutation-lock.js';
 import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
 import { computeDiff, type DiffHunk } from './write.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
+import {
+  findMatch,
+  findNearestMatch,
+  reindentReplacement,
+  type MatchResult,
+} from './shared/edit-matcher.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -49,6 +56,12 @@ export interface EditDetails {
   replaceAll: boolean;
   diff: DiffHunk[];
   originalContent: string;
+  /**
+   * Which matcher tier resolved the edit. Useful for consumers that want
+   * to surface "we applied a fuzzy match" in the UI. Absent when no edit
+   * was performed (errors, identical strings, etc.).
+   */
+  matchTier?: 'exact' | 'line-trimmed' | 'indentation-flexible';
 }
 
 // ---------------------------------------------------------------------------
@@ -59,24 +72,87 @@ export interface EditToolConfig {
   runtime?: CortexToolRuntime | undefined;
   readRegistry?: ReadRegistry | undefined;
   fileMutationLock?: FileMutationLock | undefined;
+  /**
+   * Undo stack. When provided, every successful edit pushes a
+   * pre-mutation snapshot so `UndoEdit` can restore the prior state.
+   * Optional — tests and embedded consumers that don't expose undo
+   * may omit it; the tool degrades gracefully to current behavior.
+   */
+  editHistory?: EditHistory | undefined;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+type AppliedTier = 'exact' | 'line-trimmed' | 'indentation-flexible';
+
+interface AppliedReplacement {
+  newContent: string;
+  replacementCount: number;
+  tier: AppliedTier;
+}
+
 /**
- * Count non-overlapping occurrences of a substring in a string.
+ * Given a successful match (not `none` and not `ambiguous`), produce the
+ * rebuilt file content along with the replacement count and the tier
+ * that resolved the edit. Caller is responsible for having already
+ * rejected `none`, `ambiguous`, and the tier-1 `count>1 && !replaceAll`
+ * case. Returns null when `match` is one of those guarded states, which
+ * is a programming error at the call site.
  */
-function countOccurrences(haystack: string, needle: string): number {
-  if (needle.length === 0) return 0;
-  let count = 0;
-  let pos = 0;
-  while ((pos = haystack.indexOf(needle, pos)) !== -1) {
-    count++;
-    pos += needle.length;
+function applyReplacement(
+  match: MatchResult,
+  normalizedContent: string,
+  normalizedOldString: string,
+  normalizedNewString: string,
+  replaceAll: boolean,
+): AppliedReplacement | null {
+  if (match.kind === 'exact') {
+    if (replaceAll) {
+      return {
+        newContent: normalizedContent
+          .split(normalizedOldString)
+          .join(normalizedNewString),
+        replacementCount: match.count,
+        tier: 'exact',
+      };
+    }
+    return {
+      newContent:
+        normalizedContent.slice(0, match.startIndex) +
+        normalizedNewString +
+        normalizedContent.slice(match.startIndex + match.matchedLength),
+      replacementCount: 1,
+      tier: 'exact',
+    };
   }
-  return count;
+  if (match.kind === 'line-trimmed') {
+    return {
+      newContent:
+        normalizedContent.slice(0, match.startIndex) +
+        normalizedNewString +
+        normalizedContent.slice(match.startIndex + match.matchedLength),
+      replacementCount: 1,
+      tier: 'line-trimmed',
+    };
+  }
+  if (match.kind === 'indentation-flexible') {
+    const reindented = reindentReplacement(
+      normalizedNewString,
+      match.needleIndent,
+      match.haystackIndent,
+    );
+    return {
+      newContent:
+        normalizedContent.slice(0, match.startIndex) +
+        reindented +
+        normalizedContent.slice(match.startIndex + match.matchedLength),
+      replacementCount: 1,
+      tier: 'indentation-flexible',
+    };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +170,7 @@ export function createEditTool(config: EditToolConfig): {
     throw new Error('createEditTool requires either runtime or readRegistry');
   }
   const fileMutationLock = config.runtime?.fileMutationLock ?? config.fileMutationLock;
+  const editHistory = config.runtime?.editHistory ?? config.editHistory;
 
   /** Build a no-op result for early returns. */
   function noChange(
@@ -191,20 +268,37 @@ export function createEditTool(config: EditToolConfig): {
         const normalizedOldString = oldString.replace(/\r\n/g, '\n');
         const normalizedNewString = newString.replace(/\r\n/g, '\n');
 
-        // Count occurrences in normalized content
-        const matchCount = countOccurrences(normalizedContent, normalizedOldString);
+        // Resolve the match via the tiered cascade (see edit-matcher.ts):
+        //   tier 1: exact                 — substring indexOf
+        //   tier 2: line-trimmed           — tolerates trailing whitespace
+        //   tier 3: indentation-flexible   — tolerates leading indent delta
+        // replace_all semantics apply only to tier 1; tier 2 and tier 3
+        // always resolve to a single replacement (ambiguity there rejects).
+        const match = findMatch(normalizedContent, normalizedOldString);
 
-        if (matchCount === 0) {
-          return noChange(filePath, oldString, newString, replaceAll,
-            'The specified text was not found in the file.', originalContent);
+        if (match.kind === 'none') {
+          const hint = findNearestMatch(normalizedContent, normalizedOldString);
+          const text = hint
+            ? `The specified text was not found in the file.\n\nNearest match in ${path.basename(filePath)}:\n${hint.snippet}`
+            : 'The specified text was not found in the file.';
+          return noChange(
+            filePath, oldString, newString, replaceAll, text, originalContent,
+          );
         }
 
-        // Uniqueness constraint when replaceAll is false
-        if (!replaceAll && matchCount > 1) {
+        if (match.kind === 'ambiguous') {
+          const tolerance =
+            match.tier === 'line-trimmed'
+              ? 'trailing-whitespace tolerance'
+              : 'indentation tolerance';
+          const lines = match.matchLines.join(', ');
+          const suffix = match.count > match.matchLines.length ? ' (first 3 shown)' : '';
           return {
             content: [{
               type: 'text',
-              text: `Found ${matchCount} matches. Provide more surrounding context to uniquely identify the edit location.`,
+              text:
+                `Found ${match.count} possible matches on lines ${lines}${suffix} via ${tolerance}. ` +
+                'No exact match exists. Tighten old_string to uniquely identify the edit location.',
             }],
             details: {
               filePath, oldString, newString,
@@ -213,22 +307,34 @@ export function createEditTool(config: EditToolConfig): {
           };
         }
 
-        // Perform the replacement
-        let newNormalizedContent: string;
-        let replacementCount: number;
-
-        if (replaceAll) {
-          newNormalizedContent = normalizedContent.split(normalizedOldString).join(normalizedNewString);
-          replacementCount = matchCount;
-        } else {
-          // Replace first (and only) occurrence
-          const idx = normalizedContent.indexOf(normalizedOldString);
-          newNormalizedContent =
-            normalizedContent.slice(0, idx) +
-            normalizedNewString +
-            normalizedContent.slice(idx + normalizedOldString.length);
-          replacementCount = 1;
+        if (match.kind === 'exact' && !replaceAll && match.count > 1) {
+          const lines = match.matchLines.join(', ');
+          const suffix = match.count > match.matchLines.length ? ' (first 3 shown)' : '';
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `Found ${match.count} exact matches on lines ${lines}${suffix}. ` +
+                'Provide more surrounding context to uniquely identify the edit location, or pass replace_all: true.',
+            }],
+            details: {
+              filePath, oldString, newString,
+              replacementCount: 0, replaceAll, diff: [], originalContent,
+            },
+          };
         }
+
+        const applied = applyReplacement(
+          match, normalizedContent, normalizedOldString, normalizedNewString, replaceAll,
+        );
+        if (!applied) {
+          // Unreachable: above guards cover 'none' and 'ambiguous'. Treat
+          // as a programming error rather than silently succeeding.
+          throw new Error(`Unexpected match kind: ${match.kind}`);
+        }
+        const newNormalizedContent = applied.newContent;
+        const replacementCount = applied.replacementCount;
+        const matchTier = applied.tier;
 
         // Restore original line ending style if it was CRLF
         const finalContent = hadCRLF
@@ -258,6 +364,9 @@ export function createEditTool(config: EditToolConfig): {
         // of current file contents, so subsequent edits don't require a re-read.
         // We record the new mtime and a content hash of what we just wrote so
         // external modifications still trigger the freshness check above.
+        // Also capture an EditHistory snapshot (when enabled) so UndoEdit
+        // can restore the prior contents while being able to detect
+        // post-edit external modifications.
         try {
           const postStat = await fs.promises.stat(filePath);
           const postHash = crypto.createHash('sha256')
@@ -266,16 +375,32 @@ export function createEditTool(config: EditToolConfig): {
             timestamp: postStat.mtimeMs,
             contentHash: postHash,
           });
+          editHistory?.record(filePath, {
+            originalContent,
+            postMutationMtimeMs: postStat.mtimeMs,
+            postMutationContentHash: postHash,
+            source: 'Edit',
+          });
         } catch {
           readRegistry.invalidate(filePath);
         }
 
         const plural = replacementCount === 1 ? 'replacement' : 'replacements';
+        const tierSuffix =
+          matchTier === 'line-trimmed'
+            ? ' (matched after trailing-whitespace tolerance)'
+            : matchTier === 'indentation-flexible'
+              ? ' (matched after indentation tolerance)'
+              : '';
         return {
-          content: [{ type: 'text', text: `Made ${replacementCount} ${plural} in ${filePath}` }],
+          content: [{
+            type: 'text',
+            text: `Made ${replacementCount} ${plural} in ${filePath}${tierSuffix}`,
+          }],
           details: {
             filePath, oldString, newString,
             replacementCount, replaceAll, diff, originalContent,
+            matchTier,
           },
         };
       } finally {
@@ -291,6 +416,7 @@ export function createEditTool(config: EditToolConfig): {
       runtime,
       readRegistry: runtime.readRegistry,
       fileMutationLock: runtime.fileMutationLock,
+      editHistory: runtime.editHistory,
     }),
   });
 }

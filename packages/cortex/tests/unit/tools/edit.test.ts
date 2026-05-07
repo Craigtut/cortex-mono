@@ -81,7 +81,7 @@ describe('Edit tool', () => {
       new_string: 'baz',
     });
 
-    expect(getText(result)).toContain('Found 2 matches');
+    expect(getText(result)).toContain('Found 2 exact matches');
     expect(fs.readFileSync(filePath, 'utf8')).toBe('foo bar foo bar\n');
   });
 
@@ -377,5 +377,213 @@ describe('Edit tool', () => {
     expect(rB.details.replacementCount).toBe(1);
     expect(fs.readFileSync(fileA, 'utf8')).toBe('hi\n');
     expect(fs.readFileSync(fileB, 'utf8')).toBe('earth\n');
+  });
+
+  // -------------------------------------------------------------------------
+  // Tiered fuzzy matching (integration with edit-matcher)
+  // -------------------------------------------------------------------------
+
+  describe('tiered matching', () => {
+    it('falls back to tier 2 when needle has trailing whitespace haystack lacks', async () => {
+      const filePath = path.join(tmpDir, 'trim.ts');
+      fs.writeFileSync(filePath, 'const x = 1;\nconst y = 2;\n');
+      markFileRead(registry, filePath);
+
+      const result = await editTool.execute({
+        file_path: filePath,
+        old_string: 'const x = 1;   ',
+        new_string: 'const x = 42;',
+      });
+
+      expect(result.details.replacementCount).toBe(1);
+      expect(result.details.matchTier).toBe('line-trimmed');
+      expect(getText(result)).toContain('trailing-whitespace tolerance');
+      expect(fs.readFileSync(filePath, 'utf8')).toBe(
+        'const x = 42;\nconst y = 2;\n',
+      );
+    });
+
+    it('falls back to tier 3 and re-indents replacement to match haystack', async () => {
+      const filePath = path.join(tmpDir, 'indent.ts');
+      const original = [
+        'class Foo {',
+        '    constructor() {',
+        '        this.x = 1;',
+        '    }',
+        '}',
+        '',
+      ].join('\n');
+      fs.writeFileSync(filePath, original);
+      markFileRead(registry, filePath);
+
+      const result = await editTool.execute({
+        file_path: filePath,
+        // Model wrote the block with no leading indent
+        old_string: ['constructor() {', '    this.x = 1;', '}'].join('\n'),
+        new_string: ['constructor() {', '    this.x = 99;', '}'].join('\n'),
+      });
+
+      expect(result.details.replacementCount).toBe(1);
+      expect(result.details.matchTier).toBe('indentation-flexible');
+      expect(getText(result)).toContain('indentation tolerance');
+      expect(fs.readFileSync(filePath, 'utf8')).toBe(
+        [
+          'class Foo {',
+          '    constructor() {',
+          '        this.x = 99;',
+          '    }',
+          '}',
+          '',
+        ].join('\n'),
+      );
+    });
+
+    it('preserves CRLF line endings when tier 3 matches', async () => {
+      const filePath = path.join(tmpDir, 'indent-crlf.ts');
+      // CRLF-terminated, 4-space indent. Needle is a multi-line block
+      // with zero indent so tier 1/2 cannot match as substrings and
+      // tier 3 fires (re-indenting the replacement).
+      const content = '    foo();\r\n    bar();\r\n';
+      fs.writeFileSync(filePath, content);
+      markFileRead(registry, filePath);
+
+      const result = await editTool.execute({
+        file_path: filePath,
+        old_string: 'foo();\nbar();',
+        new_string: 'baz();\nqux();',
+      });
+
+      expect(result.details.replacementCount).toBe(1);
+      expect(result.details.matchTier).toBe('indentation-flexible');
+      // Replacement gets re-indented with the haystack's 4 spaces and
+      // CRLF terminators survive the round-trip.
+      expect(fs.readFileSync(filePath, 'utf8')).toBe(
+        '    baz();\r\n    qux();\r\n',
+      );
+    });
+
+    it('includes nearest-match snippet when no tier matches', async () => {
+      const filePath = path.join(tmpDir, 'miss.ts');
+      fs.writeFileSync(
+        filePath,
+        [
+          'function compute() {',
+          '  const ratio = 0.7;',
+          '  return ratio * 100;',
+          '}',
+          '',
+        ].join('\n'),
+      );
+      markFileRead(registry, filePath);
+
+      const result = await editTool.execute({
+        file_path: filePath,
+        old_string: 'const ratio = 0.9;',
+        new_string: 'const ratio = 0.5;',
+      });
+
+      const text = getText(result);
+      expect(text).toContain('not found');
+      expect(text).toContain('Nearest match');
+      expect(text).toContain('const ratio = 0.7;');
+      expect(text).toContain('<- nearest');
+      expect(result.details.replacementCount).toBe(0);
+    });
+
+    it('reports tier-2 ambiguity with the specific tolerance used', async () => {
+      const filePath = path.join(tmpDir, 'amb-tier2.ts');
+      fs.writeFileSync(filePath, 'alpha\nalpha\n');
+      markFileRead(registry, filePath);
+
+      const result = await editTool.execute({
+        file_path: filePath,
+        old_string: 'alpha ',
+        new_string: 'beta',
+      });
+
+      const text = getText(result);
+      expect(text).toContain('2 possible matches');
+      expect(text).toContain('trailing-whitespace tolerance');
+      expect(text).toMatch(/lines 1, 2/);
+      expect(result.details.replacementCount).toBe(0);
+      // Nothing on disk should have changed.
+      expect(fs.readFileSync(filePath, 'utf8')).toBe('alpha\nalpha\n');
+    });
+
+    it('reports tier-1 ambiguity with line numbers', async () => {
+      const filePath = path.join(tmpDir, 'amb-tier1.ts');
+      fs.writeFileSync(
+        filePath,
+        ['first', 'target = 1;', 'middle', 'target = 2;', 'last', ''].join('\n'),
+      );
+      markFileRead(registry, filePath);
+
+      const result = await editTool.execute({
+        file_path: filePath,
+        old_string: 'target',
+        new_string: 'result',
+      });
+
+      const text = getText(result);
+      expect(text).toContain('2 exact matches');
+      expect(text).toMatch(/lines 2, 4/);
+      expect(text).toContain('replace_all: true');
+    });
+
+    it('prefers exact over fuzzy when both would match', async () => {
+      const filePath = path.join(tmpDir, 'prefer-exact.ts');
+      // Exact substring present on line 1, would-be tier-3 candidate on line 2.
+      fs.writeFileSync(filePath, 'foo();\n    foo();\n');
+      markFileRead(registry, filePath);
+
+      const result = await editTool.execute({
+        file_path: filePath,
+        old_string: 'foo();',
+        new_string: 'bar();',
+        replace_all: true,
+      });
+
+      expect(result.details.matchTier).toBe('exact');
+      // Both occurrences replaced via tier 1 replace_all.
+      expect(fs.readFileSync(filePath, 'utf8')).toBe('bar();\n    bar();\n');
+    });
+
+    it('leaves the file unchanged when ambiguous tier-3 rejects', async () => {
+      const filePath = path.join(tmpDir, 'amb-tier3.ts');
+      const content = ['function f() {', '  x();', '  x();', '}', ''].join('\n');
+      fs.writeFileSync(filePath, content);
+      markFileRead(registry, filePath);
+
+      const result = await editTool.execute({
+        file_path: filePath,
+        old_string: '    x();', // over-indented vs the 2-space haystack region
+        new_string: '    y();',
+      });
+
+      expect(getText(result)).toContain('indentation tolerance');
+      expect(result.details.replacementCount).toBe(0);
+      expect(fs.readFileSync(filePath, 'utf8')).toBe(content);
+    });
+
+    it('refreshes read registry after a fuzzy match so next edit needs no re-Read', async () => {
+      const filePath = path.join(tmpDir, 'refresh.ts');
+      fs.writeFileSync(filePath, 'const x = 1;\n');
+      markFileRead(registry, filePath);
+
+      await editTool.execute({
+        file_path: filePath,
+        old_string: 'const x = 1;   ',
+        new_string: 'const x = 42;',
+      });
+
+      // Second edit, same session — no re-Read, must still succeed.
+      const second = await editTool.execute({
+        file_path: filePath,
+        old_string: 'const x = 42;',
+        new_string: 'const x = 7;',
+      });
+      expect(second.details.replacementCount).toBe(1);
+      expect(fs.readFileSync(filePath, 'utf8')).toBe('const x = 7;\n');
+    });
   });
 });

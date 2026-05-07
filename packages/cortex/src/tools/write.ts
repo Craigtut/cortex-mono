@@ -12,6 +12,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { Type, type Static } from '@sinclair/typebox';
+import type { EditHistory } from './shared/edit-history.js';
 import type { FileMutationLock } from './shared/file-mutation-lock.js';
 import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
@@ -57,6 +58,12 @@ export interface WriteToolConfig {
   runtime?: CortexToolRuntime | undefined;
   readRegistry?: ReadRegistry | undefined;
   fileMutationLock?: FileMutationLock | undefined;
+  /**
+   * Undo stack. When provided, every successful write pushes a
+   * pre-mutation snapshot (or `null` when the file did not exist) so
+   * `UndoEdit` can restore the prior state.
+   */
+  editHistory?: EditHistory | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +131,7 @@ export function createWriteTool(config: WriteToolConfig): {
   execute: (params: WriteParamsType) => Promise<ToolContentDetails<WriteDetails>>;
 } {
   const readRegistry = config.runtime?.readRegistry ?? config.readRegistry;
+  const editHistory = config.runtime?.editHistory ?? config.editHistory;
   if (!readRegistry) {
     throw new Error('createWriteTool requires either runtime or readRegistry');
   }
@@ -320,6 +328,9 @@ export function createWriteTool(config: WriteToolConfig): {
         // of current file contents, so subsequent mutations don't require a re-read.
         // We record the new mtime and a content hash of what we just wrote so
         // external modifications still trigger the freshness check above.
+        // Also capture an EditHistory snapshot (when enabled) so UndoEdit
+        // can restore the prior state — including the "file didn't exist"
+        // case, where undo means deleting what Write just created.
         try {
           const postStat = await fs.promises.stat(filePath);
           const postHash = crypto.createHash('sha256')
@@ -327,6 +338,12 @@ export function createWriteTool(config: WriteToolConfig): {
           readRegistry.markRead(filePath, {
             timestamp: postStat.mtimeMs,
             contentHash: postHash,
+          });
+          editHistory?.record(filePath, {
+            originalContent,
+            postMutationMtimeMs: postStat.mtimeMs,
+            postMutationContentHash: postHash,
+            source: 'Write',
           });
         } catch {
           readRegistry.invalidate(filePath);
@@ -362,6 +379,7 @@ export function createWriteTool(config: WriteToolConfig): {
       runtime,
       readRegistry: runtime.readRegistry,
       fileMutationLock: runtime.fileMutationLock,
+      editHistory: runtime.editHistory,
     }),
   });
 }

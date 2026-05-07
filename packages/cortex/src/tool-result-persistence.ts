@@ -39,6 +39,7 @@ export const BOOKEND_CHARS = 1_500;
 export const SKIP_RESULT_PERSISTENCE = new Set<string>([
   'Read',
   'Edit',
+  'UndoEdit',
   'Write',
   'Glob',
 ]);

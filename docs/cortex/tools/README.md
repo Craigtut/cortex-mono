@@ -25,6 +25,7 @@ Application-specific tools (domain-specific tools, cognitive tools, etc.) are re
 | [Read](./read.md) | Read file contents |
 | [Write](./write.md) | Create or overwrite files |
 | [Edit](./edit.md) | Make precise edits to existing files |
+| [UndoEdit](./undo-edit.md) | Revert the most recent Edit or Write on a single file |
 | [Glob](./glob.md) | Find files by pattern |
 | [Grep](./grep.md) | Search file contents with regex (ripgrep) |
 | [WebFetch](./web-fetch.md) | Fetch and parse web content |

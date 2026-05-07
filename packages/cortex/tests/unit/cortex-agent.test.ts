@@ -1111,10 +1111,12 @@ You have 12 emotions.`;
 
       expect(setToolsFn).toHaveBeenCalledOnce();
       const allTools = setToolsFn.mock.calls[0]![0];
-      // 8 built-in tools auto-registered: Read, Write, Edit, Glob, Grep, Bash, TaskOutput, WebFetch
-      expect(allTools.length).toBe(8);
+      // 9 built-in tools auto-registered: Read, Write, Edit, UndoEdit,
+      // Glob, Grep, Bash, TaskOutput, WebFetch
+      expect(allTools.length).toBe(9);
       const toolNames = allTools.map((t: { name: string }) => t.name);
       expect(toolNames).toContain('Read');
+      expect(toolNames).toContain('UndoEdit');
       expect(toolNames).toContain('Bash');
       expect(toolNames).toContain('Glob');
     });
