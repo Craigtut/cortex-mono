@@ -137,9 +137,11 @@ describe('Read tool', () => {
     expect(text).toContain('\u4e16\u754c');
   });
 
-  it('returns PDF message for .pdf files instead of binary error', async () => {
+  it('routes .pdf files through the PDF extractor rather than the binary path', async () => {
+    // Malformed PDF bytes — the extractor surfaces a parse error, but
+    // crucially the binary-file path is NOT taken (the .pdf extension
+    // is handled specially).
     const filePath = path.join(tmpDir, 'document.pdf');
-    // PDF files start with %PDF header and contain null bytes (binary)
     const pdfHeader = Buffer.from('%PDF-1.4 fake pdf content');
     const pdfContent = Buffer.concat([pdfHeader, Buffer.alloc(100)]);
     fs.writeFileSync(filePath, pdfContent);
@@ -147,19 +149,9 @@ describe('Read tool', () => {
     const result = await readTool.execute({ file_path: filePath });
 
     const text = (result.content[0] as { type: 'text'; text: string }).text;
-    expect(text).toContain('PDF file detected');
-    expect(text).toContain('pdf-parse');
     expect(text).not.toContain('Binary file detected');
-  });
-
-  it('accepts the pages parameter for PDF files', async () => {
-    const filePath = path.join(tmpDir, 'document.pdf');
-    fs.writeFileSync(filePath, '%PDF-1.4 fake');
-
-    const result = await readTool.execute({ file_path: filePath, pages: '1-5' });
-
-    const text = (result.content[0] as { type: 'text'; text: string }).text;
-    expect(text).toContain('PDF file detected');
+    // Either a parse error surfaces, or the extractor reports no text.
+    expect(text).toMatch(/parse PDF|no extractable text|image/i);
   });
 
   it('shows truncation notice when file exceeds limit', async () => {
@@ -439,6 +431,137 @@ describe('Read tool', () => {
 
     it('mentions token limit', () => {
       expect(readTool.description).toContain('25,000 tokens');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // PDF extraction (integration via unpdf)
+  // -------------------------------------------------------------------------
+
+  describe('PDF files', () => {
+    /** Build a PDF on disk from the given page texts. Returns the file path. */
+    async function writePdf(pageTexts: string[], fileName = 'doc.pdf'): Promise<string> {
+      const { PDFDocument, StandardFonts } = await import('pdf-lib');
+      const doc = await PDFDocument.create();
+      const font = await doc.embedFont(StandardFonts.Helvetica);
+      for (const pageText of pageTexts) {
+        const page = doc.addPage();
+        if (pageText.length > 0) {
+          page.drawText(pageText, { x: 72, y: 720, font, size: 12 });
+        }
+      }
+      const bytes = await doc.save();
+      const filePath = path.join(tmpDir, fileName);
+      fs.writeFileSync(filePath, bytes);
+      return filePath;
+    }
+
+    function getText(result: { content: Array<{ type: string; text?: string }> }): string {
+      return (result.content[0] as { type: 'text'; text: string }).text;
+    }
+
+    it('extracts text from a multi-page PDF with line-numbered output', async () => {
+      const pdfPath = await writePdf([
+        'First page introduces the topic.',
+        'Second page elaborates on the subject.',
+      ]);
+
+      const result = await readTool.execute({ file_path: pdfPath });
+
+      const text = getText(result);
+      expect(text).toContain('[PDF: 2 pages]');
+      expect(text).toContain('[Page 1]');
+      expect(text).toContain('First page');
+      expect(text).toContain('[Page 2]');
+      expect(text).toContain('Second page');
+      // Line-numbered like any other text read.
+      expect(text).toMatch(/^\s+1\t/m);
+      expect(result.details.totalLines).toBeGreaterThan(0);
+      expect(result.details.rejected).toBeUndefined();
+    });
+
+    it('honors the pages parameter for a subset extraction', async () => {
+      const pdfPath = await writePdf([
+        'Alpha content',
+        'Beta content',
+        'Gamma content',
+      ]);
+
+      const result = await readTool.execute({
+        file_path: pdfPath,
+        pages: '2-3',
+      });
+
+      const text = getText(result);
+      expect(text).toContain('[PDF: showing pages 2-3 of 3]');
+      expect(text).toContain('Beta');
+      expect(text).toContain('Gamma');
+      expect(text).not.toContain('Alpha');
+    });
+
+    it('rejects a pages spec that is out of range', async () => {
+      const pdfPath = await writePdf(['only page']);
+
+      const result = await readTool.execute({
+        file_path: pdfPath,
+        pages: '5',
+      });
+
+      expect(result.details.rejected).toBe(true);
+      expect(getText(result)).toContain('exceeds document');
+    });
+
+    it('rejects a malformed pages spec with an actionable message', async () => {
+      const pdfPath = await writePdf(['page one']);
+
+      const result = await readTool.execute({
+        file_path: pdfPath,
+        pages: 'bogus',
+      });
+
+      expect(result.details.rejected).toBe(true);
+      expect(getText(result)).toContain('Invalid pages spec');
+    });
+
+    it('reports scanned/image-only PDFs with a clear message', async () => {
+      const pdfPath = await writePdf(['']); // no text on the page
+
+      const result = await readTool.execute({ file_path: pdfPath });
+
+      expect(result.details.rejected).toBe(true);
+      expect(getText(result)).toMatch(/scanned|image/i);
+    });
+
+    it('marks the PDF as read so Edit-style freshness checks work', async () => {
+      const pdfPath = await writePdf([
+        'A page with enough content to clear the empty-text threshold.',
+      ]);
+      expect(registry.hasBeenRead(pdfPath)).toBe(false);
+      await readTool.execute({ file_path: pdfPath });
+      expect(registry.hasBeenRead(pdfPath)).toBe(true);
+    });
+
+    it('still enforces the 10 MB absolute size ceiling', async () => {
+      const pdfPath = path.join(tmpDir, 'huge.pdf');
+      // Write a "PDF" placeholder larger than the ceiling. Doesn't need
+      // to be a real PDF — the size gate short-circuits before extraction.
+      const big = Buffer.alloc(11 * 1024 * 1024, 0x20);
+      fs.writeFileSync(pdfPath, big);
+
+      const result = await readTool.execute({ file_path: pdfPath });
+
+      expect(result.details.rejected).toBe(true);
+      expect(getText(result)).toContain('too large');
+    });
+
+    it('reports a parse error for bytes that are not a valid PDF', async () => {
+      const pdfPath = path.join(tmpDir, 'invalid.pdf');
+      fs.writeFileSync(pdfPath, Buffer.from([0, 1, 2, 3, 4, 5]));
+
+      const result = await readTool.execute({ file_path: pdfPath });
+
+      expect(result.details.rejected).toBe(true);
+      expect(getText(result)).toContain('parse PDF');
     });
   });
 });

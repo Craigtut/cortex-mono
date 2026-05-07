@@ -38,7 +38,14 @@ The Read tool tracks which files have been read in the current agentic loop. The
 
 ### Special File Types
 - **Images** (PNG, JPG, GIF, WebP): Return as base64 in an `ImageContent` block. For vision-capable models, the image is presented visually.
-- **PDFs**: Extract text content. For large PDFs (>10 pages), require a `pages` parameter specifying a page range (e.g., "1-5"). Max 20 pages per request.
+- **PDFs**: Text extraction via `unpdf` (pure-ESM, zero native deps). Implementation: `packages/cortex/src/tools/shared/pdf-extractor.ts`.
+  - Default: extracts the first 20 pages.
+  - `pages` parameter accepts `"N"` or `"N-M"`; spec must fit the per-call 20-page cap and the document's page count.
+  - Output is rendered with a `[PDF: ...]` header and `[Page N]` markers between pages, then passed through the same `cat -n` line-number formatter used for text files. Line numbers reset per call; PDFs do not participate in the `offset`/`limit` model.
+  - Scanned / image-only PDFs return a structured "no extractable text; use an OCR tool" message. No automatic OCR.
+  - Parse failures return a structured error rather than throwing.
+  - The 10 MB absolute size ceiling still applies (enforced before extraction).
+  - The 25,000-token output ceiling still applies (enforced on the rendered text); oversized extractions suggest a narrower `pages` range.
 
 ### Cross-Platform
 - Accepts both forward slash and backslash paths. Normalizes internally.
@@ -53,6 +60,11 @@ The Read tool tracks which files have been read in the current agentic loop. The
 | Permission denied | Return error in `content`: "Permission denied: {path}" |
 | Is a directory | Return error in `content`: "Cannot read a directory. Use `ls` via Bash." |
 | Binary file (not image/PDF) | Return error in `content`: "Binary file detected. Cannot display as text." |
+| PDF: `pages` out of range | Return error in `content`: "Pages spec ... exceeds document (has N pages)." Sets `rejected: true`. |
+| PDF: malformed `pages` spec | Return error in `content`: "Invalid pages spec ... Use 'N' or 'N-M'." Sets `rejected: true`. |
+| PDF: scanned / image-only | Return error in `content` suggesting OCR. Sets `rejected: true`. |
+| PDF: unparseable bytes | Return error in `content`: "Failed to parse PDF: ..." Sets `rejected: true`. |
+| PDF: extraction exceeds token budget | Return error in `content` suggesting a narrower `pages` range. Sets `rejected: true`. |
 | File locked | Attempt read anyway (most OS allow concurrent reads). Error if truly locked. |
 
 ### System Prompt Guidance

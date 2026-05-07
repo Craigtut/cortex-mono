@@ -17,6 +17,7 @@ import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
 import { estimateTokens } from '../token-estimator.js';
+import { extractPdfText } from './shared/pdf-extractor.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -374,13 +375,57 @@ export function createReadTool(config: ReadToolConfig): {
         };
       }
 
-      // Handle PDF files
+      // Handle PDF files. The extractor (shared/pdf-extractor.ts) wraps
+      // unpdf and returns a structured result: the Read tool's only
+      // responsibility is to decide how to surface each outcome.
       if (ext === '.pdf') {
+        const pdfBuffer = await fs.promises.readFile(filePath);
+        const extraction = await extractPdfText({
+          data: pdfBuffer,
+          pagesSpec: params.pages,
+        });
+
+        if (
+          extraction.kind === 'error' ||
+          extraction.kind === 'invalid-range' ||
+          extraction.kind === 'empty'
+        ) {
+          // All three are read failures from the caller's perspective:
+          // there is no usable content to hand to the model. Flag as
+          // rejected so consumers can surface them uniformly and the
+          // model can retry (with a different pages spec, OCR, etc.).
+          return makeRejection(filePath, stat.size, extraction.message);
+        }
+
+        // Line-number the rendered output to match the cat -n style
+        // used for text files. Line numbers reset to 1 per call; PDFs
+        // don't map cleanly to the file-wide offset/limit model.
+        const renderedLines = extraction.rendered.split('\n');
+        const formatted = formatWithLineNumbers(renderedLines, 1);
+
+        // Gate 3: token ceiling on the formatted output.
+        const pdfTokenCount = estimateTokens(formatted);
+        if (pdfTokenCount > MAX_OUTPUT_TOKENS) {
+          const requestedPages = extraction.lastPage - extraction.firstPage + 1;
+          const suggestedPages = Math.max(
+            1,
+            Math.floor(requestedPages * MAX_OUTPUT_TOKENS / pdfTokenCount),
+          );
+          return makeRejection(
+            filePath,
+            stat.size,
+            `PDF extraction too large (estimated ~${pdfTokenCount.toLocaleString()} tokens, limit ${MAX_OUTPUT_TOKENS.toLocaleString()}). ` +
+            `Narrow the \`pages\` range (try ~${suggestedPages} page${suggestedPages === 1 ? '' : 's'} per call).`,
+          );
+        }
+
+        readRegistry.markRead(filePath, { timestamp: stat.mtimeMs });
+
         return {
-          content: [{ type: 'text', text: 'PDF file detected. PDF text extraction requires the pdf-parse package (not yet installed). Use Bash with a PDF tool to read this file.' }],
+          content: [{ type: 'text', text: formatted }],
           details: {
             filePath,
-            totalLines: 0,
+            totalLines: renderedLines.length,
             byteSize: stat.size,
             truncated: false,
             truncatedLines: false,
