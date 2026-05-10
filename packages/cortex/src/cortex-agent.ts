@@ -318,7 +318,7 @@ export class CortexAgent {
   private readonly config: CortexAgentConfig;
   private readonly logger: CortexLogger;
   private readonly promptDiagnostics: PromptWatchdogDiagnostics;
-  private readonly workingTagsEnabled: boolean;
+  private workingTagsEnabled: boolean;
   private readonly workingDirectory: string;
   private readonly envOverrides: Record<string, string> | undefined;
 
@@ -1110,28 +1110,28 @@ export class CortexAgent {
       };
     }
 
-    const workingTagsEnabled = cortexConfig.workingTags?.enabled ?? true;
-    if (workingTagsEnabled) {
-      agentConfig['afterToolCall'] = async (ctx: unknown) => {
-        const { result, isError } = ctx as {
-          toolCall: { name: string };
-          result: { content: unknown };
-          isError: boolean;
-          context: unknown;
-        };
-        if (isError) return undefined;
+    agentConfig['afterToolCall'] = async (ctx: unknown) => {
+      const agent = cacheBreakpointState.cortexAgent;
+      if (!agent || !agent.isWorkingTagsEnabled) return undefined;
 
-        const reminder = '\n\n' + TOOL_RESULT_WORKING_TAGS_REMINDER;
-        const content = result.content;
-        if (typeof content === 'string') {
-          return { content: content + reminder };
-        }
-        if (Array.isArray(content)) {
-          return { content: [...content, { type: 'text', text: reminder }] };
-        }
-        return undefined;
+      const { result, isError } = ctx as {
+        toolCall: { name: string };
+        result: { content: unknown };
+        isError: boolean;
+        context: unknown;
       };
-    }
+      if (isError) return undefined;
+
+      const reminder = '\n\n' + TOOL_RESULT_WORKING_TAGS_REMINDER;
+      const content = result.content;
+      if (typeof content === 'string') {
+        return { content: content + reminder };
+      }
+      if (Array.isArray(content)) {
+        return { content: [...content, { type: 'text', text: reminder }] };
+      }
+      return undefined;
+    };
 
     agentConfig['onPayload'] = async (payload: Record<string, unknown>, model: Record<string, unknown>) => {
       const agent = cacheBreakpointState.cortexAgent;
@@ -1624,6 +1624,19 @@ export class CortexAgent {
   getThinkingLevel(): ThinkingLevel {
     const piLevel = (this.agent.state as Record<string, unknown>)['thinkingLevel'];
     return typeof piLevel === 'string' ? mapFromPiThinkingLevel(piLevel) : 'medium';
+  }
+
+  get isWorkingTagsEnabled(): boolean {
+    return this.workingTagsEnabled;
+  }
+
+  setWorkingTagsEnabled(enabled: boolean): void {
+    if (this.workingTagsEnabled === enabled) return;
+    this.workingTagsEnabled = enabled;
+    this.eventBridge.setWorkingTagsEnabled(enabled);
+    if (this.currentBasePrompt !== null) {
+      this.setBasePrompt(this.currentBasePrompt);
+    }
   }
 
   /**
