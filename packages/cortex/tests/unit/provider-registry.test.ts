@@ -2,10 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
-  LOGIN_FUNCTION_NAMES,
   UTILITY_MODEL_DEFAULTS,
 } from '../../src/provider-registry.js';
-import type { ProviderInfo } from '../../src/provider-registry.js';
 
 describe('provider-registry', () => {
   // -----------------------------------------------------------------------
@@ -96,7 +94,8 @@ describe('provider-registry', () => {
       expect(OAUTH_PROVIDER_IDS).toContain('anthropic');
       expect(OAUTH_PROVIDER_IDS).toContain('openai-codex');
       expect(OAUTH_PROVIDER_IDS).toContain('github-copilot');
-      expect(OAUTH_PROVIDER_IDS).toContain('google-gemini-cli');
+      expect(OAUTH_PROVIDER_IDS).not.toContain('google-gemini-cli');
+      expect(OAUTH_PROVIDER_IDS).not.toContain('google-antigravity');
     });
 
     it('does not contain API-key-only providers', () => {
@@ -105,44 +104,9 @@ describe('provider-registry', () => {
       expect(OAUTH_PROVIDER_IDS).not.toContain('groq');
     });
 
-    it('every OAuth provider ID exists in PROVIDER_REGISTRY or is a known login target', () => {
-      // OAuth providers may not all be in the registry (e.g., google-antigravity)
-      // but they must all have a corresponding login function
+    it('every OAuth provider ID exists in PROVIDER_REGISTRY', () => {
       for (const id of OAUTH_PROVIDER_IDS) {
-        expect(LOGIN_FUNCTION_NAMES[id], `Missing login function for "${id}"`).toBeDefined();
-      }
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // LOGIN_FUNCTION_NAMES
-  // -----------------------------------------------------------------------
-
-  describe('LOGIN_FUNCTION_NAMES', () => {
-    it('maps anthropic to loginAnthropic', () => {
-      expect(LOGIN_FUNCTION_NAMES['anthropic']).toBe('loginAnthropic');
-    });
-
-    it('maps openai-codex to loginOpenAICodex', () => {
-      expect(LOGIN_FUNCTION_NAMES['openai-codex']).toBe('loginOpenAICodex');
-    });
-
-    it('maps github-copilot to loginGitHubCopilot', () => {
-      expect(LOGIN_FUNCTION_NAMES['github-copilot']).toBe('loginGitHubCopilot');
-    });
-
-    it('maps google-gemini-cli to loginGeminiCli', () => {
-      expect(LOGIN_FUNCTION_NAMES['google-gemini-cli']).toBe('loginGeminiCli');
-    });
-
-    it('maps google-antigravity to loginAntigravity', () => {
-      expect(LOGIN_FUNCTION_NAMES['google-antigravity']).toBe('loginAntigravity');
-    });
-
-    it('has entries for all OAUTH_PROVIDER_IDS', () => {
-      for (const id of OAUTH_PROVIDER_IDS) {
-        expect(LOGIN_FUNCTION_NAMES[id]).toBeDefined();
-        expect(typeof LOGIN_FUNCTION_NAMES[id]).toBe('string');
+        expect(PROVIDER_REGISTRY.some(provider => provider.id === id), `Missing provider "${id}"`).toBe(true);
       }
     });
   });

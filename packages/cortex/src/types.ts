@@ -136,6 +136,8 @@ export interface ModelThinkingCapabilities {
   supportsThinking: boolean;
   /** Whether the model supports the "max" (xhigh) thinking level. */
   supportsMax: boolean;
+  /** Exact thinking levels this model accepts, using Cortex's public names. */
+  supportedLevels: ThinkingLevel[];
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +210,12 @@ export interface CortexAgentConfig {
   /** Maximum number of concurrent sub-agents. */
   maxConcurrentSubAgents?: number;
 
+  /**
+   * Tool execution strategy for assistant messages with multiple tool calls.
+   * Defaults to sequential for deterministic permission, logging, and UI order.
+   */
+  toolExecution?: 'sequential' | 'parallel';
+
   /** WebFetch tool configuration. */
   webFetch?: {
     /** Maximum number of web fetches per agentic loop. */
@@ -244,8 +252,9 @@ export interface CortexAgentConfig {
   /**
    * Initial thinking/effort level for the agentic loop.
    * Omit to use the pi-agent-core default (medium).
-   * "max" is only effective on models where supportsXhigh() returns true;
-   * clamping to the highest supported level is the consumer's responsibility.
+   * "max" maps to pi-ai/pi-agent-core's "xhigh" internally.
+   * Consumers can use getModelThinkingCapabilities() and clampThinkingLevel()
+   * to avoid exposing unsupported levels.
    */
   thinkingLevel?: ThinkingLevel;
 

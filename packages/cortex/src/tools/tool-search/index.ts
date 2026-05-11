@@ -10,7 +10,7 @@
  * rest of the session and can be called normally.
  */
 
-import { Type, type Static } from '@sinclair/typebox';
+import { Type, type Static } from 'typebox';
 import type { CortexTool } from '../../tool-contract.js';
 import type { ToolContentDetails } from '../../types.js';
 import type { DeferredToolRegistry, ToolSearchResult } from './registry.js';
@@ -88,6 +88,7 @@ export function createToolSearchTool(
     ].join('\n'),
     parameters: ToolSearchParams,
     alwaysLoad: true, // ToolSearch itself must never be deferred
+    executionMode: 'sequential',
     async execute(params): Promise<ToolContentDetails<ToolSearchDetails>> {
       const max = params.max_results ?? DEFAULT_MAX_RESULTS;
       const result = config.registry.resolveQuery(params.query, max);

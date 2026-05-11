@@ -11,7 +11,7 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { Type, type Static } from '@sinclair/typebox';
+import { Type, type Static } from 'typebox';
 import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';

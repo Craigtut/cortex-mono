@@ -5,13 +5,14 @@ import { ProviderManager } from '../../src/provider-manager.js';
 const mockGetModel = vi.fn();
 const mockComplete = vi.fn();
 let lastAgentConfig: Record<string, unknown> | null = null;
-let lastSetModelArg: unknown = null;
+let lastAgentInstance: { state: Record<string, unknown> } | null = null;
 
 class MockManagedPiAgent {
   state: Record<string, unknown>;
 
   constructor(config: Record<string, unknown>) {
     lastAgentConfig = config;
+    lastAgentInstance = this;
     const initialState = config['initialState'] as Record<string, unknown>;
     this.state = {
       messages: [],
@@ -38,16 +39,9 @@ class MockManagedPiAgent {
   }
 
   steer(): void {}
-
-  setModel(model: unknown): void {
-    lastSetModelArg = model;
-    this.state['model'] = model;
-  }
-
-  setTools(): void {}
 }
 
-vi.mock('@mariozechner/pi-ai', () => ({
+vi.mock('@earendil-works/pi-ai', () => ({
   getModel: (...args: unknown[]) => mockGetModel(...args),
   createModel: vi.fn(),
   getModels: vi.fn(),
@@ -55,7 +49,7 @@ vi.mock('@mariozechner/pi-ai', () => ({
   complete: (...args: unknown[]) => mockComplete(...args),
 }));
 
-vi.mock('@mariozechner/pi-agent-core', () => ({
+vi.mock('@earendil-works/pi-agent-core', () => ({
   Agent: MockManagedPiAgent,
 }));
 
@@ -80,7 +74,7 @@ describe('CortexAgent model contract', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     lastAgentConfig = null;
-    lastSetModelArg = null;
+    lastAgentInstance = null;
   });
 
   it('uses the unwrapped pi-ai model across ProviderManager, create(), directComplete(), and setModel()', async () => {
@@ -137,6 +131,6 @@ describe('CortexAgent model contract', () => {
     const nextModel = await providerManager.resolveModel('anthropic', 'claude-opus-4-20260101');
     agent.setModel(nextModel);
 
-    expect(lastSetModelArg).toBe(swappedRawModel);
+    expect(lastAgentInstance!.state['model']).toBe(swappedRawModel);
   });
 });

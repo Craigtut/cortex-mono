@@ -4,11 +4,9 @@
  * This module contains:
  * 1. PROVIDER_REGISTRY: metadata for all known providers (auth methods, env vars, key prefixes)
  * 2. OAUTH_PROVIDER_IDS: the subset of providers that support OAuth
- * 3. LOGIN_FUNCTION_NAMES: maps provider IDs to their pi-ai login function names
- * 4. UTILITY_MODEL_DEFAULTS: per-provider cheapest-capable model for utility operations
+ * 3. UTILITY_MODEL_DEFAULTS: per-provider cheapest-capable model for utility operations
  *
- * Pi-ai login functions are NOT imported here directly since pi-ai is an
- * optional peer dependency. They are dynamically imported in ProviderManager.
+ * OAuth flows are resolved through pi-ai's OAuth provider registry at runtime.
  *
  * Reference: provider-manager.md
  */
@@ -46,6 +44,8 @@ export interface ModelInfo {
   contextWindow: number;
   /** Whether the model supports extended thinking. */
   supportsThinking: boolean;
+  /** Thinking levels supported by this model, in Cortex's public naming. */
+  supportedThinkingLevels: Array<'off' | 'minimal' | 'low' | 'medium' | 'high' | 'max'>;
   /** Whether the model supports image input. */
   supportsImages: boolean;
   /** Pricing per million tokens (if available). */
@@ -82,6 +82,12 @@ export const PROVIDER_REGISTRY: ProviderInfo[] = [
     keyUrl: 'platform.openai.com/api-keys',
   },
   {
+    id: 'azure-openai-responses',
+    name: 'Azure OpenAI',
+    authMethods: ['api_key'],
+    envVar: 'AZURE_OPENAI_API_KEY',
+  },
+  {
     id: 'openai-codex',
     name: 'OpenAI Codex',
     authMethods: ['oauth'],
@@ -94,19 +100,22 @@ export const PROVIDER_REGISTRY: ProviderInfo[] = [
     keyUrl: 'aistudio.google.com/apikey',
   },
   {
-    id: 'google-gemini-cli',
-    name: 'Google Gemini',
-    authMethods: ['oauth'],
-  },
-  {
-    id: 'google-antigravity',
-    name: 'Google Antigravity',
-    authMethods: ['oauth'],
+    id: 'google-vertex',
+    name: 'Google Vertex AI',
+    authMethods: ['api_key'],
+    envVar: 'GOOGLE_CLOUD_API_KEY',
   },
   {
     id: 'github-copilot',
     name: 'GitHub Copilot',
     authMethods: ['oauth'],
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    authMethods: ['api_key'],
+    envVar: 'DEEPSEEK_API_KEY',
+    keyUrl: 'platform.deepseek.com/api_keys',
   },
   {
     id: 'mistral',
@@ -147,7 +156,13 @@ export const PROVIDER_REGISTRY: ProviderInfo[] = [
     id: 'vercel-ai-gateway',
     name: 'Vercel AI Gateway',
     authMethods: ['api_key'],
-    envVar: 'VERCEL_AI_GATEWAY_API_KEY',
+    envVar: 'AI_GATEWAY_API_KEY',
+  },
+  {
+    id: 'zai',
+    name: 'z.ai',
+    authMethods: ['api_key'],
+    envVar: 'ZAI_API_KEY',
   },
   {
     id: 'minimax',
@@ -156,22 +171,88 @@ export const PROVIDER_REGISTRY: ProviderInfo[] = [
     envVar: 'MINIMAX_API_KEY',
   },
   {
-    id: 'opencode-zen',
-    name: 'OpenCode Zen',
+    id: 'minimax-cn',
+    name: 'MiniMax China',
     authMethods: ['api_key'],
-    envVar: 'OPENCODE_ZEN_API_KEY',
+    envVar: 'MINIMAX_CN_API_KEY',
+  },
+  {
+    id: 'moonshotai',
+    name: 'Moonshot AI',
+    authMethods: ['api_key'],
+    envVar: 'MOONSHOT_API_KEY',
+  },
+  {
+    id: 'moonshotai-cn',
+    name: 'Moonshot AI China',
+    authMethods: ['api_key'],
+    envVar: 'MOONSHOT_API_KEY',
+  },
+  {
+    id: 'huggingface',
+    name: 'Hugging Face',
+    authMethods: ['api_key'],
+    envVar: 'HF_TOKEN',
+  },
+  {
+    id: 'fireworks',
+    name: 'Fireworks AI',
+    authMethods: ['api_key'],
+    envVar: 'FIREWORKS_API_KEY',
+  },
+  {
+    id: 'opencode',
+    name: 'OpenCode',
+    authMethods: ['api_key'],
+    envVar: 'OPENCODE_API_KEY',
   },
   {
     id: 'opencode-go',
     name: 'OpenCode Go',
     authMethods: ['api_key'],
-    envVar: 'OPENCODE_GO_API_KEY',
+    envVar: 'OPENCODE_API_KEY',
   },
   {
-    id: 'kimi-for-coding',
-    name: 'Kimi For Coding',
+    id: 'kimi-coding',
+    name: 'Kimi Coding',
     authMethods: ['api_key'],
     envVar: 'KIMI_API_KEY',
+  },
+  {
+    id: 'cloudflare-workers-ai',
+    name: 'Cloudflare Workers AI',
+    authMethods: ['api_key'],
+    envVar: 'CLOUDFLARE_API_KEY',
+  },
+  {
+    id: 'cloudflare-ai-gateway',
+    name: 'Cloudflare AI Gateway',
+    authMethods: ['api_key'],
+    envVar: 'CLOUDFLARE_API_KEY',
+  },
+  {
+    id: 'xiaomi',
+    name: 'Xiaomi',
+    authMethods: ['api_key'],
+    envVar: 'XIAOMI_API_KEY',
+  },
+  {
+    id: 'xiaomi-token-plan-cn',
+    name: 'Xiaomi Token Plan China',
+    authMethods: ['api_key'],
+    envVar: 'XIAOMI_TOKEN_PLAN_CN_API_KEY',
+  },
+  {
+    id: 'xiaomi-token-plan-ams',
+    name: 'Xiaomi Token Plan Amsterdam',
+    authMethods: ['api_key'],
+    envVar: 'XIAOMI_TOKEN_PLAN_AMS_API_KEY',
+  },
+  {
+    id: 'xiaomi-token-plan-sgp',
+    name: 'Xiaomi Token Plan Singapore',
+    authMethods: ['api_key'],
+    envVar: 'XIAOMI_TOKEN_PLAN_SGP_API_KEY',
   },
 ];
 
@@ -186,21 +267,7 @@ export const OAUTH_PROVIDER_IDS: string[] = [
   'anthropic',
   'openai-codex',
   'github-copilot',
-  'google-gemini-cli',
-  'google-antigravity',
 ];
-
-/**
- * Maps OAuth provider IDs to the name of their pi-ai login function.
- * Used by ProviderManager for dynamic import.
- */
-export const LOGIN_FUNCTION_NAMES: Record<string, string> = {
-  'anthropic': 'loginAnthropic',
-  'openai-codex': 'loginOpenAICodex',
-  'github-copilot': 'loginGitHubCopilot',
-  'google-gemini-cli': 'loginGeminiCli',
-  'google-antigravity': 'loginAntigravity',
-};
 
 // ---------------------------------------------------------------------------
 // Utility Model Defaults

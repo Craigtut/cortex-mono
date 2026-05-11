@@ -15,7 +15,7 @@ import * as child_process from 'node:child_process';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
-import { Type, type Static } from '@sinclair/typebox';
+import { Type, type Static } from 'typebox';
 import type { ToolContentDetails } from '../types.js';
 import {
   readGitignorePatterns,

@@ -46,7 +46,7 @@ let _piAi: PiAiModule | null = null;
 
 async function loadPiAi(): Promise<PiAiModule> {
   if (_piAi) return _piAi;
-  const modulePath = '@mariozechner/pi-ai';
+  const modulePath = '@earendil-works/pi-ai';
   _piAi = await import(modulePath) as PiAiModule;
   return _piAi;
 }

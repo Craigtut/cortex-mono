@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 import { DeferredToolRegistry } from '../../../src/tools/tool-search/registry.js';
 import {
   createToolSearchTool,
@@ -301,23 +301,21 @@ describe('createToolSearchTool', () => {
 // CortexAgent integration
 // ---------------------------------------------------------------------------
 
-function createMinimalPiAgent(): PiAgent & { setToolsMock: ReturnType<typeof vi.fn> } {
-  const setToolsMock = vi.fn();
+function createMinimalPiAgent(): PiAgent {
   const agent = {
     state: {
       messages: [] as Array<{ role: 'user' | 'assistant'; content: string; timestamp: number }>,
       systemPrompt: '',
-      tools: [],
+      tools: [] as unknown[],
     },
     subscribe: () => () => {},
     prompt: async () => ({ content: 'ok' }),
     abort: () => {},
     async waitForIdle(): Promise<void> {},
     reset: () => {},
-    setTools: setToolsMock,
-    setToolsMock,
+    steer: () => {},
   };
-  return agent as unknown as PiAgent & { setToolsMock: ReturnType<typeof vi.fn> };
+  return agent as unknown as PiAgent;
 }
 
 function buildConfig(overrides: Partial<CortexAgentConfig> = {}): CortexAgentConfig {
@@ -352,7 +350,7 @@ describe('CortexAgent integration with deferred tools', () => {
     const pi = createMinimalPiAgent();
     constructAgent(pi, buildConfig());
 
-    const lastCall = pi.setToolsMock.mock.calls.at(-1)?.[0] as Array<{ name: string }>;
+    const lastCall = pi.state.tools as Array<{ name: string }>;
     const names = lastCall.map((t) => t.name);
     expect(names).not.toContain(TOOL_SEARCH_TOOL_NAME);
   });
@@ -363,7 +361,7 @@ describe('CortexAgent integration with deferred tools', () => {
       deferredTools: { enabled: true },
     }));
 
-    const lastCall = pi.setToolsMock.mock.calls.at(-1)?.[0] as Array<{ name: string }>;
+    const lastCall = pi.state.tools as Array<{ name: string }>;
     const names = lastCall.map((t) => t.name);
     expect(names).toContain(TOOL_SEARCH_TOOL_NAME);
 
@@ -396,7 +394,7 @@ describe('CortexAgent integration with deferred tools', () => {
       deferredTools: { enabled: true },
     }), [deferredTool]);
 
-    const lastCall = pi.setToolsMock.mock.calls.at(-1)?.[0] as Array<{ name: string }>;
+    const lastCall = pi.state.tools as Array<{ name: string }>;
     const names = lastCall.map((t) => t.name);
     // SpecialThing is deferred → NOT in the tools array
     expect(names).not.toContain('SpecialThing');
@@ -420,7 +418,7 @@ describe('CortexAgent integration with deferred tools', () => {
       },
     }), [deferredTool]);
 
-    const lastCall = pi.setToolsMock.mock.calls.at(-1)?.[0] as Array<{ name: string }>;
+    const lastCall = pi.state.tools as Array<{ name: string }>;
     const names = lastCall.map((t) => t.name);
     // Consumer forced this tool to always load despite shouldDefer: true
     expect(names).toContain('mcp__my_server__mytool');
@@ -440,7 +438,7 @@ describe('CortexAgent integration with deferred tools', () => {
       deferredTools: { enabled: true },
     }), [tool]);
 
-    const lastCall = pi.setToolsMock.mock.calls.at(-1)?.[0] as Array<{ name: string }>;
+    const lastCall = pi.state.tools as Array<{ name: string }>;
     const names = lastCall.map((t) => t.name);
     expect(names).toContain('ImportantTool');
   });
@@ -486,15 +484,15 @@ describe('CortexAgent integration with deferred tools', () => {
       },
     ]);
 
-    const before = pi.setToolsMock.mock.calls.at(-1)?.[0] as Array<{ name: string; execute: Function }>;
+    const before = pi.state.tools as Array<{ name: string; execute: Function }>;
     expect(before.map((t) => t.name)).not.toContain('DeferredThing');
 
     // Execute ToolSearch via the pi-agent-core adapter form (toolCallId, params)
     const toolSearch = before.find((t) => t.name === TOOL_SEARCH_TOOL_NAME)!;
     await toolSearch.execute('test-call', { query: 'select:DeferredThing' });
 
-    // After discovery, refreshTools should have fired → new setTools call
-    const after = pi.setToolsMock.mock.calls.at(-1)?.[0] as Array<{ name: string }>;
+    // After discovery, refreshTools should have updated agent.state.tools.
+    const after = pi.state.tools as Array<{ name: string }>;
     expect(after.map((t) => t.name)).toContain('DeferredThing');
 
     // And the slot should no longer list it

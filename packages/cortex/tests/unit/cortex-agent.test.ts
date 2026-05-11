@@ -1052,16 +1052,13 @@ You have 12 emotions.`;
       expect(agent.getModel()).toBe(newModel);
     });
 
-    it('delegates to agent.setModel when available', () => {
-      const setModelFn = vi.fn();
-      (piAgent as unknown as Record<string, unknown>).setModel = setModelFn;
-
+    it('updates agent.state.model', () => {
       const agent = createTestCortexAgent(piAgent, config);
       const newModel = makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel);
 
       agent.setModel(newModel);
 
-      expect(setModelFn).toHaveBeenCalledWith(
+      expect(piAgent.state.model).toEqual(
         expect.objectContaining({ provider: 'openai', name: 'gpt-4o' }),
       );
     });
@@ -1076,41 +1073,35 @@ You have 12 emotions.`;
   });
 
   describe('setThinkingLevel', () => {
-    it('delegates to agent.setThinkingLevel when available', () => {
-      const setThinkingFn = vi.fn();
-      (piAgent as unknown as Record<string, unknown>).setThinkingLevel = setThinkingFn;
-
+    it('updates agent.state.thinkingLevel', () => {
       const agent = createTestCortexAgent(piAgent, config);
       agent.setThinkingLevel('high');
 
-      expect(setThinkingFn).toHaveBeenCalledWith('high');
+      expect(piAgent.state.thinkingLevel).toBe('high');
     });
 
-    it('does not throw when agent lacks setThinkingLevel', () => {
+    it('maps max to xhigh in agent state', () => {
       const agent = createTestCortexAgent(piAgent, config);
 
-      expect(() => agent.setThinkingLevel('medium')).not.toThrow();
+      agent.setThinkingLevel('max');
+
+      expect(piAgent.state.thinkingLevel).toBe('xhigh');
     });
   });
 
   describe('refreshTools', () => {
-    it('calls agent.setTools with registered + MCP tools', () => {
-      const setToolsFn = vi.fn();
-      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
-
+    it('updates agent.state.tools with registered + MCP tools', () => {
       const agent = createTestCortexAgent(
         piAgent,
         config,
         [], // No additional tools; built-in tools auto-register
         { enableSubAgentTool: false, enableLoadSkillTool: false },
       );
-      setToolsFn.mockClear();
 
       // refreshTools merges auto-registered built-in tools with MCP tools (empty in this test)
       agent.refreshTools();
 
-      expect(setToolsFn).toHaveBeenCalledOnce();
-      const allTools = setToolsFn.mock.calls[0]![0];
+      const allTools = piAgent.state.tools as Array<{ name: string }>;
       // 9 built-in tools auto-registered: Read, Write, Edit, UndoEdit,
       // Glob, Grep, Bash, TaskOutput, WebFetch
       expect(allTools.length).toBe(9);
@@ -1122,20 +1113,16 @@ You have 12 emotions.`;
     });
 
     it('adapts Bash using the canonical Cortex tool contract', async () => {
-      const setToolsFn = vi.fn();
-      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
-
       const agent = createTestCortexAgent(
         piAgent,
         createDefaultConfig({ workingDirectory: process.cwd() }),
         [],
         { enableSubAgentTool: false, enableLoadSkillTool: false },
       );
-      setToolsFn.mockClear();
 
       agent.refreshTools();
 
-      const allTools = setToolsFn.mock.calls[0]![0] as Array<{
+      const allTools = piAgent.state.tools as Array<{
         name: string;
         execute: (toolCallId: string, params: unknown) => Promise<{
           content: Array<{ type: string; text?: string }>;
@@ -1150,8 +1137,6 @@ You have 12 emotions.`;
     });
 
     it('persists oversized Bash output before it reaches conversation history', async () => {
-      const setToolsFn = vi.fn();
-      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
       const persistResult = vi.fn().mockResolvedValue('/tmp/bash-oversized.txt');
 
       const agent = createTestCortexAgent(
@@ -1163,11 +1148,10 @@ You have 12 emotions.`;
         [],
         { enableSubAgentTool: false, enableLoadSkillTool: false },
       );
-      setToolsFn.mockClear();
 
       agent.refreshTools();
 
-      const allTools = setToolsFn.mock.calls[0]![0] as Array<{
+      const allTools = piAgent.state.tools as Array<{
         name: string;
         execute: (toolCallId: string, params: unknown) => Promise<{
           content: Array<{ type: string; text?: string }>;
@@ -1208,8 +1192,6 @@ You have 12 emotions.`;
     });
 
     it('persists oversized WebFetch output before returning from the wrapped tool', async () => {
-      const setToolsFn = vi.fn();
-      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
       const persistResult = vi.fn().mockResolvedValue('/tmp/webfetch-oversized.txt');
 
       const agent = createTestCortexAgent(
@@ -1231,11 +1213,10 @@ You have 12 emotions.`;
         },
         text: async () => 'small page body',
       } as unknown as Response);
-      setToolsFn.mockClear();
 
       agent.refreshTools();
 
-      const allTools = setToolsFn.mock.calls[0]![0] as Array<{
+      const allTools = piAgent.state.tools as Array<{
         name: string;
         execute: (toolCallId: string, params: unknown) => Promise<{
           content: Array<{ type: string; text?: string }>;
@@ -1265,9 +1246,6 @@ You have 12 emotions.`;
     });
 
     it('supports raw pi-agent-core tools when explicitly wrapped', async () => {
-      const setToolsFn = vi.fn();
-      (piAgent as unknown as Record<string, unknown>).setTools = setToolsFn;
-
       const legacyTool = fromPiAgentTool({
         name: 'LegacyTool',
         description: 'Legacy execution contract',
@@ -1284,11 +1262,10 @@ You have 12 emotions.`;
         [legacyTool],
         { enableSubAgentTool: false, enableLoadSkillTool: false },
       );
-      setToolsFn.mockClear();
 
       agent.refreshTools();
 
-      const allTools = setToolsFn.mock.calls[0]![0] as Array<{
+      const allTools = piAgent.state.tools as Array<{
         name: string;
         execute: (toolCallId: string, params: unknown) => Promise<{
           content: Array<{ type: string; text?: string }>;

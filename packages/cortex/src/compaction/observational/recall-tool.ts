@@ -9,7 +9,7 @@
  * Reference: docs/cortex/observational-memory-architecture.md (Recall Tool)
  */
 
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 import type { CortexTool } from '../../tool-contract.js';
 import type { RecallConfig, RecallResult } from './types.js';
 

@@ -22,7 +22,7 @@ import type { ContextManagerConfig } from './types.js';
 
 /**
  * Minimal interface for pi-agent-core's Agent.state.messages entries.
- * The actual type is Message from @mariozechner/pi-ai, but we define
+ * The actual type is Message from @earendil-works/pi-ai, but we define
  * only what we need to avoid a hard dependency.
  */
 export interface AgentMessage {
@@ -48,6 +48,7 @@ export interface AgentStateAccessor {
     thinkingLevel?: string;
     tools?: unknown[];
     error?: string;
+    errorMessage?: string;
   };
 }
 

@@ -96,34 +96,25 @@ function saveCredentialsCache(cache: CredentialsCache): void {
 // ---------------------------------------------------------------------------
 
 interface PiAiOAuthModule {
-  loginAnthropic: (opts: {
-    onAuth: (info: { url: string; instructions?: string } | string, legacyInstructions?: string) => void;
-    onPrompt: (prompt: { message: string }) => Promise<string>;
-    onProgress: (message: string) => void;
-    signal?: AbortSignal;
-  }) => Promise<Record<string, unknown>>;
+  getOAuthProvider: (provider: string) => {
+    login: (opts: {
+      onAuth: (info: { url: string; instructions?: string }) => void;
+      onPrompt: (prompt: { message: string }) => Promise<string>;
+      onProgress?: (message: string) => void;
+      onManualCodeInput?: () => Promise<string>;
+      signal?: AbortSignal;
+    }) => Promise<Record<string, unknown>>;
+  } | undefined;
   getOAuthApiKey: (
     provider: string,
     credMap: Record<string, unknown>,
   ) => Promise<{ apiKey: string; newCredentials: Record<string, unknown> } | null>;
-  [key: string]: unknown;
 }
 
 async function loadPiAiOAuth(): Promise<PiAiOAuthModule> {
-  const modulePath = '@mariozechner/pi-ai/oauth';
+  const modulePath = '@earendil-works/pi-ai/oauth';
   return await import(modulePath) as PiAiOAuthModule;
 }
-
-// ---------------------------------------------------------------------------
-// OAuth login function registry (mirrors provider-registry.ts pattern)
-// ---------------------------------------------------------------------------
-
-const OAUTH_LOGIN_FUNCTIONS: Record<string, string> = {
-  anthropic: 'loginAnthropic',
-  'openai-codex': 'loginOpenAICodex',
-  'github-copilot': 'loginGitHubCopilot',
-  'google-gemini-cli': 'loginGeminiCli',
-};
 
 // ---------------------------------------------------------------------------
 // API key resolution
@@ -287,41 +278,32 @@ interface OAuthLoginResult {
 async function runInteractiveOAuth(provider: string): Promise<OAuthLoginResult> {
   const oauthModule = await loadPiAiOAuth();
 
-  const loginFnName = OAUTH_LOGIN_FUNCTIONS[provider];
-  if (!loginFnName) {
-    throw new Error(`No OAuth login function known for provider "${provider}"`);
-  }
-
-  const loginFn = oauthModule[loginFnName];
-  if (typeof loginFn !== 'function') {
-    throw new Error(`OAuth login function "${loginFnName}" not found in pi-ai/oauth`);
+  const oauthProvider = oauthModule.getOAuthProvider(provider);
+  if (!oauthProvider) {
+    throw new Error(`No OAuth provider found for "${provider}"`);
   }
 
   console.log('');
 
-  const rawCredentials = await (loginFn as typeof oauthModule.loginAnthropic)({
-    onAuth: (info: { url: string; instructions?: string } | string, legacyInstructions?: string) => {
-      // Pi-ai passes { url, instructions } object; handle both shapes for safety
-      const authUrl = typeof info === 'string' ? info : info.url;
-      const instructions = typeof info === 'string' ? legacyInstructions : info.instructions;
-
+  const rawCredentials = await oauthProvider.login({
+    onAuth: ({ url, instructions }) => {
       console.log('  ╔══════════════════════════════════════════════════╗');
       console.log('  ║  OAuth Authorization Required                   ║');
       console.log('  ╠══════════════════════════════════════════════════╣');
       if (instructions) {
         console.log(`  ║  ${instructions}`);
       }
-      console.log(`  ║  URL: ${authUrl}`);
+      console.log(`  ║  URL: ${url}`);
       console.log('  ╚══════════════════════════════════════════════════╝');
       console.log('');
 
       // Try to open the URL in the default browser
       try {
         if (process.platform === 'darwin') {
-          execSync(`open "${authUrl}"`, { stdio: 'ignore' });
+          execSync(`open "${url}"`, { stdio: 'ignore' });
           console.log('  Browser opened automatically.');
         } else if (process.platform === 'linux') {
-          execSync(`xdg-open "${authUrl}"`, { stdio: 'ignore' });
+          execSync(`xdg-open "${url}"`, { stdio: 'ignore' });
         }
       } catch {
         console.log('  Please open the URL above in your browser.');
@@ -331,6 +313,10 @@ async function runInteractiveOAuth(provider: string): Promise<OAuthLoginResult> 
     onPrompt: async (prompt: { message: string }) => {
       // This shouldn't happen for Anthropic OAuth, but handle it
       console.log(`  Prompt: ${prompt.message}`);
+      return '';
+    },
+    onManualCodeInput: async () => {
+      console.log('  Paste the manual authorization code if the browser callback did not complete.');
       return '';
     },
     onProgress: (message: string) => {

@@ -1,7 +1,7 @@
 /**
  * Schema conversion utility: Zod -> JSON Schema -> TypeBox.
  *
- * Pi-agent-core uses TypeBox + AJV for tool parameter schemas.
+ * Pi-agent-core uses TypeBox tool parameter schemas.
  * Consumer code continues using Zod. This module bridges the gap
  * at the tool registration boundary.
  *
@@ -10,7 +10,7 @@
  * Zod v4 schemas use the native `toJSONSchema()`.
  */
 
-import { Type, type TSchema } from '@sinclair/typebox';
+import { Type, type TSchema } from 'typebox';
 
 /**
  * Check if a schema is a Zod v3 schema (has _def property).

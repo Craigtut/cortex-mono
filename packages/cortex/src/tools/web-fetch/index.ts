@@ -13,7 +13,7 @@
 
 import { promises as dns } from 'node:dns';
 import { isIPv4, isIPv6 } from 'node:net';
-import { Type, type Static } from '@sinclair/typebox';
+import { Type, type Static } from 'typebox';
 import type { ToolContentDetails } from '../../types.js';
 import { WebFetchCache } from './cache.js';
 import type { CortexToolRuntime } from '../runtime.js';

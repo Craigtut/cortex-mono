@@ -10,10 +10,12 @@ import type { CortexModel } from '../../src/model-wrapper.js';
 // Mock pi-ai module
 // ---------------------------------------------------------------------------
 
-const mockSupportsXhigh = vi.fn();
+const mockGetSupportedThinkingLevels = vi.fn();
+const mockClampThinkingLevel = vi.fn();
 
-vi.mock('@mariozechner/pi-ai', () => ({
-  supportsXhigh: (...args: unknown[]) => mockSupportsXhigh(...args),
+vi.mock('@earendil-works/pi-ai', () => ({
+  getSupportedThinkingLevels: (...args: unknown[]) => mockGetSupportedThinkingLevels(...args),
+  clampThinkingLevel: (...args: unknown[]) => mockClampThinkingLevel(...args),
 }));
 
 // ---------------------------------------------------------------------------
@@ -22,7 +24,6 @@ vi.mock('@mariozechner/pi-ai', () => ({
 
 interface MockPiAgent extends PiAgent {
   emitEvent: (event: PiEvent) => void;
-  setThinkingLevelCalls: string[];
 }
 
 function createMockPiAgent(): MockPiAgent {
@@ -34,7 +35,6 @@ function createMockPiAgent(): MockPiAgent {
       systemPrompt: '',
       tools: [],
     },
-    setThinkingLevelCalls: [],
 
     subscribe(handler: (event: PiEvent) => void): () => void {
       eventHandler = handler;
@@ -57,11 +57,6 @@ function createMockPiAgent(): MockPiAgent {
     async waitForIdle(): Promise<void> { /* no-op */ },
     reset(): void { agent.state.messages = []; },
     steer(): void { /* no-op */ },
-
-    setThinkingLevel(level: string): void {
-      agent.setThinkingLevelCalls.push(level);
-      (agent.state as Record<string, unknown>).thinkingLevel = level;
-    },
   };
 
   return agent;
@@ -114,6 +109,8 @@ describe('ThinkingLevel', () => {
     piAgent = createMockPiAgent();
     agent = createTestCortexAgent(piAgent, createDefaultConfig());
     vi.clearAllMocks();
+    mockGetSupportedThinkingLevels.mockReturnValue([]);
+    mockClampThinkingLevel.mockImplementation((_model, level) => level);
   });
 
   afterEach(() => {
@@ -121,34 +118,34 @@ describe('ThinkingLevel', () => {
   });
 
   describe('setThinkingLevel', () => {
-    it('maps "max" to "xhigh" when delegating to pi-agent-core', () => {
+    it('maps "max" to "xhigh" in agent state', () => {
       agent.setThinkingLevel('max');
-      expect(piAgent.setThinkingLevelCalls).toEqual(['xhigh']);
+      expect(piAgent.state.thinkingLevel).toBe('xhigh');
     });
 
     it('passes through "high" unchanged', () => {
       agent.setThinkingLevel('high');
-      expect(piAgent.setThinkingLevelCalls).toEqual(['high']);
+      expect(piAgent.state.thinkingLevel).toBe('high');
     });
 
     it('passes through "medium" unchanged', () => {
       agent.setThinkingLevel('medium');
-      expect(piAgent.setThinkingLevelCalls).toEqual(['medium']);
+      expect(piAgent.state.thinkingLevel).toBe('medium');
     });
 
     it('passes through "low" unchanged', () => {
       agent.setThinkingLevel('low');
-      expect(piAgent.setThinkingLevelCalls).toEqual(['low']);
+      expect(piAgent.state.thinkingLevel).toBe('low');
     });
 
     it('passes through "minimal" unchanged', () => {
       agent.setThinkingLevel('minimal');
-      expect(piAgent.setThinkingLevelCalls).toEqual(['minimal']);
+      expect(piAgent.state.thinkingLevel).toBe('minimal');
     });
 
     it('passes through "off" unchanged', () => {
       agent.setThinkingLevel('off');
-      expect(piAgent.setThinkingLevelCalls).toEqual(['off']);
+      expect(piAgent.state.thinkingLevel).toBe('off');
     });
   });
 
@@ -201,29 +198,46 @@ describe('ThinkingLevel', () => {
       const testAgent = createTestCortexAgent(piAgent, createDefaultConfig({ model: cortexModel }));
 
       const caps = await testAgent.getModelThinkingCapabilities();
-      expect(caps).toEqual({ supportsThinking: false, supportsMax: false });
-      expect(mockSupportsXhigh).not.toHaveBeenCalled();
+      expect(caps).toEqual({ supportsThinking: false, supportsMax: false, supportedLevels: [] });
+      expect(mockGetSupportedThinkingLevels).toHaveBeenCalled();
     });
 
     it('returns supportsMax: true for xhigh-capable reasoning models', async () => {
       const model = { provider: 'anthropic', name: 'claude-opus-4-6', id: 'claude-opus-4-6', reasoning: true } as PiModel;
       const cortexModel = makeModel(model);
       const testAgent = createTestCortexAgent(piAgent, createDefaultConfig({ model: cortexModel }));
-      mockSupportsXhigh.mockReturnValue(true);
+      mockGetSupportedThinkingLevels.mockReturnValue(['off', 'medium', 'high', 'xhigh']);
 
       const caps = await testAgent.getModelThinkingCapabilities();
-      expect(caps).toEqual({ supportsThinking: true, supportsMax: true });
-      expect(mockSupportsXhigh).toHaveBeenCalled();
+      expect(caps).toEqual({
+        supportsThinking: true,
+        supportsMax: true,
+        supportedLevels: ['off', 'medium', 'high', 'max'],
+      });
+      expect(mockGetSupportedThinkingLevels).toHaveBeenCalled();
     });
 
     it('returns supportsMax: false for standard reasoning models', async () => {
       const model = { provider: 'anthropic', name: 'claude-sonnet-4-6', id: 'claude-sonnet-4-6', reasoning: true } as PiModel;
       const cortexModel = makeModel(model);
       const testAgent = createTestCortexAgent(piAgent, createDefaultConfig({ model: cortexModel }));
-      mockSupportsXhigh.mockReturnValue(false);
+      mockGetSupportedThinkingLevels.mockReturnValue(['medium', 'high']);
 
       const caps = await testAgent.getModelThinkingCapabilities();
-      expect(caps).toEqual({ supportsThinking: true, supportsMax: false });
+      expect(caps).toEqual({
+        supportsThinking: true,
+        supportsMax: false,
+        supportedLevels: ['medium', 'high'],
+      });
+    });
+
+    it('clamps using pi-ai and maps xhigh back to max', async () => {
+      mockClampThinkingLevel.mockReturnValue('xhigh');
+
+      const clamped = await agent.clampThinkingLevel('max');
+
+      expect(clamped).toBe('max');
+      expect(mockClampThinkingLevel).toHaveBeenCalledWith(expect.any(Object), 'xhigh');
     });
   });
 });

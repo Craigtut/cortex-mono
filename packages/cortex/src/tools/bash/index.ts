@@ -10,7 +10,7 @@
 
 import * as child_process from 'node:child_process';
 import * as fs from 'node:fs';
-import { Type, type Static } from '@sinclair/typebox';
+import { Type, type Static } from 'typebox';
 import type { CwdTracker } from '../shared/cwd-tracker.js';
 import type { ToolContentDetails, ToolExecuteContext } from '../../types.js';
 import { buildSafeEnv, runSafetyChecks } from './safety.js';

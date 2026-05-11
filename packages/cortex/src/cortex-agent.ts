@@ -103,34 +103,10 @@ export interface PiAgent extends AgentStateAccessor, PiEventSource {
 
   /**
    * Inject a steering message into the running agentic loop.
-   * Interrupts the current tool execution, skips remaining tools,
-   * and triggers a new LLM turn with the injected context.
+   * Pi applies steering after the current assistant turn and tool batch finish.
    * Only effective while a prompt() call is in progress.
    */
   steer(message: { role: string; content: string }): void;
-
-  /**
-   * Hot-swap the model without restarting the agent.
-   * Optional: only available if the underlying agent supports it.
-   */
-  setModel?(model: unknown): void;
-
-  /**
-   * Change the thinking/reasoning level.
-   * Optional: only available if the underlying agent supports it.
-   */
-  setThinkingLevel?(level: string): void;
-
-  /**
-   * Replace the agent's tool set at runtime.
-   * Optional: only available if the underlying agent supports it.
-   */
-  setTools?(tools: Array<{
-    name: string;
-    description: string;
-    parameters: unknown;
-    execute: (...args: any[]) => Promise<unknown>;
-  }>): void;
 
   /**
    * Context transformation hook installed by Cortex.
@@ -167,6 +143,26 @@ function mapToPiThinkingLevel(level: ThinkingLevel): string {
  */
 function mapFromPiThinkingLevel(level: string): ThinkingLevel {
   return (level === 'xhigh' ? 'max' : level) as ThinkingLevel;
+}
+
+const CORTEX_THINKING_LEVELS: readonly ThinkingLevel[] = [
+  'off',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'max',
+];
+
+function mapFromPiThinkingLevels(levels: readonly string[]): ThinkingLevel[] {
+  const mapped: ThinkingLevel[] = [];
+  for (const level of levels) {
+    const cortexLevel = mapFromPiThinkingLevel(level);
+    if ((CORTEX_THINKING_LEVELS as readonly string[]).includes(cortexLevel) && !mapped.includes(cortexLevel)) {
+      mapped.push(cortexLevel);
+    }
+  }
+  return mapped;
 }
 
 /**
@@ -331,6 +327,7 @@ export class CortexAgent {
   // Set at agent creation via setCacheRetention() and updated dynamically
   // on interval changes (sleep/wake transitions).
   private _cacheRetention: 'none' | 'short' | 'long' | null = null;
+  private _activePromptCacheRetention: 'none' | 'short' | 'long' | null = null;
 
   // Public model handles and internal pi-ai model objects.
   private primaryModel: CortexModel;
@@ -342,6 +339,7 @@ export class CortexAgent {
   // Built-in tools registered at construction (distinct from MCP-discovered tools)
   private readonly registeredTools: RegisteredTool[];
   private readonly toolRuntime: CortexToolRuntime;
+  private currentPiTools: unknown[] = [];
 
   // Deferred tool loading. When `_deferredToolsEnabled` is true, tools that
   // match deferral criteria are pulled out of the per-turn tools array and
@@ -706,16 +704,8 @@ export class CortexAgent {
       this.lifecycleState = 'active';
     }
 
-    // Set cache retention for the loop. Pi-ai reads PI_CACHE_RETENTION on
-    // each API call within the agentic loop. This encapsulates the env var
-    // swap so consumers don't have to manage process-global state.
     const effectiveRetention = options?.cacheRetention ?? this._cacheRetention;
-    const prevCacheRetention = process.env['PI_CACHE_RETENTION'];
-    if (effectiveRetention && effectiveRetention !== 'none') {
-      process.env['PI_CACHE_RETENTION'] = effectiveRetention;
-    } else {
-      delete process.env['PI_CACHE_RETENTION'];
-    }
+    this._activePromptCacheRetention = effectiveRetention ?? null;
 
     this.toolRuntime.resetForLoop();
     this._isPrompting = true;
@@ -744,11 +734,12 @@ export class CortexAgent {
       const result = await this.agent.prompt(input);
 
       // Pi-agent-core catches streaming/provider errors internally and stores
-      // them in state.error without re-throwing. Surface these so Cortex's
-      // error classification and consumer error handlers can process them.
+      // them in state.errorMessage without re-throwing. Surface these so
+      // Cortex's error classification and consumer error handlers can process them.
       const agentState = this.agent.state as Record<string, unknown>;
-      if (agentState['error']) {
-        throw new Error(String(agentState['error']));
+      const stateError = agentState['errorMessage'] ?? agentState['error'];
+      if (stateError) {
+        throw new Error(String(stateError));
       }
 
       return result;
@@ -788,13 +779,7 @@ export class CortexAgent {
 
       throw error;
     } finally {
-      // Restore previous cache retention env var
-      if (prevCacheRetention !== undefined) {
-        process.env['PI_CACHE_RETENTION'] = prevCacheRetention;
-      } else {
-        delete process.env['PI_CACHE_RETENTION'];
-      }
-
+      this._activePromptCacheRetention = null;
       this._isPrompting = false;
 
       this.logger.debug('[CortexAgent] loop complete', {
@@ -863,13 +848,13 @@ export class CortexAgent {
     cacheRetention?: 'none' | 'short' | 'long';
   }): Promise<string> {
     // Dynamically import pi-ai's complete() function
-    let completeFn: typeof import('@mariozechner/pi-ai').complete;
+    let completeFn: typeof import('@earendil-works/pi-ai').complete;
     try {
-      const piAi = await import('@mariozechner/pi-ai');
+      const piAi = await import('@earendil-works/pi-ai');
       completeFn = piAi.complete;
     } catch {
       throw new Error(
-        'directComplete() requires @mariozechner/pi-ai to be installed. ' +
+        'directComplete() requires @earendil-works/pi-ai to be installed. ' +
         'Install it as a dependency or peer dependency.',
       );
     }
@@ -943,13 +928,13 @@ export class CortexAgent {
   }, schema: unknown, toolName: string = 'structured_output', toolDescription: string = 'Produce structured output', options?: {
     cacheRetention?: 'none' | 'short' | 'long';
   }): Promise<Record<string, unknown> | null> {
-    let completeFn: typeof import('@mariozechner/pi-ai').complete;
+    let completeFn: typeof import('@earendil-works/pi-ai').complete;
     try {
-      const piAi = await import('@mariozechner/pi-ai');
+      const piAi = await import('@earendil-works/pi-ai');
       completeFn = piAi.complete;
     } catch {
       throw new Error(
-        'structuredComplete() requires @mariozechner/pi-ai to be installed.',
+        'structuredComplete() requires @earendil-works/pi-ai to be installed.',
       );
     }
 
@@ -1064,7 +1049,7 @@ export class CortexAgent {
 
   private static async loadAgentClass(errorMessage: string): Promise<new (config: Record<string, unknown>) => PiAgent> {
     try {
-      const piAgentCore = await import('@mariozechner/pi-agent-core');
+      const piAgentCore = await import('@earendil-works/pi-agent-core');
       return piAgentCore.Agent as unknown as new (config: Record<string, unknown>) => PiAgent;
     } catch {
       throw new Error(errorMessage);
@@ -1089,6 +1074,18 @@ export class CortexAgent {
         }),
       },
       getApiKey: cortexConfig.getApiKey,
+      toolExecution: cortexConfig.toolExecution ?? 'sequential',
+    };
+
+    agentConfig['streamFn'] = async (model: unknown, context: unknown, options?: Record<string, unknown>) => {
+      const { streamSimple } = await import('@earendil-works/pi-ai');
+      const retention = cacheBreakpointState.cortexAgent?._activePromptCacheRetention
+        ?? cacheBreakpointState.cortexAgent?._cacheRetention
+        ?? null;
+      const streamOptions = retention && retention !== 'none'
+        ? { ...options, cacheRetention: retention }
+        : options;
+      return streamSimple(model as any, context as any, streamOptions as any);
     };
 
     if (cortexConfig.resolvePermission) {
@@ -1112,7 +1109,9 @@ export class CortexAgent {
 
     agentConfig['afterToolCall'] = async (ctx: unknown) => {
       const agent = cacheBreakpointState.cortexAgent;
-      if (!agent || !agent.isWorkingTagsEnabled) return undefined;
+      if (!agent) return undefined;
+      agent.syncActiveLoopTools(ctx);
+      if (!agent.isWorkingTagsEnabled) return undefined;
 
       const { result, isError } = ctx as {
         toolCall: { name: string };
@@ -1154,6 +1153,16 @@ export class CortexAgent {
       // system block (our actual system prompt) needs the breakpoint.
       for (let i = 0; i < systemBlocks.length - 1; i++) {
         delete systemBlocks[i]!['cache_control'];
+      }
+
+      // Strip cache_control from tool definitions. Pi-ai sets it on the
+      // last tool, but Cortex manages its own 4-breakpoint budget (system,
+      // BP2, BP3, last user message) and the tool breakpoint is redundant.
+      const tools = payload['tools'] as Array<Record<string, unknown>> | undefined;
+      if (tools) {
+        for (const tool of tools) {
+          delete tool['cache_control'];
+        }
       }
 
       const messages = payload['messages'] as Array<Record<string, unknown>>;
@@ -1314,7 +1323,7 @@ export class CortexAgent {
     } = {
       cortexConfig: config,
       missingDependencyMessage:
-        'CortexAgent.create() requires @mariozechner/pi-agent-core to be installed. ' +
+        'CortexAgent.create() requires @earendil-works/pi-agent-core to be installed. ' +
         'Install it as a dependency or peer dependency.',
     };
     if (config.tools) {
@@ -1551,10 +1560,6 @@ export class CortexAgent {
       this.primaryModel.provider,
       this._cacheRetention ?? 'none',
     );
-    // Update the pi-agent-core agent's model if it exposes setModel
-    if (typeof this.agent.setModel === 'function') {
-      this.agent.setModel(this.primaryPiModel);
-    }
   }
 
   /**
@@ -1610,9 +1615,7 @@ export class CortexAgent {
    */
   setThinkingLevel(level: ThinkingLevel): void {
     const piLevel = mapToPiThinkingLevel(level);
-    if (typeof this.agent.setThinkingLevel === 'function') {
-      this.agent.setThinkingLevel(piLevel);
-    }
+    (this.agent.state as Record<string, unknown>)['thinkingLevel'] = piLevel;
   }
 
   /**
@@ -1641,32 +1644,58 @@ export class CortexAgent {
 
   /**
    * Get the thinking capabilities of the current primary model.
-   * Uses dynamic import of pi-ai to check model.reasoning and supportsXhigh().
+   * Uses pi-ai model metadata to expose the exact supported thinking levels.
    *
    * @returns Capabilities object describing thinking support
    */
   async getModelThinkingCapabilities(): Promise<ModelThinkingCapabilities> {
-    const piModel = this.primaryPiModel as Record<string, unknown>;
-    const supportsThinking = piModel['reasoning'] === true;
-    if (!supportsThinking) {
-      return { supportsThinking: false, supportsMax: false };
-    }
     try {
-      const { supportsXhigh } = await import('@mariozechner/pi-ai');
+      const { getSupportedThinkingLevels } = await import('@earendil-works/pi-ai');
+      const supportedLevels = mapFromPiThinkingLevels(
+        getSupportedThinkingLevels(this.primaryPiModel as any),
+      );
       return {
-        supportsThinking: true,
-        supportsMax: supportsXhigh(this.primaryPiModel as any),
+        supportsThinking: supportedLevels.some(level => level !== 'off'),
+        supportsMax: supportedLevels.includes('max'),
+        supportedLevels,
       };
     } catch {
-      return { supportsThinking: true, supportsMax: false };
+      const piModel = this.primaryPiModel as Record<string, unknown>;
+      const supportsThinking = piModel['reasoning'] === true;
+      const supportedLevels: ThinkingLevel[] = supportsThinking
+        ? ['minimal', 'low', 'medium', 'high']
+        : ['off'];
+      return {
+        supportsThinking,
+        supportsMax: false,
+        supportedLevels,
+      };
+    }
+  }
+
+  /**
+   * Clamp a requested thinking level to the current model's supported levels.
+   * Pi may clamp upward before clamping downward, so callers should surface
+   * clamping to users when latency or cost could change.
+   */
+  async clampThinkingLevel(level: ThinkingLevel): Promise<ThinkingLevel> {
+    try {
+      const { clampThinkingLevel } = await import('@earendil-works/pi-ai');
+      return mapFromPiThinkingLevel(
+        clampThinkingLevel(this.primaryPiModel as any, mapToPiThinkingLevel(level) as any),
+      );
+    } catch {
+      const caps = await this.getModelThinkingCapabilities();
+      if (caps.supportedLevels.includes(level)) return level;
+      return caps.supportedLevels[0] ?? 'off';
     }
   }
 
   /**
    * Set the cache retention policy for the agentic loop.
    * Used by the consumer to switch between short/long cache based on
-   * tick interval and provider. The pipeline sets the PI_CACHE_RETENTION
-   * env var to this value before each tick.
+   * tick interval and provider. Managed agents pass this through the pi-ai
+   * stream options for each provider request.
    */
   setCacheRetention(value: 'none' | 'short' | 'long'): void {
     this._cacheRetention = value;
@@ -1699,6 +1728,19 @@ export class CortexAgent {
       toolCategories: this.toolCategories,
       thresholds: this.toolResultThresholds,
     });
+  }
+
+  /**
+   * Pi 0.74 snapshots the agent state when prompt() starts. When ToolSearch
+   * loads deferred tools mid-run, keep the active loop context in sync so the
+   * next automatic provider call sees the newly loaded schemas.
+   */
+  private syncActiveLoopTools(ctx: unknown): void {
+    if (!this._deferredToolsEnabled) return;
+    if (!ctx || typeof ctx !== 'object') return;
+    const context = (ctx as { context?: { tools?: unknown[] } }).context;
+    if (!context || !Array.isArray(context.tools)) return;
+    context.tools = [...this.currentPiTools];
   }
 
   /**
@@ -1765,9 +1807,8 @@ export class CortexAgent {
         },
       };
     });
-    if (typeof this.agent.setTools === 'function') {
-      this.agent.setTools(allTools as Parameters<typeof this.agent.setTools>[0]);
-    }
+    this.currentPiTools = allTools;
+    (this.agent.state as Record<string, unknown>)['tools'] = allTools;
     this.refreshPromptState();
   }
 
@@ -1866,13 +1907,13 @@ export class CortexAgent {
     systemPrompt: string;
     messages: Array<{ role: string; content: string }>;
   }): Promise<string> {
-    let completeFn: typeof import('@mariozechner/pi-ai').complete;
+    let completeFn: typeof import('@earendil-works/pi-ai').complete;
     try {
-      const piAi = await import('@mariozechner/pi-ai');
+      const piAi = await import('@earendil-works/pi-ai');
       completeFn = piAi.complete;
     } catch {
       throw new Error(
-        'utilityComplete() requires @mariozechner/pi-ai to be installed. ' +
+        'utilityComplete() requires @earendil-works/pi-ai to be installed. ' +
         'Install it as a dependency or peer dependency.',
       );
     }
@@ -2476,10 +2517,10 @@ export class CortexAgent {
    * 4. Compute API message indices for cache breakpoints BP2 and BP3
    *
    * Cache breakpoint strategy:
-   *   Anthropic allows 4 cache_control breakpoints. Pi-ai uses 2 (system
-   *   prompt = BP1, last user message = BP4). This hook computes indices
-   *   for 2 more (BP2 = after last slot, BP3 = old history boundary),
-   *   which are injected by the onPayload hook in create().
+   *   Anthropic allows 4 cache_control breakpoints. Pi-ai sets up to 3
+   *   (system prompt, last tool definition, last user message). The
+   *   onPayload hook strips the tool breakpoint and adds BP2 (after last
+   *   slot) and BP3 (old history boundary), keeping the total at 4.
    *
    *   By inserting ephemeral at the boundary instead of the end, the
    *   conversation history prefix becomes stable across ticks, enabling
@@ -3186,8 +3227,8 @@ export class CortexAgent {
 
     // Check if the agent's error looks like an abort/cancel
     const state = this.agent.state as Record<string, unknown>;
-    if (state['error']) {
-      const rawError = state['error'];
+    const rawError = state['errorMessage'] ?? state['error'];
+    if (rawError) {
       const errorMsg = typeof rawError === 'string'
         ? rawError
         : rawError instanceof Error
@@ -4060,7 +4101,7 @@ export class CortexAgent {
         enableLoadSkillTool: false,
       },
       missingDependencyMessage:
-        'Sub-agent spawning requires @mariozechner/pi-agent-core to be installed.',
+        'Sub-agent spawning requires @earendil-works/pi-agent-core to be installed.',
     };
     if (promptSeed.initialBasePrompt !== undefined) {
       childCreateParams.initialBasePrompt = promptSeed.initialBasePrompt;

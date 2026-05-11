@@ -38,6 +38,12 @@ export interface CortexTool<TParams = unknown, TResult = unknown> {
    * automatically by the MCP client. Consumers should not set this manually.
    */
   isMcp?: boolean;
+
+  /**
+   * Optional pi-agent-core execution hint. Use "sequential" for tools that
+   * must update shared agent state before later tool calls in the same batch.
+   */
+  executionMode?: 'sequential' | 'parallel';
 }
 
 /**
@@ -50,6 +56,7 @@ export interface PiAgentTool<TParams = unknown, TResult = unknown> {
   name: string;
   description: string;
   parameters: unknown;
+  executionMode?: 'sequential' | 'parallel';
   execute: (
     toolCallId: string,
     params: TParams,
@@ -64,7 +71,7 @@ export interface PiAgentTool<TParams = unknown, TResult = unknown> {
 export function fromPiAgentTool<TParams = unknown, TResult = unknown>(
   tool: PiAgentTool<TParams, TResult>,
 ): CortexTool<TParams, TResult> {
-  return {
+  const cortexTool: CortexTool<TParams, TResult> = {
     name: tool.name,
     description: tool.description,
     parameters: tool.parameters,
@@ -77,6 +84,10 @@ export function fromPiAgentTool<TParams = unknown, TResult = unknown>(
       );
     },
   };
+  if (tool.executionMode) {
+    cortexTool.executionMode = tool.executionMode;
+  }
+  return cortexTool;
 }
 
 /**

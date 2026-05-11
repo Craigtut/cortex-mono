@@ -7,9 +7,9 @@
  * about the other. The consumer creates both, uses ProviderManager for
  * auth/discovery, and provides a getApiKey callback to CortexAgent.
  *
- * Pi-ai is an optional peer dependency. All pi-ai functions are imported
- * dynamically. If pi-ai is not installed, methods that require it throw
- * clear errors.
+ * Pi-ai is loaded dynamically so consumers never import it directly.
+ * If the dependency is missing or unavailable, methods that require it
+ * throw clear errors.
  *
  * Reference: provider-manager.md
  */
@@ -17,9 +17,9 @@
 import {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
-  LOGIN_FUNCTION_NAMES,
   UTILITY_MODEL_DEFAULTS,
 } from './provider-registry.js';
+import type { ThinkingLevel } from './types.js';
 import type { ProviderInfo, ModelInfo } from './provider-registry.js';
 import { wrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
@@ -33,21 +33,34 @@ export interface OAuthCallbacks {
   /**
    * Called when the user needs to visit a URL to authorize.
    * The consumer should open the URL in a browser or display it.
-   * @param url - The authorization URL
-   * @param instructions - Optional human-readable instructions
    */
-  onAuth: (url: string, instructions?: string) => void;
+  onAuth: (info: { url: string; instructions?: string }) => void;
 
   /**
    * Called when the OAuth flow needs user input (e.g., a prompt).
    * The consumer should display the prompt and return the user's response.
    */
-  onPrompt: (prompt: { message: string }) => Promise<string>;
+  onPrompt: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
 
   /**
    * Called with progress messages during the flow.
    */
-  onProgress: (message: string) => void;
+  onProgress?: (message: string) => void;
+
+  /**
+   * Called when a callback-server OAuth flow needs the user to paste a
+   * manual authorization code.
+   */
+  onManualCodeInput?: () => Promise<string>;
+
+  /**
+   * Called when the OAuth flow needs the user to choose from provider-specific
+   * options, such as a Copilot organization or endpoint.
+   */
+  onSelect?: (prompt: {
+    message: string;
+    options: Array<{ id: string; label: string }>;
+  }) => Promise<string | undefined>;
 }
 
 /** Display-safe metadata extracted at login time. */
@@ -158,11 +171,26 @@ export interface IProviderManager {
 /** Shape of the pi-ai main module functions we use. */
 interface PiAiModule {
   getModel: (provider: string, modelId: string) => unknown;
-  createModel: (config: Record<string, unknown>) => unknown;
   getModels: (provider: string) => Array<Record<string, unknown>>;
   getEnvApiKey: (provider: string) => string | undefined;
+  getSupportedThinkingLevels?: ((model: unknown) => string[]) | undefined;
   completeSimple?: ((model: unknown, context: unknown, options?: unknown) => Promise<unknown>) | undefined;
   complete?: ((model: unknown, context: unknown, options?: unknown) => Promise<unknown>) | undefined;
+}
+
+interface PiOAuthProvider {
+  id: string;
+  name: string;
+  login: (callbacks: Record<string, unknown>) => Promise<Record<string, unknown>>;
+}
+
+interface PiAiOAuthModule {
+  getOAuthProvider?: ((id: string) => PiOAuthProvider | undefined) | undefined;
+  getOAuthProviders?: (() => PiOAuthProvider[]) | undefined;
+  getOAuthApiKey?: ((
+    provider: string,
+    credentials: Record<string, unknown>,
+  ) => Promise<{ apiKey: string; newCredentials: Record<string, unknown> } | null>) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,11 +204,11 @@ interface PiAiModule {
 async function loadPiAi(): Promise<PiAiModule> {
   try {
     // Dynamic import with string literal to avoid bundler resolution
-    const modulePath = '@mariozechner/pi-ai';
+    const modulePath = '@earendil-works/pi-ai';
     return await import(/* @vite-ignore */ modulePath) as PiAiModule;
   } catch {
     throw new Error(
-      'pi-ai is not installed. Install @mariozechner/pi-ai to use ProviderManager.'
+      'pi-ai is not installed. Install @earendil-works/pi-ai to use ProviderManager.'
     );
   }
 }
@@ -189,13 +217,13 @@ async function loadPiAi(): Promise<PiAiModule> {
  * Lazily load the pi-ai OAuth module.
  * Throws a clear error if pi-ai is not installed.
  */
-async function loadPiAiOAuth(): Promise<Record<string, unknown>> {
+async function loadPiAiOAuth(): Promise<PiAiOAuthModule> {
   try {
-    const modulePath = '@mariozechner/pi-ai/oauth';
-    return await import(/* @vite-ignore */ modulePath) as Record<string, unknown>;
+    const modulePath = '@earendil-works/pi-ai/oauth';
+    return await import(/* @vite-ignore */ modulePath) as PiAiOAuthModule;
   } catch {
     throw new Error(
-      'pi-ai is not installed. Install @mariozechner/pi-ai to use OAuth features.'
+      'pi-ai is not installed. Install @earendil-works/pi-ai to use OAuth features.'
     );
   }
 }
@@ -241,12 +269,12 @@ function buildOAuthMeta(
   rawCredentials: Record<string, unknown>,
 ): OAuthMeta {
   const displayName = extractDisplayName(rawCredentials);
-  const expiresAtRaw = rawCredentials['expiresAt'];
+  const expiresAtRaw = rawCredentials['expiresAt'] ?? rawCredentials['expires'];
   const expiresAt = typeof expiresAtRaw === 'number' ? expiresAtRaw : undefined;
 
   const meta: OAuthMeta = {
     provider,
-    refreshable: !!rawCredentials['refreshToken'],
+    refreshable: !!(rawCredentials['refreshToken'] ?? rawCredentials['refresh']),
   };
 
   if (displayName !== undefined) {
@@ -288,10 +316,40 @@ const LEGACY_MODEL_PREFIXES: Record<string, string[]> = {
 // Model mapping helper
 // ---------------------------------------------------------------------------
 
+const CORTEX_THINKING_LEVELS: readonly ThinkingLevel[] = [
+  'off',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'max',
+];
+
+function mapPiThinkingLevel(level: string): ThinkingLevel | null {
+  const mapped = level === 'xhigh' ? 'max' : level;
+  return (CORTEX_THINKING_LEVELS as readonly string[]).includes(mapped)
+    ? mapped as ThinkingLevel
+    : null;
+}
+
+function mapPiThinkingLevels(levels: readonly string[]): ThinkingLevel[] {
+  const mapped: ThinkingLevel[] = [];
+  for (const level of levels) {
+    const cortexLevel = mapPiThinkingLevel(level);
+    if (cortexLevel && !mapped.includes(cortexLevel)) {
+      mapped.push(cortexLevel);
+    }
+  }
+  return mapped;
+}
+
 /**
  * Map a raw pi-ai model object to our ModelInfo type.
  */
-function mapRawToModelInfo(raw: Record<string, unknown>): ModelInfo {
+function mapRawToModelInfo(
+  raw: Record<string, unknown>,
+  getSupportedThinkingLevels?: (model: unknown) => string[],
+): ModelInfo {
   // pi-ai models have 'id' (API identifier like "claude-sonnet-4-6") and
   // 'name' (display name like "Claude Sonnet 4.6"). Use 'id' as our id.
   const rawId = raw['id'];
@@ -308,11 +366,25 @@ function mapRawToModelInfo(raw: Record<string, unknown>): ModelInfo {
   const rawContextWindow = raw['contextWindow'];
   const contextWindow = typeof rawContextWindow === 'number' ? rawContextWindow : 200_000;
 
+  let supportedThinkingLevels: ThinkingLevel[] = [];
+  if (getSupportedThinkingLevels) {
+    try {
+      supportedThinkingLevels = mapPiThinkingLevels(getSupportedThinkingLevels(raw));
+    } catch {
+      supportedThinkingLevels = [];
+    }
+  }
+  if (supportedThinkingLevels.length === 0 && raw['reasoning'] === true) {
+    supportedThinkingLevels = ['minimal', 'low', 'medium', 'high'];
+  }
+
   const info: ModelInfo = {
     id,
     name,
     contextWindow,
-    supportsThinking: !!raw['supportsThinking'],
+    supportsThinking: supportedThinkingLevels.some(level => level !== 'off')
+      || !!(raw['supportsThinking'] || raw['reasoning']),
+    supportedThinkingLevels,
     supportsImages: !!raw['supportsImages'],
   };
 
@@ -367,7 +439,7 @@ export class ProviderManager implements IProviderManager {
   async listModels(provider: string): Promise<ModelInfo[]> {
     const piAi = await loadPiAi();
     const rawModels = piAi.getModels(provider);
-    const models = rawModels.map(mapRawToModelInfo);
+    const models = rawModels.map(raw => mapRawToModelInfo(raw, piAi.getSupportedThinkingLevels));
 
     // Filter pipeline:
     // 1. Remove legacy/deprecated generation models
@@ -406,27 +478,21 @@ export class ProviderManager implements IProviderManager {
    * @throws Error if the provider does not support OAuth or pi-ai is not installed
    */
   async initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult> {
-    const functionName = LOGIN_FUNCTION_NAMES[provider];
-    if (!functionName) {
-      throw new Error(`Provider "${provider}" does not support OAuth`);
-    }
-
     const oauthModule = await loadPiAiOAuth();
-    const loginFn = oauthModule[functionName];
-    if (typeof loginFn !== 'function') {
-      throw new Error(
-        `OAuth login function "${functionName}" not found in pi-ai. ` +
-        `Ensure @mariozechner/pi-ai is up to date.`
-      );
+    const oauthProvider = oauthModule.getOAuthProvider?.(provider);
+    if (!oauthProvider) {
+      throw new Error(`Provider "${provider}" does not support OAuth`);
     }
 
     this.activeOAuthAbort = new AbortController();
 
     try {
-      const rawCredentials = await (loginFn as (opts: Record<string, unknown>) => Promise<Record<string, unknown>>)({
+      const rawCredentials = await oauthProvider.login({
         onAuth: callbacks.onAuth,
         onPrompt: callbacks.onPrompt,
         onProgress: callbacks.onProgress,
+        onManualCodeInput: callbacks.onManualCodeInput,
+        onSelect: callbacks.onSelect,
         signal: this.activeOAuthAbort.signal,
       });
 
@@ -462,7 +528,7 @@ export class ProviderManager implements IProviderManager {
    */
   async resolveOAuthApiKey(provider: string, credentials: string): Promise<OAuthRefreshResult> {
     const oauthModule = await loadPiAiOAuth();
-    const getOAuthApiKeyFn = oauthModule['getOAuthApiKey'];
+    const getOAuthApiKeyFn = oauthModule.getOAuthApiKey;
     if (typeof getOAuthApiKeyFn !== 'function') {
       throw new Error('getOAuthApiKey not found in pi-ai/oauth');
     }
@@ -471,13 +537,7 @@ export class ProviderManager implements IProviderManager {
     // Security: spread rawCredentials first so Cortex-owned 'type' cannot be overridden
     const credMap = { [provider]: { ...rawCredentials, type: 'oauth' as const } };
 
-    const result = await (getOAuthApiKeyFn as (
-      provider: string,
-      credMap: Record<string, unknown>,
-    ) => Promise<{ apiKey: string; newCredentials: Record<string, unknown> } | null>)(
-      provider,
-      credMap,
-    );
+    const result = await getOAuthApiKeyFn(provider, credMap);
 
     if (!result) {
       throw new Error(`OAuth resolution failed for provider "${provider}"`);
@@ -663,11 +723,15 @@ export class ProviderManager implements IProviderManager {
         };
       }
 
-      await completeFn(
+      const result = await completeFn(
         model,
         { messages: [{ role: 'user', content: 'hi' }] },
         { apiKey, maxTokens: 1 },
       );
+      const silentError = this.extractSilentValidationError(result);
+      if (silentError) {
+        throw new Error(silentError);
+      }
       return {
         provider,
         modelId,
@@ -745,5 +809,15 @@ export class ProviderManager implements IProviderManager {
       status: 'resolution_error',
       message,
     };
+  }
+
+  private extractSilentValidationError(result: unknown): string | null {
+    if (!result || typeof result !== 'object') return null;
+    const msg = result as Record<string, unknown>;
+    if (msg['stopReason'] !== 'error') return null;
+    const errorMessage = msg['errorMessage'];
+    return typeof errorMessage === 'string'
+      ? errorMessage
+      : 'Provider validation failed';
   }
 }

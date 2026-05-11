@@ -12,7 +12,7 @@
  *   - docs/cortex/plans/phase-4-sub-agents-and-skills.md
  */
 
-import { Type, type Static } from '@sinclair/typebox';
+import { Type, type Static } from 'typebox';
 import type { SkillRegistry } from './skill-registry.js';
 import type { LoadedSkill } from './types.js';
 

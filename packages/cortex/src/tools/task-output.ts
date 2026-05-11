@@ -9,7 +9,7 @@
  * Reference: docs/cortex/tools/bash.md (Background Execution)
  */
 
-import { Type, type Static } from '@sinclair/typebox';
+import { Type, type Static } from 'typebox';
 import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';
 import {

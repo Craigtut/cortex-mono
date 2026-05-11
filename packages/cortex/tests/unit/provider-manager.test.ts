@@ -11,26 +11,41 @@ const mockGetModel = vi.fn();
 const mockCreateModel = vi.fn();
 const mockGetModels = vi.fn();
 const mockGetEnvApiKey = vi.fn();
+const mockGetSupportedThinkingLevels = vi.fn();
 const mockCompleteSimple = vi.fn();
 
-vi.mock('@mariozechner/pi-ai', () => ({
+vi.mock('@earendil-works/pi-ai', () => ({
   getModel: (...args: unknown[]) => mockGetModel(...args),
   createModel: (...args: unknown[]) => mockCreateModel(...args),
   getModels: (...args: unknown[]) => mockGetModels(...args),
   getEnvApiKey: (...args: unknown[]) => mockGetEnvApiKey(...args),
+  getSupportedThinkingLevels: (...args: unknown[]) => mockGetSupportedThinkingLevels(...args),
   completeSimple: (...args: unknown[]) => mockCompleteSimple(...args),
 }));
 
 // Mock pi-ai/oauth module
 const mockLoginAnthropic = vi.fn();
 const mockGetOAuthApiKey = vi.fn();
+const mockGetOAuthProvider = vi.fn((provider: string) => {
+  if (provider === 'anthropic') {
+    return { id: provider, name: 'Anthropic', login: mockLoginAnthropic };
+  }
+  if (provider === 'openai-codex') {
+    return { id: provider, name: 'OpenAI Codex', login: vi.fn() };
+  }
+  if (provider === 'github-copilot') {
+    return { id: provider, name: 'GitHub Copilot', login: vi.fn() };
+  }
+  return undefined;
+});
 
-vi.mock('@mariozechner/pi-ai/oauth', () => ({
-  loginAnthropic: (...args: unknown[]) => mockLoginAnthropic(...args),
-  loginOpenAICodex: vi.fn(),
-  loginGitHubCopilot: vi.fn(),
-  loginGeminiCli: vi.fn(),
-  loginAntigravity: vi.fn(),
+vi.mock('@earendil-works/pi-ai/oauth', () => ({
+  getOAuthProvider: (...args: unknown[]) => mockGetOAuthProvider(...args),
+  getOAuthProviders: () => [
+    { id: 'anthropic', name: 'Anthropic', login: mockLoginAnthropic },
+    { id: 'openai-codex', name: 'OpenAI Codex', login: vi.fn() },
+    { id: 'github-copilot', name: 'GitHub Copilot', login: vi.fn() },
+  ],
   getOAuthApiKey: (...args: unknown[]) => mockGetOAuthApiKey(...args),
 }));
 
@@ -44,6 +59,7 @@ describe('ProviderManager', () => {
   beforeEach(() => {
     pm = new ProviderManager();
     vi.clearAllMocks();
+    mockGetSupportedThinkingLevels.mockReturnValue([]);
   });
 
   afterEach(() => {
@@ -168,6 +184,7 @@ describe('ProviderManager', () => {
 
       const result = await pm.initiateOAuth('anthropic', callbacks);
 
+      expect(mockGetOAuthProvider).toHaveBeenCalledWith('anthropic');
       expect(mockLoginAnthropic).toHaveBeenCalledTimes(1);
       expect(typeof result.credentials).toBe('string');
       expect(result.meta.provider).toBe('anthropic');
@@ -183,6 +200,8 @@ describe('ProviderManager', () => {
         onAuth: vi.fn(),
         onPrompt: vi.fn(),
         onProgress: vi.fn(),
+        onManualCodeInput: vi.fn(),
+        onSelect: vi.fn(),
       };
 
       await pm.initiateOAuth('anthropic', callbacks);
@@ -191,6 +210,8 @@ describe('ProviderManager', () => {
       expect(callArgs['onAuth']).toBe(callbacks.onAuth);
       expect(callArgs['onPrompt']).toBe(callbacks.onPrompt);
       expect(callArgs['onProgress']).toBe(callbacks.onProgress);
+      expect(callArgs['onManualCodeInput']).toBe(callbacks.onManualCodeInput);
+      expect(callArgs['onSelect']).toBe(callbacks.onSelect);
       expect(callArgs['signal']).toBeInstanceOf(AbortSignal);
     });
 
@@ -373,6 +394,25 @@ describe('ProviderManager', () => {
       const valid = await pm.validateApiKey('anthropic', 'bad-key');
 
       expect(valid).toEqual(
+        expect.objectContaining({
+          valid: false,
+          retryable: false,
+          status: 'invalid_credentials',
+          message: 'Invalid API key',
+        }),
+      );
+    });
+
+    it('classifies stopReason error validation results', async () => {
+      mockGetModel.mockReturnValue({});
+      mockCompleteSimple.mockResolvedValue({
+        stopReason: 'error',
+        errorMessage: 'Invalid API key',
+      });
+
+      const result = await pm.validateApiKey('anthropic', 'bad-key');
+
+      expect(result).toEqual(
         expect.objectContaining({
           valid: false,
           retryable: false,

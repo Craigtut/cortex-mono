@@ -19,7 +19,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 import type { McpTransportConfig, McpConnectionState, McpStdioConfig, McpHttpConfig, CortexLogger } from './types.js';
 import type { CortexTool } from './tool-contract.js';
 import { NOOP_LOGGER } from './noop-logger.js';
@@ -358,7 +358,7 @@ export class McpClientManager {
    *
    * Key details:
    * - Name is prefixed with serverName__ for namespacing
-   * - JSON Schema from MCP is wrapped via Type.Unsafe() for TypeBox/AJV
+   * - JSON Schema from MCP is wrapped via Type.Unsafe() for TypeBox
    * - execute() calls tools/call on the MCP connection using the original name
    * - Errors are caught and returned as error results (not thrown)
    */
@@ -369,7 +369,7 @@ export class McpClientManager {
   ): AgentTool {
     const namespacedName = `${serverName}__${mcpTool.name}`;
 
-    // Wrap the MCP JSON Schema as a TypeBox type via Type.Unsafe()
+      // Wrap the MCP JSON Schema as a TypeBox type via Type.Unsafe()
     const inputSchema = mcpTool.inputSchema ?? { type: 'object', properties: {} };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const parameters = Type.Unsafe(inputSchema as any);
