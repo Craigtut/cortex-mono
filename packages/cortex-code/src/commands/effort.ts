@@ -16,6 +16,7 @@ const THINKING_LEVELS: Array<{ value: ThinkingLevel; label: string; description:
 ];
 
 const OFF_LEVEL = { value: 'off' as ThinkingLevel, label: 'Off', description: 'No extended thinking' };
+const THINKING_LEVEL_ORDER: ThinkingLevel[] = ['minimal', 'low', 'medium', 'high', 'max'];
 
 export const effortCommand: Command = {
   name: 'effort',
@@ -37,26 +38,35 @@ export const effortCommand: Command = {
     }
 
     // Build level list based on capabilities
-    const available = caps.supportsMax
-      ? THINKING_LEVELS
-      : THINKING_LEVELS.filter(l => l.value !== 'max');
+    const supported = new Set(caps.supportedLevels);
+    const available = THINKING_LEVEL_ORDER
+      .filter(level => supported.has(level))
+      .map(level => THINKING_LEVELS.find(item => item.value === level)!)
+      .filter(Boolean);
 
     const current = session.getEffectiveEffort();
 
-    // Build items: active levels, separator, Off
-    const items: SelectItem[] = [
-      ...available.map(l => ({
-        value: l.value,
-        label: l.value === current ? `${l.label} \u2190 current` : l.label,
-        description: l.description,
-      })),
-      { value: SEPARATOR_VALUE, label: '\u2500'.repeat(20), description: '' },
-      {
+    const items: SelectItem[] = available.map(l => ({
+      value: l.value,
+      label: l.value === current ? `${l.label} \u2190 current` : l.label,
+      description: l.description,
+    }));
+
+    if (supported.has('off')) {
+      if (items.length > 0) {
+        items.push({ value: SEPARATOR_VALUE, label: '\u2500'.repeat(20), description: '' });
+      }
+      items.push({
         value: OFF_LEVEL.value,
         label: current === 'off' ? `${OFF_LEVEL.label} \u2190 current` : OFF_LEVEL.label,
         description: OFF_LEVEL.description,
-      },
-    ];
+      });
+    }
+
+    if (items.length === 0) {
+      app.transcript.addNotification('Effort', `${session.getModelId()} does not expose configurable effort levels.`);
+      return;
+    }
 
     const list = new SelectList(items, Math.min(items.length, 10), selectListTheme);
 
@@ -71,6 +81,7 @@ export const effortCommand: Command = {
     let previousIndex = currentIndex >= 0 ? currentIndex : 0;
     list.onSelectionChange = (item) => {
       if (item.value === SEPARATOR_VALUE) {
+        if (separatorIndex < 0) return;
         const skipTo = previousIndex < separatorIndex
           ? separatorIndex + 1
           : separatorIndex - 1;

@@ -60,6 +60,12 @@ import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display
 
 const execFileAsync = promisify(execFile);
 
+function formatEffortLabel(level: ThinkingLevel): string {
+  return level === 'max'
+    ? 'Max'
+    : level.charAt(0).toUpperCase() + level.slice(1);
+}
+
 export interface SessionOptions {
   config: CortexCodeConfig;
   mode: Mode;
@@ -1046,24 +1052,18 @@ export class Session {
 
     const caps = await this.agent.getModelThinkingCapabilities();
 
-    let effective: ThinkingLevel;
+    let effective = this.preferredEffort;
     let clamped = false;
     let reason: string | undefined;
 
-    if (!caps.supportsThinking) {
-      effective = 'off';
-      if (this.preferredEffort !== 'off') {
-        clamped = true;
-        reason = `${this.modelId} does not support thinking. Effort disabled.`;
-      }
-    } else if (this.preferredEffort === 'max' && !caps.supportsMax) {
-      effective = 'high';
-      clamped = true;
-      reason = `${this.modelId} does not support Max effort. Using High.`;
-    } else if (this.preferredEffort === 'off') {
-      effective = 'off';
-    } else {
-      effective = this.preferredEffort;
+    if (!caps.supportedLevels.includes(this.preferredEffort)) {
+      effective = await this.agent.clampThinkingLevel(this.preferredEffort);
+      clamped = effective !== this.preferredEffort;
+      const preferredLabel = formatEffortLabel(this.preferredEffort);
+      const effectiveLabel = formatEffortLabel(effective);
+      reason = caps.supportsThinking
+        ? `${this.modelId} does not support ${preferredLabel} effort. Using ${effectiveLabel}.`
+        : `${this.modelId} does not support thinking. Using ${effectiveLabel}.`;
     }
 
     this.effectiveEffort = effective;

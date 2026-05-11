@@ -190,19 +190,16 @@ class SetupRenderer {
 
         const provider = step.provider ?? '';
         this.providerManager.initiateOAuth(provider, {
-          onAuth: (urlOrInfo: string | { url: string; instructions?: string }) => {
-            const url = typeof urlOrInfo === 'string' ? urlOrInfo : urlOrInfo.url;
-            const instructions = typeof urlOrInfo === 'object' ? urlOrInfo.instructions : undefined;
+          onAuth: ({ url, instructions }) => {
             loader.setMessage(instructions ?? `Opening browser...`);
             import('node:child_process').then(cp => {
               const cmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
               cp.execFile(cmd, [url], () => {});
             });
           },
-          onPrompt: async (prompt) => {
-            loader.setMessage(prompt.message);
-            return '';
-          },
+          onPrompt: async (prompt) => this.promptOAuthText(prompt.message, loader, prompt.allowEmpty ?? false),
+          onManualCodeInput: async () => this.promptOAuthText('Paste the authorization code:', loader, false),
+          onSelect: async (prompt) => this.promptOAuthSelect(prompt, loader),
           onProgress: (message) => {
             loader.setMessage(message);
           },
@@ -327,6 +324,65 @@ class SetupRenderer {
     } else {
       this.renderStep(step);
     }
+  }
+
+  private promptOAuthText(message: string, loader: Loader, allowEmpty: boolean): Promise<string> {
+    this.contentContainer.clear();
+    this.contentContainer.addChild(new Text(`  ${colors.white(message)}`, 0, 0));
+    this.contentContainer.addChild(new Spacer(1));
+
+    const input = new Input();
+    this.contentContainer.addChild(input);
+    this.tui.setFocus(input);
+
+    return new Promise<string>((resolve) => {
+      input.handleInput = (data: string) => {
+        if (matchesKey(data, Key.enter)) {
+          const text = (input as unknown as { text: string }).text?.trim() ?? '';
+          if (text || allowEmpty) {
+            this.contentContainer.clear();
+            this.contentContainer.addChild(loader);
+            resolve(text);
+          }
+        } else if (matchesKey(data, Key.escape)) {
+          this.contentContainer.clear();
+          this.contentContainer.addChild(loader);
+          resolve('');
+        } else {
+          Input.prototype.handleInput.call(input, data);
+        }
+      };
+    });
+  }
+
+  private promptOAuthSelect(
+    prompt: { message: string; options: Array<{ id: string; label: string }> },
+    loader: Loader,
+  ): Promise<string | undefined> {
+    this.contentContainer.clear();
+    this.contentContainer.addChild(new Text(`  ${colors.white(prompt.message)}`, 0, 0));
+    this.contentContainer.addChild(new Spacer(1));
+
+    const items: SelectItem[] = prompt.options.map(option => ({
+      value: option.id,
+      label: option.label,
+    }));
+    const list = new SelectList(items, Math.min(items.length, 10), selectListTheme);
+    this.contentContainer.addChild(list);
+    this.tui.setFocus(list);
+
+    return new Promise<string | undefined>((resolve) => {
+      list.onSelect = (item) => {
+        this.contentContainer.clear();
+        this.contentContainer.addChild(loader);
+        resolve(item.value);
+      };
+      list.onCancel = () => {
+        this.contentContainer.clear();
+        this.contentContainer.addChild(loader);
+        resolve(undefined);
+      };
+    });
   }
 }
 
