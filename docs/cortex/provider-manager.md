@@ -2,11 +2,11 @@
 
 > **STATUS: IMPLEMENTED**
 
-The `ProviderManager` is a standalone class in `@animus-labs/cortex` that wraps `pi-ai`'s provider registry, model resolution, and OAuth flows into a clean, typed API. It is the sole boundary through which consumers interact with pi-ai's provider ecosystem. Consumers never import `@mariozechner/pi-ai` directly.
+The `ProviderManager` is a standalone class in `@animus-labs/cortex` that wraps `pi-ai`'s provider registry, model resolution, and OAuth flows into a clean, typed API. It is the sole boundary through which consumers interact with pi-ai's provider ecosystem. Consumers never import `@earendil-works/pi-ai` directly.
 
 ## Why It Exists
 
-Pi-ai provides powerful multi-provider support: 20+ providers, automatic model discovery, OAuth login flows, token refresh, custom model creation, and environment variable detection. But pi-ai is a low-level library with multiple entry points (`@mariozechner/pi-ai`, `@mariozechner/pi-ai/oauth`), provider-specific login functions, and raw credential objects.
+Pi-ai provides powerful multi-provider support: 20+ providers, automatic model discovery, OAuth login flows, token refresh, custom model creation, and environment variable detection. But pi-ai is a low-level library with multiple entry points (`@earendil-works/pi-ai`, `@earendil-works/pi-ai/oauth`), provider-specific login functions, and raw credential objects.
 
 ProviderManager wraps all of this into a single, typed interface that:
 
@@ -253,32 +253,31 @@ interface ApiKeyValidationResult {
 import {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
-  LOGIN_FUNCTION_NAMES,
   UTILITY_MODEL_DEFAULTS,
 } from './provider-registry.js';
 
-// Pi-ai is an optional peer dependency. All pi-ai functions are imported
-// dynamically via loadPiAi() and loadPiAiOAuth(). If pi-ai is not installed,
+// Pi-ai is loaded dynamically via loadPiAi() and loadPiAiOAuth(). Consumers
+// never import it directly through Cortex APIs. If pi-ai is unavailable,
 // methods that require it throw clear errors.
 
 async function loadPiAi(): Promise<PiAiModule> {
   try {
-    const modulePath = '@mariozechner/pi-ai';
+    const modulePath = '@earendil-works/pi-ai';
     return await import(modulePath) as PiAiModule;
   } catch {
     throw new Error(
-      'pi-ai is not installed. Install @mariozechner/pi-ai to use ProviderManager.'
+      'pi-ai is not installed. Install @earendil-works/pi-ai to use ProviderManager.'
     );
   }
 }
 
-async function loadPiAiOAuth(): Promise<Record<string, unknown>> {
+async function loadPiAiOAuth(): Promise<PiAiOAuthModule> {
   try {
-    const modulePath = '@mariozechner/pi-ai/oauth';
-    return await import(modulePath) as Record<string, unknown>;
+    const modulePath = '@earendil-works/pi-ai/oauth';
+    return await import(modulePath) as PiAiOAuthModule;
   } catch {
     throw new Error(
-      'pi-ai is not installed. Install @mariozechner/pi-ai to use OAuth features.'
+      'pi-ai is not installed. Install @earendil-works/pi-ai to use OAuth features.'
     );
   }
 }
@@ -297,7 +296,7 @@ class ProviderManager implements IProviderManager {
   async listModels(provider: string): Promise<ModelInfo[]> {
     const piAi = await loadPiAi();
     const rawModels = piAi.getModels(provider);
-    const models = rawModels.map(mapRawToModelInfo);
+    const models = rawModels.map(raw => mapRawToModelInfo(raw, piAi.getSupportedThinkingLevels));
 
     // Filter pipeline:
     // 1. Remove legacy/deprecated generation models (see LEGACY_MODEL_PREFIXES)
@@ -321,26 +320,18 @@ class ProviderManager implements IProviderManager {
   }
 
   async initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult> {
-    // LOGIN_FUNCTION_NAMES maps provider IDs to pi-ai function names (strings).
-    // The actual function is resolved via dynamic import of pi-ai/oauth.
-    const functionName = LOGIN_FUNCTION_NAMES[provider];
-    if (!functionName) throw new Error(`Provider "${provider}" does not support OAuth`);
-
     const oauthModule = await loadPiAiOAuth();
-    const loginFn = oauthModule[functionName];
-    if (typeof loginFn !== 'function') {
-      throw new Error(
-        `OAuth login function "${functionName}" not found in pi-ai. ` +
-        `Ensure @mariozechner/pi-ai is up to date.`
-      );
-    }
+    const oauthProvider = oauthModule.getOAuthProvider?.(provider);
+    if (!oauthProvider) throw new Error(`Provider "${provider}" does not support OAuth`);
 
     this.activeOAuthAbort = new AbortController();
 
-    const rawCredentials = await loginFn({
+    const rawCredentials = await oauthProvider.login({
       onAuth: callbacks.onAuth,
       onPrompt: callbacks.onPrompt,
       onProgress: callbacks.onProgress,
+      onManualCodeInput: callbacks.onManualCodeInput,
+      onSelect: callbacks.onSelect,
       signal: this.activeOAuthAbort.signal,
     });
 
@@ -501,17 +492,6 @@ const PROVIDER_REGISTRY: ProviderInfo[] = [
     keyUrl: 'aistudio.google.com/apikey',
   },
   {
-    id: 'google-gemini-cli',
-    name: 'Google Gemini',
-    authMethods: ['oauth'],
-    // Free tier or paid subscription OAuth
-  },
-  {
-    id: 'google-antigravity',
-    name: 'Google Antigravity',
-    authMethods: ['oauth'],
-  },
-  {
     id: 'github-copilot',
     name: 'GitHub Copilot',
     authMethods: ['oauth'],
@@ -558,20 +538,16 @@ const PROVIDER_REGISTRY: ProviderInfo[] = [
 
 This registry is maintained manually. When pi-ai adds a new provider, a corresponding entry is added here. Providers not in the registry can still be used via `resolveModel()` and `createCustomModel()` with direct API keys; they just won't appear in the discovery UI.
 
-### OAuth Login Function Names
+### OAuth Provider Registry
 
-Since pi-ai is an optional peer dependency, login functions are referenced by name (not by direct import). `ProviderManager.initiateOAuth()` dynamically imports `@mariozechner/pi-ai/oauth` and looks up the function by name at runtime.
+`ProviderManager.initiateOAuth()` dynamically imports `@earendil-works/pi-ai/oauth` and resolves the provider through pi-ai's OAuth registry. Cortex no longer hardcodes login function names.
 
 ```typescript
-// packages/cortex/src/provider-registry.ts
+const oauthModule = await loadPiAiOAuth();
+const oauthProvider = oauthModule.getOAuthProvider?.(provider);
+if (!oauthProvider) throw new Error(`Provider "${provider}" does not support OAuth`);
 
-const LOGIN_FUNCTION_NAMES: Record<string, string> = {
-  'anthropic': 'loginAnthropic',
-  'openai-codex': 'loginOpenAICodex',
-  'github-copilot': 'loginGitHubCopilot',
-  'google-gemini-cli': 'loginGeminiCli',
-  'google-antigravity': 'loginAntigravity',
-};
+const rawCredentials = await oauthProvider.login(callbacks);
 ```
 
 ### Display Name Extraction
@@ -683,15 +659,15 @@ packages/cortex/
 
 ### OAuth Providers
 
-These providers authenticate via browser-based OAuth flows. The user signs in with their existing subscription (Claude Pro/Max, ChatGPT Plus/Pro, GitHub Copilot, Google account). No API keys needed.
+These providers authenticate via browser-based OAuth flows. The user signs in with their existing subscription (Claude Pro/Max, ChatGPT Plus/Pro, GitHub Copilot). No API keys needed.
 
-| Provider | Pi-ai ID | Login Function | Subscription Required |
-|----------|----------|---------------|----------------------|
-| Anthropic (Claude) | `anthropic` | `loginAnthropic` | Claude Pro or Max |
-| OpenAI Codex | `openai-codex` | `loginOpenAICodex` | ChatGPT Plus or Pro |
-| GitHub Copilot | `github-copilot` | `loginGitHubCopilot` | Copilot subscription |
-| Google Gemini CLI | `google-gemini-cli` | `loginGeminiCli` | Free tier or paid |
-| Antigravity | `google-antigravity` | `loginAntigravity` | Varies |
+| Provider | Pi-ai ID | Subscription Required |
+|----------|----------|----------------------|
+| Anthropic (Claude) | `anthropic` | Claude Pro or Max |
+| OpenAI Codex | `openai-codex` | ChatGPT Plus or Pro |
+| GitHub Copilot | `github-copilot` | Copilot subscription |
+
+Google Gemini CLI and Google Antigravity OAuth providers were removed upstream in pi-ai 0.71. Cortex supports Google through the `google` API key provider. Google Vertex can be used by consumers that supply the required Google application credentials to pi-ai.
 
 ### API Key Providers
 

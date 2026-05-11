@@ -2,7 +2,7 @@
 
 > **STATUS: IMPLEMENTED**
 
-`@animus-labs/cortex` is a standalone package that wraps `@mariozechner/pi-agent-core` into a production-grade agent. It adds the capabilities pi-agent-core deliberately omits: MCP tool support, tool permissions, budget guards, context compaction, skill system, and event logging. Session persistence is the consumer's responsibility; cortex provides lifecycle hooks and serialization helpers.
+`@animus-labs/cortex` is a standalone package that wraps `@earendil-works/pi-agent-core` into a production-grade agent. It adds the capabilities pi-agent-core deliberately omits: MCP tool support, tool permissions, budget guards, context compaction, skill system, and event logging. Session persistence is the consumer's responsibility; cortex provides lifecycle hooks and serialization helpers.
 
 It does NOT contain application-specific logic (thoughts, emotions, decisions, persona). Those are concerns of the consumer (e.g., a heartbeat system or application-specific pipeline). Think of it as: pi-agent-core provides the bare agentic loop; cortex provides everything needed to wire that loop into real applications.
 
@@ -151,7 +151,7 @@ Every tool's output flows through a result-size interceptor at the registration 
 
 ### Schema Conversion (Zod -> TypeBox)
 
-Pi-agent-core uses TypeBox + AJV for tool parameter schemas. Cortex provides a conversion utility:
+Pi-agent-core uses TypeBox for tool parameter schemas. Cortex provides a conversion utility:
 
 ```typescript
 // Zod -> JSON Schema (via zod-to-json-schema) -> TypeBox Type.Unsafe()

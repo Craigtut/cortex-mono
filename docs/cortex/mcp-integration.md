@@ -76,7 +76,7 @@ Key details:
 
 - **`name`**: Prefixed with the server name for namespacing (see below)
 - **`description`**: Passed through from the MCP tool definition
-- **`parameters`**: JSON Schema from MCP, wrapped via `Type.Unsafe()` (AJV validates at runtime)
+- **`parameters`**: JSON Schema from MCP, wrapped via `Type.Unsafe()`
 - **`execute()`**: Calls `client.callTool()` on the MCP connection, returns the result
 
 ### Namespacing
@@ -195,17 +195,17 @@ Key details:
 
 ## Schema Conversion
 
-MCP tools provide JSON Schema for their parameters. Pi-agent-core requires TypeBox schemas (used internally by AJV for validation).
+MCP tools provide JSON Schema for their parameters. Pi-agent-core requires TypeBox schemas.
 
 The conversion path:
 
 ```
 MCP tool.inputSchema (JSON Schema)
   -> Type.Unsafe(jsonSchema)  (TypeBox wrapper)
-  -> AJV validates at runtime
+  -> pi-agent-core validates at runtime
 ```
 
-`Type.Unsafe()` wraps the raw JSON Schema as a TypeBox type without transformation. AJV, which understands both TypeBox and raw JSON Schema, validates tool arguments at runtime.
+`Type.Unsafe()` wraps the raw JSON Schema as a TypeBox type without transformation. Pi-agent-core validates tool arguments at runtime.
 
 This is the same conversion used for Zod-defined tools (Zod -> JSON Schema -> TypeBox via `Type.Unsafe()`), just skipping the Zod step since MCP already provides JSON Schema directly.
 

@@ -2,7 +2,7 @@
 
 **Organization**: Animus Labs (`@animus-labs` on npm)
 
-Production-grade agent infrastructure built on `pi-agent-core`. Cortex wraps `@mariozechner/pi-agent-core` into a full-featured agent framework with capabilities the core deliberately omits: MCP tool support, tool permissions, budget guards, context compaction, a skill system, event logging, built-in tools, and provider management.
+Production-grade agent infrastructure built on `pi-agent-core`. Cortex wraps `@earendil-works/pi-agent-core` into a full-featured agent framework with capabilities the core deliberately omits: MCP tool support, tool permissions, budget guards, context compaction, a skill system, event logging, built-in tools, and provider management.
 
 ## Key Principle
 
@@ -20,9 +20,9 @@ Production-grade agent infrastructure built on `pi-agent-core`. Cortex wraps `@m
 ## Tech Stack
 
 - Node.js 24+, TypeScript strict, ESM
-- `@mariozechner/pi-agent-core` + `@mariozechner/pi-ai` for the agentic loop and model access
+- `@earendil-works/pi-agent-core` + `@earendil-works/pi-ai` for the agentic loop and model access
 - `@modelcontextprotocol/sdk` for MCP protocol support
-- `@sinclair/typebox` for JSON schema
+- `typebox` for JSON schema
 - `@vscode/ripgrep` for fast file searching
 - Vitest for testing
 
@@ -53,7 +53,7 @@ Two main exports, fully independent:
 
 ### Sanitized Boundary
 
-**Cortex must never import from any consumer package.** Consumers import from Cortex, never the reverse. Cortex's only dependencies are `pi-agent-core`, `pi-ai`, `@modelcontextprotocol/sdk`, `@sinclair/typebox`, `@vscode/ripgrep`, and `zod-to-json-schema`.
+**Cortex must never import from any consumer package.** Consumers import from Cortex, never the reverse. Cortex's only dependencies are `pi-agent-core`, `pi-ai`, `@modelcontextprotocol/sdk`, `typebox`, `@vscode/ripgrep`, and `zod-to-json-schema`.
 
 ## Development Guidelines
 

@@ -17,7 +17,7 @@ Cortex was originally built for [Animus](https://github.com/Craigtut/animus), an
 - The agent runs indefinitely, so context will inevitably exceed the window. Compaction must be graceful, not catastrophic.
 - Cost matters. Prompt caching discounts (up to 90% on Anthropic) make the difference between viable and prohibitively expensive for a continuously running agent.
 
-No existing agentic loop framework provided the level of context control needed. The underlying loop library, `@mariozechner/pi-agent-core`, is deliberately minimal: it provides the agentic loop and nothing else. Cortex wraps it with everything needed to manage context in production: structured slots, ephemeral injection, three-layer compaction, skills, tools, and provider management.
+No existing agentic loop framework provided the level of context control needed. The underlying loop library, `@earendil-works/pi-agent-core`, is deliberately minimal: it provides the agentic loop and nothing else. Cortex wraps it with everything needed to manage context in production: structured slots, ephemeral injection, three-layer compaction, skills, tools, and provider management.
 
 ## Core Insight: Context as a Managed Surface
 
@@ -89,6 +89,6 @@ The key insight is that slots are never touched by compaction. They are managed 
 
 ## The Full Picture
 
-Cortex wraps `@mariozechner/pi-agent-core` with production capabilities: MCP tool support, tool permissions, budget guards, a skill system with progressive disclosure, event logging, built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent), and multi-provider management with OAuth support.
+Cortex wraps `@earendil-works/pi-agent-core` with production capabilities: MCP tool support, tool permissions, budget guards, a skill system with progressive disclosure, event logging, built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent), and multi-provider management with OAuth support.
 
 But the core value, the reason Cortex exists as a separate framework, is the context management layer. The slot system, the ephemeral region, and the three-layer compaction strategy together give consumers fine-grained control over a highly dynamic context surface while maximizing prompt cache stability. For continuously running agents, this is the difference between a viable architecture and one that degrades, costs too much, or simply breaks.

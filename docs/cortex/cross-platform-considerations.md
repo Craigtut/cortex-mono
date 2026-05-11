@@ -68,8 +68,8 @@ Headless detection and device-code-style UI will need to account for whether pi-
 | Anthropic | `loginAnthropic` | TBD — verify | TBD |
 | OpenAI Codex | `loginOpenAICodex` | Device code (likely) | Likely yes |
 | GitHub Copilot | `loginGitHubCopilot` | Device code | Yes |
-| Google Gemini CLI | `loginGeminiCli` | TBD — verify | TBD |
-| Google Antigravity | `loginAntigravity` | TBD — verify | TBD |
+
+Google Gemini CLI and Google Antigravity OAuth providers are no longer built into pi-ai. Cortex should direct Google users to API key auth for Gemini or to Google application credentials for Vertex.
 
 **Action items:**
 1. Read pi-ai's OAuth login function source code to determine each flow type
