@@ -23,7 +23,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint packages/*/src packages/*/tests",
     "lint:fix": "eslint packages/*/src packages/*/tests --fix",
-    "clean": "rm -rf packages/*/dist node_modules/.cache"
+    "clean": "rm -rf packages/*/dist node_modules/.cache",
+    "publish:cortex": "npm run build -w packages/cortex && npm run test:run -w packages/cortex && npm publish -w packages/cortex",
+    "version:cortex": "npm version -w packages/cortex"
   },
   "engines": {
     "node": ">=24.0.0"
