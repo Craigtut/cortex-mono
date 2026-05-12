@@ -2,15 +2,15 @@
 
 Production-grade agent framework with structured context management. By [Animus Labs](https://github.com/Craigtut/cortex-mono).
 
-Cortex treats the LLM context window as a managed surface, not a flat chat log. Named slots with stability-ordered layout maximize prompt cache hit rates. Three-layer compaction (string trimming, summarization, emergency truncation) keeps long-running agents within context limits without cliff-edge failures.
+Cortex treats the LLM context window as a managed surface, not a flat chat log. Named slots with stability-ordered layout maximize prompt cache hit rates. Observational memory is the default compaction strategy, with classic string trimming, summarization, and emergency truncation available when needed.
 
-Built on [`pi-agent-core`](https://github.com/badlogic/pi-mono) for the agentic loop and model access.
+Built on `@earendil-works/pi-agent-core` for the agentic loop and `@earendil-works/pi-ai` for model access.
 
 ## Packages
 
 | Package | Description | Status |
 |---------|-------------|--------|
-| [`@animus-labs/cortex`](packages/cortex/) | Core agent framework | 0.1.0 |
+| [`@animus-labs/cortex`](packages/cortex/) | Core agent framework | 0.2.0 |
 | [`@animus-labs/cortex-code`](packages/cortex-code/) | Terminal-based coding agent | In development |
 
 ## Getting Started
@@ -29,19 +29,31 @@ const agent = await CortexAgent.create({
   model,
   workingDirectory: process.cwd(),
   initialBasePrompt: 'You are a helpful assistant.',
+  // Optional. If omitted, pi-ai falls back to provider environment variables.
+  getApiKey: async (provider) => {
+    if (provider === 'anthropic' && process.env.ANTHROPIC_API_KEY) {
+      return process.env.ANTHROPIC_API_KEY;
+    }
+    throw new Error(`No API key configured for ${provider}`);
+  },
 });
 
-const result = await agent.runLoop('What files are in this directory?');
+agent.onTurnComplete((output) => {
+  if (output.userFacing) console.log(output.userFacing);
+});
+
+await agent.prompt('What files are in this directory?');
+await agent.destroy();
 ```
 
 ## Key Capabilities
 
-- **Context Slots**: Named, stability-ordered content blocks optimized for prompt cache hit rates. Ephemeral slots provide per-turn context injection that updates every message, giving the agent fresh situational awareness without polluting the persistent context.
-- **Three-Layer Compaction**: Microcompaction, summarization, and emergency truncation
-- **Built-in Tools**: Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent
+- **Context Slots**: Named, stability-ordered content blocks optimized for prompt cache hit rates. Ephemeral context provides per-loop injection without polluting persistent history.
+- **Compaction**: Observational memory by default, classic microcompaction and summarization available by config
+- **Built-in Tools**: Bash, TaskOutput, Read, Write, Edit, UndoEdit, Glob, Grep, WebFetch, SubAgent
 - **MCP Support**: Integrate external tool servers via the Model Context Protocol
 - **Skills**: Progressive disclosure system for dynamic capability loading
-- **Provider Management**: Multi-provider support (Anthropic, OpenAI, Google, Ollama) with OAuth
+- **Provider Management**: Multi-provider support, OAuth where available, API key validation, and custom OpenAI-compatible endpoints
 - **Budget Guards**: Token and cost limits to prevent runaway execution
 
 ## Development
@@ -64,7 +76,7 @@ npm run typecheck
 
 ## Documentation
 
-Architecture guides, tool references, and integration patterns live in [`docs/cortex/`](docs/cortex/).
+Start with the [Cortex consumer guide](docs/cortex/consumer-guide.md). Architecture guides, tool references, and integration notes live in [`docs/cortex/`](docs/cortex/).
 
 ## License
 

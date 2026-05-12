@@ -239,15 +239,7 @@ Placing the skills list in the `load_skill` tool description rather than the sys
 
 A native `AgentTool` registered on the pi-agent-core Agent. This is the primary mechanism for getting skill content into context.
 
-**Configuration:** Registration of the `load_skill` tool is controlled by `CortexAgentConfig.enableLoadSkillTool`, which defaults to `true`. Set it to `false` to disable the tool entirely (for example, if the consumer does not use the skill system or manages skill loading through its own mechanism).
-
-```typescript
-const agent = await CortexAgent.create({
-  model,
-  workingDirectory: cwd,
-  enableLoadSkillTool: false, // Disable load_skill tool registration
-});
-```
+Registration is automatic for parent agents created with `CortexAgent.create()`. The public `CortexAgentConfig` does not expose a disable flag for `load_skill`; consumers that do not use skills can leave the registry empty. Child agents created by the SubAgent tool disable `load_skill` internally so skills do not recurse into delegated workers.
 
 ```typescript
 const loadSkillTool: AgentTool = {

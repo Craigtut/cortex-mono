@@ -676,12 +676,10 @@ Observational memory is the default. No configuration change is needed to use it
 
 ```typescript
 // Default: observational memory (zero config)
-const agent = await CortexAgent.create({
-  // observational memory active with sensible defaults
-});
+const agent = await CortexAgent.create(config);
 
 // With hooks (method-level, like onBeforeCompaction)
-const agent = await CortexAgent.create({});
+const agent = await CortexAgent.create(config);
 agent.onObservation((event) => {
   // persist compacted messages if desired
 });

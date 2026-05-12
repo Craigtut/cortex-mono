@@ -6,7 +6,7 @@ The `ContextManager` is the core abstraction in `@animus-labs/cortex` for managi
 
 ## Message Array Layout
 
-The message array has four regions. The ContextManager owns the first and third; pi-agent-core organically grows the second; the fourth is the prompt input.
+In a managed `CortexAgent`, the effective message array has four regions. The ContextManager owns slot content and consumer ephemeral content. CortexAgent composes that with background task state, loaded skills, compaction, and cache breakpoint logic.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -41,7 +41,7 @@ The layout is ordered so stable content is at the top and volatile content is at
 
 When a slot in the middle changes, the prefix before it survives in cache; everything from the change point onward is billed at full input price. Conversation history that has not changed also benefits from caching since it sits between the stable slots and the volatile tail.
 
-Ephemeral context and the user prompt sit below the cache boundary. They change every call, so they are never cached. This is intentional: placing them at the end means they do not invalidate the cache for everything above.
+Ephemeral context and current-loop content sit below the cache boundary. They change every call, so they are not expected to produce stable cache reads. In a managed `CortexAgent`, ephemeral content is inserted at the pre-prompt boundary so old conversation history can remain cacheable while the current prompt stays at the end of the request.
 
 ## Slots
 
@@ -68,7 +68,9 @@ class ContextManager {
   getSlot(name: string): string | null;
 
   // Set ephemeral content for the next LLM call(s).
-  // Injected at the end of the message array inside the transformContext hook.
+  // The standalone ContextManager hook appends it at the end of the
+  // message array. CortexAgent uses its composed hook to insert it at the
+  // pre-prompt boundary for cache optimization.
   // Never written to agent.state.messages.
   // Pass null to clear.
   setEphemeral(content: string | null): void;
@@ -76,9 +78,9 @@ class ContextManager {
   // Read the current ephemeral content.
   getEphemeral(): string | null;
 
-  // Returns a transformContext hook function that appends the ephemeral
-  // content. The consumer registers this with the Agent (or composes it
-  // with other transformContext logic like compaction).
+  // Returns a standalone transformContext hook function that appends the
+  // ephemeral content. Consumers using CortexAgent normally do not register
+  // this manually; CortexAgent installs its composed hook internally.
   getTransformContextHook(): (context: AgentContext) => AgentContext;
 }
 ```
@@ -94,11 +96,15 @@ The consumer defines slots at startup and populates them with content built from
 **Startup (once per process)**:
 
 ```typescript
-const cm = new ContextManager(agent, {
+const agent = await CortexAgent.create({
+  model,
+  workingDirectory,
+  initialBasePrompt,
   // Order = position. Most stable first for best prefix caching.
-  // The constructor pre-initializes all slot positions with empty messages.
-  slots: ['credentials', 'user-profile', 'project-context', 'history']
+  slots: ['credentials', 'user-profile', 'project-context', 'history'],
 });
+
+const cm = agent.getContextManager();
 
 // Initial population from application state
 cm.setSlot('credentials', buildCredentialContext(credentialStore));
@@ -179,7 +185,7 @@ The ContextManager does not impose any formatting. The consumer provides the ful
 
 ## Ephemeral Context
 
-Ephemeral context is per-call content that the LLM should see but that should NOT persist in `agent.state.messages`. It is appended at the end of the message array inside `transformContext`, after all conversation history, so it does not invalidate the prefix cache.
+Ephemeral context is per-call content that the LLM should see but that should NOT persist in `agent.state.messages`. The standalone `ContextManager.getTransformContextHook()` appends it at the end of the message array. The managed `CortexAgent.getTransformContextHook()` reads the same ephemeral content and inserts it at the pre-prompt boundary, along with framework-managed background task state and loaded skill instructions.
 
 ### What Goes in Ephemeral Context
 
@@ -197,7 +203,7 @@ This block is omitted entirely when no background tasks are running.
 
 ### Composability
 
-The consumer may need `transformContext` for other purposes (compaction, dynamic system prompt updates). The ContextManager provides its hook as a composable function, not as something that replaces the entire `transformContext` pipeline:
+Applications that use `CortexAgent.create()` do not need to wire `transformContext`; Cortex installs the composed hook internally. Consumers that instantiate `ContextManager` directly can compose its standalone hook with their own logic:
 
 ```typescript
 const cm = new ContextManager(agent, { slots: [...] });

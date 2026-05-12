@@ -37,7 +37,7 @@ ProviderManager and CortexAgent are **fully independent**. Neither knows about t
 ## Interface
 
 ```typescript
-// packages/cortex/src/types.ts
+// packages/cortex/src/provider-manager.ts
 
 interface IProviderManager {
   // ── Discovery ──
@@ -97,6 +97,8 @@ interface ModelInfo {
   contextWindow: number;
   /** Whether the model supports extended thinking */
   supportsThinking: boolean;
+  /** Thinking levels supported by this model, using Cortex public names */
+  supportedThinkingLevels: Array<'off' | 'minimal' | 'low' | 'medium' | 'high' | 'max'>;
   /** Whether the model supports image input */
   supportsImages: boolean;
   /** Pricing per million tokens (if available) */
@@ -136,21 +138,32 @@ interface OAuthCallbacks {
   /**
    * Called when the user needs to visit a URL to authorize.
    * The consumer should open the URL in a browser or display it to the user.
-   * @param url - The authorization URL
-   * @param instructions - Optional human-readable instructions (e.g., "Enter code: ABCD")
    */
-  onAuth: (url: string, instructions?: string) => void;
+  onAuth: (info: { url: string; instructions?: string }) => void;
 
   /**
    * Called when the OAuth flow needs user input (e.g., a prompt).
    * The consumer should display the prompt and return the user's response.
    */
-  onPrompt: (prompt: { message: string }) => Promise<string>;
+  onPrompt: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
 
   /**
    * Called with progress messages during the flow.
    */
-  onProgress: (message: string) => void;
+  onProgress?: (message: string) => void;
+
+  /**
+   * Called when a callback-server OAuth flow needs a manual authorization code.
+   */
+  onManualCodeInput?: () => Promise<string>;
+
+  /**
+   * Called when the OAuth flow needs the user to choose from provider-specific options.
+   */
+  onSelect?: (prompt: {
+    message: string;
+    options: Array<{ id: string; label: string }>;
+  }) => Promise<string | undefined>;
 }
 
 interface OAuthResult {
@@ -648,11 +661,10 @@ agent.setModel(model);
 packages/cortex/
   src/
     provider-manager.ts       # ProviderManager class (IProviderManager implementation)
-    provider-registry.ts      # Static provider metadata (PROVIDER_REGISTRY)
+                              # OAuth types, API key validation types, custom model config
+    provider-registry.ts      # Static provider metadata (PROVIDER_REGISTRY), ProviderInfo, ModelInfo
     model-wrapper.ts          # CortexModel wrapping/unwrapping utilities
-    types.ts                  # Add: IProviderManager, ProviderInfo, ModelInfo,
-                              #   CortexModel, OAuthCallbacks, OAuthResult,
-                              #   OAuthMeta, OAuthRefreshResult, CustomModelConfig
+    types.ts                  # CortexAgent config and shared agent/runtime types
 ```
 
 ## Supported Providers
@@ -683,11 +695,11 @@ These providers authenticate with a static API key obtained from the provider's 
 | Cerebras | `cerebras` | `CEREBRAS_API_KEY` |
 | xAI | `xai` | `XAI_API_KEY` |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
-| Vercel AI Gateway | `vercel-ai-gateway` | `VERCEL_AI_GATEWAY_API_KEY` |
+| Vercel AI Gateway | `vercel-ai-gateway` | `AI_GATEWAY_API_KEY` |
 | MiniMax | `minimax` | `MINIMAX_API_KEY` |
-| OpenCode Zen | `opencode-zen` | `OPENCODE_ZEN_API_KEY` |
-| OpenCode Go | `opencode-go` | `OPENCODE_GO_API_KEY` |
-| Kimi For Coding | `kimi-for-coding` | `KIMI_API_KEY` |
+| OpenCode | `opencode` | `OPENCODE_API_KEY` |
+| OpenCode Go | `opencode-go` | `OPENCODE_API_KEY` |
+| Kimi Coding | `kimi-coding` | `KIMI_API_KEY` |
 
 Note: Anthropic supports both OAuth and API key. It appears in both tables.
 

@@ -25,20 +25,20 @@ packages/cortex/
     working-tags.ts             # Working tag parsing and response delivery
     types.ts                    # Package-specific types
     tools/
-      index.ts                  # Tool registration entry point
+      index.ts                  # Tool barrel exports and tool name constants
       runtime.ts                # Per-agent mutable tool runtime state
-      bash.ts                   # Bash shell execution
-      bash-safety.ts            # 7-layer safety checks for shell commands
-      cwd-tracker.ts            # Working directory tracking across bash calls
+      bash/                     # Bash execution, streaming, and safety checks
+      shared/                   # CWD, read tracking, edit history, gitignore helpers
       read.ts                   # Read file contents
-      read-registry.ts          # Tracks which files have been read (read-before-write)
-      write.ts                  # Write/create files (atomic writes)
+      write.ts                  # Write/create files
       edit.ts                   # String replacement edits
+      undo-edit.ts              # Revert current-loop Write/Edit mutations
       glob.ts                   # File pattern matching
       grep.ts                   # Regex content search
-      web-fetch.ts              # URL content fetching
-      web-fetch-cache.ts        # Cache for web fetch results
-      task-output.ts            # Background task output polling
+      web-fetch/                # URL content fetching and cache
+      task-output.ts            # Background task interaction
+      sub-agent.ts              # Cortex-based sub-agent tool
+      tool-search/              # Deferred tool schema loading
   package.json
 ```
 
@@ -65,8 +65,8 @@ These terms are intentionally not interchangeable. Session persistence is a cons
 
 There is no cold/warm/active state machine. A single `Agent` instance persists for the lifetime of the process. The system prompt is set once and rarely changes. Context is managed through two complementary mechanisms:
 
-1. **`replaceMessages()`**: Updates persistent context slots in `agent.state.messages`. Used for content that changes infrequently. Consumers define how many slots exist and what they contain.
-2. **`transformContext` hook**: Injects ephemeral per-call context that should NOT persist in `agent.state.messages`. Ephemeral content should be placed at the end of the message array to avoid invalidating the prefix cache.
+1. **`ContextManager.setSlot()`**: Updates persistent context slots in `agent.state.messages`. Used for content that changes infrequently. Consumers define how many slots exist and what they contain.
+2. **`transformContext` hook**: Injects ephemeral per-call context that should NOT persist in `agent.state.messages`. In a managed `CortexAgent`, Cortex inserts consumer ephemeral content, background task state, and loaded skill instructions at the pre-prompt boundary. This keeps old history cacheable while keeping the current prompt as the final message.
 
 ### The ContextManager
 
@@ -100,20 +100,23 @@ Cortex acts as a **unified MCP client**, connecting to all tool sources through 
 - **Dynamic lifecycle**: Tools are added and removed as plugins install or uninstall, without tearing down the agent session. On plugin install, Cortex opens a new MCP client connection and registers the discovered tools. On uninstall, it closes the connection and removes those tools.
 - **Dynamic discovery**: On each MCP client connection, Cortex calls `tools/list` to discover the server's available tools. This means tool inventories are always derived from the server, not hardcoded.
 
-Built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent) are NOT delivered via MCP. They are native in-process Cortex tools that Cortex adapts to pi-agent-core when synchronizing the tool inventory. See the Built-in Tools section below.
+Built-in tools are NOT delivered via MCP. They are native in-process Cortex tools that Cortex adapts to pi-agent-core when synchronizing the tool inventory. See the Built-in Tools section below.
 
 ### Built-in Tools
 
 Built-in tools are native Cortex tools defined directly in Cortex. These run in-process with no MCP overhead and are adapted to pi-agent-core at the registration boundary.
 
 - **Bash**: Execute shell commands and return output.
+- **TaskOutput**: Poll, send input to, or kill backgrounded Bash processes.
 - **Read**: Read file contents from the filesystem.
 - **Write**: Write content to a file.
 - **Edit**: Make targeted edits to existing files (string replacement).
+- **UndoEdit**: Revert the most recent current-loop Write or Edit mutation for a file.
 - **Glob**: Search for files by name patterns.
 - **Grep**: Search file contents with regex patterns.
 - **WebFetch**: Fetch content from URLs.
 - **SubAgent**: Spawn a sub-agent for delegated work.
+- **ToolSearch**: Load deferred tool schemas on demand when `deferredTools.enabled` is true.
 
 Mutable built-in tool state is scoped per agent runtime. That includes cwd tracking, read tracking, WebFetch loop counters/cache ownership, and background task ownership. Parent and child agents get fresh built-in tool instances so they do not share mutable closures.
 
@@ -127,7 +130,7 @@ const agent = await CortexAgent.create({
 });
 ```
 
-Permissions are enforced through the `beforeToolCall` hook used for both built-in and MCP tools. Built-in tool schemas use TypeBox directly since they are defined within Cortex. SubAgent is a special case: it delegates work to a child Cortex agent.
+Permissions are enforced through the `beforeToolCall` hook used for both built-in and MCP tools. Built-in tool schemas use TypeBox directly since they are defined within Cortex. SubAgent is a special case: spawning is treated as internal orchestration, while tools used by the child agent still go through the parent's permission resolver.
 
 #### Dynamic Consumer Tool Management
 
@@ -181,7 +184,7 @@ Pi-agent-core has no limits on turns or cost.
 Cortex provides optional, configurable guards. All default to unlimited (no enforcement):
 
 - **Max turns**: Count LLM turns via `turn_end` events. Default: `Infinity`. On breach, force-stop the loop.
-- **Max cost**: Track via `AssistantMessage.cost.total`. Default: `Infinity`. On breach, force-stop the loop.
+- **Max cost**: Track via `AssistantMessage.usage.cost.total`. Default: `Infinity`. On breach, force-stop the loop.
 
 These are safety rails for runaway loops, not user-facing budget enforcement. Application-level budgeting (weekly/monthly spend limits, user-configurable caps) is the consumer's responsibility.
 
@@ -222,15 +225,15 @@ See **`working-tags.md`** for the full design: tag rules, system prompt guidance
 
 ### Model Tiers
 
-Cortex uses two model tiers: a **primary model** for all consumer-facing work (agentic loop, direct LLM calls like THOUGHT/REFLECT) and a **utility model** for internal operations the user never sees (WebFetch summarization, safety classifier, compaction).
+Cortex uses two model tiers: a **primary model** for all consumer-facing work (agentic loop and direct completion helpers) and a **utility model** for internal operations the user never sees, such as WebFetch summarization, Bash safety classification, and observational memory observer/reflector calls.
 
 See **`model-tiers.md`** for the full design: tier definitions, provider default mapping, same-provider constraint, configuration API, and frontend implications.
 
 ### System Prompt Management
 
-Cortex assembles a system prompt from two layers: a **cortex default** (operational foundation: rules, tool guidance, safety, environment info) and a **consumer layer** (domain-specific content like persona, instructions, etc.). The cortex default is always present; the consumer appends after it.
+Cortex assembles a system prompt from two layers: a **consumer layer** (identity, domain instructions, communication style) followed by a **cortex operational layer** (response delivery, system rules, tool guidance, safety, environment info). The consumer content comes first, and Cortex appends its operational rules after it.
 
-See **`system-prompt.md`** for the full design: all seven default sections, how the consumer appends, platform-aware tool guidance, and caching implications.
+See **`system-prompt.md`** for the full design: the operational sections, how the consumer prompt is composed, platform-aware tool guidance, and caching implications.
 
 Cortex provides a `setBasePrompt(newPrompt: string)` method for when the application prompt needs to change:
 
@@ -290,7 +293,7 @@ See **`error-recovery.md`** for the full design: classification patterns per cat
 
 ### Token Tracking
 
-Pi-agent-core has no pre-request token counting. Pi-ai reports `Usage` (inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, per-category costs) on every response. `model.contextWindow` provides the limit.
+Pi-agent-core has no pre-request token counting. Pi-ai reports `Usage` (`input`, `output`, `cacheRead`, `cacheWrite`, `totalTokens`, and per-category costs) on every response. `model.contextWindow` provides the limit.
 
 Cortex tracks tokens through two complementary mechanisms:
 

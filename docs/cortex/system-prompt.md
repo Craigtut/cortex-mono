@@ -112,7 +112,7 @@ General principles for how the agent should approach work.
 
 ### Section 4: Tool Usage
 
-Static guidance about preferring dedicated tools over shell commands.
+Static guidance about preferring dedicated tools over shell commands and keeping tool-use turns free of narration.
 
 ```
 # Tool Usage
@@ -128,11 +128,40 @@ Static guidance about preferring dedicated tools over shell commands.
     tool covers.
 - You can call multiple tools in a single response. When multiple
   independent operations are needed, make all calls in parallel.
-- Do not narrate routine tool calls. Just call the tool. Only
-  explain what you're doing for multi-step, complex, or sensitive
-  operations.
+- Multiple Edit or Write calls targeting the same file are NOT
+  independent. Never emit more than one file-mutating call per
+  file in a single response. Edit or Write different files in
+  parallel, but serialize changes to the same file across turns.
 - Do not poll, loop, or sleep-wait for backgrounded tasks. You
   will be notified when they complete.
+
+## IMPORTANT: Text output during tool use
+
+When you are using tools, do NOT produce text that narrates what
+you are doing. Just call the tool. No preamble, no commentary,
+no "let me look at that", no "I found it", no status updates
+between every tool call.
+
+BAD (do not do this):
+  "Let me search for that file." [tool_use: Glob]
+  "Found it. Let me read it now." [tool_use: Read]
+  "Good, I can see the code. Let me trace the function." [tool_use: Grep]
+
+GOOD (do this instead):
+  [tool_use: Glob]
+  [tool_use: Read]
+  [tool_use: Grep]
+  <working>The function traces through three layers: router -> service -> store.
+  The foreign key constraint is in the messages table schema.</working>
+  The issue is in the messages table schema. Here is what I found: ...
+
+Rules:
+1. When calling a tool, produce ONLY the tool call. No text.
+2. After receiving results, wrap your analysis in <working> tags.
+3. Only produce text outside <working> tags when you have something
+   meaningful to tell the user: a finding, a question, or a final answer.
+4. A brief acknowledgment on the FIRST message is fine ("Sure, let me
+   look into that."). After that, work silently until you have results.
 ```
 
 ### Section 5: Executing with Care
@@ -179,7 +208,7 @@ Windows example:
 # Environment
 
 - Platform: win32 (Windows, x64)
-- Shell: PowerShell 7.4
+- Shell: PowerShell
 - Working Directory: C:\Users\user\workspace
 ```
 
@@ -205,4 +234,4 @@ On rebuild:
 
 ## Caching Implications
 
-The system prompt is the first content in the prefix. Since the consumer's content comes first and rarely changes, the cache is stable. Each phase (THOUGHT, AGENTIC LOOP, REFLECT) has its own system prompt and therefore its own cache, established by the unique phase-specific instructions at the very start of the consumer content.
+The system prompt is the first content in the prefix. Since the consumer's content comes first and usually changes rarely, the cache is stable. Applications that use different prompts for direct completion phases and agentic loops should treat each distinct prompt as its own cache prefix.

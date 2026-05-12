@@ -1,8 +1,8 @@
 # @animus-labs/cortex
 
-Production-grade agent framework with structured context management. Built on [`pi-agent-core`](https://github.com/nickmarchandpm/pi-agent-core).
+Production-grade agent framework with structured context management. Built on `@earendil-works/pi-agent-core`.
 
-Cortex treats the context window as a managed surface, not a flat chat log. Named slots, stability-ordered layout, and three-layer compaction give you fine-grained control over what the model sees while maximizing prompt cache hit rates.
+Cortex treats the context window as a managed surface, not a flat chat log. Named slots, stability-ordered layout, observational memory, and classic compaction controls give you fine-grained control over what the model sees while maximizing prompt cache hit rates.
 
 ## Install
 
@@ -24,19 +24,31 @@ const agent = await CortexAgent.create({
   model,
   workingDirectory: process.cwd(),
   initialBasePrompt: 'You are a helpful assistant.',
+  // Optional. If omitted, pi-ai falls back to provider environment variables.
+  getApiKey: async (provider) => {
+    if (provider === 'anthropic' && process.env.ANTHROPIC_API_KEY) {
+      return process.env.ANTHROPIC_API_KEY;
+    }
+    throw new Error(`No API key configured for ${provider}`);
+  },
 });
 
-const result = await agent.runLoop('What files are in this directory?');
+agent.onTurnComplete((output) => {
+  if (output.userFacing) console.log(output.userFacing);
+});
+
+await agent.prompt('What files are in this directory?');
+await agent.destroy();
 ```
 
 ## Key Features
 
-- **Context Slots**: Named, stability-ordered content blocks for prompt cache optimization. Ephemeral slots update every message, providing fresh per-turn context (environment state, recent observations) without accumulating in the persistent context.
-- **Three-Layer Compaction**: Microcompaction (string trimming), summarization, and emergency truncation
-- **Built-in Tools**: Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent, TaskOutput
+- **Context Slots**: Named, stability-ordered content blocks for prompt cache optimization. Ephemeral context provides fresh per-loop state without accumulating in persistent history.
+- **Compaction**: Observational memory by default, with classic microcompaction, summarization, and emergency truncation available via config
+- **Built-in Tools**: Bash, TaskOutput, Read, Write, Edit, UndoEdit, Glob, Grep, WebFetch, SubAgent
 - **MCP Support**: Integrate external tool servers via the Model Context Protocol
 - **Skills**: Progressive disclosure system for dynamically loading capabilities
-- **Tool Permissions**: Per-tool permission modes with pre-execution callbacks
+- **Tool Permissions**: Consumer-provided resolver hook for allow, block, or approval-required decisions
 - **Budget Guards**: Token and cost limits to prevent runaway execution
 - **Provider Management**: Multi-provider support with OAuth flows and model resolution
 - **Event Bridge**: Normalized event stream for logging and observability
@@ -54,7 +66,7 @@ const result = await agent.runLoop('What files are in this directory?');
 
 ## Documentation
 
-See the [docs](../../docs/cortex/) directory for architecture guides, API details, and integration patterns.
+Start with the [consumer guide](../../docs/cortex/consumer-guide.md). The [docs](../../docs/cortex/) directory also contains architecture notes, API details, and tool references.
 
 ## License
 

@@ -329,4 +329,4 @@ Steer the model away from using Bash for operations that have dedicated tools:
 
 ### Platform Detection
 
-The cortex default system prompt includes platform and shell information (see `system-prompt.md`, Section 7: Environment). The model uses this to determine which shell syntax to use.
+The Cortex operational system prompt includes platform and shell information (see `system-prompt.md`, Environment section). The model uses this to determine which shell syntax to use.

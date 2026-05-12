@@ -17,7 +17,7 @@ Cortex was originally built for [Animus](https://github.com/Craigtut/animus), an
 - The agent runs indefinitely, so context will inevitably exceed the window. Compaction must be graceful, not catastrophic.
 - Cost matters. Prompt caching discounts (up to 90% on Anthropic) make the difference between viable and prohibitively expensive for a continuously running agent.
 
-No existing agentic loop framework provided the level of context control needed. The underlying loop library, `@earendil-works/pi-agent-core`, is deliberately minimal: it provides the agentic loop and nothing else. Cortex wraps it with everything needed to manage context in production: structured slots, ephemeral injection, three-layer compaction, skills, tools, and provider management.
+No existing agentic loop framework provided the level of context control needed. The underlying loop library, `@earendil-works/pi-agent-core`, is deliberately minimal: it provides the agentic loop and nothing else. Cortex wraps it with everything needed to manage context in production: structured slots, ephemeral injection, observational memory, classic compaction controls, skills, tools, and provider management.
 
 ## Core Insight: Context as a Managed Surface
 
@@ -56,19 +56,19 @@ Cortex imposes no formatting on slot content. The consumer provides the full str
 
 ## Ephemeral Context: Volatile Without Cost
 
-Ephemeral context is content the model should see for a single call but that should not persist in conversation history. It is injected at the end of the message array via `transformContext`, below the prefix cache boundary.
+Ephemeral context is content the model should see for a single call but that should not persist in conversation history. In a managed `CortexAgent`, it is injected via `transformContext` at the pre-prompt boundary, below stable slots and old history but before current-loop content.
 
-This placement is intentional: because ephemeral content sits below the cache boundary, it can change every single call without invalidating any of the cached content above it. The slots stay cached, the conversation history stays cached, and only the ephemeral region and current prompt are billed at full input price.
+This placement is intentional: because ephemeral content sits below the stable cached prefix, it can change every single call without invalidating the slots or old conversation history above it. The current prompt remains the final user message, preserving model attention on the active request.
 
-## Three-Layer Compaction: Graceful Context Management
+## Compaction: Graceful Context Management
 
-Context grows. For a continuously running agent, it will always eventually exceed the window. Cortex handles this with a graduated three-layer compaction strategy that avoids cliff-edge failures:
+Context grows. For a continuously running agent, it will always eventually exceed the window. Cortex handles this with two strategies:
 
-**Layer 1 (Microcompaction):** Progressively trim old tool results. Tool outputs (file reads, bash results, web fetches) are the largest individual items in context. Microcompaction reduces them in stages: first to semantic bookends (head + tail), then to one-line placeholders. The agent's own analytical text is never touched. This is pure string manipulation with zero LLM calls, triggered at 40%, 50%, and 60% of context capacity. Between threshold crossings, the trimmed content is stable, so the prefix cache rebuilds.
+**Observational memory (default):** Background observer and reflector calls compress older conversation history into structured observations stored in an internal slot. This keeps long-running sessions useful without relying on a single large summary blob.
 
-**Layer 2 (Summarization):** At 70% capacity, summarize older conversation history into a structured summary while preserving a tail of recent turns verbatim. This uses the primary model (not a cheaper utility model) because the summary is the only record of what happened during agentic loops. The consumer receives `onBeforeCompaction` and `onPostCompaction` events to coordinate domain-specific work.
+**Classic compaction (`strategy: 'classic'`):** A traditional layered strategy with tool result microcompaction, conversation summarization, and emergency truncation.
 
-**Layer 3 (Emergency Truncation):** If summarization fails or context still exceeds 90%, drop the oldest turns one at a time. This is a safety net, not a primary strategy.
+Both strategies preserve context slots and keep emergency truncation as a safety valve.
 
 The key insight is that slots are never touched by compaction. They are managed independently by the consumer and rebuilt from authoritative sources. This means the agent's core context (identity, configuration, observation summaries, goals) survives indefinitely, regardless of how many compaction cycles occur.
 
@@ -79,7 +79,7 @@ The key insight is that slots are never touched by compaction. They are managed 
 
 2. **Stable at the top, volatile at the bottom.** Maximize the prefix cache hit rate across calls.
 
-3. **Graduated compaction, not cliff edges.** Cheap operations first (string trimming), expensive operations only when needed (LLM summarization), emergency fallbacks as a safety net.
+3. **Graceful compaction, not cliff edges.** Compress old history before context overflow, preserve slots, and keep emergency fallbacks as a safety net.
 
 4. **Mechanism, not policy.** Cortex provides hooks and callbacks. Consumers implement domain-specific logic. No application concerns leak into the framework.
 
@@ -89,6 +89,6 @@ The key insight is that slots are never touched by compaction. They are managed 
 
 ## The Full Picture
 
-Cortex wraps `@earendil-works/pi-agent-core` with production capabilities: MCP tool support, tool permissions, budget guards, a skill system with progressive disclosure, event logging, built-in tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent), and multi-provider management with OAuth support.
+Cortex wraps `@earendil-works/pi-agent-core` with production capabilities: MCP tool support, tool permissions, budget guards, a skill system with progressive disclosure, event logging, built-in tools (Bash, TaskOutput, Read, Write, Edit, UndoEdit, Glob, Grep, WebFetch, SubAgent), and multi-provider management with OAuth support.
 
-But the core value, the reason Cortex exists as a separate framework, is the context management layer. The slot system, the ephemeral region, and the three-layer compaction strategy together give consumers fine-grained control over a highly dynamic context surface while maximizing prompt cache stability. For continuously running agents, this is the difference between a viable architecture and one that degrades, costs too much, or simply breaks.
+But the core value, the reason Cortex exists as a separate framework, is the context management layer. The slot system, the ephemeral region, and the compaction system together give consumers fine-grained control over a highly dynamic context surface while maximizing prompt cache stability. For continuously running agents, this is the difference between a viable architecture and one that degrades, costs too much, or simply breaks.

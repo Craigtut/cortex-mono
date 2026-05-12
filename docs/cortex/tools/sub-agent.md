@@ -10,8 +10,7 @@ Spawn independent cortex-based sub-agents for delegated work.
 |-----------|------|:--------:|-------------|
 | `instructions` | string | Yes | What the sub-agent should do. This becomes the sub-agent's initial prompt. |
 | `tools` | string[] | No | Tool names to make available. Default: inherits parent's registered tools. |
-| `systemPrompt` | string | No | Custom system prompt. Default: inherits parent's full system prompt (cortex default + consumer content). |
-| `model` | string | No | Model to use. Default: inherits parent's primary model. Can be set to the utility model for cheaper tasks. |
+| `systemPrompt` | string | No | Custom system prompt. Default: inherits parent's full system prompt (consumer content + Cortex operational rules). |
 | `maxTurns` | number | No | Turn limit. Default: inherits parent's budget guard config. |
 | `maxCost` | number | No | Cost limit. Default: inherits parent's budget guard config. |
 | `background` | boolean | No | Run asynchronously. Default: false (blocks until complete). |
