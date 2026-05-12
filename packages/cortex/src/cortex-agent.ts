@@ -811,8 +811,8 @@ export class CortexAgent {
 
   /**
    * Inject a steering message into the running agentic loop.
-   * Interrupts the current tool execution, skips remaining tools,
-   * and triggers a new LLM turn with the injected context.
+   * Queues the message for pi-agent-core to inject after the current
+   * assistant turn and any current tool batch finish.
    * Only effective while a prompt() call is in progress.
    *
    * No-op if the agent is not currently running a prompt.

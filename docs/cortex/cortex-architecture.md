@@ -282,11 +282,11 @@ Pi-agent-core emits 10 events across 4 scopes. Cortex normalizes these into a co
 
 ### Error Recovery
 
-Pi-ai surfaces errors as plain `Error` objects with string messages. Cortex implements a regex-based error classifier that maps error strings to actionable categories (`authentication`, `rate_limit`, `context_overflow`, `server_error`, `network`, `cancelled`, `unknown`). Classified errors are emitted via the `onError` event for the consumer to route (logging, UI notifications, backoff).
+Pi-ai surfaces errors as plain `Error` objects with string messages. Cortex implements a regex-based error classifier that maps error strings to actionable categories (`authentication`, `rate_limit`, `context_overflow`, `server_error`, `network`, `cancelled`, `unknown`). Classified errors are emitted via the `onError` event for the consumer to route (logging, UI notifications, backoff, or retry).
 
-Cortex also provides **automatic retry** for transient errors (`rate_limit`, `server_error`, `network`) inside `prompt()`. Uses `agent.continue()` from pi-agent-core with exponential backoff (default: 5 retries, 2s base delay). Retry events (`onRetry`, `onRetriesExhausted`) let consumers show UI feedback. Provider SDKs have inconsistent retry coverage; Cortex provides uniform behavior.
+Cortex does not automatically retry `prompt()` internally. Provider SDKs have inconsistent retry coverage, so Cortex normalizes the error category and lets each consumer choose the right recovery behavior for its runtime.
 
-See **`error-recovery.md`** for the full design: classification patterns per category, error event flow, auth failure detection, automatic retry mechanism, consumer-specific rate limit handling, and integration with the 5-phase pipeline.
+See **`error-recovery.md`** for the full design: classification patterns per category, error event flow, auth failure detection, transient error handling, consumer-specific rate limit handling, and pipeline integration.
 
 ### Token Tracking
 
