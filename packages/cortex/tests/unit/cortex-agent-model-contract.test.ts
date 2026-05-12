@@ -12,6 +12,7 @@ class MockManagedPiAgent {
 
   constructor(config: Record<string, unknown>) {
     lastAgentConfig = config;
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
     lastAgentInstance = this;
     const initialState = config['initialState'] as Record<string, unknown>;
     this.state = {

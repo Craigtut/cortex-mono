@@ -484,7 +484,7 @@ describe('CortexAgent integration with deferred tools', () => {
       },
     ]);
 
-    const before = pi.state.tools as Array<{ name: string; execute: Function }>;
+    const before = pi.state.tools as Array<{ name: string; execute: (...args: unknown[]) => unknown }>;
     expect(before.map((t) => t.name)).not.toContain('DeferredThing');
 
     // Execute ToolSearch via the pi-agent-core adapter form (toolCallId, params)
