@@ -2788,7 +2788,14 @@ export class CortexAgent {
       tools.push(createGrepTool({ defaultCwd: cwd }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.Bash)) {
-      tools.push(createBashTool({ runtime }) as RegisteredTool);
+      tools.push(createBashTool({
+        runtime,
+        utilityComplete: (context) => this.utilityComplete(context as {
+          systemPrompt: string;
+          messages: Array<{ role: string; content: string }>;
+        }),
+        isAutoApprove: () => this.config.isAutoApprove?.() ?? false,
+      }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.TaskOutput)) {
       tools.push(createTaskOutputTool() as RegisteredTool);

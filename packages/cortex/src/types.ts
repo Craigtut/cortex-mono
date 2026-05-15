@@ -231,6 +231,12 @@ export interface CortexAgentConfig {
   };
 
   /**
+   * Whether the consumer is currently auto-approving tool calls.
+   * Used by built-in tool safety gates that need stricter checks in auto mode.
+   */
+  isAutoApprove?: () => boolean;
+
+  /**
    * Disable specific built-in tools by name.
    * Built-in tools (Read, Write, Edit, Glob, Grep, Bash, WebFetch, TaskOutput)
    * are registered automatically. Use this to exclude tools the agent should not have.

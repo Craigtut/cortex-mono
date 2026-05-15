@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import {
   buildSafeEnv,
   isCriticalPath,
+  isCriticalPathOrDescendant,
   classifyCommand,
   splitOnShellOperators,
   checkObfuscation,
@@ -113,9 +114,13 @@ describe('Bash safety layers', () => {
       expect(isCriticalPath('/tmp/workspace')).toBe(false);
     });
 
-    it('allows paths within /usr subdirectories (not /usr itself)', () => {
-      // /usr/local is fine, /usr is not
-      expect(isCriticalPath('/usr')).toBe(true);
+    it('allows paths within /usr subdirectories for exact critical path checks', () => {
+      expect(isCriticalPath('/usr/local')).toBe(false);
+    });
+
+    it('blocks descendants for write-path critical checks', () => {
+      expect(isCriticalPathOrDescendant('/etc/passwd')).toBe(true);
+      expect(isCriticalPathOrDescendant('/tmp/workspace/file.txt')).toBe(false);
     });
   });
 
@@ -532,7 +537,7 @@ describe('Bash safety layers', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Layer 7: Auto-Mode Classifier (Stub)
+  // Layer 7: Auto-Mode Classifier
   // -----------------------------------------------------------------------
   describe('Layer 7: checkAutoModeClassifier', () => {
     // S3: fail-safe when auto-approve is active
@@ -549,14 +554,27 @@ describe('Bash safety layers', () => {
     it('blocks when auto-approve is active and no classifier', async () => {
       const result = await checkAutoModeClassifier('ls -la', undefined, undefined, true);
       expect(result.allowed).toBe(false);
-      expect(result.reason).toContain('not yet implemented');
+      expect(result.reason).toContain('classifier unavailable');
     });
 
-    it('blocks when auto-approve is active even with utility model', async () => {
-      const mockUtility = async () => ({ allowed: true });
+    it('allows when the utility classifier returns allow', async () => {
+      const mockUtility = async () => '{"decision":"allow","reason":"read-only command"}';
+      const result = await checkAutoModeClassifier('ls -la', undefined, mockUtility, true);
+      expect(result.allowed).toBe(true);
+    });
+
+    it('blocks when the utility classifier returns block', async () => {
+      const mockUtility = async () => '{"decision":"block","reason":"destructive outside project"}';
+      const result = await checkAutoModeClassifier('rm -rf /tmp/outside', undefined, mockUtility, true);
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('destructive outside project');
+    });
+
+    it('blocks unparseable classifier output', async () => {
+      const mockUtility = async () => 'allow';
       const result = await checkAutoModeClassifier('ls -la', undefined, mockUtility, true);
       expect(result.allowed).toBe(false);
-      expect(result.reason).toContain('not yet implemented');
+      expect(result.reason).toContain('unparseable');
     });
   });
 
@@ -567,6 +585,16 @@ describe('Bash safety layers', () => {
     it('blocks compound command with critical path in later sub-command', async () => {
       const result = await runSafetyChecks(
         'ls /tmp ; rm -rf /etc',
+        '/tmp',
+        '/tmp',
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('critical system directory');
+    });
+
+    it('blocks write commands under critical paths', async () => {
+      const result = await runSafetyChecks(
+        'rm -f /etc/passwd',
         '/tmp',
         '/tmp',
       );
@@ -588,10 +616,12 @@ describe('Bash safety layers', () => {
         'echo hello',
         '/tmp',
         '/tmp',
-        { isAutoApprove: true },
+        {
+          isAutoApprove: true,
+          utilityComplete: async () => '{"decision":"allow","reason":"safe output"}',
+        },
       );
-      expect(result.allowed).toBe(false);
-      expect(result.reason).toContain('not yet implemented');
+      expect(result.allowed).toBe(true);
     });
   });
 

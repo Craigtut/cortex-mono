@@ -70,6 +70,21 @@ describe('Edit tool', () => {
     expect(fs.readFileSync(filePath, 'utf8')).toBe('baz bar baz bar baz\n');
   });
 
+  it('rejects critical system paths', async () => {
+    const filePath = process.platform === 'win32'
+      ? 'C:\\Windows\\cortex-edit-test.txt'
+      : '/etc/cortex-edit-test.txt';
+
+    const result = await editTool.execute({
+      file_path: filePath,
+      old_string: 'old',
+      new_string: 'new',
+    });
+
+    expect(getText(result)).toContain('critical system path');
+    expect(result.details.replacementCount).toBe(0);
+  });
+
   it('rejects non-unique match without replaceAll', async () => {
     const filePath = path.join(tmpDir, 'test.txt');
     fs.writeFileSync(filePath, 'foo bar foo bar\n');

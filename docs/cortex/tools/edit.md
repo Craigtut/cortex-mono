@@ -33,6 +33,9 @@ When `replace_all` is false, `old_string` must appear exactly once in the file. 
 ### Read-Before-Edit Contract
 The file must have been Read in the current agentic loop before it can be edited. The tool fails if the file hasn't been Read first. This ensures the model has seen the current state of the file.
 
+### Path Validation
+Edit refuses critical system paths. Descendants are also blocked for non-broad critical roots such as `/etc`, `/boot`, `/sbin`, `/System`, `/proc`, and `/sys`.
+
 ### Undo snapshot
 After every successful edit, the tool pushes a snapshot onto the per-file `EditHistory` stack (original contents + post-edit mtime + post-edit hash) so [UndoEdit](./undo-edit.md) can revert the mutation in a single call. History is per-loop and bounded (5 entries per file).
 
@@ -62,6 +65,7 @@ When no tier matches, the error includes a `<- nearest` annotated snippet: the s
 |-----------|----------|
 | File not found | Return error in `content`: "File does not exist: {path}" |
 | Permission denied | Return error in `content`: "Permission denied: {path}" |
+| Critical system path | Return error in `content`: "Refusing to edit critical system path: {path}" |
 | `old_string` not found | Return error in `content`: "The specified text was not found in the file." + nearest-match snippet (when a similar line exists) |
 | `old_string` matches multiple locations (tier 1) | Return error in `content`: "Found {N} exact matches on lines {list}. Provide more surrounding context to uniquely identify the edit location, or pass `replace_all: true`." |
 | Ambiguous tier 2 or tier 3 match | Return error in `content`: "Found {N} possible matches on lines {list} via {trailing-whitespace \| indentation} tolerance. No exact match exists. Tighten old_string to uniquely identify the edit location." |

@@ -94,6 +94,8 @@ export interface BashToolConfig {
   onProcessExited?: ((pid: number) => void) | undefined;
   /** Utility model completion function for Layer 7 safety classifier. */
   utilityComplete?: ((context: unknown) => Promise<unknown>) | undefined;
+  /** Whether the consumer is currently auto-approving tool calls. */
+  isAutoApprove?: boolean | (() => boolean) | undefined;
   /**
    * Consumer-set environment variable overrides that bypass the security blocklist.
    * Merged ON TOP of the sanitized environment for shell subprocesses.
@@ -278,6 +280,9 @@ export function createBashTool(config: BashToolConfig): {
         {
           utilityComplete: config.utilityComplete,
           description: params.description,
+          isAutoApprove: typeof config.isAutoApprove === 'function'
+            ? config.isAutoApprove()
+            : config.isAutoApprove,
         },
       );
 

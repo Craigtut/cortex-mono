@@ -153,6 +153,7 @@ export class Session {
       initialBasePrompt: this.mode.systemPrompt,
       slots: this.mode.contextSlots,
       resolvePermission: (toolName, toolArgs) => this.resolvePermission(toolName, toolArgs),
+      isAutoApprove: () => this.yoloMode,
       getApiKey: (provider) => this.getApiKey(provider),
       contextWindowLimit: this.config.contextWindowLimit ?? null,
       compaction: { strategy: this.compactionStrategy },

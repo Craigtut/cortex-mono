@@ -202,7 +202,7 @@ Classify commands by their impact to inform the permission gate.
 ### Layer 4: Path Validation
 
 For write/create commands, extract target file paths and validate:
-- Target must be within the configured working directory or an explicitly allowed path
+- Target must not be a critical system path. Descendants are also blocked for non-broad critical roots such as `/etc`, `/boot`, `/sbin`, `/System`, `/proc`, and `/sys`.
 - Compound commands with `cd` followed by write operations require extra scrutiny (path resolution bypass)
 - Commands with flags that change target directories (e.g., `--target-directory=PATH`) require manual approval
 - On Windows, handle both forward slash and backslash path formats
@@ -294,18 +294,13 @@ Uses the cortex **utility model** (see `model-tiers.md`) to classify whether a c
 
 **System prompt role:** "You are a security monitor for autonomous AI coding agents."
 
-**Default rule:** Actions are ALLOWED by default. Only block if a BLOCK condition matches AND no ALLOW exception applies.
+**Default rule:** Actions are blocked by default when the classifier is unavailable, errors, times out, or returns unparseable output. The classifier must explicitly return an allow decision.
 
-**Two-stage classification:**
-1. **Fast check** (256 max tokens): Quick classification. If `shouldBlock: false`, proceed.
-2. **Full analysis** (4096 max tokens): Detailed review when the fast check blocks or is uncertain.
-
-**Tool schema:**
-```typescript
-classify_result: {
-  thinking: string,     // reasoning about the decision
-  shouldBlock: boolean,  // the verdict
-  reason: string         // human-readable explanation
+**Response schema:**
+```json
+{
+  "decision": "allow" | "block",
+  "reason": "human-readable explanation"
 }
 ```
 

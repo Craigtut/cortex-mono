@@ -18,6 +18,7 @@ import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
+import { isCriticalPathOrDescendant } from './bash/safety.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -147,6 +148,19 @@ export function createWriteTool(config: WriteToolConfig): {
     async execute(params: WriteParamsType): Promise<ToolContentDetails<WriteDetails>> {
       const filePath = path.resolve(params.file_path);
       const newContent = params.content;
+
+      if (isCriticalPathOrDescendant(filePath)) {
+        return {
+          content: [{ type: 'text', text: `Refusing to write to critical system path: ${filePath}` }],
+          details: {
+            filePath,
+            isCreate: false,
+            bytesWritten: 0,
+            diff: null,
+            originalContent: null,
+          },
+        };
+      }
 
       // Check if file exists (before acquiring lock)
       let fileExists = false;

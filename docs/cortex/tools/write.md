@@ -44,7 +44,7 @@ For updates (not creates), the tool computes a structured patch internally. This
 - Atomic write on Windows: `rename` over an existing file may fail if the target is open. Fall back to direct write if rename fails.
 
 ### Path Validation
-Write does not enforce path restrictions itself. Path validation (restricting writes to the working directory) is handled by the permission gate's `beforeToolCall` hook. The consumer configures which paths are allowed.
+Write refuses critical system paths. Descendants are also blocked for non-broad critical roots such as `/etc`, `/boot`, `/sbin`, `/System`, `/proc`, and `/sys`. Other path restrictions, such as restricting writes to the working directory, are handled by the permission gate's `beforeToolCall` hook. The consumer configures which paths are allowed.
 
 ### Error Handling
 
@@ -54,6 +54,7 @@ Write does not enforce path restrictions itself. Path validation (restricting wr
 | Disk full | Return error in `content`: "Disk full. Cannot write to: {path}" |
 | Path too long | Return error in `content`: "Path exceeds system limit: {path}" |
 | Parent directory creation fails | Return error in `content`: "Cannot create directory: {parentPath}" |
+| Critical system path | Return error in `content`: "Refusing to write to critical system path: {path}" |
 | Read-before-write violation | Return error in `content`: "You must Read this file before overwriting it." |
 
 ### System Prompt Guidance

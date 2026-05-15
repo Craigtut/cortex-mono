@@ -56,6 +56,20 @@ describe('Write tool', () => {
     expect(fs.readFileSync(filePath, 'utf8')).toBe('hello world');
   });
 
+  it('rejects critical system paths', async () => {
+    const filePath = process.platform === 'win32'
+      ? 'C:\\Windows\\cortex-write-test.txt'
+      : '/etc/cortex-write-test.txt';
+
+    const result = await writeTool.execute({
+      file_path: filePath,
+      content: 'blocked',
+    });
+
+    expect(getText(result)).toContain('critical system path');
+    expect(result.details.bytesWritten).toBe(0);
+  });
+
   it('overwrites an existing file after read', async () => {
     const filePath = path.join(tmpDir, 'existing.txt');
     fs.writeFileSync(filePath, 'original content');

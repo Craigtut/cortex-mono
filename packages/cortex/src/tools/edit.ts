@@ -19,6 +19,7 @@ import type { ToolContentDetails } from '../types.js';
 import { computeDiff, type DiffHunk } from './write.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
+import { isCriticalPathOrDescendant } from './bash/safety.js';
 import {
   findMatch,
   findNearestMatch,
@@ -195,6 +196,11 @@ export function createEditTool(config: EditToolConfig): {
       const oldString = params.old_string;
       const newString = params.new_string;
       const replaceAll = params.replace_all ?? false;
+
+      if (isCriticalPathOrDescendant(filePath)) {
+        return noChange(filePath, oldString, newString, replaceAll,
+          `Refusing to edit critical system path: ${filePath}`);
+      }
 
       // Check identical strings (no lock needed)
       if (oldString === newString) {
