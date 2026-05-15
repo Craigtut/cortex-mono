@@ -164,6 +164,35 @@ interface OAuthCallbacks {
     message: string;
     options: Array<{ id: string; label: string }>;
   }) => Promise<string | undefined>;
+
+  /**
+   * Optional browser callback page renderer for callback-server OAuth flows.
+   * This is a best-effort compatibility shim around pi-ai's internal page.
+   */
+  renderCallbackPage?: (context: OAuthCallbackPageContext) => string;
+}
+
+interface OAuthCallbackPageContext {
+  /** Provider identifier, e.g. "anthropic" or "openai-codex". */
+  provider: string;
+  /** Human-readable provider name when available. */
+  providerName: string;
+  /** Whether the callback response represents success or failure. */
+  status: 'success' | 'error';
+  /** Page title extracted from pi-ai's default page. */
+  title: string;
+  /** Page heading extracted from pi-ai's default page. */
+  heading: string;
+  /** User-facing message extracted from pi-ai's default page. */
+  message: string;
+  /** Error details extracted from pi-ai's default page, if present. */
+  details?: string;
+  /** Callback path matched by the shim, without query parameters. */
+  callbackPath: string;
+  /** Local callback port matched by the shim. */
+  callbackPort: number;
+  /** Pi-ai's original generated page. */
+  defaultHtml: string;
 }
 
 interface OAuthResult {
@@ -339,14 +368,19 @@ class ProviderManager implements IProviderManager {
 
     this.activeOAuthAbort = new AbortController();
 
-    const rawCredentials = await oauthProvider.login({
-      onAuth: callbacks.onAuth,
-      onPrompt: callbacks.onPrompt,
-      onProgress: callbacks.onProgress,
-      onManualCodeInput: callbacks.onManualCodeInput,
-      onSelect: callbacks.onSelect,
-      signal: this.activeOAuthAbort.signal,
-    });
+    const rawCredentials = await withOAuthCallbackPageShim(
+      provider,
+      oauthProvider.name,
+      callbacks.renderCallbackPage,
+      () => oauthProvider.login({
+        onAuth: callbacks.onAuth,
+        onPrompt: callbacks.onPrompt,
+        onProgress: callbacks.onProgress,
+        onManualCodeInput: callbacks.onManualCodeInput,
+        onSelect: callbacks.onSelect,
+        signal: this.activeOAuthAbort.signal,
+      }),
+    );
 
     this.activeOAuthAbort = null;
 
@@ -562,6 +596,21 @@ if (!oauthProvider) throw new Error(`Provider "${provider}" does not support OAu
 
 const rawCredentials = await oauthProvider.login(callbacks);
 ```
+
+### OAuth Callback Page Customization
+
+Pi-ai owns the localhost callback server for browser-based OAuth providers. It currently renders its own success and failure HTML without exposing a page hook. `ProviderManager` offers an opt-in `renderCallbackPage` compatibility shim so consumers can brand that final browser page without importing pi-ai or copying provider login flows.
+
+The shim is intentionally narrow:
+
+- It only runs when `renderCallbackPage` is provided.
+- It only matches known pi-ai callback routes: Anthropic `/callback` on port `53692`, and OpenAI Codex `/auth/callback` on port `1455`.
+- It requires a local host header (`localhost`, `127.0.0.1`, or `::1`) and a pi-ai authentication page title.
+- It passes only safe page metadata to the renderer. Query parameters such as OAuth `code` and `state` are never exposed.
+- It is installed only for the duration of the OAuth login and restored in `finally`.
+- It rejects concurrent customized callback-page flows in the same process.
+
+GitHub Copilot uses device-code OAuth and does not show a localhost callback page, so this renderer is not used for that provider.
 
 ### Display Name Extraction
 

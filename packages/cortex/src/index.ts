@@ -283,6 +283,9 @@ export { ProviderManager } from './provider-manager.js';
 export type {
   IProviderManager,
   OAuthCallbacks,
+  OAuthCallbackPageContext,
+  OAuthCallbackPageRenderer,
+  OAuthCallbackPageStatus,
   OAuthMeta,
   OAuthResult,
   OAuthRefreshResult,

@@ -49,6 +49,53 @@ vi.mock('@earendil-works/pi-ai/oauth', () => ({
   getOAuthApiKey: (...args: unknown[]) => mockGetOAuthApiKey(...args),
 }));
 
+const PI_OAUTH_SUCCESS_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <title>Authentication successful</title>
+</head>
+<body>
+  <main>
+    <h1>Authentication successful</h1>
+    <p>Anthropic authentication completed. You can close this window.</p>
+  </main>
+</body>
+</html>`;
+
+async function requestLocalOAuthPage(options: {
+  path?: string;
+  port?: number;
+  html?: string;
+  contentType?: string;
+} = {}): Promise<string> {
+  const { createServer } = await import('node:http');
+  const path = options.path ?? '/callback';
+  const port = options.port ?? 53692;
+  const html = options.html ?? PI_OAUTH_SUCCESS_HTML;
+  const contentType = options.contentType ?? 'text/html; charset=utf-8';
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': contentType });
+    res.end(html);
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
+  });
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`);
+    return await response.text();
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close(err => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -213,6 +260,107 @@ describe('ProviderManager', () => {
       expect(callArgs['onManualCodeInput']).toBe(callbacks.onManualCodeInput);
       expect(callArgs['onSelect']).toBe(callbacks.onSelect);
       expect(callArgs['signal']).toBeInstanceOf(AbortSignal);
+      expect(callArgs['renderCallbackPage']).toBeUndefined();
+    });
+
+    it('renders a custom callback page for known pi-ai callback routes', async () => {
+      let callbackHtml = '';
+      mockLoginAnthropic.mockImplementation(async () => {
+        callbackHtml = await requestLocalOAuthPage();
+        return { accessToken: 'test-token' };
+      });
+
+      const renderCallbackPage = vi.fn((context) => {
+        expect(context.provider).toBe('anthropic');
+        expect(context.providerName).toBe('Anthropic');
+        expect(context.status).toBe('success');
+        expect(context.title).toBe('Authentication successful');
+        expect(context.heading).toBe('Authentication successful');
+        expect(context.message).toBe('Anthropic authentication completed. You can close this window.');
+        expect(context.callbackPath).toBe('/callback');
+        expect(context.callbackPort).toBe(53692);
+        expect(context.defaultHtml).toContain('Authentication successful');
+        return '<!doctype html><html><body>Cortex OAuth complete</body></html>';
+      });
+
+      await pm.initiateOAuth('anthropic', {
+        onAuth: vi.fn(),
+        onPrompt: vi.fn(),
+        renderCallbackPage,
+      });
+
+      expect(renderCallbackPage).toHaveBeenCalledTimes(1);
+      expect(callbackHtml).toContain('Cortex OAuth complete');
+      expect(callbackHtml).not.toContain('Anthropic authentication completed');
+    });
+
+    it('leaves non-matching callback responses unchanged', async () => {
+      let callbackHtml = '';
+      mockLoginAnthropic.mockImplementation(async () => {
+        callbackHtml = await requestLocalOAuthPage({ path: '/not-callback' });
+        return { accessToken: 'test-token' };
+      });
+
+      const renderCallbackPage = vi.fn(() => (
+        '<!doctype html><html><body>Cortex OAuth complete</body></html>'
+      ));
+
+      await pm.initiateOAuth('anthropic', {
+        onAuth: vi.fn(),
+        onPrompt: vi.fn(),
+        renderCallbackPage,
+      });
+
+      expect(renderCallbackPage).not.toHaveBeenCalled();
+      expect(callbackHtml).toContain('Anthropic authentication completed');
+    });
+
+    it('restores the callback page shim after login failure', async () => {
+      const renderCallbackPage = vi.fn(() => (
+        '<!doctype html><html><body>Cortex OAuth complete</body></html>'
+      ));
+      mockLoginAnthropic.mockRejectedValue(new Error('Login failed'));
+
+      await expect(pm.initiateOAuth('anthropic', {
+        onAuth: vi.fn(),
+        onPrompt: vi.fn(),
+        renderCallbackPage,
+      })).rejects.toThrow('Login failed');
+
+      const callbackHtml = await requestLocalOAuthPage();
+      expect(renderCallbackPage).not.toHaveBeenCalled();
+      expect(callbackHtml).toContain('Anthropic authentication completed');
+    });
+
+    it('rejects concurrent customized callback page shims', async () => {
+      let finishLogin!: () => void;
+      let resolveStarted!: () => void;
+      const started = new Promise<void>(resolve => {
+        resolveStarted = resolve;
+      });
+
+      mockLoginAnthropic.mockImplementationOnce(async () => {
+        resolveStarted();
+        return await new Promise<Record<string, unknown>>(resolve => {
+          finishLogin = () => resolve({ accessToken: 'test-token' });
+        });
+      });
+
+      const callbacks = {
+        onAuth: vi.fn(),
+        onPrompt: vi.fn(),
+        renderCallbackPage: vi.fn(() => '<!doctype html><html><body>Done</body></html>'),
+      };
+
+      const firstLogin = pm.initiateOAuth('anthropic', callbacks);
+      await started;
+
+      const secondProviderManager = new ProviderManager();
+      await expect(secondProviderManager.initiateOAuth('anthropic', callbacks))
+        .rejects.toThrow('already active');
+
+      finishLogin();
+      await firstLogin;
     });
 
     it('throws for unknown OAuth provider', async () => {

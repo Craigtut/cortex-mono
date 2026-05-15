@@ -19,10 +19,14 @@ import {
   OAUTH_PROVIDER_IDS,
   UTILITY_MODEL_DEFAULTS,
 } from './provider-registry.js';
+import { createRequire } from 'node:module';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ThinkingLevel } from './types.js';
 import type { ProviderInfo, ModelInfo } from './provider-registry.js';
 import { wrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
+
+const nodeRequire = createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------
 // OAuth types
@@ -61,7 +65,52 @@ export interface OAuthCallbacks {
     message: string;
     options: Array<{ id: string; label: string }>;
   }) => Promise<string | undefined>;
+
+  /**
+   * Optional renderer for provider OAuth callback pages shown in the browser.
+   *
+   * Pi-ai does not expose a native callback page hook, so Cortex implements
+   * this as a narrow Node.js compatibility shim. It only runs for known pi-ai
+   * localhost callback routes and is restored immediately after the login flow.
+   */
+  renderCallbackPage?: OAuthCallbackPageRenderer | undefined;
 }
+
+/** Status of the browser callback page produced by an OAuth flow. */
+export type OAuthCallbackPageStatus = 'success' | 'error';
+
+/** Context passed to a custom OAuth callback page renderer. */
+export interface OAuthCallbackPageContext {
+  /** Provider identifier, e.g. "anthropic" or "openai-codex". */
+  provider: string;
+  /** Human-readable provider name when available. */
+  providerName: string;
+  /** Whether the callback response represents success or failure. */
+  status: OAuthCallbackPageStatus;
+  /** Page title extracted from pi-ai's default page. */
+  title: string;
+  /** Page heading extracted from pi-ai's default page. */
+  heading: string;
+  /** User-facing message extracted from pi-ai's default page. */
+  message: string;
+  /** Error details extracted from pi-ai's default page, if present. */
+  details?: string | undefined;
+  /** Callback path matched by the shim, without query parameters. */
+  callbackPath: string;
+  /** Local callback port matched by the shim. */
+  callbackPort: number;
+  /** Pi-ai's original generated page. */
+  defaultHtml: string;
+}
+
+/**
+ * Render custom HTML for the browser page shown after an OAuth callback.
+ *
+ * The renderer must be synchronous because Node's response end hook is
+ * synchronous. If it throws or returns an empty string, Cortex falls back to
+ * pi-ai's default page.
+ */
+export type OAuthCallbackPageRenderer = (context: OAuthCallbackPageContext) => string;
 
 /** Display-safe metadata extracted at login time. */
 export interface OAuthMeta {
@@ -191,6 +240,211 @@ interface PiAiOAuthModule {
     provider: string,
     credentials: Record<string, unknown>,
   ) => Promise<{ apiKey: string; newCredentials: Record<string, unknown> } | null>) | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// OAuth callback page rendering shim
+// ---------------------------------------------------------------------------
+
+interface OAuthCallbackRoute {
+  readonly path: string;
+  readonly port: number;
+}
+
+interface ActiveOAuthCallbackPageShim {
+  readonly provider: string;
+  readonly providerName: string;
+  readonly route: OAuthCallbackRoute;
+  readonly render: OAuthCallbackPageRenderer;
+}
+
+type ServerResponseEnd = ServerResponse['end'];
+
+const OAUTH_CALLBACK_ROUTES: Record<string, OAuthCallbackRoute> = {
+  anthropic: { path: '/callback', port: 53692 },
+  'openai-codex': { path: '/auth/callback', port: 1455 },
+};
+
+let activeOAuthCallbackPageShim: ActiveOAuthCallbackPageShim | null = null;
+
+async function withOAuthCallbackPageShim<T>(
+  provider: string,
+  providerName: string,
+  render: OAuthCallbackPageRenderer | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  const route = OAUTH_CALLBACK_ROUTES[provider];
+  if (!render || !route) {
+    return run();
+  }
+
+  const release = installOAuthCallbackPageShim({
+    provider,
+    providerName,
+    route,
+    render,
+  });
+
+  try {
+    return await run();
+  } finally {
+    release();
+  }
+}
+
+function installOAuthCallbackPageShim(shim: ActiveOAuthCallbackPageShim): () => void {
+  if (activeOAuthCallbackPageShim) {
+    throw new Error(
+      `An OAuth callback page renderer is already active for provider "${activeOAuthCallbackPageShim.provider}".`,
+    );
+  }
+
+  const http = nodeRequire('node:http') as typeof import('node:http');
+  const prototype = http.ServerResponse.prototype;
+  const previousEnd = prototype.end;
+  activeOAuthCallbackPageShim = shim;
+
+  const patchedEnd = function patchedOAuthCallbackEnd(this: ServerResponse, ...args: unknown[]) {
+    const replacement = maybeRenderOAuthCallbackPage(this, args[0]);
+    if (replacement) {
+      args[0] = replacement;
+    }
+
+    return Reflect.apply(previousEnd, this, args) as ReturnType<ServerResponseEnd>;
+  } as ServerResponseEnd;
+
+  prototype.end = patchedEnd;
+
+  return () => {
+    if (activeOAuthCallbackPageShim === shim) {
+      activeOAuthCallbackPageShim = null;
+    }
+
+    if (prototype.end === patchedEnd) {
+      prototype.end = previousEnd;
+    }
+  };
+}
+
+function maybeRenderOAuthCallbackPage(response: ServerResponse, chunk: unknown): string | null {
+  const shim = activeOAuthCallbackPageShim;
+  if (!shim) return null;
+
+  const request = (response as ServerResponse & { req?: IncomingMessage | undefined }).req;
+  if (!request || request.method !== 'GET' || !request.url) return null;
+
+  const localPort = response.socket?.localPort;
+  if (localPort !== shim.route.port) return null;
+
+  let url: URL;
+  try {
+    url = new URL(request.url, `http://localhost:${shim.route.port}`);
+  } catch {
+    return null;
+  }
+
+  if (url.pathname !== shim.route.path) return null;
+  if (!isExpectedLocalCallbackHost(request.headers.host, shim.route.port)) return null;
+
+  const contentType = response.getHeader('content-type');
+  if (typeof contentType === 'string' && !contentType.toLowerCase().includes('text/html')) {
+    return null;
+  }
+
+  const defaultHtml = responseChunkToString(chunk);
+  if (!defaultHtml || !looksLikePiOAuthPage(defaultHtml)) return null;
+
+  const status = extractOAuthCallbackPageStatus(defaultHtml);
+  if (!status) return null;
+
+  const details = extractHtmlClassText(defaultHtml, 'details');
+  const context: OAuthCallbackPageContext = {
+    provider: shim.provider,
+    providerName: shim.providerName,
+    status,
+    title: extractHtmlTagText(defaultHtml, 'title') ?? defaultOAuthCallbackTitle(status),
+    heading: extractHtmlTagText(defaultHtml, 'h1') ?? defaultOAuthCallbackTitle(status),
+    message: extractHtmlTagText(defaultHtml, 'p') ?? defaultOAuthCallbackMessage(status),
+    callbackPath: shim.route.path,
+    callbackPort: shim.route.port,
+    defaultHtml,
+  };
+  if (details !== undefined) {
+    context.details = details;
+  }
+
+  try {
+    const rendered = shim.render(context);
+    return typeof rendered === 'string' && rendered.trim().length > 0 ? rendered : null;
+  } catch {
+    return null;
+  }
+}
+
+function isExpectedLocalCallbackHost(host: string | undefined, port: number): boolean {
+  if (!host) return false;
+
+  try {
+    const url = new URL(`http://${host}`);
+    const hostname = url.hostname.toLowerCase();
+    const parsedPort = url.port ? Number(url.port) : 80;
+    return (
+      parsedPort === port
+      && (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]')
+    );
+  } catch {
+    return false;
+  }
+}
+
+function responseChunkToString(chunk: unknown): string | null {
+  if (typeof chunk === 'string') return chunk;
+  if (Buffer.isBuffer(chunk)) return chunk.toString('utf8');
+  return null;
+}
+
+function looksLikePiOAuthPage(html: string): boolean {
+  return (
+    html.includes('<title>Authentication successful</title>')
+    || html.includes('<title>Authentication failed</title>')
+  );
+}
+
+function extractOAuthCallbackPageStatus(html: string): OAuthCallbackPageStatus | null {
+  if (html.includes('<title>Authentication successful</title>')) return 'success';
+  if (html.includes('<title>Authentication failed</title>')) return 'error';
+  return null;
+}
+
+function defaultOAuthCallbackTitle(status: OAuthCallbackPageStatus): string {
+  return status === 'success' ? 'Authentication successful' : 'Authentication failed';
+}
+
+function defaultOAuthCallbackMessage(status: OAuthCallbackPageStatus): string {
+  return status === 'success' ? 'Authentication completed.' : 'Authentication failed.';
+}
+
+function extractHtmlTagText(html: string, tag: string): string | undefined {
+  const pattern = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
+  const match = html.match(pattern);
+  return match?.[1] ? decodeHtmlText(match[1]) : undefined;
+}
+
+function extractHtmlClassText(html: string, className: string): string | undefined {
+  const pattern = new RegExp(`<[^>]+class=["'][^"']*\\b${className}\\b[^"']*["'][^>]*>([\\s\\S]*?)<\\/[^>]+>`, 'i');
+  const match = html.match(pattern);
+  return match?.[1] ? decodeHtmlText(match[1]) : undefined;
+}
+
+function decodeHtmlText(value: string): string {
+  return value
+    .replace(/<[^>]*>/g, '')
+    .replaceAll('&amp;', '&')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -487,14 +741,19 @@ export class ProviderManager implements IProviderManager {
     this.activeOAuthAbort = new AbortController();
 
     try {
-      const rawCredentials = await oauthProvider.login({
-        onAuth: callbacks.onAuth,
-        onPrompt: callbacks.onPrompt,
-        onProgress: callbacks.onProgress,
-        onManualCodeInput: callbacks.onManualCodeInput,
-        onSelect: callbacks.onSelect,
-        signal: this.activeOAuthAbort.signal,
-      });
+      const rawCredentials = await withOAuthCallbackPageShim(
+        provider,
+        oauthProvider.name,
+        callbacks.renderCallbackPage,
+        () => oauthProvider.login({
+          onAuth: callbacks.onAuth,
+          onPrompt: callbacks.onPrompt,
+          onProgress: callbacks.onProgress,
+          onManualCodeInput: callbacks.onManualCodeInput,
+          onSelect: callbacks.onSelect,
+          signal: this.activeOAuthAbort!.signal,
+        }),
+      );
 
       this.activeOAuthAbort = null;
 
