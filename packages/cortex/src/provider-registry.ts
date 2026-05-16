@@ -4,7 +4,7 @@
  * This module contains:
  * 1. PROVIDER_REGISTRY: metadata for all known providers (auth methods, env vars, key prefixes)
  * 2. OAUTH_PROVIDER_IDS: the subset of providers that support OAuth
- * 3. UTILITY_MODEL_DEFAULTS: per-provider cheapest-capable model for utility operations
+ * 3. UTILITY_MODEL_OVERRIDES: per-provider utility model overrides for inference exceptions
  *
  * OAuth flows are resolved through pi-ai's OAuth provider registry at runtime.
  *
@@ -270,17 +270,9 @@ export const OAUTH_PROVIDER_IDS: string[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Utility Model Defaults
+// Model Defaults
 // ---------------------------------------------------------------------------
 
-/**
- * Default utility model IDs per provider.
- * Used when utilityModel is 'default' or undefined.
- *
- * These are the cheapest capable models for each provider,
- * suitable for internal operations like WebFetch summarization
- * and safety classification.
- */
 /**
  * Default primary model IDs per provider.
  * Used when a user first connects a provider and no model is explicitly selected.
@@ -289,21 +281,22 @@ export const OAUTH_PROVIDER_IDS: string[] = [
 export const PRIMARY_MODEL_DEFAULTS: Record<string, string> = {
   anthropic: 'claude-sonnet-4-6',
   openai: 'gpt-5.4',
+  'openai-codex': 'gpt-5.5',
   google: 'gemini-3.1-pro-preview',
+  xai: 'grok-4',
   groq: 'openai/gpt-oss-120b',
   cerebras: 'gpt-oss-120b',
   mistral: 'mistral-large-2512',
 };
 
-export const UTILITY_MODEL_DEFAULTS: Record<string, string> = {
-  anthropic: 'claude-haiku-4-5-20251001',     // $1.00/$5.00 per 1M tokens
-  openai: 'gpt-4.1-nano',                     // $0.10/$0.40 per 1M tokens
-  'openai-codex': 'gpt-5.1-codex-mini',      // Smallest Codex model
-  google: 'gemini-2.5-flash-lite',            // $0.10/$0.40 per 1M tokens
-  groq: 'llama-3.1-8b-instant',              // ~$0.05/$0.08 per 1M tokens
-  cerebras: 'llama3.1-8b',                    // ~$0.10/$0.10 per 1M tokens
-  mistral: 'mistral-small-2506',             // $0.06/$0.18 per 1M tokens
-};
+/**
+ * Per-provider utility model overrides for inference exceptions.
+ * Leave empty unless dynamic inference picks a bad utility model for a provider.
+ */
+export const UTILITY_MODEL_OVERRIDES: Record<string, string> = {};
+
+/** Backwards-compatible alias. Prefer UTILITY_MODEL_OVERRIDES for new code. */
+export const UTILITY_MODEL_DEFAULTS = UTILITY_MODEL_OVERRIDES;
 
 // ---------------------------------------------------------------------------
 // Cache Retention

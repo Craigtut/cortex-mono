@@ -16,7 +16,7 @@ const { version: PKG_VERSION } = require('../package.json');
  *   cortex --yolo                   Start in YOLO mode (bypass permissions)
  */
 
-import { ProviderManager, type ThinkingLevel } from '@animus-labs/cortex';
+import { PRIMARY_MODEL_DEFAULTS, ProviderManager, type ThinkingLevel } from '@animus-labs/cortex';
 import { loadConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { Session } from './session.js';
@@ -158,6 +158,10 @@ async function main(): Promise<void> {
     }
   }
 
+  const initialUtilityModelId = config.defaultUtilityModel
+    ?? await credentialStore.getDefaultUtilityModel(provider)
+    ?? undefined;
+
   // Resolve initial effort: CLI config > persisted default > 'medium'
   const VALID_EFFORTS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'max'];
   const persistedEffort = await credentialStore.getDefaultEffort();
@@ -179,6 +183,7 @@ async function main(): Promise<void> {
     cwd,
     yoloMode: args.yolo,
     initialEffort,
+    initialUtilityModelId,
     resumeSessionId,
     ...(args.compaction ? { compactionStrategy: args.compaction } : {}),
   });
@@ -193,14 +198,7 @@ async function main(): Promise<void> {
 
 /** Get a sensible default model for a provider. */
 function getDefaultModel(provider: string): string {
-  switch (provider) {
-    case 'anthropic': return 'claude-sonnet-4-6';
-    case 'openai': return 'gpt-4.1';
-    case 'google': return 'gemini-2.5-flash';
-    case 'xai': return 'grok-3';
-    case 'groq': return 'llama-3.3-70b-versatile';
-    default: return 'claude-sonnet-4-6';
-  }
+  return PRIMARY_MODEL_DEFAULTS[provider] ?? PRIMARY_MODEL_DEFAULTS['anthropic']!;
 }
 
 // Run

@@ -1,5 +1,5 @@
 import { SelectList, Text, Container, type SelectItem } from '@mariozechner/pi-tui';
-import { UTILITY_MODEL_DEFAULTS } from '@animus-labs/cortex';
+import { inferUtilityModelId } from '@animus-labs/cortex';
 import type { Command } from './index.js';
 import { selectListTheme, colors } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';
@@ -176,7 +176,7 @@ async function showModelPicker(
   // For utility tier, add an "(auto)" option at the top to reset to auto-resolution
   if (tier === 'utility') {
     const agent = session.getAgent();
-    const autoModelId = agent ? UTILITY_MODEL_DEFAULTS[provider] ?? provider : '';
+    const autoModelId = inferUtilityModelId(models as Array<Record<string, unknown>>) ?? agent?.getUtilityModel().modelId ?? provider;
     items.push({
       value: '__auto__',
       label: `Auto (${autoModelId})`,
@@ -219,14 +219,12 @@ async function showModelPicker(
       if (tier === 'utility') {
         // Utility model selection
         if (item.value === '__auto__') {
-          agent.resetUtilityModel();
+          await session.resetUtilityModel();
           const resolved = agent.getUtilityModel();
           app.transcript.addNotification('Model', `Utility model reset to auto (${resolved.modelId}).`);
         } else {
           try {
-            const pm = session.getProviderManager();
-            const newModel = await pm.resolveModel(provider, item.value);
-            agent.setUtilityModel(newModel);
+            await session.setUtilityModel(item.value);
             app.transcript.addNotification('Model', `Utility model set to ${item.value}.`);
           } catch (err) {
             app.transcript.addNotification('Model Error', `Failed: ${err instanceof Error ? err.message : String(err)}`);

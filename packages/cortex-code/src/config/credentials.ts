@@ -29,6 +29,7 @@ export interface CredentialFile {
   defaultProvider: string | null;
   defaultModel: string | null;
   defaultEffort: string | null;
+  defaultUtilityModels: Record<string, string>;
   providers: Record<string, CredentialEntry>;
 }
 
@@ -41,6 +42,7 @@ function emptyCredentialFile(): CredentialFile {
     defaultProvider: null,
     defaultModel: null,
     defaultEffort: null,
+    defaultUtilityModels: {},
     providers: {},
   };
 }
@@ -52,7 +54,15 @@ async function ensureDir(filePath: string): Promise<void> {
 async function readCredentialFile(): Promise<CredentialFile> {
   try {
     const content = await readFile(CREDENTIALS_PATH, 'utf-8');
-    return JSON.parse(content) as CredentialFile;
+    const file = JSON.parse(content) as Partial<CredentialFile>;
+    return {
+      version: 1,
+      defaultProvider: file.defaultProvider ?? null,
+      defaultModel: file.defaultModel ?? null,
+      defaultEffort: file.defaultEffort ?? null,
+      defaultUtilityModels: file.defaultUtilityModels ?? {},
+      providers: file.providers ?? {},
+    };
   } catch {
     return emptyCredentialFile();
   }
@@ -222,6 +232,36 @@ export class CredentialStore {
       const file = await readCredentialFile();
       file.defaultProvider = provider;
       file.defaultModel = model;
+      await writeCredentialFile(file);
+    } finally {
+      if (release) await release();
+    }
+  }
+
+  /** Get the persisted default utility model for a provider. */
+  async getDefaultUtilityModel(provider: string): Promise<string | null> {
+    const file = await readCredentialFile();
+    return file.defaultUtilityModels[provider] ?? null;
+  }
+
+  /** Persist or clear the default utility model for a provider. */
+  async setDefaultUtilityModel(provider: string, model: string | null): Promise<void> {
+    await ensureDir(CREDENTIALS_PATH);
+    let release: (() => Promise<void>) | undefined;
+    try {
+      try {
+        await readFile(CREDENTIALS_PATH);
+      } catch {
+        await writeCredentialFile(emptyCredentialFile());
+      }
+      release = await lockfile.lock(CREDENTIALS_PATH, { retries: 3 });
+      const file = await readCredentialFile();
+      file.defaultUtilityModels ??= {};
+      if (model) {
+        file.defaultUtilityModels[provider] = model;
+      } else {
+        delete file.defaultUtilityModels[provider];
+      }
       await writeCredentialFile(file);
     } finally {
       if (release) await release();

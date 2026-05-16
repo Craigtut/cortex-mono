@@ -26,7 +26,9 @@ import type { PiEventSource } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
 import { classifyError } from './error-classifier.js';
 import { parseWorkingTags } from './working-tags.js';
-import { UTILITY_MODEL_DEFAULTS } from './provider-registry.js';
+import { getModel as getPiModel, getModels as getPiModels } from '@earendil-works/pi-ai';
+import { UTILITY_MODEL_OVERRIDES } from './provider-registry.js';
+import { inferUtilityModel } from './utility-model-inference.js';
 import { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
 import { isContextOverflow } from './compaction/failsafe.js';
@@ -2863,6 +2865,25 @@ export class CortexAgent {
    * If 'default' or undefined, look up the provider default and preserve
    * the raw provider-specific fields from the primary pi-ai model.
    */
+  private inferDefaultUtilityModel(provider: string): PiModel | null {
+    const overrideModelId = UTILITY_MODEL_OVERRIDES[provider];
+    if (overrideModelId) {
+      try {
+        const overrideModel = (getPiModel as unknown as (provider: string, modelId: string) => unknown)(provider, overrideModelId);
+        if (overrideModel) return overrideModel as PiModel;
+      } catch {
+        return null;
+      }
+    }
+
+    try {
+      const models = (getPiModels as unknown as (provider: string) => PiModel[])(provider);
+      return inferUtilityModel(models as unknown as Array<Record<string, unknown>>) as PiModel | null;
+    } catch {
+      return null;
+    }
+  }
+
   private resolveUtilityModels(
     primaryModel: CortexModel,
     primaryPiModel: PiModel,
@@ -2874,26 +2895,24 @@ export class CortexAgent {
     const primaryProvider = primaryModel.provider;
 
     if (!utilityModelConfig || utilityModelConfig === 'default') {
-      const defaultModelId = UTILITY_MODEL_DEFAULTS[primaryProvider];
-      if (!defaultModelId) {
+      const utilityPiModel = this.inferDefaultUtilityModel(primaryProvider);
+      if (!utilityPiModel) {
         return {
           utilityModel: primaryModel,
           utilityPiModel: primaryPiModel,
         };
       }
 
-      const utilityPiModel = {
-        ...primaryPiModel,
-        name: defaultModelId,
-        id: defaultModelId,
-      };
+      const rawUtilityId = utilityPiModel['id'];
+      const rawUtilityName = utilityPiModel['name'];
+      const utilityModelId = typeof rawUtilityId === 'string' ? rawUtilityId : String(rawUtilityId ?? rawUtilityName);
 
       return {
         utilityPiModel,
         utilityModel: wrapModel(
           utilityPiModel,
           primaryProvider,
-          defaultModelId,
+          utilityModelId,
           utilityPiModel.contextWindow ?? primaryModel.contextWindow,
         ),
       };

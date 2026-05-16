@@ -260,11 +260,13 @@ export type {
 // Model Wrapper (Phase 1D)
 export { wrapModel, unwrapModel, isCortexModel } from './model-wrapper.js';
 export type { CortexModel } from './model-wrapper.js';
+export { inferUtilityModel, inferUtilityModelId } from './utility-model-inference.js';
 
 // Provider Registry (Phase 1D)
 export {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
+  UTILITY_MODEL_OVERRIDES,
   UTILITY_MODEL_DEFAULTS,
   PRIMARY_MODEL_DEFAULTS,
   PROVIDER_CACHE_CONFIG,

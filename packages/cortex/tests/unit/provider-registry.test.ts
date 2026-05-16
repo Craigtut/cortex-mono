@@ -3,6 +3,7 @@ import {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
   UTILITY_MODEL_DEFAULTS,
+  UTILITY_MODEL_OVERRIDES,
 } from '../../src/provider-registry.js';
 
 describe('provider-registry', () => {
@@ -112,45 +113,16 @@ describe('provider-registry', () => {
   });
 
   // -----------------------------------------------------------------------
-  // UTILITY_MODEL_DEFAULTS
+  // UTILITY_MODEL_OVERRIDES
   // -----------------------------------------------------------------------
 
-  describe('UTILITY_MODEL_DEFAULTS', () => {
-    it('maps anthropic to a haiku model', () => {
-      expect(UTILITY_MODEL_DEFAULTS['anthropic']).toContain('haiku');
+  describe('UTILITY_MODEL_OVERRIDES', () => {
+    it('is empty by default so utility models are inferred dynamically', () => {
+      expect(UTILITY_MODEL_OVERRIDES).toEqual({});
     });
 
-    it('maps openai to gpt-4.1-nano', () => {
-      expect(UTILITY_MODEL_DEFAULTS['openai']).toBe('gpt-4.1-nano');
-    });
-
-    it('maps google to gemini flash', () => {
-      expect(UTILITY_MODEL_DEFAULTS['google']).toContain('flash');
-    });
-
-    it('maps groq to a model', () => {
-      expect(UTILITY_MODEL_DEFAULTS['groq']).toBeDefined();
-    });
-
-    it('maps cerebras to a model', () => {
-      expect(UTILITY_MODEL_DEFAULTS['cerebras']).toBeDefined();
-    });
-
-    it('maps mistral to mistral-small', () => {
-      expect(UTILITY_MODEL_DEFAULTS['mistral']).toContain('mistral-small');
-    });
-
-    it('does not have entries for providers without known cheap models', () => {
-      // Providers like openrouter, xai, custom have no default mapping
-      expect(UTILITY_MODEL_DEFAULTS['openrouter']).toBeUndefined();
-      expect(UTILITY_MODEL_DEFAULTS['custom']).toBeUndefined();
-    });
-
-    it('all values are non-empty strings', () => {
-      for (const [provider, modelId] of Object.entries(UTILITY_MODEL_DEFAULTS)) {
-        expect(typeof modelId).toBe('string');
-        expect(modelId.length, `Empty model ID for ${provider}`).toBeGreaterThan(0);
-      }
+    it('keeps UTILITY_MODEL_DEFAULTS as a backwards-compatible alias', () => {
+      expect(UTILITY_MODEL_DEFAULTS).toBe(UTILITY_MODEL_OVERRIDES);
     });
   });
 });

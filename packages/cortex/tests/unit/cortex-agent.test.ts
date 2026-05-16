@@ -210,21 +210,21 @@ describe('CortexAgent', () => {
       expect(cm.slotCount).toBe(2);
     });
 
-    it('resolves utility model from defaults for anthropic', () => {
+    it('infers utility model dynamically for anthropic', () => {
       const agent = createTestCortexAgent(piAgent, config);
       const utilityModel = agent.getUtilityModel();
       expect(utilityModel.provider).toBe('anthropic');
       expect(utilityModel.modelId).toBe('claude-haiku-4-5-20251001');
     });
 
-    it('resolves utility model from defaults for openai', () => {
+    it('infers utility model dynamically for openai', () => {
       const agent = createTestCortexAgent(piAgent, {
         ...config,
         model: makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel),
       });
       const utilityModel = agent.getUtilityModel();
       expect(utilityModel.provider).toBe('openai');
-      expect(utilityModel.modelId).toBe('gpt-4.1-nano');
+      expect(utilityModel.modelId).toBe('gpt-5.4-nano');
     });
 
     it('uses primary model when no default mapping exists', () => {

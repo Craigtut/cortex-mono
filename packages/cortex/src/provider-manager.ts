@@ -17,13 +17,14 @@
 import {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
-  UTILITY_MODEL_DEFAULTS,
+  UTILITY_MODEL_OVERRIDES,
 } from './provider-registry.js';
 import { createRequire } from 'node:module';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ThinkingLevel } from './types.js';
 import type { ProviderInfo, ModelInfo } from './provider-registry.js';
 import { wrapModel } from './model-wrapper.js';
+import { inferUtilityModelId } from './utility-model-inference.js';
 import type { CortexModel } from './model-wrapper.js';
 
 const nodeRequire = createRequire(import.meta.url);
@@ -639,10 +640,12 @@ function mapRawToModelInfo(
     supportsThinking: supportedThinkingLevels.some(level => level !== 'off')
       || !!(raw['supportsThinking'] || raw['reasoning']),
     supportedThinkingLevels,
-    supportsImages: !!raw['supportsImages'],
+    supportsImages: Array.isArray(raw['input'])
+      ? raw['input'].includes('image')
+      : !!raw['supportsImages'],
   };
 
-  const rawPricing = raw['pricing'];
+  const rawPricing = raw['pricing'] ?? raw['cost'];
   if (rawPricing && typeof rawPricing === 'object') {
     const pricing = rawPricing as Record<string, unknown>;
     const inputPrice = pricing['input'];
@@ -830,32 +833,31 @@ export class ProviderManager implements IProviderManager {
   async validateApiKey(provider: string, apiKey: string): Promise<ApiKeyValidationResult> {
     const piAi = await loadPiAi();
 
-    // Find the cheapest model for this provider to minimize validation cost
-    const cheapestModelId = this.getSmallestModelId(provider);
-    if (!cheapestModelId) {
-      // No known model, try a generic test with the provider's first model
-      const models = piAi.getModels(provider);
-      if (models.length === 0) {
-        return {
-          provider,
-          modelId: null,
-          valid: false,
-          retryable: false,
-          status: 'resolution_error',
-          message: `No models found for provider "${provider}"`,
-        };
-      }
-      const firstRawId = models[0]!['id'];
-      const firstRawName = models[0]!['name'];
-      const firstModelId = typeof firstRawId === 'string'
-        ? firstRawId
-        : typeof firstRawName === 'string'
-          ? firstRawName
-          : String(firstRawId ?? firstRawName);
-      return this.tryValidation(piAi, provider, firstModelId, apiKey);
+    const models = piAi.getModels(provider) ?? [];
+    if (models.length === 0) {
+      return {
+        provider,
+        modelId: null,
+        valid: false,
+        retryable: false,
+        status: 'resolution_error',
+        message: `No models found for provider "${provider}"`,
+      };
     }
 
-    return this.tryValidation(piAi, provider, cheapestModelId, apiKey);
+    const modelId = this.getSmallestModelId(provider, models);
+    if (!modelId) {
+      return {
+        provider,
+        modelId: null,
+        valid: false,
+        retryable: false,
+        status: 'resolution_error',
+        message: `No usable models found for provider "${provider}"`,
+      };
+    }
+
+    return this.tryValidation(piAi, provider, modelId, apiKey);
   }
 
   /**
@@ -948,11 +950,10 @@ export class ProviderManager implements IProviderManager {
   // -----------------------------------------------------------------------
 
   /**
-   * Get the cheapest known model ID for a provider.
-   * Uses the UTILITY_MODEL_DEFAULTS as a proxy for "smallest model."
+   * Get the cheapest likely utility model ID for a provider.
    */
-  private getSmallestModelId(provider: string): string | null {
-    return UTILITY_MODEL_DEFAULTS[provider] ?? null;
+  private getSmallestModelId(provider: string, models: Array<Record<string, unknown>>): string | null {
+    return UTILITY_MODEL_OVERRIDES[provider] ?? inferUtilityModelId(models);
   }
 
   /**

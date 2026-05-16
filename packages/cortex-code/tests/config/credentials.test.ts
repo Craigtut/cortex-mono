@@ -33,6 +33,7 @@ describe('CredentialStore', () => {
       expect(file.version).toBe(1);
       expect(file.defaultProvider).toBeNull();
       expect(file.defaultModel).toBeNull();
+      expect(file.defaultUtilityModels).toEqual({});
       expect(Object.keys(file.providers)).toHaveLength(0);
     });
 
@@ -53,6 +54,7 @@ describe('CredentialStore', () => {
       mockReadFile.mockResolvedValue(JSON.stringify(data));
       const file = await store.load();
       expect(file.defaultProvider).toBe('anthropic');
+      expect(file.defaultUtilityModels).toEqual({});
       expect(file.providers['anthropic']?.apiKey).toBe('sk-test');
     });
   });
@@ -137,6 +139,52 @@ describe('CredentialStore', () => {
       const defaults = await store.getDefaults();
       expect(defaults.provider).toBeNull();
       expect(defaults.model).toBeNull();
+    });
+  });
+
+  describe('getDefaultUtilityModel / setDefaultUtilityModel', () => {
+    it('returns null when no utility model is stored for the provider', async () => {
+      mockReadFile.mockResolvedValue(JSON.stringify({
+        version: 1,
+        defaultProvider: null,
+        defaultModel: null,
+        defaultUtilityModels: {},
+        providers: {},
+      }));
+
+      await expect(store.getDefaultUtilityModel('openai-codex')).resolves.toBeNull();
+    });
+
+    it('persists a utility model per provider', async () => {
+      mockReadFile.mockResolvedValue(JSON.stringify({
+        version: 1,
+        defaultProvider: null,
+        defaultModel: null,
+        defaultUtilityModels: {},
+        providers: {},
+      }));
+
+      await store.setDefaultUtilityModel('openai-codex', 'gpt-5.4-mini');
+
+      const writeCall = mockWriteFile.mock.calls[mockWriteFile.mock.calls.length - 1];
+      const written = JSON.parse(writeCall![1] as string);
+      expect(written.defaultUtilityModels['openai-codex']).toBe('gpt-5.4-mini');
+    });
+
+    it('clears a stored utility model for a provider', async () => {
+      mockReadFile.mockResolvedValue(JSON.stringify({
+        version: 1,
+        defaultProvider: null,
+        defaultModel: null,
+        defaultUtilityModels: { 'openai-codex': 'gpt-5.4-mini' },
+        providers: {},
+      }));
+
+      await store.setDefaultUtilityModel('openai-codex', null);
+
+      const writeCall = mockWriteFile.mock.calls[mockWriteFile.mock.calls.length - 1];
+      const written = JSON.parse(writeCall![1] as string);
+      expect(written.defaultUtilityModels['openai-codex']).toBeUndefined();
     });
   });
 });

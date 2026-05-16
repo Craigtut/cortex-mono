@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { ProviderManager } from '../../src/provider-manager.js';
-import { PROVIDER_REGISTRY, OAUTH_PROVIDER_IDS, UTILITY_MODEL_DEFAULTS } from '../../src/provider-registry.js';
+import { PROVIDER_REGISTRY, OAUTH_PROVIDER_IDS } from '../../src/provider-registry.js';
 import { isCortexModel, unwrapModel } from '../../src/model-wrapper.js';
 
 // ---------------------------------------------------------------------------
@@ -107,6 +107,15 @@ describe('ProviderManager', () => {
     pm = new ProviderManager();
     vi.clearAllMocks();
     mockGetSupportedThinkingLevels.mockReturnValue([]);
+    mockGetModels.mockReturnValue([
+      {
+        id: 'claude-haiku-4-5-20251001',
+        name: 'Claude Haiku 4.5',
+        input: ['text'],
+        cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+        contextWindow: 200_000,
+      },
+    ]);
   });
 
   afterEach(() => {
@@ -518,7 +527,7 @@ describe('ProviderManager', () => {
       expect(valid).toEqual(
         expect.objectContaining({
           provider: 'anthropic',
-          modelId: UTILITY_MODEL_DEFAULTS['anthropic'],
+          modelId: 'claude-haiku-4-5-20251001',
           valid: true,
           retryable: false,
           status: 'valid',
@@ -526,7 +535,7 @@ describe('ProviderManager', () => {
       );
       expect(mockGetModel).toHaveBeenCalledWith(
         'anthropic',
-        UTILITY_MODEL_DEFAULTS['anthropic'],
+        'claude-haiku-4-5-20251001',
       );
       expect(mockCompleteSimple).toHaveBeenCalledWith(
         mockModel,

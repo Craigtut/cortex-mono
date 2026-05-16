@@ -77,6 +77,7 @@ export interface SessionOptions {
   cwd: string;
   yoloMode: boolean;
   initialEffort: ThinkingLevel;
+  initialUtilityModelId?: string | undefined;
   resumeSessionId: string | undefined;
   compactionStrategy?: 'observational' | 'classic';
 }
@@ -106,6 +107,7 @@ export class Session {
   private readonly providerManager: ProviderManager;
   private readonly credentialStore: CredentialStore;
   private readonly cwd: string;
+  private readonly initialUtilityModelId: string | undefined;
   private readonly compactionStrategy: 'observational' | 'classic';
 
   constructor(options: SessionOptions) {
@@ -117,6 +119,7 @@ export class Session {
     this.providerManager = options.providerManager;
     this.credentialStore = options.credentialStore;
     this.cwd = options.cwd;
+    this.initialUtilityModelId = options.initialUtilityModelId;
     this.yoloMode = options.yoloMode;
     this.preferredEffort = options.initialEffort;
     this.effectiveEffort = this.preferredEffort;
@@ -161,6 +164,18 @@ export class Session {
       logger: log,
       ...this.buildDiagnosticsConfig() ? { diagnostics: this.buildDiagnosticsConfig()! } : {},
     });
+
+    if (this.initialUtilityModelId) {
+      try {
+        await this.applyUtilityModel(this.initialUtilityModelId, false);
+      } catch (err) {
+        log.warn('Failed to apply initial utility model', {
+          provider: this.provider,
+          model: this.initialUtilityModelId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     // Set up context slots
     const projectContext = await discoverProjectContext(this.cwd);
@@ -1131,6 +1146,55 @@ export class Session {
     }
   }
 
+  private async resolveProviderModel(provider: string, modelId: string): Promise<CortexModel> {
+    const entry = await this.credentialStore.getProvider(provider);
+    if (entry?.method === 'custom' || provider === 'ollama') {
+      const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
+      const contextWindow = provider === 'ollama'
+        ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), modelId) ?? undefined
+        : undefined;
+      return this.providerManager.createCustomModel({ baseUrl, modelId, contextWindow });
+    }
+    return this.providerManager.resolveModel(provider, modelId);
+  }
+
+  private async applyUtilityModel(modelId: string, persist: boolean): Promise<void> {
+    const utilityModel = await this.resolveProviderModel(this.provider, modelId);
+    this.agent!.setUtilityModel(utilityModel);
+    if (persist) {
+      await this.credentialStore.setDefaultUtilityModel(this.provider, modelId);
+    }
+  }
+
+  async setUtilityModel(modelId: string): Promise<void> {
+    await this.applyUtilityModel(modelId, true);
+  }
+
+  async resetUtilityModel(): Promise<void> {
+    this.agent!.resetUtilityModel();
+    await this.credentialStore.setDefaultUtilityModel(this.provider, null);
+  }
+
+  private async applyStoredUtilityModelForProvider(provider: string): Promise<void> {
+    const utilityModelId = this.config.defaultUtilityModel
+      ?? await this.credentialStore.getDefaultUtilityModel(provider);
+    if (!utilityModelId) {
+      this.agent!.resetUtilityModel();
+      return;
+    }
+
+    try {
+      await this.applyUtilityModel(utilityModelId, false);
+    } catch (err) {
+      this.agent!.resetUtilityModel();
+      log.warn('Failed to apply stored utility model', {
+        provider,
+        model: utilityModelId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   /** Switch the primary model. Returns the new CortexModel or throws. */
   async switchModel(modelId: string): Promise<void> {
     let newModel;
@@ -1174,6 +1238,7 @@ export class Session {
     this.agent!.setModel(newModel);
     this.provider = newProvider;
     this.modelId = newModelId;
+    await this.applyStoredUtilityModelForProvider(newProvider);
     // Reconcile effort with new model's capabilities
     const { clamped, reason, effective } = await this.reconcileEffort();
     this.app?.updateStatus({ provider: newProvider, model: newModelId, effortLevel: effective, contextTokenLimit: this.agent!.effectiveContextWindow });

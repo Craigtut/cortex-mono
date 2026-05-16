@@ -15,6 +15,8 @@ export interface CortexCodeConfig {
   maxTurns?: number;
   /** Default thinking effort level. Default: 'medium'. */
   defaultEffort?: string;
+  /** Default utility model override for the active provider. */
+  defaultUtilityModel?: string;
   /** Optional diagnostics for investigating TUI or prompt freezes. */
   diagnostics?: CortexCodeDiagnosticsConfig;
 }
