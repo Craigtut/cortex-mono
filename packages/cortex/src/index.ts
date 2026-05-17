@@ -281,8 +281,9 @@ export type {
 } from './provider-registry.js';
 
 // Provider Manager (Phase 1D)
-export { ProviderManager } from './provider-manager.js';
+export { ProviderManager, OAuthError } from './provider-manager.js';
 export type {
+  OAuthErrorCode,
   IProviderManager,
   OAuthCallbacks,
   OAuthCallbackPageContext,

@@ -75,6 +75,16 @@ export interface OAuthCallbacks {
    * localhost callback routes and is restored immediately after the login flow.
    */
   renderCallbackPage?: OAuthCallbackPageRenderer | undefined;
+
+  /**
+   * Overall timeout for the OAuth flow, in milliseconds. pi-ai's
+   * callback-server flows (e.g. Anthropic) do not honor an abort signal and
+   * hang forever if the callback never arrives or arrives with an error, so
+   * Cortex enforces this timeout itself and rejects with an
+   * `OAuthError('timed_out')`. Defaults to 5 minutes. Pass `0` or a negative
+   * value to disable (not recommended).
+   */
+  timeoutMs?: number | undefined;
 }
 
 /** Status of the browser callback page produced by an OAuth flow. */
@@ -150,6 +160,48 @@ export interface OAuthRefreshResult {
   meta: OAuthMeta;
   /** Whether the credentials were actually refreshed (true) or reused as-is (false). */
   changed: boolean;
+}
+
+/**
+ * Discriminant for OAuth flow failures, so consumers can render specific
+ * UX instead of parsing error strings.
+ *
+ * - `unsupported_provider`: provider has no OAuth support.
+ * - `callback_port_in_use`: the provider's fixed loopback callback port is
+ *   already bound (e.g. another Anthropic app on 53692, or a leftover flow).
+ *   Detected before the browser opens.
+ * - `cancelled`: the flow was cancelled via `cancelOAuth()`.
+ * - `timed_out`: the flow exceeded its timeout (pi-ai's callback servers do
+ *   not honor an abort signal, so this is the backstop against hangs).
+ * - `callback_failed`: the browser callback fired but the provider reported
+ *   an error (e.g. state mismatch). Surfaced immediately instead of hanging.
+ */
+export type OAuthErrorCode =
+  | 'unsupported_provider'
+  | 'callback_port_in_use'
+  | 'cancelled'
+  | 'timed_out'
+  | 'callback_failed';
+
+/** Structured error thrown by initiateOAuth. */
+export class OAuthError extends Error {
+  readonly code: OAuthErrorCode;
+  readonly provider: string;
+  /** The fixed callback port, when relevant (`callback_port_in_use`). */
+  readonly port?: number | undefined;
+
+  constructor(
+    code: OAuthErrorCode,
+    provider: string,
+    message: string,
+    options?: { port?: number | undefined; cause?: unknown },
+  ) {
+    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = 'OAuthError';
+    this.code = code;
+    this.provider = provider;
+    this.port = options?.port;
+  }
 }
 
 /** Configuration for creating a custom model endpoint. */
@@ -256,7 +308,13 @@ interface ActiveOAuthCallbackPageShim {
   readonly provider: string;
   readonly providerName: string;
   readonly route: OAuthCallbackRoute;
-  readonly render: OAuthCallbackPageRenderer;
+  readonly render: OAuthCallbackPageRenderer | undefined;
+  /**
+   * Notified exactly once when the browser callback fires and its status
+   * (success/error) is known. Lets the flow react immediately instead of
+   * waiting on pi-ai (which hangs on non-success callbacks).
+   */
+  readonly onResult?: ((status: OAuthCallbackPageStatus, context: OAuthCallbackPageContext) => void) | undefined;
 }
 
 type ServerResponseEnd = ServerResponse['end'];
@@ -267,30 +325,88 @@ const OAUTH_CALLBACK_ROUTES: Record<string, OAuthCallbackRoute> = {
 };
 
 let activeOAuthCallbackPageShim: ActiveOAuthCallbackPageShim | null = null;
+/** Ensures `onResult` fires at most once per installed shim. */
+let oauthCallbackResultNotified = false;
 
-async function withOAuthCallbackPageShim<T>(
+/** Default overall OAuth flow timeout (pi-ai hangs without this). */
+const DEFAULT_OAUTH_FLOW_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * Probe whether something is already listening on a loopback port. Used to
+ * fail an OAuth flow fast (before opening a browser) when the provider's
+ * fixed callback port is occupied — otherwise pi-ai binds the other stack /
+ * the browser hits the wrong listener and the user gets a dead page while
+ * pi-ai waits forever.
+ */
+function probeCallbackPortInUse(port: number, host: string): Promise<boolean> {
+  const net = nodeRequire('node:net') as typeof import('node:net');
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (inUse: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(inUse);
+    };
+    const socket = net.connect({ port, host });
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.setTimeout(600, () => finish(false));
+  });
+}
+
+/**
+ * Throw an `OAuthError('callback_port_in_use')` if the provider's fixed
+ * callback port is occupied on either IPv4 or IPv6 loopback. No-op for
+ * providers without a known callback route (manual/device-code flows).
+ */
+async function assertOAuthCallbackPortAvailable(provider: string): Promise<void> {
+  const route = OAUTH_CALLBACK_ROUTES[provider];
+  if (!route) return;
+
+  for (const host of ['127.0.0.1', '::1']) {
+    if (await probeCallbackPortInUse(route.port, host)) {
+      throw new OAuthError(
+        'callback_port_in_use',
+        provider,
+        `OAuth callback port ${route.port} for "${provider}" is already in use ` +
+        `(detected on ${host}). This is a fixed port: another application is ` +
+        `holding it, or a previous sign-in did not finish. Close that ` +
+        `application (or restart the host process), then try again.`,
+        { port: route.port },
+      );
+    }
+  }
+}
+
+/**
+ * Install the callback-page shim for a flow when there is a known callback
+ * route AND something to do with it (a custom renderer and/or a result
+ * observer). Returns a release function (a no-op when no shim was installed).
+ *
+ * Unlike a `try/finally` wrapper around pi-ai's `login()`, the caller owns
+ * the release lifecycle: pi-ai's callback-server flows hang forever on a
+ * non-success callback, so cleanup must be tied to the flow's own
+ * race/timeout, not to awaiting the (possibly never-settling) login promise.
+ */
+function maybeInstallOAuthCallbackShim(
   provider: string,
   providerName: string,
   render: OAuthCallbackPageRenderer | undefined,
-  run: () => Promise<T>,
-): Promise<T> {
+  onResult: ActiveOAuthCallbackPageShim['onResult'],
+): () => void {
   const route = OAUTH_CALLBACK_ROUTES[provider];
-  if (!render || !route) {
-    return run();
+  if (!route || (!render && !onResult)) {
+    return () => {};
   }
 
-  const release = installOAuthCallbackPageShim({
+  return installOAuthCallbackPageShim({
     provider,
     providerName,
     route,
     render,
+    onResult,
   });
-
-  try {
-    return await run();
-  } finally {
-    release();
-  }
 }
 
 function installOAuthCallbackPageShim(shim: ActiveOAuthCallbackPageShim): () => void {
@@ -304,6 +420,7 @@ function installOAuthCallbackPageShim(shim: ActiveOAuthCallbackPageShim): () => 
   const prototype = http.ServerResponse.prototype;
   const previousEnd = prototype.end;
   activeOAuthCallbackPageShim = shim;
+  oauthCallbackResultNotified = false;
 
   const patchedEnd = function patchedOAuthCallbackEnd(this: ServerResponse, ...args: unknown[]) {
     const replacement = maybeRenderOAuthCallbackPage(this, args[0]);
@@ -374,6 +491,19 @@ function maybeRenderOAuthCallbackPage(response: ServerResponse, chunk: unknown):
     context.details = details;
   }
 
+  // Notify the flow that the browser callback fired (once). This lets
+  // initiateOAuth react to a failed callback immediately rather than
+  // waiting on pi-ai, which hangs on non-success callbacks.
+  if (!oauthCallbackResultNotified && shim.onResult) {
+    oauthCallbackResultNotified = true;
+    try {
+      shim.onResult(status, context);
+    } catch {
+      // An observer must never break the callback response.
+    }
+  }
+
+  if (!shim.render) return null;
   try {
     const rendered = shim.render(context);
     return typeof rendered === 'string' && rendered.trim().length > 0 ? rendered : null;
@@ -732,41 +862,112 @@ export class ProviderManager implements IProviderManager {
    * @param provider - OAuth provider identifier
    * @param callbacks - UI callbacks for auth URL, prompts, and progress
    * @returns The OAuth credentials and display metadata
-   * @throws Error if the provider does not support OAuth or pi-ai is not installed
+   * @throws {OAuthError} `unsupported_provider`, `callback_port_in_use`,
+   *   `cancelled`, `timed_out`, or `callback_failed`. Other errors (e.g.
+   *   network/token-exchange failures from pi-ai) propagate as-is.
    */
   async initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult> {
     const oauthModule = await loadPiAiOAuth();
     const oauthProvider = oauthModule.getOAuthProvider?.(provider);
     if (!oauthProvider) {
-      throw new Error(`Provider "${provider}" does not support OAuth`);
+      throw new OAuthError(
+        'unsupported_provider',
+        provider,
+        `Provider "${provider}" does not support OAuth`,
+      );
     }
 
-    this.activeOAuthAbort = new AbortController();
+    // (A) Fail fast — before opening a browser — if the provider's fixed
+    // callback port is already taken. Otherwise pi-ai binds the other
+    // stack, the browser hits the wrong listener, and pi-ai waits forever.
+    await assertOAuthCallbackPortAvailable(provider);
+
+    const abort = new AbortController();
+    this.activeOAuthAbort = abort;
+
+    // (C) pi-ai only settles its callback wait on success; on a failed
+    // callback (e.g. state mismatch) it hangs. The render shim already sees
+    // that response — use it to fail the flow immediately with the reason.
+    let failFromCallback!: (err: OAuthError) => void;
+    const callbackFailure = new Promise<never>((_, reject) => {
+      failFromCallback = reject;
+    });
+    const handleCallbackResult = (
+      status: OAuthCallbackPageStatus,
+      ctx: OAuthCallbackPageContext,
+    ): void => {
+      if (status !== 'error') return;
+      const detail = ctx.details ? ` (${ctx.details})` : '';
+      failFromCallback(new OAuthError(
+        'callback_failed',
+        provider,
+        `OAuth callback for "${provider}" reported a failure: ${ctx.message}${detail}`,
+      ));
+    };
+
+    const releaseShim = maybeInstallOAuthCallbackShim(
+      provider,
+      oauthProvider.name,
+      callbacks.renderCallbackPage,
+      handleCallbackResult,
+    );
+
+    // (B) pi-ai callback servers ignore the abort signal, so cancellation
+    // and timeout are enforced here. Without this the flow hangs forever.
+    const timeoutMs = callbacks.timeoutMs ?? DEFAULT_OAUTH_FLOW_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+        timer = setTimeout(() => reject(new OAuthError(
+          'timed_out',
+          provider,
+          `OAuth flow for "${provider}" timed out after ${timeoutMs}ms.`,
+        )), timeoutMs);
+        timer.unref?.();
+      }
+    });
+    const cancelled = new Promise<never>((_, reject) => {
+      abort.signal.addEventListener('abort', () => reject(new OAuthError(
+        'cancelled',
+        provider,
+        `OAuth flow for "${provider}" was cancelled.`,
+      )), { once: true });
+    });
+
+    const login = oauthProvider.login({
+      onAuth: callbacks.onAuth,
+      onPrompt: callbacks.onPrompt,
+      onProgress: callbacks.onProgress,
+      onManualCodeInput: callbacks.onManualCodeInput,
+      onSelect: callbacks.onSelect,
+      signal: abort.signal,
+    }) as Promise<Record<string, unknown>>;
+    // Whichever promise loses the race may still settle later (pi-ai's
+    // login can hang or settle late; the aux promises can reject after the
+    // race is decided). Attach inert handlers so a late rejection never
+    // surfaces as an unhandled rejection. Promise.race still observes the
+    // first settlement independently.
+    login.catch(() => {});
+    cancelled.catch(() => {});
+    timeout.catch(() => {});
+    callbackFailure.catch(() => {});
 
     try {
-      const rawCredentials = await withOAuthCallbackPageShim(
-        provider,
-        oauthProvider.name,
-        callbacks.renderCallbackPage,
-        () => oauthProvider.login({
-          onAuth: callbacks.onAuth,
-          onPrompt: callbacks.onPrompt,
-          onProgress: callbacks.onProgress,
-          onManualCodeInput: callbacks.onManualCodeInput,
-          onSelect: callbacks.onSelect,
-          signal: this.activeOAuthAbort!.signal,
-        }),
-      );
-
-      this.activeOAuthAbort = null;
+      const rawCredentials = await Promise.race([
+        login,
+        cancelled,
+        timeout,
+        callbackFailure,
+      ]);
 
       const credentials = JSON.stringify(rawCredentials);
       const meta = buildOAuthMeta(provider, rawCredentials);
 
       return { credentials, meta };
-    } catch (err) {
-      this.activeOAuthAbort = null;
-      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+      releaseShim();
+      if (this.activeOAuthAbort === abort) this.activeOAuthAbort = null;
     }
   }
 

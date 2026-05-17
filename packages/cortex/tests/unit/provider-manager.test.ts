@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { ProviderManager } from '../../src/provider-manager.js';
+import { ProviderManager, OAuthError } from '../../src/provider-manager.js';
 import { PROVIDER_REGISTRY, OAUTH_PROVIDER_IDS } from '../../src/provider-registry.js';
 import { isCortexModel, unwrapModel } from '../../src/model-wrapper.js';
 
@@ -25,13 +25,14 @@ vi.mock('@earendil-works/pi-ai', () => ({
 
 // Mock pi-ai/oauth module
 const mockLoginAnthropic = vi.fn();
+const mockLoginCodex = vi.fn();
 const mockGetOAuthApiKey = vi.fn();
 const mockGetOAuthProvider = vi.fn((provider: string) => {
   if (provider === 'anthropic') {
     return { id: provider, name: 'Anthropic', login: mockLoginAnthropic };
   }
   if (provider === 'openai-codex') {
-    return { id: provider, name: 'OpenAI Codex', login: vi.fn() };
+    return { id: provider, name: 'OpenAI Codex', login: mockLoginCodex };
   }
   if (provider === 'github-copilot') {
     return { id: provider, name: 'GitHub Copilot', login: vi.fn() };
@@ -43,7 +44,7 @@ vi.mock('@earendil-works/pi-ai/oauth', () => ({
   getOAuthProvider: (...args: unknown[]) => mockGetOAuthProvider(...args),
   getOAuthProviders: () => [
     { id: 'anthropic', name: 'Anthropic', login: mockLoginAnthropic },
-    { id: 'openai-codex', name: 'OpenAI Codex', login: vi.fn() },
+    { id: 'openai-codex', name: 'OpenAI Codex', login: mockLoginCodex },
     { id: 'github-copilot', name: 'GitHub Copilot', login: vi.fn() },
   ],
   getOAuthApiKey: (...args: unknown[]) => mockGetOAuthApiKey(...args),
@@ -61,6 +62,31 @@ const PI_OAUTH_SUCCESS_HTML = `<!doctype html>
   </main>
 </body>
 </html>`;
+
+const PI_OAUTH_FAILURE_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <title>Authentication failed</title>
+</head>
+<body>
+  <main>
+    <h1>Authentication failed</h1>
+    <p>State mismatch.</p>
+    <div class="details">expected state did not match</div>
+  </main>
+</body>
+</html>`;
+
+/** Bind a TCP listener on a fixed loopback port for preflight tests. */
+async function occupyPort(port: number): Promise<() => Promise<void>> {
+  const { createServer } = await import('node:net');
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', resolve);
+  });
+  return () => new Promise<void>((resolve) => server.close(() => resolve()));
+}
 
 async function requestLocalOAuthPage(options: {
   path?: string;
@@ -434,16 +460,14 @@ describe('ProviderManager', () => {
       expect(() => pm.cancelOAuth()).not.toThrow();
     });
 
-    it('aborts an active OAuth flow', async () => {
-      // Create a login that hangs until aborted
+    it('aborts an active OAuth flow with a typed OAuthError', async () => {
+      // Codex port (1455) so this is independent of anything holding 53692.
+      // pi-ai's anthropic flow ignores the abort signal entirely, so cancel
+      // must reject via Cortex's own race, not the login promise.
       let signalRef: AbortSignal | null = null;
-      mockLoginAnthropic.mockImplementation(async (opts: Record<string, unknown>) => {
+      mockLoginCodex.mockImplementation(async (opts: Record<string, unknown>) => {
         signalRef = opts['signal'] as AbortSignal;
-        return new Promise((_resolve, reject) => {
-          (opts['signal'] as AbortSignal).addEventListener('abort', () => {
-            reject(new Error('Aborted'));
-          });
-        });
+        return new Promise(() => {}); // never settles (pi-ai-style hang)
       });
 
       const callbacks = {
@@ -452,9 +476,8 @@ describe('ProviderManager', () => {
         onProgress: vi.fn(),
       };
 
-      const loginPromise = pm.initiateOAuth('anthropic', callbacks);
+      const loginPromise = pm.initiateOAuth('openai-codex', callbacks);
 
-      // Wait a tick for the login to start
       await new Promise(resolve => setTimeout(resolve, 10));
 
       expect(signalRef).not.toBeNull();
@@ -464,7 +487,76 @@ describe('ProviderManager', () => {
 
       expect(signalRef!.aborted).toBe(true);
 
-      await expect(loginPromise).rejects.toThrow('Aborted');
+      await expect(loginPromise).rejects.toMatchObject({
+        name: 'OAuthError',
+        code: 'cancelled',
+        provider: 'openai-codex',
+      });
+    });
+  });
+
+  describe('initiateOAuth resilience', () => {
+    it('throws OAuthError(unsupported_provider) for unknown providers', async () => {
+      await expect(
+        pm.initiateOAuth('definitely-not-a-provider', { onAuth: vi.fn(), onPrompt: vi.fn() }),
+      ).rejects.toMatchObject({ name: 'OAuthError', code: 'unsupported_provider' });
+      expect(mockLoginCodex).not.toHaveBeenCalled();
+    });
+
+    it('fails fast with callback_port_in_use before opening a browser', async () => {
+      // openai-codex callback port is 1455 (fixed in OAUTH_CALLBACK_ROUTES).
+      const release = await occupyPort(1455);
+      try {
+        await expect(
+          pm.initiateOAuth('openai-codex', { onAuth: vi.fn(), onPrompt: vi.fn() }),
+        ).rejects.toMatchObject({
+          name: 'OAuthError',
+          code: 'callback_port_in_use',
+          provider: 'openai-codex',
+          port: 1455,
+        });
+        // The browser/login must never start when the port is taken.
+        expect(mockLoginCodex).not.toHaveBeenCalled();
+      } finally {
+        await release();
+      }
+    });
+
+    it('times out a hung flow with OAuthError(timed_out)', async () => {
+      mockLoginCodex.mockImplementation(() => new Promise(() => {})); // never settles
+
+      await expect(
+        pm.initiateOAuth('openai-codex', {
+          onAuth: vi.fn(),
+          onPrompt: vi.fn(),
+          timeoutMs: 60,
+        }),
+      ).rejects.toMatchObject({ name: 'OAuthError', code: 'timed_out' });
+
+      // Flow released — a subsequent flow can start.
+      pm.cancelOAuth();
+    });
+
+    it('fails immediately on a failed browser callback instead of hanging', async () => {
+      // pi-ai serves its error page then hangs forever (never settles).
+      // The render shim sees the error page; Cortex must reject right away.
+      mockLoginCodex.mockImplementation(async () => {
+        await requestLocalOAuthPage({
+          port: 1455,
+          path: '/auth/callback',
+          html: PI_OAUTH_FAILURE_HTML,
+        });
+        return new Promise(() => {});
+      });
+
+      const err = await pm
+        .initiateOAuth('openai-codex', { onAuth: vi.fn(), onPrompt: vi.fn() })
+        .then(() => null)
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(OAuthError);
+      expect((err as OAuthError).code).toBe('callback_failed');
+      expect((err as OAuthError).message).toContain('State mismatch');
     });
   });
 
