@@ -1,4 +1,4 @@
-import { fuzzyFilter } from '@mariozechner/pi-tui';
+import { fuzzyFilter } from '@earendil-works/pi-tui';
 import { helpCommand } from './help.js';
 import { clearCommand } from './clear.js';
 import { compactCommand } from './compact.js';

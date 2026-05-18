@@ -1,4 +1,4 @@
-import { SelectList, type SelectItem } from '@mariozechner/pi-tui';
+import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import type { Command } from './index.js';
 import { CredentialStore } from '../config/credentials.js';
 import { selectListTheme } from '../tui/theme.js';

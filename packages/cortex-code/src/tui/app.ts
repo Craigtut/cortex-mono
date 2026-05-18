@@ -3,7 +3,7 @@ import {
   ProcessTerminal,
   Container,
   Spacer,
-} from '@mariozechner/pi-tui';
+} from '@earendil-works/pi-tui';
 import { CustomEditor, type CustomEditorCallbacks } from './editor.js';
 import { StatusBar, type StatusBarState } from './status.js';
 import { TranscriptManager } from './transcript.js';

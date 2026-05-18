@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { visibleWidth } from '@mariozechner/pi-tui';
+import { visibleWidth } from '@earendil-works/pi-tui';
 import { BorderedBox } from '../../src/tui/renderers/bordered-box.js';
 
 describe('BorderedBox', () => {

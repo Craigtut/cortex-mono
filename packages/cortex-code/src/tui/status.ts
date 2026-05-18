@@ -1,4 +1,4 @@
-import { type Component, type TUI, visibleWidth, truncateToWidth } from '@mariozechner/pi-tui';
+import { type Component, type TUI, visibleWidth, truncateToWidth } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
 import { colors } from './theme.js';
 

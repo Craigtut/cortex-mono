@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { Box, Text, SelectList, type SelectItem, type Component } from '@mariozechner/pi-tui';
+import { Box, Text, SelectList, type SelectItem, type Component } from '@earendil-works/pi-tui';
 import { colors, selectListTheme } from './theme.js';
 import { extractPattern, formatRule } from '../permissions/patterns.js';
 import type { PermissionDecision } from '../permissions/rules.js';

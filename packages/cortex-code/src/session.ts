@@ -30,7 +30,7 @@ import {
   type McpStdioConfig,
   stripWorkingTags,
 } from '@animus-labs/cortex';
-import { SelectList, type SelectItem } from '@mariozechner/pi-tui';
+import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import { App, type AppCallbacks } from './tui/app.js';
 import { randomThinkingLabel } from './tui/spinner.js';
 import { selectListTheme } from './tui/theme.js';

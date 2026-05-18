@@ -1,4 +1,4 @@
-import { Editor, type TUI, type EditorTheme, CombinedAutocompleteProvider, matchesKey, Key } from '@mariozechner/pi-tui';
+import { Editor, type TUI, type EditorTheme, CombinedAutocompleteProvider, matchesKey, Key } from '@earendil-works/pi-tui';
 import type { PermissionPromptComponent } from './permissions.js';
 import { buildSlashCommands } from './command-provider.js';
 

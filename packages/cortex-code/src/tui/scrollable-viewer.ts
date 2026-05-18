@@ -1,4 +1,4 @@
-import { type Component, type Focusable, visibleWidth, truncateToWidth, matchesKey } from '@mariozechner/pi-tui';
+import { type Component, type Focusable, visibleWidth, truncateToWidth, matchesKey } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
 
 const BG = chalk.bgHex('#1a1a2e');

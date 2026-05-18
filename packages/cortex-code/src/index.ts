@@ -80,10 +80,11 @@ function parseArgs(argv: string[]): CliArgs {
 
 function printUsage(): void {
   console.log(`
-cortex v0.1.0 - Terminal-based coding agent
+cortex v${PKG_VERSION} - Terminal-based coding agent
 
 Usage:
   cortex                                    Start interactive session
+  cortex-code                               Start interactive session
   cortex --resume [session-id]              Resume last (or specific) session
   cortex --model <model>                    Override default model
   cortex --compaction <observational|classic>  Compaction strategy (default: observational)

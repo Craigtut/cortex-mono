@@ -1,6 +1,6 @@
 import chalk from 'chalk';
-import type { MarkdownTheme } from '@mariozechner/pi-tui';
-import type { SelectListTheme } from '@mariozechner/pi-tui';
+import type { MarkdownTheme } from '@earendil-works/pi-tui';
+import type { SelectListTheme } from '@earendil-works/pi-tui';
 
 // ---------------------------------------------------------------------------
 // Tool renderer theme

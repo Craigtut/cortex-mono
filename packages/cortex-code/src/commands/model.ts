@@ -1,4 +1,4 @@
-import { SelectList, Text, Container, type SelectItem } from '@mariozechner/pi-tui';
+import { SelectList, Text, Container, type SelectItem } from '@earendil-works/pi-tui';
 import { inferUtilityModelId } from '@animus-labs/cortex';
 import type { Command } from './index.js';
 import { selectListTheme, colors } from '../tui/theme.js';

@@ -3,7 +3,7 @@
  */
 
 import * as os from 'node:os';
-import { visibleWidth } from '@mariozechner/pi-tui';
+import { visibleWidth } from '@earendil-works/pi-tui';
 
 const HOME = os.homedir();
 

@@ -1,8 +1,14 @@
 # @animus-labs/cortex-code
 
-Terminal-based coding agent built on [`@animus-labs/cortex`](../cortex/).
+Terminal-based coding agent built on `@animus-labs/cortex`.
 
-> **Status: In Development.** This package is under active development and not yet published to npm.
+## Install
+
+```bash
+npm install -g @animus-labs/cortex-code
+```
+
+This installs both `cortex` and `cortex-code` commands. `cortex` is the primary command, and `cortex-code` is provided as an explicit alias.
 
 ## What It Does
 
@@ -13,6 +19,9 @@ Cortex Code is an interactive CLI coding agent. It uses Cortex's agentic loop, b
 ```bash
 # Start an interactive session
 cortex
+
+# Equivalent explicit command
+cortex-code
 
 # Resume a previous session
 cortex --resume

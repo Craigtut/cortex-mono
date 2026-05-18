@@ -1,4 +1,4 @@
-import type { SlashCommand } from '@mariozechner/pi-tui';
+import type { SlashCommand } from '@earendil-works/pi-tui';
 import { getCommands } from '../commands/index.js';
 
 /**

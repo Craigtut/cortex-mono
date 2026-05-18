@@ -13,7 +13,7 @@
  * Used as the universal container for all tool renderers.
  */
 
-import { type Component, visibleWidth, truncateToWidth } from '@mariozechner/pi-tui';
+import { type Component, visibleWidth, truncateToWidth } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
 import type { ToolStatus } from './types.js';
 import { getToolTheme } from '../theme.js';

@@ -7,7 +7,7 @@
  * Handles per-tool expand/collapse state and animated spinner during execution.
  */
 
-import type { Component, TUI } from '@mariozechner/pi-tui';
+import type { Component, TUI } from '@earendil-works/pi-tui';
 import { estimateTokens, TOOL_RESULT_WORKING_TAGS_REMINDER } from '@animus-labs/cortex';
 import { BorderedBox } from './bordered-box.js';
 import { getRenderer } from './registry.js';

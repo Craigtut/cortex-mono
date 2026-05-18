@@ -7,7 +7,7 @@
 | Language | TypeScript (strict, ESM) | Matches Cortex, shared tooling |
 | Runtime | Node.js 24+ | Same requirement as Cortex |
 | Agent framework | `@animus-labs/cortex` | The whole point |
-| TUI rendering | `@mariozechner/pi-tui` | Lightweight, imperative, same ecosystem as pi-agent-core |
+| TUI rendering | `@earendil-works/pi-tui` | Lightweight, imperative, same ecosystem as pi-agent-core |
 | Credential storage | Plaintext file (0600) + opportunistic macOS Keychain | Zero native deps, industry standard |
 | File locking | `proper-lockfile` | Prevents corruption from concurrent instances |
 | Testing | Vitest | Matches monorepo conventions |
@@ -17,7 +17,7 @@
 
 Ink is a React reconciler for the terminal. It brings React 19+, `yoga-layout` (Flexbox), and 20+ transitive dependencies. That is a lot of machinery for what is fundamentally a scrolling transcript with an input editor.
 
-`@mariozechner/pi-tui` is an imperative TUI library (~1,200 lines core) from the same author as `pi-agent-core`. It uses differential rendering (full repaint, line-diff, or character-diff) with synchronized output for flicker-free updates. Components implement `render(width): string[]` and optionally `handleInput(data)`. It ships built-in components for text, markdown, editor input, select lists, images, overlays, and dialogs.
+`@earendil-works/pi-tui` is an imperative TUI library (~1,200 lines core) from the same ecosystem as `pi-agent-core`. It uses differential rendering (full repaint, line-diff, or character-diff) with synchronized output for flicker-free updates. Components implement `render(width): string[]` and optionally `handleInput(data)`. It ships built-in components for text, markdown, editor input, select lists, images, overlays, and dialogs.
 
 The trade-offs:
 
@@ -60,10 +60,11 @@ Bun's `bun build --compile` can produce self-contained executables with no runti
 ## CLI Interface
 
 ```bash
-cortex-code                          # Start interactive session in CWD
-cortex-code --resume [session-id]    # Resume last (or specific) session
-cortex-code --model <model>          # Override default model
-cortex-code --yolo                   # Start in YOLO mode (bypass permissions)
+cortex                               # Start interactive session in CWD
+cortex-code                          # Alias for cortex
+cortex --resume [session-id]         # Resume last (or specific) session
+cortex --model <model>               # Override default model
+cortex --yolo                        # Start in YOLO mode (bypass permissions)
 ```
 
 ## High-Level Architecture

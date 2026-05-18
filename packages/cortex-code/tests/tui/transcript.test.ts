@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const requestRenderSpy = vi.fn();
 const toolDisposeSpy = vi.fn();
 
-vi.mock('@mariozechner/pi-tui', () => {
+vi.mock('@earendil-works/pi-tui', () => {
   class MockContainer {
     children: unknown[] = [];
 
@@ -89,7 +89,7 @@ vi.mock('../../src/tui/theme.js', () => ({
   markdownTheme: {},
 }));
 
-import { Container } from '@mariozechner/pi-tui';
+import { Container } from '@earendil-works/pi-tui';
 import { TranscriptManager } from '../../src/tui/transcript.js';
 
 describe('TranscriptManager', () => {

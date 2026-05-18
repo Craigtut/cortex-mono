@@ -21,7 +21,7 @@ import {
   type OverlayHandle,
   matchesKey,
   Key,
-} from '@mariozechner/pi-tui';
+} from '@earendil-works/pi-tui';
 import { ProviderManager, type CortexModel, PROVIDER_REGISTRY, OAUTH_PROVIDER_IDS } from '@animus-labs/cortex';
 import { ProviderSetupFlow, type SetupResult, type SetupStep } from './setup.js';
 import { detectOllama } from './ollama.js';

@@ -1,5 +1,5 @@
-import { Container, Text, Markdown, Spacer } from '@mariozechner/pi-tui';
-import type { TUI } from '@mariozechner/pi-tui';
+import { Container, Text, Markdown, Spacer } from '@earendil-works/pi-tui';
+import type { TUI } from '@earendil-works/pi-tui';
 import { stripWorkingTags } from '@animus-labs/cortex';
 import { colors, markdownTheme } from './theme.js';
 import { ToolExecutionComponent } from './renderers/tool-execution.js';

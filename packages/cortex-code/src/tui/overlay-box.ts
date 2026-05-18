@@ -1,4 +1,4 @@
-import { type Component, type Focusable, visibleWidth } from '@mariozechner/pi-tui';
+import { type Component, type Focusable, visibleWidth } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
 
 const OVERLAY_BG = chalk.bgHex('#1a1a2e');

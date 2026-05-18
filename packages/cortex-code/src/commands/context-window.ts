@@ -1,4 +1,4 @@
-import { SelectList, type SelectItem } from '@mariozechner/pi-tui';
+import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import type { Command } from './index.js';
 import { selectListTheme } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';

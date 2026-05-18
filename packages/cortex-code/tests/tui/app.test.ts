@@ -20,7 +20,7 @@ const {
   renderState: { throwCount: 0 },
 }));
 
-vi.mock('@mariozechner/pi-tui', () => {
+vi.mock('@earendil-works/pi-tui', () => {
   class MockProcessTerminal {
     columns = 120;
     rows = 40;

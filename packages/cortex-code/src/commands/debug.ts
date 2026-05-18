@@ -1,4 +1,4 @@
-import { SelectList, type SelectItem } from '@mariozechner/pi-tui';
+import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import { OverlayBox } from '../tui/overlay-box.js';
 import { ScrollableViewer } from '../tui/scrollable-viewer.js';
 import { selectListTheme } from '../tui/theme.js';
