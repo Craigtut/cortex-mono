@@ -134,18 +134,37 @@ The consumer can read `provider`, `modelId`, and `contextWindow` for display and
 ### OAuth
 
 ```typescript
+type OAuthFlowType = 'browser' | 'localhost_callback' | 'device_code';
+
+interface OAuthAuthInfo {
+  url: string;
+  instructions?: string;
+  flowType: OAuthFlowType;
+  deviceCode?: string;
+  manualCodeRecommended?: boolean;
+  callbackPort?: number;
+  callbackPath?: string;
+}
+
+interface OAuthPromptInfo {
+  message: string;
+  placeholder?: string;
+  allowEmpty?: boolean;
+}
+
 interface OAuthCallbacks {
   /**
    * Called when the user needs to visit a URL to authorize.
    * The consumer should open the URL in a browser or display it to the user.
+   * Cortex normalizes provider-specific details into flow metadata.
    */
-  onAuth: (info: { url: string; instructions?: string }) => void;
+  onAuth: (info: OAuthAuthInfo) => void;
 
   /**
    * Called when the OAuth flow needs user input (e.g., a prompt).
    * The consumer should display the prompt and return the user's response.
    */
-  onPrompt: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
+  onPrompt: (prompt: OAuthPromptInfo) => Promise<string>;
 
   /**
    * Called with progress messages during the flow.
@@ -600,6 +619,8 @@ const rawCredentials = await oauthProvider.login(callbacks);
 ### OAuth Callback Page Customization
 
 Pi-ai owns the localhost callback server for browser-based OAuth providers. It currently renders its own success and failure HTML without exposing a page hook. `ProviderManager` offers an opt-in `renderCallbackPage` compatibility shim so consumers can brand that final browser page without importing pi-ai or copying provider login flows.
+
+`ProviderManager` also normalizes OAuth callback data before it reaches the consumer. Callback-server providers are marked with `flowType: 'localhost_callback'`, callback port/path metadata, and `manualCodeRecommended: true`; device-code providers are marked with `flowType: 'device_code'` and a parsed `deviceCode` when the provider supplies one in its instructions. Prompt callbacks preserve `placeholder` and `allowEmpty` so remote UIs can render blank-submittable prompts such as GitHub Enterprise domain selection.
 
 The shim is intentionally narrow:
 

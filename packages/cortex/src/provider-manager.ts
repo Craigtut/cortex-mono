@@ -33,19 +33,50 @@ const nodeRequire = createRequire(import.meta.url);
 // OAuth types
 // ---------------------------------------------------------------------------
 
+/** OAuth flow shape, used by consumers to render provider-specific UX. */
+export type OAuthFlowType = 'browser' | 'localhost_callback' | 'device_code';
+
+/** URL and flow metadata emitted when a user needs to authorize a provider. */
+export interface OAuthAuthInfo {
+  /** URL the user should open to authorize the provider. */
+  url: string;
+  /** Provider-supplied instructions, when available. */
+  instructions?: string | undefined;
+  /** Normalized flow type. */
+  flowType: OAuthFlowType;
+  /** Device code extracted from provider instructions, when available. */
+  deviceCode?: string | undefined;
+  /** Whether a remote/headless environment should show a manual paste input. */
+  manualCodeRecommended?: boolean | undefined;
+  /** Fixed localhost callback port, for callback-server flows. */
+  callbackPort?: number | undefined;
+  /** Fixed callback path, for callback-server flows. */
+  callbackPath?: string | undefined;
+}
+
+/** Prompt emitted when a provider needs user input during OAuth. */
+export interface OAuthPromptInfo {
+  /** User-facing prompt text. */
+  message: string;
+  /** Optional input placeholder. */
+  placeholder?: string | undefined;
+  /** Whether an empty response is valid. */
+  allowEmpty?: boolean | undefined;
+}
+
 /** Callbacks provided by the consumer during an OAuth flow. */
 export interface OAuthCallbacks {
   /**
    * Called when the user needs to visit a URL to authorize.
    * The consumer should open the URL in a browser or display it.
    */
-  onAuth: (info: { url: string; instructions?: string }) => void;
+  onAuth: (info: OAuthAuthInfo) => void;
 
   /**
    * Called when the OAuth flow needs user input (e.g., a prompt).
    * The consumer should display the prompt and return the user's response.
    */
-  onPrompt: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
+  onPrompt: (prompt: OAuthPromptInfo) => Promise<string>;
 
   /**
    * Called with progress messages during the flow.
@@ -324,12 +355,82 @@ const OAUTH_CALLBACK_ROUTES: Record<string, OAuthCallbackRoute> = {
   'openai-codex': { path: '/auth/callback', port: 1455 },
 };
 
+const DEVICE_CODE_INSTRUCTIONS_RE = /\benter\s+code:\s*([A-Z0-9-]+)/i;
+
 let activeOAuthCallbackPageShim: ActiveOAuthCallbackPageShim | null = null;
 /** Ensures `onResult` fires at most once per installed shim. */
 let oauthCallbackResultNotified = false;
 
 /** Default overall OAuth flow timeout (pi-ai hangs without this). */
 const DEFAULT_OAUTH_FLOW_TIMEOUT_MS = 5 * 60_000;
+
+function normalizeOAuthPromptInfo(prompt: unknown): OAuthPromptInfo {
+  if (typeof prompt === 'string') {
+    return { message: prompt };
+  }
+
+  const raw = prompt as Record<string, unknown> | null | undefined;
+  const message = typeof raw?.['message'] === 'string' ? raw['message'] : String(prompt ?? '');
+  const normalized: OAuthPromptInfo = { message };
+
+  if (typeof raw?.['placeholder'] === 'string') {
+    normalized.placeholder = raw['placeholder'];
+  }
+
+  if (typeof raw?.['allowEmpty'] === 'boolean') {
+    normalized.allowEmpty = raw['allowEmpty'];
+  }
+
+  return normalized;
+}
+
+function isOAuthFlowType(value: unknown): value is OAuthFlowType {
+  return value === 'browser' || value === 'localhost_callback' || value === 'device_code';
+}
+
+function normalizeOAuthAuthInfo(
+  provider: string,
+  info: unknown,
+  legacyInstructions?: string,
+): OAuthAuthInfo {
+  const raw = typeof info === 'string'
+    ? { url: info, instructions: legacyInstructions }
+    : (info as Record<string, unknown> | null | undefined);
+
+  const url = typeof raw?.['url'] === 'string' ? raw['url'] : String(info ?? '');
+  const instructions = typeof raw?.['instructions'] === 'string'
+    ? raw['instructions']
+    : legacyInstructions;
+  const callbackRoute = OAUTH_CALLBACK_ROUTES[provider];
+  const deviceCode = typeof raw?.['deviceCode'] === 'string'
+    ? raw['deviceCode']
+    : instructions?.match(DEVICE_CODE_INSTRUCTIONS_RE)?.[1];
+  const isDeviceCodeFlow = Boolean(deviceCode) || provider === 'github-copilot';
+  const flowType = isOAuthFlowType(raw?.['flowType'])
+    ? raw['flowType']
+    : isDeviceCodeFlow ? 'device_code'
+      : callbackRoute ? 'localhost_callback'
+      : 'browser';
+  const manualCodeRecommended = typeof raw?.['manualCodeRecommended'] === 'boolean'
+    ? raw['manualCodeRecommended']
+    : flowType === 'localhost_callback' && callbackRoute ? true : undefined;
+  const callbackPort = typeof raw?.['callbackPort'] === 'number'
+    ? raw['callbackPort']
+    : flowType === 'localhost_callback' ? callbackRoute?.port : undefined;
+  const callbackPath = typeof raw?.['callbackPath'] === 'string'
+    ? raw['callbackPath']
+    : flowType === 'localhost_callback' ? callbackRoute?.path : undefined;
+
+  return {
+    url,
+    ...(instructions ? { instructions } : {}),
+    flowType,
+    ...(deviceCode ? { deviceCode } : {}),
+    ...(manualCodeRecommended !== undefined ? { manualCodeRecommended } : {}),
+    ...(callbackPort !== undefined ? { callbackPort } : {}),
+    ...(callbackPath !== undefined ? { callbackPath } : {}),
+  };
+}
 
 /**
  * Probe whether something is already listening on a loopback port. Used to
@@ -935,8 +1036,10 @@ export class ProviderManager implements IProviderManager {
     });
 
     const login = oauthProvider.login({
-      onAuth: callbacks.onAuth,
-      onPrompt: callbacks.onPrompt,
+      onAuth: (info: unknown, legacyInstructions?: string) => {
+        callbacks.onAuth(normalizeOAuthAuthInfo(provider, info, legacyInstructions));
+      },
+      onPrompt: (prompt: unknown) => callbacks.onPrompt(normalizeOAuthPromptInfo(prompt)),
       onProgress: callbacks.onProgress,
       onManualCodeInput: callbacks.onManualCodeInput,
       onSelect: callbacks.onSelect,

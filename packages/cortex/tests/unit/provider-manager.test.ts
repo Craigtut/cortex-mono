@@ -275,7 +275,7 @@ describe('ProviderManager', () => {
       expect(result.meta.expiresAt).toBeDefined();
     });
 
-    it('passes callbacks and signal to the login function', async () => {
+    it('passes normalized callbacks and signal to the login function', async () => {
       mockLoginAnthropic.mockResolvedValue({});
 
       const callbacks = {
@@ -289,13 +289,90 @@ describe('ProviderManager', () => {
       await pm.initiateOAuth('anthropic', callbacks);
 
       const callArgs = mockLoginAnthropic.mock.calls[0][0] as Record<string, unknown>;
-      expect(callArgs['onAuth']).toBe(callbacks.onAuth);
-      expect(callArgs['onPrompt']).toBe(callbacks.onPrompt);
+      expect(callArgs['onAuth']).not.toBe(callbacks.onAuth);
+      expect(callArgs['onPrompt']).not.toBe(callbacks.onPrompt);
       expect(callArgs['onProgress']).toBe(callbacks.onProgress);
       expect(callArgs['onManualCodeInput']).toBe(callbacks.onManualCodeInput);
       expect(callArgs['onSelect']).toBe(callbacks.onSelect);
       expect(callArgs['signal']).toBeInstanceOf(AbortSignal);
       expect(callArgs['renderCallbackPage']).toBeUndefined();
+    });
+
+    it('annotates localhost callback OAuth auth URLs', async () => {
+      mockLoginAnthropic.mockImplementation(async (oauthCallbacks) => {
+        oauthCallbacks.onAuth({
+          url: 'https://claude.ai/oauth/authorize?test=1',
+          instructions: 'Complete login in your browser.',
+        });
+        return {};
+      });
+
+      const onAuth = vi.fn();
+
+      await pm.initiateOAuth('anthropic', {
+        onAuth,
+        onPrompt: vi.fn(),
+      });
+
+      expect(onAuth).toHaveBeenCalledWith({
+        url: 'https://claude.ai/oauth/authorize?test=1',
+        instructions: 'Complete login in your browser.',
+        flowType: 'localhost_callback',
+        manualCodeRecommended: true,
+        callbackPort: 53692,
+        callbackPath: '/callback',
+      });
+    });
+
+    it('extracts device codes from OAuth auth instructions', async () => {
+      const mockLoginGitHub = vi.fn(async (oauthCallbacks) => {
+        oauthCallbacks.onAuth('https://github.com/login/device', 'Enter code: ABCD-1234');
+        return {};
+      });
+      mockGetOAuthProvider.mockImplementationOnce((provider: string) => {
+        if (provider === 'github-copilot') {
+          return { id: provider, name: 'GitHub Copilot', login: mockLoginGitHub };
+        }
+        return undefined;
+      });
+
+      const onAuth = vi.fn();
+
+      await pm.initiateOAuth('github-copilot', {
+        onAuth,
+        onPrompt: vi.fn(),
+      });
+
+      expect(onAuth).toHaveBeenCalledWith({
+        url: 'https://github.com/login/device',
+        instructions: 'Enter code: ABCD-1234',
+        flowType: 'device_code',
+        deviceCode: 'ABCD-1234',
+      });
+    });
+
+    it('normalizes OAuth prompt metadata', async () => {
+      mockLoginAnthropic.mockImplementation(async (oauthCallbacks) => {
+        await oauthCallbacks.onPrompt({
+          message: 'Paste the redirect URL:',
+          placeholder: 'http://localhost:53692/callback',
+          allowEmpty: false,
+        });
+        return {};
+      });
+
+      const onPrompt = vi.fn(async () => 'code');
+
+      await pm.initiateOAuth('anthropic', {
+        onAuth: vi.fn(),
+        onPrompt,
+      });
+
+      expect(onPrompt).toHaveBeenCalledWith({
+        message: 'Paste the redirect URL:',
+        placeholder: 'http://localhost:53692/callback',
+        allowEmpty: false,
+      });
     });
 
     it('renders a custom callback page for known pi-ai callback routes', async () => {
