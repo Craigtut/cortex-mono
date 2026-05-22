@@ -301,6 +301,12 @@ interface CortexAgentConstructorOptions {
   enableLoadSkillTool?: boolean;
 }
 
+type CacheRetention = 'none' | 'short' | 'long';
+
+interface DirectCompletionOptions {
+  cacheRetention?: CacheRetention;
+}
+
 // ---------------------------------------------------------------------------
 // CortexAgent
 // ---------------------------------------------------------------------------
@@ -328,8 +334,8 @@ export class CortexAgent {
   // null = not yet resolved (pi-ai uses its own default).
   // Set at agent creation via setCacheRetention() and updated dynamically
   // on interval changes (sleep/wake transitions).
-  private _cacheRetention: 'none' | 'short' | 'long' | null = null;
-  private _activePromptCacheRetention: 'none' | 'short' | 'long' | null = null;
+  private _cacheRetention: CacheRetention | null = null;
+  private _activePromptCacheRetention: CacheRetention | null = null;
 
   // Public model handles and internal pi-ai model objects.
   private primaryModel: CortexModel;
@@ -690,7 +696,7 @@ export class CortexAgent {
    * @returns The agent's response (opaque, from pi-agent-core)
    * @throws Error if the agent has been destroyed
    */
-  async prompt(input: string, options?: { cacheRetention?: 'none' | 'short' | 'long' }): Promise<unknown> {
+  async prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
     if (this.lifecycleState === 'destroyed') {
       throw new Error('Agent has been destroyed');
     }
@@ -826,6 +832,19 @@ export class CortexAgent {
     this.agent.steer({ role: 'user', content: message });
   }
 
+  private buildDirectCompletionOptions(
+    apiKey: string | undefined,
+    options?: DirectCompletionOptions,
+  ): Record<string, unknown> | undefined {
+    const completeOptions: Record<string, unknown> = {};
+    const cacheRetention = options?.cacheRetention ?? this._cacheRetention;
+
+    if (apiKey) completeOptions['apiKey'] = apiKey;
+    if (cacheRetention) completeOptions['cacheRetention'] = cacheRetention;
+
+    return Object.keys(completeOptions).length > 0 ? completeOptions : undefined;
+  }
+
   // -----------------------------------------------------------------------
   // Direct Completion (non-agentic)
   // -----------------------------------------------------------------------
@@ -846,9 +865,7 @@ export class CortexAgent {
   async directComplete(context: {
     systemPrompt: string;
     messages: unknown[];
-  }, options?: {
-    cacheRetention?: 'none' | 'short' | 'long';
-  }): Promise<string> {
+  }, options?: DirectCompletionOptions): Promise<string> {
     // Dynamically import pi-ai's complete() function
     let completeFn: typeof import('@earendil-works/pi-ai').complete;
     try {
@@ -874,9 +891,7 @@ export class CortexAgent {
 
     this._lastDirectUsage = null;
 
-    const completeOptions: Record<string, unknown> = {};
-    if (apiKey) completeOptions['apiKey'] = apiKey;
-    if (options?.cacheRetention) completeOptions['cacheRetention'] = options.cacheRetention;
+    const completeOptions = this.buildDirectCompletionOptions(apiKey, options);
 
     // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
     // provider-specific convertMessages() handle all format normalization:
@@ -889,9 +904,7 @@ export class CortexAgent {
         systemPrompt: context.systemPrompt,
         messages: context.messages,
       } as Parameters<typeof completeFn>[1],
-      Object.keys(completeOptions).length > 0
-        ? completeOptions as Parameters<typeof completeFn>[2]
-        : undefined,
+      completeOptions as Parameters<typeof completeFn>[2] | undefined,
     );
 
     // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
@@ -927,9 +940,7 @@ export class CortexAgent {
   async structuredComplete(context: {
     systemPrompt: string;
     messages: unknown[];
-  }, schema: unknown, toolName: string = 'structured_output', toolDescription: string = 'Produce structured output', options?: {
-    cacheRetention?: 'none' | 'short' | 'long';
-  }): Promise<Record<string, unknown> | null> {
+  }, schema: unknown, toolName: string = 'structured_output', toolDescription: string = 'Produce structured output', options?: DirectCompletionOptions): Promise<Record<string, unknown> | null> {
     let completeFn: typeof import('@earendil-works/pi-ai').complete;
     try {
       const piAi = await import('@earendil-works/pi-ai');
@@ -958,6 +969,7 @@ export class CortexAgent {
     }
 
     this._lastDirectUsage = null;
+    const completeOptions = this.buildDirectCompletionOptions(apiKey, options);
 
     // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
     // provider-specific convertMessages() handle all format normalization:
@@ -972,11 +984,10 @@ export class CortexAgent {
         tools: [tool],
       } as Parameters<typeof completeFn>[1],
       {
-        ...(apiKey ? { apiKey } : {}),
+        ...(completeOptions ?? {}),
         // Force the model to call a tool (since we only pass one, it must call ours).
         // "any" has the widest provider support across Anthropic, Google, Mistral, OpenAI, Bedrock.
         toolChoice: 'any',
-        ...(options?.cacheRetention ? { cacheRetention: options.cacheRetention } : {}),
       } as Parameters<typeof completeFn>[2],
     );
 
@@ -1084,7 +1095,7 @@ export class CortexAgent {
       const retention = cacheBreakpointState.cortexAgent?._activePromptCacheRetention
         ?? cacheBreakpointState.cortexAgent?._cacheRetention
         ?? null;
-      const streamOptions = retention && retention !== 'none'
+      const streamOptions = retention
         ? { ...options, cacheRetention: retention }
         : options;
       return streamSimple(model as any, context as any, streamOptions as any);

@@ -43,6 +43,27 @@ When a slot in the middle changes, the prefix before it survives in cache; every
 
 Ephemeral context and current-loop content sit below the cache boundary. They change every call, so they are not expected to produce stable cache reads. In a managed `CortexAgent`, ephemeral content is inserted at the pre-prompt boundary so old conversation history can remain cacheable while the current prompt stays at the end of the request.
 
+### Anthropic Cache Breakpoints
+
+Anthropic prompt caching is explicit: at least one content block must carry `cache_control` before Anthropic will create or read a cache entry. A cache entry covers the full request prefix in Anthropic request order: `tools`, then `system`, then `messages`, up to and including the marked block.
+
+Anthropic also performs automatic prefix checking around explicit breakpoints. When a breakpoint is present, Anthropic checks previous content-block boundaries near that breakpoint, currently documented as roughly 20 blocks back, and uses the longest matching cached prefix it finds. This is why Cortex's slot ordering matters: one explicit breakpoint at the end of the slot region can still reuse an earlier stable prefix when a later slot changes, as long as the earlier boundary is within Anthropic's lookback window.
+
+For a managed `CortexAgent` using Anthropic, pi-ai first places cache controls on the system prompt, the last tool definition, and the last user message. Cortex's `onPayload` hook then adjusts that payload into the intended four-breakpoint layout:
+
+1. System prompt.
+2. End of the slot region.
+3. Old conversation history boundary, before injected ephemeral context.
+4. Last user message, usually the current prompt.
+
+Cortex strips the tool-definition breakpoint because the system breakpoint already covers tools in Anthropic's prefix order, and Anthropic allows only four breakpoints. Keeping the slot and history breakpoints is more valuable for long-running agents.
+
+Slot order should be chosen by expected stability. Put content that almost never changes first, semi-stable context after that, and high-churn context near the end of the slot list. If a late slot changes, Anthropic can still walk back from the end-of-slots breakpoint to an earlier unchanged slot boundary. If the slot region grows beyond roughly 20 content blocks, add another explicit breakpoint or reduce slot fragmentation, because Anthropic may not check far enough back from the end-of-slots breakpoint.
+
+Direct completion helpers (`directComplete()` and `structuredComplete()`) do not run the managed agentic-loop `transformContext` pipeline, but they do inherit the agent's configured `cacheRetention` by default. They rely on pi-ai's provider-level cache controls unless a future direct-completion breakpoint API is added.
+
+Reference: [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching).
+
 ## Slots
 
 Slots are persistent, named content blocks stored as user-role messages at the start of `agent.state.messages`. They are defined at `ContextManager` creation time as an ordered list. The order defines their position in the message array: first slot = position 0 (most stable, best cache life), last slot = position N-1 (least stable among slots). Slot count and names are static for the lifetime of the agent.

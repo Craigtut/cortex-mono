@@ -134,4 +134,93 @@ describe('CortexAgent model contract', () => {
 
     expect(lastAgentInstance!.state['model']).toBe(swappedRawModel);
   });
+
+  it('applies the agent cache retention to directComplete calls by default', async () => {
+    const rawModel = {
+      provider: 'anthropic',
+      name: 'claude-sonnet-4-20250514',
+      id: 'claude-sonnet-4-20250514',
+      api: 'anthropic',
+      contextWindow: 200_000,
+    };
+
+    mockGetModel.mockReturnValue(rawModel);
+    mockComplete.mockResolvedValue({
+      content: [{ type: 'text', text: 'direct completion ok' }],
+      usage: makeUsage(),
+    });
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+    });
+
+    agent.setCacheRetention('long');
+
+    await agent.directComplete({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    expect(mockComplete).toHaveBeenCalledWith(
+      rawModel,
+      expect.objectContaining({
+        systemPrompt: 'System',
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+      { cacheRetention: 'long' },
+    );
+  });
+
+  it('applies the agent cache retention to structuredComplete calls by default', async () => {
+    const rawModel = {
+      provider: 'anthropic',
+      name: 'claude-sonnet-4-20250514',
+      id: 'claude-sonnet-4-20250514',
+      api: 'anthropic',
+      contextWindow: 200_000,
+    };
+
+    mockGetModel.mockReturnValue(rawModel);
+    mockComplete.mockResolvedValue({
+      content: [],
+      usage: makeUsage(),
+    });
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+    });
+
+    agent.setCacheRetention('long');
+
+    await agent.structuredComplete(
+      {
+        systemPrompt: 'System',
+        messages: [{ role: 'user', content: 'Hello' }],
+      },
+      { type: 'object', properties: {}, required: [] },
+      'structured_output',
+      'Produce structured output',
+    );
+
+    expect(mockComplete).toHaveBeenCalledWith(
+      rawModel,
+      expect.objectContaining({
+        systemPrompt: 'System',
+        messages: [{ role: 'user', content: 'Hello' }],
+        tools: [expect.objectContaining({ name: 'structured_output' })],
+      }),
+      expect.objectContaining({
+        toolChoice: 'any',
+        cacheRetention: 'long',
+      }),
+    );
+  });
 });
