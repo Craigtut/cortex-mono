@@ -10,11 +10,11 @@ import { collapseContent } from './collapsible-content.js';
 import { StreamingBuffer } from './streaming-buffer.js';
 import { registerRenderer } from './registry.js';
 
-const COLLAPSED_HEAD = 3;
-const COLLAPSED_TAIL = 2;
-const ERROR_HEAD = 5;
-const ERROR_TAIL = 5;
-const STREAMING_WINDOW = 20;
+const COLLAPSED_HEAD = 1;
+const COLLAPSED_TAIL = 1;
+const ERROR_HEAD = 4;
+const ERROR_TAIL = 4;
+const STREAMING_WINDOW = 3;
 
 function extractTextContent(result: unknown): string {
   if (typeof result === 'string') return result;

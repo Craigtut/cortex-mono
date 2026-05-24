@@ -21,7 +21,11 @@ vi.mock('@earendil-works/pi-tui', () => {
   }
 
   class MockText {
-    constructor(..._args: unknown[]) {}
+    args: unknown[];
+
+    constructor(...args: unknown[]) {
+      this.args = args;
+    }
   }
 
   class MockMarkdown {
@@ -79,6 +83,33 @@ vi.mock('../../src/tui/renderers/tool-execution.js', () => ({
   },
 }));
 
+vi.mock('../../src/tui/renderers/tool-group.js', () => ({
+  ToolGroupComponent: class MockToolGroupComponent {
+    readonly groupKind: string;
+    isExpanded = false;
+    starts: string[] = [];
+
+    constructor(groupKind: string) {
+      this.groupKind = groupKind;
+    }
+
+    startToolCall(id: string): void {
+      this.starts.push(id);
+    }
+
+    completeToolCall(): void {}
+    failToolCall(): void {}
+
+    toggleExpand(): void {
+      this.isExpanded = !this.isExpanded;
+    }
+
+    dispose(): void {
+      toolDisposeSpy();
+    }
+  },
+}));
+
 vi.mock('../../src/tui/theme.js', () => ({
   colors: {
     primary: (text: string) => text,
@@ -120,6 +151,28 @@ describe('TranscriptManager', () => {
     });
 
     // Background sub-agents go inline in the chat, same as foreground
+    expect(chat.children).toHaveLength(1);
+  });
+
+  it('groups consecutive exploration tools into one transcript row', () => {
+    const chat = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never);
+
+    transcript.startToolCall('tool-1', 'Glob', { pattern: '**/*.ts' });
+    transcript.completeToolCall('tool-1', {}, { totalCount: 3 }, 10);
+    transcript.startToolCall('tool-2', 'Read', { file_path: '/tmp/project/src/index.ts' });
+
+    expect(chat.children).toHaveLength(1);
+  });
+
+  it('renders routine single-line notifications compactly', () => {
+    const chat = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never);
+
+    transcript.addNotification('Model', 'Switched to gpt-5.5.');
+
     expect(chat.children).toHaveLength(1);
   });
 

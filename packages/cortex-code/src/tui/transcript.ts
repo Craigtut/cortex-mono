@@ -3,6 +3,7 @@ import type { TUI } from '@earendil-works/pi-tui';
 import { stripWorkingTags } from '@animus-labs/cortex';
 import { colors, markdownTheme } from './theme.js';
 import { ToolExecutionComponent } from './renderers/tool-execution.js';
+import { ToolGroupComponent, type ToolGroupKind } from './renderers/tool-group.js';
 // Import renderers to trigger their self-registration with the registry
 import './renderers/read-renderer.js';
 import './renderers/edit-renderer.js';
@@ -27,10 +28,27 @@ import type { FreezeDiagnostics } from '../diagnostics/freeze.js';
 
 /** Tools that render as compact single-line summaries (no content box). */
 const COMPACT_TOOLS = new Set([
-  'Read', 'Glob', 'Grep', 'Write', 'WebFetch', 'TaskOutput',
+  'Write', 'TaskOutput',
 ]);
 
-type TranscriptItemCategory = 'compact-tool' | 'other' | 'spacer' | null;
+const GROUPED_TOOLS = new Map<string, ToolGroupKind>([
+  ['Read', 'exploration'],
+  ['Glob', 'exploration'],
+  ['Grep', 'exploration'],
+  ['WebFetch', 'web'],
+]);
+
+type TranscriptItemCategory = 'compact-tool' | 'tool-group' | 'routine-notification' | 'other' | 'spacer' | null;
+
+interface ExpandableTranscriptItem {
+  readonly isExpanded: boolean;
+  toggleExpand(): void;
+  dispose(): void;
+}
+
+type ToolTranscriptComponent = ToolExecutionComponent | ToolGroupComponent;
+
+export type NotificationSeverity = 'routine' | 'important' | 'error';
 
 export class TranscriptManager {
   /** The current streaming assistant message Markdown component. */
@@ -38,7 +56,9 @@ export class TranscriptManager {
   /** Accumulated text for the current streaming assistant message. */
   private currentAssistantText = '';
   /** Map of active tool call components by tool call ID. */
-  private toolCalls = new Map<string, ToolExecutionComponent>();
+  private toolCalls = new Map<string, ToolTranscriptComponent>();
+  private currentToolGroup: ToolGroupComponent | null = null;
+  private lastExpandable: ExpandableTranscriptItem | null = null;
   /** Track running sub-agent IDs for the activity indicator. */
   private runningSubAgents = new Set<string>();
   private activityIndicator: Text | null = null;
@@ -91,7 +111,7 @@ export class TranscriptManager {
    * Add a spacer before a new item unless:
    * - Nothing has been added yet
    * - The previous item was already a spacer
-   * - A compact tool follows another compact tool (keeps exploration blocks tight)
+   * - A compact tool follows another compact tool
    */
   private maybeAddSpacer(isCompactTool: boolean): void {
     if (this.lastAddedItemCategory === null) return;
@@ -132,6 +152,7 @@ export class TranscriptManager {
   /** Add a user message to the transcript. */
   addUserMessage(text: string): void {
     this.finalizeCurrentAssistant();
+    this.currentToolGroup = null;
     this.chatContainer.addChild(new Spacer(1));
     this.chatContainer.addChild(new Text(text, 2, 1, colors.userMessageBg));
     this.chatContainer.addChild(new Spacer(1));
@@ -142,6 +163,7 @@ export class TranscriptManager {
   /** Start a new assistant message (renders streaming content). */
   startAssistantMessage(): void {
     this.finalizeCurrentAssistant();
+    this.currentToolGroup = null;
     this.maybeAddSpacer(false);
     this.currentAssistantText = '';
     this.currentAssistantMarkdown = new Markdown('', 0, 0, markdownTheme);
@@ -182,12 +204,25 @@ export class TranscriptManager {
     // Freeze current assistant message (Mastra Code pattern)
     this.freezeCurrentAssistant();
 
+    const groupKind = GROUPED_TOOLS.get(toolName);
+    if (groupKind) {
+      const toolGroup = this.getOrCreateToolGroup(groupKind);
+      toolGroup.startToolCall(toolCallId, toolName, args);
+      this.toolCalls.set(toolCallId, toolGroup);
+      this.lastExpandable = toolGroup;
+      this.diagnostics?.recordTranscriptMutation('tool_group_start');
+      this.throttledRender();
+      return;
+    }
+
+    this.currentToolGroup = null;
     const isCompact = COMPACT_TOOLS.has(toolName);
     this.maybeAddSpacer(isCompact);
 
     const toolComponent = new ToolExecutionComponent(toolName, this.tui);
     toolComponent.start(args);
     this.toolCalls.set(toolCallId, toolComponent);
+    this.lastExpandable = toolComponent;
     this.chatContainer.addChild(toolComponent);
     this.lastAddedItemCategory = isCompact ? 'compact-tool' : 'other';
     this.diagnostics?.recordTranscriptMutation('tool_start');
@@ -204,7 +239,7 @@ export class TranscriptManager {
   /** Update a tool call with streaming partial result. */
   updateToolCall(toolCallId: string, partialResult: unknown): void {
     const tc = this.toolCalls.get(toolCallId);
-    if (tc) {
+    if (tc instanceof ToolExecutionComponent) {
       tc.streamUpdate(partialResult);
       this.diagnostics?.recordTranscriptMutation('tool_update');
       this.throttledRender();
@@ -214,7 +249,9 @@ export class TranscriptManager {
   /** Complete a tool call with its result. */
   completeToolCall(toolCallId: string, result: unknown, details: unknown, durationMs: number): void {
     const tc = this.toolCalls.get(toolCallId);
-    if (tc) {
+    if (tc instanceof ToolGroupComponent) {
+      tc.completeToolCall(toolCallId, details, durationMs);
+    } else if (tc) {
       tc.complete(result, details, durationMs);
     }
     this.currentAssistantText = '';
@@ -250,7 +287,9 @@ export class TranscriptManager {
   /** Fail a tool call with an error. */
   failToolCall(toolCallId: string, error: string, durationMs: number): void {
     const tc = this.toolCalls.get(toolCallId);
-    if (tc) {
+    if (tc instanceof ToolGroupComponent) {
+      tc.failToolCall(toolCallId, error, durationMs);
+    } else if (tc) {
       tc.fail(error, durationMs);
     }
     this.currentAssistantText = '';
@@ -267,7 +306,18 @@ export class TranscriptManager {
   }
 
   /** Add a system notification (compaction, error, etc.). */
-  addNotification(title: string, message: string): void {
+  addNotification(
+    title: string,
+    message: string,
+    options?: { severity?: NotificationSeverity },
+  ): void {
+    this.currentToolGroup = null;
+    const severity = options?.severity ?? this.inferNotificationSeverity(title, message);
+    if (severity === 'routine' && !message.includes('\n')) {
+      this.addRoutineNotification(title, message);
+      return;
+    }
+
     this.maybeAddSpacer(false);
     const header = colors.primaryMuted(`\u2500\u2500\u2500 ${title} ` + '\u2500'.repeat(Math.max(0, 56 - title.length)));
     this.chatContainer.addChild(new Text(header));
@@ -280,6 +330,7 @@ export class TranscriptManager {
 
   /** Add a permission prompt inline in the transcript. */
   addPermissionPrompt(prompt: PermissionPromptComponent): void {
+    this.currentToolGroup = null;
     this.chatContainer.addChild(prompt);
     this.diagnostics?.recordTranscriptMutation('permission_prompt_added');
   }
@@ -292,7 +343,7 @@ export class TranscriptManager {
 
   /** Toggle expand/collapse for the most recent tool (Ctrl+E). */
   toggleExpand(): void {
-    const lastFocused = ToolExecutionComponent.lastFocused;
+    const lastFocused = this.lastExpandable ?? ToolExecutionComponent.lastFocused;
     if (lastFocused) {
       lastFocused.toggleExpand();
       this.tui.requestRender();
@@ -303,7 +354,8 @@ export class TranscriptManager {
   toggleExpandAll(): void {
     // Detect majority state: if any are collapsed, expand all; otherwise collapse all
     let anyCollapsed = false;
-    for (const tc of this.toolCalls.values()) {
+    const components = new Set(this.toolCalls.values());
+    for (const tc of components) {
       if (!tc.isExpanded) {
         anyCollapsed = true;
         break;
@@ -311,7 +363,7 @@ export class TranscriptManager {
     }
     const targetState = anyCollapsed; // expand if any collapsed, collapse if all expanded
 
-    for (const tc of this.toolCalls.values()) {
+    for (const tc of components) {
       if (tc.isExpanded !== targetState) {
         tc.toggleExpand();
       }
@@ -325,13 +377,15 @@ export class TranscriptManager {
       clearTimeout(this.renderTimer);
       this.renderTimer = null;
     }
-    for (const tc of this.toolCalls.values()) {
+    for (const tc of new Set(this.toolCalls.values())) {
       tc.dispose();
     }
     this.chatContainer.clear();
     this.currentAssistantMarkdown = null;
     this.currentAssistantText = '';
     this.toolCalls.clear();
+    this.currentToolGroup = null;
+    this.lastExpandable = null;
     this.runningSubAgents.clear();
     this.lastAddedItemCategory = null;
     this.diagnostics?.recordTranscriptMutation('clear');
@@ -376,6 +430,55 @@ export class TranscriptManager {
       this.currentAssistantMarkdown = null;
       this.currentAssistantText = '';
     }
+  }
+
+  private getOrCreateToolGroup(groupKind: ToolGroupKind): ToolGroupComponent {
+    if (this.currentToolGroup?.groupKind === groupKind) {
+      return this.currentToolGroup;
+    }
+
+    this.maybeAddSpacer(false);
+    const group = new ToolGroupComponent(groupKind);
+    this.chatContainer.addChild(group);
+    this.currentToolGroup = group;
+    this.lastAddedItemCategory = 'tool-group';
+    return group;
+  }
+
+  private addRoutineNotification(title: string, message: string): void {
+    if (
+      this.lastAddedItemCategory !== null &&
+      this.lastAddedItemCategory !== 'spacer' &&
+      this.lastAddedItemCategory !== 'routine-notification'
+    ) {
+      this.chatContainer.addChild(new Spacer(1));
+    }
+
+    const label = colors.primaryMuted(title);
+    this.chatContainer.addChild(new Text(`  ${label}${colors.muted(`: ${message}`)}`));
+    this.lastAddedItemCategory = 'routine-notification';
+    this.diagnostics?.recordTranscriptMutation('notification_routine');
+    this.immediateRender();
+  }
+
+  private inferNotificationSeverity(title: string, message: string): NotificationSeverity {
+    const text = `${title} ${message}`.toLowerCase();
+    if (
+      text.includes('error') ||
+      text.includes('failed') ||
+      text.includes('failure') ||
+      text.includes('denied') ||
+      text.includes('limit') ||
+      text.includes('rate') ||
+      text.includes('connection') ||
+      text.includes('authentication') ||
+      text.includes('exhausted') ||
+      text.includes('degraded')
+    ) {
+      return 'important';
+    }
+
+    return 'routine';
   }
 
   /** Finalize and detach the current assistant message. */

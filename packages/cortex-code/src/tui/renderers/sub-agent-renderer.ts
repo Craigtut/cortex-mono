@@ -11,6 +11,7 @@ import { registerRenderer } from './registry.js';
 
 const MAX_DESCRIPTION_LINES = 5;
 const MAX_ACTIVITY_LINES = 15;
+const MAX_LIVE_ACTIVITY_LINES = 5;
 
 function extractTextContent(result: unknown): string {
   if (typeof result === 'string') return result;
@@ -138,7 +139,12 @@ const subAgentRenderer: ToolRenderer = {
 
     // Nested tool calls
     if (u?.toolCalls) {
-      const recentCalls = u.toolCalls.slice(-MAX_ACTIVITY_LINES);
+      const earlierCount = Math.max(0, u.toolCalls.length - MAX_LIVE_ACTIVITY_LINES);
+      if (earlierCount > 0) {
+        contentLines.push(chalk.hex(context.theme.muted)(`${earlierCount} earlier tool calls`));
+      }
+
+      const recentCalls = u.toolCalls.slice(-MAX_LIVE_ACTIVITY_LINES);
       for (const call of recentCalls) {
         const icon = call.status === 'success'
           ? chalk.hex(context.theme.statusSuccess)('\u2713')
@@ -151,7 +157,7 @@ const subAgentRenderer: ToolRenderer = {
     }
 
     return {
-      headerText: 'subagent',
+      headerText: u?.toolCalls ? `subagent (${u.toolCalls.length} tools)` : 'subagent',
       contentLines: contentLines.length > 0
         ? contentLines
         : [chalk.hex(context.theme.muted)('Working...')],

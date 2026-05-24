@@ -97,6 +97,7 @@ export class Session {
   private createdAt: number;
   private permissionLockPromise: Promise<void> | null = null;
   private permissionLockRelease: (() => void) | null = null;
+  private subAgentActivity = new Map<string, Map<string, { name: string; status: string; summary?: string }>>();
   private readonly freezeDiagnostics: FreezeDiagnostics;
 
   private readonly config: CortexCodeConfig;
@@ -410,8 +411,12 @@ export class Session {
 
     // Tool call lifecycle (uses typed payloads from EventBridge)
     bridge.on('tool_call_start', (event: CortexEvent) => {
-      // Drop child agent tool events entirely; sub-agent internals are not shown
-      if (event.childTaskId) return;
+      // Child agent tool events update the parent sub-agent row instead of
+      // creating separate transcript rows.
+      if (event.childTaskId) {
+        this.recordSubAgentToolStart(event);
+        return;
+      }
 
       const p = event.payload as import('@animus-labs/cortex').ToolCallStartPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
@@ -462,8 +467,12 @@ export class Session {
     });
 
     bridge.on('tool_call_end', (event: CortexEvent) => {
-      // Drop child agent tool events entirely
-      if (event.childTaskId) return;
+      // Child agent tool events update the parent sub-agent row instead of
+      // creating separate transcript rows.
+      if (event.childTaskId) {
+        this.recordSubAgentToolEnd(event);
+        return;
+      }
 
       const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
@@ -575,6 +584,7 @@ export class Session {
 
     // Sub-agent events: rendered as tool calls via the SubAgent renderer
     this.agent.onSubAgentSpawned((taskId, instructions, background) => {
+      this.subAgentActivity.set(taskId, new Map());
       this.app!.transcript.startSubAgentCall(taskId, {
         instructions,
         background,
@@ -584,10 +594,12 @@ export class Session {
 
     this.agent.onSubAgentCompleted((taskId, result, status, usage) => {
       this.app!.transcript.completeSubAgentCall(taskId, result, status, usage);
+      this.subAgentActivity.delete(taskId);
     });
 
     this.agent.onSubAgentFailed((taskId, error) => {
       this.app!.transcript.failSubAgentCall(taskId, error);
+      this.subAgentActivity.delete(taskId);
     });
 
     // Background sub-agent result delivery: Cortex restarts the agentic loop
@@ -1047,6 +1059,58 @@ export class Session {
       default:
         return JSON.stringify(args).slice(0, 60);
     }
+  }
+
+  private recordSubAgentToolStart(event: CortexEvent): void {
+    if (!event.childTaskId || !this.app) return;
+
+    const p = event.payload as import('@animus-labs/cortex').ToolCallStartPayload | undefined;
+    const data = event.data as Record<string, unknown> | undefined;
+    const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
+    const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? Math.random());
+    const args = p?.args ?? (data?.['args'] as Record<string, unknown> | undefined) ?? {};
+    const summary = this.summarizeToolArgs(toolName, args);
+
+    this.updateSubAgentActivity(event.childTaskId, toolCallId, {
+      name: toolName,
+      status: 'pending',
+      summary,
+    });
+  }
+
+  private recordSubAgentToolEnd(event: CortexEvent): void {
+    if (!event.childTaskId || !this.app) return;
+
+    const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
+    const data = event.data as Record<string, unknown> | undefined;
+    const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
+    const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? Math.random());
+    const existing = this.subAgentActivity.get(event.childTaskId)?.get(toolCallId);
+
+    const isError = p?.isError ?? Boolean(data?.['isError']);
+
+    this.updateSubAgentActivity(event.childTaskId, toolCallId, {
+      name: existing?.name ?? toolName,
+      status: isError ? 'error' : 'success',
+      ...(existing?.summary ? { summary: existing.summary } : {}),
+    });
+  }
+
+  private updateSubAgentActivity(
+    taskId: string,
+    toolCallId: string,
+    activity: { name: string; status: string; summary?: string },
+  ): void {
+    let tools = this.subAgentActivity.get(taskId);
+    if (!tools) {
+      tools = new Map();
+      this.subAgentActivity.set(taskId, tools);
+    }
+
+    tools.set(toolCallId, activity);
+    this.app?.transcript.updateToolCall(taskId, {
+      toolCalls: [...tools.values()],
+    });
   }
 
   // -------------------------------------------------------------------------
