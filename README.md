@@ -10,7 +10,7 @@ Built on `@earendil-works/pi-agent-core` for the agentic loop and `@earendil-wor
 
 | Package | Description | Status |
 |---------|-------------|--------|
-| [`@animus-labs/cortex`](packages/cortex/) | Core agent harness | 0.2.5 |
+| [`@animus-labs/cortex`](packages/cortex/) | Core agent harness | 0.2.6 |
 | [`@animus-labs/cortex-code`](packages/cortex-code/) | Terminal-based coding agent | 0.2.2 |
 
 ## Getting Started
