@@ -22,9 +22,11 @@ describe('ToolGroupComponent', () => {
     group.completeToolCall('tool-1', { totalCount: 4 }, 10);
     group.startToolCall('tool-2', 'Read', { file_path: '/tmp/project/src/index.ts' });
     group.completeToolCall('tool-2', { filePath: '/tmp/project/src/index.ts', startLine: 1, totalLines: 10 }, 5);
+    group.close();
 
     const lines = group.render(80);
     expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('\u2570');
     expect(visibleWidth(lines[0]!)).toBeLessThanOrEqual(80);
   });
 

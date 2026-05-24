@@ -505,6 +505,7 @@ export class Session {
       this.isRunning = false;
       this.triggerAutoSave();
       this.updateFooterContextUsage();
+      this.app?.transcript.closeActiveToolGroups();
       this.app?.hideStatusSpinner();
       this.app?.focusEditor();
     });

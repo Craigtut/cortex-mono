@@ -99,6 +99,7 @@ vi.mock('../../src/tui/renderers/tool-group.js', () => ({
 
     completeToolCall(): void {}
     failToolCall(): void {}
+    close(): void {}
 
     toggleExpand(): void {
       this.isExpanded = !this.isExpanded;
@@ -161,6 +162,20 @@ describe('TranscriptManager', () => {
 
     transcript.startToolCall('tool-1', 'Glob', { pattern: '**/*.ts' });
     transcript.completeToolCall('tool-1', {}, { totalCount: 3 }, 10);
+    transcript.startToolCall('tool-2', 'Read', { file_path: '/tmp/project/src/index.ts' });
+
+    expect(chat.children).toHaveLength(1);
+  });
+
+  it('keeps exploration grouped across hidden assistant turns', () => {
+    const chat = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never);
+
+    transcript.startToolCall('tool-1', 'Glob', { pattern: '**/*.ts' });
+    transcript.completeToolCall('tool-1', {}, { totalCount: 3 }, 10);
+    transcript.startAssistantMessage();
+    transcript.appendAssistantChunk('<working>checking what to read next</working>');
     transcript.startToolCall('tool-2', 'Read', { file_path: '/tmp/project/src/index.ts' });
 
     expect(chat.children).toHaveLength(1);

@@ -57,7 +57,7 @@ export class TranscriptManager {
   private currentAssistantText = '';
   /** Map of active tool call components by tool call ID. */
   private toolCalls = new Map<string, ToolTranscriptComponent>();
-  private currentToolGroup: ToolGroupComponent | null = null;
+  private activeToolGroups = new Map<ToolGroupKind, ToolGroupComponent>();
   private lastExpandable: ExpandableTranscriptItem | null = null;
   /** Track running sub-agent IDs for the activity indicator. */
   private runningSubAgents = new Set<string>();
@@ -152,7 +152,7 @@ export class TranscriptManager {
   /** Add a user message to the transcript. */
   addUserMessage(text: string): void {
     this.finalizeCurrentAssistant();
-    this.currentToolGroup = null;
+    this.closeActiveToolGroups();
     this.chatContainer.addChild(new Spacer(1));
     this.chatContainer.addChild(new Text(text, 2, 1, colors.userMessageBg));
     this.chatContainer.addChild(new Spacer(1));
@@ -163,33 +163,53 @@ export class TranscriptManager {
   /** Start a new assistant message (renders streaming content). */
   startAssistantMessage(): void {
     this.finalizeCurrentAssistant();
-    this.currentToolGroup = null;
-    this.maybeAddSpacer(false);
     this.currentAssistantText = '';
-    this.currentAssistantMarkdown = new Markdown('', 0, 0, markdownTheme);
-    this.chatContainer.addChild(this.currentAssistantMarkdown);
-    this.lastAddedItemCategory = 'other';
+    this.currentAssistantMarkdown = null;
     this.diagnostics?.recordTranscriptMutation('assistant_start');
   }
 
   /** Append streaming text to the current assistant message. */
   appendAssistantChunk(chunk: string): void {
-    if (!this.currentAssistantMarkdown) {
-      this.startAssistantMessage();
-    }
     this.currentAssistantText += chunk;
     // Strip working tags for display; raw text stays in currentAssistantText
     const displayText = stripWorkingTags(this.currentAssistantText);
-    this.currentAssistantMarkdown!.setText(displayText);
+    if (displayText.trim()) {
+      this.closeActiveToolGroups();
+    }
+    if (!this.currentAssistantMarkdown) {
+      if (!displayText.trim()) {
+        this.diagnostics?.recordTranscriptMutation('assistant_chunk');
+        this.throttledRender();
+        return;
+      }
+
+      this.maybeAddSpacer(false);
+      this.currentAssistantMarkdown = new Markdown(displayText, 0, 0, markdownTheme);
+      this.chatContainer.addChild(this.currentAssistantMarkdown);
+      this.lastAddedItemCategory = 'other';
+    } else {
+      this.currentAssistantMarkdown.setText(displayText);
+    }
     this.diagnostics?.recordTranscriptMutation('assistant_chunk');
     this.throttledRender();
   }
 
   /** Finalize the current assistant message (e.g., strip working tags). */
   finalizeAssistantMessage(finalText?: string): void {
-    if (this.currentAssistantMarkdown && finalText !== undefined) {
+    const displayText = finalText !== undefined ? stripWorkingTags(finalText) : undefined;
+    if (finalText !== undefined) {
       this.currentAssistantText = finalText;
-      this.currentAssistantMarkdown.setText(finalText);
+    }
+    if (displayText?.trim()) {
+      this.closeActiveToolGroups();
+    }
+    if (finalText !== undefined && displayText?.trim() && !this.currentAssistantMarkdown) {
+      this.maybeAddSpacer(false);
+      this.currentAssistantMarkdown = new Markdown(displayText, 0, 0, markdownTheme);
+      this.chatContainer.addChild(this.currentAssistantMarkdown);
+      this.lastAddedItemCategory = 'other';
+    } else if (this.currentAssistantMarkdown && finalText !== undefined) {
+      this.currentAssistantMarkdown.setText(displayText ?? finalText);
     }
     this.finalizeCurrentAssistant();
     this.diagnostics?.recordTranscriptMutation('assistant_final');
@@ -215,7 +235,7 @@ export class TranscriptManager {
       return;
     }
 
-    this.currentToolGroup = null;
+    this.closeActiveToolGroups();
     const isCompact = COMPACT_TOOLS.has(toolName);
     this.maybeAddSpacer(isCompact);
 
@@ -311,7 +331,7 @@ export class TranscriptManager {
     message: string,
     options?: { severity?: NotificationSeverity },
   ): void {
-    this.currentToolGroup = null;
+    this.closeActiveToolGroups();
     const severity = options?.severity ?? this.inferNotificationSeverity(title, message);
     if (severity === 'routine' && !message.includes('\n')) {
       this.addRoutineNotification(title, message);
@@ -330,7 +350,7 @@ export class TranscriptManager {
 
   /** Add a permission prompt inline in the transcript. */
   addPermissionPrompt(prompt: PermissionPromptComponent): void {
-    this.currentToolGroup = null;
+    this.closeActiveToolGroups();
     this.chatContainer.addChild(prompt);
     this.diagnostics?.recordTranscriptMutation('permission_prompt_added');
   }
@@ -384,7 +404,7 @@ export class TranscriptManager {
     this.currentAssistantMarkdown = null;
     this.currentAssistantText = '';
     this.toolCalls.clear();
-    this.currentToolGroup = null;
+    this.activeToolGroups.clear();
     this.lastExpandable = null;
     this.runningSubAgents.clear();
     this.lastAddedItemCategory = null;
@@ -433,16 +453,31 @@ export class TranscriptManager {
   }
 
   private getOrCreateToolGroup(groupKind: ToolGroupKind): ToolGroupComponent {
-    if (this.currentToolGroup?.groupKind === groupKind) {
-      return this.currentToolGroup;
+    const activeGroup = this.activeToolGroups.get(groupKind);
+    if (activeGroup) {
+      return activeGroup;
+    }
+
+    for (const [kind, group] of this.activeToolGroups) {
+      if (kind !== groupKind) {
+        group.close();
+        this.activeToolGroups.delete(kind);
+      }
     }
 
     this.maybeAddSpacer(false);
     const group = new ToolGroupComponent(groupKind);
     this.chatContainer.addChild(group);
-    this.currentToolGroup = group;
+    this.activeToolGroups.set(groupKind, group);
     this.lastAddedItemCategory = 'tool-group';
     return group;
+  }
+
+  closeActiveToolGroups(): void {
+    for (const group of this.activeToolGroups.values()) {
+      group.close();
+    }
+    this.activeToolGroups.clear();
   }
 
   private addRoutineNotification(title: string, message: string): void {

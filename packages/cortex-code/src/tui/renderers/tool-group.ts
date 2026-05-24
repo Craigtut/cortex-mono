@@ -105,11 +105,13 @@ export class ToolGroupComponent implements Component {
   private readonly startedAt = Date.now();
   private expanded = false;
   private completedAt: number | null = null;
+  private open = true;
 
   constructor(readonly groupKind: ToolGroupKind) {}
 
   startToolCall(id: string, toolName: string, args: Record<string, unknown>): void {
     this.completedAt = null;
+    this.open = true;
     this.entries.push({
       id,
       toolName,
@@ -126,7 +128,6 @@ export class ToolGroupComponent implements Component {
     entry.status = 'success';
     entry.durationMs = durationMs;
     entry.summary = resultSummary(entry.toolName, entry.args, details);
-    this.completedAt = this.hasPendingEntries() ? null : Date.now();
   }
 
   failToolCall(id: string, error: string, durationMs: number): void {
@@ -135,7 +136,12 @@ export class ToolGroupComponent implements Component {
     entry.status = 'error';
     entry.durationMs = durationMs;
     entry.error = error.split('\n')[0] ?? error;
-    this.completedAt = this.hasPendingEntries() ? null : Date.now();
+  }
+
+  close(): void {
+    if (!this.open) return;
+    this.open = false;
+    this.completedAt = Date.now();
   }
 
   toggleExpand(): void {
@@ -152,7 +158,7 @@ export class ToolGroupComponent implements Component {
 
   render(width: number): string[] {
     const theme = getToolTheme();
-    const active = this.hasPendingEntries();
+    const active = this.open;
     const hasError = this.entries.some(entry => entry.status === 'error');
     const labels = GROUP_LABELS[this.groupKind];
     const icon = active
@@ -176,15 +182,13 @@ export class ToolGroupComponent implements Component {
         ], width);
       }
 
-      return this.clampLines([chalk.hex(theme.border)('\u2570\u2500\u2500 ') + summary], width);
+      return this.clampLines([summary], width);
     }
 
-    const border = chalk.hex(theme.border);
-    const mutedBorder = chalk.hex(theme.borderMuted);
     const lines = [
-      border('\u256D\u2500\u2500 ') + summary,
-      ...this.entries.map(entry => `${mutedBorder('\u2502')}  ${this.formatEntry(entry)}`),
-      border('\u2570\u2500\u2500 ') + `${this.entries.length} tool calls`,
+      summary,
+      ...this.entries.map(entry => `  ${this.formatEntry(entry)}`),
+      chalk.hex(theme.muted)(`  ${this.entries.length} tool calls`),
     ];
 
     return this.clampLines(lines, width);
@@ -192,10 +196,6 @@ export class ToolGroupComponent implements Component {
 
   private findEntry(id: string): GroupedToolEntry | undefined {
     return this.entries.find(entry => entry.id === id);
-  }
-
-  private hasPendingEntries(): boolean {
-    return this.entries.some(entry => entry.status === 'pending');
   }
 
   private formatCounts(): string {
