@@ -30,6 +30,13 @@ function extractTextContent(result: unknown): string {
   return String(result ?? '');
 }
 
+function stripTrailingExitCode(text: string, exitCode: number | null | undefined): string {
+  if (exitCode === null || exitCode === undefined || exitCode === 0) {
+    return text;
+  }
+  return text.replace(new RegExp(`\\n?Exit code: ${exitCode}\\s*$`), '');
+}
+
 // Per-tool-call streaming buffer (keyed by instance, managed externally)
 const streamBuffers = new WeakMap<object, StreamingBuffer>();
 
@@ -60,7 +67,8 @@ const bashRenderer: ToolRenderer = {
 
   renderResult(result: unknown, details: unknown, context: ToolRenderContext): ToolResultDisplay {
     const d = details as BashDetails | undefined;
-    const text = extractTextContent(result);
+    const rawText = extractTextContent(result);
+    const text = stripTrailingExitCode(rawText, d?.exitCode) || '(no output)';
     const allLines = text.split('\n').filter(l => l.length > 0 || text.includes('\n'));
     const isError = d ? (d.exitCode !== null && d.exitCode !== 0) : false;
 
@@ -82,7 +90,7 @@ const bashRenderer: ToolRenderer = {
     // Below-box lines for error state
     const belowBoxLines: string[] = [];
     if (d?.exitCode !== null && d?.exitCode !== undefined && d.exitCode !== 0) {
-      belowBoxLines.push(chalk.hex(context.theme.error)(`Exit code: ${d.exitCode}`));
+      belowBoxLines.push(chalk.hex(context.theme.accent)(`Command exited with code ${d.exitCode}`));
     }
     if (d?.timedOut) {
       belowBoxLines.push(chalk.hex(context.theme.error)('Command timed out'));

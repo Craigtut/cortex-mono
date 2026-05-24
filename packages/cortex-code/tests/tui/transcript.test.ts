@@ -181,6 +181,29 @@ describe('TranscriptManager', () => {
     expect(chat.children).toHaveLength(1);
   });
 
+  it('does not duplicate streamed assistant text when a tool turn finalizes', () => {
+    const chat = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never);
+    const leakedToolText = '<multi_tool_use.parallel THOOK use across the entire codebase.>';
+
+    transcript.startAssistantMessage();
+    transcript.appendAssistantChunk(leakedToolText);
+    transcript.startToolCall('tool-1', 'Bash', { command: 'echo ok' });
+    transcript.completeToolCall('tool-1', {}, {}, 10);
+    transcript.finalizeAssistantMessage(leakedToolText);
+
+    const markdownTexts = chat.children
+      .filter((child): child is { text: string } => (
+        typeof child === 'object' &&
+        child !== null &&
+        typeof (child as { text?: unknown }).text === 'string'
+      ))
+      .map(child => child.text);
+
+    expect(markdownTexts).toEqual([leakedToolText]);
+  });
+
   it('renders routine single-line notifications compactly', () => {
     const chat = new Container();
     const tui = { requestRender: requestRenderSpy };

@@ -53,8 +53,12 @@ export type NotificationSeverity = 'routine' | 'important' | 'error';
 export class TranscriptManager {
   /** The current streaming assistant message Markdown component. */
   private currentAssistantMarkdown: Markdown | null = null;
-  /** Accumulated text for the current streaming assistant message. */
+  /** Accumulated raw text for the current visible assistant segment. */
   private currentAssistantText = '';
+  /** Accumulated raw text streamed during the current assistant turn. */
+  private assistantTurnText = '';
+  /** Raw offset where the current visible assistant segment started. */
+  private currentAssistantSegmentStart = 0;
   /** Map of active tool call components by tool call ID. */
   private toolCalls = new Map<string, ToolTranscriptComponent>();
   private activeToolGroups = new Map<ToolGroupKind, ToolGroupComponent>();
@@ -165,11 +169,14 @@ export class TranscriptManager {
     this.finalizeCurrentAssistant();
     this.currentAssistantText = '';
     this.currentAssistantMarkdown = null;
+    this.assistantTurnText = '';
+    this.currentAssistantSegmentStart = 0;
     this.diagnostics?.recordTranscriptMutation('assistant_start');
   }
 
   /** Append streaming text to the current assistant message. */
   appendAssistantChunk(chunk: string): void {
+    this.assistantTurnText += chunk;
     this.currentAssistantText += chunk;
     // Strip working tags for display; raw text stays in currentAssistantText
     const displayText = stripWorkingTags(this.currentAssistantText);
@@ -196,9 +203,13 @@ export class TranscriptManager {
 
   /** Finalize the current assistant message (e.g., strip working tags). */
   finalizeAssistantMessage(finalText?: string): void {
-    const displayText = finalText !== undefined ? stripWorkingTags(finalText) : undefined;
+    const displayText = finalText !== undefined
+      ? this.getFinalAssistantDisplayText(finalText)
+      : undefined;
     if (finalText !== undefined) {
-      this.currentAssistantText = finalText;
+      this.currentAssistantText = this.currentAssistantMarkdown
+        ? this.getFinalAssistantSegmentText(finalText)
+        : displayText ?? '';
     }
     if (displayText?.trim()) {
       this.closeActiveToolGroups();
@@ -403,6 +414,8 @@ export class TranscriptManager {
     this.chatContainer.clear();
     this.currentAssistantMarkdown = null;
     this.currentAssistantText = '';
+    this.assistantTurnText = '';
+    this.currentAssistantSegmentStart = 0;
     this.toolCalls.clear();
     this.activeToolGroups.clear();
     this.lastExpandable = null;
@@ -449,7 +462,46 @@ export class TranscriptManager {
     if (this.currentAssistantMarkdown) {
       this.currentAssistantMarkdown = null;
       this.currentAssistantText = '';
+      this.currentAssistantSegmentStart = this.assistantTurnText.length;
     }
+  }
+
+  private getFinalAssistantSegmentText(finalText: string): string {
+    if (
+      this.assistantTurnText &&
+      finalText.startsWith(this.assistantTurnText) &&
+      this.currentAssistantSegmentStart <= finalText.length
+    ) {
+      return finalText.slice(this.currentAssistantSegmentStart);
+    }
+    return finalText;
+  }
+
+  private getFinalAssistantDisplayText(finalText: string): string {
+    const fullDisplayText = stripWorkingTags(finalText);
+
+    if (this.currentAssistantMarkdown) {
+      return stripWorkingTags(this.getFinalAssistantSegmentText(finalText));
+    }
+
+    if (!this.assistantTurnText) {
+      return fullDisplayText;
+    }
+
+    const streamedDisplayText = stripWorkingTags(this.assistantTurnText);
+    if (!streamedDisplayText) {
+      return fullDisplayText;
+    }
+
+    if (fullDisplayText === streamedDisplayText) {
+      return '';
+    }
+
+    if (fullDisplayText.startsWith(streamedDisplayText)) {
+      return fullDisplayText.slice(streamedDisplayText.length).trimStart();
+    }
+
+    return fullDisplayText;
   }
 
   private getOrCreateToolGroup(groupKind: ToolGroupKind): ToolGroupComponent {
