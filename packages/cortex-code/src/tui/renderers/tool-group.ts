@@ -19,7 +19,7 @@ interface GroupedToolEntry {
 }
 
 const GROUP_LABELS: Record<ToolGroupKind, { active: string; complete: string }> = {
-  exploration: { active: 'Exploring codebase', complete: 'explored codebase' },
+  exploration: { active: 'Inspecting files', complete: 'inspected files' },
   web: { active: 'Researching web', complete: 'web research' },
 };
 

@@ -10,6 +10,7 @@ describe('ToolGroupComponent', () => {
 
     const lines = group.render(80);
     expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('Inspecting files');
     for (const line of lines) {
       expect(visibleWidth(line)).toBeLessThanOrEqual(80);
     }
@@ -26,6 +27,7 @@ describe('ToolGroupComponent', () => {
 
     const lines = group.render(80);
     expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('inspected files');
     expect(lines[0]).not.toContain('\u2570');
     expect(visibleWidth(lines[0]!)).toBeLessThanOrEqual(80);
   });
