@@ -178,6 +178,16 @@ describe('Bash safety layers', () => {
       expect(classifyCommand('cat file.txt | grep pattern')).toBe('read');
     });
 
+    it('classifies output redirection as write access', () => {
+      expect(classifyCommand('echo hello > file.txt')).toBe('write');
+      expect(classifyCommand('cat package.json >> out.log')).toBe('write');
+      expect(classifyCommand('git status 2> err.log')).toBe('write');
+    });
+
+    it('does not treat file descriptor duplication as file write access', () => {
+      expect(classifyCommand('echo hello 2>&1')).toBe('read');
+    });
+
     // S1: compound command classification
     it('classifies compound commands by highest risk (semicolons)', () => {
       // ls is read, rm is write; compound should be write (higher risk)
@@ -278,6 +288,28 @@ describe('Bash safety layers', () => {
       expect(paths).toContain('file1');
       expect(paths).toContain('file2');
     });
+
+    it('extracts output redirection targets', () => {
+      expect(extractWritePaths('echo ok > out.txt')).toContain('out.txt');
+      expect(extractWritePaths('cat package.json >> logs/output.txt')).toContain('logs/output.txt');
+      expect(extractWritePaths('git status 2> err.log')).toContain('err.log');
+    });
+
+    it('extracts tee output targets without treating stdin redirection as output', () => {
+      const paths = extractWritePaths('tee -a out.txt <<< hello');
+      expect(paths).toContain('out.txt');
+      expect(paths).not.toContain('hello');
+    });
+
+    it('extracts sed in-place targets', () => {
+      const paths = extractWritePaths('sed -i "s/old/new/g" src/index.ts');
+      expect(paths).toContain('src/index.ts');
+    });
+
+    it('extracts sed in-place targets when scripts are passed with -e', () => {
+      const paths = extractWritePaths('sed -i -e "s/old/new/g" src/index.ts');
+      expect(paths).toContain('src/index.ts');
+    });
   });
 
   describe('Layer 4: validateWritePaths', () => {
@@ -289,6 +321,22 @@ describe('Bash safety layers', () => {
     it('blocks write to critical paths', () => {
       const result = validateWritePaths('rm /', '/', '/');
       expect(result.allowed).toBe(false);
+    });
+
+    it('blocks writes outside the working directory', () => {
+      const result = validateWritePaths('echo hi > ../outside.txt', '/tmp/workspace', '/tmp/workspace');
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('outside the working directory');
+    });
+
+    it('allows output redirection inside the working directory', () => {
+      const result = validateWritePaths('echo hi > out.txt', '/tmp/workspace', '/tmp/workspace');
+      expect(result.allowed).toBe(true);
+    });
+
+    it('allows output redirection to /dev/null', () => {
+      const result = validateWritePaths('echo hi > /dev/null', '/tmp/workspace', '/tmp/workspace');
+      expect(result.allowed).toBe(true);
     });
   });
 
@@ -348,6 +396,28 @@ describe('Bash safety layers', () => {
         tmpDir,
       );
       expect(result.allowed).toBe(true);
+    });
+
+    it('resolves symlinked parent directories before working-directory checks', () => {
+      const projectDir = path.join(tmpDir, 'project');
+      const outsideDir = path.join(tmpDir, 'outside');
+      fs.mkdirSync(projectDir);
+      fs.mkdirSync(outsideDir);
+
+      const symlinkPath = path.join(projectDir, 'outside-link');
+      try {
+        fs.symlinkSync(outsideDir, symlinkPath, 'dir');
+      } catch {
+        return;
+      }
+
+      const result = validateWritePaths(
+        'echo hi > outside-link/new-file.txt',
+        projectDir,
+        projectDir,
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('outside the working directory');
     });
   });
 
@@ -600,6 +670,26 @@ describe('Bash safety layers', () => {
       );
       expect(result.allowed).toBe(false);
       expect(result.reason).toContain('critical system directory');
+    });
+
+    it('blocks redirection writes under critical paths', async () => {
+      const result = await runSafetyChecks(
+        'echo pwn > /etc/passwd',
+        '/tmp',
+        '/tmp',
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('critical system directory');
+    });
+
+    it('blocks redirection writes outside the working directory', async () => {
+      const result = await runSafetyChecks(
+        'echo hi > ../outside.txt',
+        '/tmp/workspace',
+        '/tmp/workspace',
+      );
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toContain('outside the working directory');
     });
 
     it('allows compound command with only safe sub-commands', async () => {

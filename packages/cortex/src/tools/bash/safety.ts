@@ -290,6 +290,192 @@ export function splitOnShellOperators(command: string): string[] {
   return subCommands;
 }
 
+function readRedirectionOperator(command: string, index: number): string | null {
+  let cursor = index;
+  while (/\d/.test(command[cursor] ?? '')) cursor++;
+
+  const fdPrefix = cursor > index ? command.slice(index, cursor) : '';
+  const rest = command.slice(cursor);
+
+  if (rest.startsWith('&>>')) return '&>>';
+  if (rest.startsWith('&>')) return '&>';
+  if (rest.startsWith('<<-')) return `${fdPrefix}<<-`;
+  if (rest.startsWith('<<<')) return `${fdPrefix}<<<`;
+  if (rest.startsWith('>>')) return `${fdPrefix}>>`;
+  if (rest.startsWith('<<')) return `${fdPrefix}<<`;
+  if (rest.startsWith('>|')) return `${fdPrefix}>|`;
+  if (rest.startsWith('>&')) return `${fdPrefix}>&`;
+  if (rest.startsWith('<>')) return `${fdPrefix}<>`;
+  if (rest.startsWith('>')) return `${fdPrefix}>`;
+  if (rest.startsWith('<')) return `${fdPrefix}<`;
+
+  return null;
+}
+
+function tokenizeShellWords(command: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  let i = 0;
+
+  const pushCurrent = () => {
+    if (current) {
+      tokens.push(current);
+      current = '';
+    }
+  };
+
+  while (i < command.length) {
+    const ch = command[i]!;
+
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      i++;
+      continue;
+    }
+
+    if (ch === '\\' && !inSingle) {
+      escaped = true;
+      i++;
+      continue;
+    }
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      i++;
+      continue;
+    }
+
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      i++;
+      continue;
+    }
+
+    if (!inSingle && !inDouble) {
+      if (/\s/.test(ch)) {
+        pushCurrent();
+        i++;
+        continue;
+      }
+
+      const redirection = readRedirectionOperator(command, i);
+      if (redirection) {
+        pushCurrent();
+        tokens.push(redirection);
+        i += redirection.length;
+        continue;
+      }
+    }
+
+    current += ch;
+    i++;
+  }
+
+  pushCurrent();
+  return tokens;
+}
+
+function isRedirectionOperator(token: string): boolean {
+  return /^(?:\d*)?(?:>|>>|>\||>&|<>|<|<<|<<-|<<<)$/.test(token) || token === '&>' || token === '&>>';
+}
+
+function isWriteRedirectionOperator(token: string): boolean {
+  return /^(?:\d*)?(?:>|>>|>\||<>)$/.test(token) || token === '&>' || token === '&>>';
+}
+
+function isFileDescriptorTarget(token: string): boolean {
+  return /^&(?:\d+|-)$/.test(token);
+}
+
+function extractRedirectionWritePaths(tokens: string[]): string[] {
+  const paths: string[] = [];
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (!isWriteRedirectionOperator(token)) continue;
+
+    const target = tokens[i + 1];
+    if (!target || isRedirectionOperator(target) || isFileDescriptorTarget(target)) continue;
+    paths.push(target);
+  }
+
+  return paths;
+}
+
+function removeRedirectionTokens(tokens: string[]): string[] {
+  const result: string[] = [];
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (isRedirectionOperator(token)) {
+      const target = tokens[i + 1];
+      if (target && !isRedirectionOperator(target)) i++;
+      continue;
+    }
+    result.push(token);
+  }
+
+  return result;
+}
+
+function collectNonOptionOperands(tokens: string[]): string[] {
+  return tokens.filter((token) => token !== '--' && !token.startsWith('-'));
+}
+
+function extractTargetDirectoryOption(tokens: string[]): string | null {
+  for (let i = 1; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (token === '-t' || token === '--target-directory') {
+      return tokens[i + 1] ?? null;
+    }
+    if (token.startsWith('--target-directory=')) {
+      return token.slice('--target-directory='.length);
+    }
+  }
+  return null;
+}
+
+function hasSedInPlaceFlag(tokens: string[]): boolean {
+  return tokens.slice(1).some((token) => token === '-i' || /^-i.+/.test(token));
+}
+
+function extractSedInPlacePaths(tokens: string[]): string[] {
+  if (!hasSedInPlaceFlag(tokens)) return [];
+
+  const paths: string[] = [];
+  let scriptConsumed = false;
+
+  for (let i = 1; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (token === '--') {
+      paths.push(...tokens.slice(i + 1));
+      break;
+    }
+    if (token === '-i' || /^-i.+/.test(token)) continue;
+    if (token === '-e' || token === '-f') {
+      scriptConsumed = true;
+      i++;
+      continue;
+    }
+    if (/^-e.+/.test(token) || /^-f.+/.test(token)) {
+      scriptConsumed = true;
+      continue;
+    }
+    if (token.startsWith('-')) continue;
+    if (!scriptConsumed) {
+      scriptConsumed = true;
+      continue;
+    }
+    paths.push(token);
+  }
+
+  return paths;
+}
+
 /**
  * Extract the command name from a single (non-compound) command string.
  */
@@ -329,6 +515,9 @@ function higherRisk(a: CommandClassification, b: CommandClassification): Command
  * Classify a single (non-compound) command by its potential impact.
  */
 function classifySingleCommand(singleCommand: string): CommandClassification {
+  const tokens = tokenizeShellWords(singleCommand);
+  if (extractRedirectionWritePaths(tokens).length > 0) return 'write';
+
   const cmdName = extractCommandName(singleCommand);
   const isWindows = process.platform === 'win32';
 
@@ -405,21 +594,29 @@ export function classifyCommand(command: string): CommandClassification {
  * Extract target paths from write/create commands in a single sub-command.
  */
 function extractWritePathsFromSingle(singleCommand: string): string[] {
-  const paths: string[] = [];
-  const tokens = singleCommand.trim().split(/\s+/);
+  const rawTokens = tokenizeShellWords(singleCommand);
+  const paths = extractRedirectionWritePaths(rawTokens);
+  const tokens = removeRedirectionTokens(rawTokens);
   const cmd = (tokens[0] ?? '').toLowerCase();
 
-  if (['rm', 'rmdir', 'mv', 'cp', 'touch', 'mkdir'].includes(cmd)) {
-    // Last argument(s) that aren't flags
-    for (let i = tokens.length - 1; i > 0; i--) {
-      const token = tokens[i]!;
-      if (!token.startsWith('-')) {
-        paths.push(token);
-        // For rm, rmdir, touch, mkdir - all non-flag args are targets
-        // For mv, cp - last arg is destination
-        if (['mv', 'cp'].includes(cmd)) break;
-      }
+  if (['rm', 'rmdir', 'touch', 'mkdir'].includes(cmd)) {
+    paths.push(...collectNonOptionOperands(tokens.slice(1)));
+  } else if (['mv', 'cp'].includes(cmd)) {
+    const targetDirectory = extractTargetDirectoryOption(tokens);
+    if (targetDirectory) {
+      paths.push(targetDirectory);
+    } else {
+      const operands = collectNonOptionOperands(tokens.slice(1));
+      const destination = operands.at(-1);
+      if (destination) paths.push(destination);
     }
+  } else if (['chmod', 'chown'].includes(cmd)) {
+    const operands = collectNonOptionOperands(tokens.slice(1));
+    paths.push(...operands.slice(1));
+  } else if (cmd === 'tee') {
+    paths.push(...collectNonOptionOperands(tokens.slice(1)));
+  } else if (cmd === 'sed') {
+    paths.push(...extractSedInPlacePaths(tokens));
   }
 
   return paths;
@@ -444,12 +641,32 @@ export function extractWritePaths(command: string): string[] {
  * Falls back to path.resolve() if the path does not yet exist.
  */
 function resolveWithSymlinks(targetPath: string): string {
-  try {
-    return fs.realpathSync(targetPath);
-  } catch {
-    // Path does not exist yet (e.g., mkdir for a new directory), fall back
-    return path.resolve(targetPath);
+  const absoluteTarget = path.resolve(targetPath);
+  let current = absoluteTarget;
+  const remainder: string[] = [];
+
+  while (true) {
+    try {
+      return path.resolve(fs.realpathSync(current), ...remainder);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return absoluteTarget;
+      remainder.unshift(path.basename(current));
+      current = parent;
+    }
   }
+}
+
+function isPathSameOrDescendant(targetPath: string, parentPath: string): boolean {
+  const normalizedTarget = process.platform === 'win32' ? targetPath.toLowerCase() : targetPath;
+  const normalizedParent = process.platform === 'win32' ? parentPath.toLowerCase() : parentPath;
+  const relative = path.relative(normalizedParent, normalizedTarget);
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isAllowedExternalWriteTarget(resolvedPath: string): boolean {
+  if (process.platform === 'win32') return false;
+  return normalizePathForSafety(resolvedPath) === '/dev/null';
 }
 
 /**
@@ -466,6 +683,7 @@ export function validateWritePaths(
   }
 
   const writePaths = extractWritePaths(command);
+  const resolvedWorkingDirectory = resolveWithSymlinks(workingDirectory);
   for (const wp of writePaths) {
     // Resolve relative to current CWD, then resolve symlinks
     const rawResolved = path.resolve(currentCwd, wp);
@@ -476,6 +694,16 @@ export function validateWritePaths(
       return {
         allowed: false,
         reason: 'This command would modify a critical system directory. This cannot be auto-allowed.',
+        classification,
+      };
+    }
+
+    if (isAllowedExternalWriteTarget(resolved)) continue;
+
+    if (!isPathSameOrDescendant(resolved, resolvedWorkingDirectory)) {
+      return {
+        allowed: false,
+        reason: 'This command would write outside the working directory. Use a path inside the project.',
         classification,
       };
     }

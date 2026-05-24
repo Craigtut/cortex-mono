@@ -203,6 +203,8 @@ Classify commands by their impact to inform the permission gate.
 
 For write/create commands, extract target file paths and validate:
 - Target must not be a critical system path. Descendants are also blocked for non-broad critical roots such as `/etc`, `/boot`, `/sbin`, `/System`, `/proc`, and `/sys`.
+- Target must resolve inside the configured working directory, except for `/dev/null`.
+- Output redirection targets such as `>`, `>>`, `2>`, `&>`, and `>|` are treated as write targets.
 - Compound commands with `cd` followed by write operations require extra scrutiny (path resolution bypass)
 - Commands with flags that change target directories (e.g., `--target-directory=PATH`) require manual approval
 - On Windows, handle both forward slash and backslash path formats
