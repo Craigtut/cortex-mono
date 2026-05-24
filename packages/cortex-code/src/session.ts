@@ -38,6 +38,8 @@ import { OverlayBox } from './tui/overlay-box.js';
 import { type CortexCodeConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { PermissionRuleManager } from './permissions/rules.js';
+import { findDangerousCommand } from './permissions/dangerous-commands.js';
+import { isPathWithinRealCwd } from './permissions/path-containment.js';
 import { discoverProjectContext } from './discovery/context.js';
 import { discoverSkills } from './discovery/skills.js';
 import { discoverMcpServers } from './discovery/mcp.js';
@@ -631,10 +633,20 @@ export class Session {
     toolName: string,
     toolArgs: unknown,
   ): Promise<boolean | CortexToolPermissionResult> {
+    // Catastrophic commands (e.g. rm -rf /) are blocked unconditionally, ahead
+    // of yolo mode, the read-only bypass, and any allow rule. There is no
+    // override: such a command should never run, however it is reached.
+    if (toolName === 'Bash') {
+      const danger = findDangerousCommand(String((toolArgs as Record<string, unknown>)['command'] ?? ''));
+      if (danger) {
+        return { decision: 'block', reason: `Blocked catastrophic command (${danger}); this cannot be overridden.` };
+      }
+    }
+
     if (this.yoloMode) return true;
 
     // Auto-allow read-only tools within the project directory
-    if (this.isReadOnlyInProject(toolName, toolArgs)) return true;
+    if (await this.isReadOnlyInProject(toolName, toolArgs)) return true;
 
     // Fast path: check rules before acquiring the lock
     const rule = this.rules.matchRule(toolName, toolArgs);
@@ -680,7 +692,7 @@ export class Session {
   }
 
   /** Check if a tool call is a read-only operation within the project directory. */
-  private isReadOnlyInProject(toolName: string, toolArgs: unknown): boolean {
+  private async isReadOnlyInProject(toolName: string, toolArgs: unknown): Promise<boolean> {
     const args = toolArgs as Record<string, unknown>;
     switch (toolName) {
       case 'Read': {
@@ -697,12 +709,9 @@ export class Session {
     }
   }
 
-  /** Check if an absolute path is within the current working directory. */
-  private isWithinCwd(targetPath: string): boolean {
-    if (!targetPath) return false;
-    const resolved = path.resolve(targetPath);
-    const cwdWithSep = this.cwd.endsWith(path.sep) ? this.cwd : this.cwd + path.sep;
-    return resolved === this.cwd || resolved.startsWith(cwdWithSep);
+  /** Check if a path resolves within the current working directory. */
+  private async isWithinCwd(targetPath: string): Promise<boolean> {
+    return isPathWithinRealCwd(targetPath, this.cwd);
   }
 
   /** Credential resolution: stored API key or OAuth refresh. */

@@ -3,18 +3,39 @@ import { extractPattern, formatRule } from '../../src/permissions/patterns.js';
 
 describe('extractPattern', () => {
   describe('Bash', () => {
-    it('extracts first token as prefix', () => {
-      expect(extractPattern('Bash', { command: 'git push origin main' })).toBe('git *');
-    });
-
-    it('uses two tokens for package managers', () => {
+    it('suggests a two-word prefix when the second token is a subcommand', () => {
+      expect(extractPattern('Bash', { command: 'git push origin main' })).toBe('git push *');
+      expect(extractPattern('Bash', { command: 'git diff -- README.md' })).toBe('git diff *');
       expect(extractPattern('Bash', { command: 'npm run build' })).toBe('npm run *');
       expect(extractPattern('Bash', { command: 'yarn add express' })).toBe('yarn add *');
-      expect(extractPattern('Bash', { command: 'pip install requests' })).toBe('pip install *');
+      expect(extractPattern('Bash', { command: 'docker compose up -d' })).toBe('docker compose *');
+    });
+
+    it('falls back to a one-word prefix when the second token is not a subcommand', () => {
+      expect(extractPattern('Bash', { command: 'ls -la' })).toBe('ls *');
+      expect(extractPattern('Bash', { command: 'git --version' })).toBe('git *');
+      expect(extractPattern('Bash', { command: 'cat file.txt' })).toBe('cat *');
+      expect(extractPattern('Bash', { command: 'chmod 755 run.sh' })).toBe('chmod *');
     });
 
     it('falls back to first token for single-token commands', () => {
       expect(extractPattern('Bash', { command: 'ls' })).toBe('ls *');
+    });
+
+    it('skips safe leading env vars when forming the prefix', () => {
+      expect(extractPattern('Bash', { command: 'NODE_ENV=test npm run build' })).toBe('npm run *');
+    });
+
+    it('suggests no prefix for bare shells and exec wrappers', () => {
+      // No safe prefix exists — a `bash *` / `sudo *` rule would allow anything.
+      expect(extractPattern('Bash', { command: 'bash -c "rm -rf x"' })).toBe('');
+      expect(extractPattern('Bash', { command: 'sudo apt install foo' })).toBe('');
+      expect(extractPattern('Bash', { command: 'env FOO=bar do-thing' })).toBe('');
+      expect(extractPattern('Bash', { command: 'xargs rm' })).toBe('');
+    });
+
+    it('suggests no prefix when led by an unsafe env var', () => {
+      expect(extractPattern('Bash', { command: 'PATH=/evil npm run build' })).toBe('');
     });
 
     it('returns empty for empty command', () => {

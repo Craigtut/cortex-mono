@@ -1,7 +1,11 @@
 import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { extractPattern } from './patterns.js';
+import { splitBashCommand, stripLeadingAssignments, isCompoundBash } from './bash-command.js';
+import { findDangerousCommand } from './dangerous-commands.js';
 
 export type PermissionDecision = 'allow' | 'deny';
 export type RuleScope = 'session' | 'project' | 'user';
@@ -17,6 +21,10 @@ interface SettingsFile {
     allow?: string[];
     deny?: string[];
   };
+}
+
+interface PermissionRuleManagerOptions {
+  configDir?: string;
 }
 
 /**
@@ -42,6 +50,36 @@ function matchPattern(pattern: string, value: string): boolean {
   }
 
   return value === pattern;
+}
+
+/**
+ * Match a single (already-split) Bash subcommand against a rule pattern.
+ *
+ * Prefix patterns ("git commit *") match the subcommand and its arguments but
+ * never span a shell operator, so a `git *` rule cannot cover the `rm` half of
+ * `git status && rm -rf foo`. Patterns without a wildcard are exact matches.
+ */
+function matchBashPattern(pattern: string, subcommand: string): boolean {
+  if (!pattern) return true; // tool-wide allow/deny
+
+  if (pattern.endsWith(' *')) {
+    const prefix = pattern.slice(0, -2); // "git commit"
+    if (subcommand === prefix) return true;
+    if (!subcommand.startsWith(prefix + ' ')) return false;
+    // Defense in depth: a prefix rule may only cover one simple-command.
+    return !isCompoundBash(subcommand);
+  }
+
+  if (pattern.endsWith('*')) {
+    const prefix = pattern.slice(0, -1);
+    return subcommand.startsWith(prefix) && !isCompoundBash(subcommand);
+  }
+
+  return subcommand === pattern;
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
 }
 
 function parseRuleString(rule: string): { toolName: string; pattern: string } {
@@ -89,17 +127,19 @@ export class PermissionRuleManager {
   private sessionRules: PermissionRule[] = [];
   private projectRules: PermissionRule[] = [];
   private userRules: PermissionRule[] = [];
-  private projectSettingsPath: string;
+  private workspaceSettingsPath: string;
   private userSettingsPath: string;
 
-  constructor(cwd: string) {
-    this.projectSettingsPath = join(cwd, '.cortex', 'settings.json');
-    this.userSettingsPath = join(homedir(), '.cortex', 'settings.json');
+  constructor(cwd: string, options: PermissionRuleManagerOptions = {}) {
+    const configDir = options.configDir ?? join(homedir(), '.cortex');
+    const workspaceId = this.workspaceId(cwd);
+    this.workspaceSettingsPath = join(configDir, 'workspaces', workspaceId, 'settings.json');
+    this.userSettingsPath = join(configDir, 'settings.json');
   }
 
-  /** Load persisted rules from project and user settings files. */
+  /** Load persisted rules from user-owned workspace and global settings files. */
   async loadPersistedRules(): Promise<void> {
-    this.projectRules = await this.loadRulesFromFile(this.projectSettingsPath);
+    this.projectRules = await this.loadRulesFromFile(this.workspaceSettingsPath);
     this.userRules = await this.loadRulesFromFile(this.userSettingsPath);
   }
 
@@ -109,6 +149,13 @@ export class PermissionRuleManager {
    * Returns the decision if matched, null if no rule applies.
    */
   matchRule(toolName: string, toolArgs: unknown): PermissionDecision | null {
+    // Bash is evaluated per simple-command so a prefix rule cannot auto-approve
+    // a second command chained on with && / ; / | etc.
+    if (toolName === 'Bash') {
+      const args = toolArgs as Record<string, unknown>;
+      return this.matchBashCommand(String(args['command'] ?? ''));
+    }
+
     const value = getMatchValue(toolName, toolArgs);
 
     // Check in precedence order: session first, then project, then user
@@ -129,6 +176,52 @@ export class PermissionRuleManager {
     return null;
   }
 
+  /**
+   * Decide a whole Bash command by evaluating each simple-command separately.
+   *
+   * - Catastrophic commands (e.g. `rm -rf /`) are denied unconditionally, even
+   *   if an allow rule would otherwise match.
+   * - A deny on any subcommand denies the whole command.
+   * - The command is allowed only if *every* subcommand is allowed.
+   * - Otherwise null (prompt).
+   */
+  private matchBashCommand(command: string): PermissionDecision | null {
+    if (findDangerousCommand(command)) return 'deny';
+
+    let allAllowed = true;
+    for (const sub of splitBashCommand(command)) {
+      const decision = this.decideBashSubcommand(sub);
+      if (decision === 'deny') return 'deny';
+      if (decision !== 'allow') allAllowed = false;
+    }
+    return allAllowed ? 'allow' : null;
+  }
+
+  /** Apply scope precedence (session > project > user, deny before allow) to one subcommand. */
+  private decideBashSubcommand(subcommand: string): PermissionDecision | null {
+    // Allow matching may only strip *safe* env vars, so `PATH=/evil cmd` can't
+    // be normalized to satisfy an allow rule. Deny matching strips all leading
+    // assignments, so `FOO=bar denied-cmd` still matches a deny rule.
+    const allowCandidates = unique([subcommand, stripLeadingAssignments(subcommand, true)]);
+    const denyCandidates = unique([...allowCandidates, stripLeadingAssignments(subcommand, false)]);
+
+    for (const rules of [this.sessionRules, this.projectRules, this.userRules]) {
+      for (const rule of rules) {
+        if (rule.toolName === 'Bash' && rule.decision === 'deny'
+            && denyCandidates.some((c) => matchBashPattern(rule.pattern, c))) {
+          return 'deny';
+        }
+      }
+      for (const rule of rules) {
+        if (rule.toolName === 'Bash' && rule.decision === 'allow'
+            && allowCandidates.some((c) => matchBashPattern(rule.pattern, c))) {
+          return 'allow';
+        }
+      }
+    }
+    return null;
+  }
+
   /** Add a new rule. Session rules are in-memory; project/user are persisted. */
   async addRule(
     scope: RuleScope,
@@ -144,13 +237,23 @@ export class PermissionRuleManager {
         break;
       case 'project':
         this.projectRules.push(rule);
-        await this.persistRules(this.projectSettingsPath, this.projectRules);
+        await this.persistRules(this.workspaceSettingsPath, this.projectRules);
         break;
       case 'user':
         this.userRules.push(rule);
         await this.persistRules(this.userSettingsPath, this.userRules);
         break;
     }
+  }
+
+  private workspaceId(cwd: string): string {
+    let realCwd = cwd;
+    try {
+      realCwd = realpathSync(cwd);
+    } catch {
+      // Fall back to the provided cwd if the workspace disappears mid-startup.
+    }
+    return createHash('sha256').update(realCwd).digest('hex');
   }
 
   /** Get all rules for display purposes. */
@@ -206,7 +309,7 @@ export class PermissionRuleManager {
         .map(r => ruleToString(r.toolName, r.pattern)),
     };
 
-    await mkdir(dirname(path), { recursive: true });
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
     await writeFile(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
     await chmod(path, 0o600);
   }

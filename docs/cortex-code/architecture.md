@@ -241,7 +241,7 @@ const resolvePermission = async (toolName: string, toolArgs: unknown) => {
 2. **Deny**: reject this one call
 3. **Always allow `<pattern>`**: add a persistent allow rule
 
-**Pattern generation for "always allow"**: for Bash, the first token of the command is used as a prefix candidate (`git push origin main` suggests `git *`). For known package managers, the first two tokens are used (`npm run build` suggests `npm run *`). The user can edit the pattern before confirming. For file tools, the pattern is the path or a directory glob.
+**Pattern generation for "always allow"**: for Bash, a narrow command prefix is used (`git status` suggests `git status *`, `npm run build` suggests `npm run *`). For file tools, the pattern is the path or a directory glob.
 
 **Rule format**: `ToolName(pattern)`. Examples:
 - `Bash(git *)`: allow all git commands
@@ -250,12 +250,12 @@ const resolvePermission = async (toolName: string, toolArgs: unknown) => {
 - `WebFetch(api.github.com)`: allow all requests to a domain
 - `Bash`: allow all bash commands (no pattern = tool-wide)
 
-**Rule storage**: three lists, `allow`, `deny`, `ask`, stored per source:
+**Rule storage**: `allow` and `deny` lists stored per source:
 - **Session**: in-memory, cleared on exit
-- **Project**: persisted to `.cortex/settings.json`
+- **Project**: persisted to user-owned workspace settings under `~/.cortex/workspaces/<workspace-hash>/settings.json`
 - **User**: persisted to `~/.cortex/settings.json`
 
-Higher-specificity sources win. Project rules cannot override user-level deny rules.
+Scope precedence is session, then project, then user. Deny rules win within the same scope.
 
 ### Config and Credentials
 
@@ -475,7 +475,7 @@ Multiple Cortex Code instances can run concurrently in the same project director
 - **Credentials**: Read at startup and on `getApiKey` calls. Writes (from `/login`, `/logout`, OAuth refresh) acquire a file lock via `proper-lockfile`. Concurrent reads are lock-free. If two instances refresh an OAuth token simultaneously, the second write wins (last-write-wins, both tokens are valid).
 - **Config files**: Read at startup. Not watched for changes during the session. Changes made by one instance are not visible to another until restart.
 - **MCP servers**: Each instance spawns its own MCP server subprocesses. There is no sharing. This means a plugin MCP server may run multiple times concurrently, which is fine for stateless servers but could cause issues for servers that hold exclusive resources (e.g., a database lock). This is a known limitation documented for users.
-- **Permission rules**: Project-level rules (`.cortex/settings.json`) are loaded at startup. Session-scoped rules are in-memory and per-instance. If two instances both write persistent rules, last-write-wins applies.
+- **Permission rules**: Project-level rules are loaded from user-owned workspace settings at startup. Session-scoped rules are in-memory and per-instance. If two instances both write persistent rules, last-write-wins applies.
 
 ## File Structure (Planned)
 

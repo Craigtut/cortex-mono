@@ -1,30 +1,20 @@
 import { dirname } from 'node:path';
-
-const PACKAGE_MANAGERS = new Set([
-  'npm', 'npx', 'yarn', 'pnpm', 'bun', 'deno', 'pip', 'pip3',
-  'cargo', 'go', 'gem', 'composer', 'dotnet', 'mvn', 'gradle',
-]);
+import { extractBashPrefix } from './bash-command.js';
 
 /**
  * Extract a suggested "always allow" pattern from a tool call.
- * Returns a pattern string like "git *" for Bash or "src/auth/*" for file tools.
+ * Returns a pattern string like "git commit *" for Bash or "src/auth/*" for
+ * file tools.
  */
 export function extractPattern(toolName: string, toolArgs: unknown): string {
   const args = toolArgs as Record<string, unknown>;
 
   switch (toolName) {
     case 'Bash': {
-      const command = String(args['command'] ?? '');
-      const tokens = command.trim().split(/\s+/);
-      const first = tokens[0] ?? '';
-
-      // Package managers: use first two tokens (e.g., "npm run *")
-      if (PACKAGE_MANAGERS.has(first) && tokens.length > 1) {
-        return `${first} ${tokens[1]} *`;
-      }
-
-      // Default: first token as prefix (e.g., "git *")
-      return first ? `${first} *` : '';
+      // Suggest a per-subcommand prefix ("git commit *", not "git *") so an
+      // "always allow" doesn't auto-approve every other subcommand of the same
+      // program, and never suggest a prefix for bare shells/wrappers.
+      return extractBashPrefix(String(args['command'] ?? ''));
     }
 
     case 'Edit':
