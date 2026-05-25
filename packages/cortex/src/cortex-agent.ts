@@ -2548,14 +2548,19 @@ export class CortexAgent {
     const slotCount = this.contextManager.slotCount;
 
     return async (context: AgentContext): Promise<AgentContext> => {
+      const sourceMessages = context.messages;
+
       // Step 0: Apply Tier 1 insertion-time cap to the source messages.
-      // This mutates agent.state.messages directly so that oversized tool
-      // results are capped once at first observation, before any other
-      // processing. See compaction-strategy.md (Tier 1).
+      // Mutate the active transformContext source array, not only
+      // agent.state.messages. Pi-agent-core keeps its own in-loop
+      // currentContext.messages array and does not replace it with the
+      // transformContext return value, so source mutations must hit this
+      // array to persist for the next turn in the same loop.
       await this.compactionManager.applyInsertionCap(
-        this.agent.state.messages,
+        sourceMessages,
         slotCount,
       );
+      this.agent.state.messages = [...sourceMessages];
 
       // Step 1: Insert ephemeral and skill buffer at the boundary position
       // (after old history, before new tick content).
@@ -2569,9 +2574,9 @@ export class CortexAgent {
       let result = this.buildInjectedAndSanitizedContextSnapshot(context, boundary);
 
       // Step 3: Compaction (all three layers integrated)
-      // Layer 2 operates on agent.state.messages (the original transcript),
-      // not the in-memory context copy. After Layer 2 modifies the source,
-      // the rest of the hook rebuilds context from the updated messages.
+      // Source-history compaction operates on the active pi-agent-core loop
+      // transcript and syncs that result back to agent.state.messages. The
+      // returned context alone only affects the immediate LLM call.
       result = await this.compactionManager.applyInTransformContext(
         result,
         // getHistory: extract conversation history (post-slot region)
@@ -2581,20 +2586,20 @@ export class CortexAgent {
           ...ctx,
           messages: [...ctx.messages.slice(0, slotCount), ...history],
         }),
-        // getSourceHistory: get original transcript history for Layer 2
-        () => this.agent.state.messages.slice(slotCount),
-        // setSourceHistory: replace original transcript after Layer 2
+        // getSourceHistory: get original transcript history from the active
+        // pi-agent-core loop context, not only agent.state.messages.
+        () => sourceMessages.slice(slotCount),
+        // setSourceHistory: replace original transcript after compaction in
+        // both the active loop context and the persisted agent state.
         (history) => {
           // Adjust boundary after compaction
-          const currentTickCount = this.agent.state.messages.length - this._prePromptMessageCount;
-          this.agent.state.messages = [
-            ...this.agent.state.messages.slice(0, slotCount),
-            ...history,
-          ];
+          const currentTickCount = sourceMessages.length - this._prePromptMessageCount;
+          sourceMessages.splice(slotCount, sourceMessages.length - slotCount, ...history);
+          this.agent.state.messages = [...sourceMessages];
           // Recalculate boundary: new total minus current-tick messages
           this._prePromptMessageCount = Math.max(
             slotCount,
-            this.agent.state.messages.length - currentTickCount,
+            sourceMessages.length - currentTickCount,
           );
         },
       );

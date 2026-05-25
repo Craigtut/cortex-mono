@@ -1005,6 +1005,48 @@ You have 12 emotions.`;
       expect(result.messages[0]!.content).toBe('Ephemeral data');
       expect(result.messages[1]!.content).toBe('Hello');
     });
+
+    it('persists compaction source mutations into the active transform context', async () => {
+      const agent = createTestCortexAgent(piAgent, {
+        ...config,
+        slots: [],
+        compaction: { strategy: 'classic' },
+      });
+
+      const sourceMessages = [
+        { role: 'user' as const, content: 'old message' },
+        { role: 'assistant' as const, content: 'old response' },
+      ];
+      piAgent.state.messages = [...sourceMessages];
+
+      const compacted = [{ role: 'assistant' as const, content: 'summary' }];
+      const manager = agent.getCompactionManager();
+      vi.spyOn(manager, 'applyInsertionCap').mockResolvedValue();
+      vi.spyOn(manager, 'applyInTransformContext').mockImplementation(async (
+        ctx,
+        getHistory,
+        setHistory,
+        getSourceHistory,
+        setSourceHistory,
+      ) => {
+        expect(getSourceHistory?.()).toEqual(sourceMessages);
+        setSourceHistory?.(compacted);
+        return setHistory(ctx, compacted);
+      });
+
+      const hook = agent.getTransformContextHook();
+      const result = await hook({
+        systemPrompt: 'test',
+        model: {},
+        messages: sourceMessages,
+        tools: [],
+        thinkingLevel: 'medium',
+      });
+
+      expect(sourceMessages).toEqual(compacted);
+      expect(piAgent.state.messages).toEqual(compacted);
+      expect(result.messages).toEqual(compacted);
+    });
   });
 
   // -----------------------------------------------------------------------

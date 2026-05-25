@@ -761,16 +761,16 @@ export class CompactionManager {
    * Execution order:
    * 1. Layer 1 (microcompaction): tool result trimming at threshold crossings
    * 2. Layer 2 (summarization): if tokens exceed 70% after Layer 1, run LLM
-   *    summarization on agent.state.messages (the original transcript), then
-   *    rebuild context from the updated messages
+   *    summarization on the source transcript, then rebuild context from the
+   *    updated messages
    * 3. Layer 3 (failsafe): if tokens still exceed 90% after Layers 1-2,
    *    emergency truncation drops the oldest turns
    *
    * @param context - The AgentContext from transformContext
    * @param getHistory - Function to get conversation history from the context
    * @param setHistory - Function to set conversation history in the context
-   * @param getSourceHistory - Function to get the original transcript history (agent.state.messages post-slot)
-   * @param setSourceHistory - Function to replace the original transcript history (agent.state.messages)
+   * @param getSourceHistory - Function to get the original source transcript history (post-slot)
+   * @param setSourceHistory - Function to replace the original source transcript history
    * @returns Modified context with compacted history
    */
   async applyInTransformContext(
@@ -848,9 +848,9 @@ export class CompactionManager {
       );
 
       // Layer 2: Conversation summarization (70% threshold)
-      // Operates on the original transcript (agent.state.messages), not the
-      // in-memory microcompacted context. After Layer 2 modifies the source,
-      // we rebuild the context from the updated messages.
+      // Operates on the original source transcript, not the in-memory
+      // microcompacted context. After Layer 2 modifies the source, we rebuild
+      // the context from the updated messages.
       const postMicroTokens = this.estimateHistoryTokens(history);
       const totalAfterMicro = slotTokens + postMicroTokens;
 
