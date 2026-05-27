@@ -93,11 +93,16 @@ describe('TaskOutput tool', () => {
     const text = (result.content[0] as { type: 'text'; text: string }).text;
     expect(text).toContain('SIGKILL');
 
-    // Wait for cleanup
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // Poll for cleanup: kill + reap timing varies on loaded CI runners,
+    // so wait until the task is marked completed rather than a fixed delay.
+    const deadline = Date.now() + 5000;
+    let task = runtime.backgroundTasks.get(taskId);
+    while (!task?.completed && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      task = runtime.backgroundTasks.get(taskId);
+    }
 
     // Verify it completed (with non-zero exit)
-    const task = runtime.backgroundTasks.get(taskId);
     expect(task?.completed).toBe(true);
   }, 10000);
 
