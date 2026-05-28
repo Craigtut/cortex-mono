@@ -73,7 +73,9 @@ import type {
   SkillConfig,
   LoadedSkill,
   SubAgentSpawnConfig,
+  SubAgentSpawnAugmentation,
   SubAgentResult,
+  SubAgentSnapshot,
   TrackedSubAgent,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
@@ -146,6 +148,9 @@ function mapToPiThinkingLevel(level: ThinkingLevel): string {
 function mapFromPiThinkingLevel(level: string): ThinkingLevel {
   return (level === 'xhigh' ? 'max' : level) as ThinkingLevel;
 }
+
+/** Leading context slot used to seed a sub-agent with background context. */
+const CHILD_SEED_CONTEXT_SLOT = '_seed_context';
 
 const CORTEX_THINKING_LEVELS: readonly ThinkingLevel[] = [
   'off',
@@ -337,6 +342,10 @@ export class CortexAgent {
   private _cacheRetention: CacheRetention | null = null;
   private _activePromptCacheRetention: CacheRetention | null = null;
 
+  // Stable cache/session key forwarded to the provider as prompt_cache_key
+  // (see CortexAgentConfig.sessionId). null = not set (provider generates one).
+  private _sessionId: string | null = null;
+
   // Public model handles and internal pi-ai model objects.
   private primaryModel: CortexModel;
   private primaryPiModel: PiModel;
@@ -518,6 +527,9 @@ export class CortexAgent {
     if (config.toolResultThresholds) {
       this.toolResultThresholds = config.toolResultThresholds;
     }
+    if (config.sessionId) {
+      this._sessionId = config.sessionId;
+    }
 
     const compactionStrategy = compactionConfig.strategy ?? 'observational';
     // Slot ordering by stability (most stable first):
@@ -596,6 +608,12 @@ export class CortexAgent {
         spawnSubAgent: (params) => this.spawnForegroundSubAgentInternal(params),
         spawnBackgroundSubAgent: (params) => this.spawnBackgroundSubAgentInternal(params),
         canSpawn: () => this.subAgentManager.activeCount < this.subAgentManager.limit,
+        checkConsumerSpawn: () => {
+          const verdict = this.config.canSpawnSubAgent?.();
+          if (verdict === undefined) return { allowed: true };
+          if (typeof verdict === 'boolean') return { allowed: verdict };
+          return verdict;
+        },
         getConcurrencyInfo: () => ({
           active: this.subAgentManager.activeCount,
           limit: this.subAgentManager.limit,
@@ -841,6 +859,7 @@ export class CortexAgent {
 
     if (apiKey) completeOptions['apiKey'] = apiKey;
     if (cacheRetention) completeOptions['cacheRetention'] = cacheRetention;
+    if (this._sessionId) completeOptions['sessionId'] = this._sessionId;
 
     return Object.keys(completeOptions).length > 0 ? completeOptions : undefined;
   }
@@ -1095,9 +1114,13 @@ export class CortexAgent {
       const retention = cacheBreakpointState.cortexAgent?._activePromptCacheRetention
         ?? cacheBreakpointState.cortexAgent?._cacheRetention
         ?? null;
-      const streamOptions = retention
-        ? { ...options, cacheRetention: retention }
-        : options;
+      const sessionId = cacheBreakpointState.cortexAgent?._sessionId ?? null;
+      let streamOptions = options;
+      if (retention || sessionId) {
+        streamOptions = { ...options };
+        if (retention) (streamOptions as Record<string, unknown>)['cacheRetention'] = retention;
+        if (sessionId) (streamOptions as Record<string, unknown>)['sessionId'] = sessionId;
+      }
       return streamSimple(model as any, context as any, streamOptions as any);
     };
 
@@ -1722,6 +1745,22 @@ export class CortexAgent {
    */
   getCacheRetention(): 'none' | 'short' | 'long' | null {
     return this._cacheRetention;
+  }
+
+  /**
+   * Set the stable cache/session key forwarded to the provider as its
+   * prompt_cache_key. Use a value stable across calls that share a prefix.
+   * Pass null to clear (the provider then generates its own per-request key).
+   */
+  setSessionId(value: string | null): void {
+    this._sessionId = value;
+  }
+
+  /**
+   * Get the current cache/session key, or null if unset.
+   */
+  getSessionId(): string | null {
+    return this._sessionId;
   }
 
   /**
@@ -3611,6 +3650,35 @@ export class CortexAgent {
     return this.spawnBackgroundSubAgentInternal(params);
   }
 
+  /**
+   * Snapshot of all currently running sub-agents, including live cost and
+   * activity. Read-only; safe to call from anywhere (e.g. budget accounting
+   * or status surfaces). Returns an empty array when none are running.
+   */
+  getActiveSubAgents(): SubAgentSnapshot[] {
+    const snapshots: SubAgentSnapshot[] = [];
+    for (const taskId of this.subAgentManager.getActiveTaskIds()) {
+      const entry = this.subAgentManager.get(taskId);
+      if (!entry) continue;
+      const childAgent = entry.agent as CortexAgent;
+      const budget = childAgent.getBudgetGuard();
+      snapshots.push({
+        taskId,
+        instructions: entry.instructions,
+        background: entry.background,
+        spawnedAt: entry.spawnedAt,
+        status: entry.pendingPermission ? 'waiting-for-permission' : 'running',
+        toolCount: entry.toolCount,
+        lastToolName: entry.lastToolName,
+        lastToolSummary: entry.lastToolSummary,
+        lastToolStartedAt: entry.lastToolStartedAt,
+        liveCostUsd: budget.getTotalCost(),
+        turnsUsed: budget.getTurnCount(),
+      });
+    }
+    return snapshots;
+  }
+
   // -----------------------------------------------------------------------
   // Private: Skill buffer
   // -----------------------------------------------------------------------
@@ -3846,7 +3914,7 @@ export class CortexAgent {
     });
 
     try {
-      const childAgent = await this.createChildAgent({ ...params, taskId });
+      const childAgent = await this.createChildAgent({ ...params, taskId, background: false });
 
       // Track the sub-agent
       const tracked: TrackedSubAgent = {
@@ -3948,7 +4016,7 @@ export class CortexAgent {
       resolveCompletion = resolve;
     });
 
-    const childAgent = await this.createChildAgent({ ...params, taskId });
+    const childAgent = await this.createChildAgent({ ...params, taskId, background: true });
 
     // Track the sub-agent
     const tracked: TrackedSubAgent = {
@@ -4087,13 +4155,39 @@ export class CortexAgent {
 
   private async createChildAgent(params: {
     taskId: string;
+    instructions: string;
     tools?: string[];
     systemPrompt?: string;
     maxTurns?: number;
     maxCost?: number;
+    background?: boolean;
   }): Promise<CortexAgent> {
+    // Pre-spawn hook: lets the consumer record the spawn and curate the
+    // child's starting context (system prompt, tools, background seed) before
+    // the child is built. Purely additive; errors are swallowed.
+    let augmentation: SubAgentSpawnAugmentation | void = undefined;
+    if (this.config.onBeforeSubAgentSpawn) {
+      try {
+        augmentation = await this.config.onBeforeSubAgentSpawn({
+          taskId: params.taskId,
+          instructions: params.instructions,
+          background: params.background ?? false,
+          ...(params.tools ? { requestedTools: params.tools } : {}),
+          ...(params.systemPrompt ? { requestedSystemPrompt: params.systemPrompt } : {}),
+        });
+      } catch (err) {
+        this.logger.error('[CortexAgent] onBeforeSubAgentSpawn handler threw', {
+          taskId: params.taskId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    const effectiveSystemPrompt = augmentation?.systemPrompt ?? params.systemPrompt;
+    const effectiveTools = augmentation?.tools ?? params.tools;
+    const seedContext = augmentation?.seedContext;
+
     const childConfig = this.buildChildAgentConfig(params);
-    const promptSeed = this.resolveChildPromptSeed(params.systemPrompt);
+    const promptSeed = this.resolveChildPromptSeed(effectiveSystemPrompt);
 
     const childCortexConfig: CortexAgentConfig = {
       model: this.primaryModel,
@@ -4104,7 +4198,12 @@ export class CortexAgent {
         maxCost: childConfig.maxCost,
       },
       contextWindowLimit: this._contextWindowLimit,
+      // Each sub-agent is its own logical session for prefix-cache routing.
+      sessionId: params.taskId,
     };
+    if (seedContext) {
+      childCortexConfig.slots = [CHILD_SEED_CONTEXT_SLOT];
+    }
     if (this.config.logger) childCortexConfig.logger = this.config.logger;
     if (this.envOverrides) childCortexConfig.envOverrides = this.envOverrides;
     if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
@@ -4137,7 +4236,7 @@ export class CortexAgent {
       missingDependencyMessage: string;
     } = {
       cortexConfig: childCortexConfig,
-      tools: this.buildChildToolSet(params.tools),
+      tools: this.buildChildToolSet(effectiveTools),
       constructorOptions: {
         enableSubAgentTool: false,
         enableLoadSkillTool: false,
@@ -4154,6 +4253,12 @@ export class CortexAgent {
 
     const childAgent = await CortexAgent.createManagedAgent(childCreateParams);
 
+    // Seed background context as the child's leading context slot. This is
+    // reference material, not the child's objective (its task is its
+    // instructions). Positioned before history for prefix-cache stability.
+    if (seedContext) {
+      childAgent.getContextManager().setSlot(CHILD_SEED_CONTEXT_SLOT, seedContext);
+    }
     childAgent.setCacheRetention(this.getCacheRetention() ?? 'none');
     return childAgent;
   }

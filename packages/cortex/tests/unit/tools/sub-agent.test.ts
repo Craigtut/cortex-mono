@@ -19,6 +19,7 @@ function createMockConfig(overrides?: Partial<SubAgentToolConfig>): SubAgentTool
     }),
     canSpawn: overrides?.canSpawn ?? vi.fn().mockReturnValue(true),
     getConcurrencyInfo: overrides?.getConcurrencyInfo ?? vi.fn().mockReturnValue({ active: 1, limit: 4 }),
+    ...(overrides?.checkConsumerSpawn ? { checkConsumerSpawn: overrides.checkConsumerSpawn } : {}),
   };
 }
 
@@ -131,6 +132,38 @@ describe('SubAgent tool', () => {
       const text = result as string;
       expect(text).toContain('concurrency limit reached');
       expect(text).toContain('4/4');
+    });
+  });
+
+  describe('consumer spawn gate', () => {
+    it('refuses to spawn with the gate reason when the consumer gate denies', async () => {
+      const spawnSubAgent = vi.fn();
+      const tool = createSubAgentTool(createMockConfig({
+        spawnSubAgent,
+        checkConsumerSpawn: () => ({ allowed: false, reason: 'Weekly budget reached.' }),
+      }));
+
+      const result = await tool.execute({ instructions: 'Do something' });
+
+      expect(result).toBe('Weekly budget reached.');
+      expect(spawnSubAgent).not.toHaveBeenCalled();
+    });
+
+    it('spawns normally when the consumer gate allows', async () => {
+      const spawnSubAgent = vi.fn().mockResolvedValue({
+        taskId: 'task-1',
+        output: 'done',
+        status: 'completed',
+        usage: { turns: 1, cost: 0.01, durationMs: 100 },
+      });
+      const tool = createSubAgentTool(createMockConfig({
+        spawnSubAgent,
+        checkConsumerSpawn: () => ({ allowed: true }),
+      }));
+
+      await tool.execute({ instructions: 'Do something' });
+
+      expect(spawnSubAgent).toHaveBeenCalled();
     });
   });
 

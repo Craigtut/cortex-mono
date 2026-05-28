@@ -342,6 +342,37 @@ export interface CortexAgentConfig {
    * All diagnostics are opt-in and should remain disabled in normal use.
    */
   diagnostics?: CortexDiagnosticsConfig;
+
+  /**
+   * Stable identifier for prefix-cache routing. Passed to the provider as its
+   * cache/session key (e.g. OpenAI's prompt_cache_key) so requests sharing a
+   * long common prefix are routed to the same inference machine and reuse
+   * cached KV state. Use a value that is stable across the calls that share a
+   * prefix (e.g. one per logical session). Can also be set later via
+   * setSessionId(). Optional.
+   */
+  sessionId?: string;
+
+  /**
+   * Called before a sub-agent is spawned (foreground or background), giving
+   * the consumer a chance to record the spawn and curate the child's starting
+   * context. Receives the requested spawn parameters plus the generated taskId,
+   * and may return an augmentation that overrides the child's system prompt or
+   * tool set and injects an initial background-context slot. Purely additive:
+   * if omitted, sub-agents spawn with the default inherited context.
+   */
+  onBeforeSubAgentSpawn?: (
+    req: SubAgentSpawnRequest,
+  ) => SubAgentSpawnAugmentation | void | Promise<SubAgentSpawnAugmentation | void>;
+
+  /**
+   * Optional consumer gate consulted before a sub-agent spawn, in addition to
+   * the built-in concurrency limit. Return false (or { allowed: false, reason })
+   * to refuse the spawn, e.g. when a budget or policy ceiling has been hit. The
+   * reason is surfaced to the model as the SubAgent tool result so it knows why
+   * it could not delegate. Omit to always allow (subject to concurrency).
+   */
+  canSpawnSubAgent?: () => boolean | { allowed: boolean; reason?: string };
 }
 
 /**
@@ -1009,6 +1040,61 @@ export interface SubAgentSpawnConfig {
   maxCost?: number;
   /** Run asynchronously. Default: false (blocks until complete). */
   background?: boolean;
+}
+
+/**
+ * Describes a sub-agent about to be spawned. Passed to
+ * CortexAgentConfig.onBeforeSubAgentSpawn so a consumer can record the spawn
+ * and decide what background context to seed.
+ */
+export interface SubAgentSpawnRequest {
+  /** The generated task ID for this sub-agent. */
+  taskId: string;
+  /** The instructions the sub-agent will run with (its sole objective). */
+  instructions: string;
+  /** Whether the sub-agent runs in the background. */
+  background: boolean;
+  /** Tool names the caller requested, if any. */
+  requestedTools?: string[];
+  /** Custom system prompt the caller requested, if any. */
+  requestedSystemPrompt?: string;
+}
+
+/**
+ * Optional augmentation returned from onBeforeSubAgentSpawn.
+ * Every field is optional; unset fields fall back to inherited defaults.
+ */
+export interface SubAgentSpawnAugmentation {
+  /** Override the child's system prompt. Default: inherit parent's. */
+  systemPrompt?: string;
+  /**
+   * Background context to seed into the child as an initial context slot.
+   * This is reference material, NOT the child's objective: the child's task
+   * is defined solely by its instructions. Rendered verbatim and ordered
+   * before conversation history for prefix-cache stability.
+   */
+  seedContext?: string;
+  /** Override the child's tool set by name. Default: inherit parent's. */
+  tools?: string[];
+}
+
+/**
+ * Read-only snapshot of a running sub-agent, returned by getActiveSubAgents().
+ */
+export interface SubAgentSnapshot {
+  taskId: string;
+  instructions: string;
+  background: boolean;
+  spawnedAt: number;
+  status: 'running' | 'waiting-for-permission';
+  toolCount: number;
+  lastToolName: string | null;
+  lastToolSummary: string | null;
+  lastToolStartedAt: number | null;
+  /** Live accumulated cost of this sub-agent in USD. */
+  liveCostUsd: number;
+  /** Turns used so far. */
+  turnsUsed: number;
 }
 
 /**

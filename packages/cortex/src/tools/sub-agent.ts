@@ -86,9 +86,16 @@ export interface SubAgentToolConfig {
   }>;
 
   /**
-   * Check if another sub-agent can be spawned.
+   * Check if another sub-agent can be spawned (concurrency limit).
    */
   canSpawn: () => boolean;
+
+  /**
+   * Optional consumer gate consulted in addition to the concurrency limit
+   * (e.g. budget or policy). Returns whether a spawn is allowed and, if not,
+   * a reason to surface to the model. Defaults to allowed when omitted.
+   */
+  checkConsumerSpawn?: () => { allowed: boolean; reason?: string };
 
   /**
    * Get concurrency info for error messages.
@@ -143,6 +150,14 @@ Sub-agents are independent: they have their own conversation, do not share your 
       if (!config.canSpawn()) {
         const info = config.getConcurrencyInfo();
         return `Cannot spawn sub-agent: concurrency limit reached (${info.active}/${info.limit} active). Wait for a running sub-agent to complete or cancel one to free a slot.`;
+      }
+
+      // Check the consumer gate (budget / policy), if provided.
+      if (config.checkConsumerSpawn) {
+        const verdict = config.checkConsumerSpawn();
+        if (!verdict.allowed) {
+          return verdict.reason ?? 'Cannot spawn sub-agent right now.';
+        }
       }
 
       // Background mode: spawn and return immediately
