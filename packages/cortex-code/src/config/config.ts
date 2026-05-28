@@ -17,6 +17,8 @@ export interface CortexCodeConfig {
   defaultEffort?: string;
   /** Default utility model override for the active provider. */
   defaultUtilityModel?: string;
+  /** Check npm for a newer Cortex Code on startup. Default: true. */
+  updateCheck?: boolean;
   /** Optional diagnostics for investigating TUI or prompt freezes. */
   diagnostics?: CortexCodeDiagnosticsConfig;
 }

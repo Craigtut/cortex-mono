@@ -12,6 +12,7 @@ import { yoloCommand } from './yolo.js';
 import { effortCommand } from './effort.js';
 import { exitCommand } from './exit.js';
 import { debugCommand } from './debug.js';
+import { updateCommand } from './update.js';
 
 // Handler type uses `any` for the session parameter to avoid circular
 // dependency with session.ts. Type safety is enforced at the call site.
@@ -70,4 +71,5 @@ export function registerBuiltinCommands(): void {
   registerCommand(effortCommand);
   registerCommand(exitCommand);
   registerCommand(debugCommand);
+  registerCommand(updateCommand);
 }

@@ -127,7 +127,12 @@ export class TranscriptManager {
   }
 
   /** Add the startup banner to the transcript. */
-  addBanner(version: string, project: string, branch: string): void {
+  addBanner(
+    version: string,
+    project: string,
+    branch: string,
+    update?: { latestVersion: string; packageName: string },
+  ): void {
     this.diagnostics?.recordTranscriptMutation('banner');
     this.chatContainer.addChild(new Spacer(1));
 
@@ -144,6 +149,14 @@ export class TranscriptManager {
     }
     this.chatContainer.addChild(new Spacer(1));
     this.chatContainer.addChild(new Text(colors.muted(`  v${version}`), 0, 0));
+    if (update) {
+      this.chatContainer.addChild(
+        new Text(colors.accent(`  → ${update.latestVersion} available`), 0, 0),
+      );
+      this.chatContainer.addChild(
+        new Text(colors.muted(`    Update: npm i -g ${update.packageName}@latest`), 0, 0),
+      );
+    }
     this.chatContainer.addChild(new Text(colors.muted(`  Project: ${project}`), 0, 0));
     if (branch) {
       this.chatContainer.addChild(new Text(colors.muted(`  Branch: ${branch}`), 0, 0));

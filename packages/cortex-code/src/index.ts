@@ -24,16 +24,18 @@ import { BUILD_MODE } from './modes/build.js';
 import { listSessions } from './persistence/sessions.js';
 import { runFirstRunSetup } from './providers/setup-tui.js';
 import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
+import { resolveUpdateInfo } from './updates/checker.js';
 
 interface CliArgs {
   resume: string | true | undefined;
   model: string | undefined;
   yolo: boolean;
   compaction: 'observational' | 'classic' | undefined;
+  updateCheck: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { resume: undefined, model: undefined, yolo: false, compaction: undefined };
+  const args: CliArgs = { resume: undefined, model: undefined, yolo: false, compaction: undefined, updateCheck: true };
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -57,6 +59,9 @@ function parseArgs(argv: string[]): CliArgs {
       }
       case '--yolo':
         args.yolo = true;
+        break;
+      case '--no-update-check':
+        args.updateCheck = false;
         break;
       case '--help':
       case '-h':
@@ -89,6 +94,7 @@ Usage:
   cortex --model <model>                    Override default model
   cortex --compaction <observational|classic>  Compaction strategy (default: observational)
   cortex --yolo                             Start in YOLO mode
+  cortex --no-update-check                  Skip the startup check for newer versions
   cortex --help                             Show this help
   cortex --version                          Show version
 `.trim());
@@ -100,6 +106,11 @@ async function main(): Promise<void> {
 
   // Load config
   const config = await loadConfig(cwd);
+
+  // Resolve update availability from the local cache (non-blocking: this also
+  // kicks off a background registry refresh for the next launch).
+  const updateCheckEnabled = args.updateCheck && config.updateCheck !== false;
+  const updateInfo = await resolveUpdateInfo({ currentVersion: PKG_VERSION, enabled: updateCheckEnabled });
 
   // Initialize ProviderManager (once)
   const providerManager = new ProviderManager();
@@ -186,6 +197,7 @@ async function main(): Promise<void> {
     initialEffort,
     initialUtilityModelId,
     resumeSessionId,
+    updateInfo,
     ...(args.compaction ? { compactionStrategy: args.compaction } : {}),
   });
 
