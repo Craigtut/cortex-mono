@@ -163,36 +163,47 @@ function isIgnored(relativePath: string, ignorePatterns: string[]): boolean {
 
 /**
  * Walk a directory tree and collect file paths.
+ *
+ * Implemented as an iterative stack walk rather than recursion. This avoids
+ * two failure modes on large trees: deep recursion blowing the call stack,
+ * and (the one that actually bit us) `results.push(...subResults)` throwing
+ * "Maximum call stack size exceeded" when a subdirectory yields more files
+ * than the engine's function-argument limit. Symlinked directories are not
+ * followed (Dirent.isDirectory() is false for symlinks), so cycles are safe.
  */
 async function walkDirectory(
-  dir: string,
+  rootDir: string,
   baseDir: string,
   ignorePatterns: string[],
 ): Promise<string[]> {
   const results: string[] = [];
+  const stack: string[] = [rootDir];
 
-  let entries: fs.Dirent[];
-  try {
-    entries = await fs.promises.readdir(dir, { withFileTypes: true });
-  } catch {
-    // Skip directories we can't read
-    return results;
-  }
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
 
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    const relativePath = path.relative(baseDir, fullPath).split(path.sep).join('/');
-
-    // Check ignore patterns
-    if (isIgnored(relativePath, ignorePatterns)) {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      // Skip directories we can't read
       continue;
     }
 
-    if (entry.isDirectory()) {
-      const subResults = await walkDirectory(fullPath, baseDir, ignorePatterns);
-      results.push(...subResults);
-    } else if (entry.isFile()) {
-      results.push(fullPath);
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const relativePath = path.relative(baseDir, fullPath).split(path.sep).join('/');
+
+      // Check ignore patterns
+      if (isIgnored(relativePath, ignorePatterns)) {
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile()) {
+        results.push(fullPath);
+      }
     }
   }
 

@@ -42,6 +42,20 @@ describe('Glob tool', () => {
     expect(text).toContain('deep.ts');
   });
 
+  it('walks a directory with many files without spread-argument overflow', async () => {
+    // Regression: walkDirectory previously did `results.push(...subResults)`,
+    // which throws "Maximum call stack size exceeded" on large subtrees.
+    const wide = path.join(tmpDir, 'wide');
+    fs.mkdirSync(wide, { recursive: true });
+    for (let i = 0; i < 5000; i++) {
+      fs.writeFileSync(path.join(wide, `f${i}.ts`), '');
+    }
+
+    const result = await globTool.execute({ pattern: '**/*.ts' });
+    // 5000 matches collected and traversed without throwing; output truncates.
+    expect(result.details.totalCount).toBe(5000);
+  });
+
   it('returns empty for no matches', async () => {
     const result = await globTool.execute({ pattern: '*.xyz' });
 
