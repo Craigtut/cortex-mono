@@ -681,4 +681,105 @@ describe('McpClientManager', () => {
       expect(manager.isConnected('weather')).toBe(true);
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Per-tool timeout and progress callbacks
+  // -----------------------------------------------------------------------
+
+  describe('toolTimeoutMs and progress notifications', () => {
+    it('passes the configured per-tool timeout to client.callTool', async () => {
+      await manager.connect('reverie_bridge', {
+        transport: 'stdio',
+        command: 'reverie-bridge',
+        toolTimeoutMs: 600_000,
+      });
+
+      const tools = manager.getTools();
+      await tools[0].execute({ location: 'NYC' });
+
+      expect(mockCallTool).toHaveBeenCalledTimes(1);
+      const [params, schema, options] = mockCallTool.mock.calls[0];
+      expect(params).toEqual({
+        name: 'get_forecast',
+        arguments: { location: 'NYC' },
+      });
+      expect(schema).toBeUndefined();
+      expect(options).toMatchObject({
+        timeout: 600_000,
+        resetTimeoutOnProgress: true,
+      });
+    });
+
+    it('omits options entirely when no timeout and no progress callback are set', async () => {
+      await manager.connect('weather', {
+        transport: 'stdio',
+        command: 'node',
+        args: ['server.js'],
+      });
+
+      const tools = manager.getTools();
+      await tools[0].execute({ location: 'NYC' });
+
+      expect(mockCallTool).toHaveBeenCalledWith({
+        name: 'get_forecast',
+        arguments: { location: 'NYC' },
+      });
+    });
+
+    it('forwards progress notifications to onToolCallProgress with serverName and toolName', async () => {
+      const events: Array<{ serverName: string; toolName: string; progress: number; total?: number; message?: string }> = [];
+      manager.onToolCallProgress = (info) => {
+        events.push(info);
+      };
+
+      // Capture the onprogress passed into callTool and invoke it manually
+      // to simulate the SDK firing a progress notification.
+      let capturedOnprogress: ((p: { progress: number; total?: number; message?: string }) => void) | undefined;
+      mockCallTool.mockImplementationOnce(async (_params: unknown, _schema: unknown, options: { onprogress?: (p: { progress: number; total?: number; message?: string }) => void }) => {
+        capturedOnprogress = options?.onprogress;
+        capturedOnprogress?.({ progress: 1, total: 10, message: 'still waiting' });
+        capturedOnprogress?.({ progress: 2 });
+        return { content: [{ type: 'text', text: 'done' }], isError: false };
+      });
+
+      await manager.connect('reverie_bridge', {
+        transport: 'stdio',
+        command: 'reverie-bridge',
+        toolTimeoutMs: 120_000,
+      });
+
+      const tools = manager.getTools();
+      await tools[0].execute({});
+
+      expect(capturedOnprogress).toBeDefined();
+      expect(events).toEqual([
+        { serverName: 'reverie_bridge', toolName: 'get_forecast', progress: 1, total: 10, message: 'still waiting' },
+        { serverName: 'reverie_bridge', toolName: 'get_forecast', progress: 2 },
+      ]);
+    });
+
+    it('does not propagate callback exceptions back into the tool call', async () => {
+      manager.onToolCallProgress = () => {
+        throw new Error('consumer crashed');
+      };
+
+      let capturedOnprogress: ((p: { progress: number }) => void) | undefined;
+      mockCallTool.mockImplementationOnce(async (_params: unknown, _schema: unknown, options: { onprogress?: (p: { progress: number }) => void }) => {
+        capturedOnprogress = options?.onprogress;
+        // Firing onprogress with a consumer that throws must not bubble out.
+        expect(() => capturedOnprogress?.({ progress: 5 })).not.toThrow();
+        return { content: [{ type: 'text', text: 'done' }], isError: false };
+      });
+
+      await manager.connect('reverie_bridge', {
+        transport: 'stdio',
+        command: 'reverie-bridge',
+        toolTimeoutMs: 60_000,
+      });
+
+      const tools = manager.getTools();
+      const result = await tools[0].execute({});
+      expect(result).toMatchObject({ content: [{ type: 'text', text: 'done' }] });
+    });
+  });
 });

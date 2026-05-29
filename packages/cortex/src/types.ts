@@ -909,6 +909,14 @@ export interface McpStdioConfig {
   env?: Record<string, string>;
   /** Working directory for the subprocess. */
   cwd?: string;
+  /**
+   * Per-tool timeout for `tools/call`, in milliseconds. When set, this
+   * overrides the MCP SDK default (60 seconds) and the call is rearmed on
+   * every `notifications/progress` the server emits. Use higher values for
+   * tools that legitimately block on external state (e.g. waiting for a
+   * human decision). Omit to inherit the SDK default.
+   */
+  toolTimeoutMs?: number;
 }
 
 /**
@@ -920,6 +928,30 @@ export interface McpHttpConfig {
   url: string;
   /** Optional HTTP headers (e.g., for authentication). */
   headers?: Record<string, string>;
+  /**
+   * Per-tool timeout for `tools/call`, in milliseconds. See
+   * {@link McpStdioConfig.toolTimeoutMs} for semantics.
+   */
+  toolTimeoutMs?: number;
+}
+
+/**
+ * Progress event surfaced when an MCP server emits `notifications/progress`
+ * during a long-running `tools/call`. Consumers can wire this to a UI
+ * notification ("still waiting on connection accept...") without depending
+ * on `@modelcontextprotocol/sdk` directly.
+ */
+export interface McpToolCallProgress {
+  /** The MCP server that emitted the progress notification. */
+  serverName: string;
+  /** The tool name (without server namespace prefix). */
+  toolName: string;
+  /** Current progress value as reported by the server. Monotonically rising. */
+  progress: number;
+  /** Total expected progress if the server provided one. */
+  total?: number;
+  /** Optional human-readable progress message. */
+  message?: string;
 }
 
 /**

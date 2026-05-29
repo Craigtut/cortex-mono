@@ -9,6 +9,8 @@ interface McpConfigFile {
     args?: string[];
     env?: Record<string, string>;
     cwd?: string;
+    /** Per-tool timeout in milliseconds; see McpStdioConfig.toolTimeoutMs. */
+    toolTimeoutMs?: number;
   }>;
 }
 
@@ -59,6 +61,9 @@ async function loadMcpConfig(path: string, source: 'global' | 'project'): Promis
       if (entry.args) config.args = entry.args;
       if (entry.env) config.env = entry.env;
       if (entry.cwd) config.cwd = entry.cwd;
+      if (typeof entry.toolTimeoutMs === 'number' && entry.toolTimeoutMs > 0) {
+        config.toolTimeoutMs = entry.toolTimeoutMs;
+      }
       servers.push({ name, config, source });
     }
 

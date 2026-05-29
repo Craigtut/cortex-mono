@@ -70,6 +70,8 @@ import type {
   CompactionDegradedInfo,
   CompactionExhaustedInfo,
   McpTransportConfig,
+  McpConnectionState,
+  McpToolCallProgress,
   SkillConfig,
   LoadedSkill,
   SubAgentSpawnConfig,
@@ -2546,6 +2548,32 @@ export class CortexAgent {
    */
   async disconnectMcpServer(serverName: string): Promise<void> {
     await this.mcpClientManager.disconnect(serverName);
+  }
+
+  /**
+   * Snapshot of every MCP server this agent is currently connected to (or
+   * attempting to reconnect to). The shape is deliberately read-only: use
+   * {@link connectMcpServer} / {@link disconnectMcpServer} to mutate. The
+   * consumer (`cortex-code`'s hot-reload watcher) uses this to compute the
+   * diff between desired (config files) and current state between turns.
+   */
+  getMcpServerStates(): McpConnectionState[] {
+    return this.mcpClientManager.getConnectionStates();
+  }
+
+  /**
+   * Register a callback fired when MCP tool servers emit
+   * `notifications/progress` during a long-running `tools/call`. Consumers
+   * wire this to whatever UI affordance they have for "still waiting…".
+   */
+  setMcpToolCallProgressHandler(
+    handler: ((progress: McpToolCallProgress) => void) | undefined,
+  ): void {
+    if (handler === undefined) {
+      delete this.mcpClientManager.onToolCallProgress;
+    } else {
+      this.mcpClientManager.onToolCallProgress = handler;
+    }
   }
 
   /**

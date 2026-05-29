@@ -45,6 +45,7 @@ export type {
   McpStdioConfig,
   McpHttpConfig,
   McpConnectionState,
+  McpToolCallProgress,
   SkillConfig,
   SkillEntry,
   LoadedSkill,

@@ -20,7 +20,14 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { Type } from 'typebox';
-import type { McpTransportConfig, McpConnectionState, McpStdioConfig, McpHttpConfig, CortexLogger } from './types.js';
+import type {
+  McpTransportConfig,
+  McpConnectionState,
+  McpStdioConfig,
+  McpHttpConfig,
+  McpToolCallProgress,
+  CortexLogger,
+} from './types.js';
 import type { CortexTool } from './tool-contract.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { buildSafeEnv } from './tools/shared/safe-env.js';
@@ -87,6 +94,19 @@ export class McpClientManager {
    */
   envOverrides?: Record<string, string>;
 
+  /**
+   * Optional callback fired when an MCP server emits a
+   * `notifications/progress` during a long-running `tools/call`. The MCP
+   * SDK's `resetTimeoutOnProgress` is enabled whenever a per-tool timeout is
+   * configured, so a server that keeps emitting progress can stay alive past
+   * the wall-clock window. Consumers wire this to whatever UI affordance
+   * they have ("still waiting…" banners, log lines).
+   *
+   * Failures inside the callback are swallowed so a buggy consumer cannot
+   * tear down an in-flight tool call.
+   */
+  onToolCallProgress?: (progress: McpToolCallProgress) => void;
+
   /** Logger for MCP diagnostics. Set by CortexAgent after construction. */
   logger: CortexLogger = NOOP_LOGGER;
 
@@ -134,7 +154,7 @@ export class McpClientManager {
     // Discover tools
     let tools: AgentTool[];
     try {
-      tools = await this.discoverTools(serverName, client);
+      tools = await this.discoverTools(serverName, config, client);
     } catch (err) {
       this.logger.error('[MCP] tool discovery failed', { serverName, error: err instanceof Error ? err.message : String(err) });
       // Close the connection since tool discovery failed
@@ -334,13 +354,18 @@ export class McpClientManager {
   /**
    * Discover tools from a connected MCP server and wrap them as AgentTools.
    */
-  private async discoverTools(serverName: string, client: Client): Promise<AgentTool[]> {
+  private async discoverTools(
+    serverName: string,
+    config: McpTransportConfig,
+    client: Client,
+  ): Promise<AgentTool[]> {
     const response = await client.listTools();
     const tools: AgentTool[] = [];
 
     for (const mcpTool of response.tools) {
       tools.push(this.wrapMcpTool(
         serverName,
+        config,
         {
           name: mcpTool.name,
           description: mcpTool.description,
@@ -364,6 +389,7 @@ export class McpClientManager {
    */
   private wrapMcpTool(
     serverName: string,
+    serverConfig: McpTransportConfig,
     mcpTool: { name: string; description?: string | undefined; inputSchema?: Record<string, unknown> | undefined },
     client: Client,
   ): AgentTool {
@@ -374,6 +400,14 @@ export class McpClientManager {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const parameters = Type.Unsafe(inputSchema as any);
 
+    // Capture the per-server timeout (if any) and a stable reference to the
+    // manager so the callTool options below stay in sync with whatever the
+    // consumer wires up. `resetTimeoutOnProgress` is enabled whenever a
+    // timeout is configured so a server that emits regular progress can
+    // outlive its wall-clock window.
+    const toolTimeoutMs = serverConfig.toolTimeoutMs;
+    const manager = this;
+
     return {
       name: namespacedName,
       description: mcpTool.description ?? '',
@@ -383,10 +417,48 @@ export class McpClientManager {
       isMcp: true,
       execute: async (args: unknown): Promise<unknown> => {
         try {
-          const result = await client.callTool({
-            name: mcpTool.name,  // Original name (no prefix)
-            arguments: (args ?? {}) as Record<string, unknown>,
-          });
+          const hasTimeout = typeof toolTimeoutMs === 'number' && toolTimeoutMs > 0;
+          const hasProgressCallback = manager.onToolCallProgress !== undefined;
+          let result;
+          if (hasTimeout || hasProgressCallback) {
+            const callOptions: Parameters<typeof client.callTool>[2] = {};
+            if (hasTimeout) {
+              callOptions.timeout = toolTimeoutMs;
+              callOptions.resetTimeoutOnProgress = true;
+            }
+            if (hasProgressCallback) {
+              callOptions.onprogress = (progress) => {
+                const payload: McpToolCallProgress = {
+                  serverName,
+                  toolName: mcpTool.name,
+                  progress: progress.progress,
+                };
+                if (progress.total !== undefined) payload.total = progress.total;
+                if (progress.message !== undefined) payload.message = progress.message;
+                try {
+                  manager.onToolCallProgress?.(payload);
+                } catch (err) {
+                  manager.logger.warn?.(
+                    `onToolCallProgress threw for ${serverName}__${mcpTool.name}`,
+                    { error: err instanceof Error ? err.message : String(err) },
+                  );
+                }
+              };
+            }
+            result = await client.callTool(
+              {
+                name: mcpTool.name,  // Original name (no prefix)
+                arguments: (args ?? {}) as Record<string, unknown>,
+              },
+              undefined,
+              callOptions,
+            );
+          } else {
+            result = await client.callTool({
+              name: mcpTool.name,  // Original name (no prefix)
+              arguments: (args ?? {}) as Record<string, unknown>,
+            });
+          }
 
           // Return text content from MCP result
           if (result.isError) {
@@ -538,8 +610,9 @@ export class McpClientManager {
         }
       }
 
-      // Rediscover tools
-      const tools = await this.discoverTools(serverName, client);
+      // Rediscover tools using the config passed to attemptReconnect so the
+      // toolTimeoutMs and other per-server settings carry across reconnects.
+      const tools = await this.discoverTools(serverName, config, client);
 
       // Wire close handler
       transport.onclose = () => {
