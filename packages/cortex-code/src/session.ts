@@ -28,6 +28,9 @@ import {
   type CompactionResult,
   type ThinkingLevel,
   type McpStdioConfig,
+  type ToolCallEndPayload,
+  type ToolCallStartPayload,
+  type ToolCallUpdatePayload,
   stripWorkingTags,
 } from '@animus-labs/cortex';
 import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
@@ -61,6 +64,7 @@ import { log } from './logger.js';
 import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
 import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
+import { FileSessionActivityReporter, type PermissionResolution } from './activity/session-activity.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -105,6 +109,7 @@ export class Session {
   private permissionLockRelease: (() => void) | null = null;
   private subAgentActivity = new Map<string, Map<string, { name: string; status: string; summary?: string }>>();
   private readonly freezeDiagnostics: FreezeDiagnostics;
+  private readonly activity: FileSessionActivityReporter;
 
   private readonly config: CortexCodeConfig;
   private readonly mode: Mode;
@@ -140,11 +145,20 @@ export class Session {
     this.updateInfo = options.updateInfo ?? null;
     this.createdAt = Date.now();
     this.freezeDiagnostics = new FreezeDiagnostics(this.config.diagnostics?.freeze);
+    this.activity = new FileSessionActivityReporter(this.sessionId, this.cwd, {
+      onWriteError: (error) => {
+        log.warn('Session activity write failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
   }
 
   /** Start the session: create agent, set up context, wire events, start TUI. */
   async start(): Promise<void> {
     log.info('Session starting', { provider: this.provider, model: this.modelId, cwd: this.cwd });
+    await this.activity.initialize();
+
     // Register commands
     registerBuiltinCommands();
 
@@ -236,6 +250,7 @@ export class Session {
 
     // Start TUI event loop
     this.app.start();
+    void this.activity.recordAwaitingInput();
 
     // Surface the interactive update prompt once the input loop is live, and
     // only when this version has not already been skipped. The subtle banner
@@ -309,9 +324,13 @@ export class Session {
     console.log(`\nUpdating ${info.packageName} to ${info.latestVersion}...\n`);
     const code = await runNpmUpgrade(info.packageName);
     if (code === 0) {
+      await this.activity.recordDone({ code: 0, signal: null, reason: 'upgrade_completed' });
+      await this.activity.flush();
       console.log(`\n✓ Updated to ${info.latestVersion}. Restart with: cortex\n`);
       process.exit(0);
     }
+    await this.activity.recordError(new Error(`Upgrade failed with exit code ${code}`), true);
+    await this.activity.flush();
     console.log(`\nUpdate failed. Run it manually:\n  npm i -g ${info.packageName}@latest\n`);
     process.exit(1);
   }
@@ -325,7 +344,12 @@ export class Session {
       if (cmdName) {
         const cmd = getCommand(cmdName);
         if (cmd) {
-          await cmd.handler(this);
+          await this.activity.recordWorking();
+          try {
+            await cmd.handler(this);
+          } finally {
+            void this.activity.recordAwaitingInput();
+          }
           return;
         }
       }
@@ -336,6 +360,7 @@ export class Session {
     // If the agent is already running, steer it with the new message
     if (this.isRunning) {
       log.info('Steering agent with user message', { text: text.slice(0, 100) });
+      void this.activity.recordWorking();
       this.app!.transcript.addUserMessage(text);
       this.agent.steer(text);
       return;
@@ -353,11 +378,13 @@ export class Session {
     this.app!.showStatusSpinner(randomThinkingLabel());
     this.isRunning = true;
     this.freezeDiagnostics.setSessionRunning(true);
+    await this.activity.recordWorking();
 
     try {
       await this.agent.prompt(text);
     } catch (err) {
       log.error('Prompt error', { error: err instanceof Error ? err.message : String(err) });
+      void this.activity.recordError(err instanceof Error ? err : String(err));
       // Errors are mostly handled via onError handler.
       // Catch unexpected ones and stream interruptions here.
       if (this.agent?.state !== 'destroyed') {
@@ -375,6 +402,7 @@ export class Session {
       this.freezeDiagnostics.setSessionRunning(false);
       this.app!.hideStatusSpinner();
       this.app!.focusEditor();
+      void this.activity.recordAwaitingInput();
     }
   }
 
@@ -465,6 +493,7 @@ export class Session {
   private wireEvents(): void {
     if (!this.agent || !this.app) return;
     const bridge = this.agent.getEventBridge();
+    this.wireActivityEvents(bridge);
 
     // Streaming response chunks
     let assistantStarted = false;
@@ -506,7 +535,7 @@ export class Session {
         return;
       }
 
-      const p = event.payload as import('@animus-labs/cortex').ToolCallStartPayload | undefined;
+      const p = event.payload as ToolCallStartPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
 
       // SubAgent tool calls are displayed via the onSubAgentSpawned lifecycle hook
@@ -545,7 +574,7 @@ export class Session {
     bridge.on('tool_call_update', (event: CortexEvent) => {
       if (event.childTaskId) return;
 
-      const p = event.payload as import('@animus-labs/cortex').ToolCallUpdatePayload | undefined;
+      const p = event.payload as ToolCallUpdatePayload | undefined;
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
       const partialResult = p?.partialResult ?? (event.data as Record<string, unknown> | undefined)?.['partialResult'];
 
@@ -562,7 +591,7 @@ export class Session {
         return;
       }
 
-      const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
+      const p = event.payload as ToolCallEndPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
 
       // SubAgent tool_call_end is handled via onSubAgentCompleted/onSubAgentFailed
@@ -596,10 +625,12 @@ export class Session {
       this.app?.transcript.closeActiveToolGroups();
       this.app?.hideStatusSpinner();
       this.app?.focusEditor();
+      void this.activity.recordAwaitingInput();
     });
 
     // Error handling with per-category display
     this.agent.onError((error: ClassifiedError) => {
+      void this.activity.recordError(error, error.severity === 'fatal');
       switch (error.category) {
         case 'rate_limit':
           this.app!.transcript.addNotification(
@@ -696,6 +727,7 @@ export class Session {
     this.agent.onBackgroundResultDelivery(() => {
       this.isRunning = true;
       this.app!.showStatusSpinner('Processing background results...');
+      void this.activity.recordWorking();
     });
 
     // Update tokens and auto-save on turn_end (fires after each LLM turn,
@@ -704,6 +736,45 @@ export class Session {
       this.updateFooterContextUsage();
       this.updateObservationalMemoryStatus();
       this.triggerAutoSave();
+    });
+  }
+
+  private wireActivityEvents(bridge: ReturnType<CortexAgent['getEventBridge']>): void {
+    bridge.on('turn_start', () => {
+      this.activity.recordTurnStarted();
+    });
+
+    bridge.on('turn_end', () => {
+      this.activity.recordTurnEnded();
+    });
+
+    bridge.on('tool_call_start', (event: CortexEvent) => {
+      const p = event.payload as ToolCallStartPayload | undefined;
+      const data = event.data as Record<string, unknown> | undefined;
+      const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
+      const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? data?.['id'] ?? Math.random());
+      const args = p?.args ?? (data?.['args'] as Record<string, unknown> | undefined) ?? {};
+      this.activity.recordToolStarted({
+        toolCallId,
+        toolName,
+        args,
+        ...(event.childTaskId ? { childTaskId: event.childTaskId } : {}),
+      });
+    });
+
+    bridge.on('tool_call_end', (event: CortexEvent) => {
+      const p = event.payload as ToolCallEndPayload | undefined;
+      const data = event.data as Record<string, unknown> | undefined;
+      const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
+      const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? data?.['id'] ?? '');
+      this.activity.recordToolEnded({
+        toolCallId,
+        toolName,
+        durationMs: p?.durationMs ?? Number(data?.['durationMs'] ?? data?.['duration'] ?? 0),
+        isError: p?.isError ?? Boolean(data?.['isError']),
+        ...(p?.error ? { error: p.error } : {}),
+        ...(event.childTaskId ? { childTaskId: event.childTaskId } : {}),
+      });
     });
   }
 
@@ -756,8 +827,13 @@ export class Session {
       this.permissionLockRelease = resolve;
     });
 
+    const permission = this.activity.recordPermissionRequested(toolName, toolArgs);
+    await permission.written;
+    let permissionResolution: PermissionResolution = 'denied';
+
     try {
       const result = await this.app.showPermissionPrompt(toolName, toolArgs);
+      permissionResolution = result.decision === 'allow' ? 'allowed' : 'denied';
 
       if (result.scope === 'project-edits') {
         // Project-wide edit/write permission: add rules for both tools
@@ -769,7 +845,12 @@ export class Session {
       }
 
       return result.decision === 'allow' ? true : { decision: 'block' };
+    } catch (error) {
+      permissionResolution = 'error';
+      void this.activity.recordError(error instanceof Error ? error : String(error));
+      throw error;
     } finally {
+      await this.activity.recordPermissionResolved(permission.id, toolName, permissionResolution);
       const release = this.permissionLockRelease;
       this.permissionLockPromise = null;
       this.permissionLockRelease = null;
@@ -900,11 +981,17 @@ export class Session {
     this.freezeDiagnostics.recordAbortRequested('session.abort');
     if (this.agent && this.isRunning) {
       await this.agent.abort();
+      void this.activity.recordError({
+        category: 'cancelled',
+        severity: 'recoverable',
+        originalMessage: 'Agent loop cancelled by user',
+      });
     }
     this.isRunning = false;
     this.freezeDiagnostics.setSessionRunning(false);
     this.app?.hideStatusSpinner();
     this.app?.focusEditor();
+    void this.activity.recordAwaitingInput();
   }
 
   /** Graceful shutdown: save, destroy agent, stop TUI. */
@@ -934,8 +1021,24 @@ export class Session {
       this.agent = null;
     }
 
+    await this.activity.recordDone({ code: 0, signal: null, reason: 'normal_shutdown' });
+    await this.activity.flush();
     this.app?.stop();
     process.exit(0);
+  }
+
+  async recordFatalActivityError(error: unknown): Promise<void> {
+    await this.activity.recordError(error instanceof Error ? error : String(error), true);
+    await this.activity.flush();
+  }
+
+  async recordSignalActivityError(signal: NodeJS.Signals): Promise<void> {
+    await this.activity.recordError({
+      category: 'cancelled',
+      severity: 'recoverable',
+      originalMessage: `Process terminated by ${signal}`,
+    }, true);
+    await this.activity.flush();
   }
 
   // -------------------------------------------------------------------------

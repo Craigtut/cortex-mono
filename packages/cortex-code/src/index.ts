@@ -184,34 +184,86 @@ async function main(): Promise<void> {
     : 'medium';
 
   // Create and start session
-  const session = new Session({
-    config,
-    mode: BUILD_MODE,
-    model,
-    provider,
-    modelId,
-    providerManager,
-    credentialStore,
-    cwd,
-    yoloMode: args.yolo,
-    initialEffort,
-    initialUtilityModelId,
-    resumeSessionId,
-    updateInfo,
-    ...(args.compaction ? { compactionStrategy: args.compaction } : {}),
-  });
+  let session: Session | null = null;
+  let uninstallSignalHandlers: (() => void) | null = null;
+  try {
+    session = new Session({
+      config,
+      mode: BUILD_MODE,
+      model,
+      provider,
+      modelId,
+      providerManager,
+      credentialStore,
+      cwd,
+      yoloMode: args.yolo,
+      initialEffort,
+      initialUtilityModelId,
+      resumeSessionId,
+      updateInfo,
+      ...(args.compaction ? { compactionStrategy: args.compaction } : {}),
+    });
+    uninstallSignalHandlers = installActivitySignalHandlers(session);
 
-  await session.start();
+    await session.start();
 
-  // If resuming, restore conversation history
-  if (resumeSessionId) {
-    await session.resume(resumeSessionId);
+    // If resuming, restore conversation history
+    if (resumeSessionId) {
+      await session.resume(resumeSessionId);
+    }
+  } catch (err) {
+    uninstallSignalHandlers?.();
+    await session?.recordFatalActivityError(err);
+    throw err;
   }
 }
 
 /** Get a sensible default model for a provider. */
 function getDefaultModel(provider: string): string {
   return PRIMARY_MODEL_DEFAULTS[provider] ?? PRIMARY_MODEL_DEFAULTS['anthropic']!;
+}
+
+function installActivitySignalHandlers(session: Session): () => void {
+  const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGHUP'];
+  const disposers: Array<() => void> = [];
+  let exiting = false;
+
+  for (const signal of signals) {
+    const listener = () => {
+      if (exiting) {
+        process.exit(exitCodeForSignal(signal));
+      }
+      exiting = true;
+      const timeout = setTimeout(() => {
+        process.exit(exitCodeForSignal(signal));
+      }, 2_000);
+      void session.recordSignalActivityError(signal).finally(() => {
+        clearTimeout(timeout);
+        process.exit(exitCodeForSignal(signal));
+      });
+    };
+    process.once(signal, listener);
+    disposers.push(() => {
+      process.off(signal, listener);
+    });
+  }
+
+  return () => {
+    for (const dispose of disposers) {
+      dispose();
+    }
+  };
+}
+
+function exitCodeForSignal(signal: NodeJS.Signals): number {
+  switch (signal) {
+    case 'SIGHUP':
+      return 129;
+    case 'SIGTERM':
+      return 143;
+    default:
+      return 1;
+  }
 }
 
 // Run

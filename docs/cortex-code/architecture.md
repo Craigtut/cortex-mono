@@ -129,6 +129,47 @@ The session controller lives inside Cortex Code, not in a separate package. Cort
 
 **Session resume** uses a create-fresh-and-hydrate pattern: spin up a new agent instance, load saved history via `restoreConversationHistory()`, and continue. This avoids partial state corruption that can occur when mutating a live session in place.
 
+### Session Activity Surface
+
+Cortex Code writes a local runtime activity surface for external supervisors, dashboards, launchers, and wrappers. This is a product-neutral integration contract owned by Cortex Code, not Cortex core. Cortex core remains in-memory and only emits lifecycle events.
+
+Activity files live beside the existing session persistence files:
+
+```text
+~/.cortex/sessions/{sessionId}/
+  meta.json
+  history.json
+  activity/
+    state.json
+    events.jsonl
+    events.1.jsonl
+    events.2.jsonl
+    events.3.jsonl
+```
+
+`activity/state.json` is the authoritative current state for late attach. It is written with atomic replace and contains:
+
+- `sessionId`, matching the session directory name
+- `status`: `working`, `awaiting_input`, `awaiting_permission`, `done`, or `error`
+- `updatedAt` and monotonic `sequence`
+- current turn metadata
+- active tool summaries
+- pending permission details, including `displaySummary` and sanitized `args`
+- latest visible error
+- final exit information for closed sessions
+
+`activity/events.jsonl` is an append-only lifecycle stream. It records:
+
+- `status_changed`
+- `turn_started` and `turn_ended`
+- `tool_call_started` and `tool_call_ended`
+- `permission_requested` and `permission_resolved`
+- `error`
+
+Completion events include `durationMs` when Cortex Code can compute it. Permission requests include a human-readable `displaySummary` so external readers can render a safe one-line prompt without understanding every tool's argument schema. Permission `args` are sanitized before persistence: shell commands and small primitive fields are preserved, while large file contents and edit replacements are represented with previews, byte counts, line counts, and truncation flags.
+
+The event log rotates at 5 MB into `events.1.jsonl`, `events.2.jsonl`, and `events.3.jsonl`. Readers should use `state.json` for current state and treat JSONL as a best-effort activity history. If a reader sees an incomplete trailing line, it should ignore that line until the next write.
+
 ### TUI Layer
 
 Built on pi-tui. The rendering surface has a simple structure:
