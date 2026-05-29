@@ -13,6 +13,7 @@ import { effortCommand } from './effort.js';
 import { exitCommand } from './exit.js';
 import { debugCommand } from './debug.js';
 import { updateCommand } from './update.js';
+import { mcpReloadCommand } from './mcp-reload.js';
 
 // Handler type uses `any` for the session parameter to avoid circular
 // dependency with session.ts. Type safety is enforced at the call site.
@@ -72,4 +73,5 @@ export function registerBuiltinCommands(): void {
   registerCommand(exitCommand);
   registerCommand(debugCommand);
   registerCommand(updateCommand);
+  registerCommand(mcpReloadCommand);
 }
