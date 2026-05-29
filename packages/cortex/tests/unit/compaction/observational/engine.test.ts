@@ -162,6 +162,84 @@ describe('ObservationalMemoryEngine', () => {
 
       expect(newEngine.getSlotContent()).toBe(originalSlot);
     });
+
+    it('includes the buffer watermark in initial state', () => {
+      const engine = new ObservationalMemoryEngine({}, 0);
+      expect(engine.getState().bufferWatermark).toBe(0);
+    });
+
+    // Build an engine with one completed buffer chunk via onTurnEnd.
+    async function engineWithBufferedChunk(): Promise<ObservationalMemoryEngine> {
+      const engine = new ObservationalMemoryEngine({
+        activationThreshold: 0.9,
+        bufferMinTokens: 1_000,
+        bufferTargetCycles: 4,
+        bufferTokenCap: 30_000,
+      }, 0);
+      engine.setCompleteFn(vi.fn<CompleteFn>().mockResolvedValue(OBSERVER_OUTPUT));
+      engine.setContextWindow(100_000);
+      engine.setUtilityModelContextWindow(200_000);
+
+      // ~12500 tokens of unobserved messages exceeds the ~10000 buffer interval
+      engine.onTurnEnd(50_000, 100_000, [userMsg('x'.repeat(50_000))], 0);
+      await flushPromises();
+      return engine;
+    }
+
+    it('round-trips buffered chunks and watermark', async () => {
+      const engine = await engineWithBufferedChunk();
+      const savedState = engine.getState();
+
+      expect(savedState.bufferedChunks).toHaveLength(1);
+      expect(savedState.bufferWatermark).toBe(1);
+
+      const newEngine = new ObservationalMemoryEngine({}, 0);
+      newEngine.restoreState(savedState, 1);
+
+      const restored = newEngine.getState();
+      expect(restored.bufferedChunks).toHaveLength(1);
+      expect(restored.bufferedChunks[0]!.observations).toBe(savedState.bufferedChunks[0]!.observations);
+      expect(restored.bufferWatermark).toBe(1);
+    });
+
+    it('survives JSON serialization and rehydrates chunk createdAt as a Date', async () => {
+      const engine = await engineWithBufferedChunk();
+      const persisted: ObservationalMemoryState = JSON.parse(JSON.stringify(engine.getState()));
+
+      // After JSON round-trip, createdAt is a string on the wire.
+      expect(typeof persisted.bufferedChunks[0]!.createdAt).toBe('string');
+
+      const newEngine = new ObservationalMemoryEngine({}, 0);
+      newEngine.restoreState(persisted, 1);
+
+      expect(newEngine.getState().bufferedChunks[0]!.createdAt).toBeInstanceOf(Date);
+    });
+
+    it('discards chunks from legacy state without a watermark', async () => {
+      const engine = await engineWithBufferedChunk();
+      const legacyState = engine.getState();
+      // Simulate a session saved before buffer persistence existed.
+      delete (legacyState as { bufferWatermark?: number }).bufferWatermark;
+      expect(legacyState.bufferedChunks).toHaveLength(1);
+
+      const newEngine = new ObservationalMemoryEngine({}, 0);
+      newEngine.restoreState(legacyState);
+
+      const restored = newEngine.getState();
+      expect(restored.bufferedChunks).toEqual([]);
+      expect(restored.bufferWatermark).toBe(0);
+    });
+
+    it('clamps a watermark that drifted ahead of the restored history', async () => {
+      const engine = await engineWithBufferedChunk();
+      const savedState = engine.getState();
+      savedState.bufferWatermark = 99; // stale: history only has 1 message
+
+      const newEngine = new ObservationalMemoryEngine({}, 0);
+      newEngine.restoreState(savedState, 1);
+
+      expect(newEngine.getState().bufferWatermark).toBe(1);
+    });
   });
 
   // -------------------------------------------------------------------------

@@ -158,6 +158,15 @@ export interface ObservationalMemoryState {
 
   /** Buffered observation chunks not yet activated. */
   bufferedChunks: ObservationChunk[];
+
+  /**
+   * Index into post-slot conversation history up to which `bufferedChunks`
+   * cover messages. Completed chunks observe `messages[0:bufferWatermark]`.
+   * Persisted so the buffer can be restored without re-observing already
+   * buffered messages. Absent on sessions saved before buffer persistence
+   * was added; in that case chunks are discarded on restore (legacy safe).
+   */
+  bufferWatermark?: number;
 }
 
 // ---------------------------------------------------------------------------

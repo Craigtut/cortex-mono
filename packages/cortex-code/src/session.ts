@@ -1004,21 +1004,15 @@ export class Session {
     try {
       const history = this.agent.getConversationHistory();
       const meta = this.buildSessionMeta();
-      this.saver.save(history, meta);
-      this.saveObservationalState();
+      // Bundle observational state into the same debounced write so the
+      // persisted buffer watermark stays aligned with the saved history.
+      const omState = this.compactionStrategy === 'observational'
+        ? this.agent.getObservationalMemoryState() ?? undefined
+        : undefined;
+      this.saver.save(history, meta, omState);
     } catch {
       // Swallow auto-save errors silently
     }
-  }
-
-  private saveObservationalState(): void {
-    if (!this.agent || this.compactionStrategy !== 'observational') return;
-    const omState = this.agent.getObservationalMemoryState();
-    if (!omState) return;
-    // Fire-and-forget; observational state save is best-effort
-    import('./persistence/sessions.js').then(({ saveObservationalState: save }) => {
-      save(this.sessionId, omState).catch(() => {});
-    }).catch(() => {});
   }
 
   private buildSessionMeta(): SessionMeta {

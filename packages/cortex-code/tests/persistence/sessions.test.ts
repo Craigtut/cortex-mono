@@ -64,6 +64,45 @@ describe('createDebouncedSaver', () => {
       // Expected: no ~/.cortex/sessions directory in test env
     }
   });
+
+  describe('atomic observational state save', () => {
+    const createdSessionDirs: string[] = [];
+
+    afterEach(async () => {
+      for (const dir of createdSessionDirs.splice(0)) {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('writes observations.json alongside history.json in the same flush', async () => {
+      const id = `__test__-${generateSessionId()}`;
+      const dir = join(homedir(), '.cortex', 'sessions', id);
+      createdSessionDirs.push(dir);
+
+      const saver = createDebouncedSaver(id, 500);
+      const omState = { observations: 'remembered', bufferWatermark: 3, bufferedChunks: [] };
+      saver.save([{ msg: 1 }], { ...mockMeta, id }, omState);
+      await saver.flush();
+
+      const history = JSON.parse(await readFile(join(dir, 'history.json'), 'utf-8'));
+      const observations = JSON.parse(await readFile(join(dir, 'observations.json'), 'utf-8'));
+      expect(history).toEqual([{ msg: 1 }]);
+      expect(observations).toEqual(omState);
+    });
+
+    it('does not write observations.json when no omState is provided', async () => {
+      const id = `__test__-${generateSessionId()}`;
+      const dir = join(homedir(), '.cortex', 'sessions', id);
+      createdSessionDirs.push(dir);
+
+      const saver = createDebouncedSaver(id, 500);
+      saver.save([{ msg: 1 }], { ...mockMeta, id });
+      await saver.flush();
+
+      await expect(readFile(join(dir, 'history.json'), 'utf-8')).resolves.toBeDefined();
+      await expect(stat(join(dir, 'observations.json'))).rejects.toThrow();
+    });
+  });
 });
 
 describe('createToolResultPersistor', () => {

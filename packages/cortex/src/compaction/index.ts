@@ -541,9 +541,13 @@ export class CompactionManager {
 
   /**
    * Restore observational memory state from a previous session.
+   *
+   * @param state - the persisted observational memory state
+   * @param historyLength - length of the restored post-slot conversation
+   *   history, used to clamp the buffer watermark against drift
    */
-  restoreObservationalMemoryState(state: ObservationalMemoryState): void {
-    this.observationalEngine?.restoreState(state);
+  restoreObservationalMemoryState(state: ObservationalMemoryState, historyLength?: number): void {
+    this.observationalEngine?.restoreState(state, historyLength);
   }
 
   /**

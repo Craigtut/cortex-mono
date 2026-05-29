@@ -731,6 +731,14 @@ interface ObservationalMemoryState {
 
   /** Buffered observation chunks not yet activated. */
   bufferedChunks: ObservationChunk[];
+
+  /**
+   * Index into post-slot conversation history up to which `bufferedChunks`
+   * cover messages. Persisted so the buffer can be restored without
+   * re-observing already-buffered messages. Optional: sessions saved before
+   * buffer persistence omit it, in which case chunks are discarded on restore.
+   */
+  bufferWatermark?: number;
 }
 
 interface ObservationChunk {
@@ -784,13 +792,15 @@ On resumption, the agent starts with:
 - Observation slot populated with previous observations
 - `<current-task>` and `<suggested-response>` providing continuity
 - Conversation history restored (may include unobserved messages from the previous session)
-- Buffered observation chunks that completed before the session was saved are restored alongside other state. In-flight (incomplete) observer operations are lost.
+- Buffered observation chunks that completed before the session was saved are restored alongside other state, together with the `bufferWatermark` that tracks how many messages they cover. In-flight (incomplete) observer operations are lost.
 
-**Buffer rebuild on resumption:** Completed chunks from the previous session are available immediately after restore. The existing async buffering machinery handles resumption naturally:
+**Buffer restore on resumption:** Completed chunks and their watermark are restored verbatim, so the observer work done in the previous session is not recomputed. Because the watermark indexes into the post-slot conversation history (restored first, at the same positions), the chunks stay correctly aligned: the next activation trims exactly `messages[0:bufferWatermark]` when it merges their observations, with no duplication. On restore the watermark is clamped to the restored history length to guard against a watermark that drifted ahead of a stale `history.json` (possible only on a hard crash; the auto-saver writes history and observations atomically, and graceful shutdown re-saves both). The async buffering machinery then handles only the remainder:
 
-1. On `restoreObservationalMemoryState()`, Cortex immediately kicks off the first async buffer on any unobserved messages (non-blocking head start before the consumer calls `prompt()`)
-2. On the first `turn_end`, the dynamic interval calculation detects unobserved messages and continues async buffering, chunked at `bufferTokenCap`
+1. On `restoreObservationalMemoryState()`, Cortex kicks off an async buffer over the unobserved messages *after* the restored watermark (often empty, in which case nothing fires) as a non-blocking head start before the consumer calls `prompt()`
+2. On the first `turn_end`, the dynamic interval calculation detects any further unobserved messages and continues async buffering, chunked at `bufferTokenCap`
 3. Each subsequent turn rebuilds more of the buffer through normal operation
+
+Sessions saved before buffer persistence was added have no `bufferWatermark`; their chunks are discarded on restore (the pre-persistence behavior) and re-observed from scratch.
 
 **Hot resumption edge case:** If the session is restored at high utilization (e.g., 89%) and the first agent turn pushes past the activation threshold, the sync fallback handles it: one blocking observer call on the unbuffered messages, immediate activation, messages trimmed. After that, async buffering is caught up and operates normally. This is at most one blocking pause on the first turn after a hot resumption.
 

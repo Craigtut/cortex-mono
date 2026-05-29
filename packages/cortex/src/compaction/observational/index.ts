@@ -61,6 +61,22 @@ export type {
 } from './types.js';
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Rehydrate buffered chunks loaded from persistence. `createdAt` survives
+ * JSON serialization as an ISO string; convert it back to a `Date` so the
+ * in-memory shape matches {@link ObservationChunk}.
+ */
+function rehydrateChunks(chunks: ObservationChunk[]): ObservationChunk[] {
+  return chunks.map((chunk) => ({
+    ...chunk,
+    createdAt: chunk.createdAt instanceof Date ? chunk.createdAt : new Date(chunk.createdAt),
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // ObservationalMemoryEngine
 // ---------------------------------------------------------------------------
 
@@ -531,38 +547,59 @@ export class ObservationalMemoryEngine {
    * Returns the current state for session persistence.
    */
   getState(): ObservationalMemoryState {
+    const buffering = this.buffering.getState();
     return {
       observations: this.observations,
       continuationHint: this.continuationHint,
       observationTokenCount: this.observationTokenCount,
       generationCount: this.generationCount,
-      bufferedChunks: this.buffering.getState().chunks,
+      bufferedChunks: buffering.chunks,
+      bufferWatermark: buffering.watermark,
     };
   }
 
   /**
    * Restore state from a previous session.
    *
-   * Sets observations, continuation hint, token count, and generation count.
-   * Restores buffering state. If a completeFn is available and observations
-   * exist, updates the slot content. Kicks off an initial async buffer on
-   * unobserved messages as a non-blocking head start.
+   * Sets observations, continuation hint, token count, and generation count,
+   * then restores the buffer (completed chunks + watermark) so the observer
+   * work done in the previous session is not recomputed on resume.
+   *
+   * The watermark indexes into post-slot conversation history. Since
+   * `restoreConversationHistory()` runs before this and splices the same
+   * messages back at the same positions, the watermark aligns: the restored
+   * chunks observe `messages[0:watermark]`, and the next activation trims
+   * exactly those messages when it merges the chunk observations (no
+   * duplication). The kickstart buffer then re-observes only the genuinely
+   * unobserved remainder after the watermark.
+   *
+   * @param state - the persisted observational memory state
+   * @param historyLength - length of the restored post-slot conversation
+   *   history. Used to clamp a watermark that drifted ahead of the saved
+   *   history (possible only on a hard crash; graceful save keeps them in
+   *   sync). Defaults to the saved watermark (no clamp) when omitted.
    */
-  restoreState(state: ObservationalMemoryState): void {
+  restoreState(state: ObservationalMemoryState, historyLength?: number): void {
     this.observations = state.observations;
     this.continuationHint = state.continuationHint;
     this.observationTokenCount = state.observationTokenCount;
     this.generationCount = state.generationCount;
 
-    // Discard buffered chunks from the previous session. Chunks represent
-    // observations that completed async but were never activated (merged
-    // into this.observations + messages trimmed). Restoring them with
-    // watermark=0 would merge their observations without trimming any
-    // messages, duplicating context. The observer will re-observe
-    // unobserved messages naturally on the next buffer cycle.
+    // Legacy sessions saved before buffer persistence have no watermark.
+    // Their chunks cannot be safely aligned with the restored history, so
+    // discard them (the observer re-observes naturally). This preserves the
+    // pre-persistence behavior for old session files.
+    if (typeof state.bufferWatermark !== 'number') {
+      this.buffering.restoreState({ chunks: [], watermark: 0 });
+      return;
+    }
+
+    const maxWatermark = historyLength ?? state.bufferWatermark;
+    const watermark = Math.max(0, Math.min(state.bufferWatermark, maxWatermark));
+
     this.buffering.restoreState({
-      chunks: [],
-      watermark: 0,
+      chunks: rehydrateChunks(state.bufferedChunks ?? []),
+      watermark,
     });
   }
 

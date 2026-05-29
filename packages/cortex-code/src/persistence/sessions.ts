@@ -213,30 +213,48 @@ export async function listSessions(): Promise<SessionMeta[]> {
 
 /**
  * Create a debounced save function that batches rapid save calls.
+ *
+ * History, meta, and (optionally) observational memory state are written
+ * together in the same flush so `history.json` and `observations.json` cannot
+ * drift out of sync. The buffer watermark persisted in the observational state
+ * indexes into the conversation history, so a stale pairing would mis-align it
+ * on resume; writing them atomically keeps the watermark valid.
  */
 export function createDebouncedSaver(
   sessionId: string,
   delayMs: number = 500,
 ): {
-  save: (history: unknown[], meta: SessionMeta) => void;
+  save: (history: unknown[], meta: SessionMeta, omState?: unknown) => void;
   flush: () => Promise<void>;
 } {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let pendingHistory: unknown[] | null = null;
   let pendingMeta: SessionMeta | null = null;
+  let pendingOmState: unknown = null;
+  let hasPendingOmState = false;
 
   const doSave = async (): Promise<void> => {
     if (pendingHistory && pendingMeta) {
-      await saveSession(sessionId, pendingHistory, pendingMeta);
+      const writes: Promise<void>[] = [saveSession(sessionId, pendingHistory, pendingMeta)];
+      if (hasPendingOmState && pendingOmState != null) {
+        writes.push(saveObservationalState(sessionId, pendingOmState));
+      }
+      await Promise.all(writes);
       pendingHistory = null;
       pendingMeta = null;
+      pendingOmState = null;
+      hasPendingOmState = false;
     }
   };
 
   return {
-    save(history: unknown[], meta: SessionMeta): void {
+    save(history: unknown[], meta: SessionMeta, omState?: unknown): void {
       pendingHistory = history;
       pendingMeta = meta;
+      if (omState !== undefined) {
+        pendingOmState = omState;
+        hasPendingOmState = true;
+      }
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         doSave().catch(() => {

@@ -2444,14 +2444,20 @@ export class CortexAgent {
    * Must be called after restoreConversationHistory().
    */
   restoreObservationalMemoryState(state: ObservationalMemoryState): void {
-    this.compactionManager.restoreObservationalMemoryState(state);
+    // Conversation history is restored before this call, so the post-slot
+    // message count is the length the buffer watermark must align with.
+    const slotCount = this.contextManager.slotCount;
+    const historyLength = Math.max(0, this.agent.state.messages.length - slotCount);
+    this.compactionManager.restoreObservationalMemoryState(state, historyLength);
     // Update the observation slot with restored content
     const slotContent = this.compactionManager.getObservationSlotContent();
     if (slotContent) {
       this.contextManager.setSlot('_observations', slotContent);
     }
-    // Kick off initial async buffer for hot resumption
-    this.compactionManager.kickstartBuffer(this.agent.state.messages, this.contextManager.slotCount);
+    // Kick off initial async buffer for hot resumption. With the watermark
+    // restored, this observes only the unobserved remainder after the buffer,
+    // not the entire restored tail.
+    this.compactionManager.kickstartBuffer(this.agent.state.messages, slotCount);
   }
 
   /**
