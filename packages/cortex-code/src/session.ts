@@ -65,6 +65,11 @@ import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
 import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
 import { FileSessionActivityReporter, type PermissionResolution } from './activity/session-activity.js';
+import { McpConfigWatcher, type McpConfigChangeReason } from './mcp/mcp-watcher.js';
+import { reconcileMcpServers, type McpReconcileResult } from './mcp/reconcile.js';
+import { loadHookHandlers } from './hooks/loader.js';
+import { runHookHandlers } from './hooks/runner.js';
+import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -110,6 +115,10 @@ export class Session {
   private subAgentActivity = new Map<string, Map<string, { name: string; status: string; summary?: string }>>();
   private readonly freezeDiagnostics: FreezeDiagnostics;
   private readonly activity: FileSessionActivityReporter;
+  private mcpWatcher: McpConfigWatcher | null = null;
+  private mcpReloadPending: McpConfigChangeReason | null = null;
+  private mcpReloadInFlight = false;
+  private hookHandlers: Record<HookEvent, HookHandler[]> | null = null;
 
   private readonly config: CortexCodeConfig;
   private readonly mode: Mode;
@@ -218,6 +227,28 @@ export class Session {
 
     // Connect MCP servers (with trust-on-first-use for project-local configs)
     await this.connectMcpServersWithTrust();
+
+    // Watch ~/.cortex/mcp.json and {cwd}/.cortex/mcp.json for changes so we
+    // can pick them up between turns without a restart.
+    this.mcpWatcher = new McpConfigWatcher({
+      cwd: this.cwd,
+      onChange: (reason) => this.scheduleMcpReload(reason),
+      log: (msg, data) => log.info(msg, data),
+    });
+    await this.mcpWatcher.start();
+
+    // Load lifecycle hook handlers from ~/.cortex/hooks.json and
+    // {cwd}/.cortex/hooks.json. Loading is non-fatal: a malformed config or
+    // missing files yields an empty handler set rather than blocking
+    // startup.
+    try {
+      this.hookHandlers = await loadHookHandlers(this.cwd);
+    } catch (err) {
+      log.warn('Hook loader failed; running without hooks', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.hookHandlers = null;
+    }
 
     // Register skills
     const skills = await discoverSkills(this.cwd);
@@ -380,8 +411,14 @@ export class Session {
     this.freezeDiagnostics.setSessionRunning(true);
     await this.activity.recordWorking();
 
+    // Run pre_turn hooks: outside processes can inject context the agent
+    // should see before this turn (e.g. inter-agent message notifications).
+    // Failures inside individual handlers are logged but do not block the
+    // turn.
+    const promptForAgent = await this.applyPreTurnHooks(text);
+
     try {
-      await this.agent.prompt(text);
+      await this.agent.prompt(promptForAgent);
     } catch (err) {
       log.error('Prompt error', { error: err instanceof Error ? err.message : String(err) });
       void this.activity.recordError(err instanceof Error ? err : String(err));
@@ -485,6 +522,155 @@ export class Session {
       this.app!.transcript.addNotification(
         'MCP Error',
         `Failed to connect "${server.name}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Queue an MCP config reload. If the agentic loop is currently running, the
+   * reload is deferred until `onLoopComplete`; otherwise it runs immediately.
+   * Multiple queued reloads collapse into one pass.
+   */
+  private scheduleMcpReload(reason: McpConfigChangeReason): void {
+    this.mcpReloadPending = reason;
+    if (!this.isRunning) {
+      void this.runQueuedMcpReload();
+    }
+  }
+
+  /**
+   * Public entry point for the `/mcp-reload` slash command. Force a
+   * reconciliation pass; same gating rules as a watcher-driven reload.
+   */
+  async triggerMcpReload(): Promise<void> {
+    this.scheduleMcpReload('manual');
+  }
+
+  /**
+   * Execute one queued reconciliation pass. Guards against re-entrancy so
+   * concurrent watcher events do not stomp on each other.
+   */
+  private async runQueuedMcpReload(): Promise<void> {
+    if (this.mcpReloadInFlight) return;
+    if (!this.agent) {
+      this.mcpReloadPending = null;
+      return;
+    }
+    this.mcpReloadInFlight = true;
+    const reason = this.mcpReloadPending ?? 'manual';
+    this.mcpReloadPending = null;
+    try {
+      const result = await reconcileMcpServers(this.agent, this.cwd, {
+        resolveProjectTrust: (cwd, servers) => this.resolveProjectMcpTrust(cwd, servers.map(s => s.name)),
+        log: (msg, data) => log.info(msg, data),
+      });
+      this.notifyMcpReloadOutcome(reason, result);
+    } catch (err) {
+      log.warn('MCP reload failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.app?.transcript.addNotification(
+        'MCP Reload Failed',
+        err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      this.mcpReloadInFlight = false;
+      // A change that arrived while we were running would have set
+      // mcpReloadPending again; pick it up immediately if so.
+      if (this.mcpReloadPending && !this.isRunning) {
+        void this.runQueuedMcpReload();
+      }
+    }
+  }
+
+  /**
+   * Prompt the user to trust a new/changed project MCP config during a
+   * watcher-driven reload. Mirrors the startup overlay in
+   * `connectMcpServersWithTrust`. Returns 'skip' if the user declines or
+   * dismisses the overlay.
+   */
+  private async resolveProjectMcpTrust(cwd: string, serverNames: string[]): Promise<'trust' | 'skip'> {
+    if (!this.app) return 'skip';
+    void cwd;
+    return await new Promise<'trust' | 'skip'>((resolve) => {
+      const items: SelectItem[] = [
+        { value: 'trust', label: 'Trust and connect', description: 'Approve project MCP servers' },
+        { value: 'skip', label: 'Skip', description: 'Keep using global servers only' },
+      ];
+      const list = new SelectList(items, 2, selectListTheme);
+      const overlayBox = new OverlayBox(list, 'Project MCP Servers Changed');
+      const handle = this.app!.tui.showOverlay(overlayBox, {
+        anchor: 'center',
+        width: '60%',
+        maxHeight: 12,
+      });
+      this.app!.transcript.addNotification(
+        'MCP Trust Check',
+        `Approve new/changed project MCP servers?\n${serverNames.map(n => `  ${n}`).join('\n')}`,
+      );
+      list.onSelect = (item) => {
+        handle.hide();
+        resolve(item.value === 'trust' ? 'trust' : 'skip');
+      };
+      list.onCancel = () => {
+        handle.hide();
+        resolve('skip');
+      };
+    });
+  }
+
+  /**
+   * Invoke every registered `pre_turn` hook handler in parallel and prepend
+   * their concatenated `additionalContext` (if any) to the user's prompt.
+   * Returns the (possibly augmented) prompt text the agent should see.
+   *
+   * Hooks are external subprocesses; per-handler failures are logged and the
+   * other handlers still run. If no handlers are configured or none return
+   * context, the original prompt is returned unchanged.
+   */
+  private async applyPreTurnHooks(userText: string): Promise<string> {
+    const handlers = this.hookHandlers?.pre_turn ?? [];
+    if (handlers.length === 0) return userText;
+    const envelope: PreTurnEnvelope = {
+      event: 'pre_turn',
+      sessionId: this.sessionId,
+      cwd: this.cwd,
+      timestamp: new Date().toISOString(),
+      version: 1,
+      userPrompt: userText,
+    };
+    const { additionalContext, results } = await runHookHandlers(handlers, envelope);
+    for (const result of results) {
+      if (result.error) {
+        log.warn('pre_turn hook failed', {
+          handler: result.handler.name,
+          error: result.error,
+          exitCode: result.exitCode,
+          signal: result.signal,
+        });
+      }
+    }
+    if (additionalContext.length === 0) return userText;
+    return `<pre-turn-context>\n${additionalContext}\n</pre-turn-context>\n\n${userText}`;
+  }
+
+  private notifyMcpReloadOutcome(reason: McpConfigChangeReason, result: McpReconcileResult): void {
+    const parts: string[] = [];
+    if (result.added.length > 0) parts.push(`+${result.added.length} added`);
+    if (result.removed.length > 0) parts.push(`-${result.removed.length} removed`);
+    if (result.updated.length > 0) parts.push(`${result.updated.length} updated`);
+    if (result.skippedDueToUntrustedProject.length > 0) {
+      parts.push(`${result.skippedDueToUntrustedProject.length} skipped (untrusted)`);
+    }
+    if (result.errors.length > 0) parts.push(`${result.errors.length} error(s)`);
+    if (parts.length === 0 && reason === 'manual') {
+      this.app?.transcript.addNotification('MCP', 'Already up to date.');
+      return;
+    }
+    if (parts.length > 0) {
+      this.app?.transcript.addNotification(
+        reason === 'manual' ? 'MCP Reload' : 'MCP Config Changed',
+        parts.join(', '),
       );
     }
   }
@@ -626,6 +812,12 @@ export class Session {
       this.app?.hideStatusSpinner();
       this.app?.focusEditor();
       void this.activity.recordAwaitingInput();
+      // If the MCP config changed during the turn, apply it now. Doing this
+      // here (vs mid-turn) avoids invalidating the tool snapshot that
+      // pi-agent-core captured at prompt() entry.
+      if (this.mcpReloadPending) {
+        void this.runQueuedMcpReload();
+      }
     });
 
     // Error handling with per-category display
@@ -996,6 +1188,17 @@ export class Session {
 
   /** Graceful shutdown: save, destroy agent, stop TUI. */
   async shutdown(): Promise<void> {
+    // Tear down MCP config watcher first so a late filesystem event cannot
+    // schedule work against the agent we're about to destroy.
+    if (this.mcpWatcher) {
+      try {
+        await this.mcpWatcher.stop();
+      } catch {
+        // ignore
+      }
+      this.mcpWatcher = null;
+    }
+
     // Flush pending saves
     await this.saver.flush();
 
