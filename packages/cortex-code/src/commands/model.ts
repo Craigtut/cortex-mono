@@ -1,5 +1,4 @@
 import { SelectList, Text, Container, type SelectItem } from '@earendil-works/pi-tui';
-import { inferUtilityModelId } from '@animus-labs/cortex';
 import type { Command } from './index.js';
 import { selectListTheme, colors } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';
@@ -173,10 +172,13 @@ async function showModelPicker(
 
   const items: SelectItem[] = [];
 
-  // For utility tier, add an "(auto)" option at the top to reset to auto-resolution
+  // For utility tier, add an "(auto)" option at the top to reset to auto-resolution.
+  // Label it with the model auto-resolution will ACTUALLY use (the primary model
+  // for Ollama/custom endpoints Cortex can't enumerate), not a value re-inferred
+  // from the local model list that the agent never consults.
   if (tier === 'utility') {
     const agent = session.getAgent();
-    const autoModelId = inferUtilityModelId(models as Array<Record<string, unknown>>) ?? agent?.getUtilityModel().modelId ?? provider;
+    const autoModelId = agent?.getAutoResolvedUtilityModel().modelId ?? provider;
     items.push({
       value: '__auto__',
       label: `Auto (${autoModelId})`,
