@@ -1,6 +1,6 @@
 {
   "name": "@animus-labs/cortex-code",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "license": "MIT",
   "author": "Animus Labs",
   "description": "Terminal-based coding agent built on the Cortex agent framework",
@@ -57,7 +57,7 @@
     "node": ">=24.0.0"
   },
   "dependencies": {
-    "@animus-labs/cortex": "^0.3.1",
+    "@animus-labs/cortex": "^0.3.2",
     "@earendil-works/pi-tui": "^0.75.3",
     "chalk": "^5.4.0",
     "cli-highlight": "^2.1.11",
