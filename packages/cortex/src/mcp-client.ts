@@ -400,13 +400,12 @@ export class McpClientManager {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const parameters = Type.Unsafe(inputSchema as any);
 
-    // Capture the per-server timeout (if any) and a stable reference to the
-    // manager so the callTool options below stay in sync with whatever the
-    // consumer wires up. `resetTimeoutOnProgress` is enabled whenever a
-    // timeout is configured so a server that emits regular progress can
-    // outlive its wall-clock window.
+    // Capture the per-server timeout (if any). `resetTimeoutOnProgress` is
+    // enabled whenever a timeout is configured so a server that emits regular
+    // progress can outlive its wall-clock window. The execute closure below is
+    // an arrow function, so reads of `this.onToolCallProgress` stay in sync
+    // with whatever the consumer wires up after this wrapper is created.
     const toolTimeoutMs = serverConfig.toolTimeoutMs;
-    const manager = this;
 
     return {
       name: namespacedName,
@@ -418,7 +417,7 @@ export class McpClientManager {
       execute: async (args: unknown): Promise<unknown> => {
         try {
           const hasTimeout = typeof toolTimeoutMs === 'number' && toolTimeoutMs > 0;
-          const hasProgressCallback = manager.onToolCallProgress !== undefined;
+          const hasProgressCallback = this.onToolCallProgress !== undefined;
           let result;
           if (hasTimeout || hasProgressCallback) {
             const callOptions: Parameters<typeof client.callTool>[2] = {};
@@ -436,9 +435,9 @@ export class McpClientManager {
                 if (progress.total !== undefined) payload.total = progress.total;
                 if (progress.message !== undefined) payload.message = progress.message;
                 try {
-                  manager.onToolCallProgress?.(payload);
+                  this.onToolCallProgress?.(payload);
                 } catch (err) {
-                  manager.logger.warn?.(
+                  this.logger.warn?.(
                     `onToolCallProgress threw for ${serverName}__${mcpTool.name}`,
                     { error: err instanceof Error ? err.message : String(err) },
                   );
