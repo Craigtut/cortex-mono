@@ -268,6 +268,47 @@ describe('CortexAgent', () => {
   });
 
   // -----------------------------------------------------------------------
+  // getAutoResolvedUtilityModel (pure peek for UI labelling)
+  // -----------------------------------------------------------------------
+
+  describe('getAutoResolvedUtilityModel', () => {
+    it('returns the inferred utility model for an enumerable provider', () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const auto = agent.getAutoResolvedUtilityModel();
+      expect(auto.provider).toBe('anthropic');
+      expect(auto.modelId).toBe('claude-haiku-4-5-20251001');
+    });
+
+    it('returns the primary model for providers Cortex cannot enumerate (Ollama/custom)', () => {
+      // Ollama and custom OpenAI-compatible endpoints surface as a provider
+      // with no pi-ai registry, so auto-resolution falls back to the primary.
+      const customModel = makeModel({ provider: 'custom', name: 'llama3.3:70b' } as PiModel);
+      const agent = createTestCortexAgent(piAgent, {
+        ...config,
+        model: customModel,
+      });
+      expect(agent.getAutoResolvedUtilityModel()).toBe(customModel);
+    });
+
+    it('reflects auto-resolution even while a manual override is active, without clearing it', () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const override = makeModel({ provider: 'anthropic', name: 'claude-haiku-3' } as PiModel);
+      agent.setUtilityModel(override);
+
+      // The active utility model is the override...
+      expect(agent.getUtilityModel()).toBe(override);
+      expect(agent.isUtilityModelOverridden()).toBe(true);
+
+      // ...but the peek still reports what Auto would resolve to, and does not
+      // mutate the override state.
+      const auto = agent.getAutoResolvedUtilityModel();
+      expect(auto.modelId).toBe('claude-haiku-4-5-20251001');
+      expect(agent.getUtilityModel()).toBe(override);
+      expect(agent.isUtilityModelOverridden()).toBe(true);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // envOverrides
   // -----------------------------------------------------------------------
 

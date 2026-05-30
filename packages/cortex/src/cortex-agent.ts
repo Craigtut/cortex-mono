@@ -1575,6 +1575,24 @@ export class CortexAgent {
   }
 
   /**
+   * Peek at the utility model that auto-resolution would produce for the
+   * current primary model, without applying it or clearing a manual override.
+   *
+   * For providers Cortex cannot enumerate (e.g. Ollama and custom
+   * OpenAI-compatible endpoints), this returns the primary model itself,
+   * mirroring the runtime fallback in resolveUtilityModels(). Consumers use
+   * this to label an "Auto" choice in a UI with the model that will actually
+   * run, instead of re-deriving it from a model list that the agent never sees.
+   */
+  getAutoResolvedUtilityModel(): CortexModel {
+    return this.resolveUtilityModels(
+      this.primaryModel,
+      this.primaryPiModel,
+      this.config.utilityModel,
+    ).utilityModel;
+  }
+
+  /**
    * Hot-swap the primary model without restarting the agent.
    * Used when the user changes their provider/model in settings.
    *
