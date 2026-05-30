@@ -24,7 +24,7 @@ import {
 } from '@earendil-works/pi-tui';
 import { ProviderManager, type CortexModel, PROVIDER_REGISTRY, OAUTH_PROVIDER_IDS } from '@animus-labs/cortex';
 import { ProviderSetupFlow, type SetupResult, type SetupStep } from './setup.js';
-import { detectOllama } from './ollama.js';
+import { detectOllama, getOllamaContextWindow, getOllamaHost } from './ollama.js';
 import { CredentialStore, type CredentialEntry } from '../config/credentials.js';
 import { colors, selectListTheme } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';
@@ -416,11 +416,18 @@ async function resolveModelForResult(
   result: SetupResult,
 ): Promise<CortexModel> {
   if (result.method === 'custom' || result.provider === 'ollama') {
-    // Ollama and custom connections use createCustomModel with a base URL
+    // Ollama and custom connections use createCustomModel with a base URL.
+    // For Ollama, query the model's real trained context length so we don't
+    // fall back to createCustomModel's generic 128k default (which overflows
+    // small-context local models). Mirrors the stored-credentials path in index.ts.
     const baseUrl = result.baseUrl ?? 'http://localhost:11434/v1';
+    const contextWindow = result.provider === 'ollama'
+      ? await getOllamaContextWindow(getOllamaHost(result.baseUrl), result.model) ?? undefined
+      : undefined;
     return providerManager.createCustomModel({
       baseUrl,
       modelId: result.model,
+      contextWindow,
     });
   }
   return providerManager.resolveModel(result.provider, result.model);
