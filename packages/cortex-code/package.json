@@ -1,6 +1,6 @@
 {
   "name": "@animus-labs/cortex-code",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "license": "MIT",
   "author": "Animus Labs",
   "description": "Terminal-based coding agent built on the Cortex agent framework",
