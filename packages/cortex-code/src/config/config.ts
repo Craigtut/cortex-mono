@@ -19,6 +19,13 @@ export interface CortexCodeConfig {
   defaultUtilityModel?: string;
   /** Check npm for a newer Cortex Code on startup. Default: true. */
   updateCheck?: boolean;
+  /**
+   * Terminal tab title behavior. Default: 'dynamic'.
+   * - 'dynamic': name the tab after what the user is working on (utility model).
+   * - 'static': set the tab to the working directory name once.
+   * - 'off': never change the terminal title.
+   */
+  terminalTitle?: 'dynamic' | 'static' | 'off';
   /** Optional diagnostics for investigating TUI or prompt freezes. */
   diagnostics?: CortexCodeDiagnosticsConfig;
 }

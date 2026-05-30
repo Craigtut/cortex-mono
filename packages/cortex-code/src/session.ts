@@ -70,6 +70,7 @@ import { reconcileMcpServers, type McpReconcileResult } from './mcp/reconcile.js
 import { loadHookHandlers } from './hooks/loader.js';
 import { runHookHandlers } from './hooks/runner.js';
 import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
+import { TitleManager } from './terminal/title-manager.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -119,6 +120,7 @@ export class Session {
   private mcpReloadPending: McpConfigChangeReason | null = null;
   private mcpReloadInFlight = false;
   private hookHandlers: Record<HookEvent, HookHandler[]> | null = null;
+  private titleManager: TitleManager | null = null;
 
   private readonly config: CortexCodeConfig;
   private readonly mode: Mode;
@@ -221,6 +223,20 @@ export class Session {
 
     // Set up ephemeral context
     await this.updateEphemeralContext();
+
+    // Terminal title: name the tab after what the user is working on. Runs on
+    // the utility model and is best-effort, so a failure never disrupts the
+    // session. Must be created before wireEvents (onLoopComplete drives it).
+    this.titleManager = new TitleManager({
+      mode: this.config.terminalTitle ?? 'dynamic',
+      cwd: this.cwd,
+      setTitle: (title) => this.app?.terminal.setTitle(title),
+      complete: async (ctx) => (this.agent ? this.agent.utilityComplete(ctx) : null),
+      onError: (err) => log.debug('Terminal title generation failed', {
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    });
+    this.titleManager.start();
 
     // Wire events
     this.wireEvents();
@@ -393,6 +409,7 @@ export class Session {
       log.info('Steering agent with user message', { text: text.slice(0, 100) });
       void this.activity.recordWorking();
       this.app!.transcript.addUserMessage(text);
+      this.titleManager?.recordUserPrompt(text);
       this.agent.steer(text);
       return;
     }
@@ -401,6 +418,7 @@ export class Session {
 
     // Add user message to transcript
     this.app!.transcript.addUserMessage(text);
+    this.titleManager?.recordUserPrompt(text);
 
     // Update ephemeral context
     await this.updateEphemeralContext();
@@ -812,6 +830,9 @@ export class Session {
       this.app?.hideStatusSpinner();
       this.app?.focusEditor();
       void this.activity.recordAwaitingInput();
+      // One completed user turn: advance the title cadence (regenerates every
+      // N turns, idle here so it never competes with the main loop).
+      this.titleManager?.onUserTurnComplete();
       // If the MCP config changed during the turn, apply it now. Doing this
       // here (vs mid-turn) avoids invalidating the tool snapshot that
       // pi-agent-core captured at prompt() entry.
@@ -1224,6 +1245,9 @@ export class Session {
       this.agent = null;
     }
 
+    // Reset the terminal title before tearing down the TUI.
+    this.titleManager?.dispose();
+
     await this.activity.recordDone({ code: 0, signal: null, reason: 'normal_shutdown' });
     await this.activity.flush();
     this.app?.stop();
@@ -1580,6 +1604,8 @@ export class Session {
   }
 
   getSessionId(): string { return this.sessionId; }
+  /** Reset the terminal title on a fresh-start signal (e.g. /clear). */
+  resetTitle(): void { this.titleManager?.reset(); }
   getRules(): PermissionRuleManager { return this.rules; }
   getProviderManager(): ProviderManager { return this.providerManager; }
   getCredentialStore(): CredentialStore { return this.credentialStore; }
