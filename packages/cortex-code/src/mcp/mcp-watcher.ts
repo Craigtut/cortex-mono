@@ -154,7 +154,7 @@ export class McpConfigWatcher {
             // re-attach against the now-present dir.
             const idx = this.handles.findIndex((h) => h.target === parent);
             if (idx >= 0) {
-              try { this.handles[idx].watcher.close(); } catch { /* ignore */ }
+              try { this.handles[idx]?.watcher.close(); } catch { /* ignore */ }
               this.handles.splice(idx, 1);
             }
             void this.attach(dir, targetFile, reason);

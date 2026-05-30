@@ -110,7 +110,7 @@ export class TitleManager {
   private readonly cwd: string;
   private readonly setTitleFn: (title: string) => void;
   private readonly completeFn: (context: TitleCompletionContext) => Promise<string | null>;
-  private readonly onError?: (error: unknown) => void;
+  private readonly onError?: ((error: unknown) => void) | undefined;
   private readonly cadence: number;
   private readonly recentWindow: number;
 
