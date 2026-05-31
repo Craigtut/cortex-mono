@@ -26,6 +26,7 @@ import { ProviderManager, type CortexModel, PROVIDER_REGISTRY, OAUTH_PROVIDER_ID
 import { ProviderSetupFlow, type SetupResult, type SetupStep } from './setup.js';
 import { detectOllama, getOllamaContextWindow, getOllamaHost } from './ollama.js';
 import { CredentialStore, type CredentialEntry } from '../config/credentials.js';
+import { renderOAuthCallbackPage } from './oauth-callback-page.js';
 import { colors, selectListTheme } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';
 import { log } from '../logger.js';
@@ -203,6 +204,7 @@ class SetupRenderer {
           onProgress: (message) => {
             loader.setMessage(message);
           },
+          renderCallbackPage: renderOAuthCallbackPage,
         }).then(async (result) => {
           loader.stop();
 
