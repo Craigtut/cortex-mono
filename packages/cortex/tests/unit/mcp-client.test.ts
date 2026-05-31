@@ -368,6 +368,76 @@ describe('McpClientManager', () => {
       const params = tools[0].parameters as Record<string, unknown>;
       expect(params.type).toBe('object');
     });
+
+    it('sanitizes characters disallowed by the provider tool-name pattern', async () => {
+      // Real-world case: a server whose tools carry dotted names
+      // (e.g. reverie.list_peers). Anthropic rejects any tool name that does
+      // not match ^[a-zA-Z0-9_-]{1,128}$ with a 400 before the model runs.
+      mockListTools.mockResolvedValueOnce({
+        tools: [
+          { name: 'reverie.list_peers', description: 'List peers' },
+          { name: 'do:thing/now here', description: 'Mixed separators' },
+        ],
+      });
+
+      await manager.connect('reverie_bridge', {
+        transport: 'stdio',
+        command: 'node',
+        args: ['server.js'],
+      });
+
+      const tools = manager.getTools();
+      const pattern = /^[a-zA-Z0-9_-]{1,128}$/;
+      expect(tools.map(t => t.name)).toEqual([
+        'reverie_bridge__reverie_list_peers',
+        'reverie_bridge__do_thing_now_here',
+      ]);
+      for (const tool of tools) {
+        expect(tool.name).toMatch(pattern);
+      }
+    });
+
+    it('calls tools/call with the original name even when sanitized', async () => {
+      mockListTools.mockResolvedValueOnce({
+        tools: [
+          { name: 'reverie.list_peers', description: 'List peers' },
+        ],
+      });
+
+      await manager.connect('reverie_bridge', {
+        transport: 'stdio',
+        command: 'node',
+        args: ['server.js'],
+      });
+
+      const tools = manager.getTools();
+      expect(tools[0].name).toBe('reverie_bridge__reverie_list_peers');
+      await tools[0].execute({});
+
+      // The dotted, un-prefixed name is what the MCP server actually expects.
+      expect(mockCallTool).toHaveBeenCalledWith({
+        name: 'reverie.list_peers',
+        arguments: {},
+      });
+    });
+
+    it('truncates overly long namespaced names to 128 chars', async () => {
+      mockListTools.mockResolvedValueOnce({
+        tools: [
+          { name: 'x'.repeat(200), description: 'Very long tool name' },
+        ],
+      });
+
+      await manager.connect('svc', {
+        transport: 'stdio',
+        command: 'node',
+        args: ['server.js'],
+      });
+
+      const tools = manager.getTools();
+      expect(tools[0].name.length).toBe(128);
+      expect(tools[0].name).toMatch(/^[a-zA-Z0-9_-]{1,128}$/);
+    });
   });
 
   // -----------------------------------------------------------------------

@@ -91,6 +91,19 @@ Tools from different MCP servers may have name collisions. Cortex prefixes tool 
 
 This mirrors the `mcp__<server>__<tool>` naming pattern used by the Claude SDK. The prefix is stripped when calling back to the MCP server (the server only knows its own tool names).
 
+### Name sanitization
+
+Providers constrain tool names to the pattern `^[a-zA-Z0-9_-]{1,128}$`. Anthropic enforces this strictly: a single disallowed character (a `.`, `:`, `/`, or space) makes the API reject the **entire** request with a `400 invalid_request_error` before the model runs, naming the offending tool (e.g. `tools.11.custom.name`). Other providers are more lenient, so a server can appear to work on one model and fail on another.
+
+MCP servers are free to name their tools however they like, and server names come from user configuration, so the namespaced `serverName__toolName` can easily fall outside the allowed pattern. Cortex therefore sanitizes the namespaced name: every disallowed character is replaced with `_`, and the result is capped at 128 characters.
+
+| MCP Server | MCP Tool Name | AgentTool Name |
+|------------|---------------|----------------|
+| `reverie_bridge` | `reverie.list_peers` | `reverie_bridge__reverie_list_peers` |
+| `svc` | `do:thing/now` | `svc__do_thing_now` |
+
+Sanitization only rewrites the provider-facing identifier. The original MCP tool name is preserved and used when calling back to the server, so dotted or otherwise-unusual tool names continue to work. Sanitization is applied at a single point (`wrapMcpTool` in `mcp-client.ts`), and tool routing keys off the `isMcp` flag rather than parsing the name, so the rewrite never breaks the reverse mapping.
+
 ## Consumer Domain Tool Integration
 
 The consumer provides its own MCP tool server, which Cortex spawns as a stdio subprocess. This server exposes the consumer's domain-specific tools (e.g., memory, tasks, messaging) via the standard MCP protocol.

@@ -63,6 +63,21 @@ interface McpConnection {
 
 const MAX_RECONNECT_ATTEMPTS = 3;
 
+/**
+ * Providers constrain tool names to `^[a-zA-Z0-9_-]{1,128}$` (Anthropic
+ * enforces this strictly and rejects the whole request with a 400 before the
+ * model runs). MCP servers, however, may name their tools with any characters
+ * (dots, colons, slashes, spaces), and server names come from user config, so
+ * the namespaced `serverName__toolName` can easily fall outside that pattern.
+ * Replace every disallowed character with `_` and cap the length at 128. The
+ * original MCP tool name is preserved separately for `tools/call`, so this only
+ * rewrites the provider-facing identifier, not what we send back to the server.
+ */
+const TOOL_NAME_MAX_LENGTH = 128;
+function sanitizeToolName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, TOOL_NAME_MAX_LENGTH);
+}
+
 // ---------------------------------------------------------------------------
 // McpClientManager
 // ---------------------------------------------------------------------------
@@ -393,7 +408,7 @@ export class McpClientManager {
     mcpTool: { name: string; description?: string | undefined; inputSchema?: Record<string, unknown> | undefined },
     client: Client,
   ): AgentTool {
-    const namespacedName = `${serverName}__${mcpTool.name}`;
+    const namespacedName = sanitizeToolName(`${serverName}__${mcpTool.name}`);
 
       // Wrap the MCP JSON Schema as a TypeBox type via Type.Unsafe()
     const inputSchema = mcpTool.inputSchema ?? { type: 'object', properties: {} };
@@ -438,7 +453,7 @@ export class McpClientManager {
                   this.onToolCallProgress?.(payload);
                 } catch (err) {
                   this.logger.warn?.(
-                    `onToolCallProgress threw for ${serverName}__${mcpTool.name}`,
+                    `onToolCallProgress threw for ${namespacedName}`,
                     { error: err instanceof Error ? err.message : String(err) },
                   );
                 }
