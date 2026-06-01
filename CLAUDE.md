@@ -124,6 +124,7 @@ refactor(cortex): extract provider registry into separate module
 - Write in imperative mood: "add feature" not "added feature".
 - Keep the first line under 100 characters.
 - Always use `git commit -m "..."` with a single-line message.
+- Do not use branches. Commit directly to the working branch; never create feature branches.
 
 ## Documentation
 
