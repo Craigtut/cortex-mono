@@ -1,6 +1,6 @@
 {
   "name": "@animus-labs/cortex",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Production-grade agent framework with structured context management, compaction, tools, and MCP support",
   "license": "MIT",
   "author": "Animus Labs",
