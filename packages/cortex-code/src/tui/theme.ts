@@ -1,6 +1,9 @@
+import { createRequire } from 'node:module';
 import chalk from 'chalk';
 import type { MarkdownTheme } from '@earendil-works/pi-tui';
 import type { SelectListTheme } from '@earendil-works/pi-tui';
+
+const require = createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------
 // Tool renderer theme
@@ -124,7 +127,6 @@ function loadHighlighter(): typeof highlightFn {
   if (highlightLoaded) return highlightFn;
   highlightLoaded = true;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require('cli-highlight') as { highlight: typeof highlightFn };
     highlightFn = mod.highlight;
   } catch {
@@ -139,7 +141,9 @@ export const markdownTheme: MarkdownTheme = {
   linkUrl: (s) => chalk.hex('#6B7280')(s),
   code: (s) => chalk.hex('#FFB347')(s),
   codeBlock: (s) => s,
-  codeBlockBorder: (s) => chalk.hex('#008577')(s),
+  // pi-tui passes the raw ```lang fence text here for both the top and bottom
+  // of a code block. Ignore it and draw a short rule instead of literal backticks.
+  codeBlockBorder: () => chalk.hex('#008577')('─────'),
   quote: (s) => chalk.italic.hex('#6B7280')(s),
   quoteBorder: (s) => chalk.hex('#008577')(s),
   hr: (s) => chalk.hex('#008577')(s),
