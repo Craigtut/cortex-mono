@@ -158,4 +158,4 @@ Detailed documentation lives in `/docs/cortex/`. Use `/doc-explorer <topic>` to 
 
 ## Consumers
 
-The primary consumer of Cortex is [Animus](https://github.com/Craigtut/animus), an autonomous AI assistant with persistent inner life. Animus uses Cortex for its mind session (agentic loop), sub-agent orchestration, and provider management. Animus-specific integration documentation lives in the Animus repository under `docs/cortex/`.
+Cortex is a general-purpose framework consumed by downstream applications. Consumers integrate via the documented hooks and callbacks (`getApiKey`, `beforeToolCall`, `transformContext`, compaction hooks) and provide their own system prompt, persistence, and domain logic. Consumer-specific integration documentation lives in each consumer's own repository, not here.
