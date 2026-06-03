@@ -1,0 +1,32 @@
+{
+  "name": "@animus-labs/landing-page",
+  "version": "0.0.0",
+  "description": "Cortex landing page. TanStack Start, static-prerendered.",
+  "license": "MIT",
+  "author": "Animus Labs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "serve": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@animus-labs/brand": "*",
+    "@tanstack/react-router": "^1.170.11",
+    "@tanstack/react-start": "^1.168.19",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "typescript": "^5.6.0",
+    "vite": "^7.3.5"
+  }
+}

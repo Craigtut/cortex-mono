@@ -1,0 +1,268 @@
+/*
+ * Split-flap cell. A physical object lit from a single source above.
+ * Every block below maps to one of the physicalities in docs/brand-vision.md
+ * and the SplitFlapCell reasoning: top light, diffuse response, the two-leaf
+ * flip, the cast shadow, the rounded axle, the recessed housing, the matte
+ * material, and gravity-driven motion.
+ *
+ * Tuning knobs live in the custom properties on .flap.
+ */
+
+.grid {
+  --gap: 0.3rem;
+  /* Cell width fits `--cols` columns within the available width, capped. */
+  --cell-w: min(
+    3.2rem,
+    calc((min(94vw, 82rem) - (var(--cols) - 1) * var(--gap)) / var(--cols))
+  );
+  --cell-h: calc(var(--cell-w) * 1.45);
+  display: grid;
+  grid-template-columns: repeat(var(--cols), var(--cell-w));
+  gap: var(--gap);
+  justify-content: center;
+}
+
+.flap {
+  /* Geometry (cell size comes from the parent grid). */
+  --radius: 7px;
+  --persp: 600px;
+
+  /* Timing (--flip-ms is set inline by the component) */
+  --flip-ms: 150ms;
+  --ease-fall: cubic-bezier(0.45, 0, 0.9, 0.55); /* gravity: accelerate */
+  --ease-land: cubic-bezier(0.2, 0.75, 0.3, 1.12); /* settle with a clack */
+
+  /* Material: card lit at the top, falling into shadow toward the bottom */
+  --card-hi: #161d12;
+  --card-mid: #0f150c;
+  --card-lo: #0a0f08;
+  --char: var(--color-acid, #b8e23e);
+  /* The light catch: a lighter, slightly desaturated tint of the card green,
+     not white. Alpha is the strength. */
+  --catch: rgba(190, 210, 150, 0.34);
+
+  position: relative;
+  width: var(--cell-w);
+  height: var(--cell-h);
+  perspective: var(--persp);
+  border-radius: var(--radius);
+  font-family: var(--font-mono, monospace);
+
+  /* Housing recess: ambient occlusion around the channel the cards sit in. */
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    inset 0 -3px 6px rgba(0, 0, 0, 0.55),
+    0 2px 5px rgba(0, 0, 0, 0.5);
+  background: var(--card-lo);
+}
+
+/* Matte grain: the surface imperfection that says "real material". */
+.flap::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+  border-radius: inherit;
+  opacity: 0.05;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 120px 120px;
+}
+
+/* ---- The character, split at the axle ---------------------------------- */
+/* Each half clips a full-height glyph so the split lands at the cell center.
+   --char-nudge fine-tunes the split to the glyph's optical middle. */
+.flap__char {
+  --char-nudge: 0px;
+  display: block;
+  width: 100%;
+  height: var(--cell-h);
+  line-height: var(--cell-h);
+  font-family: var(--font-mono, monospace);
+  font-size: calc(var(--cell-h) * 0.7);
+  font-weight: 500;
+  text-align: center;
+  color: var(--char);
+  transform: translateY(var(--char-nudge));
+}
+
+/* ---- Static halves ----------------------------------------------------- */
+.flap__half {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 50%;
+  overflow: hidden;
+  z-index: 1;
+}
+.flap__half--top {
+  top: 0;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: linear-gradient(to bottom, var(--card-hi), var(--card-mid));
+}
+.flap__half--bottom {
+  bottom: 0;
+  border-radius: 0 0 var(--radius) var(--radius);
+  background: linear-gradient(to bottom, var(--card-mid), var(--card-lo));
+}
+/* Top half shows the upper glyph; bottom half is shifted up to show the lower. */
+.flap__half--bottom .flap__char {
+  transform: translateY(calc(-50% + var(--char-nudge)));
+}
+
+/* ---- The two moving leaves --------------------------------------------- */
+.flap__leaf {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 50%;
+  overflow: hidden;
+  z-index: 3;
+  backface-visibility: hidden;
+}
+.flap__leaf .flap__char {
+  position: relative;
+}
+
+/* Outgoing top leaf: hinged at the axle, falls 0 to -90 over the first half. */
+.flap__leaf--top {
+  top: 0;
+  transform-origin: center bottom;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: linear-gradient(to bottom, var(--card-hi), var(--card-mid));
+  animation: leaf-fall calc(var(--flip-ms) / 2) var(--ease-fall) forwards;
+}
+
+/* Incoming bottom leaf: starts standing (90), lands flat (0) over the second
+   half. Held edge-on by the base transform during the delay. */
+.flap__leaf--bottom {
+  bottom: 0;
+  transform-origin: center top;
+  transform: rotateX(90deg);
+  border-radius: 0 0 var(--radius) var(--radius);
+  background: linear-gradient(to bottom, var(--card-mid), var(--card-lo));
+  animation: leaf-rise calc(var(--flip-ms) / 2) var(--ease-land)
+    calc(var(--flip-ms) / 2) forwards;
+}
+.flap__leaf--bottom .flap__char {
+  transform: translateY(calc(-50% + var(--char-nudge)));
+}
+
+@keyframes leaf-fall {
+  from {
+    transform: rotateX(0deg);
+  }
+  to {
+    transform: rotateX(-90deg);
+  }
+}
+@keyframes leaf-rise {
+  from {
+    transform: rotateX(90deg);
+  }
+  to {
+    transform: rotateX(0deg);
+  }
+}
+
+/* ---- Diffuse light, faked as an animated tint over each leaf ----------- */
+/* White tint = catching the light, black tint = turning into shadow. */
+.flap__shade {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+/* Falling top flap: a black shade that deepens as it turns from the light. */
+.flap__leaf--top .flap__shade {
+  background: rgba(0, 0, 0, 0.6);
+  opacity: 0;
+  animation: shade-fall calc(var(--flip-ms) / 2) var(--ease-fall) forwards;
+}
+/* Rising bottom flap: catches the light as the green tint, then settles. */
+.flap__leaf--bottom .flap__shade {
+  background: var(--catch);
+  opacity: 0;
+  animation: shade-rise calc(var(--flip-ms) / 2) var(--ease-land)
+    calc(var(--flip-ms) / 2) forwards;
+}
+@keyframes shade-fall {
+  /* The falling top flap turns its face away from the overhead light, so it
+     just darkens, more and more, all the way down. No highlight. */
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+@keyframes shade-rise {
+  /* The catch fades across the whole rise, on the same easing as the rotation,
+     so it reaches normal exactly when the flap lands flat and unrotated. */
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* ---- Cast shadow the falling leaf throws on the lower card ------------- */
+.flap__cast {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 50%;
+  z-index: 2;
+  pointer-events: none;
+  border-radius: 0 0 var(--radius) var(--radius);
+  /* The descending flap shadows the previous lower card: darkest near the seam
+     (closest to the flap), fading downward. */
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0) 80%);
+  opacity: 0;
+  animation: cast-grow var(--flip-ms) ease-in-out forwards;
+}
+@keyframes cast-grow {
+  /* Deepens over the previous bottom card as the flap looms, then fades out. */
+  0% {
+    opacity: 0;
+  }
+  45% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* ---- The axle: an opaque rounded bar over the seam --------------------- */
+/* Opaque on purpose: it covers where the two glyph halves meet, so the
+   character reads as cleanly split with a real gap instead of bleeding
+   through a translucent line. Lighter at the top edge (light catching the
+   rounded hinge), dark beneath. Height is the seam gap; tune to taste. */
+.flap__axle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(50% - 1px);
+  height: 2px;
+  z-index: 5;
+  pointer-events: none;
+  /* Dark and recessed, with only a whisper of a gradient. */
+  background: linear-gradient(to bottom, #0a0e08 0%, #040603 100%);
+  /* Thin black seams where the top flap and bottom flap meet the divider,
+     plus a soft cast beneath it. */
+  box-shadow:
+    0 -1px 0 0 #000,
+    0 1px 0 0 #000,
+    0 2px 3px rgba(0, 0, 0, 0.4);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flap__leaf,
+  .flap__cast {
+    animation: none;
+  }
+}
