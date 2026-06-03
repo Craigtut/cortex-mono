@@ -13,19 +13,22 @@
  */
 
 import type { OAuthCallbackPageContext } from '@animus-labs/cortex';
+import { colors as brand, fonts } from '@animus-labs/brand';
 
-// Mirrors the dark TUI brand palette in ../tui/theme.ts. Kept inline here
-// because this HTML renders in a browser, not the terminal.
+// The brand palette, straight from @animus-labs/brand. This page is a brand
+// surface (a browser page, not the terminal), so it uses the full palette:
+// acid as the spark, carbon and moss for depth, bone for type.
 const BRAND = {
-  primary: '#00E5CC',
-  accent: '#FFB347',
-  success: '#4ADE80',
-  error: '#FF6B6B',
-  bg: '#0E0E1A',
-  bgRaised: '#1A1A2E',
-  text: '#E5E7EB',
-  muted: '#8A92A6',
-  border: 'rgba(255, 255, 255, 0.08)',
+  primary: brand.acid,
+  accent: brand.amber,
+  success: brand.acid,
+  error: brand.cinnabar,
+  bg: brand.carbon,
+  bgRaised: brand.moss,
+  text: brand.bone,
+  muted: 'rgba(242, 235, 214, 0.55)', // bone, dimmed
+  border: 'rgba(242, 235, 214, 0.10)',
+  mono: fonts.mono,
 } as const;
 
 function escapeHtml(value: string): string {
@@ -81,6 +84,7 @@ export function renderOAuthCallbackPage(context: OAuthCallbackPageContext): stri
     --text: ${BRAND.text};
     --muted: ${BRAND.muted};
     --border: ${BRAND.border};
+    --mono: ${BRAND.mono};
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -94,13 +98,13 @@ export function renderOAuthCallbackPage(context: OAuthCallbackPageContext): stri
     padding: 24px;
     -webkit-font-smoothing: antialiased;
     background-image:
-      radial-gradient(60rem 60rem at 50% -20%, rgba(0, 229, 204, 0.10), transparent 60%),
-      radial-gradient(40rem 40rem at 100% 120%, rgba(255, 179, 71, 0.06), transparent 60%);
+      radial-gradient(60rem 60rem at 50% -20%, rgba(184, 226, 62, 0.10), transparent 60%),
+      radial-gradient(40rem 40rem at 100% 120%, rgba(229, 172, 81, 0.06), transparent 60%);
   }
   .card {
     width: 100%;
     max-width: 420px;
-    background: linear-gradient(180deg, var(--bg-raised), rgba(26, 26, 46, 0.6));
+    background: linear-gradient(180deg, var(--bg-raised), rgba(19, 32, 15, 0.6));
     border: 1px solid var(--border);
     border-radius: 18px;
     padding: 40px 36px 32px;
@@ -109,14 +113,15 @@ export function renderOAuthCallbackPage(context: OAuthCallbackPageContext): stri
     animation: rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
   }
   .wordmark {
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 0.42em;
-    text-indent: 0.42em;
-    color: var(--primary);
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: var(--text);
     margin-bottom: 28px;
   }
-  .wordmark span { color: var(--muted); font-weight: 600; letter-spacing: 0.42em; margin-left: 0.42em; }
+  .wordmark .bracket { color: var(--primary); }
+  .wordmark .cursor { color: var(--primary); animation: blink 1.1s step-end infinite; }
   .icon {
     width: 72px;
     height: 72px;
@@ -183,15 +188,16 @@ export function renderOAuthCallbackPage(context: OAuthCallbackPageContext): stri
     to { opacity: 1; transform: translateY(0); }
   }
   @keyframes draw { to { stroke-dashoffset: 0; } }
+  @keyframes blink { 50% { opacity: 0; } }
   @media (prefers-reduced-motion: reduce) {
-    .card, .icon .ring, .icon .mark { animation: none; }
+    .card, .icon .ring, .icon .mark, .wordmark .cursor { animation: none; }
     .icon .ring, .icon .mark { stroke-dashoffset: 0; }
   }
 </style>
 </head>
 <body>
   <main class="card" role="status" aria-live="polite">
-    <div class="wordmark">CORTEX<span>CODE</span></div>
+    <div class="wordmark"><span class="bracket">&lsaquo;</span>cortex<span class="bracket">&rsaquo;</span><span class="cursor">_</span></div>
     <div class="icon" style="--accent: ${accent}">${icon}</div>
     <h1>${escapeHtml(heading)}</h1>
     <p class="message">${message}</p>

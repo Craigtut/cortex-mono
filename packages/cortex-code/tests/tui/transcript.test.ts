@@ -119,6 +119,11 @@ vi.mock('../../src/tui/theme.js', () => ({
     userMessageBg: (text: string) => text,
   },
   markdownTheme: {},
+  palette: {
+    accentBright: '#B8E23E',
+    accentMid: '#81A52E',
+    accentDeep: '#4A691F',
+  },
 }));
 
 import { Container } from '@earendil-works/pi-tui';

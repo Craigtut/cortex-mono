@@ -57,6 +57,7 @@
     "node": ">=24.0.0"
   },
   "dependencies": {
+    "@animus-labs/brand": "^0.0.0",
     "@animus-labs/cortex": "^0.4.0",
     "@earendil-works/pi-tui": "^0.78.0",
     "chalk": "^5.4.0",

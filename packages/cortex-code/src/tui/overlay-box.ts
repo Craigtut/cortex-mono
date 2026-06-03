@@ -1,8 +1,9 @@
 import { type Component, type Focusable, visibleWidth } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
+import { palette } from './theme.js';
 
-const OVERLAY_BG = chalk.bgHex('#1a1a2e');
-const BORDER_COLOR = chalk.hex('#008577');
+const OVERLAY_BG = chalk.bgHex(palette.panelBg);
+const BORDER_COLOR = chalk.hex(palette.accentDeep);
 
 /**
  * Wraps content lines with a box-drawing border and dark background.

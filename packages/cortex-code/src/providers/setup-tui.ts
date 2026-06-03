@@ -28,6 +28,7 @@ import { detectOllama, getOllamaContextWindow, getOllamaHost } from './ollama.js
 import { CredentialStore, type CredentialEntry } from '../config/credentials.js';
 import { renderOAuthCallbackPage } from './oauth-callback-page.js';
 import { colors, selectListTheme } from '../tui/theme.js';
+import { addSplitFlapBoard } from '../tui/split-flap.js';
 import { OverlayBox } from '../tui/overlay-box.js';
 import { log } from '../logger.js';
 
@@ -450,20 +451,12 @@ export async function runFirstRunSetup(
   const mainContainer = new Container();
   tui.addChild(mainContainer);
 
-  // Banner
-  const banner = [
-    '',
-    colors.primary('   ██████╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗'),
-    colors.primary('  ██╔════╝██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝'),
-    colors.primary('  ██║     ██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝'),
-    colors.primary('  ██║     ██║   ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗'),
-    colors.primary('  ╚██████╗╚██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗'),
-    colors.primary('   ╚═════╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝'),
-    '',
-    `  ${colors.white('Welcome! Let\'s connect to a provider to get started.')}`,
-    '',
-  ].join('\n');
-  mainContainer.addChild(new Text(banner));
+  // Banner: the wordmark as a settled split-flap board, then a terse prompt.
+  mainContainer.addChild(new Text(''));
+  addSplitFlapBoard(mainContainer, tui, { animate: false });
+  mainContainer.addChild(
+    new Text(`\n  ${colors.muted('Connect a provider to get started.')}\n`),
+  );
 
   const contentContainer = new Container();
   mainContainer.addChild(contentContainer);

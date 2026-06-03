@@ -22,12 +22,12 @@ describe('renderOAuthCallbackPage', () => {
     const html = renderOAuthCallbackPage(makeContext());
 
     expect(html.startsWith('<!doctype html>')).toBe(true);
-    expect(html).toContain('CORTEX');
+    expect(html).toContain('cortex'); // the ‹cortex›_ wordmark
     expect(html).toContain('Anthropic');
     expect(html).toContain('signed in');
-    // Brand teal wordmark and success accent are inlined.
-    expect(html).toContain('#00E5CC');
-    expect(html).toContain('#4ADE80');
+    // Brand acid spark and carbon base are inlined.
+    expect(html).toContain('#B8E23E');
+    expect(html).toContain('#070906');
     // Fully self-contained: no external asset references.
     expect(html).not.toMatch(/<link[^>]+href=/i);
     expect(html).not.toMatch(/src\s*=\s*["']https?:/i);
@@ -44,7 +44,7 @@ describe('renderOAuthCallbackPage', () => {
     );
 
     expect(html).toContain('Sign-in failed');
-    expect(html).toContain('#FF6B6B');
+    expect(html).toContain('#D8553F'); // cinnabar error accent
     expect(html).toContain('state mismatch');
   });
 

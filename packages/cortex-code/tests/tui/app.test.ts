@@ -143,6 +143,11 @@ vi.mock('../../src/tui/theme.js', () => ({
     primary: (text: string) => text,
     muted: (text: string) => text,
   },
+  palette: {
+    accentBright: '#B8E23E',
+    accentMid: '#81A52E',
+    accentDeep: '#4A691F',
+  },
 }));
 
 vi.mock('../../src/logger.js', () => ({

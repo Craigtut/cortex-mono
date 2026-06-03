@@ -2,6 +2,7 @@ import { Container, Text, Markdown, Spacer } from '@earendil-works/pi-tui';
 import type { TUI } from '@earendil-works/pi-tui';
 import { stripWorkingTags } from '@animus-labs/cortex';
 import { colors, markdownTheme } from './theme.js';
+import { addSplitFlapBoard } from './split-flap.js';
 import { ToolExecutionComponent } from './renderers/tool-execution.js';
 import { ToolGroupComponent, type ToolGroupKind } from './renderers/tool-group.js';
 // Import renderers to trigger their self-registration with the registry
@@ -132,34 +133,34 @@ export class TranscriptManager {
     project: string,
     branch: string,
     update?: { latestVersion: string; packageName: string },
+    { animate = true }: { animate?: boolean } = {},
   ): void {
     this.diagnostics?.recordTranscriptMutation('banner');
     this.chatContainer.addChild(new Spacer(1));
 
-    const artLines = [
-      '   ██████╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗',
-      '  ██╔════╝██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝',
-      '  ██║     ██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝',
-      '  ██║     ██║   ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗',
-      '  ╚██████╗╚██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗',
-      '   ╚═════╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝',
-    ];
-    for (const line of artLines) {
-      this.chatContainer.addChild(new Text(colors.primary(line), 0, 0));
-    }
+    // The wordmark as a split-flap board. It settles on a fresh start; a
+    // resumed session renders the settled logo with no animation.
+    addSplitFlapBoard(this.chatContainer, this.tui, { animate });
+
     this.chatContainer.addChild(new Spacer(1));
-    this.chatContainer.addChild(new Text(colors.muted(`  v${version}`), 0, 0));
+    this.chatContainer.addChild(
+      new Text(
+        `  ${colors.primary('cortex code')}${colors.muted(' // coding agent')}`,
+        0,
+        0,
+      ),
+    );
+
+    const meta = [`v${version}`, project, branch].filter(Boolean).join('  ·  ');
+    this.chatContainer.addChild(new Text(colors.muted(`  ${meta}`), 0, 0));
+
     if (update) {
       this.chatContainer.addChild(
         new Text(colors.accent(`  → ${update.latestVersion} available`), 0, 0),
       );
       this.chatContainer.addChild(
-        new Text(colors.muted(`    Update: npm i -g ${update.packageName}@latest`), 0, 0),
+        new Text(colors.muted(`    npm i -g ${update.packageName}@latest`), 0, 0),
       );
-    }
-    this.chatContainer.addChild(new Text(colors.muted(`  Project: ${project}`), 0, 0));
-    if (branch) {
-      this.chatContainer.addChild(new Text(colors.muted(`  Branch: ${branch}`), 0, 0));
     }
     this.chatContainer.addChild(new Text(colors.muted('  /help for commands'), 0, 0));
     this.chatContainer.addChild(new Spacer(1));

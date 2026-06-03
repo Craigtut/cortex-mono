@@ -108,6 +108,8 @@ export class Session {
   /** The actual effort level applied to the agent (may differ from preferred due to model limits). */
   private effectiveEffort: ThinkingLevel;
   private sessionId: string;
+  /** True when this session was launched to resume a saved one. */
+  private readonly isResume: boolean;
   private saver: ReturnType<typeof createDebouncedSaver>;
   private isRunning = false;
   private createdAt: number;
@@ -151,6 +153,7 @@ export class Session {
     this.effectiveEffort = this.preferredEffort;
     this.rules = new PermissionRuleManager(options.cwd);
     this.sessionId = options.resumeSessionId ?? generateSessionId();
+    this.isResume = options.resumeSessionId !== undefined;
     this.saver = createDebouncedSaver(this.sessionId);
     this.compactionStrategy = options.compactionStrategy ?? 'observational';
     this.updateInfo = options.updateInfo ?? null;
@@ -277,10 +280,13 @@ export class Session {
     // Apply initial thinking level
     const { effective: initialEffort } = await this.reconcileEffort();
 
-    // Show banner
+    // Show banner. The split-flap settle plays only for a fresh session; a
+    // resumed session opens straight to the settled logo.
     const branch = await this.getGitBranch();
     const project = this.cwd.split('/').pop() ?? '';
-    this.app.transcript.addBanner(PKG_VERSION, project, branch, this.updateInfo ?? undefined);
+    this.app.transcript.addBanner(PKG_VERSION, project, branch, this.updateInfo ?? undefined, {
+      animate: !this.isResume,
+    });
 
     // Update footer
     this.app.updateStatus({

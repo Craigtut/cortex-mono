@@ -1,13 +1,14 @@
 import { type Component, type Focusable, visibleWidth, truncateToWidth, matchesKey } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
+import { palette } from './theme.js';
 
-const BG = chalk.bgHex('#1a1a2e');
-const BORDER = chalk.hex('#008577');
-const TITLE_COLOR = chalk.hex('#00E5CC');
-const LINE_NUM = chalk.hex('#4B5563');
-const SCROLL_BAR = chalk.hex('#00E5CC');
-const HINT = chalk.hex('#6B7280');
-const CONTENT = chalk.hex('#d1d5db');
+const BG = chalk.bgHex(palette.panelBg);
+const BORDER = chalk.hex(palette.accentDeep);
+const TITLE_COLOR = chalk.hex(palette.accent);
+const LINE_NUM = chalk.hex(palette.borderMuted);
+const SCROLL_BAR = chalk.hex(palette.accent);
+const HINT = chalk.hex(palette.muted);
+const CONTENT = chalk.hex(palette.contentFg);
 
 /**
  * A read-only scrollable text viewer rendered inside an overlay.

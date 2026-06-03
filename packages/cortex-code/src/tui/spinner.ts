@@ -1,5 +1,6 @@
 import { Text, type TUI } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
+import { palette } from './theme.js';
 
 // ---------------------------------------------------------------------------
 // Whimsical thinking words (picked randomly each time the spinner starts)
@@ -25,12 +26,12 @@ export function randomThinkingLabel(): string {
 const TEMPO = 1.21;
 
 // ---------------------------------------------------------------------------
-// Brightness tints (teal spectrum matching brand primary #00E5CC)
+// Brightness tints (acid ramp: deep olive -> mid -> the lit acid spark)
 // ---------------------------------------------------------------------------
 const TINT = {
-  dim:    chalk.hex('#1B6E60'),
-  mid:    chalk.hex('#00A898'),
-  bright: chalk.hex('#00E5CC'),
+  dim:    chalk.hex(palette.accentDeep),
+  mid:    chalk.hex(palette.accentMid),
+  bright: chalk.hex(palette.accentBright),
 } as const;
 
 type Tint = keyof typeof TINT;

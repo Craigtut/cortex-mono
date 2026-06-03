@@ -2,8 +2,125 @@ import { createRequire } from 'node:module';
 import chalk from 'chalk';
 import type { MarkdownTheme } from '@earendil-works/pi-tui';
 import type { SelectListTheme } from '@earendil-works/pi-tui';
+import { colors as brand } from '@animus-labs/brand';
 
 const require = createRequire(import.meta.url);
+
+// ---------------------------------------------------------------------------
+// Palette
+// ---------------------------------------------------------------------------
+//
+// The brand palette (carbon, moss, bone, acid, amber, cinnabar) governs brand
+// surfaces: the logo and the banner. Inline emphasis and tool rendering need
+// quieter, legible tones, so the acid spark is toned down for everyday use:
+//
+//   acid #B8E23E  ->  reserved for the banner and the spinner peak (rare)
+//   accent #B5CD6F  ->  the workhorse highlight (headings, links, selection)
+//   accentDeep #4A691F  ->  borders, rules, the dimmer end of the spinner
+//
+// The acid family is dark-first ("lime on warm carbon"). On a light terminal
+// the bright tones wash out, so the light variant collapses toward the deep
+// olive end, which is the only acid tone with contrast on a pale background.
+// We do not own body-text color (the terminal does); we only set the accents
+// we actively draw.
+
+interface PaletteTokens {
+  /** Brand acid. The banner letters and the spinner peak. Rare. */
+  accentBright: string;
+  /** Toned acid. The workhorse highlight: headings, links, bullets, selection. */
+  accent: string;
+  /** Mid acid. The middle of the spinner ramp. */
+  accentMid: string;
+  /** Deep acid/olive. Borders, rules, quote bars, the dim end of the spinner. */
+  accentDeep: string;
+  /** Secondary signal. Inline code, warnings, the running state. */
+  amber: string;
+  /** Error flag. */
+  error: string;
+  /** Added lines, resolved/healthy states. */
+  success: string;
+  muted: string;
+  borderMuted: string;
+  diffAdd: string;
+  diffRemove: string;
+  diffContext: string;
+  lineNumber: string;
+  statusPending: string;
+  /** Panel lift (overlays, scrollable viewers). */
+  panelBg: string;
+  panelBgError: string;
+  /** User-message background. A toned-down acid tint. */
+  userBg: string;
+  /** Default content color inside owned panels. */
+  contentFg: string;
+  /** Badge text color (sits on an acid/amber chip). */
+  ink: string;
+}
+
+const darkTokens: PaletteTokens = {
+  accentBright: brand.acid, // #B8E23E
+  accent: '#B5CD6F',
+  accentMid: '#81A52E',
+  accentDeep: '#4A691F',
+  amber: brand.amber, // #E5AC51
+  error: brand.cinnabar, // #D8553F
+  success: '#4ADE80',
+  muted: '#6B7280',
+  borderMuted: '#4B5563',
+  diffAdd: '#4ADE80',
+  diffRemove: brand.cinnabar,
+  diffContext: '#6B7280',
+  lineNumber: '#6B7280',
+  statusPending: '#6B7280',
+  panelBg: brand.moss, // #13200F
+  panelBgError: '#2E1A1A',
+  userBg: '#18220E',
+  contentFg: '#D1D5DB',
+  ink: brand.carbon, // #070906
+};
+
+const lightTokens: PaletteTokens = {
+  // Bright/toned acid vanish on a pale background, so the light ramp lives in
+  // the olive end where contrast holds.
+  accentBright: '#4A691F',
+  accent: '#4A691F',
+  accentMid: '#5C7D26',
+  accentDeep: '#4A691F',
+  amber: '#B5790F',
+  error: '#C2402B',
+  success: '#16A34A',
+  muted: '#6B7280',
+  borderMuted: '#9CA3AF',
+  diffAdd: '#16A34A',
+  diffRemove: '#C2402B',
+  diffContext: '#9CA3AF',
+  lineNumber: '#9CA3AF',
+  statusPending: '#6B7280',
+  panelBg: '#F3F4F6',
+  panelBgError: '#FEF2F2',
+  userBg: '#ECEFE1',
+  contentFg: '#374151',
+  ink: brand.carbon,
+};
+
+/**
+ * Auto-detect terminal background brightness.
+ * Uses COLORFGBG env var (format: "fg;bg" where bg >= 8 is dark).
+ * Falls back to dark theme. This is the only synchronous signal available;
+ * many terminals never set it, so dark is the deliberate default.
+ */
+function detectDarkMode(): boolean {
+  const colorfgbg = process.env['COLORFGBG'];
+  if (colorfgbg) {
+    const parts = colorfgbg.split(';');
+    const bg = parseInt(parts[parts.length - 1] ?? '', 10);
+    if (!isNaN(bg) && bg < 8) return false; // light background
+  }
+  return true; // default to dark
+}
+
+/** Resolved palette for the active terminal. Single source for all surfaces. */
+export const palette: PaletteTokens = detectDarkMode() ? darkTokens : lightTokens;
 
 // ---------------------------------------------------------------------------
 // Tool renderer theme
@@ -35,88 +152,50 @@ export interface ToolTheme {
   bgError: string;
 }
 
-const darkToolTheme: ToolTheme = {
-  primary: '#00E5CC',
-  accent: '#FFB347',
-  error: '#FF6B6B',
-  success: '#4ADE80',
-  muted: '#6B7280',
+const activeToolTheme: ToolTheme = {
+  primary: palette.accent,
+  accent: palette.amber,
+  error: palette.error,
+  success: palette.success,
+  muted: palette.muted,
 
-  border: '#008577',
-  borderMuted: '#4B5563',
-  diffAdd: '#4ADE80',
-  diffRemove: '#FF6B6B',
-  diffContext: '#6B7280',
-  lineNumber: '#6B7280',
+  border: palette.accentDeep,
+  borderMuted: palette.borderMuted,
+  diffAdd: palette.diffAdd,
+  diffRemove: palette.diffRemove,
+  diffContext: palette.diffContext,
+  lineNumber: palette.lineNumber,
 
-  statusPending: '#6B7280',
-  statusSuccess: '#4ADE80',
-  statusError: '#FF6B6B',
+  statusPending: palette.statusPending,
+  statusSuccess: palette.success,
+  statusError: palette.error,
 
-  bgDefault: '#1a1a2e',
-  bgError: '#2e1a1a',
+  bgDefault: palette.panelBg,
+  bgError: palette.panelBgError,
 };
-
-const lightToolTheme: ToolTheme = {
-  primary: '#007A6D',
-  accent: '#D4850A',
-  error: '#DC2626',
-  success: '#16A34A',
-  muted: '#6B7280',
-
-  border: '#007A6D',
-  borderMuted: '#9CA3AF',
-  diffAdd: '#16A34A',
-  diffRemove: '#DC2626',
-  diffContext: '#9CA3AF',
-  lineNumber: '#9CA3AF',
-
-  statusPending: '#6B7280',
-  statusSuccess: '#16A34A',
-  statusError: '#DC2626',
-
-  bgDefault: '#F3F4F6',
-  bgError: '#FEF2F2',
-};
-
-/**
- * Auto-detect terminal background brightness.
- * Uses COLORFGBG env var (format: "fg;bg" where bg >= 8 is dark).
- * Falls back to dark theme.
- */
-function detectDarkMode(): boolean {
-  const colorfgbg = process.env['COLORFGBG'];
-  if (colorfgbg) {
-    const parts = colorfgbg.split(';');
-    const bg = parseInt(parts[parts.length - 1] ?? '', 10);
-    if (!isNaN(bg) && bg < 8) return false; // light background
-  }
-  return true; // default to dark
-}
-
-let activeToolTheme: ToolTheme | null = null;
 
 export function getToolTheme(): ToolTheme {
-  if (!activeToolTheme) {
-    activeToolTheme = detectDarkMode() ? darkToolTheme : lightToolTheme;
-  }
   return activeToolTheme;
 }
 
-// Brand colors (existing, preserved for backward compatibility)
+// ---------------------------------------------------------------------------
+// Brand colors (chalk helpers, resolved from the active palette)
+// ---------------------------------------------------------------------------
+
 export const colors = {
-  primary: chalk.hex('#00E5CC'),
-  primaryMuted: chalk.hex('#008577'),
-  primaryBg: chalk.bgHex('#00E5CC').hex('#000000'),
-  accent: chalk.hex('#FFB347'),
-  accentBg: chalk.bgHex('#FFB347').hex('#000000'),
-  error: chalk.hex('#FF6B6B'),
-  success: chalk.hex('#4ADE80'),
-  muted: chalk.hex('#6B7280'),
+  primary: chalk.hex(palette.accent),
+  primaryMuted: chalk.hex(palette.accentDeep),
+  primaryBg: chalk.bgHex(palette.accentBright).hex(palette.ink),
+  accent: chalk.hex(palette.amber),
+  accentBg: chalk.bgHex(palette.amber).hex(palette.ink),
+  error: chalk.hex(palette.error),
+  success: chalk.hex(palette.success),
+  muted: chalk.hex(palette.muted),
   dim: chalk.dim,
   bold: chalk.bold,
-  white: chalk.white,
-  userMessageBg: (s: string) => chalk.bgHex('#0D2926')(s),
+  // Emphasis without owning a hue: the terminal keeps control of text color.
+  white: chalk.bold,
+  userMessageBg: (s: string) => chalk.bgHex(palette.userBg)(s),
 };
 
 // Lazy-loaded syntax highlighter (cli-highlight wraps highlight.js)
@@ -136,18 +215,18 @@ function loadHighlighter(): typeof highlightFn {
 }
 
 export const markdownTheme: MarkdownTheme = {
-  heading: (s) => chalk.bold.hex('#00E5CC')(s),
-  link: (s) => chalk.hex('#00E5CC')(s),
-  linkUrl: (s) => chalk.hex('#6B7280')(s),
-  code: (s) => chalk.hex('#FFB347')(s),
+  heading: (s) => chalk.bold.hex(palette.accent)(s),
+  link: (s) => chalk.hex(palette.accent)(s),
+  linkUrl: (s) => chalk.hex(palette.muted)(s),
+  code: (s) => chalk.hex(palette.amber)(s),
   codeBlock: (s) => s,
   // pi-tui passes the raw ```lang fence text here for both the top and bottom
   // of a code block. Ignore it and draw a short rule instead of literal backticks.
-  codeBlockBorder: () => chalk.hex('#008577')('─────'),
-  quote: (s) => chalk.italic.hex('#6B7280')(s),
-  quoteBorder: (s) => chalk.hex('#008577')(s),
-  hr: (s) => chalk.hex('#008577')(s),
-  listBullet: (s) => chalk.hex('#00E5CC')(s),
+  codeBlockBorder: () => chalk.hex(palette.accentDeep)('─────'),
+  quote: (s) => chalk.italic.hex(palette.muted)(s),
+  quoteBorder: (s) => chalk.hex(palette.accentDeep)(s),
+  hr: (s) => chalk.hex(palette.accentDeep)(s),
+  listBullet: (s) => chalk.hex(palette.accent)(s),
   bold: (s) => chalk.bold(s),
   italic: (s) => chalk.italic(s),
   strikethrough: (s) => chalk.strikethrough(s),
@@ -170,14 +249,14 @@ export const markdownTheme: MarkdownTheme = {
 };
 
 export const selectListTheme: SelectListTheme = {
-  selectedPrefix: (s) => chalk.hex('#00E5CC')(s),
-  selectedText: (s) => chalk.hex('#00E5CC')(s),
-  description: (s) => chalk.hex('#6B7280')(s),
-  scrollInfo: (s) => chalk.hex('#6B7280')(s),
-  noMatch: (s) => chalk.hex('#6B7280')(s),
+  selectedPrefix: (s) => chalk.hex(palette.accent)(s),
+  selectedText: (s) => chalk.hex(palette.accent)(s),
+  description: (s) => chalk.hex(palette.muted)(s),
+  scrollInfo: (s) => chalk.hex(palette.muted)(s),
+  noMatch: (s) => chalk.hex(palette.muted)(s),
 };
 
 export const editorTheme = {
-  borderColor: (s: string) => chalk.hex('#008577')(s),
+  borderColor: (s: string) => chalk.hex(palette.accentDeep)(s),
   selectList: selectListTheme,
 };
