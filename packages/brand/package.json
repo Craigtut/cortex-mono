@@ -1,0 +1,29 @@
+{
+  "name": "@animus-labs/brand",
+  "version": "0.0.0",
+  "description": "Shared Cortex brand tokens: palette, type, split-flap primitives, thinking words",
+  "license": "MIT",
+  "author": "Animus Labs",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

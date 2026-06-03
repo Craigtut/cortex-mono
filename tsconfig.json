@@ -4,12 +4,14 @@
     "baseUrl": ".",
     "paths": {
       "@animus-labs/cortex": ["packages/cortex/src"],
-      "@animus-labs/cortex-code": ["packages/cortex-code/src"]
+      "@animus-labs/cortex-code": ["packages/cortex-code/src"],
+      "@animus-labs/brand": ["packages/brand/src"]
     }
   },
   "references": [
     { "path": "packages/cortex" },
-    { "path": "packages/cortex-code" }
+    { "path": "packages/cortex-code" },
+    { "path": "packages/brand" }
   ],
   "include": [],
   "exclude": ["node_modules", "dist"]
