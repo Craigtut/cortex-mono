@@ -737,6 +737,52 @@ You have 12 emotions.`;
   });
 
   // -----------------------------------------------------------------------
+  // Observational memory restore
+  // -----------------------------------------------------------------------
+
+  describe('restoreObservationalMemoryState slot population', () => {
+    it('leaves the observation slot empty when restored observations are empty', () => {
+      const agent = createTestCortexAgent(piAgent, {
+        ...config,
+        compaction: { strategy: 'observational' },
+      });
+      const cm = agent.getContextManager();
+
+      agent.restoreObservationalMemoryState({
+        observations: '',
+        continuationHint: null,
+        observationTokenCount: 0,
+        generationCount: 0,
+        bufferedChunks: [],
+        bufferWatermark: 0,
+      });
+
+      // A resumed-but-never-observed session must look like a fresh one: no
+      // observation preamble injected around an empty <observations> block.
+      expect(cm.getSlot('_observations')).toBe('');
+    });
+
+    it('populates the observation slot when restored observations are present', () => {
+      const agent = createTestCortexAgent(piAgent, {
+        ...config,
+        compaction: { strategy: 'observational' },
+      });
+      const cm = agent.getContextManager();
+
+      agent.restoreObservationalMemoryState({
+        observations: 'User prefers TypeScript.',
+        continuationHint: null,
+        observationTokenCount: 6,
+        generationCount: 1,
+        bufferedChunks: [],
+        bufferWatermark: 0,
+      });
+
+      expect(cm.getSlot('_observations')).toContain('User prefers TypeScript.');
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Lifecycle
   // -----------------------------------------------------------------------
 

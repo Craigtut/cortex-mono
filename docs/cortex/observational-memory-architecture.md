@@ -794,15 +794,18 @@ On resumption, the agent starts with:
 - Conversation history restored (may include unobserved messages from the previous session)
 - Buffered observation chunks that completed before the session was saved are restored alongside other state, together with the `bufferWatermark` that tracks how many messages they cover. In-flight (incomplete) observer operations are lost.
 
-**Buffer restore on resumption:** Completed chunks and their watermark are restored verbatim, so the observer work done in the previous session is not recomputed. Because the watermark indexes into the post-slot conversation history (restored first, at the same positions), the chunks stay correctly aligned: the next activation trims exactly `messages[0:bufferWatermark]` when it merges their observations, with no duplication. On restore the watermark is clamped to the restored history length to guard against a watermark that drifted ahead of a stale `history.json` (possible only on a hard crash; the auto-saver writes history and observations atomically, and graceful shutdown re-saves both). The async buffering machinery then handles only the remainder:
+**Buffer restore on resumption:** Completed chunks and their watermark are restored verbatim, so the observer work done in the previous session is not recomputed. Because the watermark indexes into the post-slot conversation history (restored first, at the same positions), the chunks stay correctly aligned: the next activation trims exactly `messages[0:bufferWatermark]` when it merges their observations, with no duplication. On restore the watermark is clamped to the restored history length to guard against a watermark that drifted ahead of a stale `history.json` (possible only on a hard crash; the auto-saver writes history and observations atomically, and graceful shutdown re-saves both).
 
-1. On `restoreObservationalMemoryState()`, Cortex kicks off an async buffer over the unobserved messages *after* the restored watermark (often empty, in which case nothing fires) as a non-blocking head start before the consumer calls `prompt()`
-2. On the first `turn_end`, the dynamic interval calculation detects any further unobserved messages and continues async buffering, chunked at `bufferTokenCap`
-3. Each subsequent turn rebuilds more of the buffer through normal operation
+**Resumption launches no observer.** The restored buffer is valid as-is, and the unobserved tail after the watermark is restored as raw messages, which the model reads directly. There is no benefit to pre-compressing that tail at resume time: at any utilization below the activation threshold there is ample room for the raw messages, and compression only matters as the window fills. So restore does no LLM work at all. The unobserved remainder is observed lazily through normal operation:
 
-Sessions saved before buffer persistence was added have no `bufferWatermark`; their chunks are discarded on restore (the pre-persistence behavior) and re-observed from scratch.
+1. On the first `turn_end`, the dynamic interval calculation detects any unobserved messages after the watermark and runs async buffering once the tail crosses the interval, exactly as during a live session.
+2. Each subsequent turn continues from the advanced watermark.
 
-**Hot resumption edge case:** If the session is restored at high utilization (e.g., 89%) and the first agent turn pushes past the activation threshold, the sync fallback handles it: one blocking observer call on the unbuffered messages, immediate activation, messages trimmed. After that, async buffering is caught up and operates normally. This is at most one blocking pause on the first turn after a hot resumption.
+This makes resume a pure, deterministic state restore. It is also the correct behavior for consumers that resume sessions frequently: reopening a session never costs a utility-model call.
+
+Sessions saved before buffer persistence was added have no `bufferWatermark`; their chunks are discarded on restore (the pre-persistence behavior) and re-observed lazily through normal `turn_end` buffering.
+
+**Hot resumption edge case:** If the session is restored at high utilization (e.g., 89%) and the first agent turn pushes past the activation threshold, the per-prompt activation check in `transformContext` is the safety net: one blocking observer call on the unbuffered messages, immediate activation, messages trimmed. After that, async buffering operates normally. This is at most one blocking pause on the first turn after a hot resumption, and only when resuming an already near-full session. We deliberately do not optimize this case with an eager resume-time observer, since that would tax every resume to smooth a rare one.
 
 The `<suggested-response>` is particularly valuable on resumption: it tells the agent what it should say next after the gap, enabling smooth continuation even though the raw conversational flow may be sparse.
 

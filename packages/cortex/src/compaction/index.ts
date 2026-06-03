@@ -558,14 +558,6 @@ export class CompactionManager {
   }
 
   /**
-   * Kick off an initial async buffer on unobserved messages.
-   * Called during session resumption for a head start before the first prompt().
-   */
-  kickstartBuffer(messages: AgentMessage[], slotCount: number): void {
-    this.observationalEngine?.kickstartBuffer(messages, slotCount);
-  }
-
-  /**
    * Get the observation slot content string (for ContextManager.setSlot).
    */
   getObservationSlotContent(): string {

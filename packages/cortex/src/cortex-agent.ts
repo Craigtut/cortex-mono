@@ -2469,15 +2469,19 @@ export class CortexAgent {
     const slotCount = this.contextManager.slotCount;
     const historyLength = Math.max(0, this.agent.state.messages.length - slotCount);
     this.compactionManager.restoreObservationalMemoryState(state, historyLength);
-    // Update the observation slot with restored content
-    const slotContent = this.compactionManager.getObservationSlotContent();
-    if (slotContent) {
-      this.contextManager.setSlot('_observations', slotContent);
+    // Populate the observation slot only when there are real observations to
+    // show. getObservationSlotContent() always returns at least the preamble,
+    // so guarding on hasObservations() keeps a resumed-but-never-observed
+    // session looking like a fresh one (empty slot) instead of injecting the
+    // preamble around an empty <observations> block.
+    if (this.compactionManager.hasObservations()) {
+      this.contextManager.setSlot('_observations', this.compactionManager.getObservationSlotContent());
     }
-    // Kick off initial async buffer for hot resumption. With the watermark
-    // restored, this observes only the unobserved remainder after the buffer,
-    // not the entire restored tail.
-    this.compactionManager.kickstartBuffer(this.agent.state.messages, slotCount);
+    // No observer is launched on resume. The restored buffer + watermark are
+    // valid as-is, and the unobserved tail is restored as raw messages. The
+    // observer catches up lazily on the next turn_end (async buffering from the
+    // watermark), and the per-prompt activation check is the safety net if the
+    // first turn pushes utilization past the activation threshold.
   }
 
   /**

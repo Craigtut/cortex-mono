@@ -509,37 +509,6 @@ export class ObservationalMemoryEngine {
   }
 
   // -------------------------------------------------------------------------
-  // Kickstart buffer (session resumption)
-  // -------------------------------------------------------------------------
-
-  /**
-   * Kick off an initial async buffer on unobserved messages.
-   * Called during session resumption for a head start before the first prompt().
-   */
-  kickstartBuffer(messages: AgentMessage[], slotCount: number): void {
-    if (!this.completeFn) return;
-    const history = messages.slice(slotCount);
-    if (history.length === 0) return;
-    const watermark = this.buffering.getWatermark();
-    const unobserved = history.slice(watermark);
-    if (unobserved.length === 0) return;
-    const unobservedTokens = unobserved.reduce(
-      (sum, m) => sum + estimateTokens(typeof m.content === 'string' ? m.content : JSON.stringify(m.content)),
-      0,
-    );
-    if (unobservedTokens < this.config.bufferMinTokens) return;
-    // Launch async observer on the unobserved messages (non-blocking)
-    this.buffering.launchObserver(
-      this.completeFn,
-      unobserved,
-      watermark + unobserved.length,
-      this.observations || null,
-      this.buildObserverConfig(),
-      this.logger ?? undefined,
-    );
-  }
-
-  // -------------------------------------------------------------------------
   // State management
   // -------------------------------------------------------------------------
 
@@ -570,8 +539,9 @@ export class ObservationalMemoryEngine {
    * messages back at the same positions, the watermark aligns: the restored
    * chunks observe `messages[0:watermark]`, and the next activation trims
    * exactly those messages when it merges the chunk observations (no
-   * duplication). The kickstart buffer then re-observes only the genuinely
-   * unobserved remainder after the watermark.
+   * duplication). No observer is launched on restore; the genuinely
+   * unobserved remainder after the watermark is observed lazily on the next
+   * `onTurnEnd` once it crosses the dynamic buffer interval.
    *
    * @param state - the persisted observational memory state
    * @param historyLength - length of the restored post-slot conversation

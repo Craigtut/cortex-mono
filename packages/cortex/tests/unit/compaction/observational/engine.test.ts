@@ -240,6 +240,44 @@ describe('ObservationalMemoryEngine', () => {
 
       expect(newEngine.getState().bufferWatermark).toBe(1);
     });
+
+    it('launches no observer on restore; the tail is observed lazily on turn_end', async () => {
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(OBSERVER_OUTPUT);
+      const engine = new ObservationalMemoryEngine({
+        activationThreshold: 0.9,
+        bufferMinTokens: 1_000,
+        bufferTargetCycles: 4,
+        bufferTokenCap: 30_000,
+      }, 0);
+      engine.setCompleteFn(mockComplete);
+      engine.setContextWindow(100_000);
+      engine.setUtilityModelContextWindow(200_000);
+
+      // Resume a session whose watermark sits behind the conversation tail.
+      engine.restoreState(
+        {
+          observations: 'prior observations',
+          continuationHint: null,
+          observationTokenCount: 4,
+          generationCount: 0,
+          bufferedChunks: [],
+          bufferWatermark: 0,
+        },
+        0,
+      );
+      await flushPromises();
+
+      // Reopening a session must not cost a utility-model call.
+      expect(mockComplete).not.toHaveBeenCalled();
+      expect(engine.isObserverInFlight()).toBe(false);
+
+      // The unobserved tail is still picked up lazily through normal operation,
+      // once it crosses the dynamic buffer interval (~10k here).
+      engine.onTurnEnd(50_000, 100_000, [userMsg('x'.repeat(50_000))], 0);
+      expect(engine.isObserverInFlight()).toBe(true);
+      await flushPromises();
+      expect(mockComplete).toHaveBeenCalledTimes(1);
+    });
   });
 
   // -------------------------------------------------------------------------
