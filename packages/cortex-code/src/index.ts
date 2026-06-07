@@ -19,12 +19,8 @@ const { version: PKG_VERSION } = require('../package.json');
 import { PRIMARY_MODEL_DEFAULTS, ProviderManager, type ThinkingLevel } from '@animus-labs/cortex';
 import { loadConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
-import { Session } from './session.js';
-import { BUILD_MODE } from './modes/build.js';
-import { listSessions } from './persistence/sessions.js';
-import { runFirstRunSetup } from './providers/setup-tui.js';
-import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
-import { resolveUpdateInfo } from './updates/checker.js';
+import { runComplete } from './complete.js';
+import type { Session as CortexCodeSession } from './session.js';
 
 interface CliArgs {
   resume: string | true | undefined;
@@ -90,6 +86,7 @@ cortex v${PKG_VERSION} - Terminal-based coding agent
 Usage:
   cortex                                    Start interactive session
   cortex-code                               Start interactive session
+  cortex complete [options] <prompt>        Run one lightweight completion
   cortex --resume [session-id]              Resume last (or specific) session
   cortex --model <model>                    Override default model
   cortex --compaction <observational|classic>  Compaction strategy (default: observational)
@@ -101,11 +98,31 @@ Usage:
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === 'complete') {
+    await runComplete(process.argv.slice(3), { version: PKG_VERSION });
+    return;
+  }
+
   const args = parseArgs(process.argv);
   const cwd = process.cwd();
 
   // Load config
   const config = await loadConfig(cwd);
+  const [
+    { Session },
+    { BUILD_MODE },
+    { listSessions },
+    { runFirstRunSetup },
+    { getOllamaHost, getOllamaContextWindow },
+    { resolveUpdateInfo },
+  ] = await Promise.all([
+    import('./session.js'),
+    import('./modes/build.js'),
+    import('./persistence/sessions.js'),
+    import('./providers/setup-tui.js'),
+    import('./providers/ollama.js'),
+    import('./updates/checker.js'),
+  ]);
 
   // Resolve update availability from the local cache (non-blocking: this also
   // kicks off a background registry refresh for the next launch).
@@ -184,7 +201,7 @@ async function main(): Promise<void> {
     : 'medium';
 
   // Create and start session
-  let session: Session | null = null;
+  let session: CortexCodeSession | null = null;
   let uninstallSignalHandlers: (() => void) | null = null;
   try {
     session = new Session({
@@ -223,7 +240,7 @@ function getDefaultModel(provider: string): string {
   return PRIMARY_MODEL_DEFAULTS[provider] ?? PRIMARY_MODEL_DEFAULTS['anthropic']!;
 }
 
-function installActivitySignalHandlers(session: Session): () => void {
+function installActivitySignalHandlers(session: CortexCodeSession): () => void {
   const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGHUP'];
   const disposers: Array<() => void> = [];
   let exiting = false;
