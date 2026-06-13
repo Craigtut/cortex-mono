@@ -57,6 +57,7 @@ import { getCommand, registerBuiltinCommands } from './commands/index.js';
 import { dismissVersion, type UpdateInfo } from './updates/checker.js';
 import { runNpmUpgrade } from './updates/upgrade.js';
 import type { Mode } from './modes/types.js';
+import { AVAILABLE_MODES } from './modes/index.js';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -291,6 +292,7 @@ export class Session {
     // Update footer
     this.app.updateStatus({
       mode: this.mode.name,
+      modeCount: AVAILABLE_MODES.length,
       provider: this.provider,
       model: this.modelId,
       contextTokenCount: this.getDisplayedCurrentContextTokens(),

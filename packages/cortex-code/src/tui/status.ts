@@ -4,6 +4,8 @@ import { colors } from './theme.js';
 
 export interface StatusBarState {
   mode: string;
+  /** Number of modes the agent can run as. The mode badge is hidden while <= 1. */
+  modeCount: number;
   provider: string;
   model: string;
   contextTokenCount: number;
@@ -50,6 +52,24 @@ function pulseEase(t: number): number {
   return (1 - Math.cos(t * 2 * Math.PI)) / 2;
 }
 
+// ---------------------------------------------------------------------------
+// Mode + flag glyphs
+// ---------------------------------------------------------------------------
+//
+// Mode and YOLO render as bold colored text with a leading icon, not a
+// background block. The U+FE0E variation selector requests text (monochrome)
+// presentation so the glyph honors the chalk color and stays single-width
+// where the terminal obeys it.
+
+/** Per-mode icon, keyed by mode name. Unknown modes fall back to a neutral mark. */
+const MODE_ICONS: Record<string, string> = {
+  build: '⚒︎', // ⚒ hammer and pick
+};
+const DEFAULT_MODE_ICON = '◆'; // ◆
+
+/** Icon for the YOLO (auto-approve) flag. */
+const YOLO_ICON = '⚡︎'; // ⚡ high voltage
+
 /**
  * Footer status bar with progressive reduction.
  * Picks the most detailed layout that fits the terminal width.
@@ -57,6 +77,7 @@ function pulseEase(t: number): number {
 export class StatusBar implements Component {
   private state: StatusBarState = {
     mode: 'build',
+    modeCount: 1,
     provider: '',
     model: '',
     contextTokenCount: 0,
@@ -122,11 +143,14 @@ export class StatusBar implements Component {
   render(width: number): string[] {
     const s = this.state;
 
-    // Build segments
-    const modeBadge = ` ${s.mode} `;
-    const yoloBadge = s.yoloMode ? ` YOLO ` : '';
+    // Build segments. Mode + YOLO render as bold colored text with a leading
+    // icon (no background block). The mode badge is hidden while only one mode
+    // exists, since there is nothing to choose between.
+    const modeIcon = MODE_ICONS[s.mode] ?? DEFAULT_MODE_ICON;
+    const modeBadge = s.modeCount > 1 ? `${modeIcon} ${s.mode}` : '';
+    const yoloBadge = s.yoloMode ? `${YOLO_ICON} YOLO` : '';
     const effortBadge = s.effortLevel && s.effortLevel !== 'off'
-      ? ` E:${s.effortLevel.charAt(0).toUpperCase() + s.effortLevel.slice(1)} `
+      ? `E:${s.effortLevel.charAt(0).toUpperCase() + s.effortLevel.slice(1)}`
       : '';
     const modelStr = this.hintText ?? (s.provider ? `${s.provider}/${s.model}` : s.model);
     const tokenStr = this.formatTokens(s.contextTokenCount, s.contextTokenLimit);
@@ -155,7 +179,7 @@ export class StatusBar implements Component {
     }
 
     // Absolute fallback
-    return [truncateToWidth(modeBadge, width)];
+    return [truncateToWidth(modeBadge || tokenStr, width)];
   }
 
   // -------------------------------------------------------------------------
@@ -172,10 +196,13 @@ export class StatusBar implements Component {
     branchStr: string,
     width: number,
   ): string | null {
-    const left = colors.primaryBg(modeBadge)
-      + (yoloBadge ? ' ' + colors.accentBg(yoloBadge) : '')
-      + (effortBadge ? ' ' + colors.muted(effortBadge) : '')
-      + colors.muted(' | ')
+    const flags: string[] = [];
+    if (modeBadge) flags.push(colors.bold(colors.primary(modeBadge)));
+    if (yoloBadge) flags.push(colors.bold(colors.accent(yoloBadge)));
+    if (effortBadge) flags.push(colors.muted(effortBadge));
+    const flagStr = flags.join('  ');
+
+    const left = (flagStr ? flagStr + colors.muted(' | ') : '')
       + colors.white(modelStr);
 
     const right = this.colorizeTokens(tokenStr)
@@ -193,7 +220,7 @@ export class StatusBar implements Component {
   }
 
   private layoutMinimal(modeBadge: string, tokenStr: string, width: number): string | null {
-    const left = colors.primaryBg(modeBadge);
+    const left = modeBadge ? colors.bold(colors.primary(modeBadge)) : '';
     const right = this.colorizeTokens(tokenStr);
     const leftWidth = visibleWidth(left);
     const rightWidth = visibleWidth(right);
