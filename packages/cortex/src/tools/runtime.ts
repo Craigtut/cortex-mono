@@ -25,6 +25,13 @@ export interface BackgroundTask {
   stderr: string;
   exitCode: number | null;
   completed: boolean;
+  /**
+   * Whether the agent has already been informed of this task's terminal state:
+   * delivered via a completion wake-up, observed through a TaskOutput poll that
+   * returned completed/failed, or deliberately killed. Guards against delivering
+   * the same completion twice.
+   */
+  notified: boolean;
   startTime: number;
 }
 

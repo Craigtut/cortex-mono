@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { CwdTracker } from '../../../src/tools/shared/cwd-tracker.js';
+import { CortexToolRuntime } from '../../../src/tools/runtime.js';
 import { createBashTool } from '../../../src/tools/bash/index.js';
 
 describe('Bash tool', () => {
@@ -104,6 +105,37 @@ describe('Bash tool', () => {
     expect(text).toContain('Task ID');
     expect(result.details.backgrounded).toBe(true);
     expect(result.details.taskId).not.toBeNull();
+  });
+
+  it('fires onBackgroundTaskComplete when a backgrounded command finishes', async () => {
+    const runtime = new CortexToolRuntime(tmpDir);
+    let completedId: string | null = null;
+    const completed = new Promise<void>((resolve) => {
+      bashTool = createBashTool({
+        runtime,
+        onBackgroundTaskComplete: (taskId) => {
+          completedId = taskId;
+          resolve();
+        },
+      });
+    });
+
+    const result = await bashTool.execute({
+      command: 'echo "done"',
+      background: true,
+    });
+    const taskId = result.details.taskId as string;
+
+    // The task starts un-notified; only the agent/TaskOutput mark it notified.
+    expect(runtime.backgroundTasks.get(taskId)?.notified).toBe(false);
+
+    await completed;
+
+    expect(completedId).toBe(taskId);
+    const task = runtime.backgroundTasks.get(taskId);
+    expect(task?.completed).toBe(true);
+    expect(task?.exitCode).toBe(0);
+    expect(task?.notified).toBe(false);
   });
 
   it('strips CWD marker from output', async () => {

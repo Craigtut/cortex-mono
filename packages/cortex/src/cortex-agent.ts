@@ -52,7 +52,7 @@ import { DeferredToolRegistry } from './tools/tool-search/registry.js';
 import { createToolSearchTool, TOOL_SEARCH_TOOL_NAME } from './tools/tool-search/index.js';
 import { wrapModel, unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
-import { cloneRuntimeAwareTool, CortexToolRuntime } from './tools/runtime.js';
+import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { PromptWatchdogDiagnostics } from './prompt-diagnostics.js';
 import { assertValidCortexTool } from './tool-contract.js';
@@ -314,6 +314,16 @@ interface DirectCompletionOptions {
   cacheRetention?: CacheRetention;
 }
 
+/**
+ * A background task that finished while the agent was busy and must be
+ * delivered to the loop once it goes idle. Either a sub-agent (carries its
+ * result) or a backgrounded Bash command (read live from the task store at
+ * delivery time, so dedup against polling/kill stays correct).
+ */
+type PendingBackgroundCompletion =
+  | { kind: 'subagent'; taskId: string; result: SubAgentResult }
+  | { kind: 'bash'; taskId: string };
+
 // ---------------------------------------------------------------------------
 // CortexAgent
 // ---------------------------------------------------------------------------
@@ -393,7 +403,7 @@ export class CortexAgent {
   private subAgentCompletedHandlers: Array<(taskId: string, result: string, status: string, usage: unknown) => void> = [];
   private subAgentFailedHandlers: Array<(taskId: string, error: string) => void> = [];
   private backgroundResultDeliveryHandlers: Array<(taskIds: string[]) => void> = [];
-  private pendingBackgroundResults: Array<{ taskId: string; result: SubAgentResult }> = [];
+  private pendingBackgroundResults: PendingBackgroundCompletion[] = [];
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -2908,6 +2918,9 @@ export class CortexAgent {
           messages: Array<{ role: string; content: string }>;
         }),
         isAutoApprove: () => this.config.isAutoApprove?.() ?? false,
+        onBackgroundTaskComplete: (taskId) => {
+          void this.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId });
+        },
       }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.TaskOutput)) {
@@ -4115,7 +4128,7 @@ export class CortexAgent {
           cost: result.usage.cost,
           durationMs: result.usage.durationMs,
         });
-        return this.handleBackgroundCompletion(taskId, result);
+        return this.deliverOrQueueBackgroundCompletion({ kind: 'subagent', taskId, result });
       })
       .catch((err) => {
         this.logger.error('[CortexAgent] subagent failed', {
@@ -4130,23 +4143,30 @@ export class CortexAgent {
   }
 
   /**
-   * Handle a background sub-agent completing. If the parent is currently
-   * prompting, queue the result for delivery after the current loop. If
-   * the parent is idle, deliver immediately by restarting the agentic loop.
+   * Handle a background task (sub-agent or Bash command) completing. If the
+   * agent is currently prompting, queue it for delivery after the current
+   * loop. If the agent is idle, deliver immediately by restarting the loop.
+   *
+   * Shared by background sub-agents (resolved promise) and backgrounded Bash
+   * commands (process `close` callback), so both wake the loop the same way.
    */
-  private async handleBackgroundCompletion(
-    taskId: string,
-    result: SubAgentResult,
+  private async deliverOrQueueBackgroundCompletion(
+    item: PendingBackgroundCompletion,
   ): Promise<void> {
+    if (this.lifecycleState === 'destroyed') return;
+
     if (this._isPrompting) {
-      // Parent is in its agentic loop; queue for delivery when it finishes
-      this.pendingBackgroundResults.push({ taskId, result });
+      // Agent is in its loop; queue for delivery when it finishes
+      this.pendingBackgroundResults.push(item);
       return;
     }
 
-    // Parent is idle; deliver immediately by restarting the loop
-    const message = this.formatBackgroundResult(taskId, result);
-    this.fireBackgroundResultDeliveryHandlers([taskId]);
+    // Agent is idle; deliver immediately by restarting the loop. formatting
+    // returns null when there is nothing to deliver (e.g. a Bash task already
+    // observed via TaskOutput poll or killed deliberately).
+    const message = this.formatPendingCompletion(item);
+    if (message === null) return;
+    this.fireBackgroundResultDeliveryHandlers([item.taskId]);
     try {
       await this.prompt(message);
     } catch (err) {
@@ -4168,20 +4188,62 @@ export class CortexAgent {
   }
 
   /**
-   * Drain all pending background sub-agent results by restarting the
-   * agentic loop with a combined message. Called at the end of prompt().
+   * Drain all pending background completions by restarting the agentic loop
+   * with a combined message. Called at the end of prompt(). Completions that
+   * were already observed in the meantime (Bash poll/kill) are skipped, and if
+   * nothing remains to deliver the loop is not restarted.
    */
   private async drainPendingBackgroundResults(): Promise<void> {
     if (this.pendingBackgroundResults.length === 0) return;
 
     const pending = this.pendingBackgroundResults.splice(0);
-    const parts = pending.map(p => this.formatBackgroundResult(p.taskId, p.result));
-    const message = parts.join('\n\n---\n\n');
-    const taskIds = pending.map(p => p.taskId);
+    const parts: string[] = [];
+    const taskIds: string[] = [];
+    for (const item of pending) {
+      const message = this.formatPendingCompletion(item);
+      if (message === null) continue;
+      parts.push(message);
+      taskIds.push(item.taskId);
+    }
+    if (parts.length === 0) return;
 
+    const message = parts.join('\n\n---\n\n');
     this.fireBackgroundResultDeliveryHandlers(taskIds);
     // Re-enters prompt(), which will drain again if more arrive
     await this.prompt(message);
+  }
+
+  /**
+   * Format a pending completion into the message delivered to the loop, or
+   * null if there is nothing to deliver. Marks Bash tasks as notified so the
+   * same completion is never delivered twice.
+   */
+  private formatPendingCompletion(item: PendingBackgroundCompletion): string | null {
+    if (item.kind === 'subagent') {
+      return this.formatBackgroundResult(item.taskId, item.result);
+    }
+    const task = this.toolRuntime.backgroundTasks.get(item.taskId);
+    if (!task || !task.completed || task.notified) return null;
+    task.notified = true;
+    return this.formatBashCompletion(task);
+  }
+
+  private formatBashCompletion(task: BackgroundTask): string {
+    const header = task.exitCode === 0
+      ? `[Background command ${task.id} completed]`
+      : `[Background command ${task.id} failed]`;
+    const exit = task.exitCode === null ? 'unknown' : String(task.exitCode);
+    const durationSec = ((Date.now() - task.startTime) / 1000).toFixed(1);
+    const meta = `\`${task.command}\` (exit code: ${exit}, ${durationSec}s)`;
+
+    const cap = 30000;
+    const stdout = task.stdout.length > cap ? task.stdout.slice(-cap) : task.stdout;
+    const stderr = task.stderr.length > cap ? task.stderr.slice(-cap) : task.stderr;
+    let body = '';
+    if (stdout) body += `\n\nOutput:\n${stdout}`;
+    if (stderr) body += `\n\nStderr:\n${stderr}`;
+    if (!stdout && !stderr) body = '\n\nNo output was produced.';
+    return `${header} ${meta}${body}`;
   }
 
   private formatBackgroundResult(taskId: string, result: SubAgentResult): string {

@@ -1535,4 +1535,111 @@ You have 12 emotions.`;
       expect(typeof CortexAgent.create).toBe('function');
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Background bash task completion wake-up
+  // -----------------------------------------------------------------------
+
+  describe('background bash task completion', () => {
+    interface InternalAgent {
+      toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
+      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
+      drainPendingBackgroundResults: () => Promise<void>;
+      pendingBackgroundResults: unknown[];
+      _isPrompting: boolean;
+    }
+
+    function seedCompletedTask(
+      agent: CortexAgent,
+      overrides?: { exitCode?: number; stdout?: string; notified?: boolean; id?: string },
+    ): string {
+      const id = overrides?.id ?? 'task_1';
+      (agent as unknown as InternalAgent).toolRuntime.backgroundTasks.set({
+        id,
+        command: 'npm run check',
+        process: {},
+        stdout: overrides?.stdout ?? 'all tests green',
+        stderr: '',
+        exitCode: overrides?.exitCode ?? 0,
+        completed: true,
+        notified: overrides?.notified ?? false,
+        startTime: Date.now() - 1000,
+      });
+      return id;
+    }
+
+    it('wakes the loop when a bash task completes while idle', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const id = seedCompletedTask(agent, { stdout: 'all tests green' });
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+
+      expect(promptSpy).toHaveBeenCalledTimes(1);
+      const delivered = promptSpy.mock.calls[0][0] as string;
+      expect(delivered).toContain(id);
+      expect(delivered).toContain('completed');
+      expect(delivered).toContain('exit code: 0');
+      expect(delivered).toContain('all tests green');
+    });
+
+    it('marks a failed task and reports the exit code', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const id = seedCompletedTask(agent, { exitCode: 2, stdout: 'boom' });
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+
+      const delivered = promptSpy.mock.calls[0][0] as string;
+      expect(delivered).toContain('failed');
+      expect(delivered).toContain('exit code: 2');
+    });
+
+    it('queues the completion while prompting and delivers it on drain', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const id = seedCompletedTask(agent);
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+
+      // Simulate the agent being mid-loop
+      internal._isPrompting = true;
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+
+      expect(promptSpy).not.toHaveBeenCalled();
+      expect(internal.pendingBackgroundResults).toHaveLength(1);
+
+      // Loop ends; drain delivers the queued completion
+      internal._isPrompting = false;
+      await internal.drainPendingBackgroundResults();
+
+      expect(promptSpy).toHaveBeenCalledTimes(1);
+      expect(promptSpy.mock.calls[0][0] as string).toContain(id);
+    });
+
+    it('does not deliver a task already observed via poll/kill (notified)', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const id = seedCompletedTask(agent, { notified: true });
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+
+      expect(promptSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not re-deliver the same completion twice', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const id = seedCompletedTask(agent);
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+
+      // Second delivery is suppressed because the task is now notified
+      expect(promptSpy).toHaveBeenCalledTimes(1);
+    });
+  });
 });

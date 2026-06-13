@@ -34,7 +34,7 @@ export const BashParams = Type.Object({
     Type.String({ description: 'Human-readable explanation of the command.' }),
   ),
   background: Type.Optional(
-    Type.Boolean({ description: 'Run the command in the background immediately. Default: false.' }),
+    Type.Boolean({ description: 'Run the command in the background immediately. Default: false. You are woken automatically when a backgrounded command finishes, so do not poll in a loop. To wait for an external condition, background a SINGLE command that blocks until the condition holds (e.g. `gh run watch <id> --exit-status`, or `until gh release view "$TAG" >/dev/null 2>&1; do sleep 20; done`) rather than re-running a quick check.' }),
   ),
 });
 
@@ -92,6 +92,12 @@ export interface BashToolConfig {
   onProcessSpawned?: ((pid: number) => void) | undefined;
   /** Callback for removing tracked PIDs when process exits. */
   onProcessExited?: ((pid: number) => void) | undefined;
+  /**
+   * Fired when a backgrounded task (explicit `background: true` or an
+   * auto-yielded long-running command) finishes. The agent uses this to wake
+   * its loop and deliver the result, so it does not have to poll repeatedly.
+   */
+  onBackgroundTaskComplete?: ((taskId: string) => void) | undefined;
   /** Utility model completion function for Layer 7 safety classifier. */
   utilityComplete?: ((context: unknown) => Promise<unknown>) | undefined;
   /** Whether the consumer is currently auto-approving tool calls. */
@@ -371,6 +377,7 @@ export function createBashTool(config: BashToolConfig): {
           stderr: '',
           exitCode: null,
           completed: false,
+          notified: false,
           startTime: Date.now(),
         };
         backgroundTasks.set(task);
@@ -385,10 +392,11 @@ export function createBashTool(config: BashToolConfig): {
           if (proc.pid && config.onProcessExited) {
             config.onProcessExited(proc.pid);
           }
+          config.onBackgroundTaskComplete?.(taskId);
         });
 
         return {
-          content: [{ type: 'text', text: `Command running in background. Task ID: ${taskId}\nUse TaskOutput to poll, send input, or kill.` }],
+          content: [{ type: 'text', text: `Command running in background. Task ID: ${taskId}\nYou will be notified automatically when it finishes; no need to poll. Use TaskOutput to check progress, send input, or kill.` }],
           details: {
             stdout: '',
             stderr: '',
@@ -475,6 +483,7 @@ export function createBashTool(config: BashToolConfig): {
               stderr,
               exitCode: null,
               completed: false,
+              notified: false,
               startTime: Date.now(),
             };
             backgroundTasks.set(task);
@@ -491,6 +500,7 @@ export function createBashTool(config: BashToolConfig): {
               if (proc.pid && config.onProcessExited) {
                 config.onProcessExited(proc.pid);
               }
+              config.onBackgroundTaskComplete?.(taskId);
             });
 
             clearTimeout(timeoutTimer);
@@ -501,7 +511,7 @@ export function createBashTool(config: BashToolConfig): {
 
             const [cleanedOutput] = extractCwd(sanitizeOutput(stdout));
             resolve({
-              content: [{ type: 'text', text: `${cleanedOutput}\n\n[Command auto-yielded after ${autoYieldThreshold}ms. Task ID: ${taskId}]` }],
+              content: [{ type: 'text', text: `${cleanedOutput}\n\n[Command auto-yielded after ${autoYieldThreshold}ms. Task ID: ${taskId}. You will be notified automatically when it finishes; no need to poll.]` }],
               details: {
                 stdout: cleanedOutput,
                 stderr,

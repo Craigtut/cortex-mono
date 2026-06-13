@@ -89,7 +89,11 @@ Long-running commands should not block the agent. Pi-agent-core executes tools s
 - `send`: Send input to the process stdin (e.g., answering a prompt)
 - `kill`: Send a signal to the process (SIGINT for Ctrl+C, SIGTERM, SIGKILL)
 
-**Completion notification:** When a backgrounded process completes, the agent is notified via pi-agent-core's follow-up message mechanism. The agent does not need to poll repeatedly.
+**Completion notification:** When a backgrounded process exits, the Bash tool fires an `onBackgroundTaskComplete(taskId)` callback. The agent wires this into the same background-completion pipeline used by background sub-agents: if the agent is mid-loop the completion is queued and delivered when the loop ends (drained in `prompt()`'s `finally`); if the agent is idle it re-enters `prompt()` immediately with the command's exit code and output. The agent does not need to poll repeatedly.
+
+To avoid delivering the same result twice, each task carries a `notified` flag. A TaskOutput `poll` that returns a terminal status, or a `kill`, sets it, which suppresses the wake-up the agent would otherwise receive for that task.
+
+To wait for an external condition, background a single command that blocks until the condition holds (a polling loop with `sleep`, or e.g. `gh run watch <id> --exit-status`) rather than re-running a quick check. The wait then happens inside one shell process and the agent is woken exactly once, instead of looping.
 
 ### Process Tree Cleanup
 

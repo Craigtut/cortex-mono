@@ -96,6 +96,12 @@ export function createTaskOutputTool(config?: TaskOutputToolConfig): {
             ? (task.exitCode === 0 ? 'completed' : 'failed')
             : 'running';
 
+          // The agent has now seen the terminal state directly; suppress the
+          // duplicate completion wake-up that would otherwise be delivered.
+          if (task.completed) {
+            task.notified = true;
+          }
+
           let text = `Status: ${status}`;
           if (task.completed && task.exitCode !== null) {
             text += ` (exit code: ${task.exitCode})`;
@@ -170,6 +176,9 @@ export function createTaskOutputTool(config?: TaskOutputToolConfig): {
 
         case 'kill': {
           if (task.completed) {
+            // Agent is acknowledging a task that already finished; suppress
+            // any pending completion wake-up for it.
+            task.notified = true;
             return {
               content: [{ type: 'text', text: `Task ${taskId} has already completed.` }],
               details: {
@@ -186,6 +195,9 @@ export function createTaskOutputTool(config?: TaskOutputToolConfig): {
           const signal = (params.signal ?? 'SIGTERM') as NodeJS.Signals;
           try {
             task.process.kill(signal);
+            // Deliberate termination: do not wake the loop when the process
+            // exits in response to this signal.
+            task.notified = true;
             return {
               content: [{ type: 'text', text: `Sent ${signal} to task ${taskId}.` }],
               details: {
