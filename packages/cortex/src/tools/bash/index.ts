@@ -500,7 +500,7 @@ export function createBashTool(config: BashToolConfig): {
               if (proc.pid && config.onProcessExited) {
                 config.onProcessExited(proc.pid);
               }
-              config.onBackgroundTaskComplete?.(taskId);
+              if (taskId) config.onBackgroundTaskComplete?.(taskId);
             });
 
             clearTimeout(timeoutTimer);
