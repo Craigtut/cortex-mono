@@ -312,6 +312,14 @@ type CacheRetention = 'none' | 'short' | 'long';
 
 interface DirectCompletionOptions {
   cacheRetention?: CacheRetention;
+  /**
+   * Optional abort signal to cancel an in-flight completion. When the signal
+   * fires, the call rejects with an `AbortError` (an Error whose `name` is
+   * `'AbortError'`) so callers can distinguish caller-initiated cancellation
+   * from a genuine failure. Applies to `directComplete`, `structuredComplete`,
+   * and `utilityComplete`.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -872,6 +880,7 @@ export class CortexAgent {
     if (apiKey) completeOptions['apiKey'] = apiKey;
     if (cacheRetention) completeOptions['cacheRetention'] = cacheRetention;
     if (this._sessionId) completeOptions['sessionId'] = this._sessionId;
+    if (options?.signal) completeOptions['signal'] = options.signal;
 
     return Object.keys(completeOptions).length > 0 ? completeOptions : undefined;
   }
@@ -937,6 +946,9 @@ export class CortexAgent {
       } as Parameters<typeof completeFn>[1],
       completeOptions as Parameters<typeof completeFn>[2] | undefined,
     );
+
+    // Caller-initiated cancellation takes precedence over error/usage handling.
+    this.throwIfAborted(result, options?.signal);
 
     // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
     this.checkForSilentError(result);
@@ -1022,6 +1034,9 @@ export class CortexAgent {
       } as Parameters<typeof completeFn>[2],
     );
 
+    // Caller-initiated cancellation takes precedence over error/usage handling.
+    this.throwIfAborted(result, options?.signal);
+
     // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
     this.checkForSilentError(result);
 
@@ -1058,6 +1073,30 @@ export class CortexAgent {
         ? msg['errorMessage']
         : 'Unknown pi-ai error (stopReason=error)';
       throw new Error(`LLM call failed: ${errorMessage}`);
+    }
+  }
+
+  /**
+   * Surface a caller-aborted completion as a throwable `AbortError`.
+   *
+   * Pi-ai resolves (it does not throw) with stopReason 'aborted' when the
+   * supplied AbortSignal fires mid-flight. We also check the signal directly
+   * to cover the race where abortion lands just after a result resolved: the
+   * caller signalled they no longer want this completion, so we discard it.
+   * Throwing an Error named 'AbortError' lets callers distinguish caller
+   * cancellation from genuine failure via the standard `err.name` idiom, and
+   * must be checked before `checkForSilentError` so an abort is never
+   * misreported as an LLM error.
+   */
+  private throwIfAborted(result: unknown, signal?: AbortSignal): void {
+    const resultAborted =
+      !!result &&
+      typeof result === 'object' &&
+      (result as Record<string, unknown>)['stopReason'] === 'aborted';
+    if (signal?.aborted || resultAborted) {
+      const err = new Error('Completion aborted');
+      err.name = 'AbortError';
+      throw err;
     }
   }
 
@@ -1988,7 +2027,7 @@ export class CortexAgent {
   async utilityComplete(context: {
     systemPrompt: string;
     messages: Array<{ role: string; content: string }>;
-  }): Promise<string> {
+  }, options?: DirectCompletionOptions): Promise<string> {
     let completeFn: typeof import('@earendil-works/pi-ai').complete;
     try {
       const piAi = await import('@earendil-works/pi-ai');
@@ -2013,6 +2052,10 @@ export class CortexAgent {
 
     this._lastDirectUsage = null;
 
+    const utilOptions: Record<string, unknown> = {};
+    if (apiKey) utilOptions['apiKey'] = apiKey;
+    if (options?.signal) utilOptions['signal'] = options.signal;
+
     const utilStartMs = Date.now();
     const result = await completeFn(
       this.resolvedUtilityPiModel as unknown as Parameters<typeof completeFn>[0],
@@ -2023,8 +2066,13 @@ export class CortexAgent {
           content: m.content,
         })),
       } as Parameters<typeof completeFn>[1],
-      apiKey ? { apiKey } as Parameters<typeof completeFn>[2] : undefined,
+      Object.keys(utilOptions).length > 0
+        ? utilOptions as Parameters<typeof completeFn>[2]
+        : undefined,
     );
+
+    // Caller-initiated cancellation takes precedence over error/usage handling.
+    this.throwIfAborted(result, options?.signal);
 
     // Check for silent errors (same as directComplete/structuredComplete)
     this.checkForSilentError(result);

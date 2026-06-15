@@ -223,4 +223,121 @@ describe('CortexAgent model contract', () => {
       }),
     );
   });
+
+  it('forwards a caller abort signal to direct and structured completions', async () => {
+    const rawModel = {
+      provider: 'anthropic',
+      name: 'claude-sonnet-4-20250514',
+      id: 'claude-sonnet-4-20250514',
+      api: 'anthropic',
+      contextWindow: 200_000,
+    };
+
+    mockGetModel.mockReturnValue(rawModel);
+    mockComplete.mockResolvedValue({
+      content: [{ type: 'text', text: 'ok' }],
+      usage: makeUsage(),
+    });
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+    });
+
+    const controller = new AbortController();
+
+    await agent.directComplete(
+      { systemPrompt: 'System', messages: [{ role: 'user', content: 'Hello' }] },
+      { signal: controller.signal },
+    );
+
+    expect(mockComplete).toHaveBeenLastCalledWith(
+      rawModel,
+      expect.anything(),
+      expect.objectContaining({ signal: controller.signal }),
+    );
+
+    mockComplete.mockResolvedValue({ content: [], usage: makeUsage() });
+
+    await agent.structuredComplete(
+      { systemPrompt: 'System', messages: [{ role: 'user', content: 'Hello' }] },
+      { type: 'object', properties: {}, required: [] },
+      'structured_output',
+      'Produce structured output',
+      { signal: controller.signal },
+    );
+
+    expect(mockComplete).toHaveBeenLastCalledWith(
+      rawModel,
+      expect.anything(),
+      expect.objectContaining({ signal: controller.signal, toolChoice: 'any' }),
+    );
+  });
+
+  it('rejects a direct completion with an AbortError when pi-ai reports it aborted', async () => {
+    const rawModel = {
+      provider: 'anthropic',
+      name: 'claude-sonnet-4-20250514',
+      id: 'claude-sonnet-4-20250514',
+      api: 'anthropic',
+      contextWindow: 200_000,
+    };
+
+    mockGetModel.mockReturnValue(rawModel);
+    mockComplete.mockResolvedValue({
+      stopReason: 'aborted',
+      content: [],
+      usage: makeUsage(),
+    });
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+    });
+
+    await expect(
+      agent.directComplete({ systemPrompt: 'System', messages: [{ role: 'user', content: 'Hello' }] }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('rejects a structured completion with an AbortError when the caller signal is already aborted', async () => {
+    const rawModel = {
+      provider: 'anthropic',
+      name: 'claude-sonnet-4-20250514',
+      id: 'claude-sonnet-4-20250514',
+      api: 'anthropic',
+      contextWindow: 200_000,
+    };
+
+    mockGetModel.mockReturnValue(rawModel);
+    // A valid result still resolves, but an aborted caller signal discards it.
+    mockComplete.mockResolvedValue({ content: [], usage: makeUsage() });
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      agent.structuredComplete(
+        { systemPrompt: 'System', messages: [{ role: 'user', content: 'Hello' }] },
+        { type: 'object', properties: {}, required: [] },
+        'structured_output',
+        'Produce structured output',
+        { signal: controller.signal },
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+  });
 });
