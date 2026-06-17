@@ -200,7 +200,7 @@ class SetupRenderer {
             });
           },
           onPrompt: async (prompt) => this.promptOAuthText(prompt.message, loader, prompt.allowEmpty ?? false),
-          onManualCodeInput: async () => this.promptOAuthText('Paste the authorization code:', loader, false),
+          onManualCodeInput: async () => this.awaitManualCodeOnDemand(loader),
           onSelect: async (prompt) => this.promptOAuthSelect(prompt, loader),
           onProgress: (message) => {
             loader.setMessage(message);
@@ -327,6 +327,42 @@ class SetupRenderer {
     } else {
       this.renderStep(step);
     }
+  }
+
+  /**
+   * Manual-code fallback for OAuth, surfaced on demand instead of forced.
+   *
+   * pi-ai invokes this callback the moment the flow starts and races it against
+   * the localhost callback server (see loginAnthropic in pi-ai). On the same
+   * machine the callback captures the code automatically and this promise stays
+   * pending forever (harmless). So we must NOT immediately render a paste field,
+   * or every login would demand a manual paste even though the browser callback
+   * already handles it. Instead we keep the "waiting" loader visible and only
+   * reveal the paste input when the user presses 'p' (needed when the browser is
+   * on another machine and the localhost callback can't reach back).
+   */
+  private awaitManualCodeOnDemand(loader: Loader): Promise<string> {
+    // Loader has no typed handleInput, but the TUI dispatches keystrokes to
+    // whatever component is focused, so we attach one to catch the reveal key.
+    const keyTarget = loader as unknown as { handleInput?: (data: string) => void };
+    return new Promise<string>((resolve) => {
+      const armRevealKey = () => {
+        loader.setMessage("Waiting for browser...  (on another machine? press 'p' to paste the URL)");
+        this.tui.setFocus(loader);
+        keyTarget.handleInput = (data: string) => {
+          if (data !== 'p' && data !== 'P') return;
+          keyTarget.handleInput = () => {};
+          void this.promptOAuthText("Paste the full redirect URL from your browser's address bar:", loader, false)
+            .then((input) => {
+              // Empty means the user backed out (Esc); keep waiting for the
+              // browser callback and let them retry the manual path with 'p'.
+              if (input) resolve(input);
+              else armRevealKey();
+            });
+        };
+      };
+      armRevealKey();
+    });
   }
 
   private promptOAuthText(message: string, loader: Loader, allowEmpty: boolean): Promise<string> {
