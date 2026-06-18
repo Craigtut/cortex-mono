@@ -78,7 +78,11 @@ Delegates to pi-ai's `isContextOverflow(message, contextWindow)` which already h
 /fetch.failed/i
 /socket.hang.up/i
 /DNS.*resolution/i
+/connection error/i
+/timed out/i
 ```
+
+The last two match the Anthropic SDK's canonical `APIConnectionError` ("Connection error.") and `APIConnectionTimeoutError` ("Request timed out.") messages, which the SDK throws after exhausting its own internal retries.
 
 **Cancelled:**
 Detected by checking `agent.state.error` after abort, or `stopReason === "aborted"` on the response.

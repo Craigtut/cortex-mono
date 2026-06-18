@@ -67,6 +67,12 @@ const NETWORK_PATTERNS: RegExp[] = [
   /fetch.failed/i,
   /socket.hang.up/i,
   /DNS.*resolution/i,
+  // Anthropic SDK surfaces transient connection failures with these canonical
+  // messages after its own retries are exhausted (APIConnectionError /
+  // APIConnectionTimeoutError). Match them so they classify as network/retry
+  // rather than falling through to unknown.
+  /connection error/i,
+  /timed out/i,
 ];
 
 // ---------------------------------------------------------------------------

@@ -142,6 +142,9 @@ describe('classifyError', () => {
       'TypeError: fetch failed',
       'socket hang up during TLS handshake',
       'DNS resolution failed for api.anthropic.com',
+      // Anthropic SDK canonical messages (post-retry)
+      'Connection error.',
+      'Request timed out.',
     ];
 
     for (const msg of networkMessages) {
