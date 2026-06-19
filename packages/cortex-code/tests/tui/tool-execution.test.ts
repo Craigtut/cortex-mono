@@ -10,8 +10,8 @@ vi.mock('@animus-labs/cortex', () => ({
   TOOL_RESULT_WORKING_TAGS_REMINDER: '[working-tags-reminder]',
 }));
 
-vi.mock('../../src/tui/renderers/bordered-box.js', () => ({
-  BorderedBox: class MockBorderedBox {
+vi.mock('../../src/tui/renderers/activity-line.js', () => ({
+  ActivityLine: class MockActivityLine {
     setContent(..._args: unknown[]): void {}
     setBelowBox(..._args: unknown[]): void {}
     invalidate(): void {}

@@ -10,8 +10,6 @@ import { collapseContent } from './collapsible-content.js';
 import { StreamingBuffer } from './streaming-buffer.js';
 import { registerRenderer } from './registry.js';
 
-const COLLAPSED_HEAD = 1;
-const COLLAPSED_TAIL = 1;
 const ERROR_HEAD = 4;
 const ERROR_TAIL = 4;
 const STREAMING_WINDOW = 3;
@@ -53,7 +51,7 @@ function getOrCreateBuffer(key: object): StreamingBuffer {
 function commandHeader(command: string, maxLen = 77): string {
   const firstLine = command.split('\n')[0] ?? command;
   const display = firstLine.length > maxLen ? firstLine.slice(0, maxLen - 3) + '...' : firstLine;
-  return `$ ${display}`;
+  return `Ran ${display}`;
 }
 
 const bashRenderer: ToolRenderer = {
@@ -67,44 +65,38 @@ const bashRenderer: ToolRenderer = {
 
   renderResult(result: unknown, details: unknown, context: ToolRenderContext): ToolResultDisplay {
     const d = details as BashDetails | undefined;
+    const header = commandHeader(String(context.args['command'] ?? 'command'));
+    const isError = d ? (d.exitCode !== null && d.exitCode !== 0) : false;
+    const timedOut = d?.timedOut ?? false;
+
+    // Success is the common case: the command ran, no body needed. Output only
+    // surfaces when something failed, so the user sees why without expanding.
+    if (!isError && !timedOut && !context.expanded) {
+      return { headerText: header, contentLines: [], footerText: '' };
+    }
+
     const rawText = extractTextContent(result);
     const text = stripTrailingExitCode(rawText, d?.exitCode) || '(no output)';
     const allLines = text.split('\n').filter(l => l.length > 0 || text.includes('\n'));
-    const isError = d ? (d.exitCode !== null && d.exitCode !== 0) : false;
 
-    // Head+tail truncation: more lines on error
-    const head = isError ? ERROR_HEAD : COLLAPSED_HEAD;
-    const tail = isError ? ERROR_TAIL : COLLAPSED_TAIL;
-
+    // Errors live at the end of output: show the tail.
     const { lines } = collapseContent(allLines, {
-      mode: 'head-tail',
-      limit: head + tail,
-      headLines: head,
-      tailLines: tail,
+      mode: 'tail',
+      limit: ERROR_HEAD + ERROR_TAIL,
       expanded: context.expanded,
     });
 
-    // Header and footer
-    const header = commandHeader(String(context.args['command'] ?? 'command'));
+    const footerText = timedOut
+      ? 'timed out'
+      : (d?.exitCode !== null && d?.exitCode !== undefined && d.exitCode !== 0)
+        ? `exit ${d.exitCode}`
+        : '';
 
-    // Below-box lines for error state
-    const belowBoxLines: string[] = [];
-    if (d?.exitCode !== null && d?.exitCode !== undefined && d.exitCode !== 0) {
-      belowBoxLines.push(chalk.hex(context.theme.accent)(`Command exited with code ${d.exitCode}`));
-    }
-    if (d?.timedOut) {
-      belowBoxLines.push(chalk.hex(context.theme.error)('Command timed out'));
-    }
-
-    const display: ToolResultDisplay = {
+    return {
       headerText: header,
       contentLines: lines,
-      footerText: '',
+      footerText,
     };
-    if (belowBoxLines.length > 0) {
-      display.belowBoxLines = belowBoxLines;
-    }
-    return display;
   },
 
   renderStreamUpdate(update: unknown, context: ToolRenderContext): ToolResultDisplay {
@@ -128,8 +120,7 @@ const bashRenderer: ToolRenderer = {
   },
 
   renderError(error: string, args: Record<string, unknown>, context: ToolRenderContext): ToolResultDisplay {
-    const command = String(args['command'] ?? '').split('\n')[0]?.slice(0, 77) ?? '';
-    const errorLines = error.split('\n');
+    const errorLines = error.split('\n').map(line => chalk.hex(context.theme.error)(line));
 
     const { lines } = collapseContent(errorLines, {
       mode: 'head',
@@ -138,10 +129,9 @@ const bashRenderer: ToolRenderer = {
     });
 
     return {
-      headerText: `$ ${command}`,
+      headerText: commandHeader(String(args['command'] ?? 'command')),
       contentLines: lines,
-      footerText: '',
-      belowBoxLines: [chalk.hex(context.theme.error)(error.split('\n')[0] ?? 'Command failed')],
+      footerText: 'failed',
     };
   },
 };

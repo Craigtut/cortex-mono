@@ -1,9 +1,21 @@
+/**
+ * ToolGroupComponent: folds a run of low-signal tool calls into a single
+ * living line in the activity stream.
+ *
+ *   Exploration / web (read-only): the content already went to the model, so
+ *   the user only needs to know it happened and roughly how much.
+ *
+ *   Changes (Edit / Write): the work product. Folded to "Changed N files +a -r";
+ *   expand (ctrl+e) reveals the per-file diffs.
+ */
+
 import { type Component, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
-import { getToolTheme } from '../theme.js';
+import type { DiffHunk, EditDetails, WriteDetails } from '@animus-labs/cortex';
+import { getToolTheme, type ToolTheme } from '../theme.js';
 import { formatDuration, shortenPath } from './path-utils.js';
 
-export type ToolGroupKind = 'exploration' | 'web';
+export type ToolGroupKind = 'exploration' | 'web' | 'changes';
 
 type GroupedToolStatus = 'pending' | 'success' | 'error';
 
@@ -16,15 +28,39 @@ interface GroupedToolEntry {
   durationMs?: number;
   summary: string;
   error?: string;
+  // Populated for the 'changes' kind.
+  filePath?: string;
+  additions?: number;
+  removals?: number;
+  bodyLines?: string[];
 }
 
-const GROUP_LABELS: Record<ToolGroupKind, { active: string; complete: string }> = {
-  exploration: { active: 'Exploring', complete: 'explored' },
-  web: { active: 'Researching web', complete: 'web research' },
+interface GroupLabel {
+  /** Shown while the group is open. */
+  active: string;
+  /** Past-tense verb for the collapsed headline. */
+  verb: string;
+  /** Noun counted in the headline ("file" -> "4 files"). */
+  noun: string;
+}
+
+const GROUP_LABELS: Record<ToolGroupKind, GroupLabel> = {
+  exploration: { active: 'Exploring', verb: 'Explored', noun: 'file' },
+  web: { active: 'Researching', verb: 'Researched', noun: 'page' },
+  changes: { active: 'Editing', verb: 'Changed', noun: 'file' },
 };
+
+const DOT = '●';
+const ACTIVE_GLYPH = '⋯';
+const CONNECTOR = '⎿';
+const MAX_DIFF_LINES = 12;
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+function pluralize(noun: string, count: number): string {
+  return count === 1 ? noun : `${noun}s`;
 }
 
 function domainFromUrl(url: string): string {
@@ -39,6 +75,42 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function diffCounts(diff: DiffHunk[] | null | undefined): { additions: number; removals: number } {
+  let additions = 0;
+  let removals = 0;
+  for (const hunk of diff ?? []) {
+    for (const line of hunk.lines) {
+      if (line.startsWith('+')) additions += 1;
+      else if (line.startsWith('-')) removals += 1;
+    }
+  }
+  return { additions, removals };
+}
+
+/** Flatten, window around the first change, cap, and colorize a diff for expansion. */
+function formatDiffBody(diff: DiffHunk[] | null | undefined, theme: ToolTheme): string[] {
+  const flat: string[] = [];
+  for (const hunk of diff ?? []) flat.push(...hunk.lines);
+  if (flat.length === 0) return [];
+
+  const firstChange = flat.findIndex(line => line.startsWith('+') || line.startsWith('-'));
+  const start = firstChange > 3 ? firstChange - 3 : 0;
+  let windowed = flat.slice(start);
+  let truncated = false;
+  if (windowed.length > MAX_DIFF_LINES) {
+    windowed = windowed.slice(0, MAX_DIFF_LINES);
+    truncated = true;
+  }
+
+  const out = windowed.map(line => {
+    if (line.startsWith('+')) return chalk.hex(theme.diffAdd)('+ ' + line.slice(1));
+    if (line.startsWith('-')) return chalk.hex(theme.diffRemove)('- ' + line.slice(1));
+    return chalk.hex(theme.diffContext)('  ' + line.slice(1));
+  });
+  if (truncated) out.push(chalk.hex(theme.muted)('…'));
+  return out;
 }
 
 function startSummary(toolName: string, args: Record<string, unknown>): string {
@@ -61,6 +133,10 @@ function startSummary(toolName: string, args: Record<string, unknown>): string {
       const url = String(args['url'] ?? '');
       return `fetch ${domainFromUrl(url)}`;
     }
+    case 'Edit':
+      return `edit ${shortenPath(String(args['file_path'] ?? ''))}`;
+    case 'Write':
+      return `write ${shortenPath(String(args['file_path'] ?? ''))}`;
     default:
       return toolName.toLowerCase();
   }
@@ -127,7 +203,12 @@ export class ToolGroupComponent implements Component {
     if (!entry) return;
     entry.status = 'success';
     entry.durationMs = durationMs;
-    entry.summary = resultSummary(entry.toolName, entry.args, details);
+
+    if (this.groupKind === 'changes') {
+      this.applyChangeDetails(entry, details);
+    } else {
+      entry.summary = resultSummary(entry.toolName, entry.args, details);
+    }
   }
 
   failToolCall(id: string, error: string, durationMs: number): void {
@@ -158,44 +239,119 @@ export class ToolGroupComponent implements Component {
 
   render(width: number): string[] {
     const theme = getToolTheme();
-    const active = this.open;
-    const hasError = this.entries.some(entry => entry.status === 'error');
-    const labels = GROUP_LABELS[this.groupKind];
-    const icon = active
-      ? chalk.hex(theme.statusPending)('\u22EF')
-      : hasError
-        ? chalk.hex(theme.statusError)('\u2717')
-        : chalk.hex(theme.statusSuccess)('\u2713');
-    const label = active ? labels.active : labels.complete;
-    const counts = this.formatCounts();
-    const duration = !active && this.completedAt
-      ? chalk.hex(theme.muted)(` ${formatDuration(this.completedAt - this.startedAt)}`)
-      : '';
-    const summary = `${icon} ${label}${counts ? ` ${chalk.hex(theme.muted)(counts)}` : ''}${duration}`;
 
-    if (!this.expanded) {
+    if (this.open) {
+      const summary = `${chalk.hex(theme.accent)(ACTIVE_GLYPH)}  ${GROUP_LABELS[this.groupKind].active}…${this.activeDescriptor(theme)}`;
       const latest = this.entries[this.entries.length - 1];
-      if (active && latest) {
+      if (latest && !this.expanded) {
         return this.clampLines([
           summary,
-          chalk.hex(theme.muted)(`  latest ${this.formatEntry(latest)}`),
+          chalk.hex(theme.muted)(` ${CONNECTOR} ${latest.summary}`),
         ], width);
       }
-
+      if (this.expanded) {
+        return this.clampLines([summary, ...this.expandedBody(theme)], width);
+      }
       return this.clampLines([summary], width);
     }
 
-    const lines = [
-      summary,
-      ...this.entries.map(entry => `  ${this.formatEntry(entry)}`),
-      chalk.hex(theme.muted)(`  ${this.entries.length} tool calls`),
-    ];
-
-    return this.clampLines(lines, width);
+    const headline = `${this.statusDot(theme)}  ${this.headline(theme)}${this.durationSuffix(theme)}`;
+    if (!this.expanded) {
+      return this.clampLines([headline], width);
+    }
+    return this.clampLines([headline, ...this.expandedBody(theme)], width);
   }
+
+  // -----------------------------------------------------------------------
+  // Internal
+  // -----------------------------------------------------------------------
 
   private findEntry(id: string): GroupedToolEntry | undefined {
     return this.entries.find(entry => entry.id === id);
+  }
+
+  private applyChangeDetails(entry: GroupedToolEntry, details: unknown): void {
+    const theme = getToolTheme();
+    const d = details as (EditDetails & WriteDetails) | undefined;
+    const filePath = String(d?.filePath ?? entry.args['file_path'] ?? '');
+    const shortPath = shortenPath(filePath);
+    const { additions, removals } = diffCounts(d?.diff);
+    const isCreate = (d as WriteDetails | undefined)?.isCreate === true;
+
+    entry.filePath = filePath;
+    entry.additions = additions;
+    entry.removals = removals;
+    entry.bodyLines = formatDiffBody(d?.diff, theme);
+
+    const counts = this.formatCountBadge(additions, removals, theme);
+    const tag = isCreate && !counts ? chalk.hex(theme.muted)('created') : counts;
+    entry.summary = `${shortPath}${tag ? `  ${tag}` : ''}`;
+  }
+
+  /** "+12 -3" with add/remove colors, or '' when there is nothing to count. */
+  private formatCountBadge(additions: number, removals: number, theme: ToolTheme): string {
+    const parts: string[] = [];
+    if (additions > 0) parts.push(chalk.hex(theme.diffAdd)(`+${additions}`));
+    if (removals > 0) parts.push(chalk.hex(theme.diffRemove)(`-${removals}`));
+    return parts.join(' ');
+  }
+
+  /** Muted descriptor shown next to the active label (current tool mix). */
+  private activeDescriptor(theme: ToolTheme): string {
+    const counts = this.formatCounts();
+    return counts ? `  ${chalk.hex(theme.muted)(counts)}` : '';
+  }
+
+  private headline(theme: ToolTheme): string {
+    const label = GROUP_LABELS[this.groupKind];
+    if (this.groupKind === 'changes') {
+      const files = new Set(this.entries.map(e => e.filePath ?? e.summary)).size;
+      let additions = 0;
+      let removals = 0;
+      for (const entry of this.entries) {
+        additions += entry.additions ?? 0;
+        removals += entry.removals ?? 0;
+      }
+      const badge = this.formatCountBadge(additions, removals, theme);
+      return `${label.verb} ${files} ${pluralize(label.noun, files)}${badge ? `  ${badge}` : ''}`;
+    }
+    const count = this.entries.length;
+    return `${label.verb} ${count} ${pluralize(label.noun, count)}`;
+  }
+
+  private durationSuffix(theme: ToolTheme): string {
+    if (!this.completedAt) return '';
+    const elapsed = this.completedAt - this.startedAt;
+    if (elapsed < 1000) return '';
+    return `  ${chalk.hex(theme.muted)(formatDuration(elapsed))}`;
+  }
+
+  private expandedBody(theme: ToolTheme): string[] {
+    const lines: string[] = [];
+    for (const entry of this.entries) {
+      lines.push(`   ${this.entryDot(entry, theme)} ${entry.summary}${this.entryError(entry, theme)}`);
+      for (const body of entry.bodyLines ?? []) {
+        lines.push(`     ${body}`);
+      }
+    }
+    return lines;
+  }
+
+  private statusDot(theme: ToolTheme): string {
+    const hasError = this.entries.some(entry => entry.status === 'error');
+    return hasError
+      ? chalk.hex(theme.statusError)(DOT)
+      : chalk.hex(theme.statusSuccess)(DOT);
+  }
+
+  private entryDot(entry: GroupedToolEntry, theme: ToolTheme): string {
+    if (entry.status === 'error') return chalk.hex(theme.statusError)(DOT);
+    if (entry.status === 'pending') return chalk.hex(theme.accent)(ACTIVE_GLYPH);
+    return chalk.hex(theme.statusSuccess)(DOT);
+  }
+
+  private entryError(entry: GroupedToolEntry, theme: ToolTheme): string {
+    return entry.error ? chalk.hex(theme.error)(`  ${entry.error}`) : '';
   }
 
   private formatCounts(): string {
@@ -207,20 +363,6 @@ export class ToolGroupComponent implements Component {
     return [...counts.entries()]
       .map(([name, count]) => count > 1 ? `${name} x${count}` : name)
       .join(', ');
-  }
-
-  private formatEntry(entry: GroupedToolEntry): string {
-    const theme = getToolTheme();
-    const icon = entry.status === 'success'
-      ? chalk.hex(theme.statusSuccess)('\u2713')
-      : entry.status === 'error'
-        ? chalk.hex(theme.statusError)('\u2717')
-        : chalk.hex(theme.statusPending)('\u22EF');
-    const duration = entry.durationMs !== undefined
-      ? chalk.hex(theme.muted)(` ${formatDuration(entry.durationMs)}`)
-      : '';
-    const error = entry.error ? chalk.hex(theme.error)(` ${entry.error}`) : '';
-    return `${icon} ${entry.summary}${duration}${error}`;
   }
 
   private clampLines(lines: string[], width: number): string[] {

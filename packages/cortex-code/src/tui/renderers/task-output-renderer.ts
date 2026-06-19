@@ -30,7 +30,7 @@ const taskOutputRenderer: ToolRenderer = {
     const action = String(args['action'] ?? 'poll');
 
     return {
-      headerText: `task ${action} ${chalk.hex(context.theme.muted)(taskId)}`,
+      headerText: `Task ${action} ${chalk.hex(context.theme.muted)(taskId)}`,
       contentLines: [],
       footerText: '',
     };
@@ -58,7 +58,7 @@ const taskOutputRenderer: ToolRenderer = {
     const action = d?.action ?? String(context.args['action'] ?? 'poll');
 
     return {
-      headerText: `task ${action} ${chalk.hex(context.theme.muted)(taskId)}`,
+      headerText: `Task ${action} ${chalk.hex(context.theme.muted)(taskId)}`,
       contentLines: lines,
       footerText: chalk.hex(statusColor)(statusText),
     };

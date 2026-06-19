@@ -16,7 +16,7 @@ export { getToolTheme } from '../theme.js';
 export type { ToolTheme } from '../theme.js';
 
 // Components
-export { BorderedBox } from './bordered-box.js';
+export { ActivityLine } from './activity-line.js';
 export { ToolExecutionComponent } from './tool-execution.js';
 export { ToolGroupComponent } from './tool-group.js';
 export type { ToolGroupKind } from './tool-group.js';

@@ -48,7 +48,7 @@ const subAgentRenderer: ToolRenderer = {
       : '';
 
     return {
-      headerText: `subagent${modelLabel}${modeLabel}`,
+      headerText: `Delegated${modelLabel}${modeLabel}`,
       contentLines: descLines,
       footerText: '',
     };
@@ -94,19 +94,15 @@ const subAgentRenderer: ToolRenderer = {
     const modelId = d?.modelId ?? (context.args['modelId'] as string | undefined);
 
     // Header
-    const headerParts: string[] = ['subagent'];
+    const headerParts: string[] = ['Delegated'];
     if (modelId) {
       headerParts.push(chalk.hex(context.theme.muted)(`(${modelId})`));
     }
 
-    // Footer: stats
+    // Footer: stats. Duration is owned by the activity line (shown when slow).
     const statsParts: string[] = [];
     if (d?.turns) {
       statsParts.push(`${d.turns} turns`);
-    }
-    if (d?.durationMs) {
-      const sec = (d.durationMs / 1000).toFixed(1);
-      statsParts.push(`${sec}s`);
     }
     if (d?.status && d.status !== 'completed') {
       statsParts.push(d.status);
@@ -157,7 +153,7 @@ const subAgentRenderer: ToolRenderer = {
     }
 
     return {
-      headerText: u?.toolCalls ? `subagent (${u.toolCalls.length} tools)` : 'subagent',
+      headerText: u?.toolCalls ? `Delegated (${u.toolCalls.length} tools)` : 'Delegated',
       contentLines: contentLines.length > 0
         ? contentLines
         : [chalk.hex(context.theme.muted)('Working...')],
@@ -167,7 +163,7 @@ const subAgentRenderer: ToolRenderer = {
 
   renderError(error: string, _args: Record<string, unknown>, context: ToolRenderContext): ToolResultDisplay {
     return {
-      headerText: 'subagent',
+      headerText: 'Delegated',
       contentLines: [chalk.hex(context.theme.error)(error)],
       footerText: '',
     };

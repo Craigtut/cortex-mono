@@ -27,19 +27,20 @@ import type { FreezeDiagnostics } from '../diagnostics/freeze.js';
  * the tool component.
  */
 
-/** Tools that render as compact single-line summaries (no content box). */
-const COMPACT_TOOLS = new Set([
-  'Write', 'TaskOutput',
-]);
-
+/**
+ * Low-signal and work-product tools that fold into a single living group line
+ * rather than each getting their own row.
+ */
 const GROUPED_TOOLS = new Map<string, ToolGroupKind>([
   ['Read', 'exploration'],
   ['Glob', 'exploration'],
   ['Grep', 'exploration'],
   ['WebFetch', 'web'],
+  ['Edit', 'changes'],
+  ['Write', 'changes'],
 ]);
 
-type TranscriptItemCategory = 'compact-tool' | 'tool-group' | 'routine-notification' | 'other' | 'spacer' | null;
+type TranscriptItemCategory = 'activity' | 'routine-notification' | 'other' | 'spacer' | null;
 
 interface ExpandableTranscriptItem {
   readonly isExpanded: boolean;
@@ -116,12 +117,13 @@ export class TranscriptManager {
    * Add a spacer before a new item unless:
    * - Nothing has been added yet
    * - The previous item was already a spacer
-   * - A compact tool follows another compact tool
+   * - One activity row (tool line or group) follows another: the activity
+   *   stream packs contiguously, with blank lines only around prose.
    */
-  private maybeAddSpacer(isCompactTool: boolean): void {
+  private maybeAddSpacer(nextIsActivity: boolean): void {
     if (this.lastAddedItemCategory === null) return;
     if (this.lastAddedItemCategory === 'spacer') return;
-    if (isCompactTool && this.lastAddedItemCategory === 'compact-tool') return;
+    if (nextIsActivity && this.lastAddedItemCategory === 'activity') return;
 
     this.chatContainer.addChild(new Spacer(1));
     // Don't set lastAddedItemCategory here; the caller sets it for the actual item.
@@ -261,15 +263,14 @@ export class TranscriptManager {
     }
 
     this.closeActiveToolGroups();
-    const isCompact = COMPACT_TOOLS.has(toolName);
-    this.maybeAddSpacer(isCompact);
+    this.maybeAddSpacer(true);
 
     const toolComponent = new ToolExecutionComponent(toolName, this.tui);
     toolComponent.start(args);
     this.toolCalls.set(toolCallId, toolComponent);
     this.lastExpandable = toolComponent;
     this.chatContainer.addChild(toolComponent);
-    this.lastAddedItemCategory = isCompact ? 'compact-tool' : 'other';
+    this.lastAddedItemCategory = 'activity';
     this.diagnostics?.recordTranscriptMutation('tool_start');
     this.throttledRender();
   }
@@ -531,11 +532,11 @@ export class TranscriptManager {
       }
     }
 
-    this.maybeAddSpacer(false);
+    this.maybeAddSpacer(true);
     const group = new ToolGroupComponent(groupKind);
     this.chatContainer.addChild(group);
     this.activeToolGroups.set(groupKind, group);
-    this.lastAddedItemCategory = 'tool-group';
+    this.lastAddedItemCategory = 'activity';
     return group;
   }
 

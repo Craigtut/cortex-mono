@@ -2,7 +2,7 @@
  * Types for the per-tool renderer system.
  *
  * Each tool type registers a ToolRenderer that controls how its call header
- * and result are displayed inside a BorderedBox. Unknown tools fall back to
+ * and result are displayed inside an ActivityLine. Unknown tools fall back to
  * GenericToolRenderer.
  */
 

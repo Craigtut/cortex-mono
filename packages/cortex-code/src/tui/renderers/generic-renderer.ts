@@ -1,42 +1,36 @@
 /**
  * Generic fallback renderer for unknown tools and MCP tools.
  *
- * Shows tool name (with MCP namespace) in footer, args as compact JSON,
- * result as text or JSON.
+ * Shows a clean "server: tool" name. Raw JSON args are intentionally not
+ * displayed (noise); the result is shown collapsed.
  */
 
-import chalk from 'chalk';
 import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDisplay } from './types.js';
 import { collapseContent } from './collapsible-content.js';
 
-const DEFAULT_COLLAPSED_LINES = 5;
-const MAX_ARGS_WIDTH = 80;
+const DEFAULT_COLLAPSED_LINES = 4;
 
 /**
- * Format a tool name for display. MCP tools use "server__tool" format;
- * display as "server/tool" for readability.
+ * Format a tool name for display. MCP tools use "mcp__server__tool" format;
+ * strip the prefix and render as "server: tool" for readability.
  */
 function formatToolName(name: string): string {
-  if (name.includes('__')) {
-    return name.replace('__', '/');
+  let n = name;
+  if (n.startsWith('mcp__')) {
+    n = n.slice(5);
   }
-  return name.toLowerCase();
+  if (n.includes('__')) {
+    const [server, ...rest] = n.split('__');
+    return `${server}: ${rest.join('_')}`;
+  }
+  return n.toLowerCase();
 }
 
 export const genericRenderer: ToolRenderer = {
-  renderCall(args: Record<string, unknown>, context: ToolRenderContext): ToolCallDisplay {
-    const argsJson = JSON.stringify(args);
-    const argsText = Object.keys(args).length > 0
-      ? chalk.hex(context.theme.muted)(
-          argsJson.length > MAX_ARGS_WIDTH
-            ? argsJson.slice(0, MAX_ARGS_WIDTH - 3) + '...'
-            : argsJson,
-        )
-      : '';
-
+  renderCall(_args: Record<string, unknown>, context: ToolRenderContext): ToolCallDisplay {
     return {
       headerText: formatToolName(context.toolName),
-      contentLines: argsText ? [argsText] : [],
+      contentLines: [],
       footerText: '',
     };
   },

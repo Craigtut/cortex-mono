@@ -2,14 +2,14 @@
  * ToolExecutionComponent: pi-tui Component that manages the full lifecycle
  * of a tool call display.
  *
- * Creates a BorderedBox internally, looks up the ToolRenderer from the
+ * Creates an ActivityLine internally, looks up the ToolRenderer from the
  * registry, and manages state transitions: pending -> streaming -> success/error.
  * Handles per-tool expand/collapse state and animated spinner during execution.
  */
 
 import type { Component, TUI } from '@earendil-works/pi-tui';
 import { estimateTokens, TOOL_RESULT_WORKING_TAGS_REMINDER } from '@animus-labs/cortex';
-import { BorderedBox } from './bordered-box.js';
+import { ActivityLine } from './activity-line.js';
 import { getRenderer } from './registry.js';
 import { getToolTheme } from '../theme.js';
 import type {
@@ -30,7 +30,7 @@ export class ToolExecutionComponent implements Component {
   static lastFocused: ToolExecutionComponent | null = null;
   private static readonly spinnerGroups = new Map<TUI, SpinnerGroup>();
 
-  private readonly box = new BorderedBox();
+  private readonly box = new ActivityLine();
   private readonly renderer: ToolRenderer;
   private readonly toolName: string;
   private readonly tui: TUI | null;

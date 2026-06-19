@@ -32,7 +32,7 @@ function context(command = 'npm audit --omit=dev --json'): ToolRenderContext {
 }
 
 describe('bashRenderer', () => {
-  it('shows a nonzero exit code once as command outcome metadata', () => {
+  it('surfaces a nonzero exit code as footer metadata, not duplicated in the body', () => {
     const display = bashRenderer.renderResult(
       {
         content: [{
@@ -45,6 +45,18 @@ describe('bashRenderer', () => {
     );
 
     expect(display.contentLines.join('\n')).not.toContain('Exit code: 1');
-    expect(display.belowBoxLines?.join('\n')).toContain('Command exited with code 1');
+    expect(display.footerText).toContain('exit 1');
+  });
+
+  it('uses the "Ran" verb and hides output for a successful command', () => {
+    const display = bashRenderer.renderResult(
+      { content: [{ type: 'text', text: 'all good\nmore output' }] },
+      { exitCode: 0 },
+      context('npm run build'),
+    );
+
+    expect(display.headerText).toBe('Ran npm run build');
+    expect(display.contentLines).toHaveLength(0);
+    expect(display.footerText).toBe('');
   });
 });
