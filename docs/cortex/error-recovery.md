@@ -34,14 +34,25 @@ The classifier checks error strings against provider-specific regex patterns. Pa
 ```
 /invalid.api.key/i
 /unauthorized/i
+/\b401\b/
 /not.logged.in/i
+/login.*required/i
+/please.*log.?in/i
 /authentication.required/i
+/re-?authenticate/i
 /expired.*token/i
+/token.*expired/i
+/token.*(revoked|invalid)/i
+/refresh.*token/i
+/oauth.*(fail|error|expire|invalid|denied|revoke)/i
+/session.*expired/i
 /invalid.*credentials/i
 /api.key.*invalid/i
 /permission.denied.*key/i
 /Could not resolve API key/i
 ```
+
+The `401`, `oauth`, `refresh.*token`, `token.*expired`, and `session.*expired` patterns cover OAuth access-token expiry where the refresh token is itself revoked or expired. In that case pi-ai's `getOAuthApiKey()` (invoked from the `getApiKey` callback) throws during credential resolution; the resolution error is surfaced as the cause rather than the downstream provider error (see "Auth Failure Detection").
 
 **Rate Limit:**
 ```
@@ -141,7 +152,7 @@ cortexAgent.onError((error: ClassifiedError) => {
 });
 ```
 
-This fires for any error during the agentic loop (LLM call failures, not tool execution errors; those are handled by pi-agent-core internally and don't crash the loop).
+This fires for any LLM call failure, whether it happens in the agentic loop (`prompt()`) or in a direct completion (`directComplete` / `structuredComplete` / `utilityComplete`, used for phases like THOUGHT and REFLECT). All four paths route failures through the same `emitError()` helper. Tool execution errors are not surfaced here; those are handled by pi-agent-core internally and don't crash the loop.
 
 ### Consumer Error Routing
 
@@ -192,11 +203,12 @@ Two detection points:
 
 ### Pre-Call (Credential Resolution)
 
-The `CortexCredentialService.resolveApiKey()` callback (provided to pi-ai via `getApiKey`) throws if:
+The `getApiKey` callback (e.g. a consumer's `CortexCredentialService.resolveApiKey()`) throws if:
 - No API key is configured for the provider
 - The encrypted key cannot be decrypted (vault locked)
+- An OAuth access token is expired and its refresh token is revoked/expired (refresh fails)
 
-These throw before the LLM call happens. The `CortexAgent` catches them and classifies as `authentication` / `fatal`.
+A resolution failure is remembered, not swallowed. The completion still attempts pi-ai's env-var fallback (so a consumer whose callback can't resolve but who has `ANTHROPIC_API_KEY` set still works). If the call then fails, the remembered resolution error is surfaced as the cause (it is more actionable than the downstream provider error) and classified as `authentication` / `fatal`. In the agentic loop, pi-agent-core invokes `getApiKey` and stores the failure on `agent.state.errorMessage`, which `CortexAgent` re-throws and classifies the same way.
 
 ### Post-Call (Provider Rejection)
 
