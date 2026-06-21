@@ -53,6 +53,7 @@ import {
   createToolResultPersistor,
   type SessionMeta,
 } from './persistence/sessions.js';
+import { TranscriptWriter, extractToolResultText } from './persistence/transcript-writer.js';
 import { getCommand, registerBuiltinCommands } from './commands/index.js';
 import { dismissVersion, type UpdateInfo } from './updates/checker.js';
 import { runNpmUpgrade } from './updates/upgrade.js';
@@ -119,6 +120,7 @@ export class Session {
   private subAgentActivity = new Map<string, Map<string, { name: string; status: string; summary?: string }>>();
   private readonly freezeDiagnostics: FreezeDiagnostics;
   private readonly activity: FileSessionActivityReporter;
+  private readonly transcriptWriter: TranscriptWriter;
   private mcpWatcher: McpConfigWatcher | null = null;
   private mcpReloadPending: McpConfigChangeReason | null = null;
   private mcpReloadInFlight = false;
@@ -163,6 +165,19 @@ export class Session {
     this.activity = new FileSessionActivityReporter(this.sessionId, this.cwd, {
       onWriteError: (error) => {
         log.warn('Session activity write failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
+    // Durable append-only conversation log, separate from the lossy history.json
+    // snapshot. Read by sibling apps to summarize where a session left off.
+    this.transcriptWriter = new TranscriptWriter(this.sessionId, this.cwd, {
+      cliVersion: PKG_VERSION,
+      provider: this.provider,
+      model: this.modelId,
+      resume: this.isResume,
+      onWriteError: (error) => {
+        log.warn('Session transcript write failed', {
           error: error instanceof Error ? error.message : String(error),
         });
       },
@@ -284,6 +299,9 @@ export class Session {
     // Show banner. The split-flap settle plays only for a fresh session; a
     // resumed session opens straight to the settled logo.
     const branch = await this.getGitBranch();
+    // Settle the transcript header now that the git branch is known, before any
+    // turn events can fire. session_meta is the first line of a fresh transcript.
+    await this.transcriptWriter.initialize({ gitBranch: branch });
     const project = this.cwd.split('/').pop() ?? '';
     this.app.transcript.addBanner(PKG_VERSION, project, branch, this.updateInfo ?? undefined, {
       animate: !this.isResume,
@@ -381,6 +399,7 @@ export class Session {
     if (code === 0) {
       await this.activity.recordDone({ code: 0, signal: null, reason: 'upgrade_completed' });
       await this.activity.flush();
+      await this.transcriptWriter.flush();
       console.log(`\n✓ Updated to ${info.latestVersion}. Restart with: cortex\n`);
       process.exit(0);
     }
@@ -417,6 +436,7 @@ export class Session {
       log.info('Steering agent with user message', { text: text.slice(0, 100) });
       void this.activity.recordWorking();
       this.app!.transcript.addUserMessage(text);
+      this.transcriptWriter.addUserMessage(text);
       this.titleManager?.recordUserPrompt(text);
       this.agent.steer(text);
       return;
@@ -426,6 +446,7 @@ export class Session {
 
     // Add user message to transcript
     this.app!.transcript.addUserMessage(text);
+    this.transcriptWriter.addUserMessage(text);
     this.titleManager?.recordUserPrompt(text);
 
     // Update ephemeral context
@@ -821,9 +842,14 @@ export class Session {
       }
     });
 
-    // Turn complete (finalize assistant message)
+    // Turn complete (finalize assistant message). onTurnComplete fires once per
+    // LLM turn with the final user-facing text already assembled (working tags
+    // stripped), so it is the clean source for the durable transcript's
+    // assistant_message record. We record here rather than on the raw `turn_end`
+    // bridge event to avoid re-accumulating streamed response_chunks.
     this.agent.onTurnComplete((output: AgentTextOutput) => {
       this.app!.transcript.finalizeAssistantMessage(output.userFacing);
+      this.transcriptWriter.addAssistantMessage(output.userFacing);
       assistantStarted = false;
       rawStreamText = '';
       workingTagOpen = false;
@@ -852,6 +878,11 @@ export class Session {
     // Error handling with per-category display
     this.agent.onError((error: ClassifiedError) => {
       void this.activity.recordError(error, error.severity === 'fatal');
+      // Record the failure in the durable transcript so a turn that errored
+      // before completing is visible. Skip user-initiated aborts (cancelled).
+      if (error.category !== 'cancelled') {
+        this.transcriptWriter.addError(error.originalMessage ?? String(error), error.category);
+      }
       switch (error.category) {
         case 'rate_limit':
           this.app!.transcript.addNotification(
@@ -892,6 +923,12 @@ export class Session {
     this.agent.onPostCompaction((result: CompactionResult) => {
       const beforeK = (result.tokensBefore / 1000).toFixed(1);
       const afterK = (result.tokensAfter / 1000).toFixed(1);
+      // Mark in the durable transcript where context was summarized away. The
+      // full pre-compaction turns remain earlier in this transcript.
+      this.transcriptWriter.addCompaction({
+        beforeTokens: result.tokensBefore,
+        afterTokens: result.tokensAfter,
+      });
       this.app!.transcript.addNotification(
         'Context Compacted',
         `Reduced from ${beforeK}k to ${afterK}k tokens`,
@@ -926,6 +963,7 @@ export class Session {
     // Sub-agent events: rendered as tool calls via the SubAgent renderer
     this.agent.onSubAgentSpawned((taskId, instructions, background) => {
       this.subAgentActivity.set(taskId, new Map());
+      this.transcriptWriter.addSubAgent(taskId, 'spawned', { summary: instructions, background });
       this.app!.transcript.startSubAgentCall(taskId, {
         instructions,
         background,
@@ -934,11 +972,13 @@ export class Session {
     });
 
     this.agent.onSubAgentCompleted((taskId, result, status, usage) => {
+      this.transcriptWriter.addSubAgent(taskId, 'completed', { summary: result });
       this.app!.transcript.completeSubAgentCall(taskId, result, status, usage);
       this.subAgentActivity.delete(taskId);
     });
 
     this.agent.onSubAgentFailed((taskId, error) => {
+      this.transcriptWriter.addSubAgent(taskId, 'failed', { error });
       this.app!.transcript.failSubAgentCall(taskId, error);
       this.subAgentActivity.delete(taskId);
     });
@@ -981,6 +1021,7 @@ export class Session {
         args,
         ...(event.childTaskId ? { childTaskId: event.childTaskId } : {}),
       });
+      this.transcriptWriter.addToolCall(toolCallId, toolName, args);
     });
 
     bridge.on('tool_call_end', (event: CortexEvent) => {
@@ -988,14 +1029,19 @@ export class Session {
       const data = event.data as Record<string, unknown> | undefined;
       const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
       const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? data?.['id'] ?? '');
+      const isError = p?.isError ?? Boolean(data?.['isError']);
       this.activity.recordToolEnded({
         toolCallId,
         toolName,
         durationMs: p?.durationMs ?? Number(data?.['durationMs'] ?? data?.['duration'] ?? 0),
-        isError: p?.isError ?? Boolean(data?.['isError']),
+        isError,
         ...(p?.error ? { error: p.error } : {}),
         ...(event.childTaskId ? { childTaskId: event.childTaskId } : {}),
       });
+      const output = isError && p?.error
+        ? p.error
+        : extractToolResultText(p?.result ?? data?.['result']);
+      this.transcriptWriter.addToolResult(toolCallId, isError, output);
     });
   }
 
@@ -1230,6 +1276,8 @@ export class Session {
 
     // Flush pending saves
     await this.saver.flush();
+    // Drain any queued transcript appends (best-effort; never throws).
+    await this.transcriptWriter.flush();
 
     // Immediate final save
     if (this.agent) {
