@@ -34,6 +34,16 @@ describe('classifyError', () => {
       'Your api key is invalid',
       'Permission denied for this key',
       'Could not resolve API key for provider anthropic',
+      // OAuth token expiry / refresh failures (refresh token revoked or expired)
+      'Request failed with status code 401',
+      'HTTP 401 Unauthorized',
+      'Please log in to continue',
+      'Your session has expired, please re-authenticate',
+      'OAuth token refresh failed for provider anthropic',
+      'Failed to refresh token: refresh_token expired',
+      'The access token has expired',
+      'Token has been revoked',
+      'Login required to access this resource',
     ];
 
     for (const msg of authMessages) {

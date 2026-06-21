@@ -20,9 +20,18 @@ import type { ClassifiedError, ErrorCategory, ErrorSeverity } from './types.js';
 const AUTHENTICATION_PATTERNS: RegExp[] = [
   /invalid.api.key/i,
   /unauthorized/i,
+  /\b401\b/,
   /not.logged.in/i,
+  /login.*required/i,
+  /please.*log.?in/i,
   /authentication.required/i,
+  /re-?authenticate/i,
   /expired.*token/i,
+  /token.*expired/i,
+  /token.*(revoked|invalid)/i,
+  /refresh.*token/i,
+  /oauth.*(fail|error|expire|invalid|denied|revoke)/i,
+  /session.*expired/i,
   /invalid.*credentials/i,
   /api.key.*invalid/i,
   /permission.denied.*key/i,
@@ -135,7 +144,7 @@ export interface ClassifyErrorOptions {
  *
  * Checks error strings against regex patterns in priority order (first match wins):
  * 1. Cancelled (if wasAborted is true)
- * 2. Authentication (9 patterns)
+ * 2. Authentication (18 patterns)
  * 3. Rate limit (7 patterns)
  * 4. Context overflow (4 fallback patterns; delegates to pi-ai isContextOverflow when available)
  * 5. Server error (7 patterns)
