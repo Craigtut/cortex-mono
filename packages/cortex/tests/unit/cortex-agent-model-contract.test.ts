@@ -340,4 +340,123 @@ describe('CortexAgent model contract', () => {
       ),
     ).rejects.toMatchObject({ name: 'AbortError' });
   });
+
+  // -----------------------------------------------------------------------
+  // Error surfacing from direct (non-agentic) completion paths.
+  // THOUGHT / REFLECT / utility calls run through directComplete /
+  // structuredComplete / utilityComplete. Their failures must reach onError
+  // just like agentic-loop failures, so consumers can detect auth problems.
+  // -----------------------------------------------------------------------
+
+  const ANTHROPIC_MODEL = {
+    provider: 'anthropic',
+    name: 'claude-sonnet-4-20250514',
+    id: 'claude-sonnet-4-20250514',
+    api: 'anthropic',
+    contextWindow: 200_000,
+  };
+
+  it('emits an authentication onError and rethrows when a direct completion fails with an auth error', async () => {
+    mockGetModel.mockReturnValue(ANTHROPIC_MODEL);
+    mockComplete.mockRejectedValue(new Error('Request failed with status code 401'));
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+    });
+
+    const errors: Array<{ category: string; severity: string; originalMessage: string }> = [];
+    agent.onError((e) => errors.push(e));
+
+    await expect(
+      agent.directComplete({ systemPrompt: 'System', messages: [{ role: 'user', content: 'Hello' }] }),
+    ).rejects.toThrow(/401/);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.category).toBe('authentication');
+    expect(errors[0]!.severity).toBe('fatal');
+  });
+
+  it('prefers the credential-resolution error as the cause when a direct completion fails', async () => {
+    mockGetModel.mockReturnValue(ANTHROPIC_MODEL);
+    // With no usable key, pi-ai fails generically; the credential error is more actionable.
+    mockComplete.mockRejectedValue(new Error('Could not resolve API key'));
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+      getApiKey: async () => {
+        throw new Error('OAuth token refresh failed for provider anthropic');
+      },
+    });
+
+    const errors: Array<{ category: string; severity: string; originalMessage: string }> = [];
+    agent.onError((e) => errors.push(e));
+
+    await expect(
+      agent.directComplete({ systemPrompt: 'System', messages: [{ role: 'user', content: 'Hello' }] }),
+    ).rejects.toThrow(/OAuth token refresh failed/);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.category).toBe('authentication');
+    expect(errors[0]!.originalMessage).toMatch(/OAuth token refresh failed/);
+  });
+
+  it('does not surface an error when credential resolution fails but env fallback succeeds', async () => {
+    mockGetModel.mockReturnValue(ANTHROPIC_MODEL);
+    mockComplete.mockResolvedValue({
+      content: [{ type: 'text', text: 'ok via env' }],
+      usage: makeUsage(),
+    });
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+      getApiKey: async () => {
+        throw new Error('No credentials configured for provider anthropic');
+      },
+    });
+
+    const errors: Array<{ category: string }> = [];
+    agent.onError((e) => errors.push(e));
+
+    const text = await agent.directComplete({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    expect(text).toBe('ok via env');
+    expect(errors).toHaveLength(0);
+  });
+
+  it('classifies an aborted direct completion as cancelled, not a fatal error', async () => {
+    mockGetModel.mockReturnValue(ANTHROPIC_MODEL);
+    mockComplete.mockResolvedValue({ stopReason: 'aborted', content: [], usage: makeUsage() });
+
+    const providerManager = new ProviderManager();
+    const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+    const agent = await CortexAgent.create({
+      model,
+      workingDirectory: '/tmp/cortex-model-contract',
+      initialBasePrompt: 'Test prompt',
+    });
+
+    const errors: Array<{ category: string }> = [];
+    agent.onError((e) => errors.push(e));
+
+    await expect(
+      agent.directComplete({ systemPrompt: 'System', messages: [{ role: 'user', content: 'Hello' }] }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(errors.every((e) => e.category === 'cancelled')).toBe(true);
+  });
 });

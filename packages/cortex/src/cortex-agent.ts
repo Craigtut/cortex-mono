@@ -802,26 +802,7 @@ export class CortexAgent {
         );
       }
 
-      const classified = classifyError(error, {
-        wasAborted: this.isAborted(),
-      });
-
-      this.logger.warn('[CortexAgent] loop error', {
-        category: classified.category,
-        severity: classified.severity,
-        message: classified.originalMessage,
-      });
-
-      // Emit to error handlers
-      for (const handler of this.errorHandlers) {
-        try {
-          handler(classified);
-        } catch (err) {
-          this.logger.error('[CortexAgent] onError handler threw', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
+      this.emitError(error);
 
       throw error;
     } finally {
@@ -868,6 +849,65 @@ export class CortexAgent {
   steer(message: string): void {
     if (!this._isPrompting) return; // no-op if not running
     this.agent.steer({ role: 'user', content: message });
+  }
+
+  /**
+   * Classify an error and dispatch it to all registered onError handlers.
+   *
+   * Shared by the agentic loop (prompt) and the direct completion paths
+   * (directComplete / structuredComplete / utilityComplete) so every LLM
+   * call failure surfaces to consumers through the same onError channel,
+   * regardless of which phase produced it.
+   *
+   * @param error - The error to classify and surface
+   * @param wasAborted - Override for abort detection (defaults to this.isAborted())
+   * @returns The classified error (so callers can branch on category if needed)
+   */
+  private emitError(error: Error, wasAborted?: boolean): ClassifiedError {
+    const classified = classifyError(error, {
+      wasAborted: wasAborted ?? this.isAborted(),
+    });
+
+    this.logger.warn('[CortexAgent] error', {
+      category: classified.category,
+      severity: classified.severity,
+      message: classified.originalMessage,
+    });
+
+    for (const handler of this.errorHandlers) {
+      try {
+        handler(classified);
+      } catch (handlerErr) {
+        this.logger.error('[CortexAgent] onError handler threw', {
+          error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
+        });
+      }
+    }
+
+    return classified;
+  }
+
+  /**
+   * Handle an error thrown by a direct (non-agentic) completion path
+   * (directComplete / structuredComplete / utilityComplete).
+   *
+   * Prefers the original credential-resolution error as the cause when present,
+   * since "OAuth refresh failed" / "Vault is sealed" is more actionable than the
+   * downstream provider error that results from calling without a key. Classifies
+   * and emits the error through onError (so auth failures in THOUGHT/REFLECT/
+   * utility phases surface like loop failures), then returns the error to throw.
+   */
+  private surfaceDirectError(
+    err: unknown,
+    keyError: Error | undefined,
+    signal?: AbortSignal,
+  ): Error {
+    const downstream = err instanceof Error ? err : new Error(String(err));
+    const aborted =
+      this.isAborted() || (signal?.aborted ?? false) || downstream.name === 'AbortError';
+    const cause = aborted ? downstream : (keyError ?? downstream);
+    this.emitError(cause, aborted);
+    return cause;
   }
 
   private buildDirectCompletionOptions(
@@ -918,14 +958,17 @@ export class CortexAgent {
       );
     }
 
-    // Resolve API key for the provider
+    // Resolve API key for the provider. A resolution failure is remembered
+    // rather than swallowed: pi-ai may still succeed via env vars, but if the
+    // call below fails we surface this (more actionable) cause instead.
     const provider = this.primaryModel.provider;
     let apiKey: string | undefined;
+    let keyError: Error | undefined;
     if (this.config.getApiKey) {
       try {
         apiKey = await this.config.getApiKey(provider);
-      } catch {
-        // If key resolution fails, let pi-ai try env vars
+      } catch (err) {
+        keyError = err instanceof Error ? err : new Error(String(err));
       }
     }
 
@@ -933,36 +976,40 @@ export class CortexAgent {
 
     const completeOptions = this.buildDirectCompletionOptions(apiKey, options);
 
-    // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
-    // provider-specific convertMessages() handle all format normalization:
-    // UserMessage (string or content blocks), AssistantMessage (content block
-    // arrays with text/thinking/toolCall), and ToolResultMessage.
     const directStartMs = Date.now();
-    const result = await completeFn(
-      this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
-      {
-        systemPrompt: context.systemPrompt,
-        messages: context.messages,
-      } as Parameters<typeof completeFn>[1],
-      completeOptions as Parameters<typeof completeFn>[2] | undefined,
-    );
+    try {
+      // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
+      // provider-specific convertMessages() handle all format normalization:
+      // UserMessage (string or content blocks), AssistantMessage (content block
+      // arrays with text/thinking/toolCall), and ToolResultMessage.
+      const result = await completeFn(
+        this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
+        {
+          systemPrompt: context.systemPrompt,
+          messages: context.messages,
+        } as Parameters<typeof completeFn>[1],
+        completeOptions as Parameters<typeof completeFn>[2] | undefined,
+      );
 
-    // Caller-initiated cancellation takes precedence over error/usage handling.
-    this.throwIfAborted(result, options?.signal);
+      // Caller-initiated cancellation takes precedence over error/usage handling.
+      this.throwIfAborted(result, options?.signal);
 
-    // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
-    this.checkForSilentError(result);
+      // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
+      this.checkForSilentError(result);
 
-    // Capture usage from the AssistantMessage response
-    this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      // Capture usage from the AssistantMessage response
+      this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-    this.logger.debug('[CortexAgent] directComplete', {
-      durationMs: Date.now() - directStartMs,
-      usage: this._lastDirectUsage,
-    });
+      this.logger.debug('[CortexAgent] directComplete', {
+        durationMs: Date.now() - directStartMs,
+        usage: this._lastDirectUsage,
+      });
 
-    // Extract text from the AssistantMessage response
-    return this.extractTextFromAssistantMessage(result);
+      // Extract text from the AssistantMessage response
+      return this.extractTextFromAssistantMessage(result);
+    } catch (err) {
+      throw this.surfaceDirectError(err, keyError, options?.signal);
+    }
   }
 
   /**
@@ -1000,57 +1047,64 @@ export class CortexAgent {
       parameters: schema,
     };
 
-    // Resolve API key for the provider
+    // Resolve API key for the provider. A resolution failure is remembered
+    // rather than swallowed (see directComplete) so a downstream failure can be
+    // reported with the more actionable credential cause.
     const provider = this.primaryModel.provider;
     let apiKey: string | undefined;
+    let keyError: Error | undefined;
     if (this.config.getApiKey) {
       try {
         apiKey = await this.config.getApiKey(provider);
-      } catch {
-        // If key resolution fails, let pi-ai try env vars
+      } catch (err) {
+        keyError = err instanceof Error ? err : new Error(String(err));
       }
     }
 
     this._lastDirectUsage = null;
     const completeOptions = this.buildDirectCompletionOptions(apiKey, options);
 
-    // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
-    // provider-specific convertMessages() handle all format normalization:
-    // UserMessage (string or content blocks), AssistantMessage (content block
-    // arrays with text/thinking/toolCall), and ToolResultMessage.
     const structStartMs = Date.now();
-    const result = await completeFn(
-      this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
-      {
-        systemPrompt: context.systemPrompt,
-        messages: context.messages,
-        tools: [tool],
-      } as Parameters<typeof completeFn>[1],
-      {
-        ...(completeOptions ?? {}),
-        // Force the model to call a tool (since we only pass one, it must call ours).
-        // "any" has the widest provider support across Anthropic, Google, Mistral, OpenAI, Bedrock.
-        toolChoice: 'any',
-      } as Parameters<typeof completeFn>[2],
-    );
+    try {
+      // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
+      // provider-specific convertMessages() handle all format normalization:
+      // UserMessage (string or content blocks), AssistantMessage (content block
+      // arrays with text/thinking/toolCall), and ToolResultMessage.
+      const result = await completeFn(
+        this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
+        {
+          systemPrompt: context.systemPrompt,
+          messages: context.messages,
+          tools: [tool],
+        } as Parameters<typeof completeFn>[1],
+        {
+          ...(completeOptions ?? {}),
+          // Force the model to call a tool (since we only pass one, it must call ours).
+          // "any" has the widest provider support across Anthropic, Google, Mistral, OpenAI, Bedrock.
+          toolChoice: 'any',
+        } as Parameters<typeof completeFn>[2],
+      );
 
-    // Caller-initiated cancellation takes precedence over error/usage handling.
-    this.throwIfAborted(result, options?.signal);
+      // Caller-initiated cancellation takes precedence over error/usage handling.
+      this.throwIfAborted(result, options?.signal);
 
-    // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
-    this.checkForSilentError(result);
+      // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
+      this.checkForSilentError(result);
 
-    // Capture usage from the AssistantMessage response
-    this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      // Capture usage from the AssistantMessage response
+      this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-    this.logger.debug('[CortexAgent] structuredComplete', {
-      toolName,
-      durationMs: Date.now() - structStartMs,
-      usage: this._lastDirectUsage,
-    });
+      this.logger.debug('[CortexAgent] structuredComplete', {
+        toolName,
+        durationMs: Date.now() - structStartMs,
+        usage: this._lastDirectUsage,
+      });
 
-    // Extract tool call arguments from the response
-    return this.extractToolCallArgs(result, toolName);
+      // Extract tool call arguments from the response
+      return this.extractToolCallArgs(result, toolName);
+    } catch (err) {
+      throw this.surfaceDirectError(err, keyError, options?.signal);
+    }
   }
 
   /**
@@ -2039,14 +2093,17 @@ export class CortexAgent {
       );
     }
 
-    // Resolve API key for the utility model's provider
+    // Resolve API key for the utility model's provider. A resolution failure is
+    // remembered rather than swallowed (see directComplete) so a downstream
+    // failure can be reported with the more actionable credential cause.
     const provider = this.resolvedUtilityModel.provider;
     let apiKey: string | undefined;
+    let keyError: Error | undefined;
     if (this.config.getApiKey) {
       try {
         apiKey = await this.config.getApiKey(provider);
-      } catch {
-        // If key resolution fails, let pi-ai try env vars
+      } catch (err) {
+        keyError = err instanceof Error ? err : new Error(String(err));
       }
     }
 
@@ -2057,35 +2114,39 @@ export class CortexAgent {
     if (options?.signal) utilOptions['signal'] = options.signal;
 
     const utilStartMs = Date.now();
-    const result = await completeFn(
-      this.resolvedUtilityPiModel as unknown as Parameters<typeof completeFn>[0],
-      {
-        systemPrompt: context.systemPrompt,
-        messages: context.messages.map(m => ({
-          role: m.role as 'user' | 'assistant',
-          content: m.content,
-        })),
-      } as Parameters<typeof completeFn>[1],
-      Object.keys(utilOptions).length > 0
-        ? utilOptions as Parameters<typeof completeFn>[2]
-        : undefined,
-    );
+    try {
+      const result = await completeFn(
+        this.resolvedUtilityPiModel as unknown as Parameters<typeof completeFn>[0],
+        {
+          systemPrompt: context.systemPrompt,
+          messages: context.messages.map(m => ({
+            role: m.role as 'user' | 'assistant',
+            content: m.content,
+          })),
+        } as Parameters<typeof completeFn>[1],
+        Object.keys(utilOptions).length > 0
+          ? utilOptions as Parameters<typeof completeFn>[2]
+          : undefined,
+      );
 
-    // Caller-initiated cancellation takes precedence over error/usage handling.
-    this.throwIfAborted(result, options?.signal);
+      // Caller-initiated cancellation takes precedence over error/usage handling.
+      this.throwIfAborted(result, options?.signal);
 
-    // Check for silent errors (same as directComplete/structuredComplete)
-    this.checkForSilentError(result);
+      // Check for silent errors (same as directComplete/structuredComplete)
+      this.checkForSilentError(result);
 
-    // Capture usage from utility model calls
-    this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      // Capture usage from utility model calls
+      this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-    this.logger.debug('[CortexAgent] utilityComplete', {
-      durationMs: Date.now() - utilStartMs,
-      usage: this._lastDirectUsage,
-    });
+      this.logger.debug('[CortexAgent] utilityComplete', {
+        durationMs: Date.now() - utilStartMs,
+        usage: this._lastDirectUsage,
+      });
 
-    return this.extractTextFromAssistantMessage(result);
+      return this.extractTextFromAssistantMessage(result);
+    } catch (err) {
+      throw this.surfaceDirectError(err, keyError, options?.signal);
+    }
   }
 
   // -----------------------------------------------------------------------
