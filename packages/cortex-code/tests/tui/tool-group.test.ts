@@ -48,8 +48,10 @@ describe('ToolGroupComponent', () => {
     group.close();
 
     const collapsed = group.render(80);
-    expect(collapsed).toHaveLength(1);
+    expect(collapsed).toHaveLength(2);
     expect(collapsed[0]).toContain('Changed 1 file');
+    // The file path is shown on a dimmed second line.
+    expect(collapsed[1]).toContain('login.ts');
 
     group.toggleExpand();
     const expanded = group.render(80);

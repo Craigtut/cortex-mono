@@ -257,7 +257,7 @@ export class ToolGroupComponent implements Component {
 
     const headline = `${this.statusDot(theme)}  ${this.headline(theme)}${this.durationSuffix(theme)}`;
     if (!this.expanded) {
-      return this.clampLines([headline], width);
+      return this.clampLines([headline, ...this.changedFileLines(theme)], width);
     }
     return this.clampLines([headline, ...this.expandedBody(theme)], width);
   }
@@ -333,6 +333,24 @@ export class ToolGroupComponent implements Component {
       for (const body of entry.bodyLines ?? []) {
         lines.push(`     ${body}`);
       }
+    }
+    return lines;
+  }
+
+  /**
+   * Dimmed file paths shown under a collapsed "Changed N files" headline, one
+   * per unique file, so the user can see what was edited without expanding.
+   */
+  private changedFileLines(theme: ToolTheme): string[] {
+    if (this.groupKind !== 'changes') return [];
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const entry of this.entries) {
+      const path = entry.filePath
+        ?? (entry.args['file_path'] != null ? String(entry.args['file_path']) : '');
+      if (!path || seen.has(path)) continue;
+      seen.add(path);
+      lines.push(`   ${chalk.hex(theme.muted)(shortenPath(path))}`);
     }
     return lines;
   }
