@@ -207,6 +207,14 @@ export interface CortexAgentConfig {
     maxCost?: number;
   };
 
+  /**
+   * Background retry policy for transient turn failures. Sits above pi-ai's
+   * fast HTTP retries; resumes the failed turn with exponential backoff. Merged
+   * over the built-in defaults, so a consumer can override just one field
+   * (e.g. `{ enabled: false }` or `{ maxAttempts: 30 }`). See {@link RetryPolicy}.
+   */
+  retryPolicy?: Partial<RetryPolicy>;
+
   /** Maximum number of concurrent sub-agents. */
   maxConcurrentSubAgents?: number;
 
@@ -484,8 +492,88 @@ export interface ClassifiedError {
   severity: ErrorSeverity;
   /** The original error message string. */
   originalMessage: string;
+  /**
+   * Concise detail extracted from the error's `cause` chain, when the
+   * top-level message is generic. Node's fetch (undici) and the Anthropic SDK
+   * bury the real reason several `cause` levels below an opaque message like
+   * "Connection error." (e.g. "fetch failed: read ECONNRESET"). Undefined when
+   * the cause chain adds nothing over `originalMessage`.
+   */
+  causeDetail?: string;
   /** Human-readable suggested action, or undefined if no action is needed. */
   suggestedAction?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Retry Policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Policy for cortex's background retry loop, which sits ABOVE pi-ai's
+ * HTTP-level retries. pi-ai retries fast (seconds, honoring `Retry-After`).
+ * Cortex only sees an error after that is exhausted, and retries on the scale
+ * of minutes by resuming the failed turn (pi-agent-core `continue()`), so no
+ * tool calls re-run and the user message is not duplicated.
+ *
+ * Only transient categories retry. Fatal or human-actionable failures
+ * (authentication, context overflow, a 404 classified as unknown) surface
+ * immediately for the user to fix.
+ */
+export interface RetryPolicy {
+  /** Master switch. Default: true. */
+  enabled: boolean;
+  /**
+   * Error categories eligible for background retry.
+   * Default: ['network', 'server_error', 'rate_limit'].
+   */
+  retryableCategories: ErrorCategory[];
+  /**
+   * Backoff before each retry, indexed by retry number (0-based). Entries past
+   * the end of the array fall back to `maxBackoffMs`. Default:
+   * [120_000, 240_000, 480_000] (2m, 4m, 8m), then capped at 10m.
+   */
+  backoffMs: number[];
+  /** Hard cap on any single backoff delay. Default: 600_000 (10m). */
+  maxBackoffMs: number;
+  /** Maximum number of retries before giving up. Default: 20. */
+  maxAttempts: number;
+  /**
+   * Optional ceiling on total elapsed time since the first failure. When set,
+   * no retry is scheduled once this is exceeded, regardless of attempt count.
+   */
+  maxElapsedMs?: number;
+}
+
+/** Payload for the onRetryScheduled hook, fired before each backoff wait. */
+export interface RetryScheduledInfo {
+  /** The classified category that triggered the retry. */
+  category: ErrorCategory;
+  /** 1-based index of the retry about to be waited for. */
+  attempt: number;
+  /** Total retries allowed (from the policy). */
+  maxAttempts: number;
+  /** Backoff delay, in ms, before this attempt. */
+  delayMs: number;
+  /** Wall-clock timestamp (ms) the next attempt is expected to start. */
+  nextAttemptAt: number;
+  /** The original (top-level) error message. */
+  originalMessage: string;
+  /** Detail extracted from the error's cause chain, when available. */
+  causeDetail?: string;
+}
+
+/** Payload for the onRetrySucceeded hook, fired when a retry resolves the turn. */
+export interface RetrySucceededInfo {
+  /** Number of retries it took to succeed. */
+  attempts: number;
+}
+
+/** Payload for the onRetryExhausted hook, fired when retries are given up on. */
+export interface RetryExhaustedInfo {
+  /** Number of retries attempted before giving up. */
+  attempts: number;
+  /** The category of the final failure. */
+  category: ErrorCategory;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyError } from '../../src/error-classifier.js';
+import { classifyError, extractCauseDetail } from '../../src/error-classifier.js';
 
 describe('classifyError', () => {
   // -----------------------------------------------------------------------
@@ -253,6 +253,82 @@ describe('classifyError', () => {
     it('accepts contextWindow option without affecting basic classification', () => {
       const result = classifyError('Some unknown error', { contextWindow: 128000 });
       expect(result.category).toBe('unknown');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Cause chain extraction
+  // -----------------------------------------------------------------------
+  describe('cause chain', () => {
+    // Reproduce the real undici/SDK nesting:
+    //   APIConnectionError("Connection error.")
+    //     -> TypeError("fetch failed")
+    //       -> Error { code: "ECONNRESET", message: "read ECONNRESET" }
+    function buildConnectionError(): Error {
+      const root = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+      const fetchErr = new TypeError('fetch failed', { cause: root });
+      return new Error('Connection error.', { cause: fetchErr });
+    }
+
+    it('extracts the buried reason from a Connection error cause chain', () => {
+      const detail = extractCauseDetail(buildConnectionError());
+      expect(detail).toBe('fetch failed: read ECONNRESET');
+    });
+
+    it('attaches causeDetail to the classified result', () => {
+      const result = classifyError(buildConnectionError());
+      expect(result.category).toBe('network');
+      expect(result.causeDetail).toBe('fetch failed: read ECONNRESET');
+      // The opaque top-level message is preserved untouched.
+      expect(result.originalMessage).toBe('Connection error.');
+    });
+
+    it('routes on a buried code even when the top message is opaque', () => {
+      const opaque = new Error('Something went wrong', {
+        cause: Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' }),
+      });
+      const result = classifyError(opaque);
+      expect(result.category).toBe('network');
+      expect(result.causeDetail).toContain('ETIMEDOUT');
+    });
+
+    it('collects sibling failures from an AggregateError', () => {
+      const agg = Object.assign(new AggregateError([], 'Connection error.'), {
+        errors: [
+          Object.assign(new Error('connect ECONNREFUSED ::1:443'), { code: 'ECONNREFUSED' }),
+          Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), { code: 'ECONNREFUSED' }),
+        ],
+      });
+      const detail = extractCauseDetail(agg);
+      expect(detail).toContain('ECONNREFUSED');
+    });
+
+    it('returns undefined when there is no cause', () => {
+      expect(extractCauseDetail(new Error('Connection error.'))).toBeUndefined();
+      expect(extractCauseDetail('Connection error.')).toBeUndefined();
+    });
+
+    it('does not attach causeDetail when there is nothing to add', () => {
+      const result = classifyError(new Error('Connection error.'));
+      expect(result.category).toBe('network');
+      expect(result.causeDetail).toBeUndefined();
+    });
+
+    it('survives a cyclic cause chain without looping', () => {
+      const a = new Error('a-failure');
+      const b = new Error('b-failure');
+      (a as { cause?: unknown }).cause = b;
+      (b as { cause?: unknown }).cause = a;
+      const top = new Error('top', { cause: a });
+      const detail = extractCauseDetail(top);
+      expect(detail).toBe('a-failure: b-failure');
+    });
+
+    it('truncates an overlong cause chain', () => {
+      const long = new Error('top', { cause: new Error('x'.repeat(500)) });
+      const detail = extractCauseDetail(long);
+      expect(detail!.length).toBeLessThanOrEqual(200);
+      expect(detail!.endsWith('…')).toBe(true);
     });
   });
 });

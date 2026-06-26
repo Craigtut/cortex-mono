@@ -117,6 +117,86 @@ function matchesAny(message: string, patterns: RegExp[]): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Cause-chain extraction
+// ---------------------------------------------------------------------------
+
+const MAX_CAUSE_DEPTH = 6;
+const MAX_CAUSE_LENGTH = 200;
+
+/**
+ * Walk an error's `cause` chain (and any AggregateError children) to build a
+ * concise detail string describing the underlying failure.
+ *
+ * Node's fetch (undici) and the Anthropic SDK nest the real reason several
+ * levels below a generic top-level message:
+ *
+ *   APIConnectionError("Connection error.")
+ *     -> cause: TypeError("fetch failed")
+ *       -> cause: Error { code: "ECONNRESET", message: "read ECONNRESET" }
+ *
+ * The top-level message ("Connection error.") tells the user nothing, so we
+ * collect distinct, informative fragments from below it (error codes and
+ * messages) and join them into e.g. "fetch failed: read ECONNRESET".
+ *
+ * Only the chain BELOW the top-level error is inspected; the top-level message
+ * is already surfaced as `originalMessage`. Returns undefined when the chain
+ * adds nothing (bare string, or no `cause`).
+ */
+export function extractCauseDetail(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+
+  const fragments: string[] = [];
+  const seen = new Set<unknown>();
+
+  const visit = (value: unknown, depth: number): void => {
+    if (value == null || depth > MAX_CAUSE_DEPTH || seen.has(value)) return;
+    seen.add(value);
+    if (value instanceof Error) {
+      const code = (value as { code?: unknown }).code;
+      if (typeof code === 'string' && code.length > 0) fragments.push(code);
+      const msg = value.message.trim();
+      if (msg.length > 0) fragments.push(msg);
+      // AggregateError holds sibling failures (e.g. DNS: every address attempt
+      // failed). Visit them so at least one concrete reason surfaces.
+      const errors = (value as { errors?: unknown }).errors;
+      if (Array.isArray(errors)) {
+        for (const child of errors) visit(child, depth + 1);
+      }
+      visit((value as { cause?: unknown }).cause, depth + 1);
+    } else if (typeof value === 'string') {
+      const s = value.trim();
+      if (s.length > 0) fragments.push(s);
+    }
+  };
+
+  // Start at the cause (and any aggregated siblings), not the top-level error.
+  const topErrors = (error as { errors?: unknown }).errors;
+  if (Array.isArray(topErrors)) {
+    for (const child of topErrors) visit(child, 1);
+  }
+  visit((error as { cause?: unknown }).cause, 1);
+
+  if (fragments.length === 0) return undefined;
+
+  // Dedupe, dropping any fragment fully contained in another already kept
+  // (e.g. the bare code "ECONNRESET" inside "read ECONNRESET"). The longer,
+  // more descriptive fragment wins.
+  const kept: string[] = [];
+  for (const frag of fragments) {
+    if (kept.includes(frag) || kept.some((k) => k.includes(frag))) continue;
+    for (let i = kept.length - 1; i >= 0; i--) {
+      if (frag.includes(kept[i]!)) kept.splice(i, 1);
+    }
+    kept.push(frag);
+  }
+
+  const detail = kept.join(': ');
+  return detail.length > MAX_CAUSE_LENGTH
+    ? `${detail.slice(0, MAX_CAUSE_LENGTH - 1)}…`
+    : detail;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -160,53 +240,68 @@ export function classifyError(
   options?: ClassifyErrorOptions,
 ): ClassifiedError {
   const message = typeof error === 'string' ? error : error.message;
+  // Pull the real reason out of the `cause` chain (undici/SDK bury it). Used
+  // both to enrich the surfaced detail and to match patterns against, so a
+  // buried code (e.g. ECONNRESET) routes correctly when the top message is
+  // opaque ("Connection error.").
+  const causeDetail = extractCauseDetail(error);
+  const matchTarget = causeDetail ? `${message}\n${causeDetail}` : message;
 
   // 1. Cancelled (highest priority if wasAborted flag is set)
   if (options?.wasAborted) {
-    return buildResult('cancelled', message);
+    return buildResult('cancelled', message, causeDetail);
   }
 
   // 2. Authentication
-  if (matchesAny(message, AUTHENTICATION_PATTERNS)) {
-    return buildResult('authentication', message);
+  if (matchesAny(matchTarget, AUTHENTICATION_PATTERNS)) {
+    return buildResult('authentication', message, causeDetail);
   }
 
   // 3. Rate limit
-  if (matchesAny(message, RATE_LIMIT_PATTERNS)) {
-    return buildResult('rate_limit', message);
+  if (matchesAny(matchTarget, RATE_LIMIT_PATTERNS)) {
+    return buildResult('rate_limit', message, causeDetail);
   }
 
   // 4. Context overflow
   // Uses built-in patterns. In Phase 1B, this will also delegate to
   // pi-ai's isContextOverflow() when available.
-  if (matchesAny(message, CONTEXT_OVERFLOW_PATTERNS)) {
-    return buildResult('context_overflow', message);
+  if (matchesAny(matchTarget, CONTEXT_OVERFLOW_PATTERNS)) {
+    return buildResult('context_overflow', message, causeDetail);
   }
 
   // 5. Server error
-  if (matchesAny(message, SERVER_ERROR_PATTERNS)) {
-    return buildResult('server_error', message);
+  if (matchesAny(matchTarget, SERVER_ERROR_PATTERNS)) {
+    return buildResult('server_error', message, causeDetail);
   }
 
   // 6. Network
-  if (matchesAny(message, NETWORK_PATTERNS)) {
-    return buildResult('network', message);
+  if (matchesAny(matchTarget, NETWORK_PATTERNS)) {
+    return buildResult('network', message, causeDetail);
   }
 
   // 7. Unknown (catch-all)
-  return buildResult('unknown', message);
+  return buildResult('unknown', message, causeDetail);
 }
 
 /**
- * Build a ClassifiedError from a category and original message.
+ * Build a ClassifiedError from a category, original message, and optional
+ * cause detail.
  */
-function buildResult(category: ErrorCategory, originalMessage: string): ClassifiedError {
+function buildResult(
+  category: ErrorCategory,
+  originalMessage: string,
+  causeDetail?: string,
+): ClassifiedError {
   const action = SUGGESTED_ACTIONS[category];
   const result: ClassifiedError = {
     category,
     severity: SEVERITY_MAP[category],
     originalMessage,
   };
+  // Only attach when it adds information beyond the original message.
+  if (causeDetail !== undefined && causeDetail !== originalMessage) {
+    result.causeDetail = causeDetail;
+  }
   if (action !== undefined) {
     result.suggestedAction = action;
   }

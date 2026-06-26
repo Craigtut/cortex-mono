@@ -25,6 +25,12 @@ import { EventBridge } from './event-bridge.js';
 import type { PiEventSource } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
 import { classifyError } from './error-classifier.js';
+import {
+  resolveRetryPolicy,
+  backoffForAttempt,
+  shouldRetry,
+  isRetryableCategory,
+} from './retry-policy.js';
 import { parseWorkingTags } from './working-tags.js';
 import { getModel as getPiModel, getModels as getPiModels } from '@earendil-works/pi-ai';
 import { UTILITY_MODEL_OVERRIDES } from './provider-registry.js';
@@ -64,6 +70,10 @@ import type {
   CortexUsage,
   SessionUsage,
   ClassifiedError,
+  RetryPolicy,
+  RetryScheduledInfo,
+  RetrySucceededInfo,
+  RetryExhaustedInfo,
   AgentTextOutput,
   CompactionResult,
   CompactionTarget,
@@ -103,6 +113,12 @@ export interface PiAgent extends AgentStateAccessor, PiEventSource {
     update?: (event: unknown) => void;
     signal?: AbortSignal;
   }): Promise<unknown>;
+  /**
+   * Resume the agentic loop from the current transcript without adding a new
+   * message. Used for background retries; the last message must be a user or
+   * tool-result (Cortex trims pi-agent-core's synthetic failure message first).
+   */
+  continue(): Promise<unknown>;
   abort(): void;
   waitForIdle(): Promise<void>;
   reset(): void;
@@ -345,6 +361,7 @@ export class CortexAgent {
   private readonly eventBridge: EventBridge;
   private readonly budgetGuard: BudgetGuard;
   private readonly config: CortexAgentConfig;
+  private readonly retryPolicy: RetryPolicy;
   private readonly logger: CortexLogger;
   private readonly promptDiagnostics: PromptWatchdogDiagnostics;
   private workingTagsEnabled: boolean;
@@ -402,6 +419,9 @@ export class CortexAgent {
   // Event handlers (consumer-registered callbacks)
   private loopCompleteHandlers: Array<() => void> = [];
   private errorHandlers: Array<(error: ClassifiedError) => void> = [];
+  private retryScheduledHandlers: Array<(info: RetryScheduledInfo) => void> = [];
+  private retrySucceededHandlers: Array<(info: RetrySucceededInfo) => void> = [];
+  private retryExhaustedHandlers: Array<(info: RetryExhaustedInfo) => void> = [];
   private beforeCompactionHandlers: Array<(target: CompactionTarget) => Promise<void>> = [];
   private compactionErrorHandlers: Array<(error: Error) => void> = [];
   private compactionDegradedHandlers: Array<(info: CompactionDegradedInfo) => void> = [];
@@ -484,6 +504,7 @@ export class CortexAgent {
   ) {
     this.agent = agent;
     this.config = config;
+    this.retryPolicy = resolveRetryPolicy(config.retryPolicy);
     this.logger = config.logger ?? NOOP_LOGGER;
     this.promptDiagnostics = new PromptWatchdogDiagnostics(
       config.diagnostics?.promptWatchdog,
@@ -777,33 +798,13 @@ export class CortexAgent {
 
     let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
     try {
-      const result = await this.agent.prompt(input);
-
-      // Pi-agent-core catches streaming/provider errors internally and stores
-      // them in state.errorMessage without re-throwing. Surface these so
-      // Cortex's error classification and consumer error handlers can process them.
-      const agentState = this.agent.state as Record<string, unknown>;
-      const stateError = agentState['errorMessage'] ?? agentState['error'];
-      if (stateError) {
-        throw new Error(String(stateError));
-      }
-
-      return result;
+      return await this.runTurnWithRetry(input);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       promptStatus = this.isAborted() ? 'cancelled' : 'rejected';
-
-      // Reactive overflow detection: if the API returns a context overflow
-      // error, perform emergency truncation and let the consumer retry
-      if (isContextOverflow(error)) {
-        this.compactionManager.handleOverflowError(
-          () => this.getConversationHistory(),
-          (history) => this.restoreConversationHistory(history),
-        );
-      }
-
-      this.emitError(error);
-
+      // Classification, overflow handling, retry orchestration, and the onError
+      // emission all happen inside runTurnWithRetry. Here we only record status
+      // for diagnostics and re-throw to the consumer.
       throw error;
     } finally {
       this._activePromptCacheRetention = null;
@@ -829,6 +830,241 @@ export class CortexAgent {
       // This re-enters prompt() before the consumer's await resolves, keeping
       // the consumer's UI state consistent.
       await this.drainPendingBackgroundResults();
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Background retry
+  // -----------------------------------------------------------------------
+
+  /**
+   * Run one user turn, transparently retrying transient failures in the
+   * background per the configured RetryPolicy.
+   *
+   * The first attempt uses `agent.prompt(input)`. Each retry resumes the failed
+   * turn with `agent.continue()` after trimming pi-agent-core's synthetic
+   * failure message, so completed tool calls do not re-run and the user message
+   * is never duplicated. The returned promise stays pending across the whole
+   * backoff window; an abort during a backoff wait cancels it.
+   *
+   * On a non-retryable failure (auth, a 404 classified as unknown, context
+   * overflow, abort) or once retries are exhausted, it emits onError and throws
+   * exactly as the non-retrying path did, so the consumer's existing handling
+   * is unchanged for those cases.
+   */
+  private async runTurnWithRetry(input: string): Promise<unknown> {
+    let retryIndex = 0;
+    let firstFailureAt: number | undefined;
+
+    // Resolves to the turn result, or throws after onError has been emitted.
+    for (;;) {
+      try {
+        const result =
+          retryIndex === 0 ? await this.agent.prompt(input) : await this.agent.continue();
+
+        // Pi-agent-core catches streaming/provider errors internally and stores
+        // them in state.errorMessage without re-throwing. Surface these so
+        // Cortex's error classification and consumer handlers can process them.
+        const agentState = this.agent.state as Record<string, unknown>;
+        const stateError = agentState['errorMessage'] ?? agentState['error'];
+        if (stateError) {
+          throw new Error(String(stateError));
+        }
+
+        if (retryIndex > 0) {
+          this.fireRetrySucceeded({ attempts: retryIndex });
+        }
+        return result;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        const aborted = this.isAborted();
+        const classified = classifyError(error, { wasAborted: aborted });
+
+        // Reactive overflow detection: emergency truncation, then surface (not
+        // retried by default; context_overflow is not a retryable category).
+        if (isContextOverflow(error)) {
+          this.compactionManager.handleOverflowError(
+            () => this.getConversationHistory(),
+            (history) => this.restoreConversationHistory(history),
+          );
+        }
+
+        if (firstFailureAt === undefined) firstFailureAt = Date.now();
+        const elapsedMs = Date.now() - firstFailureAt;
+
+        // Only retry when the policy allows AND the transcript can actually be
+        // resumed (last message after trimming is a user/tool-result, never a
+        // dangling assistant turn that continue() would reject).
+        const policyAllowsRetry = shouldRetry(
+          classified,
+          { retryIndex, elapsedMs, aborted },
+          this.retryPolicy,
+        );
+        const willRetry = policyAllowsRetry && this.peekResumableAfterTrim();
+
+        if (!willRetry) {
+          // Signal "gave up" only when the retry budget was genuinely exhausted
+          // (not when the transcript simply could not be resumed), and only if
+          // we had actually been retrying a transient failure.
+          if (
+            retryIndex > 0 &&
+            !aborted &&
+            !policyAllowsRetry &&
+            isRetryableCategory(classified.category, this.retryPolicy)
+          ) {
+            this.fireRetryExhausted({ attempts: retryIndex, category: classified.category });
+          }
+          this.emitError(error, aborted);
+          throw error;
+        }
+
+        const delayMs = backoffForAttempt(this.retryPolicy, retryIndex);
+        const attemptNumber = retryIndex + 1;
+        const scheduled: RetryScheduledInfo = {
+          category: classified.category,
+          attempt: attemptNumber,
+          maxAttempts: this.retryPolicy.maxAttempts,
+          delayMs,
+          nextAttemptAt: Date.now() + delayMs,
+          originalMessage: classified.originalMessage,
+        };
+        if (classified.causeDetail !== undefined) {
+          scheduled.causeDetail = classified.causeDetail;
+        }
+        this.fireRetryScheduled(scheduled);
+        this.logger.warn('[CortexAgent] scheduling background retry', {
+          category: classified.category,
+          attempt: attemptNumber,
+          maxAttempts: this.retryPolicy.maxAttempts,
+          delayMs,
+        });
+
+        const completed = await this.abortableDelay(delayMs);
+        if (!completed) {
+          // Aborted during the wait: surface as cancelled, do not retry. Throw a
+          // fresh AbortError rather than the original transient failure so the
+          // consumer's catch sees a cancellation (matching the in-run abort
+          // path) instead of a stale network/rate-limit message.
+          this.emitError(error, true);
+          const abortErr = new Error('Prompt aborted during retry backoff');
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
+
+        // Remove pi-agent-core's synthetic failure message so continue() sees a
+        // user/tool-result as the last message and resumes cleanly.
+        this.trimTrailingFailureMessages();
+        retryIndex += 1;
+      }
+    }
+  }
+
+  /**
+   * Count trailing synthetic failure messages on the transcript. When a run
+   * fails, pi-agent-core appends an assistant message with `stopReason` of
+   * 'error'/'aborted' (and `errorMessage` set) and empty content. These must be
+   * removed before `agent.continue()`, which rejects a trailing assistant turn.
+   */
+  private trailingFailureTrimCount(): number {
+    const messages = this.agent.state.messages;
+    let count = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i] as unknown as Record<string, unknown>;
+      const isFailure =
+        msg['role'] === 'assistant' &&
+        (msg['stopReason'] === 'error' ||
+          msg['stopReason'] === 'aborted' ||
+          msg['errorMessage'] != null);
+      if (isFailure) {
+        count += 1;
+      } else {
+        break;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Whether trimming trailing failure messages would leave a transcript that
+   * `agent.continue()` can resume (last message is a user or tool-result, not a
+   * dangling assistant turn). Guards the rare case of a failure that lands right
+   * after an assistant tool-call turn but before its tool results.
+   */
+  private peekResumableAfterTrim(): boolean {
+    const messages = this.agent.state.messages;
+    const lastIndex = messages.length - this.trailingFailureTrimCount() - 1;
+    // Require a real conversation message PAST the slot region: a failure with
+    // only slots present (no committed user/tool turn) has nothing to resume,
+    // so it must surface rather than retry.
+    if (lastIndex < this.contextManager.slotCount) return false;
+    const last = messages[lastIndex] as unknown as Record<string, unknown>;
+    return last['role'] !== 'assistant';
+  }
+
+  /** Remove trailing synthetic failure messages so continue() can resume. */
+  private trimTrailingFailureMessages(): void {
+    const messages = this.agent.state.messages;
+    const trimCount = this.trailingFailureTrimCount();
+    if (trimCount > 0) {
+      messages.splice(messages.length - trimCount, trimCount);
+    }
+  }
+
+  /**
+   * Sleep for `ms`, resolving early if the agent is aborted. Resolves true when
+   * the full delay elapsed, false when aborted. Used for abortable backoff so a
+   * user cancel during a multi-minute wait takes effect immediately.
+   */
+  private abortableDelay(ms: number): Promise<boolean> {
+    const signal = this.abortController.signal;
+    if (signal.aborted) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(true);
+      }, ms);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  private fireRetryScheduled(info: RetryScheduledInfo): void {
+    for (const handler of this.retryScheduledHandlers) {
+      try {
+        handler(info);
+      } catch (err) {
+        this.logger.error('[CortexAgent] onRetryScheduled handler threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  private fireRetrySucceeded(info: RetrySucceededInfo): void {
+    for (const handler of this.retrySucceededHandlers) {
+      try {
+        handler(info);
+      } catch (err) {
+        this.logger.error('[CortexAgent] onRetrySucceeded handler threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  private fireRetryExhausted(info: RetryExhaustedInfo): void {
+    for (const handler of this.retryExhaustedHandlers) {
+      try {
+        handler(info);
+      } catch (err) {
+        this.logger.error('[CortexAgent] onRetryExhausted handler threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -872,6 +1108,7 @@ export class CortexAgent {
       category: classified.category,
       severity: classified.severity,
       message: classified.originalMessage,
+      ...(classified.causeDetail ? { cause: classified.causeDetail } : {}),
     });
 
     for (const handler of this.errorHandlers) {
@@ -2268,6 +2505,32 @@ export class CortexAgent {
    */
   onError(handler: (error: ClassifiedError) => void): void {
     this.errorHandlers.push(handler);
+  }
+
+  /**
+   * Register a handler fired before each background retry's backoff wait.
+   * Consumers use this to render a compact, in-place retry status (countdown,
+   * attempt count) instead of a hard error. See {@link RetryPolicy}.
+   */
+  onRetryScheduled(handler: (info: RetryScheduledInfo) => void): void {
+    this.retryScheduledHandlers.push(handler);
+  }
+
+  /**
+   * Register a handler fired when a background retry resolves the turn.
+   * The consumer clears the retry status.
+   */
+  onRetrySucceeded(handler: (info: RetrySucceededInfo) => void): void {
+    this.retrySucceededHandlers.push(handler);
+  }
+
+  /**
+   * Register a handler fired when background retries are given up on. The
+   * matching fatal `onError` fires immediately after, so the consumer shows a
+   * terminal state.
+   */
+  onRetryExhausted(handler: (info: RetryExhaustedInfo) => void): void {
+    this.retryExhaustedHandlers.push(handler);
   }
 
   /**

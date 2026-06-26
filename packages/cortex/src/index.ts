@@ -25,6 +25,10 @@ export type {
   ErrorCategory,
   ErrorSeverity,
   ClassifiedError,
+  RetryPolicy,
+  RetryScheduledInfo,
+  RetrySucceededInfo,
+  RetryExhaustedInfo,
   AgentTextOutput,
   ToolContentDetails,
   BudgetGuardConfig,
@@ -82,8 +86,18 @@ export {
 } from './working-tags.js';
 
 // Error Classifier
-export { classifyError } from './error-classifier.js';
+export { classifyError, extractCauseDetail } from './error-classifier.js';
 export type { ClassifyErrorOptions } from './error-classifier.js';
+
+// Retry Policy
+export {
+  DEFAULT_RETRY_POLICY,
+  resolveRetryPolicy,
+  backoffForAttempt,
+  shouldRetry,
+  isRetryableCategory,
+} from './retry-policy.js';
+export type { RetryDecisionContext } from './retry-policy.js';
 
 // Context Manager (Phase 1B)
 export { ContextManager } from './context-manager.js';

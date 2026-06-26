@@ -1,0 +1,247 @@
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { CortexAgent } from '../../src/cortex-agent.js';
+import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
+import type { PiEvent } from '../../src/event-bridge.js';
+import type { CortexAgentConfig } from '../../src/types.js';
+import { wrapModel } from '../../src/model-wrapper.js';
+
+// ---------------------------------------------------------------------------
+// Scriptable mock that mutates state.messages the way pi-agent-core does:
+// a committed user message before each run, and a synthetic assistant failure
+// message (stopReason 'error'/'aborted') appended when a run fails.
+// ---------------------------------------------------------------------------
+
+type Outcome = 'fail' | 'ok';
+
+interface RetryMockAgent extends PiAgent {
+  promptCalls: number;
+  continueCalls: number;
+  /** Roles seen as the LAST message at the moment continue() was entered. */
+  continueLastRoles: string[];
+  abortCalled: boolean;
+}
+
+function createRetryMock(outcomes: Outcome[], failStopReason: 'error' | 'aborted' = 'error'): RetryMockAgent {
+  const queue = [...outcomes];
+  let idleResolve: (() => void) | null = null;
+
+  const pushUser = (text: string): void => {
+    agent.state.messages.push({ role: 'user', content: text } as never);
+  };
+  const applyOutcome = (): void => {
+    agent.state.messages = agent.state.messages.filter(Boolean);
+    const outcome = queue.shift() ?? 'ok';
+    if (outcome === 'fail') {
+      agent.state.errorMessage = 'Connection error.';
+      agent.state.messages.push({
+        role: 'assistant',
+        content: [],
+        stopReason: failStopReason,
+        errorMessage: 'Connection error.',
+      } as never);
+    } else {
+      agent.state.messages.push({
+        role: 'assistant',
+        content: 'done',
+        stopReason: 'end_turn',
+      } as never);
+    }
+  };
+
+  const agent: RetryMockAgent = {
+    state: { messages: [], systemPrompt: '', tools: [] },
+    promptCalls: 0,
+    continueCalls: 0,
+    continueLastRoles: [],
+    abortCalled: false,
+
+    subscribe(_handler: (event: PiEvent) => void): () => void {
+      return () => {};
+    },
+
+    async prompt(input: string): Promise<unknown> {
+      agent.promptCalls += 1;
+      agent.state.errorMessage = undefined;
+      pushUser(input);
+      applyOutcome();
+      return undefined;
+    },
+
+    async continue(): Promise<unknown> {
+      agent.continueCalls += 1;
+      agent.state.errorMessage = undefined;
+      const last = agent.state.messages[agent.state.messages.length - 1] as
+        | { role?: string }
+        | undefined;
+      agent.continueLastRoles.push(last?.role ?? 'none');
+      applyOutcome();
+      return undefined;
+    },
+
+    steer(_message: { role: string; content: string }): void {},
+
+    abort(): void {
+      agent.abortCalled = true;
+      idleResolve?.();
+      idleResolve = null;
+    },
+
+    async waitForIdle(): Promise<void> {
+      return new Promise<void>((resolve) => {
+        idleResolve = resolve;
+        setTimeout(() => {
+          resolve();
+          idleResolve = null;
+        }, 5);
+      });
+    },
+
+    reset(): void {
+      agent.state.messages = [];
+    },
+  };
+
+  return agent;
+}
+
+function makeModel(raw: PiModel) {
+  return wrapModel(raw, raw.provider, raw.name, raw.contextWindow);
+}
+
+function createConfig(overrides?: Partial<CortexAgentConfig>): CortexAgentConfig {
+  return {
+    model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel),
+    workingDirectory: '/tmp/test-workspace',
+    initialBasePrompt: 'Test base prompt',
+    slots: [],
+    // Tiny backoff so the loop runs fast under real timers.
+    retryPolicy: { backoffMs: [5], maxBackoffMs: 5, maxAttempts: 3 },
+    ...overrides,
+  };
+}
+
+type Ctor = new (agent: PiAgent, config: CortexAgentConfig) => CortexAgent;
+function build(agent: PiAgent, config: CortexAgentConfig): CortexAgent {
+  return new (CortexAgent as unknown as Ctor)(agent, config);
+}
+
+describe('CortexAgent background retry', () => {
+  let mock: RetryMockAgent;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('retries a transient failure by resuming with continue() and succeeds', async () => {
+    mock = createRetryMock(['fail', 'ok']);
+    const agent = build(mock, createConfig());
+    const scheduled = vi.fn();
+    const succeeded = vi.fn();
+    const errored = vi.fn();
+    agent.onRetryScheduled(scheduled);
+    agent.onRetrySucceeded(succeeded);
+    agent.onError(errored);
+
+    await agent.prompt('hello');
+
+    expect(mock.promptCalls).toBe(1);
+    expect(mock.continueCalls).toBe(1);
+    expect(scheduled).toHaveBeenCalledTimes(1);
+    expect(scheduled.mock.calls[0][0]).toMatchObject({
+      category: 'network',
+      attempt: 1,
+      maxAttempts: 3,
+    });
+    expect(succeeded).toHaveBeenCalledWith({ attempts: 1 });
+    expect(errored).not.toHaveBeenCalled();
+  });
+
+  it('trims the synthetic failure message so continue() sees a user/tool-result', async () => {
+    mock = createRetryMock(['fail', 'ok']);
+    const agent = build(mock, createConfig());
+    await agent.prompt('hi');
+    // The only continue() call must have seen a non-assistant last message.
+    expect(mock.continueLastRoles).toEqual(['user']);
+  });
+
+  it('gives up after maxAttempts and fires onRetryExhausted then onError', async () => {
+    mock = createRetryMock(['fail', 'fail', 'fail', 'fail']);
+    const agent = build(mock, createConfig({ retryPolicy: { backoffMs: [3], maxBackoffMs: 3, maxAttempts: 3 } }));
+    const scheduled = vi.fn();
+    const exhausted = vi.fn();
+    const errored = vi.fn();
+    agent.onRetryScheduled(scheduled);
+    agent.onRetryExhausted(exhausted);
+    agent.onError(errored);
+
+    await expect(agent.prompt('hi')).rejects.toThrow();
+
+    expect(scheduled).toHaveBeenCalledTimes(3); // one per allowed retry
+    expect(mock.continueCalls).toBe(3);
+    expect(exhausted).toHaveBeenCalledWith({ attempts: 3, category: 'network' });
+    expect(errored).toHaveBeenCalledTimes(1);
+    expect(errored.mock.calls[0][0].category).toBe('network');
+  });
+
+  it('does not retry a non-retryable (authentication) failure', async () => {
+    mock = createRetryMock(['ok']);
+    // Force an auth error regardless of message script.
+    mock.prompt = async (input: string) => {
+      mock.promptCalls += 1;
+      mock.state.messages.push({ role: 'user', content: input } as never);
+      mock.state.errorMessage = 'invalid api key';
+      return undefined;
+    };
+    const agent = build(mock, createConfig());
+    const scheduled = vi.fn();
+    const errored = vi.fn();
+    agent.onRetryScheduled(scheduled);
+    agent.onError(errored);
+
+    await expect(agent.prompt('hi')).rejects.toThrow();
+
+    expect(scheduled).not.toHaveBeenCalled();
+    expect(mock.continueCalls).toBe(0);
+    expect(errored.mock.calls[0][0].category).toBe('authentication');
+  });
+
+  it('does not retry when the policy is disabled', async () => {
+    mock = createRetryMock(['fail', 'ok']);
+    const agent = build(mock, createConfig({ retryPolicy: { enabled: false } }));
+    const scheduled = vi.fn();
+    const errored = vi.fn();
+    agent.onRetryScheduled(scheduled);
+    agent.onError(errored);
+
+    await expect(agent.prompt('hi')).rejects.toThrow();
+
+    expect(scheduled).not.toHaveBeenCalled();
+    expect(mock.continueCalls).toBe(0);
+    expect(errored.mock.calls[0][0].category).toBe('network');
+  });
+
+  it('cancels a pending retry when aborted during the backoff wait', async () => {
+    mock = createRetryMock(['fail', 'ok']);
+    const agent = build(mock, createConfig({ retryPolicy: { backoffMs: [1000], maxBackoffMs: 1000, maxAttempts: 3 } }));
+    const errored = vi.fn();
+    agent.onError(errored);
+    // Abort as soon as the first retry is scheduled (during the 1s wait).
+    agent.onRetryScheduled(() => {
+      void agent.abort();
+    });
+
+    // A backoff abort throws a cancellation, not the stale transient error, so
+    // the consumer's catch treats it as an interruption (message says aborted).
+    const thrown = await agent.prompt('hi').then(
+      () => null,
+      (e: Error) => e,
+    );
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown!.name).toBe('AbortError');
+    expect(thrown!.message).toMatch(/abort/i);
+
+    // The wait was cancelled before the retry ran.
+    expect(mock.continueCalls).toBe(0);
+    expect(errored.mock.calls[0][0].category).toBe('cancelled');
+  });
+});
