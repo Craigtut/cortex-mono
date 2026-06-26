@@ -1,4 +1,4 @@
-import { appendFile, mkdir, open, rename, stat, unlink } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile, rename, rm, stat, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -249,8 +249,69 @@ export function normalizeActivityErrorCategory(
   }
 }
 
+/** An out-of-band answer to a pending permission request. */
+export type ExternalDecision = 'allow' | 'deny';
+
+/**
+ * Watch a control file for an out-of-band allow/deny decision written by a
+ * separate process (for example a companion app answering a native approval
+ * card). Generic on purpose: the caller owns the path and the trust model; this
+ * only runs the read / validate / consume / poll loop.
+ *
+ * - Resolves with the decision once a complete, valid file lands, and removes
+ *   the file when it does so a stale answer can't resolve a later prompt.
+ * - A garbled or partially written file (invalid JSON) is left in place and
+ *   retried on the next tick, so a non-atomic writer can't have its decision
+ *   silently dropped.
+ * - Never rejects. If `signal` aborts (the prompt was answered elsewhere) it
+ *   stops polling, best-effort removes any answer that landed late, and stays
+ *   unresolved.
+ */
+export function watchDecisionFile(
+  filePath: string,
+  signal: AbortSignal,
+  pollMs = 200,
+): Promise<ExternalDecision> {
+  return new Promise<ExternalDecision>((resolve) => {
+    const poll = async (): Promise<void> => {
+      while (!signal.aborted) {
+        let raw: string | undefined;
+        try {
+          raw = await readFile(filePath, 'utf8');
+        } catch {
+          // Not written yet (ENOENT) or unreadable; keep polling.
+        }
+        if (raw !== undefined) {
+          let parsed: { decision?: unknown } | undefined;
+          try {
+            parsed = JSON.parse(raw) as { decision?: unknown };
+          } catch {
+            // Likely a partial write: leave the file so the next tick retries
+            // once the writer has finished.
+          }
+          if (parsed) {
+            // A complete write (valid JSON): consume the file either way.
+            await rm(filePath, { force: true });
+            if (parsed.decision === 'allow' || parsed.decision === 'deny') {
+              resolve(parsed.decision);
+              return;
+            }
+            // Complete but malformed shape: ignore it and keep waiting.
+          }
+        }
+        await new Promise<void>((r) => setTimeout(r, pollMs));
+      }
+      // Answered elsewhere: drop any decision that landed late so it doesn't
+      // linger in the control directory.
+      await rm(filePath, { force: true }).catch(() => {});
+    };
+    void poll();
+  });
+}
+
 export class FileSessionActivityReporter {
   private readonly activityDir: string;
+  private readonly controlDir: string;
   private readonly statePath: string;
   private readonly eventsPath: string;
   private readonly maxEventLogBytes: number;
@@ -273,6 +334,7 @@ export class FileSessionActivityReporter {
   ) {
     const sessionsDir = options.sessionsDir ?? DEFAULT_SESSIONS_DIR;
     this.activityDir = join(sessionsDir, sessionId, 'activity');
+    this.controlDir = join(sessionsDir, sessionId, 'control');
     this.statePath = join(this.activityDir, 'state.json');
     this.eventsPath = join(this.activityDir, 'events.jsonl');
     this.maxEventLogBytes = options.maxEventLogBytes ?? DEFAULT_MAX_EVENT_LOG_BYTES;
@@ -294,6 +356,20 @@ export class FileSessionActivityReporter {
       lastError: null,
       finalExit: null,
     };
+  }
+
+  /**
+   * Absolute path of the control file an external process writes to answer a
+   * pending permission request out-of-band (for example a companion app
+   * answering a native card), keyed by the permission id. It lives in a
+   * `control/` sibling of `activity/` so the activity surface stays a one-way
+   * contract: the agent writes `activity/`, an external answerer writes
+   * `control/`, and neither reads the other's writes back. The session polls
+   * this path while a prompt is open and applies the decision if it lands. See
+   * `resolvePermission` in session.ts and `watchDecisionFile` above.
+   */
+  decisionPath(permissionId: string): string {
+    return join(this.controlDir, `${permissionId}.json`);
   }
 
   initialize(): Promise<void> {

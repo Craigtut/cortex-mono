@@ -156,16 +156,27 @@ export class App {
   showPermissionPrompt(
     toolName: string,
     toolArgs: unknown,
+    externalDecision?: Promise<'allow' | 'deny'>,
   ): Promise<PermissionResult> {
     return new Promise<PermissionResult>((resolve) => {
-      const prompt = new PermissionPromptComponent(toolName, toolArgs, this.cwd, (result) => {
+      let settled = false;
+      let prompt!: PermissionPromptComponent;
+      const finish = (result: PermissionResult) => {
+        if (settled) return;
+        settled = true;
         this.transcript.removePermissionPrompt(prompt);
         this.editor.activePermissionPrompt = null;
         resolve(result);
-      });
+      };
 
+      prompt = new PermissionPromptComponent(toolName, toolArgs, this.cwd, finish);
       this.transcript.addPermissionPrompt(prompt);
       this.editor.activePermissionPrompt = prompt;
+
+      // An external process (e.g. a companion app) can answer the request
+      // out-of-band. The first of the inline prompt or the external decision
+      // wins; the settle guard cleans up the prompt either way.
+      externalDecision?.then((decision) => finish({ decision })).catch(() => {});
     });
   }
 

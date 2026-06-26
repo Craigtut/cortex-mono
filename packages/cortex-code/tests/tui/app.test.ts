@@ -131,9 +131,35 @@ vi.mock('../../src/tui/status.js', () => ({
 
 vi.mock('../../src/tui/transcript.js', () => ({
   TranscriptManager: class MockTranscriptManager {
+    permissionPrompts: unknown[] = [];
+    removeCalls = 0;
     clear(): void {}
     toggleExpand(): void {}
     toggleExpandAll(): void {}
+    addPermissionPrompt(prompt: unknown): void {
+      this.permissionPrompts.push(prompt);
+    }
+    removePermissionPrompt(prompt: unknown): void {
+      this.removeCalls += 1;
+      this.permissionPrompts = this.permissionPrompts.filter((p) => p !== prompt);
+    }
+  },
+}));
+
+const { promptHolder } = vi.hoisted(() => ({
+  promptHolder: { current: null as null | { callback: (result: unknown) => void } },
+}));
+
+vi.mock('../../src/tui/permissions.js', () => ({
+  PermissionPromptComponent: class MockPermissionPrompt {
+    constructor(
+      _toolName: unknown,
+      _toolArgs: unknown,
+      _cwd: unknown,
+      public callback: (result: unknown) => void,
+    ) {
+      promptHolder.current = this;
+    }
   },
 }));
 
@@ -279,5 +305,53 @@ describe('App status spinner', () => {
     expect(logDebugSpy).toHaveBeenCalledWith('[TUI] render end', expect.objectContaining({
       reasons: ['tool-start:Write:tool-1'],
     }));
+  });
+});
+
+describe('App.showPermissionPrompt out-of-band race', () => {
+  beforeEach(() => {
+    promptHolder.current = null;
+  });
+
+  function newApp(): App {
+    return new App({ onSubmit: () => {}, onAbort: () => {}, onExit: () => {} }, '/tmp/project');
+  }
+
+  it('resolves from an external decision and tears down the inline prompt', async () => {
+    const app = newApp();
+    let resolveExternal!: (decision: 'allow' | 'deny') => void;
+    const external = new Promise<'allow' | 'deny'>((resolve) => {
+      resolveExternal = resolve;
+    });
+
+    const resultPromise = app.showPermissionPrompt('Bash', { command: 'ls' }, external);
+    expect((app.transcript as unknown as { permissionPrompts: unknown[] }).permissionPrompts).toHaveLength(1);
+
+    resolveExternal('allow');
+    const result = await resultPromise;
+
+    expect(result).toEqual({ decision: 'allow' });
+    expect((app.transcript as unknown as { permissionPrompts: unknown[] }).permissionPrompts).toHaveLength(0);
+    expect((app.editor as unknown as { activePermissionPrompt: unknown }).activePermissionPrompt).toBeNull();
+  });
+
+  it('keeps the inline answer and ignores a late external decision', async () => {
+    const app = newApp();
+    let resolveExternal!: (decision: 'allow' | 'deny') => void;
+    const external = new Promise<'allow' | 'deny'>((resolve) => {
+      resolveExternal = resolve;
+    });
+
+    const resultPromise = app.showPermissionPrompt('Bash', { command: 'ls' }, external);
+    // User answers inline first, with a scope/pattern the external channel can't carry.
+    promptHolder.current?.callback({ decision: 'deny', scope: 'session', pattern: 'Bash(ls)' });
+    const result = await resultPromise;
+
+    // External answers afterward; the settle guard must ignore it.
+    resolveExternal('allow');
+    await Promise.resolve();
+
+    expect(result).toEqual({ decision: 'deny', scope: 'session', pattern: 'Bash(ls)' });
+    expect((app.transcript as unknown as { removeCalls: number }).removeCalls).toBe(1);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -7,9 +7,21 @@ import {
   buildActivityPermissionArgs,
   FileSessionActivityReporter,
   normalizeActivityErrorCategory,
+  watchDecisionFile,
   type ActivityEvent,
   type SessionActivityState,
 } from '../../src/activity/session-activity.js';
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const tempRoots: string[] = [];
 
@@ -321,5 +333,100 @@ describe('FileSessionActivityReporter', () => {
 
     const current = await stat(join(activityDir, 'events.jsonl'));
     expect(current.size).toBeGreaterThan(0);
+  });
+});
+
+describe('decisionPath', () => {
+  it('points at a control/ sibling of activity/, keyed by permission id', async () => {
+    const sessionsDir = await tempSessionsDir();
+    const reporter = new FileSessionActivityReporter('session-ctrl', '/repo', { sessionsDir });
+
+    expect(reporter.decisionPath('perm-abc')).toBe(
+      join(sessionsDir, 'session-ctrl', 'control', 'perm-abc.json'),
+    );
+  });
+});
+
+describe('watchDecisionFile', () => {
+  it('resolves with the decision and consumes the file', async () => {
+    const dir = await tempSessionsDir();
+    const file = join(dir, 'perm-1.json');
+    await writeFile(file, JSON.stringify({ decision: 'allow' }));
+
+    const controller = new AbortController();
+    expect(await watchDecisionFile(file, controller.signal, 10)).toBe('allow');
+    expect(await fileExists(file)).toBe(false);
+    controller.abort();
+  });
+
+  it('resolves with deny', async () => {
+    const dir = await tempSessionsDir();
+    const file = join(dir, 'perm-2.json');
+    await writeFile(file, JSON.stringify({ decision: 'deny' }));
+
+    const controller = new AbortController();
+    expect(await watchDecisionFile(file, controller.signal, 10)).toBe('deny');
+    controller.abort();
+  });
+
+  it('leaves a partially written (unparseable) file in place and retries', async () => {
+    const dir = await tempSessionsDir();
+    const file = join(dir, 'perm-3.json');
+    // Simulate a non-atomic writer mid-write: valid-prefix, invalid JSON.
+    await writeFile(file, '{"decision":');
+
+    const controller = new AbortController();
+    const decision = watchDecisionFile(file, controller.signal, 10);
+
+    await delay(60);
+    // Must not have been consumed/dropped while the write was incomplete.
+    expect(await fileExists(file)).toBe(true);
+
+    // Writer finishes.
+    await writeFile(file, JSON.stringify({ decision: 'deny' }));
+    expect(await decision).toBe('deny');
+    expect(await fileExists(file)).toBe(false);
+    controller.abort();
+  });
+
+  it('discards a complete-but-malformed decision and keeps waiting', async () => {
+    const dir = await tempSessionsDir();
+    const file = join(dir, 'perm-4.json');
+    await writeFile(file, JSON.stringify({ decision: 'maybe' }));
+
+    const controller = new AbortController();
+    const decision = watchDecisionFile(file, controller.signal, 10);
+
+    await delay(60);
+    // A complete write is consumed even when the shape is wrong, so it can't
+    // wedge the poller on the same bad file forever.
+    expect(await fileExists(file)).toBe(false);
+    const settled = await Promise.race([
+      decision.then(() => 'resolved' as const),
+      delay(20).then(() => 'pending' as const),
+    ]);
+    expect(settled).toBe('pending');
+
+    await writeFile(file, JSON.stringify({ decision: 'allow' }));
+    expect(await decision).toBe('allow');
+    controller.abort();
+  });
+
+  it('stops and cleans up a late answer when aborted before resolving', async () => {
+    const dir = await tempSessionsDir();
+    const file = join(dir, 'perm-5.json');
+    await writeFile(file, JSON.stringify({ decision: 'allow' }));
+
+    const controller = new AbortController();
+    controller.abort();
+    const decision = watchDecisionFile(file, controller.signal, 10);
+
+    const settled = await Promise.race([
+      decision.then(() => 'resolved' as const),
+      delay(40).then(() => 'pending' as const),
+    ]);
+    expect(settled).toBe('pending');
+    // The late file is swept so it can't outlive the prompt.
+    expect(await fileExists(file)).toBe(false);
   });
 });

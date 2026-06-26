@@ -66,7 +66,7 @@ import { log } from './logger.js';
 import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
 import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
-import { FileSessionActivityReporter, type PermissionResolution } from './activity/session-activity.js';
+import { FileSessionActivityReporter, watchDecisionFile, type PermissionResolution } from './activity/session-activity.js';
 import { McpConfigWatcher, type McpConfigChangeReason } from './mcp/mcp-watcher.js';
 import { reconcileMcpServers, type McpReconcileResult } from './mcp/reconcile.js';
 import { loadHookHandlers } from './hooks/loader.js';
@@ -878,28 +878,35 @@ export class Session {
     // Error handling with per-category display
     this.agent.onError((error: ClassifiedError) => {
       void this.activity.recordError(error, error.severity === 'fatal');
+      // The real reason often lives in the error's `cause` chain (undici/SDK
+      // bury it below an opaque "Connection error."). Surface it everywhere so
+      // a failed turn is diagnosable instead of mysterious.
+      const causeLine = error.causeDetail ? `\nDetails: ${error.causeDetail}` : '';
       // Record the failure in the durable transcript so a turn that errored
       // before completing is visible. Skip user-initiated aborts (cancelled).
       if (error.category !== 'cancelled') {
-        this.transcriptWriter.addError(error.originalMessage ?? String(error), error.category);
+        const transcriptMessage = error.causeDetail
+          ? `${error.originalMessage ?? String(error)} (${error.causeDetail})`
+          : (error.originalMessage ?? String(error));
+        this.transcriptWriter.addError(transcriptMessage, error.category);
       }
       switch (error.category) {
         case 'rate_limit':
           this.app!.transcript.addNotification(
             'Rate Limited',
-            'API rate limited. Cortex will auto-retry with exponential backoff.\nSend another message after retries are exhausted.',
+            `API rate limited. Cortex will auto-retry with exponential backoff.\nSend another message after retries are exhausted.${causeLine}`,
           );
           break;
         case 'authentication':
           this.app!.transcript.addNotification(
             'Authentication Error',
-            `${error.originalMessage ?? 'Credentials expired or invalid.'}\nRun /login to reconnect.`,
+            `${error.originalMessage ?? 'Credentials expired or invalid.'}\nRun /login to reconnect.${causeLine}`,
           );
           break;
         case 'network':
           this.app!.transcript.addNotification(
             'Connection Error',
-            `${error.originalMessage ?? 'Could not reach the API.'}\nCheck your network connection. Send another message to retry.`,
+            `${error.originalMessage ?? 'Could not reach the API.'}\nCheck your network connection. Send another message to retry.${causeLine}`,
           );
           break;
         case 'context_overflow':
@@ -914,7 +921,7 @@ export class Session {
         default:
           this.app!.transcript.addNotification(
             'Error',
-            error.originalMessage ?? String(error),
+            `${error.originalMessage ?? String(error)}${causeLine}`,
           );
       }
     });
@@ -1098,8 +1105,19 @@ export class Session {
     await permission.written;
     let permissionResolution: PermissionResolution = 'denied';
 
+    // Allow answering out-of-band (e.g. a companion app writing a decision to
+    // the session's control directory) as well as from the inline TUI prompt:
+    // watch for an external decision and let whichever lands first win. Aborting
+    // the controller stops the watcher once the prompt resolves, however it
+    // resolved.
+    const externalController = new AbortController();
+    const externalDecision = watchDecisionFile(
+      this.activity.decisionPath(permission.id),
+      externalController.signal,
+    );
+
     try {
-      const result = await this.app.showPermissionPrompt(toolName, toolArgs);
+      const result = await this.app.showPermissionPrompt(toolName, toolArgs, externalDecision);
       permissionResolution = result.decision === 'allow' ? 'allowed' : 'denied';
 
       if (result.scope === 'project-edits') {
@@ -1117,6 +1135,7 @@ export class Session {
       void this.activity.recordError(error instanceof Error ? error : String(error));
       throw error;
     } finally {
+      externalController.abort();
       await this.activity.recordPermissionResolved(permission.id, toolName, permissionResolution);
       const release = this.permissionLockRelease;
       this.permissionLockPromise = null;
