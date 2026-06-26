@@ -26,6 +26,9 @@ import {
   type AgentTextOutput,
   type ClassifiedError,
   type CompactionResult,
+  type RetryScheduledInfo,
+  type RetrySucceededInfo,
+  type RetryExhaustedInfo,
   type ThinkingLevel,
   type McpStdioConfig,
   type ToolCallEndPayload,
@@ -114,6 +117,10 @@ export class Session {
   private readonly isResume: boolean;
   private saver: ReturnType<typeof createDebouncedSaver>;
   private isRunning = false;
+  /** Live background-retry state, while a transient failure is being retried. */
+  private retryState: { info: RetryScheduledInfo } | null = null;
+  /** 1s ticker that refreshes the retry countdown line. */
+  private retryTicker: ReturnType<typeof setInterval> | null = null;
   private createdAt: number;
   private permissionLockPromise: Promise<void> | null = null;
   private permissionLockRelease: (() => void) | null = null;
@@ -444,6 +451,9 @@ export class Session {
 
     log.info('User prompt', { text: text.slice(0, 100) });
 
+    // A fresh turn supersedes any terminal "gave up, send a message" retry line.
+    this.clearRetry();
+
     // Add user message to transcript
     this.app!.transcript.addUserMessage(text);
     this.transcriptWriter.addUserMessage(text);
@@ -745,6 +755,9 @@ export class Session {
       // Skip child agent streaming; only parent text goes to transcript
       if (event.childTaskId) return;
 
+      // Text flowing again means a pending retry reconnected.
+      this.noteProgressAfterRetry();
+
       if (!assistantStarted) {
         this.app!.transcript.startAssistantMessage();
         assistantStarted = true;
@@ -767,6 +780,9 @@ export class Session {
         this.recordSubAgentToolStart(event);
         return;
       }
+
+      // A tool starting means the agent is making progress again.
+      this.noteProgressAfterRetry();
 
       const p = event.payload as ToolCallStartPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
@@ -891,39 +907,61 @@ export class Session {
         this.transcriptWriter.addError(transcriptMessage, error.category);
       }
       switch (error.category) {
-        case 'rate_limit':
-          this.app!.transcript.addNotification(
-            'Rate Limited',
-            `API rate limited. Cortex will auto-retry with exponential backoff.\nSend another message after retries are exhausted.${causeLine}`,
-          );
+        // Transient categories are managed by the background retry engine. When
+        // onError fires for one of these, retries are over (exhausted or
+        // disabled): collapse to a compact terminal line instead of a box.
+        case 'network':
+        case 'server_error':
+        case 'rate_limit': {
+          const attempts = this.retryState?.info.attempt ?? 0;
+          const maxAttempts = this.retryState?.info.maxAttempts ?? 0;
+          this.stopRetryTicker();
+          this.app!.transcript.setRetryStatus({
+            phase: 'failed',
+            attempt: attempts,
+            maxAttempts,
+            ...(error.causeDetail ? { detail: error.causeDetail } : {}),
+          });
           break;
+        }
         case 'authentication':
+          this.clearRetry();
           this.app!.transcript.addNotification(
             'Authentication Error',
             `${error.originalMessage ?? 'Credentials expired or invalid.'}\nRun /login to reconnect.${causeLine}`,
           );
           break;
-        case 'network':
-          this.app!.transcript.addNotification(
-            'Connection Error',
-            `${error.originalMessage ?? 'Could not reach the API.'}\nCheck your network connection. Send another message to retry.${causeLine}`,
-          );
-          break;
         case 'context_overflow':
+          this.clearRetry();
           this.app!.transcript.addNotification(
             'Context Limit Reached',
             'Context window is full and compaction has been exhausted.\nUse /context-window to increase the limit or /clear to start fresh.',
           );
           break;
         case 'cancelled':
-          // User-initiated abort; no notification needed
+          // User-initiated abort; drop any pending retry line, no notification.
+          this.clearRetry();
           break;
         default:
+          this.clearRetry();
           this.app!.transcript.addNotification(
             'Error',
             `${error.originalMessage ?? String(error)}${causeLine}`,
           );
       }
+    });
+
+    // Background retry lifecycle: drive the compact, in-place status line.
+    this.agent.onRetryScheduled((info: RetryScheduledInfo) => {
+      this.startRetryCountdown(info);
+    });
+    this.agent.onRetrySucceeded((_info: RetrySucceededInfo) => {
+      this.clearRetry();
+    });
+    this.agent.onRetryExhausted((_info: RetryExhaustedInfo) => {
+      // The matching fatal onError fires right after and renders the terminal
+      // 'failed' line; just stop the countdown here.
+      this.stopRetryTicker();
     });
 
     // Compaction notification
@@ -1282,6 +1320,9 @@ export class Session {
 
   /** Graceful shutdown: save, destroy agent, stop TUI. */
   async shutdown(): Promise<void> {
+    // Stop the retry countdown timer so it cannot fire after teardown.
+    this.stopRetryTicker();
+
     // Tear down MCP config watcher first so a late filesystem event cannot
     // schedule work against the agent we're about to destroy.
     if (this.mcpWatcher) {
@@ -1383,6 +1424,65 @@ export class Session {
       contextTokenCount: this.getDisplayedCurrentContextTokens(),
       contextTokenLimit: this.agent.effectiveContextWindow,
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Background retry status (compact, in-place line)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Begin (or update) the compact retry countdown. Replaces the "thinking"
+   * spinner with a single line that ticks down to the next attempt; a 1s timer
+   * keeps the countdown live.
+   */
+  private startRetryCountdown(info: RetryScheduledInfo): void {
+    this.retryState = { info };
+    // A retry wait is not "thinking"; swap the spinner for the status line.
+    this.app?.hideStatusSpinner();
+    this.renderRetryWaiting();
+    this.stopRetryTicker();
+    this.retryTicker = setInterval(() => this.renderRetryWaiting(), 1000);
+  }
+
+  /** Render the current waiting/reconnecting line from retryState. */
+  private renderRetryWaiting(): void {
+    if (!this.retryState || !this.app) return;
+    const { info } = this.retryState;
+    const secondsRemaining = Math.max(0, (info.nextAttemptAt - Date.now()) / 1000);
+    this.app.transcript.setRetryStatus(
+      secondsRemaining > 0
+        ? {
+            phase: 'waiting',
+            attempt: info.attempt,
+            maxAttempts: info.maxAttempts,
+            secondsRemaining,
+            ...(info.causeDetail ? { detail: info.causeDetail } : {}),
+          }
+        : { phase: 'reconnecting', attempt: info.attempt, maxAttempts: info.maxAttempts },
+    );
+  }
+
+  private stopRetryTicker(): void {
+    if (this.retryTicker) {
+      clearInterval(this.retryTicker);
+      this.retryTicker = null;
+    }
+  }
+
+  /** Tear down all retry UI (ticker, line, state). */
+  private clearRetry(): void {
+    this.stopRetryTicker();
+    this.retryState = null;
+    this.app?.transcript.clearRetryStatus();
+  }
+
+  /**
+   * The agent produced output (text or a tool call) after a retry was pending,
+   * which means we reconnected: drop the retry line immediately rather than
+   * waiting for the whole turn to resolve.
+   */
+  private noteProgressAfterRetry(): void {
+    if (this.retryState) this.clearRetry();
   }
 
   private updateObservationalMemoryStatus(): void {

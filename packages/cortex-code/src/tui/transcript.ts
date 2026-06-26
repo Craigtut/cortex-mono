@@ -52,6 +52,29 @@ type ToolTranscriptComponent = ToolExecutionComponent | ToolGroupComponent;
 
 export type NotificationSeverity = 'routine' | 'important' | 'error';
 
+/** View model for the compact background-retry status line. */
+export interface RetryStatusView {
+  /** waiting = counting down to next attempt; reconnecting = attempt in flight; failed = gave up. */
+  phase: 'waiting' | 'reconnecting' | 'failed';
+  /** 1-based attempt index. */
+  attempt: number;
+  /** Total retries allowed. */
+  maxAttempts: number;
+  /** Seconds until the next attempt (waiting phase only). */
+  secondsRemaining?: number;
+  /** Concise cause detail (e.g. "fetch failed: read ECONNRESET"). */
+  detail?: string;
+}
+
+/** Format whole seconds as m:ss (or s when under a minute). */
+function formatDuration(totalSeconds: number): string {
+  const s = Math.max(0, Math.round(totalSeconds));
+  if (s < 60) return `${s}s`;
+  const minutes = Math.floor(s / 60);
+  const seconds = s % 60;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
 export class TranscriptManager {
   /** The current streaming assistant message Markdown component. */
   private currentAssistantMarkdown: Markdown | null = null;
@@ -68,6 +91,8 @@ export class TranscriptManager {
   /** Track running sub-agent IDs for the activity indicator. */
   private runningSubAgents = new Set<string>();
   private activityIndicator: Text | null = null;
+  /** Compact, in-place line for background retry status (countdown/attempts). */
+  private retryStatusLine: Text | null = null;
   /** Tracks the category of the last item added to chatContainer for spacing decisions. */
   private lastAddedItemCategory: TranscriptItemCategory = null;
   /** Throttle renders to avoid overwhelming the terminal during rapid events. */
@@ -470,6 +495,66 @@ export class TranscriptManager {
       this.activityContainer.addChild(this.activityIndicator);
     }
     this.diagnostics?.recordTranscriptMutation('activity_indicator_updated');
+  }
+
+  /**
+   * Render or update the compact, in-place background-retry status line.
+   *
+   * One muted line in the activity area that the session refreshes (countdown
+   * ticks, attempt count) instead of stacking bordered error boxes. Replaces
+   * the heavyweight notification for transient, auto-retried failures.
+   */
+  setRetryStatus(view: RetryStatusView): void {
+    if (!this.activityContainer) return;
+    const text = this.formatRetryStatus(view);
+    if (this.retryStatusLine) {
+      this.retryStatusLine.setText(text);
+    } else {
+      // A retry supersedes the "thinking" spinner; pack tight in the activity area.
+      this.retryStatusLine = new Text(text, 0, 0);
+      this.activityContainer.addChild(this.retryStatusLine);
+    }
+    this.diagnostics?.recordTranscriptMutation('retry_status');
+    this.immediateRender();
+  }
+
+  /** Remove the retry status line (on success, abort, or a new turn). */
+  clearRetryStatus(): void {
+    if (this.retryStatusLine && this.activityContainer) {
+      this.activityContainer.removeChild(this.retryStatusLine);
+      this.retryStatusLine = null;
+      this.diagnostics?.recordTranscriptMutation('retry_status_cleared');
+      this.immediateRender();
+    }
+  }
+
+  private formatRetryStatus(view: RetryStatusView): string {
+    const counter = `retry ${view.attempt}/${view.maxAttempts}`;
+    const detail = view.detail ? colors.muted(` · ${view.detail}`) : '';
+    switch (view.phase) {
+      case 'waiting': {
+        const when =
+          view.secondsRemaining !== undefined
+            ? ` in ${formatDuration(view.secondsRemaining)}`
+            : '';
+        return (
+          colors.accent(`⟳ Connection lost`) +
+          colors.muted(` · ${counter}${when}`) +
+          detail
+        );
+      }
+      case 'reconnecting':
+        return colors.accent(`⟳ Reconnecting…`) + colors.muted(` · ${counter}`);
+      case 'failed': {
+        // attempt 0 means no retries ran (policy disabled or non-resumable):
+        // "gave up after 0 retries" would be nonsense.
+        const head =
+          view.attempt === 0
+            ? `✕ Request failed`
+            : `✕ Gave up after ${view.attempt} ${view.attempt === 1 ? 'retry' : 'retries'}`;
+        return colors.error(head) + detail + colors.muted(` · send a message to retry`);
+      }
+    }
   }
 
   /** Freeze the current assistant message (stop updating it). */

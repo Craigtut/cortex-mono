@@ -22,9 +22,15 @@ vi.mock('@earendil-works/pi-tui', () => {
 
   class MockText {
     args: unknown[];
+    text: unknown;
 
     constructor(...args: unknown[]) {
       this.args = args;
+      this.text = args[0];
+    }
+
+    setText(text: string): void {
+      this.text = text;
     }
   }
 
@@ -116,6 +122,8 @@ vi.mock('../../src/tui/theme.js', () => ({
     primary: (text: string) => text,
     primaryMuted: (text: string) => text,
     muted: (text: string) => text,
+    accent: (text: string) => text,
+    error: (text: string) => text,
     userMessageBg: (text: string) => text,
   },
   markdownTheme: {},
@@ -217,6 +225,44 @@ describe('TranscriptManager', () => {
     transcript.addNotification('Model', 'Switched to gpt-5.5.');
 
     expect(chat.children).toHaveLength(1);
+  });
+
+  it('shows a single in-place retry status line and updates it in place', () => {
+    const chat = new Container();
+    const activity = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never, activity as never);
+
+    transcript.setRetryStatus({
+      phase: 'waiting',
+      attempt: 1,
+      maxAttempts: 20,
+      secondsRemaining: 120,
+      detail: 'fetch failed: read ECONNRESET',
+    });
+    expect(activity.children).toHaveLength(1);
+    const line = activity.children[0] as { args: unknown[]; setText?: (t: string) => void };
+
+    // Updating reuses the same node (in place), not a new child.
+    transcript.setRetryStatus({ phase: 'waiting', attempt: 1, maxAttempts: 20, secondsRemaining: 60 });
+    expect(activity.children).toHaveLength(1);
+    expect(activity.children[0]).toBe(line);
+
+    // The retry line never goes in the transcript flow.
+    expect(chat.children).toHaveLength(0);
+  });
+
+  it('clears the retry status line', () => {
+    const chat = new Container();
+    const activity = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never, activity as never);
+
+    transcript.setRetryStatus({ phase: 'failed', attempt: 3, maxAttempts: 3, detail: 'read ECONNRESET' });
+    expect(activity.children).toHaveLength(1);
+
+    transcript.clearRetryStatus();
+    expect(activity.children).toHaveLength(0);
   });
 
   it('disposes transcript rows when clearing', () => {
