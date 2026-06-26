@@ -8,8 +8,9 @@
  * line to `~/.cortex/sessions/<id>/transcript.jsonl`, never rewriting prior
  * lines, so the complete turn-by-turn history survives.
  *
- * A sibling app (Reverie) reads this file to summarize "where we left off" when
- * a user returns to a session, so the record shape is a contract. Each record
+ * An external reader (for example a companion app) reads this file to summarize
+ * "where we left off" when a user returns to a session, so the record shape is a
+ * contract. Each record
  * uses a uniform envelope (the same shape as the ActivityEvent envelope in
  * activity/session-activity.ts): `{ version, sequence, sessionId, type,
  * timestamp, payload }`. New record `type`s are additive, so a reader that
