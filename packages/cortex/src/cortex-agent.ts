@@ -3496,6 +3496,23 @@ export class CortexAgent {
     // Map loop_end -> onLoopComplete
     this.eventUnsubscribers.push(
       this.eventBridge.on('loop_end', () => {
+        // pi-agent-core emits agent_end for EVERY run that ends, including a run
+        // that failed (it stores the failure in state.errorMessage and emits
+        // agent_end from handleRunFailure). Background retry means one logical
+        // turn can span several such runs: fail -> backoff -> continue() -> ...
+        // onLoopComplete must fire once per logical turn, not once per attempt.
+        // Firing it on a failed attempt would let a consumer mark the turn idle
+        // while runTurnWithRetry is still retrying, desyncing its run-state
+        // (e.g. routing the user's next message to prompt(), which throws
+        // "already processing", instead of steer()). Suppress it here; a turn
+        // that fails for good still surfaces via onError plus the prompt()
+        // rejection, and a retried turn fires onLoopComplete on the run that
+        // finally succeeds (errorMessage is cleared at the start of each run).
+        const agentState = this.agent.state as Record<string, unknown>;
+        if (agentState['errorMessage']) {
+          this.logger.info('[CortexAgent] loop_end suppressed (run ended in error; retry may follow)');
+          return;
+        }
         this.logger.info('[CortexAgent] loop_end', {
           turns: this.budgetGuard.getTurnCount(),
           totalCost: this.budgetGuard.getTotalCost(),

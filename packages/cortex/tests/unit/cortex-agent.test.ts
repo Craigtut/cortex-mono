@@ -861,6 +861,26 @@ You have 12 emotions.`;
       expect(handler).toHaveBeenCalled();
     });
 
+    it('suppresses onLoopComplete for a run that ended in error (retry may follow)', () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const handler = vi.fn();
+      agent.onLoopComplete(handler);
+
+      // pi-agent-core emits agent_end even when a run fails, leaving the failure
+      // in state.errorMessage. With background retry that agent_end belongs to an
+      // intermediate attempt, not the logical turn boundary, so onLoopComplete
+      // must NOT fire (firing it would let a consumer mark the turn idle while a
+      // retry is still pending, desyncing its run-state).
+      piAgent.state.errorMessage = 'Connection error.';
+      piAgent.emitEvent({ type: 'agent_end' });
+      expect(handler).not.toHaveBeenCalled();
+
+      // The run that finally succeeds clears errorMessage; onLoopComplete fires once.
+      piAgent.state.errorMessage = undefined;
+      piAgent.emitEvent({ type: 'agent_end' });
+      expect(handler).toHaveBeenCalledTimes(1);
+    });
+
     it('onTurnComplete fires with AgentTextOutput', async () => {
       piAgent.promptResult = 'Hello <working>internal</working> world';
       const agent = createTestCortexAgent(piAgent, config);
