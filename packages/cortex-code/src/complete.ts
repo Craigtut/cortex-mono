@@ -282,7 +282,8 @@ async function completeWithModel(input: {
   prompt: string;
   schema: unknown | null;
 }): Promise<unknown> {
-  const piAi = await import('@earendil-works/pi-ai');
+  // complete() moved to pi-ai 0.80's temporary /compat shim (Phase 2 migrates this).
+  const piAi = await import('@earendil-works/pi-ai/compat');
   const toolName = 'structured_output';
   const context: Record<string, unknown> = {
     systemPrompt: input.systemPrompt,

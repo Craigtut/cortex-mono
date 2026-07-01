@@ -32,7 +32,10 @@ import {
   isRetryableCategory,
 } from './retry-policy.js';
 import { parseWorkingTags } from './working-tags.js';
-import { getModel as getPiModel, getModels as getPiModels } from '@earendil-works/pi-ai';
+// pi-ai 0.80 moved the static catalog reads off the root to the durable
+// `providers/all` entrypoint (`getModel`/`getModels` on root are deprecated
+// compat aliases). These are the non-deprecated replacements.
+import { getBuiltinModel as getPiModel, getBuiltinModels as getPiModels } from '@earendil-works/pi-ai/providers/all';
 import { UTILITY_MODEL_OVERRIDES } from './provider-registry.js';
 import { inferUtilityModel } from './utility-model-inference.js';
 import { McpClientManager } from './mcp-client.js';
@@ -1184,9 +1187,11 @@ export class CortexAgent {
     messages: unknown[];
   }, options?: DirectCompletionOptions): Promise<string> {
     // Dynamically import pi-ai's complete() function
-    let completeFn: typeof import('@earendil-works/pi-ai').complete;
+    // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
+    // here pending the planned createModels() migration (Phase 2).
+    let completeFn: typeof import('@earendil-works/pi-ai/compat').complete;
     try {
-      const piAi = await import('@earendil-works/pi-ai');
+      const piAi = await import('@earendil-works/pi-ai/compat');
       completeFn = piAi.complete;
     } catch {
       throw new Error(
@@ -1268,9 +1273,11 @@ export class CortexAgent {
     systemPrompt: string;
     messages: unknown[];
   }, schema: unknown, toolName: string = 'structured_output', toolDescription: string = 'Produce structured output', options?: DirectCompletionOptions): Promise<Record<string, unknown> | null> {
-    let completeFn: typeof import('@earendil-works/pi-ai').complete;
+    // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
+    // here pending the planned createModels() migration (Phase 2).
+    let completeFn: typeof import('@earendil-works/pi-ai/compat').complete;
     try {
-      const piAi = await import('@earendil-works/pi-ai');
+      const piAi = await import('@earendil-works/pi-ai/compat');
       completeFn = piAi.complete;
     } catch {
       throw new Error(
@@ -1452,7 +1459,8 @@ export class CortexAgent {
     };
 
     agentConfig['streamFn'] = async (model: unknown, context: unknown, options?: Record<string, unknown>) => {
-      const { streamSimple } = await import('@earendil-works/pi-ai');
+      // streamSimple lives on pi-ai 0.80's temporary /compat shim (Phase 2 migrates this).
+      const { streamSimple } = await import('@earendil-works/pi-ai/compat');
       const retention = cacheBreakpointState.cortexAgent?._activePromptCacheRetention
         ?? cacheBreakpointState.cortexAgent?._cacheRetention
         ?? null;
@@ -2319,9 +2327,11 @@ export class CortexAgent {
     systemPrompt: string;
     messages: Array<{ role: string; content: string }>;
   }, options?: DirectCompletionOptions): Promise<string> {
-    let completeFn: typeof import('@earendil-works/pi-ai').complete;
+    // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
+    // here pending the planned createModels() migration (Phase 2).
+    let completeFn: typeof import('@earendil-works/pi-ai/compat').complete;
     try {
-      const piAi = await import('@earendil-works/pi-ai');
+      const piAi = await import('@earendil-works/pi-ai/compat');
       completeFn = piAi.complete;
     } catch {
       throw new Error(

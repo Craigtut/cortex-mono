@@ -47,7 +47,21 @@ vi.mock('@earendil-works/pi-ai', () => ({
   createModel: vi.fn(),
   getModels: vi.fn(),
   getEnvApiKey: vi.fn(),
+  getSupportedThinkingLevels: vi.fn(),
+  clampThinkingLevel: vi.fn(),
   complete: (...args: unknown[]) => mockComplete(...args),
+}));
+
+// pi-ai 0.80 moved catalog reads to providers/all and completion to /compat.
+// cortex-agent now imports from those entrypoints; mock them to the same fns.
+vi.mock('@earendil-works/pi-ai/providers/all', () => ({
+  getBuiltinModel: (...args: unknown[]) => mockGetModel(...args),
+  getBuiltinModels: vi.fn(),
+}));
+
+vi.mock('@earendil-works/pi-ai/compat', () => ({
+  complete: (...args: unknown[]) => mockComplete(...args),
+  completeSimple: (...args: unknown[]) => mockComplete(...args),
 }));
 
 vi.mock('@earendil-works/pi-agent-core', () => ({

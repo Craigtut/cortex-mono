@@ -18,6 +18,14 @@ vi.mock('@earendil-works/pi-ai', () => ({
   clampThinkingLevel: (...args: unknown[]) => mockClampThinkingLevel(...args),
 }));
 
+// cortex-agent's static catalog import now resolves from providers/all (pi-ai
+// 0.80). Stub it so agent construction stays hermetic instead of hitting the
+// real model catalog; the utility-model inference guards against undefined.
+vi.mock('@earendil-works/pi-ai/providers/all', () => ({
+  getBuiltinModel: vi.fn(),
+  getBuiltinModels: vi.fn(),
+}));
+
 // ---------------------------------------------------------------------------
 // Mock PiAgent factory (minimal, focused on thinking level)
 // ---------------------------------------------------------------------------

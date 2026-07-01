@@ -301,11 +301,15 @@ export interface IProviderManager {
 // Pi-ai dynamic import types
 // ---------------------------------------------------------------------------
 
-/** Shape of the pi-ai main module functions we use. */
+/**
+ * Shape of the pi-ai functions ProviderManager uses. pi-ai 0.80 split these
+ * across entrypoints: catalog reads live on `providers/all`, thinking-level
+ * helpers on the root, and completion on the temporary `/compat` shim.
+ * `loadPiAi()` composes them back into this single object.
+ */
 interface PiAiModule {
   getModel: (provider: string, modelId: string) => unknown;
   getModels: (provider: string) => Array<Record<string, unknown>>;
-  getEnvApiKey: (provider: string) => string | undefined;
   getSupportedThinkingLevels?: ((model: unknown) => string[]) | undefined;
   completeSimple?: ((model: unknown, context: unknown, options?: unknown) => Promise<unknown>) | undefined;
   complete?: ((model: unknown, context: unknown, options?: unknown) => Promise<unknown>) | undefined;
@@ -689,9 +693,34 @@ function decodeHtmlText(value: string): string {
  */
 async function loadPiAi(): Promise<PiAiModule> {
   try {
-    // Dynamic import with string literal to avoid bundler resolution
-    const modulePath = '@earendil-works/pi-ai';
-    return await import(/* @vite-ignore */ modulePath) as PiAiModule;
+    // pi-ai 0.80 split the old root "global API" across entrypoints. Compose
+    // the subset ProviderManager needs from their durable homes: catalog reads
+    // from `providers/all`, thinking-level helpers from root, and completion
+    // from the temporary `/compat` shim (pinned pending the Phase 2
+    // createModels() migration). String-literal paths avoid bundler resolution.
+    const catalogPath = '@earendil-works/pi-ai/providers/all';
+    const rootPath = '@earendil-works/pi-ai';
+    const compatPath = '@earendil-works/pi-ai/compat';
+    const [catalog, root, compat] = await Promise.all([
+      import(/* @vite-ignore */ catalogPath) as Promise<{
+        getBuiltinModel: (provider: string, modelId: string) => unknown;
+        getBuiltinModels: (provider: string) => Array<Record<string, unknown>>;
+      }>,
+      import(/* @vite-ignore */ rootPath) as Promise<{
+        getSupportedThinkingLevels?: (model: unknown) => string[];
+      }>,
+      import(/* @vite-ignore */ compatPath) as Promise<{
+        complete?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown>;
+        completeSimple?: (model: unknown, context: unknown, options?: unknown) => Promise<unknown>;
+      }>,
+    ]);
+    return {
+      getModel: catalog.getBuiltinModel,
+      getModels: catalog.getBuiltinModels,
+      getSupportedThinkingLevels: root.getSupportedThinkingLevels,
+      complete: compat.complete,
+      completeSimple: compat.completeSimple,
+    };
   } catch {
     throw new Error(
       'pi-ai is not installed. Install @earendil-works/pi-ai to use ProviderManager.'

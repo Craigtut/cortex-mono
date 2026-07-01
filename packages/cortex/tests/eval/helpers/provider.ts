@@ -46,7 +46,9 @@ let _piAi: PiAiModule | null = null;
 
 async function loadPiAi(): Promise<PiAiModule> {
   if (_piAi) return _piAi;
-  const modulePath = '@earendil-works/pi-ai';
+  // pi-ai 0.80 moved getModel/complete to the /compat shim (a strict superset
+  // of root). Test-only eval infra uses compat directly for minimal churn.
+  const modulePath = '@earendil-works/pi-ai/compat';
   _piAi = await import(modulePath) as PiAiModule;
   return _piAi;
 }

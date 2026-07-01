@@ -23,6 +23,19 @@ vi.mock('@earendil-works/pi-ai', () => ({
   completeSimple: (...args: unknown[]) => mockCompleteSimple(...args),
 }));
 
+// pi-ai 0.80 split the API across entrypoints; loadPiAi() composes them, so
+// mirror that split here: catalog reads from providers/all, completion from
+// /compat. All wired to the same mock fns as the root mock above.
+vi.mock('@earendil-works/pi-ai/providers/all', () => ({
+  getBuiltinModel: (...args: unknown[]) => mockGetModel(...args),
+  getBuiltinModels: (...args: unknown[]) => mockGetModels(...args),
+}));
+
+vi.mock('@earendil-works/pi-ai/compat', () => ({
+  complete: (...args: unknown[]) => mockCompleteSimple(...args),
+  completeSimple: (...args: unknown[]) => mockCompleteSimple(...args),
+}));
+
 // Mock pi-ai/oauth module
 const mockLoginAnthropic = vi.fn();
 const mockLoginCodex = vi.fn();
