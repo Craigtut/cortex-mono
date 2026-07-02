@@ -337,7 +337,9 @@ const agent = await CortexAgent.create({
 
 ## Direct Model Calls
 
-Use `prompt()` for tool-using agent loops. Use direct completion helpers for single LLM calls that should not use tools or mutate conversation history.
+Use `prompt()` for tool-using agent loops. Use direct completion helpers for single LLM calls that should not use tools or mutate conversation history. `directComplete()` and `structuredComplete()` use the primary model; `utilityComplete()` uses the cheaper utility model.
+
+Each helper accepts two context shapes. A raw context passes caller-assembled messages to the provider verbatim:
 
 ```typescript
 const text = await agent.directComplete({
@@ -355,6 +357,30 @@ const data = await agent.structuredComplete(
 
 const usage = agent.getLastDirectUsage();
 ```
+
+### Structured Contexts and Caching
+
+A structured context supplies the same opinionated regions the agentic loop uses, and Cortex assembles the message array as `[slots][history][ephemeral][prompt]` with its cache breakpoint strategy applied on top (BP2 after the last slot, BP3 at the end of history):
+
+```typescript
+const review = await agent.directComplete({
+  systemPrompt: 'You review pull requests.',   // consumer-owned, sent as-is
+  slots: [styleGuide, repoConventions],        // stable blocks, most stable first
+  history: reviewTurns,                        // consumer-managed, append-only
+  ephemeral: `Queue depth: ${queue.length}`,   // volatile, outside the cached prefix
+  prompt: 'Review the attached diff.',
+}, { sessionId: 'pr-review-pipeline' });
+```
+
+Prefix caching rewards byte-identical prefixes across calls, so the caching contract is:
+
+- Keep `slots` byte-stable and ordered most stable first. Empty entries are dropped.
+- Treat `history` as append-only. Cortex stores nothing between calls; pass the same array plus any new turns. Because pi-ai also marks the last user message, appending the previous `prompt` and response to `history` turns the previous call's cache entry into a read on the next call.
+- Put anything that changes per call in `ephemeral` (or the `prompt`). It sits after BP3 and never invalidates the cached prefix.
+- When running several independent pipelines, give each a distinct `sessionId` (option, defaults to the agent's session id) so requests route to the right cache.
+- For `structuredComplete()`, keep the output schema byte-stable across calls: tool definitions precede the system prompt in Anthropic's cacheable prefix, so a changing schema misses the whole prefix.
+
+Breakpoints are stamped on Anthropic only; other providers still benefit from the stable prefix through their implicit caching. Raw and structured shapes are mutually exclusive: pass `messages`, or `prompt` with the optional regions, never both.
 
 ## Shutdown
 

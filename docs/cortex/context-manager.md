@@ -17,10 +17,13 @@ In a managed `CortexAgent`, the effective message array has four regions. The Co
 │  Grows organically as agent runs                │  ContextManager does NOT touch this
 │  User messages, assistant responses,            │
 │  tool_use/tool_result pairs                     │
-├ ─ ─ ─ ─ ─ ─ PREFIX CACHE BOUNDARY ─ ─ ─ ─ ─ ─ ┤
+├─────────────────────────────────────────────────┤
 │  EPHEMERAL CONTEXT (injected in transformContext)│  Owned by ContextManager + Cortex
-│  Consumer ephemeral, background task state,     │  Rebuilt every LLM call
-│  loaded skill instructions                      │  Never stored in agent.state.messages
+│  Consumer ephemeral, loaded skill instructions  │  Rebuilt every LLM call, stable
+│                                                 │  across ticks within a turn
+├ ─ ─ ─ ─ ─ ─ PREFIX CACHE BOUNDARY ─ ─ ─ ─ ─ ─ ┤
+│  BACKGROUND TASK STATE (injected)               │  Churns every tick (durations,
+│                                                 │  live output); never cached
 ├─────────────────────────────────────────────────┤
 │  CURRENT TICK CONTENT + USER PROMPT             │  New tool results + prompt
 │  Content from the current agentic loop turn     │  Appended by pi-agent-core
@@ -41,7 +44,7 @@ The layout is ordered so stable content is at the top and volatile content is at
 
 When a slot in the middle changes, the prefix before it survives in cache; everything from the change point onward is billed at full input price. Conversation history that has not changed also benefits from caching since it sits between the stable slots and the volatile tail.
 
-Ephemeral context and current-loop content sit below the cache boundary. They change every call, so they are not expected to produce stable cache reads. In a managed `CortexAgent`, ephemeral content is inserted at the pre-prompt boundary so old conversation history can remain cacheable while the current prompt stays at the end of the request.
+Consumer ephemeral content and loaded skill instructions sit just above the cache boundary: they are rebuilt every LLM call but hold constant across the ticks of a single turn, so within a turn they cache alongside old history. Background task state (durations, live output) churns every tick, so it is injected after the boundary and never enters the cached prefix, together with current-loop content and the prompt.
 
 ### Anthropic Cache Breakpoints
 
@@ -53,14 +56,14 @@ For a managed `CortexAgent` using Anthropic, pi-ai first places cache controls o
 
 1. System prompt.
 2. End of the slot region.
-3. Old conversation history boundary, before injected ephemeral context.
+3. End of the stable prefix: old conversation history plus the injected ephemeral and skill messages, before background task state and current-tick content.
 4. Last user message, usually the current prompt.
 
 Cortex strips the tool-definition breakpoint because the system breakpoint already covers tools in Anthropic's prefix order, and Anthropic allows only four breakpoints. Keeping the slot and history breakpoints is more valuable for long-running agents.
 
 Slot order should be chosen by expected stability. Put content that almost never changes first, semi-stable context after that, and high-churn context near the end of the slot list. If a late slot changes, Anthropic can still walk back from the end-of-slots breakpoint to an earlier unchanged slot boundary. If the slot region grows beyond roughly 20 content blocks, add another explicit breakpoint or reduce slot fragmentation, because Anthropic may not check far enough back from the end-of-slots breakpoint.
 
-Direct completion helpers (`directComplete()` and `structuredComplete()`) do not run the managed agentic-loop `transformContext` pipeline, but they do inherit the agent's configured `cacheRetention` by default. They rely on pi-ai's provider-level cache controls unless a future direct-completion breakpoint API is added.
+Direct completion helpers (`directComplete()`, `structuredComplete()`, and `utilityComplete()`) do not run the managed agentic-loop `transformContext` pipeline, and raw calls (`{ systemPrompt, messages }`) rely on pi-ai's provider-level cache controls. Passing a structured context (`{ systemPrompt, slots, history, ephemeral, prompt }`) instead opts into the same breakpoint strategy: BP2 after the last slot, BP3 at the end of history, with per-call ephemeral content kept outside the cached prefix. Direct completions inherit the agent's configured `cacheRetention` and `sessionId` by default; both can be overridden per call. See the consumer guide's "Direct Model Calls" section for the caching contract.
 
 Reference: [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching).
 
@@ -210,7 +213,7 @@ Ephemeral context is per-call content that the LLM should see but that should NO
 
 ### What Goes in Ephemeral Context
 
-There are two sources of ephemeral content, injected as separate user-role messages at the boundary position:
+There are two sources of ephemeral content, injected as separate user-role messages at the boundary position. Injection order follows stability: consumer ephemeral first, then loaded skill instructions, then background task state last, so the churning background block stays outside the BP3 cache breakpoint.
 
 **1. Consumer ephemeral content** (via `setEphemeral()`): Anything the consumer wants the LLM to see per-call. Examples: environment info (cwd, git branch, model), runtime state, active contact context, emotional state, retrieved memories.
 
