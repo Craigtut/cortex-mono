@@ -117,6 +117,13 @@ export class Session {
   private readonly isResume: boolean;
   private saver: ReturnType<typeof createDebouncedSaver>;
   private isRunning = false;
+  /**
+   * True once the onError handler has surfaced the current turn's failure. The
+   * agent framework both emits an error (via onError) and re-throws it out of
+   * prompt(); without this guard the prompt() catch would render the same
+   * failure a second time as a generic "Error". Reset at the start of each turn.
+   */
+  private lastTurnErrorHandled = false;
   /** Live background-retry state, while a transient failure is being retried. */
   private retryState: { info: RetryScheduledInfo } | null = null;
   /** 1s ticker that refreshes the retry countdown line. */
@@ -474,21 +481,23 @@ export class Session {
     // turn.
     const promptForAgent = await this.applyPreTurnHooks(text);
 
+    this.lastTurnErrorHandled = false;
     try {
       await this.agent.prompt(promptForAgent);
     } catch (err) {
       log.error('Prompt error', { error: err instanceof Error ? err.message : String(err) });
       void this.activity.recordError(err instanceof Error ? err : String(err));
-      // Errors are mostly handled via onError handler.
-      // Catch unexpected ones and stream interruptions here.
-      if (this.agent?.state !== 'destroyed') {
+      // Classified errors are already surfaced by the onError handler, which
+      // both emits and lets the error re-throw here. Only handle throws it did
+      // NOT show: stream interruptions and truly-unexpected errors.
+      if (this.agent?.state !== 'destroyed' && !this.lastTurnErrorHandled) {
         const message = err instanceof Error ? err.message : String(err);
         // Check if this is a stream interruption (partial response already displayed)
         if (message.includes('stream') || message.includes('aborted') || message.includes('interrupted')) {
           this.app!.transcript.appendAssistantChunk('\n\n[response interrupted]');
           this.app!.transcript.finalizeAssistantMessage();
         } else {
-          this.app!.transcript.addNotification('Error', message);
+          this.app!.transcript.addNotification('Error', message, { severity: 'error' });
         }
       }
     } finally {
@@ -894,12 +903,11 @@ export class Session {
     // Error handling with per-category display
     this.agent.onError((error: ClassifiedError) => {
       void this.activity.recordError(error, error.severity === 'fatal');
-      // The real reason often lives in the error's `cause` chain (undici/SDK
-      // bury it below an opaque "Connection error."). Surface it everywhere so
-      // a failed turn is diagnosable instead of mysterious.
-      const causeLine = error.causeDetail ? `\nDetails: ${error.causeDetail}` : '';
+      // The framework emits here and then re-throws out of prompt(); mark the
+      // failure handled so the prompt() catch does not render it a second time.
+      this.lastTurnErrorHandled = true;
       // Record the failure in the durable transcript so a turn that errored
-      // before completing is visible. Skip user-initiated aborts (cancelled).
+      // before completing is visible, cause chain included. Skip user aborts.
       if (error.category !== 'cancelled') {
         const transcriptMessage = error.causeDetail
           ? `${error.originalMessage ?? String(error)} (${error.causeDetail})`
@@ -925,18 +933,20 @@ export class Session {
           break;
         }
         case 'authentication':
+          // The OAuth mechanics ("Failed to refresh token") are jargon and
+          // already in the durable transcript; the user just needs the fix.
           this.clearRetry();
-          this.app!.transcript.addNotification(
-            'Authentication Error',
-            `${error.originalMessage ?? 'Credentials expired or invalid.'}\nRun /login to reconnect.${causeLine}`,
-          );
+          this.app!.transcript.addNotification('Authentication expired', '', {
+            severity: 'error',
+            action: 'run /login to reconnect',
+          });
           break;
         case 'context_overflow':
           this.clearRetry();
-          this.app!.transcript.addNotification(
-            'Context Limit Reached',
-            'Context window is full and compaction has been exhausted.\nUse /context-window to increase the limit or /clear to start fresh.',
-          );
+          this.app!.transcript.addNotification('Context limit reached', '', {
+            severity: 'error',
+            action: 'use /context-window or /clear',
+          });
           break;
         case 'cancelled':
           // User-initiated abort; drop any pending retry line, no notification.
@@ -945,8 +955,9 @@ export class Session {
         default:
           this.clearRetry();
           this.app!.transcript.addNotification(
-            'Error',
-            `${error.originalMessage ?? String(error)}${causeLine}`,
+            error.originalMessage ?? String(error),
+            error.causeDetail ?? '',
+            { severity: 'error' },
           );
       }
     });

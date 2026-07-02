@@ -50,7 +50,22 @@ interface ExpandableTranscriptItem {
 
 type ToolTranscriptComponent = ToolExecutionComponent | ToolGroupComponent;
 
-export type NotificationSeverity = 'routine' | 'important' | 'error';
+/**
+ * Visual severity of a notification. It drives the leading glyph and its color;
+ * everything else in the line stays muted so severity is what the eye catches.
+ */
+export type NotificationSeverity = 'error' | 'warning' | 'info' | 'success';
+
+/** Leading glyph + tint for each severity. Single-width glyphs only. */
+const SEVERITY_STYLE: Record<
+  NotificationSeverity,
+  { glyph: string; tint: (s: string) => string }
+> = {
+  error: { glyph: '✕', tint: colors.error }, // ✕ cinnabar
+  warning: { glyph: '⚠', tint: colors.accent }, // ⚠ amber
+  info: { glyph: '•', tint: colors.primaryMuted }, // • olive
+  success: { glyph: '✓', tint: colors.success }, // ✓ green
+};
 
 /** View model for the compact background-retry status line. */
 export interface RetryStatusView {
@@ -376,25 +391,28 @@ export class TranscriptManager {
     this.updateActivityIndicator();
   }
 
-  /** Add a system notification (compaction, error, etc.). */
+  /**
+   * Add a system notification (error, compaction, MCP notice, etc.).
+   *
+   * A single-line message renders as a compact one-line alert
+   * ("\u2715 Title \u00b7 detail \u00b7 action") so a routine failure costs one row, not a
+   * boxed block. Pass `action` for the accented call-to-action (e.g. a
+   * "/login" suggestion). A multi-line message keeps a light glyph header over
+   * its raw body, for content that is genuinely a block (command lists, tables).
+   */
   addNotification(
     title: string,
     message: string,
-    options?: { severity?: NotificationSeverity },
+    options?: { severity?: NotificationSeverity; action?: string },
   ): void {
     this.closeActiveToolGroups();
-    const severity = options?.severity ?? this.inferNotificationSeverity(title, message);
-    if (severity === 'routine' && !message.includes('\n')) {
-      this.addRoutineNotification(title, message);
-      return;
+    const severity = options?.severity ?? this.inferSeverity(title, message);
+    const body = message.trim();
+    if (body.includes('\n')) {
+      this.addNotificationBlock(severity, title, body);
+    } else {
+      this.addAlertLine(severity, title, body, options?.action);
     }
-
-    this.maybeAddSpacer(false);
-    const header = colors.primaryMuted(`\u2500\u2500\u2500 ${title} ` + '\u2500'.repeat(Math.max(0, 56 - title.length)));
-    this.chatContainer.addChild(new Text(header));
-    this.chatContainer.addChild(new Text(colors.muted(message)));
-    this.chatContainer.addChild(new Spacer(1));
-    this.lastAddedItemCategory = 'spacer';
     this.diagnostics?.recordTranscriptMutation('notification');
     this.immediateRender();
   }
@@ -632,7 +650,17 @@ export class TranscriptManager {
     this.activeToolGroups.clear();
   }
 
-  private addRoutineNotification(title: string, message: string): void {
+  /**
+   * Compact one-line alert: "✕ Title · detail · action". The severity glyph
+   * carries the color; consecutive alerts pack together with no blank line
+   * between them so a burst of notices reads as a short stack, not a wall.
+   */
+  private addAlertLine(
+    severity: NotificationSeverity,
+    title: string,
+    detail: string,
+    action?: string,
+  ): void {
     if (
       this.lastAddedItemCategory !== null &&
       this.lastAddedItemCategory !== 'spacer' &&
@@ -641,31 +669,41 @@ export class TranscriptManager {
       this.chatContainer.addChild(new Spacer(1));
     }
 
-    const label = colors.primaryMuted(title);
-    this.chatContainer.addChild(new Text(`  ${label}${colors.muted(`: ${message}`)}`));
+    const { glyph, tint } = SEVERITY_STYLE[severity];
+    const segments = [`${tint(glyph)} ${tint(title)}`];
+    if (detail) segments.push(colors.muted(detail));
+    if (action) segments.push(colors.accent(action));
+    this.chatContainer.addChild(new Text(`  ${segments.join(colors.muted(' · '))}`));
     this.lastAddedItemCategory = 'routine-notification';
     this.diagnostics?.recordTranscriptMutation('notification_routine');
-    this.immediateRender();
   }
 
-  private inferNotificationSeverity(title: string, message: string): NotificationSeverity {
-    const text = `${title} ${message}`.toLowerCase();
-    if (
-      text.includes('error') ||
-      text.includes('failed') ||
-      text.includes('failure') ||
-      text.includes('denied') ||
-      text.includes('limit') ||
-      text.includes('rate') ||
-      text.includes('connection') ||
-      text.includes('authentication') ||
-      text.includes('exhausted') ||
-      text.includes('degraded')
-    ) {
-      return 'important';
-    }
+  /**
+   * Multi-line notification: a light glyph header over the raw body. No full
+   * width rule; the body keeps its own formatting (command lists, summaries).
+   */
+  private addNotificationBlock(
+    severity: NotificationSeverity,
+    title: string,
+    body: string,
+  ): void {
+    this.maybeAddSpacer(false);
+    const { glyph, tint } = SEVERITY_STYLE[severity];
+    this.chatContainer.addChild(new Text(`  ${tint(glyph)} ${tint(title)}`));
+    this.chatContainer.addChild(new Text(colors.muted(body)));
+    this.chatContainer.addChild(new Spacer(1));
+    this.lastAddedItemCategory = 'spacer';
+  }
 
-    return 'routine';
+  private inferSeverity(title: string, message: string): NotificationSeverity {
+    const text = `${title} ${message}`.toLowerCase();
+    if (/\berror\b|failed|failure|denied|expired|invalid|unable|not found/.test(text)) {
+      return 'error';
+    }
+    if (/degraded|exhausted|\bwarning\b|rate limit|\blimit\b/.test(text)) {
+      return 'warning';
+    }
+    return 'info';
   }
 
   /** Finalize and detach the current assistant message. */

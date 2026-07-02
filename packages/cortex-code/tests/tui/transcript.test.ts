@@ -124,6 +124,7 @@ vi.mock('../../src/tui/theme.js', () => ({
     muted: (text: string) => text,
     accent: (text: string) => text,
     error: (text: string) => text,
+    success: (text: string) => text,
     userMessageBg: (text: string) => text,
   },
   markdownTheme: {},
@@ -225,6 +226,45 @@ describe('TranscriptManager', () => {
     transcript.addNotification('Model', 'Switched to gpt-5.5.');
 
     expect(chat.children).toHaveLength(1);
+  });
+
+  it('renders a single-line error as one compact alert with a glyph and action', () => {
+    const chat = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never);
+
+    transcript.addNotification('Authentication expired', '', {
+      severity: 'error',
+      action: 'run /login to reconnect',
+    });
+
+    expect(chat.children).toHaveLength(1);
+    const text = (chat.children[0] as { text: string }).text;
+    expect(text).toContain('✕');
+    expect(text).toContain('Authentication expired');
+    expect(text).toContain('run /login to reconnect');
+    // No heavyweight box rule.
+    expect(text).not.toContain('───');
+  });
+
+  it('renders a multi-line notification as a light glyph header over its body', () => {
+    const chat = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never);
+
+    transcript.addNotification(
+      'Available Commands',
+      '  /help  Show help\n  /model  Switch model',
+    );
+
+    // Glyph header + raw body + trailing spacer, and no full-width rule.
+    expect(chat.children).toHaveLength(3);
+    const header = (chat.children[0] as { text: string }).text;
+    expect(header).toContain('Available Commands');
+    expect(header).not.toContain('───');
+    const body = (chat.children[1] as { text: string }).text;
+    expect(body).toContain('/help');
+    expect(body).toContain('/model');
   });
 
   it('shows a single in-place retry status line and updates it in place', () => {

@@ -9,14 +9,13 @@ export const updateCommand: Command = {
     const app = session.getApp();
     if (!app) return;
 
-    app.transcript.addNotification('Update', 'Checking for updates...', { severity: 'routine' });
+    app.transcript.addNotification('Update', 'Checking for updates...');
 
     const info = await checkNow(PKG_VERSION);
     if (!info) {
       app.transcript.addNotification(
         'Update',
         `You're on the latest version (${PKG_VERSION}).`,
-        { severity: 'routine' },
       );
       return;
     }
