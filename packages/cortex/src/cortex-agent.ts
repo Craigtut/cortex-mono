@@ -21,6 +21,12 @@
 import * as os from 'node:os';
 import { ContextManager } from './context-manager.js';
 import type { AgentContext, AgentMessage, AgentStateAccessor } from './context-manager.js';
+import {
+  computeCacheBreakpointIndices,
+  applyCacheBreakpoints,
+  resolveDirectCompletionContext,
+} from './cache-breakpoints.js';
+import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-breakpoints.js';
 import { EventBridge } from './event-bridge.js';
 import type { PiEventSource } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
@@ -329,8 +335,16 @@ interface CortexAgentConstructorOptions {
 
 type CacheRetention = 'none' | 'short' | 'long';
 
-interface DirectCompletionOptions {
+export interface DirectCompletionOptions {
   cacheRetention?: CacheRetention;
+  /**
+   * Per-call cache affinity key, sent as the `x-session-affinity` header on
+   * Anthropic requests so repeated calls route to the same cache. Defaults to
+   * the agent's sessionId. Set a distinct value per pipeline when running
+   * several independent direct-completion pipelines with different stable
+   * prefixes.
+   */
+  sessionId?: string;
   /**
    * Optional abort signal to cancel an in-flight completion. When the signal
    * fires, the call rejects with an `AbortError` (an Error whose `name` is
@@ -475,7 +489,7 @@ export class CortexAgent {
   // consumed in onPayload (which has the final Anthropic API params).
   // Stores the API-level message indices where cache_control breakpoints
   // should be injected (BP2 = after last slot, BP3 = old history boundary).
-  private _cacheBreakpointIndices: { bp2ApiIndex: number; bp3ApiIndex: number } | null = null;
+  private _cacheBreakpointIndices: CacheBreakpointIndices | null = null;
 
   // Usage from the most recent directComplete() or structuredComplete() call.
   // Reset to null before each call. Consumers read this after a call to
@@ -1153,14 +1167,28 @@ export class CortexAgent {
   private buildDirectCompletionOptions(
     apiKey: string | undefined,
     options?: DirectCompletionOptions,
+    breakpointIndices?: CacheBreakpointIndices | null,
   ): Record<string, unknown> | undefined {
     const completeOptions: Record<string, unknown> = {};
     const cacheRetention = options?.cacheRetention ?? this._cacheRetention;
+    const sessionId = options?.sessionId ?? this._sessionId;
 
     if (apiKey) completeOptions['apiKey'] = apiKey;
     if (cacheRetention) completeOptions['cacheRetention'] = cacheRetention;
-    if (this._sessionId) completeOptions['sessionId'] = this._sessionId;
+    if (sessionId) completeOptions['sessionId'] = sessionId;
     if (options?.signal) completeOptions['signal'] = options.signal;
+
+    // Structured contexts carry BP2/BP3 indices; stamp them onto the payload
+    // via pi-ai's onPayload hook, same as the agentic loop does.
+    if (breakpointIndices) {
+      completeOptions['onPayload'] = (
+        payload: Record<string, unknown>,
+        model: Record<string, unknown>,
+      ) => {
+        if (!model || model['provider'] !== 'anthropic') return undefined;
+        return applyCacheBreakpoints(payload, breakpointIndices);
+      };
+    }
 
     return Object.keys(completeOptions).length > 0 ? completeOptions : undefined;
   }
@@ -1175,17 +1203,20 @@ export class CortexAgent {
    * like THOUGHT and REFLECT where a single LLM response is needed
    * without tool execution.
    *
+   * Accepts either a raw context ({ systemPrompt, messages }) passed to
+   * pi-ai verbatim, or a structured context ({ systemPrompt, slots?,
+   * history?, ephemeral?, prompt }) that Cortex assembles with the same
+   * cache breakpoint strategy the agentic loop uses. See
+   * StructuredCompletionContext for the caching contract.
+   *
    * Dynamically imports pi-ai's complete() function. If pi-ai is not
    * installed, throws a clear error.
    *
-   * @param context - System prompt and messages for the completion
+   * @param context - Raw or structured completion context
    * @returns The response text from the LLM
    * @throws Error if pi-ai is not installed or the call fails
    */
-  async directComplete(context: {
-    systemPrompt: string;
-    messages: unknown[];
-  }, options?: DirectCompletionOptions): Promise<string> {
+  async directComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string> {
     // Dynamically import pi-ai's complete() function
     // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
     // here pending the planned createModels() migration (Phase 2).
@@ -1199,6 +1230,10 @@ export class CortexAgent {
         'Install it as a dependency or peer dependency.',
       );
     }
+
+    // Validate and assemble the context. Structured contexts get the
+    // [slots][history][ephemeral][prompt] layout plus BP2/BP3 indices.
+    const resolved = resolveDirectCompletionContext(context);
 
     // Resolve API key for the provider. A resolution failure is remembered
     // rather than swallowed: pi-ai may still succeed via env vars, but if the
@@ -1216,7 +1251,7 @@ export class CortexAgent {
 
     this._lastDirectUsage = null;
 
-    const completeOptions = this.buildDirectCompletionOptions(apiKey, options);
+    const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
 
     const directStartMs = Date.now();
     try {
@@ -1227,8 +1262,8 @@ export class CortexAgent {
       const result = await completeFn(
         this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
         {
-          systemPrompt: context.systemPrompt,
-          messages: context.messages,
+          systemPrompt: resolved.systemPrompt,
+          messages: resolved.messages,
         } as Parameters<typeof completeFn>[1],
         completeOptions as Parameters<typeof completeFn>[2] | undefined,
       );
@@ -1263,16 +1298,18 @@ export class CortexAgent {
    * support tool use (Anthropic, OpenAI, Google, Mistral, etc.) without
    * needing provider-specific structured output parameters.
    *
-   * @param context - System prompt and messages (accepts pi-ai native message format)
+   * Accepts the same raw or structured contexts as directComplete(). Note
+   * for cached structured contexts: tool definitions precede the system
+   * prompt in Anthropic's cacheable prefix, so keep the schema byte-stable
+   * across calls or the whole prefix misses.
+   *
+   * @param context - Raw or structured completion context
    * @param schema - Tool schema defining the structured output shape (TypeBox or JSON Schema)
    * @param toolName - Name for the virtual tool (default: 'structured_output')
    * @param toolDescription - Description for the virtual tool
    * @returns The parsed tool call arguments, or null if the model didn't call the tool
    */
-  async structuredComplete(context: {
-    systemPrompt: string;
-    messages: unknown[];
-  }, schema: unknown, toolName: string = 'structured_output', toolDescription: string = 'Produce structured output', options?: DirectCompletionOptions): Promise<Record<string, unknown> | null> {
+  async structuredComplete(context: DirectCompletionContext, schema: unknown, toolName: string = 'structured_output', toolDescription: string = 'Produce structured output', options?: DirectCompletionOptions): Promise<Record<string, unknown> | null> {
     // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
     // here pending the planned createModels() migration (Phase 2).
     let completeFn: typeof import('@earendil-works/pi-ai/compat').complete;
@@ -1291,6 +1328,9 @@ export class CortexAgent {
       parameters: schema,
     };
 
+    // Validate and assemble the context (see directComplete).
+    const resolved = resolveDirectCompletionContext(context);
+
     // Resolve API key for the provider. A resolution failure is remembered
     // rather than swallowed (see directComplete) so a downstream failure can be
     // reported with the more actionable credential cause.
@@ -1306,7 +1346,7 @@ export class CortexAgent {
     }
 
     this._lastDirectUsage = null;
-    const completeOptions = this.buildDirectCompletionOptions(apiKey, options);
+    const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
 
     const structStartMs = Date.now();
     try {
@@ -1317,8 +1357,8 @@ export class CortexAgent {
       const result = await completeFn(
         this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
         {
-          systemPrompt: context.systemPrompt,
-          messages: context.messages,
+          systemPrompt: resolved.systemPrompt,
+          messages: resolved.messages,
           tools: [tool],
         } as Parameters<typeof completeFn>[1],
         {
@@ -1528,42 +1568,7 @@ export class CortexAgent {
       const indices = agent._cacheBreakpointIndices;
       if (!indices) return undefined;
 
-      const systemBlocks = payload['system'] as Array<Record<string, unknown>> | undefined;
-      if (!systemBlocks || systemBlocks.length === 0) return undefined;
-      const cacheControl = systemBlocks[systemBlocks.length - 1]!['cache_control'];
-      if (!cacheControl) return undefined;
-
-      // Strip cache_control from all system blocks except the last.
-      // OAuth tokens cause pi-ai to prepend an identity block with its own
-      // cache_control, consuming an extra breakpoint slot. Only the last
-      // system block (our actual system prompt) needs the breakpoint.
-      for (let i = 0; i < systemBlocks.length - 1; i++) {
-        delete systemBlocks[i]!['cache_control'];
-      }
-
-      // Strip cache_control from tool definitions. Pi-ai sets it on the
-      // last tool, but Cortex manages its own 4-breakpoint budget (system,
-      // BP2, BP3, last user message) and the tool breakpoint is redundant.
-      const tools = payload['tools'] as Array<Record<string, unknown>> | undefined;
-      if (tools) {
-        for (const tool of tools) {
-          delete tool['cache_control'];
-        }
-      }
-
-      const messages = payload['messages'] as Array<Record<string, unknown>>;
-      if (!messages) return undefined;
-
-      if (indices.bp2ApiIndex >= 0 && indices.bp2ApiIndex < messages.length) {
-        addCacheControlToMessage(messages[indices.bp2ApiIndex]!, cacheControl);
-      }
-
-      if (indices.bp3ApiIndex >= 0 && indices.bp3ApiIndex < messages.length &&
-          indices.bp3ApiIndex !== indices.bp2ApiIndex) {
-        addCacheControlToMessage(messages[indices.bp3ApiIndex]!, cacheControl);
-      }
-
-      return payload;
+      return applyCacheBreakpoints(payload, indices);
     };
 
     return agentConfig;
@@ -2317,16 +2322,14 @@ export class CortexAgent {
    * safety classification, etc.).
    *
    * Analogous to directComplete() but uses the utility model (smaller, cheaper)
-   * instead of the primary model. Dynamically imports pi-ai's complete() function.
+   * instead of the primary model. Accepts the same raw or structured contexts
+   * as directComplete(). Dynamically imports pi-ai's complete() function.
    *
-   * @param context - System prompt and messages for the completion
+   * @param context - Raw or structured completion context
    * @returns The response text from the LLM
    * @throws Error if pi-ai is not installed or the call fails
    */
-  async utilityComplete(context: {
-    systemPrompt: string;
-    messages: Array<{ role: string; content: string }>;
-  }, options?: DirectCompletionOptions): Promise<string> {
+  async utilityComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string> {
     // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
     // here pending the planned createModels() migration (Phase 2).
     let completeFn: typeof import('@earendil-works/pi-ai/compat').complete;
@@ -2339,6 +2342,9 @@ export class CortexAgent {
         'Install it as a dependency or peer dependency.',
       );
     }
+
+    // Validate and assemble the context (see directComplete).
+    const resolved = resolveDirectCompletionContext(context);
 
     // Resolve API key for the utility model's provider. A resolution failure is
     // remembered rather than swallowed (see directComplete) so a downstream
@@ -2356,24 +2362,17 @@ export class CortexAgent {
 
     this._lastDirectUsage = null;
 
-    const utilOptions: Record<string, unknown> = {};
-    if (apiKey) utilOptions['apiKey'] = apiKey;
-    if (options?.signal) utilOptions['signal'] = options.signal;
+    const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
 
     const utilStartMs = Date.now();
     try {
       const result = await completeFn(
         this.resolvedUtilityPiModel as unknown as Parameters<typeof completeFn>[0],
         {
-          systemPrompt: context.systemPrompt,
-          messages: context.messages.map(m => ({
-            role: m.role as 'user' | 'assistant',
-            content: m.content,
-          })),
+          systemPrompt: resolved.systemPrompt,
+          messages: resolved.messages,
         } as Parameters<typeof completeFn>[1],
-        Object.keys(utilOptions).length > 0
-          ? utilOptions as Parameters<typeof completeFn>[2]
-          : undefined,
+        completeOptions as Parameters<typeof completeFn>[2] | undefined,
       );
 
       // Caller-initiated cancellation takes precedence over error/usage handling.
@@ -3109,11 +3108,20 @@ export class CortexAgent {
 
       // Step 4: Compute API message indices for cache breakpoints.
       // Count how messages map from our array to the Anthropic API format
-      // (convertMessages skips empty user messages and merges consecutive
-      // tool_results). The indices are consumed by the onPayload hook.
-      this._cacheBreakpointIndices = this.computeCacheBreakpointIndices(
-        result.messages, slotCount,
-      );
+      // (convertMessages skips empty messages and merges consecutive
+      // toolResults). The indices are consumed by the onPayload hook.
+      //
+      // BP3 covers old history plus the stable injections (ephemeral and
+      // skills, which hold constant across ticks within a turn). Background
+      // task state churns every tick, so it is injected after this boundary
+      // and stays outside the cached prefix.
+      const stableInjectionCount =
+        (this.contextManager.getEphemeral() ? 1 : 0) +
+        (this.skillBuffer.length > 0 ? 1 : 0);
+      this._cacheBreakpointIndices = computeCacheBreakpointIndices(result.messages, {
+        slotCount,
+        boundary: this._prePromptMessageCount + stableInjectionCount,
+      });
 
       return result;
     };
@@ -3138,10 +3146,19 @@ export class CortexAgent {
     let result = context;
     const ephemeralContent = this.contextManager.getEphemeral();
 
-    // Build injection messages (ephemeral + background state + skills)
+    // Build injection messages ordered by stability: ephemeral and skills
+    // hold constant across ticks within a turn, so the BP3 cache breakpoint
+    // can sit after them. Background task state (durations, live output)
+    // churns every tick and must come last, outside the cached prefix.
     const injections: AgentMessage[] = [];
     if (ephemeralContent) {
       injections.push({ role: 'user' as const, content: ephemeralContent, timestamp: Date.now() });
+    }
+    if (this.skillBuffer.length > 0) {
+      const formatted = this.skillBuffer.map(s =>
+        `<skill-instructions name="${s.name}">\n${s.content}\n</skill-instructions>`,
+      ).join('\n\n');
+      injections.push({ role: 'user' as const, content: formatted, timestamp: Date.now() });
     }
 
     // Inject background task state so the agent has visibility into
@@ -3149,12 +3166,6 @@ export class CortexAgent {
     const backgroundState = this.buildBackgroundTaskState();
     if (backgroundState) {
       injections.push({ role: 'user' as const, content: backgroundState, timestamp: Date.now() });
-    }
-    if (this.skillBuffer.length > 0) {
-      const formatted = this.skillBuffer.map(s =>
-        `<skill-instructions name="${s.name}">\n${s.content}\n</skill-instructions>`,
-      ).join('\n\n');
-      injections.push({ role: 'user' as const, content: formatted, timestamp: Date.now() });
     }
 
     if (injections.length > 0) {
@@ -3180,87 +3191,8 @@ export class CortexAgent {
     };
   }
 
-  // -----------------------------------------------------------------------
-  // Private: Cache breakpoint computation
-  // -----------------------------------------------------------------------
-
-  /**
-   * Compute API message indices for cache breakpoints BP2 and BP3.
-   *
-   * Walks the transformed message array and counts how messages will appear
-   * in the final Anthropic API params after convertMessages processes them.
-   * convertMessages skips empty user messages and merges consecutive
-   * toolResult messages into single user messages.
-   *
-   * BP2: placed after the last slot message. Slots are stable across the
-   *   entire session lifetime, so everything up to BP2 is always cached.
-   * BP3: placed at the old history boundary (before injected ephemeral/skills).
-   *   Old history is stable across ticks within the same session, so this
-   *   is a "ratcheting" breakpoint that advances as history grows.
-   *
-   * @param messages - The transformed message array (after injection + sanitization)
-   * @param slotCount - Number of slot messages at the start of the array
-   * @returns API indices for BP2 and BP3, or -1 if not applicable
-   */
-  private computeCacheBreakpointIndices(
-    messages: AgentMessage[],
-    slotCount: number,
-  ): { bp2ApiIndex: number; bp3ApiIndex: number } {
-    let apiIndex = -1;
-    let bp2ApiIndex = -1;
-    let bp3ApiIndex = -1;
-    let inToolResultRun = false;
-
-    // The boundary in the transformed messages accounts for injected
-    // ephemeral/skills. Ephemeral + skills were inserted at
-    // _prePromptMessageCount, so the boundary in the transformed array
-    // shifts by the number of injections.
-    const ephemeralContent = this.contextManager.getEphemeral();
-    const injectionCount = (ephemeralContent ? 1 : 0) + (this.skillBuffer.length > 0 ? 1 : 0);
-    const transformedBoundary = this._prePromptMessageCount + injectionCount;
-
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i]!;
-      const role = msg.role;
-      const content = typeof msg.content === 'string' ? msg.content : '';
-      const isToolResult = role === 'user' && Array.isArray(msg.content) &&
-        (msg.content as Array<Record<string, unknown>>).some(
-          (block) => block['type'] === 'tool_result',
-        );
-
-      // convertMessages skips empty user messages
-      if (role === 'user' && typeof msg.content === 'string' && content.trim() === '') {
-        continue;
-      }
-
-      // convertMessages merges consecutive toolResult messages
-      if (isToolResult) {
-        if (!inToolResultRun) {
-          apiIndex++;
-          inToolResultRun = true;
-        }
-        // else: merged into the same API message, don't increment
-      } else {
-        inToolResultRun = false;
-        apiIndex++;
-      }
-
-      // BP2: last slot message
-      if (i === slotCount - 1) {
-        bp2ApiIndex = apiIndex;
-      }
-
-      // BP3: last message before the boundary (old history end).
-      // The boundary is the index where ephemeral was inserted.
-      // The message at transformedBoundary - 1 is the last old
-      // history message.
-      if (i === transformedBoundary - 1 && transformedBoundary > slotCount) {
-        bp3ApiIndex = apiIndex;
-      }
-    }
-
-    return { bp2ApiIndex, bp3ApiIndex };
-  }
+  // Cache breakpoint index computation lives in cache-breakpoints.ts,
+  // shared with the direct completion endpoints.
 
   // -----------------------------------------------------------------------
   // Private: Model resolution
@@ -4930,32 +4862,3 @@ export class CortexAgent {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Module-level helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Add cache_control to the last content block of an Anthropic API message.
- * Handles both string content (converts to block array) and existing block
- * arrays. This is a mutation-in-place operation on the message object.
- *
- * Used by the onPayload hook to inject cache breakpoints on intermediate
- * messages (BP2 and BP3) beyond what pi-ai places automatically (BP1 on
- * system prompt, BP4 on last user message).
- */
-function addCacheControlToMessage(
-  message: Record<string, unknown>,
-  cacheControl: unknown,
-): void {
-  const content = message['content'];
-  if (Array.isArray(content) && content.length > 0) {
-    const lastBlock = content[content.length - 1] as Record<string, unknown>;
-    lastBlock['cache_control'] = cacheControl;
-  } else if (typeof content === 'string') {
-    message['content'] = [{
-      type: 'text',
-      text: content,
-      cache_control: cacheControl,
-    }];
-  }
-}

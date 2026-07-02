@@ -107,6 +107,22 @@ export type {
   AgentContext,
 } from './context-manager.js';
 
+// Cache Breakpoints (shared by the agentic loop and direct completions)
+export {
+  computeCacheBreakpointIndices,
+  applyCacheBreakpoints,
+  addCacheControlToMessage,
+  resolveDirectCompletionContext,
+} from './cache-breakpoints.js';
+export type {
+  CacheBreakpointIndices,
+  CacheBreakpointRegions,
+  RawCompletionContext,
+  StructuredCompletionContext,
+  DirectCompletionContext,
+  ResolvedCompletionContext,
+} from './cache-breakpoints.js';
+
 // Event Bridge (Phase 1B)
 export { EventBridge } from './event-bridge.js';
 export type {
@@ -123,7 +139,7 @@ export { BudgetGuard } from './budget-guard.js';
 
 // CortexAgent (Phase 1B)
 export { CortexAgent, MINIMUM_CONTEXT_WINDOW, TOOL_RESULT_WORKING_TAGS_REMINDER } from './cortex-agent.js';
-export type { PiAgent, PiModel } from './cortex-agent.js';
+export type { PiAgent, PiModel, DirectCompletionOptions } from './cortex-agent.js';
 
 // Tool Contracts
 export { fromPiAgentTool, assertValidCortexTool } from './tool-contract.js';
