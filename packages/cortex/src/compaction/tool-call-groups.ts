@@ -37,32 +37,18 @@ export function extractToolCallIds(message: AgentMessage): Set<string> {
 }
 
 /**
- * Extract the tool call ID a tool result message refers to.
- * Real runtime messages carry it as `toolCallId`; legacy content-part
- * shapes may carry it as a `tool_use_id` field on a 'tool_result' part.
- */
-function extractToolResultCallId(message: AgentMessage): string | null {
-  if (typeof message.toolCallId === 'string') {
-    return message.toolCallId;
-  }
-  if (Array.isArray(message.content)) {
-    for (const part of message.content) {
-      if (part.type === 'tool_result' && typeof part['tool_use_id'] === 'string') {
-        return part['tool_use_id'];
-      }
-    }
-  }
-  return null;
-}
-
-/**
  * Find atomic tool call groups in conversation history.
  *
  * A group is a contiguous run of messages: one assistant message containing
- * 'toolCall' blocks followed by its consecutive toolResult messages. Results
- * whose IDs belong to a different call end the group (defensive; should not
- * occur in well-formed history). Results or calls missing IDs are grouped by
- * adjacency.
+ * 'toolCall' blocks followed by its consecutive toolResult messages.
+ *
+ * Every contiguous toolResult message after an assistant tool-call message is
+ * swept into the group, including one whose ID does not match any of the
+ * assistant's calls. Providers place a result immediately after its call, so a
+ * contiguous run of results structurally belongs to the preceding call message.
+ * Ending the group early on a foreign ID (which cannot arise from well-formed
+ * pi history) would strand a later, genuinely-matched result as its own head,
+ * so the group is kept whole instead.
  *
  * Returns a map from every message index that belongs to a group to the full
  * ascending list of indices in that group. Indices within a group are always
@@ -78,16 +64,9 @@ export function findToolCallGroups(history: AgentMessage[]): Map<number, number[
       continue;
     }
 
-    const callIds = extractToolCallIds(history[i]!);
     const group = [i];
     let j = i + 1;
     while (j < history.length && isToolResultMessage(history[j]!)) {
-      const resultId = extractToolResultCallId(history[j]!);
-      // A result referencing an ID outside this assistant's calls belongs
-      // to some other (malformed) sequence; end the group before it.
-      if (resultId !== null && callIds.size > 0 && !callIds.has(resultId)) {
-        break;
-      }
       group.push(j);
       j++;
     }

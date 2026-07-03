@@ -74,7 +74,9 @@ describe('findToolCallGroups', () => {
     expect(groups.get(3)).toEqual([2, 3]);
   });
 
-  it('ends a group at a result referencing a foreign call id', () => {
+  it('sweeps a contiguous foreign-id toolResult into the group (belt-and-braces)', () => {
+    // A malformed result whose id matches no call must NOT end the group:
+    // breaking here would strand a later matched result as its own head.
     const history: AgentMessage[] = [
       makeToolCallMsg([{ id: 'call_1', name: 'Read' }]),  // 0
       makeToolResultMsg('call_1', 'Read', 'r1'),          // 1
@@ -82,8 +84,8 @@ describe('findToolCallGroups', () => {
     ];
     const groups = findToolCallGroups(history);
 
-    expect(groups.get(0)).toEqual([0, 1]);
-    expect(groups.has(2)).toBe(false);
+    expect(groups.get(0)).toEqual([0, 1, 2]);
+    expect(groups.get(2)).toEqual([0, 1, 2]);
   });
 
   it('keeps an assistant message with calls but no results as a lone group', () => {
