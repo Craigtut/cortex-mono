@@ -891,6 +891,10 @@ export class CortexAgent {
     this._activePromptCacheRetention = effectiveRetention ?? null;
 
     this.toolRuntime.resetForLoop();
+    // Budget limits cover the whole logical turn: reset here (once per
+    // prompt) instead of on loop_start, which pi-agent-core emits again for
+    // every background-retry continuation.
+    this.budgetGuard.reset();
     this._isPrompting = true;
     const loopStartMs = Date.now();
 

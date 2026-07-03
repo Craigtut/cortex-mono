@@ -24,6 +24,7 @@ interface RetryMockAgent extends PiAgent {
 function createRetryMock(outcomes: Outcome[], failStopReason: 'error' | 'aborted' = 'error'): RetryMockAgent {
   const queue = [...outcomes];
   let idleResolve: (() => void) | null = null;
+  let eventHandler: ((event: PiEvent) => void) | null = null;
 
   const pushUser = (text: string): void => {
     agent.state.messages.push({ role: 'user', content: text } as never);
@@ -46,6 +47,8 @@ function createRetryMock(outcomes: Outcome[], failStopReason: 'error' | 'aborted
         stopReason: 'end_turn',
       } as never);
     }
+    // Pi emits turn_end for both success and synthetic failure turns.
+    eventHandler?.({ type: 'turn_end' });
   };
 
   const agent: RetryMockAgent = {
@@ -55,13 +58,18 @@ function createRetryMock(outcomes: Outcome[], failStopReason: 'error' | 'aborted
     continueLastRoles: [],
     abortCalled: false,
 
-    subscribe(_handler: (event: PiEvent) => void): () => void {
-      return () => {};
+    subscribe(handler: (event: PiEvent) => void): () => void {
+      eventHandler = handler;
+      return () => {
+        eventHandler = null;
+      };
     },
 
     async prompt(input: string): Promise<unknown> {
       agent.promptCalls += 1;
       agent.state.errorMessage = undefined;
+      // Pi emits agent_start once per run (so once per retry attempt too).
+      eventHandler?.({ type: 'agent_start' });
       pushUser(input);
       applyOutcome();
       return undefined;
@@ -70,6 +78,7 @@ function createRetryMock(outcomes: Outcome[], failStopReason: 'error' | 'aborted
     async continue(): Promise<unknown> {
       agent.continueCalls += 1;
       agent.state.errorMessage = undefined;
+      eventHandler?.({ type: 'agent_start' });
       const last = agent.state.messages[agent.state.messages.length - 1] as
         | { role?: string }
         | undefined;
@@ -218,6 +227,23 @@ describe('CortexAgent background retry', () => {
     expect(scheduled).not.toHaveBeenCalled();
     expect(mock.continueCalls).toBe(0);
     expect(errored.mock.calls[0][0].category).toBe('network');
+  });
+
+  it('budget counts turns across retry attempts of one logical prompt', async () => {
+    mock = createRetryMock(['fail', 'ok']);
+    const agent = build(mock, createConfig());
+
+    await agent.prompt('hi');
+
+    // One logical turn, two attempts (fail + successful retry). Each pi run
+    // emitted agent_start, but the budget must span the whole logical turn
+    // instead of resetting per attempt.
+    expect(mock.continueCalls).toBe(1);
+    expect(agent.getBudgetGuard().getTurnCount()).toBe(2);
+
+    // The next logical prompt starts a fresh budget.
+    await agent.prompt('again');
+    expect(agent.getBudgetGuard().getTurnCount()).toBe(1);
   });
 
   it('abort() mid-turn does not resurrect the turn as a background retry', async () => {

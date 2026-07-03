@@ -266,11 +266,11 @@ describe('BudgetGuard', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Reset on loop_start
+  // Reset per logical turn
   // -----------------------------------------------------------------------
 
-  describe('reset on loop_start', () => {
-    it('resets counters on loop_start', () => {
+  describe('reset per logical turn', () => {
+    it('reset() clears counters and breach state', () => {
       const guard = new BudgetGuard({ maxTurns: Infinity, maxCost: Infinity }, abortFn);
       guard.wire(bridge);
 
@@ -280,8 +280,7 @@ describe('BudgetGuard', () => {
       expect(guard.getTurnCount()).toBe(2);
       expect(guard.getTotalCost()).toBeCloseTo(0.10);
 
-      // Reset via agent_start -> loop_start
-      source.emit({ type: 'agent_start' });
+      guard.reset();
 
       expect(guard.getTurnCount()).toBe(0);
       expect(guard.getTotalCost()).toBe(0);
@@ -297,13 +296,32 @@ describe('BudgetGuard', () => {
       expect(abortFn).toHaveBeenCalledTimes(1);
       expect(guard.isBreached()).toBe(true);
 
-      // Reset via agent_start -> loop_start
-      source.emit({ type: 'agent_start' });
+      guard.reset();
       expect(guard.isBreached()).toBe(false);
 
       // Should be able to run 2 more turns
       source.emit({ type: 'turn_end' });
       expect(abortFn).toHaveBeenCalledTimes(1); // Still just the 1 from before
+    });
+
+    it('does not reset on loop_start (retry continuations emit one per attempt)', () => {
+      const guard = new BudgetGuard({ maxTurns: Infinity, maxCost: Infinity }, abortFn);
+      guard.wire(bridge);
+
+      source.emit(turnEndWithCost(0.05));
+      expect(guard.getTurnCount()).toBe(1);
+
+      // pi-agent-core emits agent_start for every run, including each
+      // background-retry continue(); the budget must keep accumulating
+      // across attempts of the same logical turn.
+      source.emit({ type: 'agent_start' });
+
+      expect(guard.getTurnCount()).toBe(1);
+      expect(guard.getTotalCost()).toBeCloseTo(0.05);
+
+      source.emit(turnEndWithCost(0.05));
+      expect(guard.getTurnCount()).toBe(2);
+      expect(guard.getTotalCost()).toBeCloseTo(0.10);
     });
   });
 
