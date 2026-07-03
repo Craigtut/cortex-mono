@@ -247,7 +247,11 @@ export class PermissionRuleManager {
       }
       for (const rule of rules) {
         if (rule.toolName !== toolName || rule.decision !== 'allow') continue;
-        // A tool-wide allow (empty pattern) is an explicit, unscoped grant.
+        // A tool-wide allow (empty pattern, e.g. a hand-written `Edit` with no
+        // parens) is a deliberate unscoped grant and intentionally skips
+        // containment. suggestPattern never emits an empty pattern for a file
+        // tool, so this is not reachable from the "always allow" UI: it only
+        // exists when a user authors it explicitly.
         if (!rule.pattern) return 'allow';
         if (resolvedTarget && (await this.patternContainsTarget(rule.pattern, resolvedTarget))) {
           return 'allow';

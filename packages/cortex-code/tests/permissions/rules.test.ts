@@ -201,6 +201,26 @@ describe('PermissionRuleManager', () => {
       expect(await manager.matchRule('Read', { file_path: externalFile })).toBe('allow');
     });
 
+    it('resolves link/.. lexically to the inside path (permission layer stays lexical, matching the tools)', async () => {
+      // A real dir symlink inside the workspace that points OUTSIDE it. The
+      // input `${cwd}/link/../secret.txt` collapses lexically (path.resolve) to
+      // `${cwd}/secret.txt`, which is inside, so a workspace allow fires. This
+      // matches how the file tools resolve their fs target. If the permission
+      // layer ever switched to symlink-following resolution, `link` would
+      // resolve outside and this would diverge from the tool: pin it to allow.
+      const elsewhere = path.join(tmpDir, 'elsewhere');
+      fs.mkdirSync(path.join(elsewhere, 'sub'), { recursive: true });
+      const linkPath = path.join(projectDir, 'link');
+      try {
+        fs.symlinkSync(path.join(elsewhere, 'sub'), linkPath, 'dir');
+      } catch {
+        return; // symlink privileges unavailable (e.g. Windows without dev mode)
+      }
+      await manager.addRule('session', 'allow', 'Edit', `${projectDir}/*`);
+      const lexicallyInside = `${projectDir}${path.sep}link${path.sep}..${path.sep}secret.txt`;
+      expect(await manager.matchRule('Edit', { file_path: lexicallyInside })).toBe('allow');
+    });
+
     it('does not auto-approve a Glob/Grep search rooted outside the workspace', async () => {
       const outsideDir = path.join(tmpDir, 'outside-search');
       fs.mkdirSync(outsideDir, { recursive: true });
