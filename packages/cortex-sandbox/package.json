@@ -1,0 +1,68 @@
+{
+  "name": "@animus-labs/cortex-sandbox",
+  "version": "0.1.0",
+  "description": "OS-level sandbox provider for @animus-labs/cortex (macOS Seatbelt, Linux bubblewrap) built on @anthropic-ai/sandbox-runtime",
+  "license": "MIT",
+  "author": "Animus Labs",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Craigtut/cortex-mono.git",
+    "directory": "packages/cortex-sandbox"
+  },
+  "bugs": {
+    "url": "https://github.com/Craigtut/cortex-mono/issues"
+  },
+  "homepage": "https://github.com/Craigtut/cortex-mono/tree/main/packages/cortex-sandbox",
+  "keywords": [
+    "cortex",
+    "sandbox",
+    "seatbelt",
+    "bubblewrap",
+    "security",
+    "agent"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "prepack": "npm run build"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.63"
+  },
+  "peerDependencies": {
+    "@animus-labs/cortex": "^0.5.0"
+  },
+  "devDependencies": {
+    "@animus-labs/cortex": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
