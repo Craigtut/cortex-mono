@@ -1284,7 +1284,13 @@ function inspectCommand(
   depth: number,
   startCwd: string | null,
 ): CatastrophicFinding | null {
-  if (depth > MAX_RECURSION_DEPTH) return null;
+  // Fail closed: a command nested past the cap (6+ levels of sh -c / eval) is
+  // unverifiable, and the shell would still run whatever it wraps. Never return
+  // null here.
+  if (depth > MAX_RECURSION_DEPTH) {
+    return finding('unresolved-target',
+      'Destructive command blocked: this command nests shell invocations (sh -c / eval) too deeply to verify statically.');
+  }
 
   // Invisible characters cannot make a command safer; strip and analyze.
   const cleaned = command.replace(INVISIBLE_CHARS_RE, '');
