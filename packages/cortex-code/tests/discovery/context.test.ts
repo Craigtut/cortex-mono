@@ -6,6 +6,16 @@ vi.mock('node:fs/promises');
 
 const mockReaddir = vi.mocked(fs.readdir);
 const mockReadFile = vi.mocked(fs.readFile);
+const mockLstat = vi.mocked(fs.lstat);
+
+/** Build a minimal fs.Stats-like object for lstat mocks. */
+function statLike(opts: { symlink?: boolean; file?: boolean; size?: number }): fs.Stats {
+  return {
+    isSymbolicLink: () => opts.symlink ?? false,
+    isFile: () => opts.file ?? true,
+    size: opts.size ?? 100,
+  } as unknown as fs.Stats;
+}
 
 describe('discoverProjectContext', () => {
   beforeEach(() => {
@@ -13,6 +23,8 @@ describe('discoverProjectContext', () => {
     // Default: no files found
     mockReaddir.mockRejectedValue(new Error('ENOENT'));
     mockReadFile.mockRejectedValue(new Error('ENOENT'));
+    // Default: a small regular file, so the happy paths read normally.
+    mockLstat.mockResolvedValue(statLike({ file: true, size: 100 }));
   });
 
   it('returns empty string when no context files found', async () => {
@@ -92,5 +104,38 @@ describe('discoverProjectContext', () => {
     const rootIdx = result.indexOf('ROOT CONTENT');
     const projectIdx = result.indexOf('PROJECT CONTENT');
     expect(rootIdx).toBeLessThan(projectIdx);
+  });
+
+  it('does not follow a symlinked context file', async () => {
+    mockReaddir.mockImplementation(async (path) => {
+      if (String(path) === '/test/project') {
+        return ['AGENTS.md'] as unknown as ReturnType<typeof fs.readdir>;
+      }
+      throw new Error('ENOENT');
+    });
+    // AGENTS.md is a symlink (e.g. -> ~/.ssh/id_rsa).
+    mockLstat.mockResolvedValue(statLike({ symlink: true, file: false, size: 100 }));
+    mockReadFile.mockResolvedValue('SECRET KEY MATERIAL');
+
+    const result = await discoverProjectContext('/test/project');
+    expect(result).toBe('');
+    // The symlink target must never be read.
+    expect(mockReadFile).not.toHaveBeenCalled();
+  });
+
+  it('skips a context file that exceeds the size cap', async () => {
+    mockReaddir.mockImplementation(async (path) => {
+      if (String(path) === '/test/project') {
+        return ['AGENTS.md'] as unknown as ReturnType<typeof fs.readdir>;
+      }
+      throw new Error('ENOENT');
+    });
+    // Oversized regular file (1 MB, above the 256 KB cap).
+    mockLstat.mockResolvedValue(statLike({ file: true, size: 1024 * 1024 }));
+    mockReadFile.mockResolvedValue('huge content');
+
+    const result = await discoverProjectContext('/test/project');
+    expect(result).toBe('');
+    expect(mockReadFile).not.toHaveBeenCalled();
   });
 });

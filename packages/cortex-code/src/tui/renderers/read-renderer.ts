@@ -11,6 +11,7 @@ import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDispla
 import type { ReadDetails } from '@animus-labs/cortex';
 import { shortenPath } from './path-utils.js';
 import { fileLink } from './osc-links.js';
+import { sanitizeTerminalLine } from './sanitize-terminal.js';
 import { registerRenderer } from './registry.js';
 
 const readRenderer: ToolRenderer = {
@@ -60,9 +61,10 @@ const readRenderer: ToolRenderer = {
       errorText = error.split('\n')[0] ?? error;
     }
 
+    // shortPath and raw error text are model/OS-controlled; strip control chars.
     return {
-      headerText: `read ${shortPath}`,
-      contentLines: [errorColor(errorText)],
+      headerText: `read ${sanitizeTerminalLine(shortPath)}`,
+      contentLines: [errorColor(sanitizeTerminalLine(errorText))],
       footerText: '',
     };
   },

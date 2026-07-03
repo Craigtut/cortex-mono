@@ -7,6 +7,7 @@ import chalk from 'chalk';
 import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDisplay } from './types.js';
 import type { SubAgentDetails } from '@animus-labs/cortex';
 import { collapseContent } from './collapsible-content.js';
+import { sanitizeTerminalText } from './sanitize-terminal.js';
 import { registerRenderer } from './registry.js';
 
 const MAX_DESCRIPTION_LINES = 5;
@@ -29,7 +30,8 @@ function extractTextContent(result: unknown): string {
 
 const subAgentRenderer: ToolRenderer = {
   renderCall(args: Record<string, unknown>, context: ToolRenderContext): ToolCallDisplay {
-    const instructions = String(args['instructions'] ?? '');
+    // Instructions are model-authored and rendered as the call description.
+    const instructions = sanitizeTerminalText(String(args['instructions'] ?? ''));
     const background = Boolean(args['background']);
     const modeLabel = background
       ? chalk.hex(context.theme.muted)(' [background]')
@@ -56,7 +58,7 @@ const subAgentRenderer: ToolRenderer = {
 
   renderResult(result: unknown, details: unknown, context: ToolRenderContext): ToolResultDisplay {
     const d = details as SubAgentDetails | undefined;
-    let text = extractTextContent(result);
+    let text = sanitizeTerminalText(extractTextContent(result));
 
     // Strip <working> tags from sub-agent output (LLM reasoning, not for display)
     text = text.replace(/<working>[\s\S]*?<\/working>/g, '').trim();
@@ -128,7 +130,7 @@ const subAgentRenderer: ToolRenderer = {
 
     // Description
     if (u?.description) {
-      const descLines = u.description.split('\n').slice(0, MAX_DESCRIPTION_LINES);
+      const descLines = sanitizeTerminalText(u.description).split('\n').slice(0, MAX_DESCRIPTION_LINES);
       contentLines.push(...descLines);
       contentLines.push(chalk.hex(context.theme.borderMuted)('\u2500'.repeat(20)));
     }
@@ -147,8 +149,8 @@ const subAgentRenderer: ToolRenderer = {
           : call.status === 'error'
             ? chalk.hex(context.theme.statusError)('\u2717')
             : chalk.hex(context.theme.statusPending)('\u22EF');
-        const summary = call.summary ? ` ${chalk.hex(context.theme.muted)(call.summary)}` : '';
-        contentLines.push(`${icon} ${call.name}${summary}`);
+        const summary = call.summary ? ` ${chalk.hex(context.theme.muted)(sanitizeTerminalText(call.summary))}` : '';
+        contentLines.push(`${icon} ${sanitizeTerminalText(call.name)}${summary}`);
       }
     }
 
@@ -164,7 +166,7 @@ const subAgentRenderer: ToolRenderer = {
   renderError(error: string, _args: Record<string, unknown>, context: ToolRenderContext): ToolResultDisplay {
     return {
       headerText: 'Delegated',
-      contentLines: [chalk.hex(context.theme.error)(error)],
+      contentLines: [chalk.hex(context.theme.error)(sanitizeTerminalText(error))],
       footerText: '',
     };
   },

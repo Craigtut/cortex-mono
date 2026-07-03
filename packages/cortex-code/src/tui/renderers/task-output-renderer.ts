@@ -6,6 +6,7 @@ import chalk from 'chalk';
 import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDisplay } from './types.js';
 import type { TaskOutputDetails } from '@animus-labs/cortex';
 import { collapseContent } from './collapsible-content.js';
+import { sanitizeTerminalText } from './sanitize-terminal.js';
 import { registerRenderer } from './registry.js';
 
 const COLLAPSED_LINES = 10;
@@ -38,7 +39,7 @@ const taskOutputRenderer: ToolRenderer = {
 
   renderResult(result: unknown, details: unknown, context: ToolRenderContext): ToolResultDisplay {
     const d = details as TaskOutputDetails | undefined;
-    const text = extractTextContent(result);
+    const text = sanitizeTerminalText(extractTextContent(result));
     const allLines = text.split('\n');
 
     const { lines } = collapseContent(allLines, {

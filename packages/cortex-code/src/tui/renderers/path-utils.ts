@@ -3,15 +3,23 @@
  */
 
 import * as os from 'node:os';
+import * as path from 'node:path';
 import { visibleWidth } from '@earendil-works/pi-tui';
 
 const HOME = os.homedir();
 
 /**
  * Replace the home directory prefix with ~ for display.
+ *
+ * Requires a path-separator boundary after $HOME so a sibling directory that
+ * merely shares the prefix (e.g. /home/runner2 when $HOME is /home/runner) is
+ * not mangled into "~2/...".
  */
 export function shortenPath(fullPath: string): string {
-  if (fullPath.startsWith(HOME)) {
+  if (!HOME) return fullPath;
+  if (fullPath === HOME) return '~';
+  const homeWithSep = HOME.endsWith(path.sep) ? HOME : HOME + path.sep;
+  if (fullPath.startsWith(homeWithSep)) {
     return '~' + fullPath.slice(HOME.length);
   }
   return fullPath;

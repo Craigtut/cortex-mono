@@ -1396,6 +1396,16 @@ export class Session {
     process.exit(0);
   }
 
+  /**
+   * Restore the terminal out of raw mode. Called from crash/signal paths in the
+   * entry point before the process exits so a fatal error never leaves the
+   * user's terminal wedged. App.stop() is idempotent, so this is safe to call
+   * alongside a normal shutdown().
+   */
+  restoreTerminal(): void {
+    this.app?.stop();
+  }
+
   async recordFatalActivityError(error: unknown): Promise<void> {
     await this.activity.recordError(error instanceof Error ? error : String(error), true);
     await this.activity.flush();

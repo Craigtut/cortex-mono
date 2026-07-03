@@ -66,7 +66,9 @@ export function collapseContent(lines: string[], options: CollapseOptions): Coll
       const headCount = options.headLines ?? Math.ceil(options.limit * 0.6);
       const tailCount = options.tailLines ?? Math.floor(options.limit * 0.4);
       const headSlice = lines.slice(0, headCount);
-      const tailSlice = lines.slice(-tailCount);
+      // slice(-0) is slice(0), which returns the whole array. Guard tailCount 0
+      // so a zero-length tail yields no lines instead of duplicating everything.
+      const tailSlice = tailCount > 0 ? lines.slice(-tailCount) : [];
       const middleHidden = Math.max(0, lines.length - headCount - tailCount);
 
       if (middleHidden === 0) {

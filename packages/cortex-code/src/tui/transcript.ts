@@ -336,7 +336,7 @@ export class TranscriptManager {
   completeToolCall(toolCallId: string, result: unknown, details: unknown, durationMs: number): void {
     const tc = this.toolCalls.get(toolCallId);
     if (tc instanceof ToolGroupComponent) {
-      tc.completeToolCall(toolCallId, details, durationMs);
+      tc.completeToolCall(toolCallId, result, details, durationMs);
     } else if (tc) {
       tc.complete(result, details, durationMs);
     }

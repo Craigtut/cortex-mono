@@ -2,6 +2,7 @@ import path from 'node:path';
 import { Box, Text, SelectList, type SelectItem, type Component } from '@earendil-works/pi-tui';
 import { colors, selectListTheme } from './theme.js';
 import { extractPattern, formatRule } from '../permissions/patterns.js';
+import { sanitizeTerminalLine } from './renderers/sanitize-terminal.js';
 import type { PermissionDecision } from '../permissions/rules.js';
 
 export interface PermissionResult {
@@ -57,9 +58,11 @@ export class PermissionPromptComponent implements Component {
         label: 'Always allow edits in this project',
       });
     } else if (this.suggestedPattern) {
+      // suggestedPattern is model-controlled (Glob pattern, Bash prefix, file
+      // dir), so the rule label is another injection surface in this dialog.
       items.push({
         value: 'always-allow',
-        label: `Always allow  ${formatRule(toolName, this.suggestedPattern)}`,
+        label: sanitizeTerminalLine(`Always allow  ${formatRule(toolName, this.suggestedPattern)}`),
       });
     }
 
@@ -136,6 +139,13 @@ export class PermissionPromptComponent implements Component {
   }
 
   private getArgsSummary(): string {
+    // The summary is model-controlled (command text, paths, URLs). Strip control
+    // characters so a prompt-injected tool call cannot forge or overwrite the
+    // permission dialog via ANSI/OSC escapes.
+    return sanitizeTerminalLine(this.computeArgsSummary());
+  }
+
+  private computeArgsSummary(): string {
     const args = this.toolArgs as Record<string, unknown>;
     switch (this.toolName) {
       case 'Bash':

@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { requestRenderSpy, advanceSpinnerSpy } = vi.hoisted(() => ({
+const { requestRenderSpy, advanceSpinnerSpy, setContentSpy } = vi.hoisted(() => ({
   requestRenderSpy: vi.fn(),
   advanceSpinnerSpy: vi.fn(),
+  setContentSpy: vi.fn(),
 }));
 
 vi.mock('@animus-labs/cortex', () => ({
@@ -12,7 +13,9 @@ vi.mock('@animus-labs/cortex', () => ({
 
 vi.mock('../../src/tui/renderers/activity-line.js', () => ({
   ActivityLine: class MockActivityLine {
-    setContent(..._args: unknown[]): void {}
+    setContent(...args: unknown[]): void {
+      setContentSpy(...args);
+    }
     setBelowBox(..._args: unknown[]): void {}
     invalidate(): void {}
     render(): string[] { return []; }
@@ -24,23 +27,18 @@ vi.mock('../../src/tui/renderers/activity-line.js', () => ({
 }));
 
 vi.mock('../../src/tui/renderers/registry.js', () => ({
-  getRenderer: () => ({
-    renderCall: () => ({
-      headerText: 'tool',
-      contentLines: [],
-      footerText: '',
-    }),
-    renderResult: () => ({
-      headerText: 'tool',
-      contentLines: [],
-      footerText: '',
-    }),
-    renderError: (error: string) => ({
-      headerText: 'tool',
-      contentLines: [error],
-      footerText: '',
-    }),
-  }),
+  getRenderer: (toolName: string) => {
+    const base = {
+      renderCall: () => ({ headerText: 'tool', contentLines: [], footerText: '' }),
+      renderResult: () => ({ headerText: 'tool', contentLines: [], footerText: '' }),
+    };
+    // 'NoRenderError' exercises the generic error fallback in rebuildDisplay.
+    if (toolName === 'NoRenderError') return base;
+    return {
+      ...base,
+      renderError: (error: string) => ({ headerText: 'tool', contentLines: [error], footerText: '' }),
+    };
+  },
 }));
 
 vi.mock('../../src/tui/theme.js', () => ({
@@ -102,5 +100,61 @@ describe('ToolExecutionComponent spinner animation', () => {
 
     expect(advanceSpinnerSpy).not.toHaveBeenCalled();
     expect(requestRenderSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('ToolExecutionComponent Write rejection detection', () => {
+  beforeEach(() => {
+    setContentSpy.mockClear();
+  });
+
+  /** setContent(headerText, contentLines, footerText, status, ...) */
+  function lastStatus(): string | undefined {
+    const call = setContentSpy.mock.calls.at(-1);
+    return call?.[3] as string | undefined;
+  }
+
+  it('flags a refused write (no bytes, no diff) as an error', () => {
+    const tool = new ToolExecutionComponent('Write');
+    tool.start({ file_path: '/etc/hosts' });
+    tool.complete(
+      { content: [{ type: 'text', text: 'You must Read this file before overwriting it.' }] },
+      { filePath: '/etc/hosts', isCreate: false, bytesWritten: 0, diff: null },
+      5,
+    );
+
+    expect(lastStatus()).toBe('error');
+  });
+
+  it('sanitizes the generic error fallback for tools without a renderError', () => {
+    const tool = new ToolExecutionComponent('NoRenderError');
+    tool.start({});
+    setContentSpy.mockClear();
+    tool.fail('boom\x1b]0;evil\x07\x1b[31m\rX', 5);
+
+    const call = setContentSpy.mock.calls.at(-1)!;
+    const contentLines = call[1] as string[];
+    const joined = contentLines.join('\n');
+    expect(joined).not.toContain('\x1b');
+    expect(joined).not.toContain('\x07');
+    expect(joined).not.toContain('\r');
+    expect(joined).toContain('boom');
+  });
+
+  it('treats a truncate-to-empty write (0 bytes but a real diff) as success', () => {
+    const tool = new ToolExecutionComponent('Write');
+    tool.start({ file_path: '/tmp/file.txt' });
+    tool.complete(
+      { content: [{ type: 'text', text: 'Updated /tmp/file.txt (0 bytes)' }] },
+      {
+        filePath: '/tmp/file.txt',
+        isCreate: false,
+        bytesWritten: 0,
+        diff: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 0, lines: ['-old line'] }],
+      },
+      5,
+    );
+
+    expect(lastStatus()).toBe('success');
   });
 });

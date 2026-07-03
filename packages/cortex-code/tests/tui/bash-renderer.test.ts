@@ -48,6 +48,32 @@ describe('bashRenderer', () => {
     expect(display.footerText).toContain('exit 1');
   });
 
+  it('strips ESC/BEL/CR injection from rendered command output', () => {
+    const display = bashRenderer.renderResult(
+      { content: [{ type: 'text', text: 'boom\x1b]0;pwned\x07\x1b[31mred\rX\nExit code: 1' }] },
+      { exitCode: 1 },
+      context('do thing'),
+    );
+
+    const joined = display.contentLines.join('\n');
+    expect(joined).not.toContain('\x1b');
+    expect(joined).not.toContain('\x07');
+    expect(joined).not.toContain('\r');
+    expect(joined).toContain('red');
+  });
+
+  it('strips control bytes from streamed stdout', () => {
+    const display = bashRenderer.renderStreamUpdate?.(
+      { details: { stdout: 'streaming\x1b]52;c;ZXZpbA==\x07line\n', totalLines: 1 } },
+      context('tail -f log'),
+    );
+
+    const joined = (display?.contentLines ?? []).join('\n');
+    expect(joined).not.toContain('\x1b');
+    expect(joined).not.toContain('\x07');
+    expect(joined).toContain('streaming');
+  });
+
   it('uses the "Ran" verb and hides output for a successful command', () => {
     const display = bashRenderer.renderResult(
       { content: [{ type: 'text', text: 'all good\nmore output' }] },

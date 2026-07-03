@@ -8,6 +8,7 @@ import type { EditDetails, DiffHunk } from '@animus-labs/cortex';
 import { collapseContent } from './collapsible-content.js';
 import { shortenPath } from './path-utils.js';
 import { fileLink } from './osc-links.js';
+import { sanitizeTerminalText, sanitizeTerminalLine } from './sanitize-terminal.js';
 import { registerRenderer } from './registry.js';
 
 const COLLAPSED_LINES = 15;
@@ -42,12 +43,13 @@ function colorizeDiffLines(lines: string[], theme: ToolRenderContext['theme']): 
   const contextColor = chalk.hex(theme.diffContext);
 
   for (const line of lines) {
+    // Diff content is raw file content; strip control chars before colorizing.
     if (line.startsWith('+')) {
-      rendered.push(addColor('+ ' + line.slice(1)));
+      rendered.push(addColor('+ ' + sanitizeTerminalText(line.slice(1))));
     } else if (line.startsWith('-')) {
-      rendered.push(removeColor('- ' + line.slice(1)));
+      rendered.push(removeColor('- ' + sanitizeTerminalText(line.slice(1))));
     } else {
-      rendered.push(contextColor('  ' + line.slice(1)));
+      rendered.push(contextColor('  ' + sanitizeTerminalText(line.slice(1))));
     }
   }
 
@@ -90,10 +92,10 @@ const editRenderer: ToolRenderer = {
     const isRejection = d?.replacementCount === 0 && (!d?.diff || d.diff.length === 0);
 
     if (isRejection && resultText) {
-      const shortPath = shortenPath(filePath);
+      const shortPath = sanitizeTerminalLine(shortenPath(filePath));
       return {
         headerText: `edit ${shortPath}`,
-        contentLines: [chalk.hex(context.theme.muted)(resultText)],
+        contentLines: [chalk.hex(context.theme.muted)(sanitizeTerminalText(resultText))],
         footerText: 'rejected',
       };
     }
@@ -111,7 +113,7 @@ const editRenderer: ToolRenderer = {
 
       diffLines = colorizeDiffLines(lines, context.theme);
     } else {
-      diffLines = resultText ? resultText.split('\n') : ['(edit applied)'];
+      diffLines = resultText ? sanitizeTerminalText(resultText).split('\n') : ['(edit applied)'];
       const { lines } = collapseContent(diffLines, {
         mode: 'head',
         limit: COLLAPSED_LINES,
@@ -135,18 +137,20 @@ const editRenderer: ToolRenderer = {
 
   renderError(error: string, args: Record<string, unknown>, context: ToolRenderContext): ToolResultDisplay {
     const filePath = String(args['file_path'] ?? '');
-    const shortPath = shortenPath(filePath);
-    const oldString = String(args['old_string'] ?? '').slice(0, 60);
+    const shortPath = sanitizeTerminalLine(shortenPath(filePath));
+    const rawOldString = String(args['old_string'] ?? '').slice(0, 60);
+    const oldString = sanitizeTerminalLine(rawOldString);
+    const safeError = sanitizeTerminalText(error);
     const errorColor = chalk.hex(context.theme.error);
 
     let errorLines: string[];
     if (error.includes('not found') || error.includes('not unique')) {
       errorLines = [
-        errorColor(error),
-        chalk.hex(context.theme.muted)(`  Searched for: "${oldString}${oldString.length >= 60 ? '...' : ''}"`),
+        errorColor(safeError),
+        chalk.hex(context.theme.muted)(`  Searched for: "${oldString}${rawOldString.length >= 60 ? '...' : ''}"`),
       ];
     } else {
-      errorLines = [errorColor(error)];
+      errorLines = [errorColor(safeError)];
     }
 
     return {
