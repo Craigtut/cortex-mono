@@ -66,6 +66,9 @@ import { runNpmUpgrade } from './updates/upgrade.js';
 import type { Mode } from './modes/types.js';
 import { AVAILABLE_MODES } from './modes/index.js';
 import path from 'node:path';
+import { homedir } from 'node:os';
+import { SandboxRuntimeProvider, buildDefaultPolicy } from '@animus-labs/cortex-sandbox';
+import type { SandboxStatus } from '@animus-labs/cortex';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { log } from './logger.js';
@@ -108,6 +111,8 @@ export interface SessionOptions {
 
 export class Session {
   private agent: CortexAgent | null = null;
+  private sandboxProvider: SandboxRuntimeProvider | undefined;
+  private sandboxStatus: SandboxStatus | undefined;
   private app: App | null = null;
   private rules: PermissionRuleManager;
   private yoloMode: boolean;
@@ -229,6 +234,11 @@ export class Session {
     };
     this.app = new App(callbacks, this.cwd, this.freezeDiagnostics);
 
+    // Initialize the OS sandbox (on by default at the Workspace rung) before the
+    // agent so its Bash tool spawns are contained. Warn-and-continue if the host
+    // cannot enforce; status is surfaced and the agent still runs.
+    this.sandboxProvider = await this.initSandbox();
+
     // Create agent (built-in tools are auto-registered by Cortex)
     this.agent = await CortexAgent.create({
       model: this.model,
@@ -238,6 +248,7 @@ export class Session {
       slots: this.mode.contextSlots,
       resolvePermission: (toolName, toolArgs) => this.resolvePermission(toolName, toolArgs),
       isAutoApprove: () => this.yoloMode,
+      ...(this.sandboxProvider ? { sandbox: this.sandboxProvider } : {}),
       getApiKey: (provider) => this.getApiKey(provider),
       contextWindowLimit: this.config.contextWindowLimit ?? null,
       compaction: { strategy: this.compactionStrategy },
@@ -1238,6 +1249,50 @@ export class Session {
    * rules are re-checked because a previous prompt may have created a
    * rule that now covers this request.
    */
+  /**
+   * Construct and initialize the OS sandbox provider for this session. Returns
+   * undefined when disabled (or rung 'off'), so the agent runs uncontained. On a
+   * host that cannot enforce, the provider still returns (status 'none') and we
+   * warn rather than fail.
+   */
+  private async initSandbox(): Promise<SandboxRuntimeProvider | undefined> {
+    const sb = this.config.sandbox;
+    const enabled = sb?.enabled ?? true;
+    const rung = sb?.rung ?? 'workspace';
+    if (!enabled || rung === 'off') {
+      log.info('Sandbox disabled', { enabled, rung });
+      return undefined;
+    }
+
+    const provider = new SandboxRuntimeProvider({
+      onDegraded: (degradations) => log.warn('Sandbox enforcement reduced', { degradations }),
+    });
+    const policy = buildDefaultPolicy(rung, {
+      workspaceRoots: [this.cwd],
+      // The agent's shell must never write Cortex's own config, permission rules,
+      // or stored credentials (they live under ~/.cortex).
+      extraDenyWrite: [path.join(homedir(), '.cortex')],
+      ...(sb?.allowedDomains ? { extraAllowedDomains: sb.allowedDomains } : {}),
+    });
+
+    const status = await provider.initialize(policy);
+    this.sandboxStatus = status;
+    if (status.backend === 'none') {
+      log.warn('Sandbox not enforced; shell commands run uncontained', {
+        platform: process.platform,
+        reason: status.degradations.join('; '),
+      });
+    } else {
+      log.info('Sandbox active', {
+        rung,
+        backend: status.backend,
+        filesystem: status.filesystem,
+        network: status.network,
+      });
+    }
+    return provider;
+  }
+
   private async resolvePermission(
     toolName: string,
     toolArgs: unknown,
@@ -1247,6 +1302,9 @@ export class Session {
       cwd: this.cwd,
       matchRule: (t, a) => this.rules.matchRule(t, a),
       isReadOnlyInProject: (t, a) => this.isReadOnlyInProject(t, a),
+      // Sandboxed shell commands past the catastrophic floor and any deny rule
+      // auto-run inside the OS boundary instead of prompting.
+      sandboxBashEnforced: this.sandboxStatus?.filesystem === 'enforced',
     };
 
     // Fast path: deterministic decision (catastrophic floor > yolo > deny rule
@@ -1508,6 +1566,7 @@ export class Session {
 
     // Reset the terminal title before tearing down the TUI.
     this.titleManager?.dispose();
+    await this.sandboxProvider?.dispose();
 
     await this.activity.recordDone({ code: 0, signal: null, reason: 'normal_shutdown' });
     await this.activity.flush();

@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import type { SandboxRung } from '@animus-labs/cortex';
 
 export interface CortexCodeConfig {
   /** Default model override. */
@@ -28,6 +29,20 @@ export interface CortexCodeConfig {
   terminalTitle?: 'dynamic' | 'static' | 'off';
   /** Optional diagnostics for investigating TUI or prompt freezes. */
   diagnostics?: CortexCodeDiagnosticsConfig;
+  /**
+   * OS-level sandbox for shell commands. On by default at the Workspace rung.
+   * See docs/cortex/sandboxing.md.
+   */
+  sandbox?: SandboxCodeConfig;
+}
+
+export interface SandboxCodeConfig {
+  /** Enable the sandbox. Default: true. */
+  enabled?: boolean;
+  /** Trust rung. Default: 'workspace'. 'off' disables containment. */
+  rung?: SandboxRung;
+  /** Extra domains to pre-allow beyond the seeded package registries. */
+  allowedDomains?: string[];
 }
 
 export interface FreezeDiagnosticsConfig {
