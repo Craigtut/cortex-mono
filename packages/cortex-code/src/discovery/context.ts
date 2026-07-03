@@ -1,6 +1,13 @@
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, lstat } from 'node:fs/promises';
 import { join, dirname, parse as parsePath } from 'node:path';
 import { homedir } from 'node:os';
+
+/**
+ * Cap for a single context file spliced into the agent prompt. Legitimate
+ * AGENTS.md / CLAUDE.md files are small; a multi-megabyte file is either a
+ * mistake or an attempt to flood the context, so we skip it.
+ */
+const MAX_CONTEXT_FILE_BYTES = 256 * 1024;
 
 /**
  * Discover project context files by walking from CWD upward to the filesystem root.
@@ -93,6 +100,14 @@ async function findContextFile(dir: string): Promise<{ path: string; content: st
 
 async function readFileSafe(path: string): Promise<string | null> {
   try {
+    // lstat (not stat) so a symlink is inspected without being followed. A repo
+    // shipping `AGENTS.md -> ~/.ssh/id_rsa` must not splice that target's
+    // contents into the agent context on startup. The isFile() guard also
+    // rejects Windows junctions/reparse points, which never report as a plain
+    // file.
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isFile()) return null;
+    if (info.size > MAX_CONTEXT_FILE_BYTES) return null;
     return await readFile(path, 'utf-8');
   } catch {
     return null;

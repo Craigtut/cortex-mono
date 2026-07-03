@@ -1,4 +1,4 @@
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { SkillConfig } from '@animus-labs/cortex';
@@ -38,7 +38,10 @@ async function scanSkillDirectory(dir: string, source: string): Promise<SkillCon
     const skillMdPath = join(skillDir, 'SKILL.md');
 
     try {
-      const s = await stat(skillMdPath);
+      // lstat (not stat) so a symlinked SKILL.md is not followed. isFile() is
+      // only true for a real regular file, so it rejects both POSIX symlinks and
+      // Windows junctions/reparse points, which never report as a plain file.
+      const s = await lstat(skillMdPath);
       if (s.isFile()) {
         skills.push({
           path: skillMdPath,
