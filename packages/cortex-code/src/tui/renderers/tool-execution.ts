@@ -325,8 +325,11 @@ export class ToolExecutionComponent implements Component {
       return true;
     }
 
-    // Write: bytesWritten 0 for an existing file means rejected
-    if (this.toolName === 'Write' && d['bytesWritten'] === 0 && d['isCreate'] === false) {
+    // Write: bytesWritten 0 for an existing file means rejected, but only when
+    // there is no diff. Truncating an existing file to empty also writes 0 bytes
+    // with isCreate false, yet it produces a real diff and is a legitimate write.
+    if (this.toolName === 'Write' && d['bytesWritten'] === 0 && d['isCreate'] === false &&
+        (!d['diff'] || (Array.isArray(d['diff']) && (d['diff'] as unknown[]).length === 0))) {
       return true;
     }
 
