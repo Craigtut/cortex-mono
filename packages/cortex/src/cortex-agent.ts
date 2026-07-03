@@ -459,6 +459,13 @@ export class CortexAgent {
   // Whether a prompt() call is currently in progress
   private _isPrompting = false;
 
+  // Loop gate: every agentic loop start (consumer prompt() calls and
+  // background-completion deliveries) is serialized through this promise
+  // chain. Depth counts the running cycle plus any queued ones, so callers
+  // can fail fast before mutating shared loop state. The tail never rejects.
+  private loopGateTail: Promise<void> = Promise.resolve();
+  private loopGateDepth = 0;
+
   // Tracked subprocess PIDs for synchronous exit cleanup (Level 3 safety net)
   private readonly trackedPids = new Set<number>();
 
@@ -768,9 +775,15 @@ export class CortexAgent {
    * Transitions from CREATED to ACTIVE on first call.
    * Catches errors, classifies them, and emits onError.
    *
+   * Every loop start (consumer prompt() calls and background-completion
+   * deliveries) is serialized through an internal gate, so a concurrent
+   * prompt() can never corrupt the running loop's tool runtime or history
+   * boundary. A prompt() issued while a loop is active or queued fails fast
+   * BEFORE any shared state is touched; use steer() to reach a running loop.
+   *
    * @param input - The prompt text
    * @returns The agent's response (opaque, from pi-agent-core)
-   * @throws Error if the agent has been destroyed
+   * @throws Error if the agent has been destroyed or is already prompting
    */
   async prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
     if (this.lifecycleState === 'destroyed') {
@@ -782,8 +795,63 @@ export class CortexAgent {
         'or provide initialBasePrompt during creation.',
       );
     }
+    if (this.loopGateDepth > 0) {
+      throw new Error(
+        'Agent is already processing a prompt. Use steer() to inject input into ' +
+        'the running loop, or wait for the current turn to complete.',
+      );
+    }
 
-    // Transition to ACTIVE on first prompt
+    return this.enqueueLoopTask(() => this.runPromptCycle(input, options));
+  }
+
+  /**
+   * Serialize a loop-owning task behind every previously enqueued one.
+   *
+   * This is the single gate through which every agentic loop starts:
+   * consumer prompt() calls and background-completion drains. Retry
+   * continuations run inside runTurnWithRetry under the same gate
+   * acquisition. At most one gate task executes at a time; the depth
+   * counter covers running plus queued tasks.
+   */
+  private enqueueLoopTask<T>(task: () => Promise<T>): Promise<T> {
+    this.loopGateDepth += 1;
+    const run = this.loopGateTail.then(task);
+    const release = (): void => {
+      this.loopGateDepth -= 1;
+    };
+    this.loopGateTail = run.then(release, release);
+    return run;
+  }
+
+  /**
+   * One gate-owned loop cycle: run the logical turn, then deliver any
+   * background completions that arrived while it ran. Lifecycle is
+   * re-checked here (at dequeue time) so a destroy() that lands between
+   * enqueue and dequeue can never start a new loop.
+   */
+  private async runPromptCycle(input: string, options?: DirectCompletionOptions): Promise<unknown> {
+    if (this.lifecycleState === 'destroyed') {
+      throw new Error('Agent has been destroyed');
+    }
+    try {
+      return await this.runPromptOnce(input, options);
+    } finally {
+      // Deliver background results that arrived while prompting. This runs
+      // before the consumer's await resolves, keeping its UI state
+      // consistent, and still under the same gate acquisition.
+      await this.drainPendingBackgroundResults();
+    }
+  }
+
+  /**
+   * Run one logical prompt turn (first attempt plus transparent background
+   * retries). Must be called while holding the loop gate; all mutation of
+   * shared loop state (tool runtime, history boundary, prompting flag)
+   * happens here, after the gate has been acquired.
+   */
+  private async runPromptOnce(input: string, options?: DirectCompletionOptions): Promise<unknown> {
+    // Transition to ACTIVE on first loop
     if (this.lifecycleState === 'created') {
       this.lifecycleState = 'active';
     }
@@ -842,11 +910,6 @@ export class CortexAgent {
         currentContextTokens: this.compactionManager.currentContextTokenCount,
         pendingBackgroundResults: this.pendingBackgroundResults.length,
       });
-
-      // Deliver any background sub-agent results that arrived while prompting.
-      // This re-enters prompt() before the consumer's await resolves, keeping
-      // the consumer's UI state consistent.
-      await this.drainPendingBackgroundResults();
     }
   }
 
@@ -4487,9 +4550,15 @@ export class CortexAgent {
   }
 
   /**
-   * Handle a background task (sub-agent or Bash command) completing. If the
-   * agent is currently prompting, queue it for delivery after the current
-   * loop. If the agent is idle, deliver immediately by restarting the loop.
+   * Handle a background task (sub-agent or Bash command) completing. The
+   * completion is queued and a gated drain cycle is scheduled: if a loop is
+   * currently running, its own end-of-cycle drain delivers the item first
+   * and the scheduled drain becomes a no-op; if the agent is idle, the
+   * scheduled drain delivers it by starting a new loop.
+   *
+   * Scheduling unconditionally (instead of branching on _isPrompting)
+   * closes the race where a completion lands between the running cycle's
+   * final drain check and the gate release, which would strand it.
    *
    * Shared by background sub-agents (resolved promise) and backgrounded Bash
    * commands (process `close` callback), so both wake the loop the same way.
@@ -4499,45 +4568,47 @@ export class CortexAgent {
   ): Promise<void> {
     if (this.lifecycleState === 'destroyed') return;
 
-    if (this._isPrompting) {
-      // Agent is in its loop; queue for delivery when it finishes
-      this.pendingBackgroundResults.push(item);
-      return;
-    }
+    this.pendingBackgroundResults.push(item);
+    await this.schedulePendingResultDelivery();
+  }
 
-    // Agent is idle; deliver immediately by restarting the loop. formatting
-    // returns null when there is nothing to deliver (e.g. a Bash task already
-    // observed via TaskOutput poll or killed deliberately).
-    const message = this.formatPendingCompletion(item);
-    if (message === null) return;
-    this.fireBackgroundResultDeliveryHandlers([item.taskId]);
-    try {
-      await this.prompt(message);
-    } catch (err) {
-      // Emit through error handlers; there is no consumer-level caller to catch
-      const classified = classifyError(
-        err instanceof Error ? err : new Error(String(err)),
-        { wasAborted: this.isAborted() },
-      );
-      for (const handler of this.errorHandlers) {
-        try {
-          handler(classified);
-        } catch (err) {
-          this.logger.error('[CortexAgent] onError handler threw', {
-            error: err instanceof Error ? err.message : String(err),
-          });
+  /**
+   * Enqueue a gated drain cycle. Delivery failures have no consumer-level
+   * caller to catch them, so they are routed to onError handlers and never
+   * rejected out of the returned promise.
+   */
+  private schedulePendingResultDelivery(): Promise<void> {
+    return this.enqueueLoopTask(async () => {
+      if (this.lifecycleState === 'destroyed') return;
+      try {
+        await this.drainPendingBackgroundResults();
+      } catch (err) {
+        const classified = classifyError(
+          err instanceof Error ? err : new Error(String(err)),
+          { wasAborted: this.isAborted() },
+        );
+        for (const handler of this.errorHandlers) {
+          try {
+            handler(classified);
+          } catch (handlerErr) {
+            this.logger.error('[CortexAgent] onError handler threw', {
+              error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
+            });
+          }
         }
       }
-    }
+    });
   }
 
   /**
    * Drain all pending background completions by restarting the agentic loop
-   * with a combined message. Called at the end of prompt(). Completions that
-   * were already observed in the meantime (Bash poll/kill) are skipped, and if
-   * nothing remains to deliver the loop is not restarted.
+   * with a combined message. Must be called while holding the loop gate
+   * (from a cycle's finally or a scheduled drain task). Completions that
+   * were already observed in the meantime (Bash poll/kill) are skipped, and
+   * if nothing remains to deliver the loop is not restarted.
    */
   private async drainPendingBackgroundResults(): Promise<void> {
+    if (this.lifecycleState === 'destroyed') return;
     if (this.pendingBackgroundResults.length === 0) return;
 
     const pending = this.pendingBackgroundResults.splice(0);
@@ -4553,8 +4624,13 @@ export class CortexAgent {
 
     const message = parts.join('\n\n---\n\n');
     this.fireBackgroundResultDeliveryHandlers(taskIds);
-    // Re-enters prompt(), which will drain again if more arrive
-    await this.prompt(message);
+    try {
+      await this.runPromptOnce(message);
+    } finally {
+      // Deliver anything that arrived during this delivery, even when it
+      // failed, matching the pre-gate recursive prompt() behavior.
+      await this.drainPendingBackgroundResults();
+    }
   }
 
   /**

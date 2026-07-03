@@ -1536,6 +1536,95 @@ You have 12 emotions.`;
   });
 
   // -----------------------------------------------------------------------
+  // Prompt serialization (loop gate)
+  // -----------------------------------------------------------------------
+
+  describe('prompt serialization', () => {
+    interface GateInternals {
+      _prePromptMessageCount: number;
+      _isPrompting: boolean;
+      toolRuntime: { resetForLoop: () => void };
+    }
+
+    function holdPromptOpen(mock: MockPiAgent): { release: () => void; calls: string[] } {
+      const originalPrompt = mock.prompt.bind(mock);
+      const calls: string[] = [];
+      let release!: () => void;
+      mock.prompt = async (input: string): Promise<unknown> => {
+        calls.push(input);
+        if (calls.length === 1) {
+          await new Promise<void>((resolve) => { release = resolve; });
+        }
+        return originalPrompt(input);
+      };
+      return { release: () => release(), calls };
+    }
+
+    it('a concurrent prompt() fails fast without touching the running loop', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as GateInternals;
+      const { release, calls } = holdPromptOpen(piAgent);
+
+      const first = agent.prompt('first turn');
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(calls).toHaveLength(1);
+
+      const boundaryDuringLoop = internal._prePromptMessageCount;
+      const resetSpy = vi.spyOn(internal.toolRuntime, 'resetForLoop');
+
+      await expect(agent.prompt('second turn')).rejects.toThrow(/already processing/i);
+
+      // The loser never reset the live loop's tool runtime, never moved its
+      // history boundary, and never reached pi-agent-core.
+      expect(resetSpy).not.toHaveBeenCalled();
+      expect(internal._prePromptMessageCount).toBe(boundaryDuringLoop);
+      expect(calls).toHaveLength(1);
+
+      // The running loop is still live: steer() reaches it.
+      const steerCalls: Array<{ role: string; content: string }> = [];
+      piAgent.steer = (msg: { role: string; content: string }) => {
+        steerCalls.push(msg);
+      };
+      expect(internal._isPrompting).toBe(true);
+      agent.steer('mid-loop steer');
+      expect(steerCalls).toHaveLength(1);
+
+      // And the first loop completes normally.
+      release();
+      await expect(first).resolves.toBeDefined();
+    });
+
+    it('a background completion arriving while idle does not race a consumer prompt()', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as GateInternals & {
+        toolRuntime: { resetForLoop: () => void; backgroundTasks: { set: (t: unknown) => void } };
+        deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
+      };
+      internal.toolRuntime.backgroundTasks.set({
+        id: 'task_9',
+        command: 'sleep 1',
+        process: {},
+        stdout: 'done',
+        stderr: '',
+        exitCode: 0,
+        completed: true,
+        notified: false,
+        startTime: Date.now() - 1000,
+      });
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+
+      // Delivery is scheduled (gate becomes busy synchronously), so a
+      // consumer prompt in the same tick fails fast instead of interleaving.
+      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_9' });
+      await expect(agent.prompt('user turn')).rejects.toThrow(/already processing/i);
+
+      await delivery;
+      expect(promptSpy).toHaveBeenCalledTimes(1);
+      expect(promptSpy.mock.calls[0][0] as string).toContain('task_9');
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // directComplete()
   // -----------------------------------------------------------------------
 
@@ -1621,21 +1710,38 @@ You have 12 emotions.`;
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const id = seedCompletedTask(agent);
-      const promptSpy = vi.spyOn(piAgent, 'prompt');
 
-      // Simulate the agent being mid-loop
-      internal._isPrompting = true;
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+      // Hold the first loop open so the completion arrives mid-prompt.
+      let releaseFirst!: () => void;
+      const originalPrompt = piAgent.prompt.bind(piAgent);
+      const promptCalls: string[] = [];
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        promptCalls.push(input);
+        if (promptCalls.length === 1) {
+          await new Promise<void>((resolve) => { releaseFirst = resolve; });
+        }
+        return originalPrompt(input);
+      };
 
-      expect(promptSpy).not.toHaveBeenCalled();
+      const firstTurn = agent.prompt('kick off a long turn');
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(promptCalls).toHaveLength(1);
+
+      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+      // The completion is queued while the loop runs, not delivered
+      // immediately with a competing loop start.
       expect(internal.pendingBackgroundResults).toHaveLength(1);
+      expect(promptCalls).toHaveLength(1);
 
-      // Loop ends; drain delivers the queued completion
-      internal._isPrompting = false;
-      await internal.drainPendingBackgroundResults();
+      // Loop ends; the end-of-cycle drain delivers the queued completion
+      // before the consumer's await resolves.
+      releaseFirst();
+      await firstTurn;
+      await delivery;
 
-      expect(promptSpy).toHaveBeenCalledTimes(1);
-      expect(promptSpy.mock.calls[0][0] as string).toContain(id);
+      expect(promptCalls).toHaveLength(2);
+      expect(promptCalls[1]).toContain(id);
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
     });
 
     it('does not deliver a task already observed via poll/kill (notified)', async () => {
