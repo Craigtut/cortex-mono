@@ -4892,6 +4892,10 @@ export class CortexAgent {
     }
     if (this.config.logger) childCortexConfig.logger = this.config.logger;
     if (this.envOverrides) childCortexConfig.envOverrides = this.envOverrides;
+    // Share the parent's sandbox provider so a sub-agent's shell commands are
+    // contained by the same OS boundary. Sharing the instance (not cloning) is
+    // correct: the underlying SandboxManager is a process-global singleton.
+    if (this.config.sandbox) childCortexConfig.sandbox = this.config.sandbox;
     if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
     // Inherit tool result persistence so child tool calls (Bash, Grep, WebFetch
     // inside a sub-agent doing research) get the same protection as the parent.
