@@ -334,7 +334,13 @@ interface PiAiOAuthModule {
 // OAuth callback page rendering shim
 // ---------------------------------------------------------------------------
 
-interface OAuthCallbackRoute {
+/**
+ * A provider's fixed loopback OAuth callback route. In production these are the
+ * real ports pi-ai binds ({@link OAUTH_CALLBACK_ROUTES}); tests can override
+ * them via {@link ProviderManagerOptions} to bind an OS-assigned ephemeral port
+ * instead, so parallel runs never collide on a shared socket.
+ */
+export interface OAuthCallbackRoute {
   readonly path: string;
   readonly port: number;
 }
@@ -395,7 +401,8 @@ function isOAuthFlowType(value: unknown): value is OAuthFlowType {
 function normalizeOAuthAuthInfo(
   provider: string,
   info: unknown,
-  legacyInstructions?: string,
+  legacyInstructions: string | undefined,
+  routes: Record<string, OAuthCallbackRoute>,
 ): OAuthAuthInfo {
   const raw = typeof info === 'string'
     ? { url: info, instructions: legacyInstructions }
@@ -405,7 +412,7 @@ function normalizeOAuthAuthInfo(
   const instructions = typeof raw?.['instructions'] === 'string'
     ? raw['instructions']
     : legacyInstructions;
-  const callbackRoute = OAUTH_CALLBACK_ROUTES[provider];
+  const callbackRoute = routes[provider];
   const deviceCode = typeof raw?.['deviceCode'] === 'string'
     ? raw['deviceCode']
     : instructions?.match(DEVICE_CODE_INSTRUCTIONS_RE)?.[1];
@@ -465,12 +472,16 @@ function probeCallbackPortInUse(port: number, host: string): Promise<boolean> {
  * callback port is occupied on either IPv4 or IPv6 loopback. No-op for
  * providers without a known callback route (manual/device-code flows).
  */
-async function assertOAuthCallbackPortAvailable(provider: string): Promise<void> {
-  const route = OAUTH_CALLBACK_ROUTES[provider];
+async function assertOAuthCallbackPortAvailable(
+  provider: string,
+  routes: Record<string, OAuthCallbackRoute>,
+  probe: (port: number, host: string) => Promise<boolean>,
+): Promise<void> {
+  const route = routes[provider];
   if (!route) return;
 
   for (const host of ['127.0.0.1', '::1']) {
-    if (await probeCallbackPortInUse(route.port, host)) {
+    if (await probe(route.port, host)) {
       throw new OAuthError(
         'callback_port_in_use',
         provider,
@@ -499,8 +510,9 @@ function maybeInstallOAuthCallbackShim(
   providerName: string,
   render: OAuthCallbackPageRenderer | undefined,
   onResult: ActiveOAuthCallbackPageShim['onResult'],
+  routes: Record<string, OAuthCallbackRoute>,
 ): () => void {
-  const route = OAUTH_CALLBACK_ROUTES[provider];
+  const route = routes[provider];
   if (!route || (!render && !onResult)) {
     return () => {};
   }
@@ -923,9 +935,46 @@ function mapRawToModelInfo(
 // ProviderManager implementation
 // ---------------------------------------------------------------------------
 
+/**
+ * Construction options for {@link ProviderManager}.
+ *
+ * Both fields are testing seams, not part of the product contract. Production
+ * consumers construct `new ProviderManager()` with no arguments and get the
+ * real fixed callback routes and a real TCP loopback probe. Tests inject these
+ * to keep the OAuth callback flow deterministic under parallel execution: the
+ * fixed production callback ports (e.g. 53692, 1455) are a shared, finite
+ * resource that collides across workers, and the real probe reads live machine
+ * port state that another worker can perturb.
+ */
+export interface ProviderManagerOptions {
+  /**
+   * Override the fixed loopback OAuth callback routes (provider -> path/port).
+   * Lets a test point a provider at an OS-assigned ephemeral port so the
+   * callback-page shim can be exercised without binding a fixed port.
+   */
+  oauthCallbackRoutes?: Record<string, OAuthCallbackRoute> | undefined;
+  /**
+   * Override the "is this loopback port already bound" probe. Production does a
+   * real TCP connect; a test stubs it so `callback_port_in_use` behavior never
+   * depends on real, worker-shared port state.
+   */
+  probeCallbackPortInUse?: ((port: number, host: string) => Promise<boolean>) | undefined;
+}
+
 export class ProviderManager implements IProviderManager {
   /** Active OAuth AbortController, if any. */
   private activeOAuthAbort: AbortController | null = null;
+
+  /** Fixed loopback callback routes used by OAuth flows (injectable for tests). */
+  private readonly oauthCallbackRoutes: Record<string, OAuthCallbackRoute>;
+
+  /** Loopback port-in-use probe used before opening a browser (injectable for tests). */
+  private readonly probeOAuthCallbackPort: (port: number, host: string) => Promise<boolean>;
+
+  constructor(options: ProviderManagerOptions = {}) {
+    this.oauthCallbackRoutes = options.oauthCallbackRoutes ?? OAUTH_CALLBACK_ROUTES;
+    this.probeOAuthCallbackPort = options.probeCallbackPortInUse ?? probeCallbackPortInUse;
+  }
 
   // -----------------------------------------------------------------------
   // Discovery
@@ -1010,7 +1059,11 @@ export class ProviderManager implements IProviderManager {
     // (A) Fail fast — before opening a browser — if the provider's fixed
     // callback port is already taken. Otherwise pi-ai binds the other
     // stack, the browser hits the wrong listener, and pi-ai waits forever.
-    await assertOAuthCallbackPortAvailable(provider);
+    await assertOAuthCallbackPortAvailable(
+      provider,
+      this.oauthCallbackRoutes,
+      this.probeOAuthCallbackPort,
+    );
 
     const abort = new AbortController();
     this.activeOAuthAbort = abort;
@@ -1040,6 +1093,7 @@ export class ProviderManager implements IProviderManager {
       oauthProvider.name,
       callbacks.renderCallbackPage,
       handleCallbackResult,
+      this.oauthCallbackRoutes,
     );
 
     // (B) pi-ai callback servers ignore the abort signal, so cancellation
@@ -1066,7 +1120,9 @@ export class ProviderManager implements IProviderManager {
 
     const login = oauthProvider.login({
       onAuth: (info: unknown, legacyInstructions?: string) => {
-        callbacks.onAuth(normalizeOAuthAuthInfo(provider, info, legacyInstructions));
+        callbacks.onAuth(
+          normalizeOAuthAuthInfo(provider, info, legacyInstructions, this.oauthCallbackRoutes),
+        );
       },
       onPrompt: (prompt: unknown) => callbacks.onPrompt(normalizeOAuthPromptInfo(prompt)),
       onProgress: callbacks.onProgress,
