@@ -10,6 +10,7 @@ import chalk from 'chalk';
 import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDisplay } from './types.js';
 import type { GrepDetails } from '@animus-labs/cortex';
 import { shortenPath } from './path-utils.js';
+import { sanitizeTerminalLine } from './sanitize-terminal.js';
 import { registerRenderer } from './registry.js';
 
 const grepRenderer: ToolRenderer = {
@@ -19,7 +20,8 @@ const grepRenderer: ToolRenderer = {
     const shortPath = searchPath ? shortenPath(searchPath) : '';
 
     return {
-      headerText: `grep /${pattern}/${shortPath ? ` in ${shortPath}` : ''}`,
+      // pattern and path are model-controlled; strip control chars.
+      headerText: sanitizeTerminalLine(`grep /${pattern}/${shortPath ? ` in ${shortPath}` : ''}`),
       contentLines: [],
       footerText: '',
     };
@@ -34,7 +36,7 @@ const grepRenderer: ToolRenderer = {
     const noMatches = matchCount === 0;
 
     return {
-      headerText: `grep /${pattern}/${shortPath ? ` in ${shortPath}` : ''}`,
+      headerText: sanitizeTerminalLine(`grep /${pattern}/${shortPath ? ` in ${shortPath}` : ''}`),
       contentLines: noMatches ? [chalk.hex(_context.theme.muted)('(no matches)')] : [],
       footerText: noMatches ? '' : `${matchCount} matches`,
     };

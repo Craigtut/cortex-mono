@@ -9,6 +9,7 @@
 import chalk from 'chalk';
 import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDisplay } from './types.js';
 import type { WebFetchDetails } from '@animus-labs/cortex';
+import { sanitizeTerminalLine } from './sanitize-terminal.js';
 import { registerRenderer } from './registry.js';
 
 function formatBytes(bytes: number): string {
@@ -21,7 +22,8 @@ function extractDomain(url: string): string {
   try {
     return new URL(url).hostname;
   } catch {
-    return url.slice(0, 40);
+    // Fallback for an unparseable URL: strip control chars from the raw text.
+    return sanitizeTerminalLine(url.slice(0, 40));
   }
 }
 
@@ -64,7 +66,7 @@ const webFetchRenderer: ToolRenderer = {
     } else if (error.includes('ENOTFOUND') || error.includes('DNS')) {
       errorText = 'DNS lookup failed';
     } else {
-      errorText = error.split('\n')[0] ?? 'failed';
+      errorText = sanitizeTerminalLine(error.split('\n')[0] ?? 'failed');
     }
 
     return {

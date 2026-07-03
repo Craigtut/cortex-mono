@@ -7,6 +7,7 @@
 import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDisplay } from './types.js';
 import type { GlobDetails } from '@animus-labs/cortex';
 import { shortenPath } from './path-utils.js';
+import { sanitizeTerminalLine } from './sanitize-terminal.js';
 import { registerRenderer } from './registry.js';
 
 const globRenderer: ToolRenderer = {
@@ -16,7 +17,8 @@ const globRenderer: ToolRenderer = {
     const shortPath = searchPath ? shortenPath(searchPath) : '';
 
     return {
-      headerText: `glob ${pattern}${shortPath ? ` in ${shortPath}` : ''}`,
+      // pattern and path are model-controlled; strip control chars.
+      headerText: sanitizeTerminalLine(`glob ${pattern}${shortPath ? ` in ${shortPath}` : ''}`),
       contentLines: [],
       footerText: '',
     };
@@ -31,7 +33,7 @@ const globRenderer: ToolRenderer = {
     const truncInfo = d?.truncated ? ' (truncated)' : '';
 
     return {
-      headerText: `glob ${pattern}${shortPath ? ` in ${shortPath}` : ''}`,
+      headerText: sanitizeTerminalLine(`glob ${pattern}${shortPath ? ` in ${shortPath}` : ''}`),
       contentLines: [],
       footerText: `${count} files${truncInfo}`,
     };
