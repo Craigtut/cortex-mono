@@ -123,6 +123,24 @@ describe('PermissionRuleManager', () => {
       await manager.addRule('session', 'allow', 'Bash', 'git status *');
       expect(manager.matchRule('Bash', { command: 'git status && rm -rf /' })).toBe('deny');
     });
+
+    it('denies canonicalization bypasses even under a broad allow rule', async () => {
+      await manager.addRule('session', 'allow', 'Bash', 'rm *');
+      expect(manager.matchRule('Bash', { command: 'rm -rf /./' })).toBe('deny');
+      expect(manager.matchRule('Bash', { command: 'rm -rf /home/..' })).toBe('deny');
+      expect(manager.matchRule('Bash', { command: 'rm -rf /*/' })).toBe('deny');
+      expect(manager.matchRule('Bash', { command: 'rm -rf ~' })).toBe('deny');
+      expect(manager.matchRule('Bash', { command: 'rm -rf "$TARGET"' })).toBe('deny');
+      expect(manager.matchRule('Bash', { command: 'rm -rf $(cat file)' })).toBe('deny');
+      expect(manager.matchRule('Bash', { command: '\\rm -rf /' })).toBe('deny');
+      expect(manager.matchRule('Bash', { command: 'command rm -rf /' })).toBe('deny');
+    });
+
+    it('still allows bounded project deletes to match rules', async () => {
+      await manager.addRule('session', 'allow', 'Bash', 'rm *');
+      expect(manager.matchRule('Bash', { command: 'rm -rf ./build' })).toBe('allow');
+      expect(manager.matchRule('Bash', { command: 'rm -rf node_modules' })).toBe('allow');
+    });
   });
 
   describe('suggestPattern', () => {
