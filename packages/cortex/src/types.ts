@@ -1043,13 +1043,45 @@ export interface McpToolCallProgress {
 }
 
 /**
+ * Redacted stdio transport config. Identical to {@link McpStdioConfig} except
+ * that the secret-bearing `env` map is dropped and replaced by a boolean
+ * presence flag. Surfaced in {@link McpConnectionState} so connection state can
+ * be shown to display/telemetry consumers without leaking credentials.
+ */
+export type McpRedactedStdioConfig = Omit<McpStdioConfig, 'env'> & {
+  /** True when the original config supplied environment variables (values withheld). */
+  hasEnv: boolean;
+};
+
+/**
+ * Redacted HTTP transport config. Identical to {@link McpHttpConfig} except
+ * that the secret-bearing `headers` map is dropped and replaced by a boolean
+ * presence flag.
+ */
+export type McpRedactedHttpConfig = Omit<McpHttpConfig, 'headers'> & {
+  /** True when the original config supplied HTTP headers (values withheld). */
+  hasHeaders: boolean;
+};
+
+/**
+ * Transport config with all secret-bearing fields redacted. Never carries
+ * `env` (stdio) or `headers` (http) values; presence is conveyed by the
+ * `hasEnv` / `hasHeaders` flags instead.
+ */
+export type McpRedactedTransportConfig = McpRedactedStdioConfig | McpRedactedHttpConfig;
+
+/**
  * State of a single MCP server connection.
+ *
+ * The `config` is redacted: `env` (stdio) and `headers` (http) hold secrets
+ * (API keys, auth tokens) and are never included. This lets consumers surface
+ * connection state to logs, telemetry, or UI without leaking credentials.
  */
 export interface McpConnectionState {
   /** The server name used for namespacing tools. */
   serverName: string;
-  /** Transport configuration used for this connection. */
-  config: McpTransportConfig;
+  /** Redacted transport configuration for this connection (no secret values). */
+  config: McpRedactedTransportConfig;
   /** Whether the connection is currently active. */
   connected: boolean;
   /** Number of reconnect attempts since last successful connection. */

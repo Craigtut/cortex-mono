@@ -23,6 +23,7 @@ import { Type } from 'typebox';
 import type {
   McpTransportConfig,
   McpConnectionState,
+  McpRedactedTransportConfig,
   McpStdioConfig,
   McpHttpConfig,
   McpToolCallProgress,
@@ -76,6 +77,21 @@ const MAX_RECONNECT_ATTEMPTS = 3;
 const TOOL_NAME_MAX_LENGTH = 128;
 function sanitizeToolName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, TOOL_NAME_MAX_LENGTH);
+}
+
+/**
+ * Redact secret-bearing fields from a transport config before it leaves the
+ * manager. Stdio `env` and HTTP `headers` carry credentials (API keys, auth
+ * tokens); they are dropped entirely and replaced with a boolean presence flag
+ * so callers can still tell whether the server was configured with them.
+ */
+function redactTransportConfig(config: McpTransportConfig): McpRedactedTransportConfig {
+  if (config.transport === 'stdio') {
+    const { env, ...rest } = config;
+    return { ...rest, hasEnv: env !== undefined && Object.keys(env).length > 0 };
+  }
+  const { headers, ...rest } = config;
+  return { ...rest, hasHeaders: headers !== undefined && Object.keys(headers).length > 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +297,8 @@ export class McpClientManager {
     for (const conn of this.connections.values()) {
       states.push({
         serverName: conn.serverName,
-        config: conn.config,
+        // Redact secrets: env (stdio) and headers (http) never leave the manager.
+        config: redactTransportConfig(conn.config),
         connected: conn.connected,
         reconnectAttempts: conn.reconnectAttempts,
         toolNames: conn.tools.map(t => t.name),

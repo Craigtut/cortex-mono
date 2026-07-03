@@ -591,6 +591,63 @@ describe('McpClientManager', () => {
         'weather__get_current',
       ]);
     });
+
+    it('redacts stdio env secrets, exposing only a presence flag', async () => {
+      await manager.connect('weather', {
+        transport: 'stdio',
+        command: 'node',
+        args: ['server.js'],
+        env: { API_KEY: 'super-secret-value', OTHER: 'also-secret' },
+      });
+
+      const states = manager.getConnectionStates();
+      const config = states[0].config;
+
+      // env is never present on the redacted config; a boolean flag replaces it.
+      expect('env' in config).toBe(false);
+      expect((config as { hasEnv: boolean }).hasEnv).toBe(true);
+
+      // Non-secret fields are preserved.
+      expect(config.transport).toBe('stdio');
+      expect((config as { command: string }).command).toBe('node');
+
+      // The secret values must not appear anywhere in the serialized output.
+      const serialized = JSON.stringify(states);
+      expect(serialized).not.toContain('super-secret-value');
+      expect(serialized).not.toContain('also-secret');
+      expect(serialized).not.toContain('API_KEY');
+    });
+
+    it('redacts http header secrets, exposing only a presence flag', async () => {
+      await manager.connect('browser', {
+        transport: 'http',
+        url: 'http://localhost:9222/mcp',
+        headers: { Authorization: 'Bearer super-secret-token' },
+      });
+
+      const states = manager.getConnectionStates();
+      const config = states[0].config;
+
+      expect('headers' in config).toBe(false);
+      expect((config as { hasHeaders: boolean }).hasHeaders).toBe(true);
+      expect(config.transport).toBe('http');
+      expect((config as { url: string }).url).toBe('http://localhost:9222/mcp');
+
+      const serialized = JSON.stringify(states);
+      expect(serialized).not.toContain('super-secret-token');
+      expect(serialized).not.toContain('Authorization');
+    });
+
+    it('reports hasEnv/hasHeaders false when no secrets were configured', async () => {
+      await manager.connect('plain', {
+        transport: 'stdio',
+        command: 'node',
+        args: ['server.js'],
+      });
+
+      const config = manager.getConnectionStates()[0].config;
+      expect((config as { hasEnv: boolean }).hasEnv).toBe(false);
+    });
   });
 
   // -----------------------------------------------------------------------

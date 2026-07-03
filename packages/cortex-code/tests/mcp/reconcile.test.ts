@@ -1,11 +1,26 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { CortexAgent, McpConnectionState, McpTransportConfig } from '@animus-labs/cortex';
-import { applyReconcile, configsEqual } from '../../src/mcp/reconcile.js';
+import type {
+  CortexAgent,
+  McpConnectionState,
+  McpRedactedTransportConfig,
+  McpTransportConfig,
+} from '@animus-labs/cortex';
+import { applyReconcile, configsEqual, redactedConfigMatches } from '../../src/mcp/reconcile.js';
 import type { DiscoveredMcpServer } from '../../src/discovery/mcp.js';
 
 // ---------------------------------------------------------------------------
 // Test fakes
 // ---------------------------------------------------------------------------
+
+/** Mirror the manager's redaction so the fake state matches production shape. */
+function redact(config: McpTransportConfig): McpRedactedTransportConfig {
+  if (config.transport === 'stdio') {
+    const { env, ...rest } = config;
+    return { ...rest, hasEnv: env !== undefined && Object.keys(env).length > 0 };
+  }
+  const { headers, ...rest } = config;
+  return { ...rest, hasHeaders: headers !== undefined && Object.keys(headers).length > 0 };
+}
 
 function fakeAgent(initial: Array<{ name: string; config: McpTransportConfig }> = []): {
   agent: CortexAgent;
@@ -28,7 +43,7 @@ function fakeAgent(initial: Array<{ name: string; config: McpTransportConfig }> 
     getMcpServerStates: (): McpConnectionState[] =>
       [...state.entries()].map(([name, config]) => ({
         serverName: name,
-        config,
+        config: redact(config),
         connected: true,
         reconnectAttempts: 0,
         toolNames: [],
@@ -178,6 +193,71 @@ describe('configsEqual', () => {
       configsEqual(
         { transport: 'http', url: 'http://x' },
         { transport: 'http', url: 'http://y' },
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('redactedConfigMatches', () => {
+  it('matches when non-secret fields are equal and env presence agrees', () => {
+    expect(
+      redactedConfigMatches(
+        { transport: 'stdio', command: 'node', args: ['a'], hasEnv: true },
+        { transport: 'stdio', command: 'node', args: ['a'], env: { K: '1' } },
+      ),
+    ).toBe(true);
+  });
+
+  it('detects command, arg, cwd, and timeout changes', () => {
+    expect(
+      redactedConfigMatches(
+        { transport: 'stdio', command: '/bin/old', hasEnv: false },
+        { transport: 'stdio', command: '/bin/new' },
+      ),
+    ).toBe(false);
+    expect(
+      redactedConfigMatches(
+        { transport: 'stdio', command: 'node', toolTimeoutMs: 60_000, hasEnv: false },
+        { transport: 'stdio', command: 'node', toolTimeoutMs: 600_000 },
+      ),
+    ).toBe(false);
+  });
+
+  it('detects env presence changes (added or removed env block)', () => {
+    expect(
+      redactedConfigMatches(
+        { transport: 'stdio', command: 'node', hasEnv: false },
+        { transport: 'stdio', command: 'node', env: { A: '1' } },
+      ),
+    ).toBe(false);
+    expect(
+      redactedConfigMatches(
+        { transport: 'stdio', command: 'node', hasEnv: true },
+        { transport: 'stdio', command: 'node' },
+      ),
+    ).toBe(false);
+  });
+
+  it('compares http url and header presence', () => {
+    expect(
+      redactedConfigMatches(
+        { transport: 'http', url: 'http://x', hasHeaders: true },
+        { transport: 'http', url: 'http://x', headers: { A: '1' } },
+      ),
+    ).toBe(true);
+    expect(
+      redactedConfigMatches(
+        { transport: 'http', url: 'http://x', hasHeaders: false },
+        { transport: 'http', url: 'http://y' },
+      ),
+    ).toBe(false);
+  });
+
+  it('treats different transports as not equal', () => {
+    expect(
+      redactedConfigMatches(
+        { transport: 'stdio', command: 'node', hasEnv: false },
+        { transport: 'http', url: 'http://x' },
       ),
     ).toBe(false);
   });

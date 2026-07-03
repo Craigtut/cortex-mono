@@ -15,7 +15,12 @@
  * `session.isRunning` and queue until `onLoopComplete`.
  */
 
-import type { CortexAgent, McpStdioConfig, McpTransportConfig } from '@animus-labs/cortex';
+import type {
+  CortexAgent,
+  McpStdioConfig,
+  McpTransportConfig,
+  McpRedactedTransportConfig,
+} from '@animus-labs/cortex';
 import { discoverMcpServers, type DiscoveredMcpServer } from '../discovery/mcp.js';
 import { checkProjectMcpTrust, trustProjectMcpConfig } from '../discovery/mcp-trust.js';
 
@@ -101,8 +106,10 @@ export async function applyReconcile(
     }
   }
 
-  // Index current and desired by server name.
-  const current = new Map<string, McpTransportConfig>();
+  // Index current and desired by server name. The live states carry a redacted
+  // config (secret env/headers withheld), so change detection below compares
+  // non-secret fields and secret *presence* rather than secret values.
+  const current = new Map<string, McpRedactedTransportConfig>();
   for (const state of agent.getMcpServerStates()) {
     current.set(state.serverName, state.config);
   }
@@ -151,7 +158,7 @@ export async function applyReconcile(
       }
       continue;
     }
-    if (!configsEqual(currentConfig, discovered.config)) {
+    if (!redactedConfigMatches(currentConfig, discovered.config)) {
       try {
         await agent.disconnectMcpServer(name);
         await agent.connectMcpServer(name, discovered.config);
@@ -173,9 +180,44 @@ export async function applyReconcile(
 }
 
 /**
- * Stable structural equality for two MCP transport configs. Used to detect
- * whether a server entry has been modified in the file (requiring a
- * disconnect+reconnect) vs unchanged (no-op).
+ * Change detection between a live (redacted) connection config and a freshly
+ * discovered (full) config. The live config has its secret-bearing fields
+ * withheld (`env` for stdio, `headers` for http), so this compares every
+ * non-secret field exactly and compares secrets by *presence* only.
+ *
+ * Tradeoff: a change that only edits the value of an existing env var or header
+ * (same keys) cannot be detected from the redacted state and will not trigger
+ * an automatic disconnect+reconnect. Adding, removing, or renaming keys flips
+ * the presence flag and is detected; any restart re-reads the config in full.
+ */
+export function redactedConfigMatches(
+  current: McpRedactedTransportConfig,
+  desired: McpTransportConfig,
+): boolean {
+  if (current.transport !== desired.transport) return false;
+  if (current.transport === 'stdio' && desired.transport === 'stdio') {
+    if (current.command !== desired.command) return false;
+    if (current.cwd !== desired.cwd) return false;
+    if (current.toolTimeoutMs !== desired.toolTimeoutMs) return false;
+    if (!arrayEqual(current.args ?? [], desired.args ?? [])) return false;
+    const desiredHasEnv = desired.env !== undefined && Object.keys(desired.env).length > 0;
+    return current.hasEnv === desiredHasEnv;
+  }
+  if (current.transport === 'http' && desired.transport === 'http') {
+    if (current.url !== desired.url) return false;
+    if (current.toolTimeoutMs !== desired.toolTimeoutMs) return false;
+    const desiredHasHeaders =
+      desired.headers !== undefined && Object.keys(desired.headers).length > 0;
+    return current.hasHeaders === desiredHasHeaders;
+  }
+  return false;
+}
+
+/**
+ * Stable structural equality for two full MCP transport configs, including
+ * secret values. Retained as a utility for callers that hold both full configs
+ * (e.g. tests). Reconciliation itself uses {@link redactedConfigMatches}
+ * because the live connection state is redacted.
  */
 export function configsEqual(a: McpTransportConfig, b: McpTransportConfig): boolean {
   if (a.transport !== b.transport) return false;
