@@ -19,6 +19,7 @@ import type {
   ObservationEvent,
   ReflectionEvent,
 } from './compaction/observational/types.js';
+import type { SandboxProvider } from './sandbox/types.js';
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -237,6 +238,15 @@ export interface CortexAgentConfig {
     /** Path to the shell executable. */
     shellPath?: string;
   };
+
+  /**
+   * Optional OS-level sandbox for subprocess execution (the Bash tool, and in
+   * future other spawn sites). Cortex ships no enforcement of its own; the
+   * consumer supplies an already-initialized SandboxProvider (e.g. from
+   * @animus-labs/cortex-sandbox) that wraps each spawn in an OS boundary.
+   * When omitted, subprocess execution is unchanged. See docs/cortex/sandboxing.md.
+   */
+  sandbox?: SandboxProvider;
 
   /**
    * Whether the consumer is currently auto-approving tool calls.

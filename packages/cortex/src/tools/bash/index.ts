@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import { Type, type Static } from 'typebox';
 import type { CwdTracker } from '../shared/cwd-tracker.js';
 import type { ToolContentDetails, ToolExecuteContext } from '../../types.js';
+import type { SandboxProvider } from '../../sandbox/types.js';
 import { buildSafeEnv, runSafetyChecks } from './safety.js';
 import {
   type BackgroundTask,
@@ -108,6 +109,12 @@ export interface BashToolConfig {
    * Used for macOS dock icon suppression vars (DYLD_INSERT_LIBRARIES, etc.).
    */
   envOverrides?: Record<string, string> | undefined;
+  /**
+   * Optional OS-level sandbox. When present, each shell spawn is passed through
+   * provider.wrapSpawn after safety checks and the cwd-capture suffix, launching
+   * the command inside an OS boundary. No-op when omitted.
+   */
+  sandbox?: SandboxProvider | undefined;
 }
 
 export function getBackgroundTask(id: string): BackgroundTask | undefined {
@@ -349,13 +356,33 @@ export function createBashTool(config: BashToolConfig): {
 
       const fullCommand = `${utf8Prefix}${params.command}${cwdSuffix}`;
 
+      // Resolve the spawn, optionally wrapped by an OS sandbox. The wrapper is a
+      // pure transform applied AFTER safety checks and the cwd-capture suffix, so
+      // the working-directory tracking and all safety layers still run first.
+      // No-op when no provider is configured.
+      const spawnCwd = cwdTracker.getCwd();
+      let spawnFile = shellConfig.shell;
+      let spawnArgs = [...shellConfig.args, fullCommand];
+      let spawnEnv: Record<string, string> = safeEnv;
+      if (config.sandbox) {
+        const wrapped = config.sandbox.wrapSpawn({
+          file: spawnFile,
+          args: spawnArgs,
+          cwd: spawnCwd,
+          env: safeEnv,
+        });
+        spawnFile = wrapped.file;
+        spawnArgs = wrapped.args;
+        spawnEnv = wrapped.env;
+      }
+
       // Spawn the process
       const proc = child_process.spawn(
-        shellConfig.shell,
-        [...shellConfig.args, fullCommand],
+        spawnFile,
+        spawnArgs,
         {
-          cwd: cwdTracker.getCwd(),
-          env: safeEnv,
+          cwd: spawnCwd,
+          env: spawnEnv,
           stdio: ['pipe', 'pipe', 'pipe'],
           detached: !isWindows, // Process group for Unix cleanup
         },

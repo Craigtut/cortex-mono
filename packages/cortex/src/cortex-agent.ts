@@ -3248,6 +3248,7 @@ export class CortexAgent {
         onBackgroundTaskComplete: (taskId) => {
           void this.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId });
         },
+        sandbox: this.config.sandbox,
       }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.TaskOutput)) {

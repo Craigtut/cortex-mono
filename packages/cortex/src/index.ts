@@ -260,6 +260,22 @@ export type {
 } from './tools/tool-search/index.js';
 export type { DeferredToolsConfig } from './types.js';
 
+// Sandbox seam (types + provider contract; enforcement is consumer-supplied)
+export type {
+  SandboxRung,
+  SandboxFilesystemPolicy,
+  SandboxNetworkMode,
+  SandboxNetworkPolicy,
+  SandboxPolicy,
+  SandboxEnforcement,
+  SandboxBackend,
+  SandboxStatus,
+  SandboxSpawnSpec,
+  WrappedSpawn,
+  SandboxDenial,
+  SandboxProvider,
+} from './sandbox/index.js';
+
 // Compaction (Phase 5)
 export {
   CompactionManager,
