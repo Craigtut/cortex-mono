@@ -25,10 +25,12 @@
     "lint": "eslint packages/*/src packages/*/tests",
     "lint:fix": "eslint packages/*/src packages/*/tests --fix",
     "clean": "rm -rf packages/*/dist node_modules/.cache",
-    "publish:cortex": "npm run build -w packages/cortex && npm run test:run -w packages/cortex && npm publish -w packages/cortex",
-    "publish:cortex-code": "npm run build -w packages/cortex-code && npm run test:run -w packages/cortex-code && npm publish -w packages/cortex-code",
-    "version:cortex": "npm version -w packages/cortex",
-    "version:cortex-code": "npm version -w packages/cortex-code"
+    "publish:cortex": "npm run release:check:cortex && npm publish -w packages/cortex --access public",
+    "publish:cortex-code": "npm run release:check:cortex-code && npm publish -w packages/cortex-code --access public",
+    "release:check:cortex": "npm run typecheck -w packages/cortex && npm run build -w packages/cortex && npm run test:run -w packages/cortex && npm pack -w packages/cortex --dry-run",
+    "release:check:cortex-code": "npm run typecheck -w packages/cortex-code && npm run build -w packages/cortex && npm run build -w packages/cortex-code && npm run test:run -w packages/cortex-code && npm pack -w packages/cortex-code --dry-run",
+    "version:cortex": "npm version -w packages/cortex --no-git-tag-version",
+    "version:cortex-code": "npm version -w packages/cortex-code --no-git-tag-version"
   },
   "lint-staged": {
     "packages/*/src/**/*.ts": "eslint",
@@ -37,7 +39,7 @@
   "engines": {
     "node": ">=24.0.0"
   },
-  "packageManager": "npm@10.0.0",
+  "packageManager": "npm@11.18.0",
   "overrides": {
     "vitest": {
       "vite": "^5.4.0"
