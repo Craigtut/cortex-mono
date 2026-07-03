@@ -70,7 +70,7 @@ describe('Bash tool', () => {
     });
 
     const text = (result.content[0] as { type: 'text'; text: string }).text;
-    expect(text).toContain('critical system directory');
+    expect(text).toContain('Catastrophic command blocked');
     expect(result.details.exitCode).toBeNull();
   });
 

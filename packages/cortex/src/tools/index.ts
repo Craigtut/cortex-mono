@@ -90,6 +90,26 @@ export {
 } from './bash/safety.js';
 export type { CommandClassification, SafetyCheckResult } from './bash/safety.js';
 
+// Catastrophic command floor (hard block, shared with permission systems)
+export { findCatastrophicCommand } from './bash/catastrophic.js';
+export type {
+  CatastrophicCategory,
+  CatastrophicContext,
+  CatastrophicFinding,
+} from './bash/catastrophic.js';
+
+// Shell command splitting (quote-aware; shared with permission rule matching)
+export { splitBashCommand, isCompoundBash } from './bash/split-command.js';
+export type { SplitBashOptions } from './bash/split-command.js';
+
+// Path containment primitives (shared with downstream permission systems)
+export {
+  isPathSameOrDescendant,
+  realpathIfExists,
+  resolveThroughExistingAncestor,
+  resolveThroughExistingAncestorSync,
+} from './shared/path-guard.js';
+
 // ---------------------------------------------------------------------------
 // Tool name constants
 // ---------------------------------------------------------------------------

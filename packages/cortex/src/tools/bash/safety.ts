@@ -1,8 +1,8 @@
 /**
  * Bash tool safety layers.
  *
- * Seven layers of defense-in-depth for shell command execution, plus a
- * final UX gate:
+ * Defense-in-depth for shell command execution:
+ * 0. Catastrophic command floor (hard block, no override; see catastrophic.ts)
  * 1. Environment variable stripping
  * 2. Critical path protection
  * 3. Command classification
@@ -18,7 +18,13 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import { buildSafeEnv as buildSafeEnvShared } from '../shared/safe-env.js';
+import {
+  isPathSameOrDescendant,
+  resolveThroughExistingAncestorSync,
+} from '../shared/path-guard.js';
+import { findCatastrophicCommand } from './catastrophic.js';
 import { checkInteractive } from './interactive.js';
 
 // ---------------------------------------------------------------------------
@@ -636,34 +642,6 @@ export function extractWritePaths(command: string): string[] {
   return paths;
 }
 
-/**
- * Resolve a path, following symlinks when the target exists.
- * Falls back to path.resolve() if the path does not yet exist.
- */
-function resolveWithSymlinks(targetPath: string): string {
-  const absoluteTarget = path.resolve(targetPath);
-  let current = absoluteTarget;
-  const remainder: string[] = [];
-
-  while (true) {
-    try {
-      return path.resolve(fs.realpathSync(current), ...remainder);
-    } catch {
-      const parent = path.dirname(current);
-      if (parent === current) return absoluteTarget;
-      remainder.unshift(path.basename(current));
-      current = parent;
-    }
-  }
-}
-
-function isPathSameOrDescendant(targetPath: string, parentPath: string): boolean {
-  const normalizedTarget = process.platform === 'win32' ? targetPath.toLowerCase() : targetPath;
-  const normalizedParent = process.platform === 'win32' ? parentPath.toLowerCase() : parentPath;
-  const relative = path.relative(normalizedParent, normalizedTarget);
-  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
-}
-
 function isAllowedExternalWriteTarget(resolvedPath: string): boolean {
   if (process.platform === 'win32') return false;
   return normalizePathForSafety(resolvedPath) === '/dev/null';
@@ -683,11 +661,11 @@ export function validateWritePaths(
   }
 
   const writePaths = extractWritePaths(command);
-  const resolvedWorkingDirectory = resolveWithSymlinks(workingDirectory);
+  const resolvedWorkingDirectory = resolveThroughExistingAncestorSync(workingDirectory);
   for (const wp of writePaths) {
     // Resolve relative to current CWD, then resolve symlinks
     const rawResolved = path.resolve(currentCwd, wp);
-    const resolved = resolveWithSymlinks(rawResolved);
+    const resolved = resolveThroughExistingAncestorSync(rawResolved);
 
     // Check critical paths
     if (isCriticalPathOrDescendant(resolved)) {
@@ -1559,6 +1537,21 @@ export async function runSafetyChecks(
     isAutoApprove?: boolean | undefined;
   },
 ): Promise<SafetyCheckResult> {
+  // Layer 0: Catastrophic command floor. A hard block that no configuration,
+  // permission mode, or approval can disable; it protects the machine itself
+  // (filesystem root, system directories, whole home, raw disks, fork bombs).
+  const catastrophic = findCatastrophicCommand(command, {
+    cwd: currentCwd,
+    home: os.homedir(),
+  });
+  if (catastrophic) {
+    return {
+      allowed: false,
+      reason: catastrophic.reason,
+      classification: classifyCommand(command),
+    };
+  }
+
   // Layer 2: Critical path protection
   // Check each sub-command independently for critical path access
   const subCommands = splitOnShellOperators(command);
