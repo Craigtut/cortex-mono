@@ -266,11 +266,11 @@ describe('BudgetGuard', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Reset on loop_start
+  // Reset per logical turn
   // -----------------------------------------------------------------------
 
-  describe('reset on loop_start', () => {
-    it('resets counters on loop_start', () => {
+  describe('reset per logical turn', () => {
+    it('reset() clears counters and breach state', () => {
       const guard = new BudgetGuard({ maxTurns: Infinity, maxCost: Infinity }, abortFn);
       guard.wire(bridge);
 
@@ -280,8 +280,7 @@ describe('BudgetGuard', () => {
       expect(guard.getTurnCount()).toBe(2);
       expect(guard.getTotalCost()).toBeCloseTo(0.10);
 
-      // Reset via agent_start -> loop_start
-      source.emit({ type: 'agent_start' });
+      guard.reset();
 
       expect(guard.getTurnCount()).toBe(0);
       expect(guard.getTotalCost()).toBe(0);
@@ -297,13 +296,81 @@ describe('BudgetGuard', () => {
       expect(abortFn).toHaveBeenCalledTimes(1);
       expect(guard.isBreached()).toBe(true);
 
-      // Reset via agent_start -> loop_start
-      source.emit({ type: 'agent_start' });
+      guard.reset();
       expect(guard.isBreached()).toBe(false);
 
       // Should be able to run 2 more turns
       source.emit({ type: 'turn_end' });
       expect(abortFn).toHaveBeenCalledTimes(1); // Still just the 1 from before
+    });
+
+    it('does not reset on loop_start (retry continuations emit one per attempt)', () => {
+      const guard = new BudgetGuard({ maxTurns: Infinity, maxCost: Infinity }, abortFn);
+      guard.wire(bridge);
+
+      source.emit(turnEndWithCost(0.05));
+      expect(guard.getTurnCount()).toBe(1);
+
+      // pi-agent-core emits agent_start for every run, including each
+      // background-retry continue(); the budget must keep accumulating
+      // across attempts of the same logical turn.
+      source.emit({ type: 'agent_start' });
+
+      expect(guard.getTurnCount()).toBe(1);
+      expect(guard.getTotalCost()).toBeCloseTo(0.05);
+
+      source.emit(turnEndWithCost(0.05));
+      expect(guard.getTurnCount()).toBe(2);
+      expect(guard.getTotalCost()).toBeCloseTo(0.10);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Synthetic failure / abort turns (not real model turns)
+  // -----------------------------------------------------------------------
+
+  describe('synthetic failure turns', () => {
+    it('does not count a turn_end carrying a stopReason error message', () => {
+      const guard = new BudgetGuard({ maxTurns: Infinity }, abortFn);
+      guard.wire(bridge);
+
+      source.emit({ type: 'turn_end', message: { stopReason: 'error', errorMessage: 'Connection error.' } });
+      source.emit({ type: 'turn_end', message: { stopReason: 'aborted' } });
+      source.emit({ type: 'turn_end', message: { errorMessage: 'boom' } });
+
+      expect(guard.getTurnCount()).toBe(0);
+    });
+
+    it('counts real turns but skips synthetic failures across a retried logical turn', () => {
+      // maxTurns caps a whole logical turn. Emit real turns spanning the
+      // synthetic failure + retry agent_start and confirm accumulation with
+      // no per-attempt reset and no synthetic-turn counting.
+      const guard = new BudgetGuard({ maxTurns: 5 }, abortFn);
+      guard.wire(bridge);
+
+      // Attempt 1: two real turns, then a synthetic failure.
+      source.emit(turnEndWithCost(0.01));
+      source.emit(turnEndWithCost(0.01));
+      source.emit({ type: 'turn_end', message: { stopReason: 'error', errorMessage: 'Connection error.' } });
+      // Retry continuation starts a new pi run.
+      source.emit({ type: 'agent_start' });
+      // Attempt 2: one real turn.
+      source.emit(turnEndWithCost(0.01));
+
+      expect(guard.getTurnCount()).toBe(3);
+      expect(guard.getTotalCost()).toBeCloseTo(0.03);
+      expect(abortFn).not.toHaveBeenCalled();
+    });
+
+    it('a real turn following a synthetic failure still triggers the limit', () => {
+      const guard = new BudgetGuard({ maxTurns: 2 }, abortFn);
+      guard.wire(bridge);
+
+      source.emit({ type: 'turn_end' }); // real turn 1
+      source.emit({ type: 'turn_end', message: { stopReason: 'error' } }); // skipped
+      expect(abortFn).not.toHaveBeenCalled();
+      source.emit({ type: 'turn_end' }); // real turn 2 -> breach
+      expect(abortFn).toHaveBeenCalledTimes(1);
     });
   });
 

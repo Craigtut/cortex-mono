@@ -5,14 +5,38 @@
  * On breach, calls the provided abort function to stop the loop.
  * Defaults to Infinity for both limits (no enforcement unless configured).
  *
- * Counters reset on agent_start (beginning of each agentic loop).
+ * Counters are reset by CortexAgent (via reset()) once per logical prompt
+ * turn, NOT on loop_start: pi-agent-core emits a fresh agent_start for every
+ * run, including each background-retry continuation, so resetting there
+ * would make maxTurns/maxCost per-attempt instead of per logical turn.
  *
  * Reference: cortex-architecture.md (Budget Guards section)
  */
 
 import type { BudgetGuardConfig, CortexLogger } from './types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
-import type { EventBridge } from './event-bridge.js';
+import type { CortexEvent, EventBridge } from './event-bridge.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a turn_end event carries pi-agent-core's synthetic failure message
+ * (stopReason 'error'/'aborted', or errorMessage set). These are emitted once
+ * per failed or cancelled attempt and must not count toward maxTurns.
+ */
+function isFailureTurnEnd(event: CortexEvent): boolean {
+  const data = event.data as Record<string, unknown> | undefined;
+  const message = data?.['message'] as Record<string, unknown> | undefined;
+  if (!message) return false;
+  const stopReason = message['stopReason'];
+  return (
+    stopReason === 'error' ||
+    stopReason === 'aborted' ||
+    message['errorMessage'] != null
+  );
+}
 
 // ---------------------------------------------------------------------------
 // BudgetGuard
@@ -46,23 +70,15 @@ export class BudgetGuard {
 
   /**
    * Wire the guard to an event bridge.
-   * Subscribes to turn_end (for turn counting and cost) and loop_start (for reset).
+   * Subscribes to turn_end (for turn counting and cost). Counter resets are
+   * NOT event-driven: the owner calls reset() once per logical turn, because
+   * loop_start fires per pi-agent-core run and a retried turn spans several.
    *
    * @param bridge - The EventBridge to subscribe to
    */
   wire(bridge: EventBridge): void {
     // Clean up any previous wiring
     this.unwire();
-
-    // Reset counters on agent_start (beginning of a new agentic loop).
-    // Ignore forwarded child (sub-agent) events: a parent's budget only
-    // governs its own loop, not a delegated sub-agent's loop lifecycle.
-    this.unsubscribers.push(
-      bridge.on('loop_start', (event) => {
-        if (event.childTaskId) return;
-        this.reset();
-      }),
-    );
 
     // Track turns and cost on turn_end. Forwarded child events arrive on the
     // same bridge with childTaskId set; skip them so a parent's budget counts
@@ -71,6 +87,12 @@ export class BudgetGuard {
     this.unsubscribers.push(
       bridge.on('turn_end', (event) => {
         if (event.childTaskId) return;
+        // Skip synthetic failure/abort turns. pi-agent-core emits a turn_end
+        // for its synthetic failure message (empty usage, stopReason
+        // error/aborted) on every failed or cancelled attempt; counting it
+        // would burn a maxTurns slot per retry attempt rather than per real
+        // model turn.
+        if (isFailureTurnEnd(event)) return;
         this.turnCount++;
 
         // Read cost from typed usage (extracted by EventBridge)
@@ -131,7 +153,8 @@ export class BudgetGuard {
   }
 
   /**
-   * Reset counters. Called automatically on loop_start.
+   * Reset counters. Called by CortexAgent at the start of each logical
+   * prompt turn, so limits span all retry attempts of that turn.
    */
   reset(): void {
     this.turnCount = 0;

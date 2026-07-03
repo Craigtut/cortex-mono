@@ -109,12 +109,13 @@ export interface SessionUsage {
 /**
  * The lifecycle state of a CortexAgent instance.
  *
- * CREATED -> ACTIVE -> DESTROYED
+ * CREATED -> ACTIVE -> DESTROYING -> DESTROYED
  *
  * abort() returns the agent to ACTIVE (still usable).
- * destroy() transitions to DESTROYED (all resources released).
+ * destroy() transitions to DESTROYING synchronously (no new loops can
+ * start), then to DESTROYED once all resources are released.
  */
-export type CortexLifecycleState = 'created' | 'active' | 'destroyed';
+export type CortexLifecycleState = 'created' | 'active' | 'destroying' | 'destroyed';
 
 // ---------------------------------------------------------------------------
 // Thinking / Effort Level
