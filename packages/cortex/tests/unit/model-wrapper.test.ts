@@ -39,11 +39,16 @@ describe('model-wrapper', () => {
       expect(wrapped.contextWindow).toBe(100_000);
     });
 
-    it('wraps null inner models', () => {
-      const wrapped = wrapModel(null, 'test', 'test-model', 10_000);
+    it('throws when wrapping a null inner model', () => {
+      expect(() => wrapModel(null, 'test', 'test-model', 10_000)).toThrow(
+        /cannot wrap a nullish model/,
+      );
+    });
 
-      expect(wrapped.__brand).toBe('CortexModel');
-      expect(wrapped.provider).toBe('test');
+    it('throws when wrapping an undefined inner model', () => {
+      expect(() => wrapModel(undefined, 'test', 'test-model')).toThrow(
+        /cannot wrap a nullish model/,
+      );
     });
 
     it('wraps primitive inner models', () => {
