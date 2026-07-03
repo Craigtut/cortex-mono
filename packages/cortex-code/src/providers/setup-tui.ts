@@ -17,6 +17,7 @@ import {
   Input,
   Loader,
   Box,
+  type Component,
   type SelectItem,
   type OverlayHandle,
   matchesKey,
@@ -57,12 +58,28 @@ class SetupRenderer {
     private onComplete: (result: SetupResult) => void,
     private onCancel: () => void,
     flow: ProviderSetupFlow,
+    /**
+     * How to focus an inner component. Defaults to tui.setFocus (correct for
+     * the standalone first-run TUI). The in-session overlay injects a variant
+     * that keeps focus on the OverlayBox and routes input through it, since
+     * pi-tui won't dispatch input to an overlay's detached children.
+     */
+    private focusComponent?: (component: Component) => void,
   ) {
     this.flow = flow;
   }
 
   start(): void {
     this.renderStep(this.flow.getCurrentStep());
+  }
+
+  /** Focus an inner setup component via the injected strategy (or tui directly). */
+  private focus(component: Component): void {
+    if (this.focusComponent) {
+      this.focusComponent(component);
+    } else {
+      this.tui.setFocus(component);
+    }
   }
 
   private renderStep(step: SetupStep): void {
@@ -100,7 +117,7 @@ class SetupRenderer {
         };
 
         this.contentContainer.addChild(list);
-        this.tui.setFocus(list);
+        this.focus(list);
         break;
       }
 
@@ -125,7 +142,7 @@ class SetupRenderer {
         };
 
         this.contentContainer.addChild(input);
-        this.tui.setFocus(input);
+        this.focus(input);
         break;
       }
 
@@ -272,7 +289,7 @@ class SetupRenderer {
           }
         };
         this.contentContainer.addChild(urlInput);
-        this.tui.setFocus(urlInput);
+        this.focus(urlInput);
         break;
       }
 
@@ -348,7 +365,7 @@ class SetupRenderer {
     return new Promise<string>((resolve) => {
       const armRevealKey = () => {
         loader.setMessage("Waiting for browser...  (on another machine? press 'p' to paste the URL)");
-        this.tui.setFocus(loader);
+        this.focus(loader);
         keyTarget.handleInput = (data: string) => {
           if (data !== 'p' && data !== 'P') return;
           keyTarget.handleInput = () => {};
@@ -372,7 +389,7 @@ class SetupRenderer {
 
     const input = new Input();
     this.contentContainer.addChild(input);
-    this.tui.setFocus(input);
+    this.focus(input);
 
     return new Promise<string>((resolve) => {
       input.handleInput = (data: string) => {
@@ -408,7 +425,7 @@ class SetupRenderer {
     }));
     const list = new SelectList(items, Math.min(items.length, 10), selectListTheme);
     this.contentContainer.addChild(list);
-    this.tui.setFocus(list);
+    this.focus(list);
 
     return new Promise<string | undefined>((resolve) => {
       list.onSelect = (item) => {
@@ -586,6 +603,41 @@ export async function runSetupInOverlay(
   });
 
   return new Promise<SetupResult | null>((resolve) => {
+    let settled = false;
+    let removeCtrlCListener: (() => void) | undefined;
+
+    const cleanup = () => {
+      removeCtrlCListener?.();
+      handle.hide();
+      tui.hideOverlay(); // Ensure overlay stack is cleared
+    };
+    const complete = (result: SetupResult) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(null);
+    };
+
+    // Escape hatch: while the overlay is up, Ctrl+C dismisses it and returns to
+    // the editor. Registered as a TUI input listener so it runs ahead of (and
+    // independently of) whichever inner component holds focus. Without this,
+    // the only Ctrl+C handler lives on the editor, which does not have focus
+    // while the overlay is open, so there is no way to abort the flow.
+    removeCtrlCListener = tui.addInputListener((data) => {
+      if (matchesKey(data, Key.ctrl('c'))) {
+        log.info('Setup overlay: cancelled via Ctrl+C');
+        cancel();
+        return { consume: true };
+      }
+      return undefined;
+    });
+
     const renderer = new SetupRenderer(
       tui,
       innerContent,
@@ -594,17 +646,20 @@ export async function runSetupInOverlay(
       async (result) => {
         log.info('Setup overlay: complete', { provider: result.provider, model: result.model });
         await credentialStore.setDefaults(result.provider, result.model);
-        handle.hide();
-        tui.hideOverlay(); // Ensure overlay stack is cleared
-        resolve(result);
+        complete(result);
       },
       () => {
         log.info('Setup overlay: cancelled');
-        handle.hide();
-        tui.hideOverlay();
-        resolve(null);
+        cancel();
       },
       flow,
+      // Keep focus on the OverlayBox (the registered overlay component) and let
+      // it forward input to the active child. Focusing inner children directly
+      // gets redirected back to the overlay by pi-tui, dropping all input.
+      (component) => {
+        overlayBox.setActiveChild(component);
+        tui.setFocus(overlayBox);
+      },
     );
 
     renderer.start();

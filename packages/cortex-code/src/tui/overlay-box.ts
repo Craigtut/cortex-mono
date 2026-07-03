@@ -13,6 +13,7 @@ const BORDER_COLOR = chalk.hex(palette.accentDeep);
 export class OverlayBox implements Component, Focusable {
   private innerComponent: Component;
   private title: string;
+  private activeChild: Component | null = null;
   focused = false;
 
   constructor(innerComponent: Component, title: string = '') {
@@ -20,11 +21,28 @@ export class OverlayBox implements Component, Focusable {
     this.title = title;
   }
 
+  /**
+   * Designate which inner component receives keyboard input.
+   *
+   * pi-tui only dispatches input to the component registered as the overlay
+   * (this OverlayBox), never to its detached descendants: calling
+   * tui.setFocus() on an inner child gets redirected back to the overlay
+   * wrapper, because pi-tui's focus-restore treats overlay children as
+   * unmounted (its mounted-check walks the base tree, not the overlay stack).
+   * So the overlay stays the TUI focus target and forwards keystrokes to the
+   * active child set here. Without this, input lands on the inner Container
+   * (which has no handleInput) and is silently dropped.
+   */
+  setActiveChild(child: Component | null): void {
+    this.activeChild = child;
+  }
+
   handleInput(data: string): void {
-    // Forward input to the inner component (e.g., SelectList)
-    if (this.innerComponent.handleInput) {
-      this.innerComponent.handleInput(data);
-    }
+    // Route to the designated active child, falling back to the inner
+    // container. The inner container is a plain Container with no handleInput,
+    // so absent an active child, input is dropped.
+    const target = this.activeChild ?? this.innerComponent;
+    target.handleInput?.(data);
   }
 
   invalidate(): void {
