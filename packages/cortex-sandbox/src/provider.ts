@@ -9,11 +9,13 @@
  * Note: SandboxManager is a process-global singleton, so at most one provider is
  * meaningfully active per process. Re-initialize to change policy (rung change).
  */
+import { spawn } from 'node:child_process';
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
   type SandboxAskCallback,
 } from '@anthropic-ai/sandbox-runtime';
+import { DEFAULT_CREDENTIAL_ENV_VARS } from './policy.js';
 import type {
   SandboxProvider,
   SandboxPolicy,
@@ -33,6 +35,12 @@ export interface SandboxRuntimeProviderOptions {
   onNetworkRequest?: (req: { host: string; port: number | undefined }) => Promise<boolean>;
   /** Notified with the honest degradation reasons whenever enforcement is reduced. */
   onDegraded?: (degradations: string[]) => void;
+  /**
+   * Credential environment-variable names to unset inside the sandbox (mode
+   * "deny"). Defaults to DEFAULT_CREDENTIAL_ENV_VARS. Pass [] to disable, or your
+   * own list to extend/replace coverage.
+   */
+  credentialEnvVars?: string[];
 }
 
 function backendForPlatform(): SandboxBackend {
@@ -46,6 +54,47 @@ function backendForPlatform(): SandboxBackend {
   }
 }
 
+/**
+ * Probe whether bubblewrap can actually create an unprivileged user namespace.
+ * Presence of the bwrap binary is not enough: Ubuntu 23.10+/24.04 restrict
+ * unprivileged user namespaces via AppArmor, so the binary exists but every
+ * sandboxed command fails at run time. Returns ok:false with an actionable
+ * reason so the provider can report honest `none` instead of a false `enforced`.
+ */
+async function probeBwrapUserns(): Promise<{ ok: boolean; reason?: string }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (r: { ok: boolean; reason?: string }): void => {
+      if (!settled) {
+        settled = true;
+        resolve(r);
+      }
+    };
+    try {
+      const proc = spawn(
+        'bwrap',
+        ['--ro-bind', '/', '/', '--unshare-user', '--unshare-net', '--', 'true'],
+        { stdio: 'ignore' },
+      );
+      proc.on('error', (e) => done({ ok: false, reason: `bwrap probe could not run: ${e.message}` }));
+      proc.on('close', (code) =>
+        done(
+          code === 0
+            ? { ok: true }
+            : {
+                ok: false,
+                reason:
+                  `bwrap could not create a user namespace (exit ${code}). On Ubuntu 23.10+/24.04 set ` +
+                  `kernel.apparmor_restrict_unprivileged_userns=0 or install an AppArmor profile for bwrap.`,
+              },
+        ),
+      );
+    } catch (e) {
+      done({ ok: false, reason: `bwrap probe error: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  });
+}
+
 const UNCONTAINED = (reason: string): SandboxStatus => ({
   filesystem: 'none',
   network: 'none',
@@ -56,8 +105,11 @@ const UNCONTAINED = (reason: string): SandboxStatus => ({
 export class SandboxRuntimeProvider implements SandboxProvider {
   private currentStatus: SandboxStatus = UNCONTAINED('not initialized');
   private policy: SandboxPolicy | undefined;
+  private readonly credentialEnvVars: string[];
 
-  constructor(private readonly options: SandboxRuntimeProviderOptions = {}) {}
+  constructor(private readonly options: SandboxRuntimeProviderOptions = {}) {
+    this.credentialEnvVars = options.credentialEnvVars ?? [...DEFAULT_CREDENTIAL_ENV_VARS];
+  }
 
   async initialize(policy: SandboxPolicy): Promise<SandboxStatus> {
     this.policy = policy;
@@ -69,10 +121,29 @@ export class SandboxRuntimeProvider implements SandboxProvider {
       );
     }
 
+    // Re-initialize (e.g. a rung change): SandboxManager.initialize() early-returns
+    // when already initialized, so without an explicit reset a second call is a
+    // silent no-op that would report the new policy while enforcing the old one.
+    if (this.currentStatus.backend !== 'none') {
+      await SandboxManager.reset();
+    }
+
     const degradations: string[] = [];
     if (backend === 'bubblewrap') {
       const dep = SandboxManager.checkDependencies();
-      degradations.push(...dep.errors, ...dep.warnings);
+      if (dep.errors.length > 0) {
+        return this.setStatus(
+          UNCONTAINED(`Linux sandbox dependencies missing: ${dep.errors.join('; ')}`),
+        );
+      }
+      // checkDependencies() only probes bwrap/socat presence, not whether an
+      // unprivileged user namespace can actually be created. Probe for real so we
+      // report honest `none` instead of a false `enforced` on a restricted kernel.
+      const probe = await probeBwrapUserns();
+      if (!probe.ok) {
+        return this.setStatus(UNCONTAINED(probe.reason ?? 'bubblewrap user namespace unavailable'));
+      }
+      degradations.push(...dep.warnings);
     }
 
     try {
@@ -86,12 +157,12 @@ export class SandboxRuntimeProvider implements SandboxProvider {
       return this.setStatus(UNCONTAINED(`sandbox initialization failed: ${msg}`));
     }
 
-    // Init succeeded. If the dependency preflight flagged problems, enforcement
-    // is reduced from the requested policy; report it rather than overclaim.
-    const reduced = degradations.length > 0;
+    // Init succeeded. Dependency warnings (e.g. seccomp unavailable) are attached
+    // as degradations but do not by themselves negate the primary fs/network
+    // boundary, so we report enforced with the caveats surfaced.
     return this.setStatus({
-      filesystem: reduced ? 'partial' : 'enforced',
-      network: reduced ? 'partial' : 'enforced',
+      filesystem: 'enforced',
+      network: 'enforced',
       backend,
       degradations,
     });
@@ -143,7 +214,7 @@ export class SandboxRuntimeProvider implements SandboxProvider {
   private toRuntimeConfig(policy: SandboxPolicy): SandboxRuntimeConfig {
     const fs = policy.filesystem;
     const net = policy.network;
-    return {
+    const config: SandboxRuntimeConfig = {
       network: {
         allowedDomains: net.mode === 'deny' ? [] : net.allowedDomains,
         deniedDomains: net.deniedDomains,
@@ -158,5 +229,14 @@ export class SandboxRuntimeProvider implements SandboxProvider {
         ...(fs.allowRead ? { allowRead: fs.allowRead } : {}),
       },
     };
+    // Scrub credential env vars from the child (filesystem deny-reads do not
+    // cover secrets that live in the environment, and the seeded allowlist is a
+    // ready exfil channel).
+    if (this.credentialEnvVars.length > 0) {
+      config.credentials = {
+        envVars: this.credentialEnvVars.map((name) => ({ name, mode: 'deny' as const })),
+      };
+    }
+    return config;
   }
 }
