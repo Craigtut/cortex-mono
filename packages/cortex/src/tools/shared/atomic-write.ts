@@ -101,7 +101,10 @@ export async function atomicWrite(filePath: string, content: string): Promise<vo
   }
 
   // Capture the existing file's mode so the rename (which installs a fresh
-  // inode) doesn't drop it to the umask default.
+  // inode) doesn't drop it to the umask default. Mode preservation is
+  // best-effort: on Windows POSIX modes are largely inert (chmod only toggles
+  // the read-only bit), so we never require or assume specific bits and never
+  // let a chmod failure abort the write.
   let existingMode: number | undefined;
   try {
     const st = await fs.promises.stat(realTarget);
@@ -120,7 +123,7 @@ export async function atomicWrite(filePath: string, content: string): Promise<vo
     try {
       await handle.writeFile(content, 'utf8');
       if (existingMode !== undefined) {
-        await handle.chmod(existingMode);
+        try { await handle.chmod(existingMode); } catch { /* best effort; ignore on platforms without full mode support */ }
       }
     } finally {
       await handle.close();
