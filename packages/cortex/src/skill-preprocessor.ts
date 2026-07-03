@@ -247,20 +247,43 @@ export function substituteVariables(
 }
 
 /**
+ * Single combined pattern for the three variable classes ($ARGUMENTS, $1..$9,
+ * ${VAR}). Matched in ONE pass so a substituted value that itself contains a
+ * later token (e.g. an argument value of `$1`) is never re-scanned.
+ */
+const QUOTED_VARIABLE_PATTERN = /\$ARGUMENTS|\$([1-9])|\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/**
  * Substitute variable references into a shell command, quoting each value so it
  * stays a single inert token. Author markers reference `$ARGUMENTS`/`$1`/
- * `${VAR}` exactly as before; only the substituted VALUE is quoted, so
- * attacker data can never become shell syntax.
+ * `${VAR}` exactly as before; only the substituted VALUE is quoted, so attacker
+ * data can never become shell syntax.
+ *
+ * CRITICAL: this MUST be a single left-to-right pass. String.prototype.replace
+ * never re-scans the text it inserts, so a value that contains a token like
+ * `$1` is emitted verbatim (already quoted) and not re-substituted. A previous
+ * multi-pass version (one replace() per class) was bypassable: a value inserted
+ * by an earlier pass could contain a later-pass token, and splicing a balanced
+ * `'...'` value into the middle of an already-quoted region broke quote balance
+ * and exposed live shell syntax.
+ *
+ * Assumes each variable reference sits at an UNQUOTED position in the author's
+ * command (`!`echo $ARGUMENTS``), which is the documented convention. An author
+ * who wraps a reference in their own quotes (`!`echo '$ARGUMENTS'``) defeats the
+ * value's own quoting; that deeper case is out of scope for this single-pass fix.
  */
 function substituteVariablesQuoted(
   command: string,
   variables: Record<string, string>,
 ): string {
-  let result = command;
-  result = result.replace(ARGUMENTS_PATTERN, () => quoteForShell(variables['ARGUMENTS'] ?? ''));
-  result = result.replace(POSITIONAL_PATTERN, (_match, num: string) => quoteForShell(variables[num] ?? ''));
-  result = result.replace(VARIABLE_PATTERN, (_match, varName: string) => quoteForShell(variables[varName] ?? ''));
-  return result;
+  return command.replace(
+    QUOTED_VARIABLE_PATTERN,
+    (_match, positional: string | undefined, braced: string | undefined) => {
+      if (positional !== undefined) return quoteForShell(variables[positional] ?? '');
+      if (braced !== undefined) return quoteForShell(variables[braced] ?? '');
+      return quoteForShell(variables['ARGUMENTS'] ?? '');
+    },
+  );
 }
 
 /**

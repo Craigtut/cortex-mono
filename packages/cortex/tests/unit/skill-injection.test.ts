@@ -54,6 +54,28 @@ describe('skill argument shell injection (C-4)', () => {
     expect(body).toContain(`touch ${sentinel}`);
   });
 
+  it('does not let a literal $N inside the argument value re-substitute and break quoting', async () => {
+    // Regression for the multi-pass re-scan bypass: the argument value itself
+    // contains a `$1`. A per-class multi-pass substituter would replace that
+    // `$1` (now sitting inside the quotes produced for $ARGUMENTS) on a later
+    // pass, splicing a balanced '...' into the middle and exposing live syntax
+    // (`;id>SENTINEL` running as a real command). Single-pass leaves it inert.
+    const sentinel = path.join(skillsRoot, 'PWNED');
+    const registry = new SkillRegistry([
+      { path: writeSkill('greet2', '!`echo $ARGUMENTS`'), source: 'user' },
+    ]);
+
+    const attacker = `;id>${sentinel} $1`;
+    const body = await registry.getSkillBody('greet2', {
+      args: attacker.split(/\s+/),
+      rawArgs: attacker,
+    });
+
+    expect(fs.existsSync(sentinel)).toBe(false);
+    // The whole payload, including the literal `$1`, survives as inert text.
+    expect(body).toContain('$1');
+  });
+
   it('does not let the classic "; touch /tmp/x #" payload escape quoting', async () => {
     const sentinel = path.join(skillsRoot, 'X');
     const registry = new SkillRegistry([
