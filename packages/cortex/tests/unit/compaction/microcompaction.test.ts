@@ -11,52 +11,34 @@ import {
   applyBookendWithPersistence,
   extractTextContent,
   isToolResultMessage,
-  isToolUseMessage,
+  isToolCallMessage,
   extractToolName,
   getToolCategory,
   MICROCOMPACTION_DEFAULTS,
 } from '../../../src/compaction/microcompaction.js';
 import type { AgentMessage } from '../../../src/context-manager.js';
 import type { MicrocompactionConfig } from '../../../src/types.js';
+import {
+  makeUserMsg,
+  makeAssistantMsg,
+  makeToolCallMsg,
+  makeToolResultMsg,
+} from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeUserMsg(content: string): AgentMessage {
-  return { role: 'user', content };
+let seq = 0;
+
+/** Real runtime tool result message with an auto-generated call id. */
+function makeToolResult(content: string, toolName = 'Read'): AgentMessage {
+  return makeToolResultMsg(`call_r${++seq}`, toolName, content);
 }
 
-function makeAssistantMsg(content: string): AgentMessage {
-  return { role: 'assistant', content };
-}
-
-function makeToolResult(content: string, toolName?: string): AgentMessage {
-  return {
-    role: 'user',
-    content: [
-      { type: 'tool_result', text: content, ...(toolName ? { name: toolName } : {}) },
-    ],
-  };
-}
-
-function makeRuntimeToolResult(content: string, toolName?: string): AgentMessage {
-  return {
-    role: 'toolResult',
-    toolName,
-    content: [
-      { type: 'text', text: content },
-    ],
-  };
-}
-
-function makeToolUse(toolName: string): AgentMessage {
-  return {
-    role: 'assistant',
-    content: [
-      { type: 'tool_use', name: toolName },
-    ],
-  };
+/** Real assistant message with a single toolCall block. */
+function makeToolCall(toolName: string): AgentMessage {
+  return makeToolCallMsg([{ id: `call_c${++seq}`, name: toolName }]);
 }
 
 function generateLargeContent(wordCount: number): string {
@@ -118,31 +100,76 @@ describe('extractTextContent', () => {
       role: 'user',
       content: [
         { type: 'text', text: 'part1' },
-        { type: 'text', text: ' part2' },
+        { type: 'text', text: 'part2' },
       ],
+      timestamp: 0,
     };
-    expect(extractTextContent(msg)).toBe('part1 part2');
+    expect(extractTextContent(msg)).toBe('part1\npart2');
   });
 
-  it('extracts text from all parts including tool_result', () => {
+  it('extracts text from legacy tool_result parts', () => {
     const msg: AgentMessage = {
       role: 'user',
       content: [
         { type: 'text', text: 'hello' },
         { type: 'tool_result', text: 'result' },
       ],
+      timestamp: 0,
     };
-    expect(extractTextContent(msg)).toBe('helloresult');
+    expect(extractTextContent(msg)).toBe('hello\nresult');
+  });
+
+  it('renders toolCall blocks with tool name and arguments', () => {
+    const msg = makeToolCallMsg(
+      [{ id: 'call_1', name: 'Grep', arguments: { pattern: 'handleAuth', path: '/src' } }],
+      'Searching now.',
+    );
+    const text = extractTextContent(msg);
+    expect(text).toContain('Searching now.');
+    expect(text).toContain('[Tool call: Grep');
+    expect(text).toContain('handleAuth');
+    expect(text).toContain('/src');
+  });
+
+  it('renders a pure tool-call turn as non-empty', () => {
+    const msg = makeToolCallMsg([
+      { id: 'call_1', name: 'Read', arguments: { path: '/a.ts' } },
+      { id: 'call_2', name: 'Bash', arguments: { command: 'npm test' } },
+    ]);
+    const text = extractTextContent(msg);
+    expect(text.length).toBeGreaterThan(0);
+    expect(text).toContain('[Tool call: Read');
+    expect(text).toContain('[Tool call: Bash');
+    expect(text).toContain('npm test');
+  });
+
+  it('includes full tool call arguments (not a truncated summary)', () => {
+    const bigArg = 'z'.repeat(5_000);
+    const msg = makeToolCallMsg([
+      { id: 'call_1', name: 'Write', arguments: { path: '/f.txt', content: bigArg } },
+    ]);
+    const text = extractTextContent(msg);
+    expect(text).toContain(bigArg);
+  });
+
+  it('renders a toolCall with empty arguments without trailing args', () => {
+    const msg = makeToolCallMsg([{ id: 'call_1', name: 'Glob' }]);
+    expect(extractTextContent(msg)).toBe('[Tool call: Glob]');
   });
 });
 
 describe('isToolResultMessage', () => {
-  it('returns true for legacy tool result messages', () => {
-    expect(isToolResultMessage(makeToolResult('result'))).toBe(true);
+  it('returns true for runtime toolResult messages', () => {
+    expect(isToolResultMessage(makeToolResult('result', 'Read'))).toBe(true);
   });
 
-  it('returns true for runtime toolResult messages', () => {
-    expect(isToolResultMessage(makeRuntimeToolResult('result', 'Read'))).toBe(true);
+  it('returns true for legacy tool_result content parts', () => {
+    const msg: AgentMessage = {
+      role: 'user',
+      content: [{ type: 'tool_result', text: 'result' }],
+      timestamp: 0,
+    };
+    expect(isToolResultMessage(msg)).toBe(true);
   });
 
   it('returns false for string content messages', () => {
@@ -153,36 +180,58 @@ describe('isToolResultMessage', () => {
     const msg: AgentMessage = {
       role: 'user',
       content: [{ type: 'text', text: 'hello' }],
+      timestamp: 0,
     };
     expect(isToolResultMessage(msg)).toBe(false);
   });
 });
 
-describe('isToolUseMessage', () => {
-  it('returns true for tool use messages', () => {
-    expect(isToolUseMessage(makeToolUse('Read'))).toBe(true);
+describe('isToolCallMessage', () => {
+  it('returns true for assistant messages with toolCall blocks', () => {
+    expect(isToolCallMessage(makeToolCall('Read'))).toBe(true);
+  });
+
+  it('returns true when toolCall blocks are mixed with text', () => {
+    const msg = makeToolCallMsg([{ id: 'call_1', name: 'Read' }], 'Let me check.');
+    expect(isToolCallMessage(msg)).toBe(true);
   });
 
   it('returns false for user messages', () => {
-    expect(isToolUseMessage(makeUserMsg('hello'))).toBe(false);
+    expect(isToolCallMessage(makeUserMsg('hello'))).toBe(false);
   });
 
-  it('returns false for assistant messages without tool_use', () => {
-    expect(isToolUseMessage(makeAssistantMsg('thinking'))).toBe(false);
+  it('returns false for assistant messages without toolCall blocks', () => {
+    expect(isToolCallMessage(makeAssistantMsg('thinking'))).toBe(false);
+  });
+
+  it('regression: the wrong Anthropic-style tool_use key is NOT a pi toolCall', () => {
+    // Real pi-ai assistant blocks are typed 'toolCall'. Keying on 'tool_use'
+    // made the structural-pair guard never fire (C-5/H-5).
+    const msg: AgentMessage = {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }],
+      timestamp: 0,
+    };
+    expect(isToolCallMessage(msg)).toBe(false);
   });
 });
 
 describe('extractToolName', () => {
-  it('extracts name from tool_use message', () => {
-    expect(extractToolName(makeToolUse('Read'))).toBe('Read');
-  });
-
-  it('extracts name from legacy tool_result message with name', () => {
-    expect(extractToolName(makeToolResult('content', 'Glob'))).toBe('Glob');
+  it('extracts name from toolCall blocks', () => {
+    expect(extractToolName(makeToolCall('Read'))).toBe('Read');
   });
 
   it('extracts name from runtime toolResult message metadata', () => {
-    expect(extractToolName(makeRuntimeToolResult('content', 'Bash'))).toBe('Bash');
+    expect(extractToolName(makeToolResult('content', 'Bash'))).toBe('Bash');
+  });
+
+  it('extracts name from legacy tool_result parts with a name field', () => {
+    const msg: AgentMessage = {
+      role: 'user',
+      content: [{ type: 'tool_result', text: 'content', name: 'Glob' }],
+      timestamp: 0,
+    };
+    expect(extractToolName(msg)).toBe('Glob');
   });
 
   it('returns null for string content messages', () => {
@@ -388,10 +437,10 @@ describe('computeTrimState', () => {
     // offsets from messages NEWER than each tool result. So a big assistant
     // message must come AFTER an older tool result to push it back.
     const history: AgentMessage[] = [
-      makeToolUse('Read'),                              // 0
+      makeToolCall('Read'),                             // 0
       makeToolResult('old content', 'Read'),            // 1
       makeAssistantMsg(makeContentOfTokens(20_000)),    // 2 - pushes index 1 beyond hot zone
-      makeToolUse('Read'),                              // 3
+      makeToolCall('Read'),                             // 3
       makeToolResult('recent content', 'Read'),         // 4 - tokenOffset = 0
     ];
 
@@ -399,6 +448,21 @@ describe('computeTrimState', () => {
     // Most recent tool result is fully within hot zone -> not in actions
     expect(state.actions.has(4)).toBe(false);
     // The older one is pushed beyond the hot zone by the 20k assistant msg after it
+    expect(state.actions.has(1)).toBe(true);
+  });
+
+  it('counts tool call arguments toward token offsets', () => {
+    // A toolCall whose arguments carry ~20k tokens must push older tool
+    // results beyond the hot zone even with no other content around.
+    const bigArgs = { path: '/f.txt', content: makeContentOfTokens(20_000) };
+    const history: AgentMessage[] = [
+      makeToolCall('Read'),                                                  // 0
+      makeToolResult('old content', 'Read'),                                 // 1
+      makeToolCallMsg([{ id: 'call_w', name: 'Write', arguments: bigArgs }]), // 2
+      makeToolResultMsg('call_w', 'Write', 'File written'),                  // 3
+    ];
+
+    const state = computeTrimState(history, 200_000, 0.5, config);
     expect(state.actions.has(1)).toBe(true);
   });
 
@@ -414,13 +478,13 @@ describe('computeTrimState', () => {
     // The big assistant messages must come AFTER (newer than) older tool
     // results to push them back, since the algorithm walks newest to oldest.
     const history: AgentMessage[] = [
-      makeToolUse('Read'),                                // 0
+      makeToolCall('Read'),                               // 0
       makeToolResult('very old', 'Read'),                 // 1
       makeAssistantMsg(makeContentOfTokens(100_000)),     // 2 - pushes index 1 beyond degradation span
-      makeToolUse('Read'),                                // 3
+      makeToolCall('Read'),                               // 3
       makeToolResult('middle', 'Read'),                   // 4
       makeAssistantMsg(makeContentOfTokens(20_000)),      // 5 - pushes index 4 just beyond hot zone
-      makeToolUse('Read'),                                // 6
+      makeToolCall('Read'),                               // 6
       makeToolResult('newest', 'Read'),                   // 7 - tokenOffset = 0
     ];
     const state = computeTrimState(history, 200_000, 0.6, config);
@@ -449,7 +513,7 @@ describe('applyTrimAction', () => {
 
   it('applies bookend format', () => {
     const content = 'A'.repeat(200) + 'B'.repeat(200);
-    const msg: AgentMessage = { role: 'user', content };
+    const msg: AgentMessage = { role: 'user', content, timestamp: 0 };
     const result = applyTrimAction(msg, {
       kind: 'bookend',
       headChars: 50,
@@ -481,66 +545,7 @@ describe('applyTrimAction', () => {
     expect(text).toBe('[Tool result cleared]');
   });
 
-  it('preserves tool_result content structure with tool_use_id for clear action', () => {
-    const msg: AgentMessage = {
-      role: 'user',
-      content: [
-        { type: 'tool_result', tool_use_id: 'toolu_abc123', text: 'file contents here', name: 'Read' },
-      ],
-    };
-    const result = applyTrimAction(msg, { kind: 'clear' });
-
-    expect(Array.isArray(result.content)).toBe(true);
-    const parts = result.content as Array<Record<string, unknown>>;
-    expect(parts.length).toBe(1);
-    expect(parts[0]!.type).toBe('tool_result');
-    expect(parts[0]!.tool_use_id).toBe('toolu_abc123');
-    expect(parts[0]!.text).toBe('[Tool result cleared]');
-  });
-
-  it('preserves tool_result content structure with tool_use_id for placeholder action', () => {
-    const msg: AgentMessage = {
-      role: 'user',
-      content: [
-        { type: 'tool_result', tool_use_id: 'toolu_xyz789', text: 'original content', name: 'Grep' },
-      ],
-    };
-    const result = applyTrimAction(msg, {
-      kind: 'placeholder',
-      toolName: 'Grep',
-      preview: 'original con',
-    });
-
-    expect(Array.isArray(result.content)).toBe(true);
-    const parts = result.content as Array<Record<string, unknown>>;
-    expect(parts[0]!.type).toBe('tool_result');
-    expect(parts[0]!.tool_use_id).toBe('toolu_xyz789');
-    expect(parts[0]!.text as string).toContain('Tool result trimmed');
-  });
-
-  it('preserves tool_result content structure with tool_use_id for bookend action', () => {
-    const longContent = 'A'.repeat(500);
-    const msg: AgentMessage = {
-      role: 'user',
-      content: [
-        { type: 'tool_result', tool_use_id: 'toolu_def456', text: longContent, name: 'Read' },
-      ],
-    };
-    const result = applyTrimAction(msg, {
-      kind: 'bookend',
-      headChars: 50,
-      tailChars: 50,
-      originalTokens: 125,
-    });
-
-    expect(Array.isArray(result.content)).toBe(true);
-    const parts = result.content as Array<Record<string, unknown>>;
-    expect(parts[0]!.type).toBe('tool_result');
-    expect(parts[0]!.tool_use_id).toBe('toolu_def456');
-    expect(parts[0]!.text as string).toContain('tokens trimmed');
-  });
-
-  it('preserves runtime toolResult structure for text parts', () => {
+  it('preserves runtime toolResult structure and toolCallId linkage', () => {
     const msg: AgentMessage = {
       role: 'toolResult',
       toolCallId: 'call_123',
@@ -548,6 +553,7 @@ describe('applyTrimAction', () => {
       content: [
         { type: 'text', text: 'runtime output' },
       ],
+      timestamp: 0,
     };
     const result = applyTrimAction(msg, { kind: 'clear' });
 
@@ -560,25 +566,90 @@ describe('applyTrimAction', () => {
     expect(parts[0]!.text).toBe('[Tool result cleared]');
   });
 
-  it('handles multiple tool_result parts in a single message', () => {
-    const msg: AgentMessage = {
-      role: 'user',
-      content: [
-        { type: 'tool_result', tool_use_id: 'toolu_1', text: 'result one', name: 'Read' },
-        { type: 'tool_result', tool_use_id: 'toolu_2', text: 'result two', name: 'Glob' },
-      ],
-    };
-    const result = applyTrimAction(msg, { kind: 'clear' });
+  describe('legacy tool_result content parts', () => {
+    it('preserves structure with tool_use_id for clear action', () => {
+      const msg: AgentMessage = {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_abc123', text: 'file contents here', name: 'Read' },
+        ],
+        timestamp: 0,
+      };
+      const result = applyTrimAction(msg, { kind: 'clear' });
 
-    expect(Array.isArray(result.content)).toBe(true);
-    const parts = result.content as Array<Record<string, unknown>>;
-    expect(parts.length).toBe(2);
-    expect(parts[0]!.text).toBe('[Tool result cleared]');
-    expect(parts[1]!.text).toBe('[Tool result cleared]');
+      expect(Array.isArray(result.content)).toBe(true);
+      const parts = result.content as Array<Record<string, unknown>>;
+      expect(parts.length).toBe(1);
+      expect(parts[0]!.type).toBe('tool_result');
+      expect(parts[0]!.tool_use_id).toBe('toolu_abc123');
+      expect(parts[0]!.text).toBe('[Tool result cleared]');
+    });
+
+    it('preserves structure with tool_use_id for placeholder action', () => {
+      const msg: AgentMessage = {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_xyz789', text: 'original content', name: 'Grep' },
+        ],
+        timestamp: 0,
+      };
+      const result = applyTrimAction(msg, {
+        kind: 'placeholder',
+        toolName: 'Grep',
+        preview: 'original con',
+      });
+
+      expect(Array.isArray(result.content)).toBe(true);
+      const parts = result.content as Array<Record<string, unknown>>;
+      expect(parts[0]!.type).toBe('tool_result');
+      expect(parts[0]!.tool_use_id).toBe('toolu_xyz789');
+      expect(parts[0]!.text as string).toContain('Tool result trimmed');
+    });
+
+    it('preserves structure with tool_use_id for bookend action', () => {
+      const longContent = 'A'.repeat(500);
+      const msg: AgentMessage = {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_def456', text: longContent, name: 'Read' },
+        ],
+        timestamp: 0,
+      };
+      const result = applyTrimAction(msg, {
+        kind: 'bookend',
+        headChars: 50,
+        tailChars: 50,
+        originalTokens: 125,
+      });
+
+      expect(Array.isArray(result.content)).toBe(true);
+      const parts = result.content as Array<Record<string, unknown>>;
+      expect(parts[0]!.type).toBe('tool_result');
+      expect(parts[0]!.tool_use_id).toBe('toolu_def456');
+      expect(parts[0]!.text as string).toContain('tokens trimmed');
+    });
+
+    it('handles multiple tool_result parts in a single message', () => {
+      const msg: AgentMessage = {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_1', text: 'result one', name: 'Read' },
+          { type: 'tool_result', tool_use_id: 'toolu_2', text: 'result two', name: 'Glob' },
+        ],
+        timestamp: 0,
+      };
+      const result = applyTrimAction(msg, { kind: 'clear' });
+
+      expect(Array.isArray(result.content)).toBe(true);
+      const parts = result.content as Array<Record<string, unknown>>;
+      expect(parts.length).toBe(2);
+      expect(parts[0]!.text).toBe('[Tool result cleared]');
+      expect(parts[1]!.text).toBe('[Tool result cleared]');
+    });
   });
 
   it('falls back to plain string for non-array content', () => {
-    const msg: AgentMessage = { role: 'user', content: 'plain string content' };
+    const msg: AgentMessage = { role: 'user', content: 'plain string content', timestamp: 0 };
     const result = applyTrimAction(msg, { kind: 'clear' });
     expect(result.content).toBe('[Tool result cleared]');
   });
@@ -636,7 +707,7 @@ describe('MicrocompactionEngine', () => {
     it('returns history unchanged when cache is warm (regardless of utilization)', async () => {
       const history: AgentMessage[] = [
         makeAssistantMsg(makeContentOfTokens(50_000)),
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(makeContentOfTokens(20_000), 'Read'),
         makeAssistantMsg('recent'),
       ];
@@ -647,7 +718,7 @@ describe('MicrocompactionEngine', () => {
 
     it('returns history unchanged below trim floor (even when cache is cold)', async () => {
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(makeContentOfTokens(5_000), 'Read'),
         makeAssistantMsg('recent'),
       ];
@@ -660,7 +731,7 @@ describe('MicrocompactionEngine', () => {
       // contextWindow=200k, hotZone=16k. Push old result well past hot zone with a big assistant msg.
       const longContent = makeContentOfTokens(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(longContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
@@ -674,7 +745,7 @@ describe('MicrocompactionEngine', () => {
     it('defaults cacheCold to true when no options provided', async () => {
       const longContent = makeContentOfTokens(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(longContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
@@ -682,20 +753,6 @@ describe('MicrocompactionEngine', () => {
       // No options arg -> default behavior should trim
       const result = await engine.apply(history, 200_000, 100_000);
       const trimmed = extractTextContent(result[1]!);
-      expect(trimmed).toContain('tokens trimmed');
-    });
-
-    it('trims runtime toolResult messages', async () => {
-      const longContent = makeContentOfTokens(20_000);
-      const history: AgentMessage[] = [
-        makeToolUse('Read'),
-        makeRuntimeToolResult(longContent, 'Read'),
-        makeAssistantMsg(makeContentOfTokens(30_000)),
-        makeAssistantMsg('recent'),
-      ];
-      const result = await engine.apply(history, 200_000, 100_000, { cacheCold: true });
-      const trimmed = extractTextContent(result[1]!);
-      expect(trimmed).not.toBe(longContent);
       expect(trimmed).toContain('tokens trimmed');
     });
   });
@@ -706,7 +763,7 @@ describe('MicrocompactionEngine', () => {
       const recentContent = 'recent and full';
       const history: AgentMessage[] = [
         makeAssistantMsg(makeContentOfTokens(50_000)),
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(recentContent, 'Read'),
       ];
       const result = await engine.apply(history, 200_000, 80_000, { cacheCold: true });
@@ -720,10 +777,10 @@ describe('MicrocompactionEngine', () => {
       const middleContent = 'M'.repeat(20_000);
       const olderContent = 'O'.repeat(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(olderContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(40_000)),
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(middleContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(20_000)),
       ];
@@ -742,7 +799,7 @@ describe('MicrocompactionEngine', () => {
       // the extended hot zone (16k * 1.5 = 24k for no-persister default).
       const content = makeContentOfTokens(5_000);
       const history: AgentMessage[] = [
-        makeToolUse('Bash'),
+        makeToolCall('Bash'),
         makeToolResult(content, 'Bash'),
         makeAssistantMsg(makeContentOfTokens(18_000)),
       ];
@@ -764,37 +821,11 @@ describe('MicrocompactionEngine', () => {
       });
       const longContent = 'web' + 'x'.repeat(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('WebFetch'),
+        makeToolCall('WebFetch'),
         makeToolResult(longContent, 'WebFetch'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
       ];
-      const result = await engine.apply(history, 200_000, 100_000, { cacheCold: true });
-      const trimmed = extractTextContent(result[1]!);
-
-      expect(persisted.length).toBe(1);
-      expect(persisted[0]!.content).toBe(longContent);
-      expect(trimmed).toContain('Result persisted');
-      expect(trimmed).toContain(persisted[0]!.path);
-    });
-
-    it('persists runtime toolResult content using message metadata', async () => {
-      const persisted: Array<{ content: string; path: string }> = [];
-      const engine = new MicrocompactionEngine({
-        persistResult: async (content) => {
-          const path = `/tmp/runtime-${persisted.length}.txt`;
-          persisted.push({ content, path });
-          return path;
-        },
-      });
-      const longContent = 'runtime' + 'x'.repeat(20_000);
-      const history: AgentMessage[] = [
-        makeToolUse('WebFetch'),
-        makeRuntimeToolResult(longContent, 'WebFetch'),
-        makeAssistantMsg(makeContentOfTokens(30_000)),
-        makeAssistantMsg('recent'),
-      ];
-
       const result = await engine.apply(history, 200_000, 100_000, { cacheCold: true });
       const trimmed = extractTextContent(result[1]!);
 
@@ -814,7 +845,7 @@ describe('MicrocompactionEngine', () => {
       });
       const longContent = 'file contents ' + 'y'.repeat(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(longContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
@@ -832,7 +863,7 @@ describe('MicrocompactionEngine', () => {
         },
       });
       const history: AgentMessage[] = [
-        makeToolUse('SubAgent'),
+        makeToolCall('SubAgent'),
         makeToolResult('subagent output ' + 'z'.repeat(20_000), 'SubAgent'),
         makeAssistantMsg(makeContentOfTokens(120_000)),
         makeAssistantMsg('recent'),
@@ -847,7 +878,7 @@ describe('MicrocompactionEngine', () => {
       });
       const longContent = 'web' + 'x'.repeat(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('WebFetch'),
+        makeToolCall('WebFetch'),
         makeToolResult(longContent, 'WebFetch'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
@@ -867,7 +898,7 @@ describe('MicrocompactionEngine', () => {
       // the degradation span (200k * 0.40 = 80k) plus the extended hot zone
       // (16k * 1.0 = 16k since persister is configured).
       const history: AgentMessage[] = [
-        makeToolUse('Bash'),
+        makeToolCall('Bash'),
         makeToolResult('bash output', 'Bash'),
         makeAssistantMsg(makeContentOfTokens(120_000)),
         makeAssistantMsg('recent'),
@@ -889,7 +920,7 @@ describe('MicrocompactionEngine', () => {
     it('caches trim state across identical calls', async () => {
       const longContent = makeContentOfTokens(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(longContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
@@ -906,7 +937,7 @@ describe('MicrocompactionEngine', () => {
     it('recomputes when history length changes', async () => {
       const longContent = makeContentOfTokens(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(longContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
@@ -924,7 +955,7 @@ describe('MicrocompactionEngine', () => {
     it('recomputes when utilization band changes', async () => {
       const longContent = makeContentOfTokens(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(longContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),
@@ -942,7 +973,7 @@ describe('MicrocompactionEngine', () => {
     it('resets cache on resetCache()', async () => {
       const longContent = makeContentOfTokens(20_000);
       const history: AgentMessage[] = [
-        makeToolUse('Read'),
+        makeToolCall('Read'),
         makeToolResult(longContent, 'Read'),
         makeAssistantMsg(makeContentOfTokens(30_000)),
         makeAssistantMsg('recent'),

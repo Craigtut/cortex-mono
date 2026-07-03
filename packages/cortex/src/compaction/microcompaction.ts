@@ -137,11 +137,33 @@ export function capToolResult(
 // ---------------------------------------------------------------------------
 
 /**
+ * Render tool call arguments as a compact JSON string.
+ * Returns '' for empty/missing arguments. Full fidelity (no truncation):
+ * the output feeds token estimation and Layer 2 summarization, both of
+ * which need the real size and content of the arguments.
+ */
+function formatToolCallArgs(args: unknown): string {
+  if (args === null || args === undefined) return '';
+  if (typeof args === 'string') return args;
+  try {
+    const json = JSON.stringify(args);
+    return json === '{}' || json === undefined ? '' : json;
+  } catch {
+    return String(args);
+  }
+}
+
+/**
  * Extract the text content from a message's content field.
  * Handles both string content and content arrays.
- * For content arrays, extracts text from 'text' parts and also from
- * 'tool_result' parts that have a 'text' field (which is where
- * pi-agent-core stores tool output).
+ *
+ * For content arrays:
+ *   - 'text' parts (and legacy 'tool_result' parts with a text field)
+ *     contribute their text verbatim.
+ *   - 'toolCall' parts (pi-ai assistant tool call blocks) render as
+ *     "[Tool call: <name> <args JSON>]" so tool activity is visible to
+ *     the Layer 2 summarizer and counted by token estimation. A turn
+ *     that is purely tool calls no longer renders empty.
  */
 export function extractTextContent(message: AgentMessage): string {
   if (typeof message.content === 'string') {
@@ -153,10 +175,19 @@ export function extractTextContent(message: AgentMessage): string {
     return '';
   }
 
-  return message.content
-    .filter(part => typeof part.text === 'string')
-    .map(part => part.text as string)
-    .join('');
+  const segments: string[] = [];
+  for (const part of message.content) {
+    if (part.type === 'toolCall') {
+      const name = typeof part['name'] === 'string' ? part['name'] : 'unknown';
+      const args = formatToolCallArgs(part['arguments']);
+      segments.push(args ? `[Tool call: ${name} ${args}]` : `[Tool call: ${name}]`);
+      continue;
+    }
+    if (typeof part.text === 'string') {
+      segments.push(part.text);
+    }
+  }
+  return segments.join('\n');
 }
 
 /**
@@ -175,20 +206,22 @@ export function isToolResultMessage(message: AgentMessage): boolean {
 }
 
 /**
- * Check if a message contains a tool use (tool call from the assistant).
+ * Check if an assistant message contains a tool call.
+ * Real pi-ai assistant messages carry tool calls as content blocks of
+ * type 'toolCall' ({ type: 'toolCall', id, name, arguments }).
  */
-export function isToolUseMessage(message: AgentMessage): boolean {
+export function isToolCallMessage(message: AgentMessage): boolean {
   if (message.role !== 'assistant') {
     return false;
   }
   if (!Array.isArray(message.content)) {
     return false;
   }
-  return message.content.some(part => part.type === 'tool_use');
+  return message.content.some(part => part.type === 'toolCall');
 }
 
 /**
- * Extract the tool name from a tool result or tool use message.
+ * Extract the tool name from a tool result or tool call message.
  * Returns null if the message is not a tool-related message.
  */
 export function extractToolName(message: AgentMessage): string | null {
@@ -201,7 +234,7 @@ export function extractToolName(message: AgentMessage): string | null {
   }
 
   for (const part of message.content) {
-    if (part.type === 'tool_use' && typeof part['name'] === 'string') {
+    if (part.type === 'toolCall' && typeof part['name'] === 'string') {
       return part['name'];
     }
     if (part.type === 'tool_result' && typeof part['name'] === 'string') {

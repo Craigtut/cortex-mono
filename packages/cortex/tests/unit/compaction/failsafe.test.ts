@@ -5,38 +5,17 @@ import {
   isContextOverflow,
 } from '../../../src/compaction/failsafe.js';
 import type { AgentMessage } from '../../../src/context-manager.js';
+import {
+  makeUserMsg,
+  makeAssistantMsg,
+  makeToolCallMsg,
+  makeToolResultMsg,
+  assertNoOrphans,
+} from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function makeUserMsg(content: string): AgentMessage {
-  return { role: 'user', content, timestamp: 0 };
-}
-
-function makeAssistantMsg(content: string): AgentMessage {
-  return { role: 'assistant', content, timestamp: 0 };
-}
-
-function makeToolUse(toolName: string): AgentMessage {
-  return {
-    role: 'assistant',
-    content: [
-      { type: 'tool_use', name: toolName },
-    ],
-    timestamp: 0,
-  };
-}
-
-function makeToolResult(content: string, toolName?: string): AgentMessage {
-  return {
-    role: 'user',
-    content: [
-      { type: 'tool_result', text: content, ...(toolName ? { name: toolName } : {}) },
-    ],
-    timestamp: 0,
-  };
-}
 
 /**
  * Generate a history that will use approximately targetTokens in total.
@@ -53,6 +32,14 @@ function buildLargeHistory(messageCount: number, wordsPerMessage: number): Agent
     history.push(i % 2 === 0 ? makeUserMsg(content) : makeAssistantMsg(content));
   }
   return history;
+}
+
+/** A single-call group: assistant toolCall message + its toolResult message. */
+function makeGroup(id: string, toolName: string, resultText: string): AgentMessage[] {
+  return [
+    makeToolCallMsg([{ id, name: toolName, arguments: { path: '/tmp/file.txt' } }]),
+    makeToolResultMsg(id, toolName, resultText),
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -119,31 +106,114 @@ describe('emergencyTruncate', () => {
     expect(result.newHistory).toEqual(lastMessages);
   });
 
-  it('drops tool_use/tool_result pairs together', () => {
+  it('drops a toolCall message and its toolResult together', () => {
     const history: AgentMessage[] = [
-      makeToolUse('Read'),           // 0
-      makeToolResult('file content', 'Read'), // 1
-      makeAssistantMsg('analysis'),  // 2
-      makeUserMsg('recent1'),        // 3
-      makeAssistantMsg('recent2'),   // 4
-      makeUserMsg('recent3'),        // 5
+      ...makeGroup('call_1', 'Read', 'file content'),  // 0, 1
+      makeAssistantMsg('analysis'),                    // 2
+      makeUserMsg('recent1'),                          // 3
+      makeAssistantMsg('recent2'),                     // 4
+      makeUserMsg('recent3'),                          // 5
     ];
 
     // Force truncation
     const result = emergencyTruncate(history, 100, 0, 0.01);
 
-    // The tool_use and tool_result should both be dropped or both preserved
-    const hasToolUse = result.newHistory.some(m =>
+    // The toolCall and toolResult should both be dropped or both preserved
+    const hasToolCall = result.newHistory.some(m =>
       m.role === 'assistant' && Array.isArray(m.content) &&
-      m.content.some(p => p.type === 'tool_use'),
+      m.content.some(p => p.type === 'toolCall'),
     );
-    const hasToolResult = result.newHistory.some(m =>
-      m.role === 'user' && Array.isArray(m.content) &&
-      m.content.some(p => p.type === 'tool_result'),
-    );
+    const hasToolResult = result.newHistory.some(m => m.role === 'toolResult');
 
-    // Either both exist or neither
-    expect(hasToolUse).toBe(hasToolResult);
+    expect(hasToolCall).toBe(hasToolResult);
+    assertNoOrphans(result.newHistory);
+  });
+
+  it('drops an N-parallel-call group atomically (one assistant message, N toolResults)', () => {
+    const parallel = makeToolCallMsg([
+      { id: 'call_a', name: 'Read', arguments: { path: '/a.ts' } },
+      { id: 'call_b', name: 'Grep', arguments: { pattern: 'foo' } },
+      { id: 'call_c', name: 'Bash', arguments: { command: 'ls' } },
+    ], 'Running three tools in parallel.');
+    const history: AgentMessage[] = [
+      makeUserMsg('old request ' + 'x'.repeat(400)),
+      parallel,                                          // 1
+      makeToolResultMsg('call_a', 'Read', 'contents of a ' + 'y'.repeat(400)),
+      makeToolResultMsg('call_b', 'Grep', 'three matches ' + 'y'.repeat(400)),
+      makeToolResultMsg('call_c', 'Bash', 'dir listing ' + 'y'.repeat(400)),
+      makeAssistantMsg('done with old work'),
+      makeUserMsg('recent1'),
+      makeAssistantMsg('recent2'),
+      makeUserMsg('recent3'),
+    ];
+
+    const result = emergencyTruncate(history, 100, 0, 0.01);
+
+    // The whole group (1 assistant message + 3 results) must vanish together
+    expect(result.turnsRemoved).toBeGreaterThan(0);
+    const remainingResults = result.newHistory.filter(m => m.role === 'toolResult');
+    const remainingCalls = result.newHistory.filter(m =>
+      Array.isArray(m.content) && m.content.some(p => p.type === 'toolCall'),
+    );
+    if (remainingCalls.length === 0) {
+      expect(remainingResults.length).toBe(0);
+    } else {
+      expect(remainingResults.length).toBe(3);
+    }
+    assertNoOrphans(result.newHistory);
+  });
+
+  it('keeps a group intact when it straddles the preserved tail boundary', () => {
+    // Group occupies indices 2..5; preserveFrom = 7 - 3 = 4, so the group
+    // straddles the boundary. It must be kept whole, not split.
+    const history: AgentMessage[] = [
+      makeUserMsg('old ' + 'x'.repeat(2_000)),                     // 0
+      makeAssistantMsg('old answer ' + 'x'.repeat(2_000)),         // 1
+      makeToolCallMsg([
+        { id: 'call_a', name: 'Read', arguments: { path: '/a' } },
+        { id: 'call_b', name: 'Read', arguments: { path: '/b' } },
+        { id: 'call_c', name: 'Read', arguments: { path: '/c' } },
+      ]),                                                          // 2
+      makeToolResultMsg('call_a', 'Read', 'aaa'),                  // 3
+      makeToolResultMsg('call_b', 'Read', 'bbb'),                  // 4 (preserveFrom)
+      makeToolResultMsg('call_c', 'Read', 'ccc'),                  // 5
+      makeAssistantMsg('most recent'),                             // 6
+    ];
+
+    const result = emergencyTruncate(history, 100, 0, 0.01);
+
+    // Indices 0 and 1 are droppable; the group must survive intact.
+    const calls = result.newHistory.filter(m =>
+      Array.isArray(m.content) && m.content.some(p => p.type === 'toolCall'),
+    );
+    const results = result.newHistory.filter(m => m.role === 'toolResult');
+    expect(calls.length).toBe(1);
+    expect(results.length).toBe(3);
+    assertNoOrphans(result.newHistory);
+  });
+
+  it('never emits orphaned tool calls or results across truncation pressures', () => {
+    const history: AgentMessage[] = [
+      makeUserMsg('start ' + 'x'.repeat(200)),
+      ...makeGroup('call_1', 'Read', 'r1 ' + 'x'.repeat(200)),
+      makeAssistantMsg('thoughts ' + 'x'.repeat(200)),
+      makeToolCallMsg([
+        { id: 'call_2', name: 'Grep', arguments: { pattern: 'a' } },
+        { id: 'call_3', name: 'Glob', arguments: { pattern: '*.ts' } },
+      ]),
+      makeToolResultMsg('call_2', 'Grep', 'matches ' + 'x'.repeat(200)),
+      makeToolResultMsg('call_3', 'Glob', 'files ' + 'x'.repeat(200)),
+      makeUserMsg('follow-up ' + 'x'.repeat(200)),
+      ...makeGroup('call_4', 'Bash', 'output ' + 'x'.repeat(200)),
+      makeAssistantMsg('answer ' + 'x'.repeat(200)),
+      makeUserMsg('latest'),
+    ];
+
+    // Sweep thresholds from "drop nothing" to "drop everything droppable"
+    for (const threshold of [0.9, 0.5, 0.3, 0.2, 0.1, 0.05, 0.01]) {
+      const result = emergencyTruncate(history, 1_000, 0, threshold);
+      assertNoOrphans(result.newHistory);
+    }
   });
 
   it('returns unchanged history when already below threshold', () => {

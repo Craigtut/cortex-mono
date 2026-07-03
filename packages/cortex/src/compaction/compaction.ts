@@ -18,7 +18,8 @@
 import type { AgentMessage } from '../context-manager.js';
 import type { CompactionConfig, CompactionResult, CompactionTarget } from '../types.js';
 import { estimateTokens } from '../token-estimator.js';
-import { extractTextContent, isToolUseMessage, isToolResultMessage } from './microcompaction.js';
+import { extractTextContent } from './microcompaction.js';
+import { findToolCallGroups } from './tool-call-groups.js';
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -131,16 +132,16 @@ export function partitionHistory(
 
   let splitPoint = history.length - preserveRecentTurns;
 
-  // Never split between a tool_use (assistant) and its tool_result (user).
-  // If the split lands on a tool_result whose preceding message is a tool_use,
-  // move the split back one so the entire pair goes into the preserved tail.
-  if (
-    splitPoint > 0 &&
-    splitPoint < history.length &&
-    isToolResultMessage(history[splitPoint]!) &&
-    isToolUseMessage(history[splitPoint - 1]!)
-  ) {
-    splitPoint -= 1;
+  // Never split inside a tool call group (an assistant message with
+  // 'toolCall' blocks plus its consecutive toolResult messages). Splitting
+  // mid-group would summarize away the calls while preserving their results
+  // (or vice versa), corrupting the conversation for the provider. If the
+  // split lands inside a group, move it back to the group start so the
+  // entire group goes into the preserved tail.
+  const groups = findToolCallGroups(history);
+  const straddled = groups.get(splitPoint);
+  if (straddled && straddled[0]! < splitPoint) {
+    splitPoint = straddled[0]!;
   }
 
   // Guard: don't create an empty target from the adjustment
@@ -179,7 +180,12 @@ export function formatTurnsForSummarization(turns: AgentMessage[]): string {
   return turns
     .map((msg, i) => {
       const text = extractTextContent(msg);
-      return `[Turn ${i + 1}] ${msg.role}:\n${text}`;
+      // Label tool results with their tool name so the summarizer can
+      // attribute outputs to the calls that produced them.
+      const roleLabel = msg.role === 'toolResult' && typeof msg.toolName === 'string'
+        ? `toolResult (${msg.toolName})`
+        : msg.role;
+      return `[Turn ${i + 1}] ${roleLabel}:\n${text}`;
     })
     .join('\n\n---\n\n');
 }
