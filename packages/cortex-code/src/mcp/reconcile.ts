@@ -90,7 +90,9 @@ export async function applyReconcile(
     if (!trust.trusted) {
       const decision = (await resolveProjectTrust?.(cwd, projectDesired)) ?? 'skip';
       if (decision === 'trust') {
-        await trustProjectMcpConfig(cwd);
+        // Record the EXACT content we trust-checked, not a fresh read, so a file
+        // swapped between the prompt and this write cannot be trusted.
+        await trustProjectMcpConfig(cwd, trust.configContent);
       } else {
         for (const server of projectDesired) {
           result.skippedDueToUntrustedProject.push(server.name);
