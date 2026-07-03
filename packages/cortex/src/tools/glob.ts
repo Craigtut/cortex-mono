@@ -15,6 +15,7 @@ import {
   readGitignorePatterns,
   DEFAULT_IGNORE_PATTERNS,
 } from './shared/gitignore.js';
+import { globToRegex } from './shared/glob-to-regex.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -62,75 +63,6 @@ export interface GlobToolConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Recursively walk a directory and collect files matching a glob pattern.
- * Uses Node.js built-in fs for simplicity (fast-glob would be used in production).
- *
- * This implementation is a simplified glob matcher. It supports:
- * - `*` (match any characters except /)
- * - `**` (match any path segment)
- * - `?` (match single character)
- * - `{a,b}` (alternation)
- * - `[abc]` (character class)
- */
-function globPatternToRegex(pattern: string): RegExp {
-  let regex = '';
-  let i = 0;
-
-  while (i < pattern.length) {
-    const char = pattern[i]!;
-
-    if (char === '*') {
-      if (pattern[i + 1] === '*') {
-        // ** matches any path segment
-        if (pattern[i + 2] === '/' || pattern[i + 2] === undefined) {
-          regex += '(?:.+/)?';
-          i += pattern[i + 2] === '/' ? 3 : 2;
-          continue;
-        }
-      }
-      // * matches anything except /
-      regex += '[^/]*';
-      i++;
-    } else if (char === '?') {
-      regex += '[^/]';
-      i++;
-    } else if (char === '{') {
-      // Find the closing brace
-      const closeIdx = pattern.indexOf('}', i);
-      if (closeIdx === -1) {
-        regex += '\\{';
-        i++;
-      } else {
-        const alternatives = pattern.slice(i + 1, closeIdx).split(',');
-        regex += '(?:' + alternatives.map(escapeRegexPart).join('|') + ')';
-        i = closeIdx + 1;
-      }
-    } else if (char === '[') {
-      const closeIdx = pattern.indexOf(']', i);
-      if (closeIdx === -1) {
-        regex += '\\[';
-        i++;
-      } else {
-        regex += pattern.slice(i, closeIdx + 1);
-        i = closeIdx + 1;
-      }
-    } else if (char === '.') {
-      regex += '\\.';
-      i++;
-    } else {
-      regex += char;
-      i++;
-    }
-  }
-
-  return new RegExp(`^${regex}$`);
-}
-
-function escapeRegexPart(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
  * Check if a path matches any of the ignore patterns.
  */
 function isIgnored(relativePath: string, ignorePatterns: string[]): boolean {
@@ -144,7 +76,7 @@ function isIgnored(relativePath: string, ignorePatterns: string[]): boolean {
     if (!cleanPattern.includes('/')) {
       if (parts.some((part) => {
         if (cleanPattern.includes('*') || cleanPattern.includes('?')) {
-          return globPatternToRegex(cleanPattern).test(part);
+          return globToRegex(cleanPattern).test(part);
         }
         return part === cleanPattern;
       })) {
@@ -152,7 +84,7 @@ function isIgnored(relativePath: string, ignorePatterns: string[]): boolean {
       }
     } else {
       // Full path pattern match
-      if (globPatternToRegex(cleanPattern).test(relativePath)) {
+      if (globToRegex(cleanPattern).test(relativePath)) {
         return true;
       }
     }
@@ -275,7 +207,7 @@ export function createGlobTool(config: GlobToolConfig): {
       const pattern = params.pattern;
       let regex: RegExp;
       try {
-        regex = globPatternToRegex(pattern);
+        regex = globToRegex(pattern);
       } catch {
         return {
           content: [{ type: 'text', text: `Invalid glob pattern: ${pattern}` }],

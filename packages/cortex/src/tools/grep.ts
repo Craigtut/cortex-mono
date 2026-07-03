@@ -21,6 +21,7 @@ import {
   readGitignorePatterns,
   DEFAULT_IGNORE_PATTERNS,
 } from './shared/gitignore.js';
+import { globToRegex } from './shared/glob-to-regex.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -435,49 +436,17 @@ async function searchWithRipgrep(
 // JS fallback helpers
 // ---------------------------------------------------------------------------
 
-function fileGlobToRegex(pattern: string): RegExp {
-  let regex = '';
-  for (let i = 0; i < pattern.length; i++) {
-    const char = pattern[i]!;
-    if (char === '*') {
-      if (pattern[i + 1] === '*') {
-        regex += '.*';
-        i++;
-        if (pattern[i + 1] === '/') i++;
-      } else {
-        regex += '[^/]*';
-      }
-    } else if (char === '?') {
-      regex += '[^/]';
-    } else if (char === '{') {
-      const closeIdx = pattern.indexOf('}', i);
-      if (closeIdx !== -1) {
-        const alternatives = pattern.slice(i + 1, closeIdx).split(',');
-        regex += '(?:' + alternatives.map((a) => a.replace(/[.*+?^$|[\]\\()]/g, '\\$&')).join('|') + ')';
-        i = closeIdx;
-      } else {
-        regex += '\\{';
-      }
-    } else if (char === '.') {
-      regex += '\\.';
-    } else {
-      regex += char;
-    }
-  }
-  return new RegExp(`^${regex}$`);
-}
-
 function matchesGitignorePattern(name: string, relativePath: string, patterns: string[]): boolean {
   for (const pattern of patterns) {
     const cleanPattern = pattern.endsWith('/') ? pattern.slice(0, -1) : pattern;
     if (!cleanPattern.includes('/')) {
       if (cleanPattern.includes('*') || cleanPattern.includes('?')) {
-        if (fileGlobToRegex(cleanPattern).test(name)) return true;
+        if (globToRegex(cleanPattern).test(name)) return true;
       } else {
         if (name === cleanPattern) return true;
       }
     } else {
-      if (fileGlobToRegex(cleanPattern).test(relativePath)) return true;
+      if (globToRegex(cleanPattern).test(relativePath)) return true;
     }
   }
   return false;
@@ -606,7 +575,7 @@ async function searchWithFallback(
   }
 
   if (params.glob) {
-    const globRegex = fileGlobToRegex(params.glob);
+    const globRegex = globToRegex(params.glob);
     const existingFilter = fileFilter;
     fileFilter = (rel: string, ext: string) => {
       if (existingFilter && !existingFilter(rel, ext)) return false;
