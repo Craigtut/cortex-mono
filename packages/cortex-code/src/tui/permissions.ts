@@ -58,9 +58,11 @@ export class PermissionPromptComponent implements Component {
         label: 'Always allow edits in this project',
       });
     } else if (this.suggestedPattern) {
+      // suggestedPattern is model-controlled (Glob pattern, Bash prefix, file
+      // dir), so the rule label is another injection surface in this dialog.
       items.push({
         value: 'always-allow',
-        label: `Always allow  ${formatRule(toolName, this.suggestedPattern)}`,
+        label: sanitizeTerminalLine(`Always allow  ${formatRule(toolName, this.suggestedPattern)}`),
       });
     }
 
