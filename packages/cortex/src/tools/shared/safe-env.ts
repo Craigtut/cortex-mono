@@ -19,8 +19,11 @@ const BLOCKED_ENV_VARS = new Set([
   'RUBYLIB', 'RUBYOPT',
   // Shell startup injection
   'BASH_ENV', 'ENV', 'SHELLOPTS', 'PS4', 'IFS', 'PROMPT_COMMAND', 'ZDOTDIR',
-  // Git execution
+  // Git execution and config redirection. A redirected git config can point
+  // core.hooksPath / core.fsmonitor / core.pager at an attacker-writable script
+  // that runs on the next git operation, sidestepping a .git/config write-deny.
   'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'GIT_SSH_COMMAND',
+  'GIT_CONFIG', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT',
   // Security-sensitive
   'SSLKEYLOGFILE', 'GCONV_PATH', 'OPENSSL_CONF', 'CURL_HOME', 'WGETRC',
 ]);
