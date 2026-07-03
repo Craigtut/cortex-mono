@@ -20,6 +20,7 @@ import { computeDiff, type DiffHunk } from './write.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
 import { isCriticalPathOrDescendant } from './bash/safety.js';
+import { atomicWrite, CriticalPathWriteError } from './shared/atomic-write.js';
 import {
   findMatch,
   findNearestMatch,
@@ -88,19 +89,35 @@ export interface EditToolConfig {
 
 type AppliedTier = 'exact' | 'line-trimmed' | 'indentation-flexible';
 
+/**
+ * A single span of `normalizedContent` (LF-normalized coordinates) that the
+ * edit replaces, together with the LF-normalized replacement text. Kept as
+ * ranges (rather than a pre-assembled string) so line-ending restoration can
+ * rewrite only the replaced regions and leave untouched bytes verbatim.
+ */
+interface ReplacementSegment {
+  /** Start offset in normalizedContent (inclusive). */
+  start: number;
+  /** End offset in normalizedContent (exclusive). */
+  end: number;
+  /** Replacement text, LF-normalized. */
+  text: string;
+}
+
 interface AppliedReplacement {
-  newContent: string;
+  /** Non-overlapping, left-to-right segments to substitute. */
+  segments: ReplacementSegment[];
   replacementCount: number;
   tier: AppliedTier;
 }
 
 /**
- * Given a successful match (not `none` and not `ambiguous`), produce the
- * rebuilt file content along with the replacement count and the tier
- * that resolved the edit. Caller is responsible for having already
- * rejected `none`, `ambiguous`, and the tier-1 `count>1 && !replaceAll`
- * case. Returns null when `match` is one of those guarded states, which
- * is a programming error at the call site.
+ * Given a successful match (not `none` and not `ambiguous`), produce the set
+ * of replacement segments along with the replacement count and the tier that
+ * resolved the edit. Caller is responsible for having already rejected
+ * `none`, `ambiguous`, and the tier-1 `count>1 && !replaceAll` case. Returns
+ * null when `match` is one of those guarded states, which is a programming
+ * error at the call site.
  */
 function applyReplacement(
   match: MatchResult,
@@ -111,29 +128,36 @@ function applyReplacement(
 ): AppliedReplacement | null {
   if (match.kind === 'exact') {
     if (replaceAll) {
-      return {
-        newContent: normalizedContent
-          .split(normalizedOldString)
-          .join(normalizedNewString),
-        replacementCount: match.count,
-        tier: 'exact',
-      };
+      // Collect every non-overlapping occurrence, left to right — mirrors the
+      // semantics of String.split(old).join(new).
+      const segments: ReplacementSegment[] = [];
+      let pos = 0;
+      while (true) {
+        const idx = normalizedContent.indexOf(normalizedOldString, pos);
+        if (idx === -1) break;
+        const end = idx + normalizedOldString.length;
+        segments.push({ start: idx, end, text: normalizedNewString });
+        pos = end;
+      }
+      return { segments, replacementCount: match.count, tier: 'exact' };
     }
     return {
-      newContent:
-        normalizedContent.slice(0, match.startIndex) +
-        normalizedNewString +
-        normalizedContent.slice(match.startIndex + match.matchedLength),
+      segments: [{
+        start: match.startIndex,
+        end: match.startIndex + match.matchedLength,
+        text: normalizedNewString,
+      }],
       replacementCount: 1,
       tier: 'exact',
     };
   }
   if (match.kind === 'line-trimmed') {
     return {
-      newContent:
-        normalizedContent.slice(0, match.startIndex) +
-        normalizedNewString +
-        normalizedContent.slice(match.startIndex + match.matchedLength),
+      segments: [{
+        start: match.startIndex,
+        end: match.startIndex + match.matchedLength,
+        text: normalizedNewString,
+      }],
       replacementCount: 1,
       tier: 'line-trimmed',
     };
@@ -145,15 +169,119 @@ function applyReplacement(
       match.haystackIndent,
     );
     return {
-      newContent:
-        normalizedContent.slice(0, match.startIndex) +
-        reindented +
-        normalizedContent.slice(match.startIndex + match.matchedLength),
+      segments: [{
+        start: match.startIndex,
+        end: match.startIndex + match.matchedLength,
+        text: reindented,
+      }],
       replacementCount: 1,
       tier: 'indentation-flexible',
     };
   }
   return null;
+}
+
+/**
+ * Substitute the given segments into `normalizedContent`, yielding the new
+ * LF-normalized file content.
+ */
+function applySegments(
+  normalizedContent: string,
+  segments: ReplacementSegment[],
+): string {
+  let result = '';
+  let cursor = 0;
+  for (const seg of segments) {
+    result += normalizedContent.slice(cursor, seg.start) + seg.text;
+    cursor = seg.end;
+  }
+  result += normalizedContent.slice(cursor);
+  return result;
+}
+
+/**
+ * Rebuild the file with line endings restored.
+ *
+ * The matcher works on LF-normalized content. Naively converting every `\n`
+ * back to `\r\n` when the file "had CRLF" rewrites untouched bare-LF lines in
+ * a mixed-ending file into a large spurious diff. Instead:
+ *
+ *   - pure LF (no CRLF anywhere): write the normalized result as-is.
+ *   - pure CRLF (every newline is CRLF): global conversion, as before.
+ *   - mixed: preserve every untouched byte (and its original ending) exactly,
+ *     rewriting endings only inside the replaced regions, following the style
+ *     of the text each region replaced.
+ */
+function restoreLineEndings(
+  originalContent: string,
+  normalizedContent: string,
+  segments: ReplacementSegment[],
+): string {
+  const crlfCount = (originalContent.match(/\r\n/g) ?? []).length;
+  if (crlfCount === 0) {
+    return applySegments(normalizedContent, segments);
+  }
+  const totalLf = (originalContent.match(/\n/g) ?? []).length;
+  const bareLf = totalLf - crlfCount;
+  if (bareLf === 0) {
+    // Every newline in the file is CRLF: safe to convert globally.
+    return applySegments(normalizedContent, segments).replace(/\n/g, '\r\n');
+  }
+  return reconstructMixed(
+    originalContent,
+    normalizedContent,
+    segments,
+    crlfCount > bareLf,
+  );
+}
+
+/**
+ * Reconstruct a mixed-ending file. Untouched spans are copied verbatim from
+ * `originalContent` (so their exact line endings survive); replaced spans are
+ * re-rendered with CRLF or LF based on the style of the original text they
+ * replaced, falling back to the file's dominant style when the replaced span
+ * carried no newline of its own.
+ */
+function reconstructMixed(
+  originalContent: string,
+  normalizedContent: string,
+  segments: ReplacementSegment[],
+  dominantIsCRLF: boolean,
+): string {
+  // origAt[n] = offset in originalContent where normalized index n begins.
+  // Normalization only ever collapsed a `\r\n` into a single `\n`, so each
+  // normalized char maps to either 1 original char or (for such a `\n`) 2.
+  const origAt = new Array<number>(normalizedContent.length + 1);
+  let o = 0;
+  for (let n = 0; n < normalizedContent.length; n++) {
+    origAt[n] = o;
+    if (
+      normalizedContent[n] === '\n' &&
+      originalContent[o] === '\r' &&
+      originalContent[o + 1] === '\n'
+    ) {
+      o += 2;
+    } else {
+      o += 1;
+    }
+  }
+  origAt[normalizedContent.length] = o;
+
+  let result = '';
+  let cursorNorm = 0;
+  for (const seg of segments) {
+    result += originalContent.slice(origAt[cursorNorm]!, origAt[seg.start]!);
+    const origMatched = originalContent.slice(origAt[seg.start]!, origAt[seg.end]!);
+    const useCRLF = origMatched.includes('\r\n')
+      ? true
+      : origMatched.includes('\n')
+        ? false
+        : dominantIsCRLF;
+    result += useCRLF ? seg.text.replace(/\n/g, '\r\n') : seg.text;
+    cursorNorm = seg.end;
+  }
+  result += originalContent.slice(origAt[cursorNorm]!);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,10 +394,10 @@ export function createEditTool(config: EditToolConfig): {
           ? originalBuffer.toString('utf8')
           : await fs.promises.readFile(filePath, 'utf8');
 
-        // Normalize line endings for matching: \r\n -> \n
-        // We'll do matching on normalized content but track whether the
-        // original had \r\n so we can preserve the original style.
-        const hadCRLF = originalContent.includes('\r\n');
+        // Normalize line endings for matching: \r\n -> \n. Matching runs on
+        // the normalized content; the original endings are restored per-region
+        // after the replacement (see restoreLineEndings) so untouched lines in
+        // a mixed-ending file are never rewritten.
         const normalizedContent = originalContent.replace(/\r\n/g, '\n');
         const normalizedOldString = oldString.replace(/\r\n/g, '\n');
         const normalizedNewString = newString.replace(/\r\n/g, '\n');
@@ -338,31 +466,27 @@ export function createEditTool(config: EditToolConfig): {
           // as a programming error rather than silently succeeding.
           throw new Error(`Unexpected match kind: ${match.kind}`);
         }
-        const newNormalizedContent = applied.newContent;
         const replacementCount = applied.replacementCount;
         const matchTier = applied.tier;
 
-        // Restore original line ending style if it was CRLF
-        const finalContent = hadCRLF
-          ? newNormalizedContent.replace(/\n/g, '\r\n')
-          : newNormalizedContent;
+        // Restore line endings: only the replaced regions follow the original
+        // style; untouched lines in a mixed-ending file are left byte-for-byte.
+        const finalContent = restoreLineEndings(
+          originalContent, normalizedContent, applied.segments,
+        );
 
         // Compute diff
         const diff = computeDiff(originalContent, finalContent);
 
-        // Atomic write: write to temp file, then rename
-        const tempPath = path.join(path.dirname(filePath), `.edit-${crypto.randomUUID()}.tmp`);
+        // Atomic write: temp file + rename, preserving the target's mode and
+        // refusing to write through a symlink to a critical path.
         try {
-          await fs.promises.writeFile(tempPath, finalContent, 'utf8');
-          try {
-            await fs.promises.rename(tempPath, filePath);
-          } catch {
-            // Rename may fail on Windows if target is open. Fall back to direct write.
-            await fs.promises.writeFile(filePath, finalContent, 'utf8');
-            try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
-          }
+          await atomicWrite(filePath, finalContent);
         } catch (writeErr) {
-          try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
+          if (writeErr instanceof CriticalPathWriteError) {
+            return noChange(filePath, oldString, newString, replaceAll,
+              `Refusing to edit critical system path: ${writeErr.resolvedPath}`, originalContent);
+          }
           throw writeErr;
         }
 

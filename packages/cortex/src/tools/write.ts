@@ -19,6 +19,7 @@ import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
 import { isCriticalPathOrDescendant } from './bash/safety.js';
+import { atomicWrite, CriticalPathWriteError } from './shared/atomic-write.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -274,28 +275,22 @@ export function createWriteTool(config: WriteToolConfig): {
           throw err;
         }
 
-        // Atomic write: write to temp file, then rename
-        const tempPath = path.join(parentDir, `.write-${crypto.randomUUID()}.tmp`);
+        // Atomic write: temp file + rename, preserving the target's mode and
+        // refusing to write through a symlink to a critical path.
         try {
-          await fs.promises.writeFile(tempPath, newContent, 'utf8');
-          try {
-            await fs.promises.rename(tempPath, filePath);
-          } catch {
-            // Rename may fail on Windows if target is open. Fall back to direct write.
-            await fs.promises.writeFile(filePath, newContent, 'utf8');
-            // Clean up temp file
-            try {
-              await fs.promises.unlink(tempPath);
-            } catch {
-              // Ignore cleanup errors
-            }
-          }
+          await atomicWrite(filePath, newContent);
         } catch (err: unknown) {
-          // Clean up temp file on error
-          try {
-            await fs.promises.unlink(tempPath);
-          } catch {
-            // Ignore cleanup errors
+          if (err instanceof CriticalPathWriteError) {
+            return {
+              content: [{ type: 'text', text: `Refusing to write to critical system path: ${err.resolvedPath}` }],
+              details: {
+                filePath,
+                isCreate: !fileExists,
+                bytesWritten: 0,
+                diff: null,
+                originalContent,
+              },
+            };
           }
 
           const code = (err as NodeJS.ErrnoException).code;

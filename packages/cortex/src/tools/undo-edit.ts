@@ -24,6 +24,7 @@ import type { ReadRegistry } from './shared/read-registry.js';
 import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
+import { atomicWrite } from './shared/atomic-write.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -85,31 +86,9 @@ function rejection(
   };
 }
 
-/**
- * Atomically write the restored content to disk. Mirrors the pattern
- * used by Edit and Write so concurrent consumers observe a coherent
- * file at all times.
- */
-async function atomicWrite(filePath: string, content: string): Promise<void> {
-  const tempPath = path.join(
-    path.dirname(filePath),
-    `.undo-${crypto.randomUUID()}.tmp`,
-  );
-  try {
-    await fs.promises.writeFile(tempPath, content, 'utf8');
-    try {
-      await fs.promises.rename(tempPath, filePath);
-    } catch {
-      // Rename may fail on Windows if the target is open. Fall back to a
-      // direct write and clean up the temp file.
-      await fs.promises.writeFile(filePath, content, 'utf8');
-      try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
-    }
-  } catch (err) {
-    try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
-    throw err;
-  }
-}
+// Restored content is written via the shared `atomicWrite` helper so undo
+// mirrors Edit/Write: mode is preserved and symlinks to critical paths are
+// refused (surfaced here as a restore failure).
 
 // ---------------------------------------------------------------------------
 // Tool factory
