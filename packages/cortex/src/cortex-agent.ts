@@ -883,9 +883,6 @@ export class CortexAgent {
     if (this.abortController.signal.aborted) {
       this.abortController = new AbortController();
     }
-    this.turnUnwound = new Promise<void>((resolve) => {
-      this.resolveTurnUnwound = resolve;
-    });
 
     const effectiveRetention = options?.cacheRetention ?? this._cacheRetention;
     this._activePromptCacheRetention = effectiveRetention ?? null;
@@ -914,6 +911,13 @@ export class CortexAgent {
       messageCount: this._prePromptMessageCount,
       provider: this.primaryModel.provider,
       modelId: this.primaryModel.modelId,
+    });
+
+    // Created immediately before the try so every code path that leaves a
+    // pending turnUnwound is guaranteed to hit the finally that resolves it
+    // (abort() awaits this promise and must never hang).
+    this.turnUnwound = new Promise<void>((resolve) => {
+      this.resolveTurnUnwound = resolve;
     });
 
     let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
@@ -2530,10 +2534,21 @@ export class CortexAgent {
     } finally {
       this.promptDiagnostics.finishAbortWait();
     }
-    // Reset so the agent is reusable, unless a newer turn (e.g. a background
-    // delivery that started during the wait) already installed its own
-    // controller.
-    if (this.abortController === controller) {
+
+    // When no background delivery is pending, also wait for the gate to
+    // release the aborted cycle. From the unwound turn to the release there
+    // are only microtasks (an empty drain check), so this is bounded and a
+    // follow-up prompt() cannot spuriously fail fast on a stale gate. When
+    // deliveries ARE pending they start a fresh (non-aborted) loop, so
+    // return immediately rather than blocking abort() on it.
+    if (this.pendingBackgroundResults.length === 0) {
+      await this.loopGateTail;
+    }
+
+    // Reset so the agent is reusable, unless teardown owns the controller
+    // now or a newer turn (e.g. a background delivery that started during
+    // the wait) already installed its own controller.
+    if (!this.isShuttingDown() && this.abortController === controller) {
       this.abortController = new AbortController();
     }
     this.logger.info('[CortexAgent] abort complete');

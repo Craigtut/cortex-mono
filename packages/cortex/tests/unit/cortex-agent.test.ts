@@ -829,6 +829,39 @@ You have 12 emotions.`;
       expect(agent.state).toBe('active');
     });
 
+    it('prompt() issued right after abort() resolves does not fail fast on a stale gate', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+
+      // Hold a turn open; release it when abort() reaches pi (as a real
+      // abort would settle the in-flight run).
+      let release!: () => void;
+      const originalPrompt = piAgent.prompt.bind(piAgent);
+      const calls: string[] = [];
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        calls.push(input);
+        if (calls.length === 1) {
+          await new Promise<void>((resolve) => { release = resolve; });
+        }
+        return originalPrompt(input);
+      };
+      const originalAbort = piAgent.abort.bind(piAgent);
+      piAgent.abort = (): void => {
+        originalAbort();
+        release();
+      };
+
+      const first = agent.prompt('one');
+      await new Promise((resolve) => setImmediate(resolve));
+
+      await agent.abort();
+      await first;
+
+      // The gate has fully released the aborted cycle by the time abort()
+      // resolves, so a follow-up prompt starts a fresh, non-cancelled turn.
+      await expect(agent.prompt('two')).resolves.toBeDefined();
+      expect(calls).toEqual(['one', 'two']);
+    });
+
     it('does not add an exit listener per agent instance', async () => {
       const before = process.listenerCount('exit');
 
