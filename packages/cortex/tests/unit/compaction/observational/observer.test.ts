@@ -18,22 +18,27 @@ import type { AgentMessage } from '../../../../src/context-manager.js';
 const userMsg = (content: string): AgentMessage => ({ role: 'user', content, timestamp: 0 });
 const assistantMsg = (content: string): AgentMessage => ({ role: 'assistant', content, timestamp: 0 });
 
-function makeToolUseMsg(name: string): AgentMessage {
+// Real pi-ai shapes: assistant 'toolCall' blocks with `arguments`, and tool
+// results as separate role 'toolResult' messages with toolCallId/toolName.
+function makeToolCallMsg(name: string): AgentMessage {
   return {
     role: 'assistant',
     content: [
-      { type: 'tool_use', id: 'toolu_123', name, input: { path: '/tmp/test.txt' } },
+      { type: 'toolCall', id: 'call_123', name, arguments: { path: '/tmp/test.txt' } },
     ],
     timestamp: 0,
   } as AgentMessage;
 }
 
-function makeToolResultMsg(text: string): AgentMessage {
+function makeToolResultMsg(text: string, toolName = 'Read'): AgentMessage {
   return {
-    role: 'user',
+    role: 'toolResult',
+    toolCallId: 'call_123',
+    toolName,
     content: [
-      { type: 'tool_result', tool_use_id: 'toolu_123', text },
+      { type: 'text', text },
     ],
+    isError: false,
     timestamp: 0,
   } as AgentMessage;
 }
@@ -56,20 +61,35 @@ describe('formatMessagesForObserver', () => {
     expect(result).toContain('**assistant (Message 2)**: Hi there');
   });
 
-  it('formats content array messages with tool_use parts', () => {
-    const messages = [makeToolUseMsg('Read')];
+  it('formats assistant toolCall blocks with tool name and summarized arguments', () => {
+    const messages = [makeToolCallMsg('Read')];
     const result = formatMessagesForObserver(messages);
 
     expect(result).toContain('[Tool Call: Read]');
     expect(result).toContain('path:');
+    expect(result).toContain('/tmp/test.txt');
   });
 
-  it('formats content array messages with tool_result parts', () => {
-    const messages = [makeToolResultMsg('file contents here')];
+  it('formats runtime toolResult messages with their tool name', () => {
+    const messages = [makeToolResultMsg('file contents here', 'Read')];
     const result = formatMessagesForObserver(messages);
 
-    expect(result).toContain('[Tool Result');
+    expect(result).toContain('[Tool Result: Read]');
     expect(result).toContain('file contents here');
+  });
+
+  it('formats legacy tool_result content parts', () => {
+    const legacy: AgentMessage = {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_123', text: 'legacy output' },
+      ],
+      timestamp: 0,
+    } as AgentMessage;
+    const result = formatMessagesForObserver([legacy]);
+
+    expect(result).toContain('[Tool Result');
+    expect(result).toContain('legacy output');
   });
 
   it('returns empty string for empty messages array', () => {

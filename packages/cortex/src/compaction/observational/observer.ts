@@ -68,14 +68,20 @@ export function formatMessagesForObserver(messages: AgentMessage[]): string {
       label = `Message ${i + 1}`;
     }
 
+    // Runtime toolResult messages carry the tool name as message metadata;
+    // surface it so observations can attribute results to their tools.
+    const resultHeader = msg.role === 'toolResult' && typeof msg.toolName === 'string'
+      ? `[Tool Result: ${msg.toolName}]\n`
+      : '';
+
     if (typeof msg.content === 'string') {
-      lines.push(`**${roleLabel} (${label})**: ${msg.content}`);
+      lines.push(`**${roleLabel} (${label})**: ${resultHeader}${msg.content}`);
     } else if (Array.isArray(msg.content)) {
       const parts = formatContentParts(msg.content);
       if (parts) {
-        lines.push(`**${roleLabel} (${label})**:\n${parts}`);
+        lines.push(`**${roleLabel} (${label})**:\n${resultHeader}${parts}`);
       } else {
-        lines.push(`**${roleLabel} (${label})**: [empty]`);
+        lines.push(`**${roleLabel} (${label})**: ${resultHeader || '[empty]'}`);
       }
     } else {
       lines.push(`**${roleLabel} (${label})**: [empty]`);
@@ -112,8 +118,9 @@ function formatTime(date: Date): string {
 /**
  * Format an array of content parts from a structured message.
  *
- * Handles text, tool_use, and tool_result part types. Other part types
- * are rendered with their type label.
+ * Handles text and toolCall part types (real pi-ai assistant blocks), plus
+ * legacy tool_result parts. Other part types are rendered with their type
+ * label.
  */
 function formatContentParts(
   parts: Array<{ type: string; text?: string; [key: string]: unknown }>,
@@ -129,9 +136,9 @@ function formatContentParts(
         break;
       }
 
-      case 'tool_use': {
+      case 'toolCall': {
         const toolName = typeof part['name'] === 'string' ? part['name'] : 'unknown';
-        const argsSummary = summarizeToolArgs(part['input']);
+        const argsSummary = summarizeToolArgs(part['arguments']);
         formatted.push(`[Tool Call: ${toolName}] ${argsSummary}`);
         break;
       }

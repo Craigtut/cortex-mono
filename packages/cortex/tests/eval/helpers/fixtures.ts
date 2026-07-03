@@ -118,8 +118,9 @@ export const MEMORY_LEAK_FACTS = [
  * in session token refresh, add rate limiting, fix tests, and resolve a
  * circular dependency.
  *
- * The conversation uses structured tool_use / tool_result messages to
- * simulate real agent tool interactions with large file reads.
+ * The conversation uses real pi message shapes (assistant 'toolCall' blocks
+ * and role 'toolResult' messages) to simulate real agent tool interactions
+ * with large file reads.
  */
 export const AUTH_REFACTOR_CONVERSATION: AgentMessage[] = [
   // --- Turn 1: User kicks off the auth refactor ---
@@ -128,12 +129,12 @@ export const AUTH_REFACTOR_CONVERSATION: AgentMessage[] = [
   // --- Turn 2: Agent reads the monolithic auth file ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Let me read the current auth file to understand its structure.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/auth/index.ts' } }
+    { type: 'toolCall', id: 'call_1', name: 'Read', arguments: { path: '/src/auth/index.ts' } }
   ] },
 
   // --- Turn 3: Tool result with the full monolithic auth file (~500 lines) ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import crypto from 'crypto';
+  { role: 'toolResult', toolCallId: 'call_1', toolName: 'Read', content: [
+    { type: 'text', text: `import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
@@ -1024,24 +1025,24 @@ export function initializeAuth(): void {
   // --- Turn 6: Agent searches for bcrypt usage ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Good call, fixing the security issue first makes sense. Let me check if bcrypt is already in the dependencies.' },
-    { type: 'tool_use', name: 'Bash', input: { command: 'cat /src/package.json | grep -A2 -B2 bcrypt' } }
+    { type: 'toolCall', id: 'call_2', name: 'Bash', arguments: { command: 'cat /src/package.json | grep -A2 -B2 bcrypt' } }
   ] },
 
   // --- Turn 7: Bash result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Bash', text: `    "bcrypt": "^5.1.1",
+  { role: 'toolResult', toolCallId: 'call_2', toolName: 'Bash', content: [
+    { type: 'text', text: `    "bcrypt": "^5.1.1",
     "@types/bcrypt": "^5.0.2",` }
   ] },
 
   // --- Turn 8: Agent checks existing bcrypt usage ---
   { role: 'assistant', content: [
     { type: 'text', text: 'bcrypt is already a dependency. Let me check if it is used anywhere else in the codebase.' },
-    { type: 'tool_use', name: 'Grep', input: { pattern: 'bcrypt', path: '/src' } }
+    { type: 'toolCall', id: 'call_3', name: 'Grep', arguments: { pattern: 'bcrypt', path: '/src' } }
   ] },
 
   // --- Turn 9: Grep results ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Grep', text: `/src/auth/index.ts:1:import crypto from 'crypto';
+  { role: 'toolResult', toolCallId: 'call_3', toolName: 'Grep', content: [
+    { type: 'text', text: `/src/auth/index.ts:1:import crypto from 'crypto';
 /src/auth/index.ts:103:  // WARNING: This uses MD5 which is cryptographically broken
 /src/auth/index.ts:104:  // This was the original implementation from 2019 and needs migration to bcrypt
 /src/utils/test-helpers.ts:3:import bcrypt from 'bcrypt';
@@ -1056,7 +1057,7 @@ export function initializeAuth(): void {
   // --- Turn 11: Agent writes the new password module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the new password module with bcrypt and MD5 migration support.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/password.ts', content: `import bcrypt from 'bcrypt';
+    { type: 'toolCall', id: 'call_4', name: 'Write', arguments: { path: '/src/auth/password.ts', content: `import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import { createLogger } from '../lib/logger.js';
 
@@ -1134,14 +1135,14 @@ export async function migratePasswordHash(
   ] },
 
   // --- Turn 12: Tool result for write ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/password.ts (67 lines)' }
+  { role: 'toolResult', toolCallId: 'call_4', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/password.ts (67 lines)' }
   ] },
 
   // --- Turn 13: Agent creates the types module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Now creating the types module with all interfaces and Zod schemas.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/types.ts', content: `import { z } from 'zod';
+    { type: 'toolCall', id: 'call_5', name: 'Write', arguments: { path: '/src/auth/types.ts', content: `import { z } from 'zod';
 
 // ============================================================================
 // User Types
@@ -1316,14 +1317,14 @@ export const OAuthCallbackSchema = z.object({
   ] },
 
   // --- Turn 14: Tool result for types write ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/types.ts (165 lines)' }
+  { role: 'toolResult', toolCallId: 'call_5', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/types.ts (165 lines)' }
   ] },
 
   // --- Turn 15: Agent creates tokens module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the JWT token management module.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/tokens.ts', content: `import jwt from 'jsonwebtoken';
+    { type: 'toolCall', id: 'call_6', name: 'Write', arguments: { path: '/src/auth/tokens.ts', content: `import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { createLogger } from '../lib/logger.js';
 import { AuthConfig, type User, type TokenPayload } from './types.js';
@@ -1409,14 +1410,14 @@ export function generateOAuthNonce(): string {
   ] },
 
   // --- Turn 16: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/tokens.ts (82 lines)' }
+  { role: 'toolResult', toolCallId: 'call_6', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/tokens.ts (82 lines)' }
   ] },
 
   // --- Turn 17: Agent creates sessions module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Now creating the sessions module. This is where I will fix the race condition in refreshSession by wrapping the read-update in a transaction with a serializable isolation level.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/sessions.ts', content: `import { db } from '../db/connection.js';
+    { type: 'toolCall', id: 'call_7', name: 'Write', arguments: { path: '/src/auth/sessions.ts', content: `import { db } from '../db/connection.js';
 import { EventBus } from '../lib/event-bus.js';
 import { createLogger } from '../lib/logger.js';
 import {
@@ -1671,14 +1672,14 @@ export async function countActiveSessions(userId: string): Promise<number> {
   ] },
 
   // --- Turn 18: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/sessions.ts (214 lines)' }
+  { role: 'toolResult', toolCallId: 'call_7', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/sessions.ts (214 lines)' }
   ] },
 
   // --- Turn 19: Agent creates login module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the login and registration module. This integrates with the new password module for MD5 migration.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/login.ts', content: `import crypto from 'crypto';
+    { type: 'toolCall', id: 'call_8', name: 'Write', arguments: { path: '/src/auth/login.ts', content: `import crypto from 'crypto';
 import { db } from '../db/connection.js';
 import { EventBus } from '../lib/event-bus.js';
 import { createLogger } from '../lib/logger.js';
@@ -1979,14 +1980,14 @@ export async function changePassword(
   ] },
 
   // --- Turn 20: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/login.ts (244 lines)' }
+  { role: 'toolResult', toolCallId: 'call_8', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/login.ts (244 lines)' }
   ] },
 
   // --- Turn 21: Agent creates OAuth module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the OAuth integration module.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/oauth.ts', content: `import { db } from '../db/connection.js';
+    { type: 'toolCall', id: 'call_9', name: 'Write', arguments: { path: '/src/auth/oauth.ts', content: `import { db } from '../db/connection.js';
 import { createLogger } from '../lib/logger.js';
 import { OAuthClient } from '../lib/oauth-client.js';
 import {
@@ -2186,14 +2187,14 @@ export async function handleOAuthCallback(
   ] },
 
   // --- Turn 22: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/oauth.ts (174 lines)' }
+  { role: 'toolResult', toolCallId: 'call_9', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/oauth.ts (174 lines)' }
   ] },
 
   // --- Turn 23: Agent creates middleware module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the middleware module with auth verification and rate limiting.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/middleware.ts', content: `import { Request, Response, NextFunction } from 'express';
+    { type: 'toolCall', id: 'call_10', name: 'Write', arguments: { path: '/src/auth/middleware.ts', content: `import { Request, Response, NextFunction } from 'express';
 import { createLogger } from '../lib/logger.js';
 import { RateLimiter } from '../lib/rate-limiter.js';
 import { AuthConfig, type UserRole, type TokenPayload, type Session } from './types.js';
@@ -2348,14 +2349,14 @@ export function passwordResetRateLimitMiddleware() {
   ] },
 
   // --- Turn 24: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/middleware.ts (138 lines)' }
+  { role: 'toolResult', toolCallId: 'call_10', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/middleware.ts (138 lines)' }
   ] },
 
   // --- Turn 25: Agent creates handlers module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the route handlers module. These are the Express request handlers that wire up to the router.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/handlers.ts', content: `import { Request, Response } from 'express';
+    { type: 'toolCall', id: 'call_11', name: 'Write', arguments: { path: '/src/auth/handlers.ts', content: `import { Request, Response } from 'express';
 import { createLogger } from '../lib/logger.js';
 import {
   LoginSchema,
@@ -2555,14 +2556,14 @@ export async function handleChangePassword(req: Request, res: Response): Promise
   ] },
 
   // --- Turn 26: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/handlers.ts (178 lines)' }
+  { role: 'toolResult', toolCallId: 'call_11', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/handlers.ts (178 lines)' }
   ] },
 
   // --- Turn 27: Agent creates init and barrel modules ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the initialization module and the barrel re-export index.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/init.ts', content: `import { createLogger } from '../lib/logger.js';
+    { type: 'toolCall', id: 'call_12', name: 'Write', arguments: { path: '/src/auth/init.ts', content: `import { createLogger } from '../lib/logger.js';
 import { registerOAuthProvider } from './oauth.js';
 import { startSessionCleanup, stopSessionCleanup } from './sessions.js';
 
@@ -2614,14 +2615,14 @@ export function shutdownAuth(): void {
   ] },
 
   // --- Turn 28: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/init.ts (50 lines)' }
+  { role: 'toolResult', toolCallId: 'call_12', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/init.ts (50 lines)' }
   ] },
 
   // --- Turn 29: Agent creates the barrel index ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the barrel re-export index file.' },
-    { type: 'tool_use', name: 'Write', input: { path: '/src/auth/index.ts', content: `// /src/auth/index.ts - Barrel re-export
+    { type: 'toolCall', id: 'call_13', name: 'Write', arguments: { path: '/src/auth/index.ts', content: `// /src/auth/index.ts - Barrel re-export
 // All auth module exports are accessible through this single entry point.
 
 // Types and schemas
@@ -2657,8 +2658,8 @@ export { initializeAuth, shutdownAuth } from './init.js';` } }
   ] },
 
   // --- Turn 30: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Write', text: 'File written: /src/auth/index.ts (35 lines)' }
+  { role: 'toolResult', toolCallId: 'call_13', toolName: 'Write', content: [
+    { type: 'text', text: 'File written: /src/auth/index.ts (35 lines)' }
   ] },
 
   // --- Turn 31: Agent summarizes the structure ---
@@ -2667,12 +2668,12 @@ export { initializeAuth, shutdownAuth } from './init.js';` } }
   // --- Turn 31b: Agent reads the rate limiter to verify the interface ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Before we run tests, let me verify that the RateLimiter interface matches what the middleware expects. Let me read the rate limiter implementation.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/lib/rate-limiter.ts' } }
+    { type: 'toolCall', id: 'call_14', name: 'Read', arguments: { path: '/src/lib/rate-limiter.ts' } }
   ] },
 
   // --- Turn 31c: Rate limiter source ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { createLogger } from './logger.js';
+  { role: 'toolResult', toolCallId: 'call_14', toolName: 'Read', content: [
+    { type: 'text', text: `import { createLogger } from './logger.js';
 
 const log = createLogger('RateLimiter', 'server');
 
@@ -2911,12 +2912,12 @@ export function createRegistrationRateLimiter(): RateLimiter {
   // --- Turn 31e: Agent reads the db connection ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Reading the database connection module to verify transaction support.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/db/connection.ts' } }
+    { type: 'toolCall', id: 'call_15', name: 'Read', arguments: { path: '/src/db/connection.ts' } }
   ] },
 
   // --- Turn 31f: Database connection source ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import Database from 'better-sqlite3';
+  { role: 'toolResult', toolCallId: 'call_15', toolName: 'Read', content: [
+    { type: 'text', text: `import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { createLogger } from '../lib/logger.js';
@@ -3291,12 +3292,12 @@ export function closeDb(): void {
   // --- Turn 31h: Agent reads the EventBus ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Reading the EventBus implementation to verify event name conventions.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/lib/event-bus.ts' } }
+    { type: 'toolCall', id: 'call_16', name: 'Read', arguments: { path: '/src/lib/event-bus.ts' } }
   ] },
 
   // --- Turn 31i: EventBus source ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { EventEmitter } from 'events';
+  { role: 'toolResult', toolCallId: 'call_16', toolName: 'Read', content: [
+    { type: 'text', text: `import { EventEmitter } from 'events';
 import { createLogger } from './logger.js';
 
 const log = createLogger('EventBus', 'server');
@@ -3524,12 +3525,12 @@ export const EventBus = new TypedEventBus();` }
   // --- Turn 31k: Agent reads OAuth client ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Reading the OAuth client library to verify the interface contract.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/lib/oauth-client.ts' } }
+    { type: 'toolCall', id: 'call_17', name: 'Read', arguments: { path: '/src/lib/oauth-client.ts' } }
   ] },
 
   // --- Turn 31l: OAuth client source ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { createLogger } from './logger.js';
+  { role: 'toolResult', toolCallId: 'call_17', toolName: 'Read', content: [
+    { type: 'text', text: `import { createLogger } from './logger.js';
 
 const log = createLogger('OAuthClient', 'auth');
 
@@ -3888,12 +3889,12 @@ export class OAuthClient {
   // --- Turn 31n: Agent reads the routes file ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Reading the existing routes file to verify backward compatibility.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/routes/index.ts' } }
+    { type: 'toolCall', id: 'call_18', name: 'Read', arguments: { path: '/src/routes/index.ts' } }
   ] },
 
   // --- Turn 31o: Routes file ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { Router } from 'express';
+  { role: 'toolResult', toolCallId: 'call_18', toolName: 'Read', content: [
+    { type: 'text', text: `import { Router } from 'express';
 import { createLogger } from '../lib/logger.js';
 import {
   handleLogin,
@@ -4109,12 +4110,12 @@ export function createRouter(): Router {
   // --- Turn 31o2: Agent also reads the server entry point ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Let me also verify the server entry point to understand the full middleware chain and how auth is initialized.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/server.ts' } }
+    { type: 'toolCall', id: 'call_19', name: 'Read', arguments: { path: '/src/server.ts' } }
   ] },
 
   // --- Turn 31o3: Server source ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import express, { Request, Response, NextFunction } from 'express';
+  { role: 'toolResult', toolCallId: 'call_19', toolName: 'Read', content: [
+    { type: 'text', text: `import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
@@ -4405,7 +4406,7 @@ if (process.env.NODE_ENV !== 'test') {
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Updating the routes file to use the new typed property names.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_20', name: 'Edit', arguments: {
       path: '/src/routes/index.ts',
       old_content: `const userId = (req as any).user?.sub;`,
       new_content: `const userId = req.authUser?.sub;`
@@ -4413,13 +4414,13 @@ if (process.env.NODE_ENV !== 'test') {
   ] },
 
   // --- Turn 31q: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/routes/index.ts (3 occurrences replaced)' }
+  { role: 'toolResult', toolCallId: 'call_20', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/routes/index.ts (3 occurrences replaced)' }
   ] },
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Now fixing the sessionId reference.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_21', name: 'Edit', arguments: {
       path: '/src/routes/index.ts',
       old_content: `const currentSessionId = (req as any).sessionId;`,
       new_content: `const currentSessionId = req.authSessionId;`
@@ -4427,19 +4428,19 @@ if (process.env.NODE_ENV !== 'test') {
   ] },
 
   // --- Turn 31r: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/routes/index.ts (1 occurrence replaced)' }
+  { role: 'toolResult', toolCallId: 'call_21', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/routes/index.ts (1 occurrence replaced)' }
   ] },
 
   // --- Turn 31s: Agent reads test helpers to check bcrypt usage ---
   { role: 'assistant', content: [
     { type: 'text', text: 'The original file mentioned test helpers that already use bcrypt. Let me read them to make sure the test helpers are consistent with the new password module.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/utils/test-helpers.ts' } }
+    { type: 'toolCall', id: 'call_22', name: 'Read', arguments: { path: '/src/utils/test-helpers.ts' } }
   ] },
 
   // --- Turn 31t: Test helpers source ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import crypto from 'crypto';
+  { role: 'toolResult', toolCallId: 'call_22', toolName: 'Read', content: [
+    { type: 'text', text: `import crypto from 'crypto';
 import { EventEmitter } from 'events';
 import bcrypt from 'bcrypt';
 import { createLogger } from '../lib/logger.js';
@@ -4712,12 +4713,12 @@ export async function seedTestData(db: ReturnType<typeof createMockDb>): Promise
   // --- Turn 31v: Agent reads database migration ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Reading the auth-related database migrations to verify the schema.' },
-    { type: 'tool_use', name: 'Bash', input: { command: 'cat /src/db/migrations/001_initial.sql /src/db/migrations/005_sessions.sql /src/db/migrations/008_oauth.sql /src/db/migrations/012_password_resets.sql' } }
+    { type: 'toolCall', id: 'call_23', name: 'Bash', arguments: { command: 'cat /src/db/migrations/001_initial.sql /src/db/migrations/005_sessions.sql /src/db/migrations/008_oauth.sql /src/db/migrations/012_password_resets.sql' } }
   ] },
 
   // --- Turn 31w: Migration SQL files ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Bash', text: `-- /src/db/migrations/001_initial.sql
+  { role: 'toolResult', toolCallId: 'call_23', toolName: 'Bash', content: [
+    { type: 'text', text: `-- /src/db/migrations/001_initial.sql
 -- Initial schema creation for the application database.
 -- Creates the users table with all authentication-related fields.
 
@@ -4910,12 +4911,12 @@ END;` }
   // --- Turn 31x: Agent also reads the package.json for dependency audit ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Let me also check the package.json to verify all auth-related dependencies are present.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/package.json' } }
+    { type: 'toolCall', id: 'call_24', name: 'Read', arguments: { path: '/src/package.json' } }
   ] },
 
   // --- Turn 31y: Package.json ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `{
+  { role: 'toolResult', toolCallId: 'call_24', toolName: 'Read', content: [
+    { type: 'text', text: `{
   "name": "project",
   "version": "1.0.0",
   "description": "Full-stack application with authentication, real-time features, and admin panel",
@@ -4985,12 +4986,12 @@ END;` }
   // --- Turn 31z3: Agent runs typecheck ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Running TypeScript type checking across the entire project.' },
-    { type: 'tool_use', name: 'Bash', input: { command: 'cd /src && npx tsc --noEmit 2>&1' } }
+    { type: 'toolCall', id: 'call_25', name: 'Bash', arguments: { command: 'cd /src && npx tsc --noEmit 2>&1' } }
   ] },
 
   // --- Turn 31z4: Typecheck output with some errors ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Bash', text: `src/auth/sessions.ts(7,10): error TS2305: Module '"./types.js"' has no exported member 'User'.
+  { role: 'toolResult', toolCallId: 'call_25', toolName: 'Bash', content: [
+    { type: 'text', text: `src/auth/sessions.ts(7,10): error TS2305: Module '"./types.js"' has no exported member 'User'.
   The import of 'User' in sessions.ts is unused. The User type is only
   needed in the refreshSession function to type the db.get result, but
   TypeScript resolves the generic parameter from the SQL query context.
@@ -5033,7 +5034,7 @@ Errors  Files
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Moving the Express Request augmentation from middleware.ts to types.ts.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_26', name: 'Edit', arguments: {
       path: '/src/auth/types.ts',
       old_content: `import { z } from 'zod';`,
       new_content: `import { z } from 'zod';\n\n// Express Request augmentation for auth context\n// Placed in types.ts so it is visible to all consumers of the auth module\ndeclare global {\n  namespace Express {\n    interface Request {\n      authUser?: import('./types.js').TokenPayload;\n      authSessionId?: string;\n    }\n  }\n}`
@@ -5041,18 +5042,18 @@ Errors  Files
   ] },
 
   // --- Turn 31z6: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/auth/types.ts' }
+  { role: 'toolResult', toolCallId: 'call_26', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/auth/types.ts' }
   ] },
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Removing the declare global from middleware.ts and fixing the unused imports.' },
-    { type: 'tool_use', name: 'Bash', input: { command: 'cd /src && npx tsc --noEmit 2>&1' } }
+    { type: 'toolCall', id: 'call_27', name: 'Bash', arguments: { command: 'cd /src && npx tsc --noEmit 2>&1' } }
   ] },
 
   // --- Turn 31z7: Clean typecheck ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Bash', text: `No errors found.
+  { role: 'toolResult', toolCallId: 'call_27', toolName: 'Bash', content: [
+    { type: 'text', text: `No errors found.
 
 Checked 47 source files in 2.3s.` }
   ] },
@@ -5072,12 +5073,12 @@ Checked 47 source files in 2.3s.` }
   // --- Turn 35: Agent runs tests ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Running the full test suite.' },
-    { type: 'tool_use', name: 'Bash', input: { command: 'cd /src && npm run test:run 2>&1' } }
+    { type: 'toolCall', id: 'call_28', name: 'Bash', arguments: { command: 'cd /src && npm run test:run 2>&1' } }
   ] },
 
   // --- Turn 36: Test output (large, verbose) ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Bash', text: `> project@1.0.0 test:run
+  { role: 'toolResult', toolCallId: 'call_28', toolName: 'Bash', content: [
+    { type: 'text', text: `> project@1.0.0 test:run
 > vitest run --reporter=verbose
 
  RUN  v2.1.8 /src
@@ -5361,12 +5362,12 @@ Checked 47 source files in 2.3s.` }
   // --- Turn 38: Agent reads session tests ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Let me read the session test file to understand the mock DB setup.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/tests/auth/sessions.test.ts' } }
+    { type: 'toolCall', id: 'call_29', name: 'Read', arguments: { path: '/src/tests/auth/sessions.test.ts' } }
   ] },
 
   // --- Turn 39: Sessions test file ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+  { role: 'toolResult', toolCallId: 'call_29', toolName: 'Read', content: [
+    { type: 'text', text: `import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   createSession,
   refreshSession,
@@ -5613,7 +5614,7 @@ describe('sessions', () => {
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Adding the transaction method to the mock DB and fixing the other test issues.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_30', name: 'Edit', arguments: {
       path: '/src/tests/auth/sessions.test.ts',
       old_content: `    },
   };
@@ -5631,19 +5632,19 @@ describe('sessions', () => {
   ] },
 
   // --- Turn 41: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/tests/auth/sessions.test.ts' }
+  { role: 'toolResult', toolCallId: 'call_30', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/tests/auth/sessions.test.ts' }
   ] },
 
   // --- Turn 42: Agent reads middleware tests ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Now let me read and fix the middleware tests for the property name changes.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/tests/auth/middleware.test.ts' } }
+    { type: 'toolCall', id: 'call_31', name: 'Read', arguments: { path: '/src/tests/auth/middleware.test.ts' } }
   ] },
 
   // --- Turn 43: Middleware test file ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { describe, it, expect, vi, beforeEach } from 'vitest';
+  { role: 'toolResult', toolCallId: 'call_31', toolName: 'Read', content: [
+    { type: 'text', text: `import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Request, Response, NextFunction } from 'express';
 import { authMiddleware, rateLimitMiddleware } from '../../auth/middleware.js';
 
@@ -5839,7 +5840,7 @@ describe('rateLimitMiddleware', () => {
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Fixing the property name assertion in the middleware test.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_32', name: 'Edit', arguments: {
       path: '/src/tests/auth/middleware.test.ts',
       old_content: `    expect((req as any).user).toBeDefined();
     expect((req as any).user.sub).toBe('user-1');`,
@@ -5849,19 +5850,19 @@ describe('rateLimitMiddleware', () => {
   ] },
 
   // --- Turn 45: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/tests/auth/middleware.test.ts' }
+  { role: 'toolResult', toolCallId: 'call_32', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/tests/auth/middleware.test.ts' }
   ] },
 
   // --- Turn 46: Agent reads the password test to fix import issues ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Now let me read the password test to fix the logger import issue.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/tests/auth/password.test.ts' } }
+    { type: 'toolCall', id: 'call_33', name: 'Read', arguments: { path: '/src/tests/auth/password.test.ts' } }
   ] },
 
   // --- Turn 47: Password test file ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { describe, it, expect, vi } from 'vitest';
+  { role: 'toolResult', toolCallId: 'call_33', toolName: 'Read', content: [
+    { type: 'text', text: `import { describe, it, expect, vi } from 'vitest';
 import {
   hashPassword,
   verifyPassword,
@@ -5952,7 +5953,7 @@ describe('password', () => {
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Adding the logger mock to the password test file.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_34', name: 'Edit', arguments: {
       path: '/src/tests/auth/password.test.ts',
       old_content: `// Mock bcrypt to avoid slow hashing in tests`,
       new_content: `// Mock logger (password.ts imports it for migration logging)
@@ -5970,19 +5971,19 @@ vi.mock('../../lib/logger.js', () => ({
   ] },
 
   // --- Turn 49: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/tests/auth/password.test.ts' }
+  { role: 'toolResult', toolCallId: 'call_34', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/tests/auth/password.test.ts' }
   ] },
 
   // --- Turn 50: Agent fixes the OAuth test and init test ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Now fixing the OAuth test error message and the init test missing export. Let me read the OAuth test first.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/tests/auth/oauth.test.ts' } }
+    { type: 'toolCall', id: 'call_35', name: 'Read', arguments: { path: '/src/tests/auth/oauth.test.ts' } }
   ] },
 
   // --- Turn 51: OAuth test file ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { describe, it, expect, vi, beforeEach } from 'vitest';
+  { role: 'toolResult', toolCallId: 'call_35', toolName: 'Read', content: [
+    { type: 'text', text: `import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   registerOAuthProvider,
   getRegisteredProviders,
@@ -6112,7 +6113,7 @@ describe('oauth', () => {
   // --- Turn 52: Agent fixes the OAuth test assertion ---
   { role: 'assistant', content: [
     { type: 'text', text: 'The test expects the old error message "OAuth state expired". The new code returns "Invalid or expired OAuth state". Updating the assertion.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_36', name: 'Edit', arguments: {
       path: '/src/tests/auth/oauth.test.ts',
       old_content: `      expect(result).toEqual({ error: 'OAuth state expired' });`,
       new_content: `      expect(result).toEqual({ error: 'Invalid or expired OAuth state' });`
@@ -6120,19 +6121,19 @@ describe('oauth', () => {
   ] },
 
   // --- Turn 53: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/tests/auth/oauth.test.ts' }
+  { role: 'toolResult', toolCallId: 'call_36', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/tests/auth/oauth.test.ts' }
   ] },
 
   // --- Turn 54: Agent checks the barrel export ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Now let me check the barrel file for the missing shutdownAuth export.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/auth/index.ts' } }
+    { type: 'toolCall', id: 'call_37', name: 'Read', arguments: { path: '/src/auth/index.ts' } }
   ] },
 
   // --- Turn 55: Barrel file content ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `// /src/auth/index.ts - Barrel re-export
+  { role: 'toolResult', toolCallId: 'call_37', toolName: 'Read', content: [
+    { type: 'text', text: `// /src/auth/index.ts - Barrel re-export
 // All auth module exports are accessible through this single entry point.
 
 // Types and schemas
@@ -6172,12 +6173,12 @@ export { initializeAuth, shutdownAuth } from './init.js';` }
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Reading the init test to verify its import path.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/tests/auth/init.test.ts' } }
+    { type: 'toolCall', id: 'call_38', name: 'Read', arguments: { path: '/src/tests/auth/init.test.ts' } }
   ] },
 
   // --- Turn 57: Init test file ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { describe, it, expect, vi } from 'vitest';
+  { role: 'toolResult', toolCallId: 'call_38', toolName: 'Read', content: [
+    { type: 'text', text: `import { describe, it, expect, vi } from 'vitest';
 import { initializeAuth } from '../../auth/index.js';
 
 // The test file was only importing initializeAuth, not shutdownAuth
@@ -6241,7 +6242,7 @@ describe('auth initialization', () => {
 
   { role: 'assistant', content: [
     { type: 'text', text: 'Fixing the init test to use a static import for shutdownAuth.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_39', name: 'Edit', arguments: {
       path: '/src/tests/auth/init.test.ts',
       old_content: `import { initializeAuth } from '../../auth/index.js';`,
       new_content: `import { initializeAuth, shutdownAuth } from '../../auth/index.js';`
@@ -6249,14 +6250,14 @@ describe('auth initialization', () => {
   ] },
 
   // --- Turn 59: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/tests/auth/init.test.ts' }
+  { role: 'toolResult', toolCallId: 'call_39', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/tests/auth/init.test.ts' }
   ] },
 
   // --- Turn 60: Agent also updates the test body ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Also updating the test body to use the static import instead of dynamic import.' },
-    { type: 'tool_use', name: 'Edit', input: {
+    { type: 'toolCall', id: 'call_40', name: 'Edit', arguments: {
       path: '/src/tests/auth/init.test.ts',
       old_content: `  it('stops session cleanup on shutdown', async () => {
     const { shutdownAuth } = await import('../../auth/index.js');
@@ -6267,19 +6268,19 @@ describe('auth initialization', () => {
   ] },
 
   // --- Turn 61: Tool result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Edit', text: 'File edited: /src/tests/auth/init.test.ts' }
+  { role: 'toolResult', toolCallId: 'call_40', toolName: 'Edit', content: [
+    { type: 'text', text: 'File edited: /src/tests/auth/init.test.ts' }
   ] },
 
   // --- Turn 62: Agent addresses the login test failures ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Now the login tests are failing because they cannot find ./password.js from login.ts. The tests need to mock the password module. Let me read the login test.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/tests/auth/login.test.ts' } }
+    { type: 'toolCall', id: 'call_41', name: 'Read', arguments: { path: '/src/tests/auth/login.test.ts' } }
   ] },
 
   // --- Turn 63: Login test file (large) ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { describe, it, expect, vi, beforeEach } from 'vitest';
+  { role: 'toolResult', toolCallId: 'call_41', toolName: 'Read', content: [
+    { type: 'text', text: `import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   login,
   register,
@@ -6615,12 +6616,12 @@ describe('login', () => {
   // --- Turn 66: Agent re-runs tests ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Re-running the full test suite now that all files are in place.' },
-    { type: 'tool_use', name: 'Bash', input: { command: 'cd /src && npm run test:run 2>&1' } }
+    { type: 'toolCall', id: 'call_42', name: 'Bash', arguments: { command: 'cd /src && npm run test:run 2>&1' } }
   ] },
 
   // --- Turn 67: Test output (second run, verbose) ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Bash', text: `> project@1.0.0 test:run
+  { role: 'toolResult', toolCallId: 'call_42', toolName: 'Bash', content: [
+    { type: 'text', text: `> project@1.0.0 test:run
 > vitest run --reporter=verbose
 
  RUN  v2.1.8 /src
@@ -6787,12 +6788,12 @@ describe('login', () => {
   // --- Turn 67b: Agent reads the logger module ---
   { role: 'assistant', content: [
     { type: 'text', text: 'All tests pass. Let me also verify the logger module to make sure the auth modules use it correctly.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/lib/logger.ts' } }
+    { type: 'toolCall', id: 'call_43', name: 'Read', arguments: { path: '/src/lib/logger.ts' } }
   ] },
 
   // --- Turn 67c: Logger source ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import fs from 'fs';
+  { role: 'toolResult', toolCallId: 'call_43', toolName: 'Read', content: [
+    { type: 'text', text: `import fs from 'fs';
 import path from 'path';
 import { getLogLevel, type LogLevel } from '../config/log-level.js';
 
@@ -7126,12 +7127,12 @@ export function searchLogs(pattern: string, maxResults: number = 50): string[] {
   // --- Turn 67e: Agent reads the integration test ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Reading the auth integration test to verify end-to-end coverage.' },
-    { type: 'tool_use', name: 'Read', input: { path: '/src/tests/integration/auth-flow.test.ts' } }
+    { type: 'toolCall', id: 'call_44', name: 'Read', arguments: { path: '/src/tests/integration/auth-flow.test.ts' } }
   ] },
 
   // --- Turn 67f: Integration test ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Read', text: `import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+  { role: 'toolResult', toolCallId: 'call_44', toolName: 'Read', content: [
+    { type: 'text', text: `import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createServer } from '../../server.js';
 import { closeDb } from '../../db/connection.js';
 import { hashTestPassword, testEmail, delay } from '../../utils/test-helpers.js';
@@ -7561,12 +7562,12 @@ describe('Auth Integration Flow', () => {
   // --- Turn 70: Agent analyzes the dependency graph ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Let me map the dependency graph by checking all imports.' },
-    { type: 'tool_use', name: 'Grep', input: { pattern: 'from \'\\./.*\\.js\'', path: '/src/auth' } }
+    { type: 'toolCall', id: 'call_45', name: 'Grep', arguments: { pattern: 'from \'\\./.*\\.js\'', path: '/src/auth' } }
   ] },
 
   // --- Turn 71: Grep results ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Grep', text: `/src/auth/password.ts:3:import { createLogger } from '../lib/logger.js';
+  { role: 'toolResult', toolCallId: 'call_45', toolName: 'Grep', content: [
+    { type: 'text', text: `/src/auth/password.ts:3:import { createLogger } from '../lib/logger.js';
 /src/auth/tokens.ts:2:import crypto from 'crypto';
 /src/auth/tokens.ts:3:import { createLogger } from '../lib/logger.js';
 /src/auth/tokens.ts:4:import { AuthConfig, type User, type TokenPayload } from './types.js';
@@ -7626,12 +7627,12 @@ describe('Auth Integration Flow', () => {
   // --- Turn 78: Agent commits ---
   { role: 'assistant', content: [
     { type: 'text', text: 'Creating the commit for the complete auth refactor.' },
-    { type: 'tool_use', name: 'Bash', input: { command: 'cd /src && git add src/auth/ tests/auth/ && git commit -m "refactor(auth): split monolithic auth into modular files, fix MD5 vulnerability and session refresh race condition"' } }
+    { type: 'toolCall', id: 'call_46', name: 'Bash', arguments: { command: 'cd /src && git add src/auth/ tests/auth/ && git commit -m "refactor(auth): split monolithic auth into modular files, fix MD5 vulnerability and session refresh race condition"' } }
   ] },
 
   // --- Turn 79: Commit result ---
-  { role: 'user', content: [
-    { type: 'tool_result', name: 'Bash', text: `[main abc1234] refactor(auth): split monolithic auth into modular files, fix MD5 vulnerability and session refresh race condition
+  { role: 'toolResult', toolCallId: 'call_46', toolName: 'Bash', content: [
+    { type: 'text', text: `[main abc1234] refactor(auth): split monolithic auth into modular files, fix MD5 vulnerability and session refresh race condition
  14 files changed, 1589 insertions(+), 1247 deletions(-)
  create mode 100644 src/auth/handlers.ts
  create mode 100644 src/auth/init.ts

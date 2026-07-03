@@ -427,4 +427,34 @@ export class BufferingCoordinator {
   advanceEpoch(): void {
     this.activationEpoch++;
   }
+
+  /**
+   * Reconcile buffer state after the source conversation history was
+   * truncated from the front (emergency truncation / reactive overflow).
+   *
+   * `droppedFrontCount` messages were removed from the head of the source
+   * history, so every surviving message shifted down by that many indices.
+   * The watermark, which counts observed messages from the front, is
+   * clamped by the same amount: observed messages that were dropped no
+   * longer count, and if the whole observed prefix was dropped the
+   * watermark falls to 0. Without this shift the next activation would
+   * slice `sourceHistory.slice(0, staleWatermark)`, silently trimming
+   * still-unobserved messages and potentially leaving an orphaned tool
+   * result at the head of the surviving source (a hard provider 400).
+   *
+   * The activation epoch is advanced so any in-flight observer (whose
+   * captured end index now points at stale positions) discards its result
+   * on completion instead of landing a chunk with a misaligned watermark.
+   *
+   * Completed chunks are kept: their observation text stays valid, and the
+   * clamped watermark keeps them consistent with the truncated source.
+   *
+   * @param droppedFrontCount - number of messages removed from the front of
+   *   the source history. No-op when zero or negative.
+   */
+  onSourceTruncated(droppedFrontCount: number): void {
+    if (droppedFrontCount <= 0) return;
+    this.bufferWatermark = Math.max(0, this.bufferWatermark - droppedFrontCount);
+    this.activationEpoch++;
+  }
 }

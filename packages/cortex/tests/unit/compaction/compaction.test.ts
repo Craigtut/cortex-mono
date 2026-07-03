@@ -11,32 +11,17 @@ import {
 import type { CompleteFn } from '../../../src/compaction/compaction.js';
 import type { AgentMessage } from '../../../src/context-manager.js';
 import type { CompactionResult, CompactionTarget } from '../../../src/types.js';
+import {
+  makeUserMsg,
+  makeAssistantMsg,
+  makeToolCallMsg,
+  makeToolResultMsg,
+  assertNoOrphans,
+} from './helpers.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function makeUserMsg(content: string): AgentMessage {
-  return { role: 'user', content };
-}
-
-function makeAssistantMsg(content: string): AgentMessage {
-  return { role: 'assistant', content };
-}
-
-function makeToolUseMsg(toolCallId: string): AgentMessage {
-  return {
-    role: 'assistant',
-    content: [{ type: 'tool_use', id: toolCallId, name: 'WebFetch', input: {} }],
-  } as AgentMessage;
-}
-
-function makeToolResultMsg(toolCallId: string, result: string): AgentMessage {
-  return {
-    role: 'user',
-    content: [{ type: 'tool_result', tool_use_id: toolCallId, content: result }],
-  } as AgentMessage;
-}
 
 function buildHistory(turnCount: number): AgentMessage[] {
   const history: AgentMessage[] = [];
@@ -108,59 +93,118 @@ describe('partitionHistory', () => {
     expect(preserved.length).toBe(6);
   });
 
-  it('does not split between a tool_use and its tool_result', () => {
-    // Build history where the naive split lands on a tool_result
-    // [0] user, [1] assistant, [2] tool_use, [3] tool_result, [4] assistant, [5] user
+  it('does not split between a toolCall message and its toolResult', () => {
+    // Build history where the naive split lands on a toolResult
+    // [0] user, [1] assistant, [2] toolCall, [3] toolResult, [4] assistant, [5] user
     const history: AgentMessage[] = [
       makeUserMsg('Hello'),
       makeAssistantMsg('Let me look that up'),
-      makeToolUseMsg('toolu_123'),
-      makeToolResultMsg('toolu_123', 'fetch result'),
+      makeToolCallMsg([{ id: 'call_1', name: 'WebFetch', arguments: { url: 'https://example.com' } }]),
+      makeToolResultMsg('call_1', 'WebFetch', 'fetch result'),
       makeAssistantMsg('Here is what I found'),
       makeUserMsg('Thanks'),
     ];
 
-    // preserveRecentTurns=3 => naive split at index 3 (the tool_result)
+    // preserveRecentTurns=3 => naive split at index 3 (the toolResult)
     const [target, preserved] = partitionHistory(history, 3);
 
     // Split should move back to index 2, keeping the pair together in preserved
     expect(target.length).toBe(2);
     expect(preserved.length).toBe(4);
-    expect(preserved[0]).toBe(history[2]); // tool_use
-    expect(preserved[1]).toBe(history[3]); // tool_result
+    expect(preserved[0]).toBe(history[2]); // toolCall
+    expect(preserved[1]).toBe(history[3]); // toolResult
+    assertNoOrphans(target);
+    assertNoOrphans(preserved);
   });
 
-  it('does not adjust split when it does not land on a tool_result', () => {
-    // [0] user, [1] tool_use, [2] tool_result, [3] assistant, [4] user, [5] assistant
+  it('does not split inside an N-parallel-call group', () => {
+    // One assistant message with 3 parallel toolCall blocks followed by
+    // 3 separate toolResult messages (the real pi-agent-core layout).
+    const history: AgentMessage[] = [
+      makeUserMsg('Hello'),                                       // 0
+      makeToolCallMsg([
+        { id: 'call_a', name: 'Read', arguments: { path: '/a' } },
+        { id: 'call_b', name: 'Grep', arguments: { pattern: 'x' } },
+        { id: 'call_c', name: 'Bash', arguments: { command: 'ls' } },
+      ], 'Fanning out.'),                                         // 1
+      makeToolResultMsg('call_a', 'Read', 'aaa'),                 // 2
+      makeToolResultMsg('call_b', 'Grep', 'bbb'),                 // 3
+      makeToolResultMsg('call_c', 'Bash', 'ccc'),                 // 4
+      makeAssistantMsg('All three done'),                         // 5
+      makeUserMsg('Great'),                                       // 6
+    ];
+
+    // preserveRecentTurns=4 => naive split at index 3 (middle toolResult).
+    // The split must move back to index 1 so the whole group is preserved.
+    const [target, preserved] = partitionHistory(history, 4);
+
+    expect(target.length).toBe(1);
+    expect(preserved.length).toBe(6);
+    expect(preserved[0]).toBe(history[1]);
+    assertNoOrphans(target);
+    assertNoOrphans(preserved);
+  });
+
+  it('does not adjust split when it does not land inside a group', () => {
+    // [0] user, [1] toolCall, [2] toolResult, [3] assistant, [4] user, [5] assistant
     const history: AgentMessage[] = [
       makeUserMsg('Hello'),
-      makeToolUseMsg('toolu_123'),
-      makeToolResultMsg('toolu_123', 'result'),
+      makeToolCallMsg([{ id: 'call_1', name: 'Read', arguments: { path: '/f' } }]),
+      makeToolResultMsg('call_1', 'Read', 'result'),
       makeAssistantMsg('Done'),
       makeUserMsg('Next'),
       makeAssistantMsg('Sure'),
     ];
 
-    // preserveRecentTurns=2 => split at index 4 (a user msg, not a tool_result)
+    // preserveRecentTurns=2 => split at index 4 (a user msg, not in a group)
     const [target, preserved] = partitionHistory(history, 2);
 
     expect(target.length).toBe(4);
     expect(preserved.length).toBe(2);
+    assertNoOrphans(target);
+    assertNoOrphans(preserved);
   });
 
   it('returns empty target if split adjustment would make target empty', () => {
-    // [0] tool_use, [1] tool_result, [2] user
+    // [0] toolCall, [1] toolResult, [2] user
     const history: AgentMessage[] = [
-      makeToolUseMsg('toolu_123'),
-      makeToolResultMsg('toolu_123', 'result'),
+      makeToolCallMsg([{ id: 'call_1', name: 'Read', arguments: {} }]),
+      makeToolResultMsg('call_1', 'Read', 'result'),
       makeUserMsg('Thanks'),
     ];
 
-    // preserveRecentTurns=2 => naive split at index 1 (tool_result), adjusted to 0
+    // preserveRecentTurns=2 => naive split at index 1 (toolResult), adjusted to 0
     const [target, preserved] = partitionHistory(history, 2);
 
     expect(target.length).toBe(0);
     expect(preserved.length).toBe(3);
+  });
+
+  it('never orphans a tool call or result at any split point', () => {
+    const history: AgentMessage[] = [
+      makeUserMsg('start'),
+      makeToolCallMsg([{ id: 'call_1', name: 'Read', arguments: { path: '/a' } }]),
+      makeToolResultMsg('call_1', 'Read', 'r1'),
+      makeAssistantMsg('thinking'),
+      makeToolCallMsg([
+        { id: 'call_2', name: 'Grep', arguments: { pattern: 'p' } },
+        { id: 'call_3', name: 'Glob', arguments: { pattern: '*.ts' } },
+      ]),
+      makeToolResultMsg('call_2', 'Grep', 'r2'),
+      makeToolResultMsg('call_3', 'Glob', 'r3'),
+      makeUserMsg('follow-up'),
+      makeToolCallMsg([{ id: 'call_4', name: 'Bash', arguments: { command: 'pwd' } }]),
+      makeToolResultMsg('call_4', 'Bash', 'r4'),
+      makeAssistantMsg('answer'),
+      makeUserMsg('latest'),
+    ];
+
+    for (let preserve = 1; preserve < history.length; preserve++) {
+      const [target, preserved] = partitionHistory(history, preserve);
+      expect(target.length + preserved.length).toBe(history.length);
+      assertNoOrphans(target);
+      assertNoOrphans(preserved);
+    }
   });
 });
 
@@ -204,6 +248,21 @@ describe('formatTurnsForSummarization', () => {
     expect(result).toContain('Hello');
     expect(result).toContain('[Turn 2] assistant:');
     expect(result).toContain('Hi there');
+  });
+
+  it('renders tool calls with name and arguments (pure tool-call turns are not empty)', () => {
+    const turns = [
+      makeToolCallMsg([{ id: 'call_1', name: 'Grep', arguments: { pattern: 'handleAuth', path: '/src' } }]),
+      makeToolResultMsg('call_1', 'Grep', 'auth.ts:42: handleAuth()'),
+    ];
+
+    const result = formatTurnsForSummarization(turns);
+    expect(result).toContain('[Tool call: Grep');
+    expect(result).toContain('handleAuth');
+    expect(result).toContain('/src');
+    // Tool result turns are labeled with the tool name
+    expect(result).toContain('toolResult (Grep)');
+    expect(result).toContain('auth.ts:42');
   });
 
   it('preserves full turn content without truncation', () => {
@@ -283,6 +342,50 @@ describe('runCompaction', () => {
     expect(result.oldestPreservedIndex).toBe(16);
     // No ISO timestamps in test messages, so timestamp should be null
     expect(result.oldestPreservedTimestamp).toBeNull();
+  });
+
+  it('produces a post-compaction history with no orphaned tool calls or results', async () => {
+    const history: AgentMessage[] = [
+      makeUserMsg('start'),
+      makeAssistantMsg('working'),
+      makeToolCallMsg([
+        { id: 'call_a', name: 'Read', arguments: { path: '/a' } },
+        { id: 'call_b', name: 'Read', arguments: { path: '/b' } },
+      ]),
+      makeToolResultMsg('call_a', 'Read', 'aaa'),
+      makeToolResultMsg('call_b', 'Read', 'bbb'),
+      makeAssistantMsg('found it'),
+      makeUserMsg('now fix it'),
+    ];
+    // preserveRecentTurns=3 lands the naive split at index 4 (mid-group)
+    const config = { ...COMPACTION_DEFAULTS, preserveRecentTurns: 3 };
+
+    const { newHistory } = await runCompaction(history, config, complete);
+
+    // [summary] + preserved tail; the group must be intact in the new history
+    assertNoOrphans(newHistory);
+    expect(newHistory.filter(m => m.role === 'toolResult').length).toBe(2);
+  });
+
+  it('sends tool names and arguments to the summarizer', async () => {
+    const history: AgentMessage[] = [
+      makeUserMsg('look at the config'),
+      makeToolCallMsg([{ id: 'call_1', name: 'Read', arguments: { path: '/etc/app/config.yaml' } }]),
+      makeToolResultMsg('call_1', 'Read', 'timeout: 30'),
+      makeAssistantMsg('The timeout is 30s'),
+      makeUserMsg('ok'),
+      makeAssistantMsg('anything else?'),
+    ];
+    const config = { ...COMPACTION_DEFAULTS, preserveRecentTurns: 2 };
+
+    await runCompaction(history, config, complete);
+
+    const callArgs = (complete as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    const sentText = (callArgs.messages as Array<{ content: string }>)[0]!.content;
+    expect(sentText).toContain('[Tool call: Read');
+    expect(sentText).toContain('/etc/app/config.yaml');
+    expect(sentText).toContain('toolResult (Read)');
+    expect(sentText).toContain('timeout: 30');
   });
 
   it('calls the LLM complete function with the summarization prompt', async () => {

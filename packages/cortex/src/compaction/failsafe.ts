@@ -3,7 +3,9 @@
  *
  * Last-resort truncation when Layer 2 fails or context is still too large.
  * Drops the oldest conversation turns purely mechanically (no LLM call).
- * Preserves structural integrity: tool_use/tool_result pairs are dropped together.
+ * Preserves structural integrity: an assistant tool call message and its
+ * consecutive toolResult messages form an atomic group that is dropped
+ * together or not at all.
  *
  * Triggers at 90% of context window (configurable), or reactively when
  * the API returns a context overflow error.
@@ -21,7 +23,8 @@
 import type { AgentMessage } from '../context-manager.js';
 import type { FailsafeConfig } from '../types.js';
 import { estimateTokens } from '../token-estimator.js';
-import { isToolResultMessage, isToolUseMessage, extractTextContent } from './microcompaction.js';
+import { extractTextContent } from './microcompaction.js';
+import { findToolCallGroups } from './tool-call-groups.js';
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -54,39 +57,14 @@ export interface FailsafeTruncationResult {
 }
 
 /**
- * Find structural pairs in conversation history.
- * A tool_use message and its corresponding tool_result form a pair.
- * When dropping one, we must drop both.
- *
- * Returns indices that should be dropped together for each index.
- * If a message at index i is part of a pair, pairMap[i] contains
- * all indices in that pair.
- */
-function findStructuralPairs(history: AgentMessage[]): Map<number, number[]> {
-  const pairMap = new Map<number, number[]>();
-
-  for (let i = 0; i < history.length; i++) {
-    const msg = history[i]!;
-
-    if (isToolUseMessage(msg)) {
-      // Look for the corresponding tool_result in the next message
-      if (i + 1 < history.length && isToolResultMessage(history[i + 1]!)) {
-        const pair = [i, i + 1];
-        pairMap.set(i, pair);
-        pairMap.set(i + 1, pair);
-      }
-    }
-  }
-
-  return pairMap;
-}
-
-/**
  * Perform emergency truncation on conversation history.
  *
- * Drops the oldest turns (preserving structural pairs) until the
- * estimated token count drops below the threshold, or until only
- * the preserved tail remains.
+ * Drops the oldest turns until the estimated token count drops below the
+ * threshold, or until only the preserved tail remains. Tool call groups
+ * (an assistant message with 'toolCall' blocks plus its consecutive
+ * toolResult messages) are dropped atomically: either the whole group is
+ * removed or the whole group is kept, so truncation can never orphan a
+ * tool call or a tool result.
  *
  * @param history - Conversation history (post-slot region)
  * @param contextWindow - Total context window size in tokens
@@ -105,7 +83,7 @@ export function emergencyTruncate(
   }
 
   const targetTokens = contextWindow * threshold;
-  const pairMap = findStructuralPairs(history);
+  const groups = findToolCallGroups(history);
   const dropped = new Set<number>();
 
   // Calculate initial token estimate
@@ -124,10 +102,10 @@ export function emergencyTruncate(
     }
 
     // Get all indices that must be dropped together
-    const pair = pairMap.get(i);
-    const indicesToDrop = pair ?? [i];
+    const group = groups.get(i);
+    const indicesToDrop = group ?? [i];
 
-    // Check that none of the pair indices are in the preserved tail
+    // A group that reaches into the preserved tail is kept intact
     const canDrop = indicesToDrop.every(idx => idx < preserveFrom);
     if (!canDrop) {
       i++;
