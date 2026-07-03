@@ -5,15 +5,13 @@
  * `git commit *`). A naive `startsWith` check is unsafe: the shell treats
  * `&&`, `||`, `;`, `|`, `&`, and command substitution as command boundaries,
  * so `git status && rm -rf /` would match a `git *` rule even though it runs a
- * second, unrelated command. These helpers split a command into its individual
- * simple-commands (quote-aware, recursing into substitutions) so each piece can
- * be evaluated against rules independently.
- *
- * This is intentionally a focused splitter, not a full bash parser. When it
- * cannot confidently parse something it fails safe: ambiguous input yields
- * segments that won't match a narrow prefix rule, which results in a permission
- * prompt rather than a silent auto-allow.
+ * second, unrelated command. The quote-aware splitter lives in
+ * `@animus-labs/cortex` (shared with the catastrophic-command floor) and is
+ * re-exported here; this module keeps the permission-specific pieces: safe env
+ * var stripping and "always allow" prefix suggestion.
  */
+
+export { splitBashCommand, isCompoundBash } from '@animus-labs/cortex';
 
 /**
  * Second-token shape that qualifies as a "subcommand" (e.g. `commit`, `run`,
@@ -40,6 +38,32 @@ export const BARE_SHELL_PREFIXES = new Set<string>([
   'setsid', 'ionice', 'command', 'builtin',
   // Privilege escalation
   'sudo', 'doas', 'pkexec',
+]);
+
+/**
+ * Destructive or exfiltration-capable commands for which we never suggest an
+ * "always allow" prefix. A one-click `Bash(rm *)` rule combined with any
+ * residual parser gap would auto-approve a wipe; forcing these through the
+ * prompt every time (or through a hand-written rule) keeps the failure mode
+ * contained. The catastrophic floor still hard-blocks the irreversible
+ * subset regardless of rules.
+ */
+export const NO_SUGGEST_PREFIXES = new Set<string>([
+  // POSIX destructive
+  'rm', 'rmdir', 'shred', 'find', 'dd', 'chmod', 'chown', 'chgrp', 'tee',
+  'wipefs', 'blkdiscard', 'mkswap',
+  // Network exfiltration / arbitrary download
+  'curl', 'wget', 'scp', 'rsync',
+  // Windows / PowerShell destructive
+  'remove-item', 'ri', 'del', 'erase', 'rd',
+  'format', 'format-volume', 'clear-disk', 'remove-partition', 'diskpart',
+]);
+
+/** Git subcommands that discard or rewrite work; no one-click allow-rule. */
+export const NO_SUGGEST_GIT_SUBCOMMANDS = new Set<string>([
+  'clean', 'reset', 'checkout', 'restore', 'rebase', 'push', 'branch',
+  'stash', 'rm', 'prune', 'gc', 'reflog', 'filter-branch', 'filter-repo',
+  'update-ref', 'worktree',
 ]);
 
 /**
@@ -83,225 +107,14 @@ export function stripLeadingAssignments(command: string, safeOnly: boolean): str
   return s;
 }
 
-interface Balanced {
-  body: string;
-  end: number;
-}
-
-/**
- * Read a balanced `open`/`close` delimited region. `start` points at the first
- * character *after* the opening delimiter. Quote- and escape-aware so closing
- * delimiters inside strings don't end the region early. On unbalanced input,
- * consumes the rest of the string (fail safe).
- */
-function readBalanced(s: string, start: number, open: string, close: string): Balanced {
-  let depth = 1;
-  let i = start;
-  let quote: '"' | "'" | null = null;
-  while (i < s.length) {
-    const c = s[i]!;
-    if (quote) {
-      if (c === '\\' && quote === '"') { i += 2; continue; }
-      if (c === quote) quote = null;
-      i++;
-      continue;
-    }
-    if (c === '\\') { i += 2; continue; }
-    if (c === "'" || c === '"') { quote = c; i++; continue; }
-    if (c === open) { depth++; i++; continue; }
-    if (c === close) {
-      depth--;
-      if (depth === 0) return { body: s.slice(start, i), end: i };
-      i++;
-      continue;
-    }
-    i++;
-  }
-  return { body: s.slice(start), end: s.length - 1 };
-}
-
-/** Read a backtick-delimited region. `start` points just after the opening backtick. */
-function readBacktick(s: string, start: number): Balanced {
-  let i = start;
-  while (i < s.length) {
-    if (s[i] === '\\') { i += 2; continue; }
-    if (s[i] === '`') return { body: s.slice(start, i), end: i };
-    i++;
-  }
-  return { body: s.slice(start), end: s.length - 1 };
-}
-
-function scanInto(input: string, out: string[]): void {
-  let current = '';
-  const nested: string[] = [];
-  let i = 0;
-  const n = input.length;
-  let quote: '"' | "'" | null = null;
-
-  const flush = (): void => {
-    const t = current.trim();
-    if (t) out.push(t);
-    current = '';
-  };
-
-  while (i < n) {
-    const c = input[i]!;
-
-    // Backslash escape (literal next char) — not inside single quotes.
-    if (c === '\\' && quote !== "'") {
-      current += c;
-      if (i + 1 < n) { current += input[i + 1]; i += 2; } else { i += 1; }
-      continue;
-    }
-
-    if (quote === "'") {
-      current += c;
-      if (c === "'") quote = null;
-      i++;
-      continue;
-    }
-
-    if (quote === '"') {
-      if (c === '"') { current += c; quote = null; i++; continue; }
-      // Command substitution works inside double quotes too.
-      if (c === '$' && input[i + 1] === '(') {
-        if (input[i + 2] === '(') { // arithmetic $(( )) — not a command
-          const r = readBalanced(input, i + 1, '(', ')');
-          current += input.slice(i, r.end + 1);
-          i = r.end + 1;
-          continue;
-        }
-        const r = readBalanced(input, i + 2, '(', ')');
-        nested.push(r.body);
-        current += ' ';
-        i = r.end + 1;
-        continue;
-      }
-      if (c === '`') {
-        const r = readBacktick(input, i + 1);
-        nested.push(r.body);
-        current += ' ';
-        i = r.end + 1;
-        continue;
-      }
-      current += c;
-      i++;
-      continue;
-    }
-
-    // Not currently inside quotes.
-    if (c === "'" || c === '"') { quote = c; current += c; i++; continue; }
-
-    // Command substitution / arithmetic.
-    if (c === '$' && input[i + 1] === '(') {
-      if (input[i + 2] === '(') {
-        const r = readBalanced(input, i + 1, '(', ')');
-        current += input.slice(i, r.end + 1);
-        i = r.end + 1;
-        continue;
-      }
-      const r = readBalanced(input, i + 2, '(', ')');
-      nested.push(r.body);
-      current += ' ';
-      i = r.end + 1;
-      continue;
-    }
-    if (c === '`') {
-      const r = readBacktick(input, i + 1);
-      nested.push(r.body);
-      current += ' ';
-      i = r.end + 1;
-      continue;
-    }
-    // Process substitution <( ) >( ).
-    if ((c === '<' || c === '>') && input[i + 1] === '(') {
-      const r = readBalanced(input, i + 2, '(', ')');
-      nested.push(r.body);
-      current += ' ';
-      i = r.end + 1;
-      continue;
-    }
-    // Subshell at command position.
-    if (c === '(' && current.trim() === '') {
-      const r = readBalanced(input, i + 1, '(', ')');
-      nested.push(r.body);
-      i = r.end + 1;
-      continue;
-    }
-
-    // Redirections: keep operator and any &fd attached so the `&` in `2>&1`
-    // and `&>` is not mistaken for a background/control operator below.
-    if (c === '>' || c === '<') {
-      current += c;
-      i++;
-      if (c === '>' && input[i] === '>') { current += '>'; i++; }
-      if (input[i] === '&') {
-        current += '&';
-        i++;
-        if (input[i] !== undefined && /\d/.test(input[i]!)) { current += input[i]; i++; }
-      }
-      continue;
-    }
-
-    // Control operators that separate commands.
-    if (c === '&') {
-      if (input[i + 1] === '>') { // &> or &>> redirect, not background
-        current += '&>';
-        i += 2;
-        if (input[i] === '>') { current += '>'; i++; }
-        continue;
-      }
-      flush();
-      i += input[i + 1] === '&' ? 2 : 1; // && or single &
-      continue;
-    }
-    if (c === '|') {
-      flush();
-      i += (input[i + 1] === '|' || input[i + 1] === '&') ? 2 : 1; // || or |& or |
-      continue;
-    }
-    if (c === ';') { flush(); i++; continue; }
-    if (c === '\n') { flush(); i++; continue; }
-
-    current += c;
-    i++;
-  }
-  flush();
-
-  for (const body of nested) scanInto(body, out);
-}
-
-/**
- * Split a shell command into its individual simple-commands.
- *
- * Splits on unquoted `&&`, `||`, `;`, `|`, `|&`, `&`, and newlines, and
- * extracts the bodies of command substitutions (`$(...)`, backticks), process
- * substitutions, and subshells as additional commands. The contents of quotes
- * are preserved on their owning command; redirections stay attached.
- *
- * Always returns at least one element (the trimmed input) so callers can rely
- * on a non-empty result.
- */
-export function splitBashCommand(command: string): string[] {
-  const out: string[] = [];
-  scanInto(command, out);
-  if (out.length > 0) return out;
-  const trimmed = command.trim();
-  return trimmed ? [trimmed] : [];
-}
-
-/** True if the command contains more than one simple-command. */
-export function isCompoundBash(command: string): boolean {
-  return splitBashCommand(command).length > 1;
-}
-
 /**
  * Suggest an "always allow" prefix pattern for a Bash command.
  *
  * Produces a two-word prefix (`git commit *`) when the second token looks like
  * a subcommand, otherwise a one-word prefix (`ls *`). Returns '' (no
- * suggestion) for bare shells/wrappers and for commands led by an unsafe env
- * var, since no safe prefix exists for those.
+ * suggestion) for bare shells/wrappers, destructive commands, destructive git
+ * subcommands, and commands led by an unsafe env var, since no safe prefix
+ * exists for those.
  */
 export function extractBashPrefix(command: string): string {
   const stripped = stripLeadingAssignments(command.trim(), true);
@@ -314,7 +127,14 @@ export function extractBashPrefix(command: string): string {
   if (!cmd) return '';
   if (BARE_SHELL_PREFIXES.has(cmd)) return '';
 
+  const cmdLower = cmd.toLowerCase();
+  if (NO_SUGGEST_PREFIXES.has(cmdLower) || cmdLower.startsWith('mkfs')) return '';
+
   const second = tokens[1];
+  if (cmdLower === 'git' && second && NO_SUGGEST_GIT_SUBCOMMANDS.has(second.toLowerCase())) {
+    return '';
+  }
+
   if (second && SUBCOMMAND_RE.test(second)) return `${cmd} ${second} *`;
   return `${cmd} *`;
 }
