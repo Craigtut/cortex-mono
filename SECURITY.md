@@ -1,14 +1,5 @@
 # Security Policy
 
-## Supported Versions
-
-| Version | Supported |
-|---------|-----------|
-| 0.1.x (latest) | Yes |
-| < 0.1.0 | No |
-
-Only the latest 0.1.x release receives security fixes.
-
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability, please report it responsibly:
