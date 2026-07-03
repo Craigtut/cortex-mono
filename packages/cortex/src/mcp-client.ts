@@ -106,6 +106,47 @@ function redactTransportConfig(config: McpTransportConfig): McpRedactedTransport
   return { ...rest, hasHeaders: headers !== undefined && Object.keys(headers).length > 0 };
 }
 
+/**
+ * Deep structural equality for two full MCP transport configs, INCLUDING the
+ * secret-bearing fields (`env`, `headers`). Used only inside the manager by
+ * {@link McpClientManager.configMatches}, so secrets take part in the
+ * comparison but never leave the manager.
+ */
+function transportConfigsEqual(a: McpTransportConfig, b: McpTransportConfig): boolean {
+  if (a.transport !== b.transport) return false;
+  if (a.transport === 'stdio' && b.transport === 'stdio') {
+    if (a.command !== b.command) return false;
+    if (a.cwd !== b.cwd) return false;
+    if (a.toolTimeoutMs !== b.toolTimeoutMs) return false;
+    if (!stringArrayEqual(a.args ?? [], b.args ?? [])) return false;
+    return stringRecordEqual(a.env ?? {}, b.env ?? {});
+  }
+  if (a.transport === 'http' && b.transport === 'http') {
+    if (a.url !== b.url) return false;
+    if (a.toolTimeoutMs !== b.toolTimeoutMs) return false;
+    return stringRecordEqual(a.headers ?? {}, b.headers ?? {});
+  }
+  return false;
+}
+
+function stringArrayEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function stringRecordEqual(a: Record<string, string>, b: Record<string, string>): boolean {
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (const key of keysA) {
+    if (a[key] !== b[key]) return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // McpClientManager
 // ---------------------------------------------------------------------------
@@ -332,6 +373,26 @@ export class McpClientManager {
       });
     }
     return states;
+  }
+
+  /**
+   * Whether the live config for `serverName` structurally matches `desired`.
+   *
+   * Compares every field of the stored connection config, INCLUDING the
+   * secret-bearing `env` (stdio) and `headers` (http). The secrets take part in
+   * the comparison but never leave the manager: only a boolean is returned.
+   * Consumers (e.g. cortex-code's MCP reconciler and `/mcp-reload`) call this to
+   * decide whether a server must be reconnected after its on-disk config
+   * changed, without ever reading the stored secrets back out via
+   * {@link getConnectionStates} (which is redacted).
+   *
+   * Returns false when no server is registered under `serverName`; there is
+   * nothing to match, so the caller should treat it as a change.
+   */
+  configMatches(serverName: string, desired: McpTransportConfig): boolean {
+    const conn = this.connections.get(serverName);
+    if (!conn) return false;
+    return transportConfigsEqual(conn.config, desired);
   }
 
   /**

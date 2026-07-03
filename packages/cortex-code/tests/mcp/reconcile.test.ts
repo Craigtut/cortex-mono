@@ -5,7 +5,7 @@ import type {
   McpRedactedTransportConfig,
   McpTransportConfig,
 } from '@animus-labs/cortex';
-import { applyReconcile, configsEqual, redactedConfigMatches } from '../../src/mcp/reconcile.js';
+import { applyReconcile } from '../../src/mcp/reconcile.js';
 import type { DiscoveredMcpServer } from '../../src/discovery/mcp.js';
 
 // ---------------------------------------------------------------------------
@@ -20,6 +20,39 @@ function redact(config: McpTransportConfig): McpRedactedTransportConfig {
   }
   const { headers, ...rest } = config;
   return { ...rest, hasHeaders: headers !== undefined && Object.keys(headers).length > 0 };
+}
+
+function recordEqual(a: Record<string, string>, b: Record<string, string>): boolean {
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  return keysA.every((k) => a[k] === b[k]);
+}
+
+/**
+ * Mirror of the McpClientManager's internal full-config comparison (including
+ * secret env/headers). The real comparison lives in the manager and is
+ * unit-tested in packages/cortex/tests/unit/mcp-client.test.ts; here it backs
+ * the fake agent's `mcpConfigMatches` so reconcile's decisions can be exercised
+ * against full configs, exactly as production does.
+ */
+function fullConfigsEqual(a: McpTransportConfig, b: McpTransportConfig): boolean {
+  if (a.transport !== b.transport) return false;
+  if (a.transport === 'stdio' && b.transport === 'stdio') {
+    if (a.command !== b.command) return false;
+    if (a.cwd !== b.cwd) return false;
+    if (a.toolTimeoutMs !== b.toolTimeoutMs) return false;
+    const argsA = a.args ?? [];
+    const argsB = b.args ?? [];
+    if (argsA.length !== argsB.length || !argsA.every((v, i) => v === argsB[i])) return false;
+    return recordEqual(a.env ?? {}, b.env ?? {});
+  }
+  if (a.transport === 'http' && b.transport === 'http') {
+    if (a.url !== b.url) return false;
+    if (a.toolTimeoutMs !== b.toolTimeoutMs) return false;
+    return recordEqual(a.headers ?? {}, b.headers ?? {});
+  }
+  return false;
 }
 
 function fakeAgent(initial: Array<{ name: string; config: McpTransportConfig }> = []): {
@@ -40,6 +73,7 @@ function fakeAgent(initial: Array<{ name: string; config: McpTransportConfig }> 
   const agent = {
     connectMcpServer: connect,
     disconnectMcpServer: disconnect,
+    // Redacted, exactly like production: reconcile only reads server names here.
     getMcpServerStates: (): McpConnectionState[] =>
       [...state.entries()].map(([name, config]) => ({
         serverName: name,
@@ -48,6 +82,14 @@ function fakeAgent(initial: Array<{ name: string; config: McpTransportConfig }> 
         reconnectAttempts: 0,
         toolNames: [],
       })),
+    // Full-config comparison against the (secret-bearing) stored config, which
+    // never leaves the manager in production. This is what restores change
+    // detection for secret value/key edits.
+    mcpConfigMatches: (serverName: string, desired: McpTransportConfig): boolean => {
+      const stored = state.get(serverName);
+      if (!stored) return false;
+      return fullConfigsEqual(stored, desired);
+    },
   } as unknown as CortexAgent;
   return { agent, connect, disconnect };
 }
@@ -61,6 +103,18 @@ function stdioServer(
     name,
     source,
     config: { transport: 'stdio', command: 'node', args: ['s.js'], ...overrides },
+  };
+}
+
+function httpServer(
+  name: string,
+  source: 'global' | 'project',
+  overrides: Partial<Extract<McpTransportConfig, { transport: 'http' }>> = {},
+): DiscoveredMcpServer {
+  return {
+    name,
+    source,
+    config: { transport: 'http', url: 'http://svc/mcp', ...overrides },
   };
 }
 
@@ -124,6 +178,75 @@ describe('applyReconcile', () => {
     expect(result.updated).toEqual(['svc']);
   });
 
+  // ---------------------------------------------------------------------------
+  // Secret change detection. reconcile compares against the manager's FULL
+  // stored config via agent.mcpConfigMatches, so env/header edits reconnect even
+  // though getMcpServerStates is redacted. Both the file watcher and the manual
+  // /mcp-reload command funnel through applyReconcile, so these cover both paths.
+  // ---------------------------------------------------------------------------
+
+  it('reconnects when only an env value changed (secret rotation)', async () => {
+    const { agent, connect, disconnect } = fakeAgent([
+      { name: 'svc', config: { transport: 'stdio', command: 'node', args: ['s.js'], env: { TOKEN: 'old' } } },
+    ]);
+    const desired = [stdioServer('svc', 'global', { env: { TOKEN: 'new' } })];
+    const result = await applyReconcile(agent, '/repo', desired, undefined, log);
+    expect(disconnect).toHaveBeenCalledWith('svc');
+    expect(connect).toHaveBeenCalledWith('svc', desired[0].config);
+    expect(result.updated).toEqual(['svc']);
+  });
+
+  it('reconnects when an env key is added', async () => {
+    const { agent, connect, disconnect } = fakeAgent([
+      { name: 'svc', config: { transport: 'stdio', command: 'node', args: ['s.js'], env: { A: '1' } } },
+    ]);
+    const desired = [stdioServer('svc', 'global', { env: { A: '1', B: '2' } })];
+    const result = await applyReconcile(agent, '/repo', desired, undefined, log);
+    expect(disconnect).toHaveBeenCalledWith('svc');
+    expect(result.updated).toEqual(['svc']);
+  });
+
+  it('reconnects when an env key is removed', async () => {
+    const { agent, disconnect } = fakeAgent([
+      { name: 'svc', config: { transport: 'stdio', command: 'node', args: ['s.js'], env: { A: '1', B: '2' } } },
+    ]);
+    const desired = [stdioServer('svc', 'global', { env: { A: '1' } })];
+    const result = await applyReconcile(agent, '/repo', desired, undefined, log);
+    expect(disconnect).toHaveBeenCalledWith('svc');
+    expect(result.updated).toEqual(['svc']);
+  });
+
+  it('reconnects when an env key is renamed', async () => {
+    const { agent, disconnect } = fakeAgent([
+      { name: 'svc', config: { transport: 'stdio', command: 'node', args: ['s.js'], env: { OLD: '1' } } },
+    ]);
+    const desired = [stdioServer('svc', 'global', { env: { NEW: '1' } })];
+    const result = await applyReconcile(agent, '/repo', desired, undefined, log);
+    expect(disconnect).toHaveBeenCalledWith('svc');
+    expect(result.updated).toEqual(['svc']);
+  });
+
+  it('reconnects when an http header value changed', async () => {
+    const { agent, disconnect } = fakeAgent([
+      { name: 'api', config: { transport: 'http', url: 'http://svc/mcp', headers: { Authorization: 'Bearer old' } } },
+    ]);
+    const desired = [httpServer('api', 'global', { headers: { Authorization: 'Bearer new' } })];
+    const result = await applyReconcile(agent, '/repo', desired, undefined, log);
+    expect(disconnect).toHaveBeenCalledWith('api');
+    expect(result.updated).toEqual(['api']);
+  });
+
+  it('leaves a server unchanged when the full config including env is identical', async () => {
+    const { agent, connect, disconnect } = fakeAgent([
+      { name: 'svc', config: { transport: 'stdio', command: 'node', args: ['s.js'], env: { A: '1' } } },
+    ]);
+    const desired = [stdioServer('svc', 'global', { env: { A: '1' } })];
+    const result = await applyReconcile(agent, '/repo', desired, undefined, log);
+    expect(connect).not.toHaveBeenCalled();
+    expect(disconnect).not.toHaveBeenCalled();
+    expect(result.unchanged).toEqual(['svc']);
+  });
+
   it('records a per-server error when connect fails but continues other work', async () => {
     const { agent, connect, disconnect } = fakeAgent();
     connect.mockImplementationOnce(async () => {
@@ -139,126 +262,3 @@ describe('applyReconcile', () => {
   });
 });
 
-describe('configsEqual', () => {
-  it('treats identical stdio configs as equal', () => {
-    expect(
-      configsEqual(
-        { transport: 'stdio', command: 'node', args: ['a'], env: { K: '1' } },
-        { transport: 'stdio', command: 'node', args: ['a'], env: { K: '1' } },
-      ),
-    ).toBe(true);
-  });
-
-  it('detects timeout changes', () => {
-    expect(
-      configsEqual(
-        { transport: 'stdio', command: 'node', toolTimeoutMs: 60_000 },
-        { transport: 'stdio', command: 'node', toolTimeoutMs: 600_000 },
-      ),
-    ).toBe(false);
-  });
-
-  it('detects env key/value changes', () => {
-    expect(
-      configsEqual(
-        { transport: 'stdio', command: 'node', env: { A: '1' } },
-        { transport: 'stdio', command: 'node', env: { A: '2' } },
-      ),
-    ).toBe(false);
-    expect(
-      configsEqual(
-        { transport: 'stdio', command: 'node' },
-        { transport: 'stdio', command: 'node', env: { A: '1' } },
-      ),
-    ).toBe(false);
-  });
-
-  it('treats different transports as not equal', () => {
-    expect(
-      configsEqual(
-        { transport: 'stdio', command: 'node' },
-        { transport: 'http', url: 'http://x' },
-      ),
-    ).toBe(false);
-  });
-
-  it('compares http urls and headers', () => {
-    expect(
-      configsEqual(
-        { transport: 'http', url: 'http://x', headers: { A: '1' } },
-        { transport: 'http', url: 'http://x', headers: { A: '1' } },
-      ),
-    ).toBe(true);
-    expect(
-      configsEqual(
-        { transport: 'http', url: 'http://x' },
-        { transport: 'http', url: 'http://y' },
-      ),
-    ).toBe(false);
-  });
-});
-
-describe('redactedConfigMatches', () => {
-  it('matches when non-secret fields are equal and env presence agrees', () => {
-    expect(
-      redactedConfigMatches(
-        { transport: 'stdio', command: 'node', args: ['a'], hasEnv: true },
-        { transport: 'stdio', command: 'node', args: ['a'], env: { K: '1' } },
-      ),
-    ).toBe(true);
-  });
-
-  it('detects command, arg, cwd, and timeout changes', () => {
-    expect(
-      redactedConfigMatches(
-        { transport: 'stdio', command: '/bin/old', hasEnv: false },
-        { transport: 'stdio', command: '/bin/new' },
-      ),
-    ).toBe(false);
-    expect(
-      redactedConfigMatches(
-        { transport: 'stdio', command: 'node', toolTimeoutMs: 60_000, hasEnv: false },
-        { transport: 'stdio', command: 'node', toolTimeoutMs: 600_000 },
-      ),
-    ).toBe(false);
-  });
-
-  it('detects env presence changes (added or removed env block)', () => {
-    expect(
-      redactedConfigMatches(
-        { transport: 'stdio', command: 'node', hasEnv: false },
-        { transport: 'stdio', command: 'node', env: { A: '1' } },
-      ),
-    ).toBe(false);
-    expect(
-      redactedConfigMatches(
-        { transport: 'stdio', command: 'node', hasEnv: true },
-        { transport: 'stdio', command: 'node' },
-      ),
-    ).toBe(false);
-  });
-
-  it('compares http url and header presence', () => {
-    expect(
-      redactedConfigMatches(
-        { transport: 'http', url: 'http://x', hasHeaders: true },
-        { transport: 'http', url: 'http://x', headers: { A: '1' } },
-      ),
-    ).toBe(true);
-    expect(
-      redactedConfigMatches(
-        { transport: 'http', url: 'http://x', hasHeaders: false },
-        { transport: 'http', url: 'http://y' },
-      ),
-    ).toBe(false);
-  });
-
-  it('treats different transports as not equal', () => {
-    expect(
-      redactedConfigMatches(
-        { transport: 'stdio', command: 'node', hasEnv: false },
-        { transport: 'http', url: 'http://x' },
-      ),
-    ).toBe(false);
-  });
-});

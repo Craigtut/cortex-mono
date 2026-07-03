@@ -745,6 +745,79 @@ describe('McpClientManager', () => {
   });
 
   // -----------------------------------------------------------------------
+  // configMatches (full-config comparison, secrets stay internal)
+  // -----------------------------------------------------------------------
+
+  describe('configMatches', () => {
+    const base: McpStdioConfig = {
+      transport: 'stdio',
+      command: 'node',
+      args: ['server.js'],
+      env: { API_KEY: 'secret-1', REGION: 'us' },
+    };
+
+    it('returns true for an identical config (including env)', async () => {
+      await manager.connect('weather', base);
+      expect(manager.configMatches('weather', { ...base, env: { ...base.env } })).toBe(true);
+    });
+
+    it('returns false when an env value changed (secret rotation)', async () => {
+      await manager.connect('weather', base);
+      expect(
+        manager.configMatches('weather', { ...base, env: { API_KEY: 'secret-2', REGION: 'us' } }),
+      ).toBe(false);
+    });
+
+    it('returns false when an env key is added', async () => {
+      await manager.connect('weather', base);
+      expect(
+        manager.configMatches('weather', { ...base, env: { ...base.env, EXTRA: 'x' } }),
+      ).toBe(false);
+    });
+
+    it('returns false when an env key is removed', async () => {
+      await manager.connect('weather', base);
+      expect(manager.configMatches('weather', { ...base, env: { API_KEY: 'secret-1' } })).toBe(false);
+    });
+
+    it('returns false when an env key is renamed', async () => {
+      await manager.connect('weather', base);
+      expect(
+        manager.configMatches('weather', { ...base, env: { RENAMED: 'secret-1', REGION: 'us' } }),
+      ).toBe(false);
+    });
+
+    it('returns false when command, args, cwd, or timeout changed', async () => {
+      await manager.connect('weather', base);
+      expect(manager.configMatches('weather', { ...base, command: 'deno' })).toBe(false);
+      expect(manager.configMatches('weather', { ...base, args: ['other.js'] })).toBe(false);
+      expect(manager.configMatches('weather', { ...base, cwd: '/somewhere' })).toBe(false);
+      expect(manager.configMatches('weather', { ...base, toolTimeoutMs: 60_000 })).toBe(false);
+    });
+
+    it('compares http url and header values', async () => {
+      const httpBase: McpHttpConfig = {
+        transport: 'http',
+        url: 'http://localhost:9222/mcp',
+        headers: { Authorization: 'Bearer old' },
+      };
+      await manager.connect('browser', httpBase);
+      expect(manager.configMatches('browser', { ...httpBase, headers: { Authorization: 'Bearer old' } })).toBe(true);
+      expect(manager.configMatches('browser', { ...httpBase, headers: { Authorization: 'Bearer new' } })).toBe(false);
+      expect(manager.configMatches('browser', { ...httpBase, url: 'http://localhost:9999/mcp' })).toBe(false);
+    });
+
+    it('returns false when transport type differs', async () => {
+      await manager.connect('weather', base);
+      expect(manager.configMatches('weather', { transport: 'http', url: 'http://x/mcp' })).toBe(false);
+    });
+
+    it('returns false for an unknown server', () => {
+      expect(manager.configMatches('nonexistent', base)).toBe(false);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Reconnection
   // -----------------------------------------------------------------------
 

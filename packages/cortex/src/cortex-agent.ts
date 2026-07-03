@@ -2976,6 +2976,19 @@ export class CortexAgent {
   }
 
   /**
+   * Whether the live config for a connected MCP server structurally matches
+   * `config`. Delegates to the MCP client manager, which compares the full
+   * stored config (including secret `env`/`headers`) without exposing it. The
+   * hot-reload watcher and `/mcp-reload` use this to decide whether a server
+   * needs reconnecting after its on-disk config changed, since
+   * {@link getMcpServerStates} deliberately returns redacted configs. Returns
+   * false when no server is connected under `serverName`.
+   */
+  mcpConfigMatches(serverName: string, config: McpTransportConfig): boolean {
+    return this.mcpClientManager.configMatches(serverName, config);
+  }
+
+  /**
    * Register a callback fired when MCP tool servers emit
    * `notifications/progress` during a long-running `tools/call`. Consumers
    * wire this to whatever UI affordance they have for "still waiting…".

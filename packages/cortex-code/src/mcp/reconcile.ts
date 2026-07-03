@@ -15,12 +15,7 @@
  * `session.isRunning` and queue until `onLoopComplete`.
  */
 
-import type {
-  CortexAgent,
-  McpStdioConfig,
-  McpTransportConfig,
-  McpRedactedTransportConfig,
-} from '@animus-labs/cortex';
+import type { CortexAgent } from '@animus-labs/cortex';
 import { discoverMcpServers, type DiscoveredMcpServer } from '../discovery/mcp.js';
 import { checkProjectMcpTrust, trustProjectMcpConfig } from '../discovery/mcp-trust.js';
 
@@ -106,12 +101,14 @@ export async function applyReconcile(
     }
   }
 
-  // Index current and desired by server name. The live states carry a redacted
-  // config (secret env/headers withheld), so change detection below compares
-  // non-secret fields and secret *presence* rather than secret values.
-  const current = new Map<string, McpRedactedTransportConfig>();
+  // Index currently-connected server names and the desired set. The live states
+  // carry a redacted config (secret env/headers withheld), so we only read the
+  // names from them; change detection below asks the agent to compare the full
+  // stored config (secrets included) via `mcpConfigMatches`, which keeps the
+  // secrets inside the MCP client manager.
+  const currentNames = new Set<string>();
   for (const state of agent.getMcpServerStates()) {
-    current.set(state.serverName, state.config);
+    currentNames.add(state.serverName);
   }
   const desiredByName = new Map(desired.map((d) => [d.name, d]));
 
@@ -121,7 +118,7 @@ export async function applyReconcile(
   //    currently working." Otherwise a user who approves on startup, then
   //    dismisses a watcher-driven re-trust prompt, would unexpectedly lose
   //    their connected project servers.
-  for (const [name] of current) {
+  for (const name of currentNames) {
     if (!desiredByName.has(name)) {
       if (result.skippedDueToUntrustedProject.includes(name)) {
         result.unchanged.push(name);
@@ -143,8 +140,7 @@ export async function applyReconcile(
 
   // 2) Add or update servers in the desired set.
   for (const [name, discovered] of desiredByName) {
-    const currentConfig = current.get(name);
-    if (currentConfig === undefined) {
+    if (!currentNames.has(name)) {
       try {
         await agent.connectMcpServer(name, discovered.config);
         result.added.push(name);
@@ -158,7 +154,10 @@ export async function applyReconcile(
       }
       continue;
     }
-    if (!redactedConfigMatches(currentConfig, discovered.config)) {
+    // Full-config comparison inside the manager: detects any change to a
+    // secret value, args, cwd, url, timeout, or added/removed/renamed
+    // env/header keys. Both the file watcher and `/mcp-reload` reach this path.
+    if (!agent.mcpConfigMatches(name, discovered.config)) {
       try {
         await agent.disconnectMcpServer(name);
         await agent.connectMcpServer(name, discovered.config);
@@ -177,87 +176,4 @@ export async function applyReconcile(
   }
 
   return result;
-}
-
-/**
- * Change detection between a live (redacted) connection config and a freshly
- * discovered (full) config. The live config has its secret-bearing fields
- * withheld (`env` for stdio, `headers` for http), so this compares every
- * non-secret field exactly and compares secrets by *presence* only.
- *
- * Tradeoff: a change that only edits the value of an existing env var or header
- * (same keys) cannot be detected from the redacted state and will not trigger
- * an automatic disconnect+reconnect. Adding, removing, or renaming keys flips
- * the presence flag and is detected; any restart re-reads the config in full.
- */
-export function redactedConfigMatches(
-  current: McpRedactedTransportConfig,
-  desired: McpTransportConfig,
-): boolean {
-  if (current.transport !== desired.transport) return false;
-  if (current.transport === 'stdio' && desired.transport === 'stdio') {
-    if (current.command !== desired.command) return false;
-    if (current.cwd !== desired.cwd) return false;
-    if (current.toolTimeoutMs !== desired.toolTimeoutMs) return false;
-    if (!arrayEqual(current.args ?? [], desired.args ?? [])) return false;
-    const desiredHasEnv = desired.env !== undefined && Object.keys(desired.env).length > 0;
-    return current.hasEnv === desiredHasEnv;
-  }
-  if (current.transport === 'http' && desired.transport === 'http') {
-    if (current.url !== desired.url) return false;
-    if (current.toolTimeoutMs !== desired.toolTimeoutMs) return false;
-    const desiredHasHeaders =
-      desired.headers !== undefined && Object.keys(desired.headers).length > 0;
-    return current.hasHeaders === desiredHasHeaders;
-  }
-  return false;
-}
-
-/**
- * Stable structural equality for two full MCP transport configs, including
- * secret values. Retained as a utility for callers that hold both full configs
- * (e.g. tests). Reconciliation itself uses {@link redactedConfigMatches}
- * because the live connection state is redacted.
- */
-export function configsEqual(a: McpTransportConfig, b: McpTransportConfig): boolean {
-  if (a.transport !== b.transport) return false;
-  if (a.transport === 'stdio' && b.transport === 'stdio') {
-    return stdioEqual(a, b);
-  }
-  if (a.transport === 'http' && b.transport === 'http') {
-    return httpEqual(a, b);
-  }
-  return false;
-}
-
-function stdioEqual(a: McpStdioConfig, b: McpStdioConfig): boolean {
-  if (a.command !== b.command) return false;
-  if (a.cwd !== b.cwd) return false;
-  if (a.toolTimeoutMs !== b.toolTimeoutMs) return false;
-  if (!arrayEqual(a.args ?? [], b.args ?? [])) return false;
-  return recordEqual(a.env ?? {}, b.env ?? {});
-}
-
-function httpEqual(a: Extract<McpTransportConfig, { transport: 'http' }>, b: Extract<McpTransportConfig, { transport: 'http' }>): boolean {
-  if (a.url !== b.url) return false;
-  if (a.toolTimeoutMs !== b.toolTimeoutMs) return false;
-  return recordEqual(a.headers ?? {}, b.headers ?? {});
-}
-
-function arrayEqual<T>(a: T[], b: T[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
-
-function recordEqual(a: Record<string, string>, b: Record<string, string>): boolean {
-  const keysA = Object.keys(a);
-  const keysB = Object.keys(b);
-  if (keysA.length !== keysB.length) return false;
-  for (const key of keysA) {
-    if (a[key] !== b[key]) return false;
-  }
-  return true;
 }
