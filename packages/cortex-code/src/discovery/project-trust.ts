@@ -17,11 +17,18 @@
  * Persistence mirrors the old `trusted-mcp.json` store: a JSON map of project
  * path to the SHA-256 hashes of each trusted content kind, written 0600.
  *
- * TOCTOU note: callers pass the EXACT content they are about to act on / show
- * the user into both `checkProjectTrust` and `recordProjectTrust`. Trust is
- * decided and recorded against those identical bytes, never re-read from disk
- * at approval time, so a file swapped between the prompt and the click cannot
- * launder itself into the trust store.
+ * TOCTOU scope: callers pass the EXACT content they showed the user into both
+ * `checkProjectTrust` and `recordProjectTrust`, so trust is decided and recorded
+ * against identical bytes and a file swapped between the PROMPT and the CLICK
+ * cannot launder itself into the store. This does NOT cover a swap between
+ * startup-trust and later USE: hooks are read into memory at startup (a post-
+ * startup edit to hooks.json is simply not loaded until the next run), but
+ * skills are re-read lazily by `SkillRegistry.getSkillBody` at load_skill time,
+ * so a local write to a trusted skill's files AFTER startup runs unapproved
+ * bytes within the same session. Closing that window would require re-checking
+ * the signature at load time (e.g. via a consumer `beforeToolCall` guard on
+ * `load_skill`); it is left as a follow-up. The signature does re-flag such an
+ * edit on the NEXT session, and edits before startup are gated normally.
  */
 
 import { createHash } from 'node:crypto';
