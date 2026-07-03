@@ -916,6 +916,10 @@ function checkPosixRm(words: ShellWord[], ec: EvalContext, viaXargs: boolean): C
 
 function checkChmodFamily(verb: string, words: ShellWord[], ec: EvalContext): CatastrophicFinding | null {
   let recursive = false;
+  // When the mode/owner comes from a flag (--reference=FILE, or `chmod`'s
+  // --mode=, or chown's --from=), there is NO positional mode argument, so the
+  // first positional operand is already a TARGET and must not be sliced off.
+  let modeFromFlag = false;
   const operands: ShellWord[] = [];
   let afterDashDash = false;
 
@@ -925,13 +929,15 @@ function checkChmodFamily(verb: string, words: ShellWord[], ec: EvalContext): Ca
     if (afterDashDash) { operands.push(w); continue; }
     if (t === '--') { afterDashDash = true; continue; }
     if (/^--recursive(=|$)/.test(t) || (isCombinedShortFlags(t) && /[rR]/.test(t))) { recursive = true; continue; }
+    if (t === '--reference' || t === '--from' || t === '--mode') { modeFromFlag = true; i++; continue; }
+    if (/^--(reference|from|mode)=/.test(t)) { modeFromFlag = true; continue; }
     if (t.startsWith('-') && t.length > 1) continue;
     operands.push(w);
   }
 
   if (!recursive) return null;
-  // First operand is the mode/owner, not a path.
-  return evaluateDeleteTargets(operands.slice(1), ec, `recursive ${verb}`);
+  const targets = modeFromFlag ? operands : operands.slice(1);
+  return evaluateDeleteTargets(targets, ec, `recursive ${verb}`);
 }
 
 function checkShred(words: ShellWord[], ec: EvalContext, viaXargs: boolean): CatastrophicFinding | null {
