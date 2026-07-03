@@ -90,26 +90,33 @@ const PI_OAUTH_FAILURE_HTML = `<!doctype html>
 </body>
 </html>`;
 
-/** Bind a TCP listener on a fixed loopback port for preflight tests. */
-async function occupyPort(port: number): Promise<() => Promise<void>> {
-  const { createServer } = await import('node:net');
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, '127.0.0.1', resolve);
-  });
-  return () => new Promise<void>((resolve) => server.close(() => resolve()));
+/** A loopback OAuth callback server bound to an OS-assigned ephemeral port. */
+interface LocalOAuthServer {
+  /** The actual bound port. Feed this into the ProviderManager route so the
+   *  callback-page shim matches this server. */
+  port: number;
+  /** Issue a GET to this server and return the (possibly shim-rewritten) body. */
+  request: (path: string) => Promise<string>;
+  /** Stop the server. */
+  close: () => Promise<void>;
 }
 
-async function requestLocalOAuthPage(options: {
-  path?: string;
-  port?: number;
+/**
+ * Start a loopback HTTP server that serves a pi-ai style OAuth callback page.
+ *
+ * It listens on port 0, so the OS assigns a free ephemeral port that is unique
+ * across the whole machine. This is the crux of the parallel-safety fix: the
+ * previous helper bound the *fixed* production ports (53692 / 1455), which
+ * collide the moment two workers or two `vitest run` invocations overlap. An
+ * OS-assigned port never collides. The caller wires `port` into the manager's
+ * callback route so the shim still matches, exercising the exact same code
+ * path without a fixed socket.
+ */
+async function startLocalOAuthServer(options: {
   html?: string;
   contentType?: string;
-} = {}): Promise<string> {
+} = {}): Promise<LocalOAuthServer> {
   const { createServer } = await import('node:http');
-  const path = options.path ?? '/callback';
-  const port = options.port ?? 53692;
   const html = options.html ?? PI_OAUTH_SUCCESS_HTML;
   const contentType = options.contentType ?? 'text/html; charset=utf-8';
   const server = createServer((_req, res) => {
@@ -119,20 +126,33 @@ async function requestLocalOAuthPage(options: {
 
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(port, '127.0.0.1', resolve);
+    server.listen(0, '127.0.0.1', resolve);
   });
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
 
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}${path}`);
-    return await response.text();
-  } finally {
-    await new Promise<void>((resolve, reject) => {
-      server.close(err => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-  }
+  return {
+    port,
+    request: async (path: string) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`);
+      return await response.text();
+    },
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close(err => (err ? reject(err) : resolve()));
+    }),
+  };
+}
+
+/** A ProviderManager whose OAuth port probe never touches a real socket, so
+ *  unrelated OAuth tests can never be poisoned by real, worker-shared port
+ *  state. Optionally points a provider's callback route at an ephemeral port. */
+function makeProviderManager(
+  routes?: Record<string, { path: string; port: number }>,
+): ProviderManager {
+  return new ProviderManager({
+    probeCallbackPortInUse: async () => false,
+    ...(routes ? { oauthCallbackRoutes: routes } : {}),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +163,11 @@ describe('ProviderManager', () => {
   let pm: ProviderManager;
 
   beforeEach(() => {
-    pm = new ProviderManager();
+    // Stub the loopback port probe so OAuth tests never do a real TCP connect
+    // to the fixed callback ports. Under parallel execution another worker may
+    // legitimately hold 53692/1455, which would otherwise poison every
+    // anthropic/codex flow with a spurious `callback_port_in_use`.
+    pm = makeProviderManager();
     vi.clearAllMocks();
     mockGetSupportedThinkingLevels.mockReturnValue([]);
     mockGetModels.mockReturnValue([
@@ -389,9 +413,13 @@ describe('ProviderManager', () => {
     });
 
     it('renders a custom callback page for known pi-ai callback routes', async () => {
+      const oauthServer = await startLocalOAuthServer();
+      const localPm = makeProviderManager({
+        anthropic: { path: '/callback', port: oauthServer.port },
+      });
       let callbackHtml = '';
       mockLoginAnthropic.mockImplementation(async () => {
-        callbackHtml = await requestLocalOAuthPage();
+        callbackHtml = await oauthServer.request('/callback');
         return { accessToken: 'test-token' };
       });
 
@@ -403,16 +431,20 @@ describe('ProviderManager', () => {
         expect(context.heading).toBe('Authentication successful');
         expect(context.message).toBe('Anthropic authentication completed. You can close this window.');
         expect(context.callbackPath).toBe('/callback');
-        expect(context.callbackPort).toBe(53692);
+        expect(context.callbackPort).toBe(oauthServer.port);
         expect(context.defaultHtml).toContain('Authentication successful');
         return '<!doctype html><html><body>Cortex OAuth complete</body></html>';
       });
 
-      await pm.initiateOAuth('anthropic', {
-        onAuth: vi.fn(),
-        onPrompt: vi.fn(),
-        renderCallbackPage,
-      });
+      try {
+        await localPm.initiateOAuth('anthropic', {
+          onAuth: vi.fn(),
+          onPrompt: vi.fn(),
+          renderCallbackPage,
+        });
+      } finally {
+        await oauthServer.close();
+      }
 
       expect(renderCallbackPage).toHaveBeenCalledTimes(1);
       expect(callbackHtml).toContain('Cortex OAuth complete');
@@ -420,9 +452,13 @@ describe('ProviderManager', () => {
     });
 
     it('leaves non-matching callback responses unchanged', async () => {
+      const oauthServer = await startLocalOAuthServer();
+      const localPm = makeProviderManager({
+        anthropic: { path: '/callback', port: oauthServer.port },
+      });
       let callbackHtml = '';
       mockLoginAnthropic.mockImplementation(async () => {
-        callbackHtml = await requestLocalOAuthPage({ path: '/not-callback' });
+        callbackHtml = await oauthServer.request('/not-callback');
         return { accessToken: 'test-token' };
       });
 
@@ -430,29 +466,44 @@ describe('ProviderManager', () => {
         '<!doctype html><html><body>Cortex OAuth complete</body></html>'
       ));
 
-      await pm.initiateOAuth('anthropic', {
-        onAuth: vi.fn(),
-        onPrompt: vi.fn(),
-        renderCallbackPage,
-      });
+      try {
+        await localPm.initiateOAuth('anthropic', {
+          onAuth: vi.fn(),
+          onPrompt: vi.fn(),
+          renderCallbackPage,
+        });
+      } finally {
+        await oauthServer.close();
+      }
 
       expect(renderCallbackPage).not.toHaveBeenCalled();
       expect(callbackHtml).toContain('Anthropic authentication completed');
     });
 
     it('restores the callback page shim after login failure', async () => {
+      const oauthServer = await startLocalOAuthServer();
+      const localPm = makeProviderManager({
+        anthropic: { path: '/callback', port: oauthServer.port },
+      });
       const renderCallbackPage = vi.fn(() => (
         '<!doctype html><html><body>Cortex OAuth complete</body></html>'
       ));
       mockLoginAnthropic.mockRejectedValue(new Error('Login failed'));
 
-      await expect(pm.initiateOAuth('anthropic', {
+      await expect(localPm.initiateOAuth('anthropic', {
         onAuth: vi.fn(),
         onPrompt: vi.fn(),
         renderCallbackPage,
       })).rejects.toThrow('Login failed');
 
-      const callbackHtml = await requestLocalOAuthPage();
+      // The route port matches the live server, so an un-restored shim would
+      // rewrite this response. It staying unchanged proves the shim released.
+      let callbackHtml = '';
+      try {
+        callbackHtml = await oauthServer.request('/callback');
+      } finally {
+        await oauthServer.close();
+      }
       expect(renderCallbackPage).not.toHaveBeenCalled();
       expect(callbackHtml).toContain('Anthropic authentication completed');
     });
@@ -480,7 +531,10 @@ describe('ProviderManager', () => {
       const firstLogin = pm.initiateOAuth('anthropic', callbacks);
       await started;
 
-      const secondProviderManager = new ProviderManager();
+      // Stubbed probe on the second manager too, so this asserts the shim's
+      // "already active" guard rather than any real port state. No server is
+      // bound here: the shim is a process-wide ServerResponse.end patch.
+      const secondProviderManager = makeProviderManager();
       await expect(secondProviderManager.initiateOAuth('anthropic', callbacks))
         .rejects.toThrow('already active');
 
@@ -595,21 +649,21 @@ describe('ProviderManager', () => {
 
     it('fails fast with callback_port_in_use before opening a browser', async () => {
       // openai-codex callback port is 1455 (fixed in OAUTH_CALLBACK_ROUTES).
-      const release = await occupyPort(1455);
-      try {
-        await expect(
-          pm.initiateOAuth('openai-codex', { onAuth: vi.fn(), onPrompt: vi.fn() }),
-        ).rejects.toMatchObject({
-          name: 'OAuthError',
-          code: 'callback_port_in_use',
-          provider: 'openai-codex',
-          port: 1455,
-        });
-        // The browser/login must never start when the port is taken.
-        expect(mockLoginCodex).not.toHaveBeenCalled();
-      } finally {
-        await release();
-      }
+      // Stub the probe to report that port occupied instead of binding a real
+      // socket, so the assertion is deterministic under parallel execution.
+      const busyPm = new ProviderManager({
+        probeCallbackPortInUse: async (port) => port === 1455,
+      });
+      await expect(
+        busyPm.initiateOAuth('openai-codex', { onAuth: vi.fn(), onPrompt: vi.fn() }),
+      ).rejects.toMatchObject({
+        name: 'OAuthError',
+        code: 'callback_port_in_use',
+        provider: 'openai-codex',
+        port: 1455,
+      });
+      // The browser/login must never start when the port is taken.
+      expect(mockLoginCodex).not.toHaveBeenCalled();
     });
 
     it('times out a hung flow with OAuthError(timed_out)', async () => {
@@ -630,19 +684,21 @@ describe('ProviderManager', () => {
     it('fails immediately on a failed browser callback instead of hanging', async () => {
       // pi-ai serves its error page then hangs forever (never settles).
       // The render shim sees the error page; Cortex must reject right away.
+      const oauthServer = await startLocalOAuthServer({ html: PI_OAUTH_FAILURE_HTML });
+      const localPm = makeProviderManager({
+        'openai-codex': { path: '/auth/callback', port: oauthServer.port },
+      });
       mockLoginCodex.mockImplementation(async () => {
-        await requestLocalOAuthPage({
-          port: 1455,
-          path: '/auth/callback',
-          html: PI_OAUTH_FAILURE_HTML,
-        });
+        await oauthServer.request('/auth/callback');
         return new Promise(() => {});
       });
 
-      const err = await pm
+      const err = await localPm
         .initiateOAuth('openai-codex', { onAuth: vi.fn(), onPrompt: vi.fn() })
         .then(() => null)
         .catch((e: unknown) => e);
+
+      await oauthServer.close();
 
       expect(err).toBeInstanceOf(OAuthError);
       expect((err as OAuthError).code).toBe('callback_failed');

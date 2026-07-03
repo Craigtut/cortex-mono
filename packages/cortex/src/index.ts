@@ -349,6 +349,8 @@ export { ProviderManager, OAuthError } from './provider-manager.js';
 export type {
   OAuthErrorCode,
   IProviderManager,
+  ProviderManagerOptions,
+  OAuthCallbackRoute,
   OAuthCallbacks,
   OAuthAuthInfo,
   OAuthFlowType,
