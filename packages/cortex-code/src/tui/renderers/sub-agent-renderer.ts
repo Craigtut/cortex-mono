@@ -30,7 +30,8 @@ function extractTextContent(result: unknown): string {
 
 const subAgentRenderer: ToolRenderer = {
   renderCall(args: Record<string, unknown>, context: ToolRenderContext): ToolCallDisplay {
-    const instructions = String(args['instructions'] ?? '');
+    // Instructions are model-authored and rendered as the call description.
+    const instructions = sanitizeTerminalText(String(args['instructions'] ?? ''));
     const background = Boolean(args['background']);
     const modeLabel = background
       ? chalk.hex(context.theme.muted)(' [background]')

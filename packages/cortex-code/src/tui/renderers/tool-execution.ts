@@ -11,6 +11,7 @@ import type { Component, TUI } from '@earendil-works/pi-tui';
 import { estimateTokens, TOOL_RESULT_WORKING_TAGS_REMINDER } from '@animus-labs/cortex';
 import { ActivityLine } from './activity-line.js';
 import { getRenderer } from './registry.js';
+import { sanitizeTerminalText } from './sanitize-terminal.js';
 import { getToolTheme } from '../theme.js';
 import type {
   ToolRenderer,
@@ -248,8 +249,10 @@ export class ToolExecutionComponent implements Component {
           this.box.setBelowBox(display.belowBoxLines);
         }
       } else {
-        // Generic error display
-        const errorLines = this.lastError.split('\n');
+        // Generic error display for tools with no renderError (e.g. MCP tools
+        // via the generic renderer, TaskOutput). MCP error text is
+        // server-controlled, so strip control chars before rendering.
+        const errorLines = sanitizeTerminalText(this.lastError).split('\n');
         this.box.setContent(this.toolName.toLowerCase(), errorLines, '', this.status, this.durationMs);
       }
       return;

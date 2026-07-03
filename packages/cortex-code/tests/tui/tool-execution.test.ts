@@ -27,23 +27,18 @@ vi.mock('../../src/tui/renderers/activity-line.js', () => ({
 }));
 
 vi.mock('../../src/tui/renderers/registry.js', () => ({
-  getRenderer: () => ({
-    renderCall: () => ({
-      headerText: 'tool',
-      contentLines: [],
-      footerText: '',
-    }),
-    renderResult: () => ({
-      headerText: 'tool',
-      contentLines: [],
-      footerText: '',
-    }),
-    renderError: (error: string) => ({
-      headerText: 'tool',
-      contentLines: [error],
-      footerText: '',
-    }),
-  }),
+  getRenderer: (toolName: string) => {
+    const base = {
+      renderCall: () => ({ headerText: 'tool', contentLines: [], footerText: '' }),
+      renderResult: () => ({ headerText: 'tool', contentLines: [], footerText: '' }),
+    };
+    // 'NoRenderError' exercises the generic error fallback in rebuildDisplay.
+    if (toolName === 'NoRenderError') return base;
+    return {
+      ...base,
+      renderError: (error: string) => ({ headerText: 'tool', contentLines: [error], footerText: '' }),
+    };
+  },
 }));
 
 vi.mock('../../src/tui/theme.js', () => ({
@@ -129,6 +124,21 @@ describe('ToolExecutionComponent Write rejection detection', () => {
     );
 
     expect(lastStatus()).toBe('error');
+  });
+
+  it('sanitizes the generic error fallback for tools without a renderError', () => {
+    const tool = new ToolExecutionComponent('NoRenderError');
+    tool.start({});
+    setContentSpy.mockClear();
+    tool.fail('boom\x1b]0;evil\x07\x1b[31m\rX', 5);
+
+    const call = setContentSpy.mock.calls.at(-1)!;
+    const contentLines = call[1] as string[];
+    const joined = contentLines.join('\n');
+    expect(joined).not.toContain('\x1b');
+    expect(joined).not.toContain('\x07');
+    expect(joined).not.toContain('\r');
+    expect(joined).toContain('boom');
   });
 
   it('treats a truncate-to-empty write (0 bytes but a real diff) as success', () => {
