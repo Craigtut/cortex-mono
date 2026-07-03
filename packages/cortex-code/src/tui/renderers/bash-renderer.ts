@@ -8,6 +8,7 @@ import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDispla
 import type { BashDetails, BashStreamUpdate } from '@animus-labs/cortex';
 import { collapseContent } from './collapsible-content.js';
 import { StreamingBuffer } from './streaming-buffer.js';
+import { sanitizeTerminalText } from './sanitize-terminal.js';
 import { registerRenderer } from './registry.js';
 
 const ERROR_HEAD = 4;
@@ -75,7 +76,7 @@ const bashRenderer: ToolRenderer = {
       return { headerText: header, contentLines: [], footerText: '' };
     }
 
-    const rawText = extractTextContent(result);
+    const rawText = sanitizeTerminalText(extractTextContent(result));
     const text = stripTrailingExitCode(rawText, d?.exitCode) || '(no output)';
     const allLines = text.split('\n').filter(l => l.length > 0 || text.includes('\n'));
 
@@ -107,7 +108,7 @@ const bashRenderer: ToolRenderer = {
     // Use args object as stable WeakMap key (same reference across all updates for one tool call)
     const buffer = getOrCreateBuffer(context.args);
     if (stdout) {
-      buffer.append(stdout);
+      buffer.append(sanitizeTerminalText(stdout));
     }
 
     const visibleLines = buffer.getLines(STREAMING_WINDOW);
@@ -120,7 +121,7 @@ const bashRenderer: ToolRenderer = {
   },
 
   renderError(error: string, args: Record<string, unknown>, context: ToolRenderContext): ToolResultDisplay {
-    const errorLines = error.split('\n').map(line => chalk.hex(context.theme.error)(line));
+    const errorLines = sanitizeTerminalText(error).split('\n').map(line => chalk.hex(context.theme.error)(line));
 
     const { lines } = collapseContent(errorLines, {
       mode: 'head',

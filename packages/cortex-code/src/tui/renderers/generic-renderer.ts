@@ -7,6 +7,7 @@
 
 import type { ToolRenderer, ToolRenderContext, ToolCallDisplay, ToolResultDisplay } from './types.js';
 import { collapseContent } from './collapsible-content.js';
+import { sanitizeTerminalText } from './sanitize-terminal.js';
 
 const DEFAULT_COLLAPSED_LINES = 4;
 
@@ -53,7 +54,7 @@ export const genericRenderer: ToolRenderer = {
       text = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result ?? '');
     }
 
-    const allLines = text.split('\n');
+    const allLines = sanitizeTerminalText(text).split('\n');
     const { lines } = collapseContent(allLines, {
       mode: 'head',
       limit: DEFAULT_COLLAPSED_LINES,
