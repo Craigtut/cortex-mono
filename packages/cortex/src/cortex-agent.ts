@@ -3376,6 +3376,15 @@ export class CortexAgent {
           messages: Array<{ role: string; content: string }>;
         }),
         isAutoApprove: () => this.config.isAutoApprove?.() ?? false,
+        // Track spawned shell PIDs so destroy()'s force-kill deadline and
+        // the process-exit safety net cover background/auto-yielded
+        // commands, not just MCP subprocesses.
+        onProcessSpawned: (pid) => {
+          this.trackPid(pid);
+        },
+        onProcessExited: (pid) => {
+          this.untrackPid(pid);
+        },
         onBackgroundTaskComplete: (taskId) => {
           void this.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId });
         },

@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import { Type, type Static } from 'typebox';
 import type { CwdTracker } from '../shared/cwd-tracker.js';
 import type { ToolContentDetails, ToolExecuteContext } from '../../types.js';
+import { killProcessTree } from '../shared/process-tree.js';
 import { buildSafeEnv, runSafetyChecks } from './safety.js';
 import {
   type BackgroundTask,
@@ -618,31 +619,3 @@ export function createBashTool(config: BashToolConfig): {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Process tree cleanup
-// ---------------------------------------------------------------------------
-
-/**
- * Kill the entire process tree.
- * Unix: send SIGKILL to the process group.
- * Windows: use taskkill /F /T.
- */
-function killProcessTree(proc: child_process.ChildProcess): void {
-  if (!proc.pid) return;
-
-  try {
-    if (process.platform === 'win32') {
-      child_process.execFileSync('taskkill', ['/F', '/T', '/PID', String(proc.pid)], { stdio: 'ignore' });
-    } else {
-      // Kill the entire process group
-      process.kill(-proc.pid, 'SIGKILL');
-    }
-  } catch {
-    // Process may have already exited
-    try {
-      proc.kill('SIGKILL');
-    } catch {
-      // Ignore
-    }
-  }
-}

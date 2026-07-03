@@ -1081,6 +1081,57 @@ You have 12 emotions.`;
       expect(agent.state).toBe('destroyed');
     });
 
+    it('kills a background bash process and untracks its pid on destroy', async () => {
+      const isAlive = (pid: number): boolean => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      const agent = createTestCortexAgent(
+        piAgent,
+        createDefaultConfig({ workingDirectory: process.cwd() }),
+        [],
+        { enableSubAgentTool: false, enableLoadSkillTool: false },
+      );
+      agent.refreshTools();
+
+      const allTools = piAgent.state.tools as Array<{
+        name: string;
+        execute: (toolCallId: string, params: unknown) => Promise<{
+          details: { taskId: string | null };
+        }>;
+      }>;
+      const bashTool = allTools.find((tool) => tool.name === 'Bash');
+      expect(bashTool).toBeDefined();
+
+      const result = await bashTool!.execute('tc-bash-bg', { command: 'sleep 30', background: true });
+      const taskId = result.details.taskId as string;
+
+      const internal = agent as unknown as {
+        toolRuntime: { backgroundTasks: { get: (id: string) => { process: { pid?: number } } | undefined } };
+        trackedPids: Set<number>;
+      };
+      const pid = internal.toolRuntime.backgroundTasks.get(taskId)?.process.pid;
+      expect(pid).toBeGreaterThan(0);
+      // The spawned shell entered PID tracking (destroy/exit safety nets).
+      expect(internal.trackedPids.has(pid!)).toBe(true);
+      expect(isAlive(pid!)).toBe(true);
+
+      await agent.destroy();
+
+      // SIGKILL delivery, reaping, and the close-event untrack are async.
+      const deadline = Date.now() + 3000;
+      while ((isAlive(pid!) || internal.trackedPids.has(pid!)) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(isAlive(pid!)).toBe(false);
+      expect(internal.trackedPids.has(pid!)).toBe(false);
+    }, 10000);
+
     it('does not start a new loop for a background completion pending at destroy', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as {

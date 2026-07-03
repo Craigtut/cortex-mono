@@ -9,6 +9,7 @@ import type * as child_process from 'node:child_process';
 import { CwdTracker } from './shared/cwd-tracker.js';
 import { EditHistory } from './shared/edit-history.js';
 import { FileMutationLock } from './shared/file-mutation-lock.js';
+import { killProcessTree } from './shared/process-tree.js';
 import { ReadRegistry } from './shared/read-registry.js';
 import { WebFetchCache } from './web-fetch/cache.js';
 
@@ -63,6 +64,21 @@ export class BackgroundTaskStore {
         this.tasks.delete(id);
       }
     }
+  }
+
+  /**
+   * Kill the process tree of every task that has not completed, then drop
+   * all entries. Bash spawns detached on Unix, so without the group kill
+   * backgrounded and auto-yielded commands would outlive the agent.
+   */
+  killIncompleteAndClear(): void {
+    for (const task of this.tasks.values()) {
+      if (!task.completed) {
+        task.notified = true;
+        killProcessTree(task.process);
+      }
+    }
+    this.tasks.clear();
   }
 
   clear(): void {
@@ -134,7 +150,7 @@ export class CortexToolRuntime {
     this.readRegistry.clear();
     this.fileMutationLock.clear();
     this.editHistory.clear();
-    this.backgroundTasks.clear();
+    this.backgroundTasks.killIncompleteAndClear();
     this.webFetch.destroy();
   }
 }

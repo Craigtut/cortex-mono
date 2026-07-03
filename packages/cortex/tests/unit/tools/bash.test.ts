@@ -107,6 +107,36 @@ describe('Bash tool', () => {
     expect(result.details.taskId).not.toBeNull();
   });
 
+  it('kills incomplete background tasks when the runtime is destroyed', async () => {
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const runtime = new CortexToolRuntime(tmpDir);
+    const tool = createBashTool({ runtime });
+    const result = await tool.execute({ command: 'sleep 30', background: true });
+    const taskId = result.details.taskId as string;
+    const task = runtime.backgroundTasks.get(taskId);
+    expect(task).toBeDefined();
+    const pid = task!.process.pid!;
+    expect(isAlive(pid)).toBe(true);
+
+    runtime.destroy();
+
+    // SIGKILL delivery and reaping are asynchronous; poll briefly.
+    const deadline = Date.now() + 3000;
+    while (isAlive(pid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(isAlive(pid)).toBe(false);
+    expect(runtime.backgroundTasks.get(taskId)).toBeUndefined();
+  }, 10000);
+
   it('fires onBackgroundTaskComplete when a backgrounded command finishes', async () => {
     const runtime = new CortexToolRuntime(tmpDir);
     let completedId: string | null = null;
