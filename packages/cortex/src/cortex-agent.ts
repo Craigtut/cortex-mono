@@ -803,10 +803,27 @@ export class CortexAgent {
       );
     }
     if (this.loopGateDepth > 0) {
+      // Spurious-fail-fast note: re-prompting synchronously inside the .then
+      // of a just-resolved prompt() can land here while a no-op
+      // background-drain task is still queued (depth briefly > 0). It clears
+      // after one macrotask, so a caller that wants to chain a follow-up
+      // prompt should await a macrotask (or the delivery handler) first
+      // rather than calling prompt() from directly within the resolution.
       throw new Error(
         'Agent is already processing a prompt. Use steer() to inject input into ' +
         'the running loop, or wait for the current turn to complete.',
       );
+    }
+
+    // Install a fresh controller SYNCHRONOUSLY when the current one is
+    // already aborted. The loopGateDepth === 0 guard above guarantees no
+    // loop currently owns it, so this is safe. It makes a same-frame abort()
+    // (called after this prompt() but before the queued cycle dequeues) land
+    // on THIS turn's controller, so the cycle sees the abort at dequeue and
+    // cancels promptly instead of replacing a stale-aborted controller and
+    // running to completion un-aborted.
+    if (this.abortController.signal.aborted) {
+      this.abortController = new AbortController();
     }
 
     return this.enqueueLoopTask(() => this.runPromptCycle(input, options));
@@ -869,19 +886,39 @@ export class CortexAgent {
    * retries). Must be called while holding the loop gate; all mutation of
    * shared loop state (tool runtime, history boundary, prompting flag)
    * happens here, after the gate has been acquired.
+   *
+   * @param fromDrain - True for the background-completion delivery path,
+   *   which deliberately starts a fresh loop after an abort. The consumer
+   *   path (false) instead cancels a turn whose controller was aborted
+   *   before it dequeued (e.g. a same-frame prompt()+abort()).
    */
-  private async runPromptOnce(input: string, options?: DirectCompletionOptions): Promise<unknown> {
+  private async runPromptOnce(
+    input: string,
+    options?: DirectCompletionOptions,
+    fromDrain = false,
+  ): Promise<unknown> {
     // Transition to ACTIVE on first loop
     if (this.lifecycleState === 'created') {
       this.lifecycleState = 'active';
     }
 
-    // A previous turn's abort must not bleed into this one. The aborted
-    // controller is replaced here, at the start of the next turn, rather
-    // than inside abort(): resetting there raced the cancelled turn's own
-    // unwind and could reclassify it as a retryable failure. See abort().
+    // Abort visibility at dequeue. prompt() installs a fresh (non-aborted)
+    // controller synchronously, so if THIS controller is aborted here an
+    // abort() must have landed between enqueue and dequeue.
     if (this.abortController.signal.aborted) {
-      this.abortController = new AbortController();
+      if (fromDrain) {
+        // A scheduled drain delivers background results by starting a fresh
+        // loop even after an abort (matching the pre-gate "deliver when
+        // idle" behavior), so replace the aborted controller and proceed.
+        this.abortController = new AbortController();
+      } else {
+        // A consumer turn cancelled before it ever reached pi. Surface it
+        // like any other cancellation and never start the run.
+        const abortErr = new Error('Prompt aborted before it started');
+        abortErr.name = 'AbortError';
+        this.emitError(abortErr, true);
+        throw abortErr;
+      }
     }
 
     const effectiveRetention = options?.cacheRetention ?? this._cacheRetention;
@@ -1200,14 +1237,19 @@ export class CortexAgent {
    * Inject a steering message into the running agentic loop.
    * Queues the message for pi-agent-core to inject after the current
    * assistant turn and any current tool batch finish.
-   * Only effective while a prompt() call is in progress.
+   * Only effective while a prompt() call is in progress or queued.
    *
-   * No-op if the agent is not currently running a prompt.
+   * No-op if the agent is not currently prompting.
    *
    * @param message - The message content to inject
    */
   steer(message: string): void {
-    if (!this._isPrompting) return; // no-op if not running
+    // A turn started via prompt() is deferred one microtask (it dequeues
+    // from the loop gate), so _isPrompting is still false in the same frame.
+    // Treat a non-empty gate (loopGateDepth > 0) as prompting too, so a
+    // same-frame prompt()+steer() reaches pi's steering queue (drained at
+    // loop start) instead of being silently dropped.
+    if (!this._isPrompting && this.loopGateDepth === 0) return;
     this.agent.steer({ role: 'user', content: message });
   }
 
@@ -2536,11 +2578,13 @@ export class CortexAgent {
     }
 
     // When no background delivery is pending, also wait for the gate to
-    // release the aborted cycle. From the unwound turn to the release there
-    // are only microtasks (an empty drain check), so this is bounded and a
-    // follow-up prompt() cannot spuriously fail fast on a stale gate. When
-    // deliveries ARE pending they start a fresh (non-aborted) loop, so
-    // return immediately rather than blocking abort() on it.
+    // release the aborted cycle so a follow-up prompt() cannot spuriously
+    // fail fast on a stale gate. This is bounded: the queued cycle is either
+    // the just-unwound running turn (its finally drain is an empty no-op
+    // before release) or a same-frame prompt() that has not started yet,
+    // which sees the aborted controller at dequeue and cancels without ever
+    // reaching pi. When deliveries ARE pending they start a fresh
+    // (non-aborted) loop, so return immediately rather than blocking on it.
     if (this.pendingBackgroundResults.length === 0) {
       await this.loopGateTail;
     }
@@ -4726,7 +4770,9 @@ export class CortexAgent {
     const message = parts.join('\n\n---\n\n');
     this.fireBackgroundResultDeliveryHandlers(taskIds);
     try {
-      await this.runPromptOnce(message);
+      // fromDrain: deliver via a fresh loop even if a prior turn was
+      // aborted; background completions are not cancelled by user abort.
+      await this.runPromptOnce(message, undefined, true);
     } finally {
       // Deliver anything that arrived during this delivery, even when it
       // failed, matching the pre-gate recursive prompt() behavior.

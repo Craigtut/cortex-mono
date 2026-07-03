@@ -31,6 +31,9 @@ function createMockPiAgent(options?: {
 }): MockPiAgent {
   let eventHandler: ((event: PiEvent) => void) | null = null;
   let idleResolve: (() => void) | null = null;
+  // Mirrors pi-agent-core: waitForIdle() resolves immediately when no run is
+  // active, and only pends (until the run finishes or aborts) while one is.
+  let running = false;
 
   const agent: MockPiAgent = {
     state: {
@@ -57,28 +60,35 @@ function createMockPiAgent(options?: {
     },
 
     async prompt(input: string): Promise<unknown> {
-      // Emit agent_start
-      agent.emitEvent({ type: 'agent_start' });
+      running = true;
+      try {
+        // Emit agent_start
+        agent.emitEvent({ type: 'agent_start' });
 
-      if (agent.promptError) {
-        // Emit agent_end before throwing
+        if (agent.promptError) {
+          // Emit agent_end before throwing
+          agent.emitEvent({ type: 'agent_end' });
+          throw agent.promptError;
+        }
+
+        // Simulate a turn
+        agent.emitEvent({ type: 'turn_start' });
+        agent.emitEvent({
+          type: 'turn_end',
+          text: typeof agent.promptResult === 'string'
+            ? agent.promptResult
+            : 'Mock response text',
+        });
+
+        // Emit agent_end
         agent.emitEvent({ type: 'agent_end' });
-        throw agent.promptError;
+
+        return agent.promptResult;
+      } finally {
+        running = false;
+        idleResolve?.();
+        idleResolve = null;
       }
-
-      // Simulate a turn
-      agent.emitEvent({ type: 'turn_start' });
-      agent.emitEvent({
-        type: 'turn_end',
-        text: typeof agent.promptResult === 'string'
-          ? agent.promptResult
-          : 'Mock response text',
-      });
-
-      // Emit agent_end
-      agent.emitEvent({ type: 'agent_end' });
-
-      return agent.promptResult;
     },
 
     abort(): void {
@@ -90,14 +100,10 @@ function createMockPiAgent(options?: {
     },
 
     async waitForIdle(): Promise<void> {
-      // If already idle, resolve immediately
+      // Resolve immediately when idle (matches pi's activeRun == null path).
+      if (!running) return;
       return new Promise<void>((resolve) => {
         idleResolve = resolve;
-        // Auto-resolve after a tick to prevent hanging
-        setTimeout(() => {
-          resolve();
-          idleResolve = null;
-        }, 10);
       });
     },
 
@@ -1685,6 +1691,25 @@ You have 12 emotions.`;
 
       expect(steerCalls.length).toBe(0);
     });
+
+    it('delivers a steer issued in the same frame as prompt()', async () => {
+      const steerCalls: Array<{ role: string; content: string }> = [];
+      piAgent.steer = (msg: { role: string; content: string }) => {
+        steerCalls.push(msg);
+      };
+
+      const agent = createTestCortexAgent(piAgent, config);
+
+      // The turn is deferred one microtask (it dequeues from the loop gate),
+      // so _isPrompting is still false here. steer() must treat the non-empty
+      // gate as "prompting" and forward to pi instead of dropping the message.
+      const turn = agent.prompt('Hello');
+      agent.steer('same-frame steer');
+      await turn;
+
+      expect(steerCalls).toHaveLength(1);
+      expect(steerCalls[0]!.content).toBe('same-frame steer');
+    });
   });
 
   // -----------------------------------------------------------------------
@@ -1773,6 +1798,37 @@ You have 12 emotions.`;
       await delivery;
       expect(promptSpy).toHaveBeenCalledTimes(1);
       expect(promptSpy.mock.calls[0][0] as string).toContain('task_9');
+    });
+
+    it('a same-frame prompt() + abort() cancels the queued turn without running pi', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+      const errored = vi.fn();
+      agent.onError(errored);
+
+      // prompt() only enqueues; the cycle dequeues next microtask. A same-
+      // frame abort() must be visible to that not-yet-started cycle, which
+      // cancels it before it ever calls pi (matching main, which cancels in
+      // ~1ms rather than running the whole turn un-aborted).
+      const turn = agent.prompt('do work');
+      const settled = turn.then(
+        () => 'resolved',
+        (e: Error) => e.name,
+      );
+      const aborting = agent.abort();
+
+      const [outcome] = await Promise.all([settled, aborting]);
+
+      expect(outcome).toBe('AbortError');
+      expect(promptSpy).not.toHaveBeenCalled();
+      expect(agent.state).toBe('active');
+      expect(errored).toHaveBeenCalledTimes(1);
+      expect(errored.mock.calls[0][0].category).toBe('cancelled');
+
+      // The agent stays usable: a fresh prompt runs normally afterward.
+      await expect(agent.prompt('next')).resolves.toBeDefined();
+      expect(promptSpy).toHaveBeenCalledTimes(1);
+      expect(promptSpy.mock.calls[0][0] as string).toBe('next');
     });
   });
 
