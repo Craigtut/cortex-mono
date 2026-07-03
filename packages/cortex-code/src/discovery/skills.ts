@@ -1,4 +1,4 @@
-import { readdir, lstat } from 'node:fs/promises';
+import { readdir, lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { SkillConfig } from '@animus-labs/cortex';
@@ -21,6 +21,37 @@ export async function discoverSkills(cwd: string): Promise<SkillConfig[]> {
   }
 
   return skills;
+}
+
+/** True for skills discovered under `{cwd}/.cortex/skills` (source `project:*`). */
+export function isProjectSkill(skill: SkillConfig): boolean {
+  return skill.source.startsWith('project:');
+}
+
+/**
+ * Build a stable trust signature over a set of project skills: every SKILL.md
+ * path and its full content, sorted by path. The signature changes if any
+ * project skill is added, removed, or edited, so an edited skill re-prompts for
+ * trust before it can run shell on load. Returns null when there are no project
+ * skills (nothing to gate).
+ */
+export async function computeProjectSkillsSignature(
+  skills: SkillConfig[],
+): Promise<string | null> {
+  const projectSkills = skills.filter(isProjectSkill);
+  if (projectSkills.length === 0) return null;
+
+  const parts: string[] = [];
+  for (const skill of [...projectSkills].sort((a, b) => a.path.localeCompare(b.path))) {
+    let content: string;
+    try {
+      content = await readFile(skill.path, 'utf-8');
+    } catch {
+      content = '<unreadable>';
+    }
+    parts.push(`${skill.source}\n${skill.path}\n${content}`);
+  }
+  return parts.join('\u0000');
 }
 
 async function scanSkillDirectory(dir: string, source: string): Promise<SkillConfig[]> {

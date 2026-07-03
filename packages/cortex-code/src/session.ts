@@ -50,9 +50,10 @@ import { resolveStoredOAuthApiKey } from './utils/oauth-credentials.js';
 import { PermissionRuleManager } from './permissions/rules.js';
 import { isPathWithinRealCwd } from './permissions/path-containment.js';
 import { discoverProjectContext } from './discovery/context.js';
-import { discoverSkills } from './discovery/skills.js';
+import { discoverSkills, isProjectSkill, computeProjectSkillsSignature } from './discovery/skills.js';
 import { discoverMcpServers } from './discovery/mcp.js';
 import { checkProjectMcpTrust, trustProjectMcpConfig } from './discovery/mcp-trust.js';
+import { checkProjectTrust, recordProjectTrust } from './discovery/project-trust.js';
 import {
   generateSessionId,
   createDebouncedSaver,
@@ -75,7 +76,7 @@ import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display
 import { FileSessionActivityReporter, watchDecisionFile, type PermissionResolution } from './activity/session-activity.js';
 import { McpConfigWatcher, type McpConfigChangeReason } from './mcp/mcp-watcher.js';
 import { reconcileMcpServers, type McpReconcileResult } from './mcp/reconcile.js';
-import { loadHookHandlers } from './hooks/loader.js';
+import { loadHookHandlers, readProjectHooksContent, hasProjectHooks } from './hooks/loader.js';
 import { runHookHandlers } from './hooks/runner.js';
 import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
@@ -301,9 +302,11 @@ export class Session {
     // Load lifecycle hook handlers from ~/.cortex/hooks.json and
     // {cwd}/.cortex/hooks.json. Loading is non-fatal: a malformed config or
     // missing files yields an empty handler set rather than blocking
-    // startup.
+    // startup. Project hooks pass through the trust gate first: an untrusted
+    // project's hooks are NOT loaded, so a cloned repo cannot run its
+    // hooks.json on the first turn.
     try {
-      this.hookHandlers = await loadHookHandlers(this.cwd);
+      this.hookHandlers = await this.loadHooksWithTrust();
     } catch (err) {
       log.warn('Hook loader failed; running without hooks', {
         error: err instanceof Error ? err.message : String(err),
@@ -311,11 +314,11 @@ export class Session {
       this.hookHandlers = null;
     }
 
-    // Register skills
-    const skills = await discoverSkills(this.cwd);
-    for (const skill of skills) {
-      this.agent.getSkillRegistry().addSkill(skill);
-    }
+    // Register skills. Global skills (~/.cortex/skills) are user-authored and
+    // always registered. Project skills (.cortex/skills) run shell on load, so
+    // they pass through the trust gate first: an untrusted project's skills are
+    // NOT registered and are therefore not model-invocable.
+    await this.registerSkillsWithTrust();
     // Refresh autocomplete after skills are registered
     this.app.refreshCommands(this.cwd);
 
@@ -574,7 +577,9 @@ export class Session {
       list.onSelect = async (item) => {
         handle.hide();
         if (item.value === 'trust') {
-          await trustProjectMcpConfig(this.cwd);
+          // Record the EXACT config we trust-checked and showed the user, not a
+          // fresh read, so a file swapped between prompt and click is not trusted.
+          await trustProjectMcpConfig(this.cwd, trust.configContent);
           for (const server of projectServers) {
             await this.connectMcpServer(server);
           }
@@ -602,6 +607,112 @@ export class Session {
         `Failed to connect "${server.name}": ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  /**
+   * Load lifecycle hooks with the project-trust gate applied. Global hooks
+   * (~/.cortex/hooks.json) are user-authored and always load. Project hooks
+   * (.cortex/hooks.json) run subprocesses, so if the project's hooks are new or
+   * changed and the user has not trusted them, we prompt before loading. On
+   * decline, only global hooks load and the project's hooks never run.
+   */
+  private async loadHooksWithTrust(): Promise<Record<HookEvent, HookHandler[]>> {
+    const handlers = await loadHookHandlers(this.cwd);
+
+    // Nothing project-local to gate: return as-is (global-only or empty).
+    if (!hasProjectHooks(handlers)) return handlers;
+
+    const content = await readProjectHooksContent(this.cwd);
+    if (await checkProjectTrust(this.cwd, 'hooks', content)) return handlers;
+
+    // Untrusted project hooks: prompt before loading them.
+    const decision = await this.promptProjectContentTrust(
+      'New Project Hooks',
+      'This project defines lifecycle hooks in .cortex/hooks.json that run\n' +
+        'commands on your machine. Trust and load them?',
+    );
+    if (decision === 'trust' && content !== null) {
+      await recordProjectTrust(this.cwd, 'hooks', content);
+      this.app!.transcript.addNotification('Hooks', 'Loaded project hooks.');
+      return handlers;
+    }
+
+    this.app!.transcript.addNotification('Hooks', 'Skipped project hooks (untrusted).');
+    // Reload global-only so declined project hooks are absent, not just inert.
+    return loadHookHandlers(this.cwd, { includeProject: false });
+  }
+
+  /**
+   * Register discovered skills with the project-trust gate applied. Global
+   * skills always register. Project skills (.cortex/skills) can run shell on
+   * load, so if they are new or changed and untrusted, we prompt before
+   * registering them. On decline, project skills are not registered and so are
+   * never model-invocable.
+   */
+  private async registerSkillsWithTrust(): Promise<void> {
+    if (!this.agent) return;
+    const registry = this.agent.getSkillRegistry();
+    const skills = await discoverSkills(this.cwd);
+
+    const globalSkills = skills.filter((s) => !isProjectSkill(s));
+    const projectSkills = skills.filter(isProjectSkill);
+    for (const skill of globalSkills) registry.addSkill(skill);
+
+    if (projectSkills.length === 0) return;
+
+    const signature = await computeProjectSkillsSignature(skills);
+    if (await checkProjectTrust(this.cwd, 'skills', signature)) {
+      for (const skill of projectSkills) registry.addSkill(skill);
+      return;
+    }
+
+    const decision = await this.promptProjectContentTrust(
+      'New Project Skills',
+      `This project defines ${projectSkills.length} skill(s) in .cortex/skills that can\n` +
+        'run shell commands when loaded. Trust and register them?',
+    );
+    if (decision === 'trust' && signature !== null) {
+      await recordProjectTrust(this.cwd, 'skills', signature);
+      for (const skill of projectSkills) registry.addSkill(skill);
+      this.app!.transcript.addNotification('Skills', `Registered ${projectSkills.length} project skill(s).`);
+      return;
+    }
+
+    this.app!.transcript.addNotification('Skills', 'Skipped project skills (untrusted).');
+  }
+
+  /**
+   * Show a two-option trust overlay for project-local executable content
+   * (hooks or skills), mirroring the MCP trust prompt. Returns 'skip' if the
+   * user declines, cancels, or the TUI is unavailable.
+   */
+  private async promptProjectContentTrust(
+    title: string,
+    message: string,
+  ): Promise<'trust' | 'skip'> {
+    if (!this.app) return 'skip';
+    return new Promise<'trust' | 'skip'>((resolve) => {
+      const items: SelectItem[] = [
+        { value: 'trust', label: 'Trust and load', description: 'Approve this project content' },
+        { value: 'skip', label: 'Skip', description: 'Leave it inert for this project' },
+      ];
+      const list = new SelectList(items, 2, selectListTheme);
+      const overlayBox = new OverlayBox(list, title);
+      const handle = this.app!.tui.showOverlay(overlayBox, {
+        anchor: 'center',
+        width: '60%',
+        maxHeight: 12,
+      });
+      this.app!.transcript.addNotification(title, message);
+      list.onSelect = (item) => {
+        handle.hide();
+        resolve(item.value === 'trust' ? 'trust' : 'skip');
+      };
+      list.onCancel = () => {
+        handle.hide();
+        resolve('skip');
+      };
+    });
   }
 
   /**

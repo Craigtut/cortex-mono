@@ -1,51 +1,17 @@
 /**
- * MCP trust-on-first-use: tracks which project-local MCP configurations
- * the user has approved. When a project's .cortex/mcp.json is new or has
- * changed since last approval, the caller is notified so it can prompt
- * the user before spawning those servers.
+ * MCP trust-on-first-use: tracks which project-local MCP configurations the
+ * user has approved. When a project's `.cortex/mcp.json` is new or has changed
+ * since last approval, the caller is notified so it can prompt the user before
+ * spawning those servers.
  *
- * Global configs (~/.cortex/mcp.json) are always trusted since the user
- * owns them directly.
+ * This is a thin adapter over the shared project-trust store (see
+ * `project-trust.ts`), which also gates project hooks and skills. Global
+ * configs (`~/.cortex/mcp.json`) are user-authored and always trusted.
  */
 
-import { createHash } from 'node:crypto';
-import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
-
-const TRUST_STORE_PATH = join(homedir(), '.cortex', 'trusted-mcp.json');
-
-interface TrustStore {
-  /** Map of project path to the SHA-256 hash of its .cortex/mcp.json content. */
-  projects: Record<string, string>;
-}
-
-async function loadTrustStore(): Promise<TrustStore> {
-  try {
-    const raw = await readFile(TRUST_STORE_PATH, 'utf-8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (
-      typeof parsed === 'object' &&
-      parsed !== null &&
-      typeof (parsed as Record<string, unknown>)['projects'] === 'object'
-    ) {
-      return parsed as TrustStore;
-    }
-  } catch {
-    // File doesn't exist or is corrupt
-  }
-  return { projects: {} };
-}
-
-async function saveTrustStore(store: TrustStore): Promise<void> {
-  await mkdir(dirname(TRUST_STORE_PATH), { recursive: true });
-  await writeFile(TRUST_STORE_PATH, JSON.stringify(store, null, 2), { mode: 0o600 });
-  await chmod(TRUST_STORE_PATH, 0o600);
-}
-
-function hashContent(content: string): string {
-  return createHash('sha256').update(content).digest('hex');
-}
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { checkProjectTrust, recordProjectTrust } from './project-trust.js';
 
 export interface McpTrustResult {
   /** Whether the project MCP config is trusted (matches stored hash or doesn't exist). */
@@ -54,48 +20,35 @@ export interface McpTrustResult {
   configContent: string | null;
 }
 
-/**
- * Check whether a project's .cortex/mcp.json is trusted.
- * Returns trusted=true if:
- *   - The project has no .cortex/mcp.json
- *   - The file's hash matches the last approved hash
- */
-export async function checkProjectMcpTrust(cwd: string): Promise<McpTrustResult> {
-  const projectConfigPath = join(cwd, '.cortex', 'mcp.json');
-
-  let content: string;
+/** Read a project's `.cortex/mcp.json`, or null if it does not exist. */
+async function readProjectMcpConfig(cwd: string): Promise<string | null> {
   try {
-    content = await readFile(projectConfigPath, 'utf-8');
+    return await readFile(join(cwd, '.cortex', 'mcp.json'), 'utf-8');
   } catch {
-    // No project MCP config: nothing to trust-check
-    return { trusted: true, configContent: null };
+    return null;
   }
-
-  const store = await loadTrustStore();
-  const currentHash = hashContent(content);
-  const storedHash = store.projects[cwd];
-
-  if (storedHash === currentHash) {
-    return { trusted: true, configContent: content };
-  }
-
-  return { trusted: false, configContent: content };
 }
 
 /**
- * Record that the user has approved the current project MCP config.
+ * Check whether a project's `.cortex/mcp.json` is trusted.
+ * Returns trusted=true if the project has no config, or the file's hash matches
+ * the last approved hash. The raw content is returned so the caller can display
+ * it and thread the SAME bytes into `trustProjectMcpConfig` (no re-read TOCTOU).
  */
-export async function trustProjectMcpConfig(cwd: string): Promise<void> {
-  const projectConfigPath = join(cwd, '.cortex', 'mcp.json');
+export async function checkProjectMcpTrust(cwd: string): Promise<McpTrustResult> {
+  const configContent = await readProjectMcpConfig(cwd);
+  const trusted = await checkProjectTrust(cwd, 'mcp', configContent);
+  return { trusted, configContent };
+}
 
-  let content: string;
-  try {
-    content = await readFile(projectConfigPath, 'utf-8');
-  } catch {
-    return;
-  }
-
-  const store = await loadTrustStore();
-  store.projects[cwd] = hashContent(content);
-  await saveTrustStore(store);
+/**
+ * Record that the user has approved a project MCP config. The caller passes the
+ * content it displayed (from `checkProjectMcpTrust`); if omitted, the file is
+ * read as a fallback. Passing the displayed content closes the window where a
+ * file swapped between prompt and approval could be trusted.
+ */
+export async function trustProjectMcpConfig(cwd: string, content?: string | null): Promise<void> {
+  const resolved = content ?? (await readProjectMcpConfig(cwd));
+  if (resolved === null) return;
+  await recordProjectTrust(cwd, 'mcp', resolved);
 }

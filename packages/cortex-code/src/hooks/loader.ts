@@ -18,19 +18,51 @@ const HOOK_EVENTS: readonly HookEvent[] = [
   'session_end',
 ];
 
+export interface LoadHookOptions {
+  /**
+   * Whether to include project-local (`{cwd}/.cortex/hooks.json`) handlers.
+   * Defaults to true. Callers pass false to load ONLY global handlers when the
+   * project's hooks are untrusted (declined at the trust prompt), so project
+   * hooks never run.
+   */
+  includeProject?: boolean;
+}
+
 /**
  * Discover hook handlers grouped by event. Returned map is exhaustive: every
  * known event has an entry (possibly empty). Missing or malformed files are
  * treated as "no hooks".
  */
-export async function loadHookHandlers(cwd: string): Promise<Record<HookEvent, HookHandler[]>> {
+export async function loadHookHandlers(
+  cwd: string,
+  options: LoadHookOptions = {},
+): Promise<Record<HookEvent, HookHandler[]>> {
+  const includeProject = options.includeProject ?? true;
   const globalPath = join(homedir(), '.cortex', 'hooks.json');
   const projectPath = join(cwd, '.cortex', 'hooks.json');
   const [global, project] = await Promise.all([
     loadOne(globalPath, 'global'),
-    loadOne(projectPath, 'project'),
+    includeProject ? loadOne(projectPath, 'project') : Promise.resolve(emptyMap()),
   ]);
   return merge(global, project);
+}
+
+/**
+ * Read the raw `{cwd}/.cortex/hooks.json` content, or null if it does not
+ * exist. Used as the trust signature for project hooks so the exact bytes that
+ * back the loaded handlers are what the user approves.
+ */
+export async function readProjectHooksContent(cwd: string): Promise<string | null> {
+  try {
+    return await readFile(join(cwd, '.cortex', 'hooks.json'), 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/** True if any event bucket contains a handler sourced from the project. */
+export function hasProjectHooks(handlers: Record<HookEvent, HookHandler[]>): boolean {
+  return HOOK_EVENTS.some((event) => handlers[event].some((h) => h.source === 'project'));
 }
 
 async function loadOne(
