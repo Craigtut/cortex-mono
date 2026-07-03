@@ -960,6 +960,7 @@ function checkFind(words: ShellWord[], ec: EvalContext): CatastrophicFinding | n
   // Leading options.
   while (i < words.length) {
     const t = words[i]!.text;
+    if (t === '--') { i++; break; } // end-of-options: start paths follow
     if (t === '-H' || t === '-L' || t === '-P') { i++; continue; }
     if (t === '-D') { i += 2; continue; }
     if (/^-O/.test(t)) { i++; continue; }
@@ -970,32 +971,32 @@ function checkFind(words: ShellWord[], ec: EvalContext): CatastrophicFinding | n
     }
     break;
   }
-  // Start paths (everything before the first expression token).
+  // Start paths (everything before the first expression token). `--` here also
+  // terminates options, so `find -- / -delete` collects `/`.
   while (i < words.length) {
     const t = words[i]!.text;
+    if (t === '--') { i++; continue; }
     if (t.startsWith('-') || t === '(' || t === '!' || t === ',') break;
     paths.push(words[i]!);
     i++;
   }
 
-  // Destructive expressions.
+  // Destructive expressions. -delete deletes matches; -exec/-execdir/-ok/-okdir
+  // run an arbitrary command per match (which we cannot reliably prove
+  // non-destructive, e.g. `-exec sh -c '...'`), so treat ANY of them as
+  // destructive and let the start-path check (protected/unresolved) decide.
   let destructive = false;
   for (let j = i; j < words.length; j++) {
     const t = words[j]!.text;
-    if (t === '-delete') { destructive = true; break; }
-    if (t === '-exec' || t === '-execdir' || t === '-ok' || t === '-okdir') {
-      const nextWord = words[j + 1];
-      const execVerb = nextWord ? verbBaseName(nextWord, ec.platform) : null;
-      if (execVerb !== null && ['rm', 'shred', 'unlink', 'rmdir'].includes(execVerb.toLowerCase())) {
-        destructive = true;
-        break;
-      }
+    if (t === '-delete' || t === '-exec' || t === '-execdir' || t === '-ok' || t === '-okdir') {
+      destructive = true;
+      break;
     }
   }
   if (!destructive) return null;
 
   const effectivePaths = paths.length > 0 ? paths : [{ ...newWord(), text: '.' }];
-  return evaluateDeleteTargets(effectivePaths, ec, 'find with -delete/-exec rm');
+  return evaluateDeleteTargets(effectivePaths, ec, 'find with -delete/-exec');
 }
 
 function deviceFinding(target: string, raw: string, verb: string): CatastrophicFinding {
