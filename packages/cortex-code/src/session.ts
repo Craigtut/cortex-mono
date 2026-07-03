@@ -35,7 +35,9 @@ import {
   type ToolCallStartPayload,
   type ToolCallUpdatePayload,
   stripWorkingTags,
+  findCatastrophicCommand,
 } from '@animus-labs/cortex';
+import { homedir } from 'node:os';
 import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import { App, type AppCallbacks } from './tui/app.js';
 import { randomThinkingLabel } from './tui/spinner.js';
@@ -46,7 +48,6 @@ import { CredentialStore, type CredentialEntry } from './config/credentials.js';
 import { singleFlight } from './utils/single-flight.js';
 import { resolveStoredOAuthApiKey } from './utils/oauth-credentials.js';
 import { PermissionRuleManager } from './permissions/rules.js';
-import { findDangerousCommand } from './permissions/dangerous-commands.js';
 import { isPathWithinRealCwd } from './permissions/path-containment.js';
 import { discoverProjectContext } from './discovery/context.js';
 import { discoverSkills } from './discovery/skills.js';
@@ -1128,9 +1129,12 @@ export class Session {
     // of yolo mode, the read-only bypass, and any allow rule. There is no
     // override: such a command should never run, however it is reached.
     if (toolName === 'Bash') {
-      const danger = findDangerousCommand(String((toolArgs as Record<string, unknown>)['command'] ?? ''));
-      if (danger) {
-        return { decision: 'block', reason: `Blocked catastrophic command (${danger}); this cannot be overridden.` };
+      const finding = findCatastrophicCommand(
+        String((toolArgs as Record<string, unknown>)['command'] ?? ''),
+        { cwd: this.cwd, home: homedir() },
+      );
+      if (finding) {
+        return { decision: 'block', reason: finding.reason };
       }
     }
 

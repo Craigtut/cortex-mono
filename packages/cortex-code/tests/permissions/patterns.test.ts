@@ -4,7 +4,7 @@ import { extractPattern, formatRule } from '../../src/permissions/patterns.js';
 describe('extractPattern', () => {
   describe('Bash', () => {
     it('suggests a two-word prefix when the second token is a subcommand', () => {
-      expect(extractPattern('Bash', { command: 'git push origin main' })).toBe('git push *');
+      expect(extractPattern('Bash', { command: 'git fetch origin' })).toBe('git fetch *');
       expect(extractPattern('Bash', { command: 'git diff -- README.md' })).toBe('git diff *');
       expect(extractPattern('Bash', { command: 'npm run build' })).toBe('npm run *');
       expect(extractPattern('Bash', { command: 'yarn add express' })).toBe('yarn add *');
@@ -15,7 +15,6 @@ describe('extractPattern', () => {
       expect(extractPattern('Bash', { command: 'ls -la' })).toBe('ls *');
       expect(extractPattern('Bash', { command: 'git --version' })).toBe('git *');
       expect(extractPattern('Bash', { command: 'cat file.txt' })).toBe('cat *');
-      expect(extractPattern('Bash', { command: 'chmod 755 run.sh' })).toBe('chmod *');
     });
 
     it('falls back to first token for single-token commands', () => {
@@ -36,6 +35,47 @@ describe('extractPattern', () => {
 
     it('suggests no prefix when led by an unsafe env var', () => {
       expect(extractPattern('Bash', { command: 'PATH=/evil npm run build' })).toBe('');
+    });
+
+    it('suggests no prefix for destructive commands', () => {
+      // An always-allow rule for these plus any residual parser gap would
+      // auto-approve a wipe; they must go through the prompt every time.
+      expect(extractPattern('Bash', { command: 'rm -rf build' })).toBe('');
+      expect(extractPattern('Bash', { command: 'rm file.txt' })).toBe('');
+      expect(extractPattern('Bash', { command: 'find . -delete' })).toBe('');
+      expect(extractPattern('Bash', { command: 'find . -name "*.ts"' })).toBe('');
+      expect(extractPattern('Bash', { command: 'dd if=a of=b' })).toBe('');
+      expect(extractPattern('Bash', { command: 'mkfs.ext4 disk.img' })).toBe('');
+      expect(extractPattern('Bash', { command: 'shred -u file' })).toBe('');
+      expect(extractPattern('Bash', { command: 'chmod 755 run.sh' })).toBe('');
+      expect(extractPattern('Bash', { command: 'chown -R me dir' })).toBe('');
+      expect(extractPattern('Bash', { command: 'chgrp staff file' })).toBe('');
+      expect(extractPattern('Bash', { command: 'tee out.txt' })).toBe('');
+      expect(extractPattern('Bash', { command: 'curl https://example.com' })).toBe('');
+      expect(extractPattern('Bash', { command: 'wget https://example.com' })).toBe('');
+      expect(extractPattern('Bash', { command: 'scp file host:/tmp' })).toBe('');
+      expect(extractPattern('Bash', { command: 'rsync -a src/ dst/' })).toBe('');
+    });
+
+    it('suggests no prefix for PowerShell destructive commands', () => {
+      expect(extractPattern('Bash', { command: 'Remove-Item -Recurse x' })).toBe('');
+      expect(extractPattern('Bash', { command: 'ri -r x' })).toBe('');
+      expect(extractPattern('Bash', { command: 'del /s /q x' })).toBe('');
+      expect(extractPattern('Bash', { command: 'rd /s /q x' })).toBe('');
+      expect(extractPattern('Bash', { command: 'rmdir x' })).toBe('');
+      expect(extractPattern('Bash', { command: 'Format-Volume -DriveLetter D' })).toBe('');
+      expect(extractPattern('Bash', { command: 'Clear-Disk -Number 1' })).toBe('');
+    });
+
+    it('suggests no prefix for destructive git subcommands', () => {
+      expect(extractPattern('Bash', { command: 'git clean -fdx' })).toBe('');
+      expect(extractPattern('Bash', { command: 'git reset --hard HEAD~1' })).toBe('');
+      expect(extractPattern('Bash', { command: 'git checkout -- .' })).toBe('');
+      expect(extractPattern('Bash', { command: 'git push --force origin main' })).toBe('');
+      expect(extractPattern('Bash', { command: 'git branch -D feature' })).toBe('');
+      // Non-destructive git subcommands still get suggestions.
+      expect(extractPattern('Bash', { command: 'git status' })).toBe('git status *');
+      expect(extractPattern('Bash', { command: 'git log --oneline' })).toBe('git log *');
     });
 
     it('returns empty for empty command', () => {

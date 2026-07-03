@@ -3,9 +3,9 @@ import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { findCatastrophicCommand } from '@animus-labs/cortex';
 import { extractPattern } from './patterns.js';
 import { splitBashCommand, stripLeadingAssignments, isCompoundBash } from './bash-command.js';
-import { findDangerousCommand } from './dangerous-commands.js';
 
 export type PermissionDecision = 'allow' | 'deny';
 export type RuleScope = 'session' | 'project' | 'user';
@@ -129,8 +129,10 @@ export class PermissionRuleManager {
   private userRules: PermissionRule[] = [];
   private workspaceSettingsPath: string;
   private userSettingsPath: string;
+  private readonly cwd: string;
 
   constructor(cwd: string, options: PermissionRuleManagerOptions = {}) {
+    this.cwd = cwd;
     const configDir = options.configDir ?? join(homedir(), '.cortex');
     const workspaceId = this.workspaceId(cwd);
     this.workspaceSettingsPath = join(configDir, 'workspaces', workspaceId, 'settings.json');
@@ -186,7 +188,7 @@ export class PermissionRuleManager {
    * - Otherwise null (prompt).
    */
   private matchBashCommand(command: string): PermissionDecision | null {
-    if (findDangerousCommand(command)) return 'deny';
+    if (findCatastrophicCommand(command, { cwd: this.cwd, home: homedir() })) return 'deny';
 
     let allAllowed = true;
     for (const sub of splitBashCommand(command)) {
