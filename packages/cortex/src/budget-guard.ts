@@ -54,16 +54,23 @@ export class BudgetGuard {
     // Clean up any previous wiring
     this.unwire();
 
-    // Reset counters on agent_start (beginning of a new agentic loop)
+    // Reset counters on agent_start (beginning of a new agentic loop).
+    // Ignore forwarded child (sub-agent) events: a parent's budget only
+    // governs its own loop, not a delegated sub-agent's loop lifecycle.
     this.unsubscribers.push(
-      bridge.on('loop_start', () => {
+      bridge.on('loop_start', (event) => {
+        if (event.childTaskId) return;
         this.reset();
       }),
     );
 
-    // Track turns and cost on turn_end
+    // Track turns and cost on turn_end. Forwarded child events arrive on the
+    // same bridge with childTaskId set; skip them so a parent's budget counts
+    // only its own turns and cost (matching the childTaskId branching in
+    // CortexAgent's own turn_end handlers).
     this.unsubscribers.push(
       bridge.on('turn_end', (event) => {
+        if (event.childTaskId) return;
         this.turnCount++;
 
         // Read cost from typed usage (extracted by EventBridge)
