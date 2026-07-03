@@ -98,6 +98,18 @@ describe('executeShellCommand', () => {
     const result = await executeShellCommand('cat test.txt', tmpDir);
     expect(result).toBe('file content');
   });
+
+  it('sanitizes the environment (strips injection vectors like NODE_OPTIONS)', async () => {
+    const prev = process.env['NODE_OPTIONS'];
+    process.env['NODE_OPTIONS'] = '--inspect=0';
+    try {
+      const result = await executeShellCommand('echo "opt=[${NODE_OPTIONS}]"', tmpDir);
+      expect(result).toBe('opt=[]');
+    } finally {
+      if (prev === undefined) delete process.env['NODE_OPTIONS'];
+      else process.env['NODE_OPTIONS'] = prev;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

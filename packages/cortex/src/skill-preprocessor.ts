@@ -18,6 +18,7 @@ import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { buildSafeEnv } from './tools/shared/safe-env.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -218,7 +219,10 @@ export function executeShellCommand(
         cwd,
         timeout: COMMAND_TIMEOUT_MS,
         maxBuffer: 1024 * 1024, // 1MB
-        env: process.env,
+        // Sanitize the environment (strip injection vectors: LD_/DYLD_ preloads,
+        // NODE_OPTIONS, BASH_ENV, and similar) just like the Bash tool. SKILL.md
+        // shell hooks are author-controlled but must not run with a raw env.
+        env: buildSafeEnv(process.env),
       },
       (error: Error | null, stdout: string, _stderr: string) => {
         if (error) {
