@@ -42,7 +42,8 @@ import { randomThinkingLabel } from './tui/spinner.js';
 import { selectListTheme } from './tui/theme.js';
 import { OverlayBox } from './tui/overlay-box.js';
 import { type CortexCodeConfig } from './config/config.js';
-import { CredentialStore } from './config/credentials.js';
+import { CredentialStore, type CredentialEntry } from './config/credentials.js';
+import { singleFlight } from './utils/single-flight.js';
 import { PermissionRuleManager } from './permissions/rules.js';
 import { findDangerousCommand } from './permissions/dangerous-commands.js';
 import { isPathWithinRealCwd } from './permissions/path-containment.js';
@@ -117,6 +118,15 @@ export class Session {
   private readonly isResume: boolean;
   private saver: ReturnType<typeof createDebouncedSaver>;
   private isRunning = false;
+  /**
+   * In-flight OAuth resolve/refresh promises, keyed by provider. Providers like
+   * Anthropic rotate the refresh token on every use and invalidate the prior
+   * one, so two concurrent refreshes with the same stored token make one win
+   * and the rest fail with invalid_grant ("Failed to refresh OAuth token").
+   * Deduping concurrent callers onto one read-refresh-persist rotates the token
+   * exactly once and hands everyone the same fresh key.
+   */
+  private readonly oauthResolveInFlight = new Map<string, Promise<string>>();
   /**
    * True once the onError handler has surfaced the current turn's failure. The
    * agent framework both emits an error (via onError) and re-throws it out of
@@ -1239,21 +1249,12 @@ export class Session {
       return entry.apiKey;
     }
 
-    // OAuth: resolve via ProviderManager (handles token refresh)
+    // OAuth: resolve via ProviderManager (handles token refresh). Single-flight
+    // per provider so a burst of concurrent requests (main model + utility
+    // model + subagents at session start) triggers exactly one refresh; see
+    // oauthResolveInFlight for why a rotating refresh token makes a race fatal.
     if (entry.method === 'oauth' && entry.oauthCredentials) {
-      const result = await this.providerManager.resolveOAuthApiKey(
-        provider,
-        entry.oauthCredentials,
-      );
-      // Persist refreshed credentials if they changed
-      if (result.changed) {
-        await this.credentialStore.setProvider(provider, {
-          ...entry,
-          oauthCredentials: result.credentials,
-          oauthMeta: result.meta,
-        });
-      }
-      return result.apiKey;
+      return this.resolveOAuthApiKey(provider, entry);
     }
 
     // Custom: return stored API key, or a placeholder for keyless endpoints
@@ -1263,6 +1264,31 @@ export class Session {
     }
 
     throw new Error(`Unable to resolve API key for provider "${provider}"`);
+  }
+
+  /**
+   * Resolve (and refresh if expired) an OAuth API key, deduping concurrent
+   * callers per provider. The single-flight spans the whole read-refresh-persist
+   * cycle so a rotating refresh token is consumed exactly once; a second caller
+   * only starts a fresh resolve after the first has persisted the new token, so
+   * it reads the rotated credential rather than replaying the spent one.
+   */
+  private resolveOAuthApiKey(provider: string, entry: CredentialEntry): Promise<string> {
+    return singleFlight(this.oauthResolveInFlight, provider, async () => {
+      const result = await this.providerManager.resolveOAuthApiKey(
+        provider,
+        entry.oauthCredentials!,
+      );
+      // Persist refreshed credentials if they changed (rotation).
+      if (result.changed) {
+        await this.credentialStore.setProvider(provider, {
+          ...entry,
+          oauthCredentials: result.credentials,
+          oauthMeta: result.meta,
+        });
+      }
+      return result.apiKey;
+    });
   }
 
   /** Resume a previous session by loading and restoring its history. */
