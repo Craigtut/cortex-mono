@@ -40,6 +40,7 @@ export class App {
   private statusIndicator: StatusSpinner | null = null;
   private statusSpacer: Spacer | null = null;
   private pendingRenderTraceReasons: string[] = [];
+  private stopped = false;
   private readonly cwd: string;
   private readonly diagnostics: FreezeDiagnostics | undefined;
 
@@ -106,8 +107,15 @@ export class App {
     this.tui.start();
   }
 
-  /** Stop the TUI and clean up. */
+  /**
+   * Stop the TUI and clean up. Idempotent: safe to call from a signal handler,
+   * an uncaughtException/unhandledRejection handler, and the normal shutdown
+   * path without double-tearing-down. tui.stop() is what restores the terminal
+   * out of raw mode (on every platform), so this must run on any exit path.
+   */
   stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
     this.transcript.clear();
     this.hideStatusSpinner();
     this.statusBar.destroy();

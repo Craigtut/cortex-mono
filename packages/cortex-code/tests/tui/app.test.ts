@@ -269,6 +269,32 @@ describe('App status spinner', () => {
     expect(diagnostics.stop).toHaveBeenCalledTimes(1);
   });
 
+  it('is idempotent when stop is called more than once', () => {
+    const diagnostics = {
+      start: vi.fn(),
+      stop: vi.fn(),
+      recordKeypress: vi.fn(),
+      recordRenderRequested: vi.fn(),
+      recordRenderCompleted: vi.fn(),
+      recordTranscriptMutation: vi.fn(),
+    };
+
+    const app = new App({
+      onSubmit: () => {},
+      onAbort: () => {},
+      onExit: () => {},
+    }, '/tmp/project', diagnostics as never);
+
+    app.start();
+    app.stop();
+    app.stop();
+    app.stop();
+
+    // Teardown work runs exactly once, so a signal handler racing shutdown()
+    // cannot double-tear-down the terminal.
+    expect(diagnostics.stop).toHaveBeenCalledTimes(1);
+  });
+
   it('retries a failed render with a forced redraw instead of crashing', async () => {
     renderState.throwCount = 1;
 

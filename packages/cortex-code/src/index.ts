@@ -97,6 +97,13 @@ Usage:
 `.trim());
 }
 
+/**
+ * Set once the interactive session exists, so the process-level crash and
+ * signal handlers can restore the terminal before exiting. Null during CLI
+ * argument parsing, the `complete` subcommand, and first-run setup.
+ */
+let activeSession: CortexCodeSession | null = null;
+
 async function main(): Promise<void> {
   if (process.argv[2] === 'complete') {
     await runComplete(process.argv.slice(3), { version: PKG_VERSION });
@@ -220,6 +227,7 @@ async function main(): Promise<void> {
       updateInfo,
       ...(args.compaction ? { compactionStrategy: args.compaction } : {}),
     });
+    activeSession = session;
     uninstallSignalHandlers = installActivitySignalHandlers(session);
 
     await session.start();
@@ -241,12 +249,19 @@ function getDefaultModel(provider: string): string {
 }
 
 function installActivitySignalHandlers(session: CortexCodeSession): () => void {
-  const signals: NodeJS.Signals[] = ['SIGTERM', 'SIGHUP'];
+  // SIGHUP does not exist on Windows and process.once() throws for it there.
+  // SIGTERM is supported (synthetically) on all platforms Node targets.
+  const signals: NodeJS.Signals[] = process.platform === 'win32'
+    ? ['SIGTERM']
+    : ['SIGTERM', 'SIGHUP'];
   const disposers: Array<() => void> = [];
   let exiting = false;
 
   for (const signal of signals) {
     const listener = () => {
+      // Restore the terminal out of raw mode immediately (idempotent) so the
+      // user is never left with a wedged shell, even if activity recording hangs.
+      session.restoreTerminal();
       if (exiting) {
         process.exit(exitCodeForSignal(signal));
       }
@@ -259,10 +274,14 @@ function installActivitySignalHandlers(session: CortexCodeSession): () => void {
         process.exit(exitCodeForSignal(signal));
       });
     };
-    process.once(signal, listener);
-    disposers.push(() => {
-      process.off(signal, listener);
-    });
+    try {
+      process.once(signal, listener);
+      disposers.push(() => {
+        process.off(signal, listener);
+      });
+    } catch {
+      // Signal not supported on this platform; skip it.
+    }
   }
 
   return () => {
@@ -283,8 +302,28 @@ function exitCodeForSignal(signal: NodeJS.Signals): number {
   }
 }
 
+/**
+ * Restore the terminal, log, and exit on an otherwise-unhandled crash. Without
+ * this, an uncaughtException or unhandledRejection would terminate the process
+ * with the terminal still in raw mode, leaving the user's shell wedged. These
+ * handlers are cross-platform (unlike POSIX signals).
+ */
+function handleFatalCrash(kind: string, err: unknown): void {
+  try {
+    activeSession?.restoreTerminal();
+  } catch {
+    // Best-effort terminal restore; never mask the original crash.
+  }
+  console.error(`Fatal ${kind}:`, err instanceof Error ? (err.stack ?? err.message) : String(err));
+  process.exit(1);
+}
+
+process.on('uncaughtException', (err) => handleFatalCrash('exception', err));
+process.on('unhandledRejection', (reason) => handleFatalCrash('rejection', reason));
+
 // Run
 main().catch((err) => {
+  activeSession?.restoreTerminal();
   console.error('Fatal error:', err instanceof Error ? err.message : String(err));
   process.exit(1);
 });
