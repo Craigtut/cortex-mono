@@ -274,7 +274,10 @@ function installActivitySignalHandlers(session: CortexCodeSession): () => void {
       const timeout = setTimeout(() => {
         process.exit(exitCodeForSignal(signal));
       }, 2_000);
-      void session.recordSignalActivityError(signal).finally(() => {
+      void Promise.allSettled([
+        session.recordSignalActivityError(signal),
+        session.disposeSandbox(),
+      ]).finally(() => {
         clearTimeout(timeout);
         process.exit(exitCodeForSignal(signal));
       });
