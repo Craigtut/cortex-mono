@@ -16,6 +16,12 @@ export interface PreflightDeps {
   isReadOnlyInProject: (toolName: string, toolArgs: unknown) => Promise<boolean>;
   /** Home directory override; defaults to os.homedir(). Injectable for tests. */
   home?: string;
+  /**
+   * True when the OS sandbox is enforcing filesystem containment for shell
+   * commands. A Bash call that clears the catastrophic floor and any deny rule
+   * then auto-runs inside the boundary instead of prompting.
+   */
+  sandboxBashEnforced?: boolean;
 }
 
 /**
@@ -24,6 +30,7 @@ export interface PreflightDeps {
  *   1. Catastrophic Bash command  -> block   (never overridable)
  *   2. Yolo mode                  -> allow
  *   3. Explicit deny rule         -> block   (beats the read-only auto-approve)
+ *   3b. Sandboxed Bash            -> allow   (the OS boundary is the control)
  *   4. Read-only within project   -> allow
  *   5. Explicit allow rule        -> allow
  *   6. Otherwise                  -> prompt
@@ -54,6 +61,10 @@ export async function preflightPermission(
   // 3. Explicit deny wins over the read-only-in-project auto-approve.
   const rule = await deps.matchRule(toolName, toolArgs);
   if (rule === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
+
+  // 3b. Sandbox auto-allow: when the OS boundary contains shell commands, a Bash
+  //     call past the catastrophic floor and any deny rule runs without a prompt.
+  if (deps.sandboxBashEnforced && toolName === 'Bash') return { decision: 'allow' };
 
   // 4. Read-only tools contained in the workspace auto-approve.
   if (await deps.isReadOnlyInProject(toolName, toolArgs)) return { decision: 'allow' };

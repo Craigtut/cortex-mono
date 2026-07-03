@@ -92,4 +92,42 @@ describe('preflightPermission', () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it('sandbox auto-allows a non-catastrophic Bash command that would otherwise prompt', async () => {
+    const promptOut = await preflightPermission('Bash', { command: 'npm test' }, deps());
+    expect(promptOut.decision).toBe('prompt');
+    const allowOut = await preflightPermission(
+      'Bash',
+      { command: 'npm test' },
+      deps({ sandboxBashEnforced: true }),
+    );
+    expect(allowOut.decision).toBe('allow');
+  });
+
+  it('sandbox auto-allow never overrides the catastrophic floor', async () => {
+    const out = await preflightPermission(
+      'Bash',
+      { command: 'rm -rf /' },
+      deps({ sandboxBashEnforced: true }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('sandbox auto-allow never overrides an explicit deny rule', async () => {
+    const out = await preflightPermission(
+      'Bash',
+      { command: 'git push' },
+      deps({ sandboxBashEnforced: true, matchRule: async () => 'deny' }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('sandbox auto-allow applies only to Bash, not in-process tools like Write', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/workspace/x.ts' },
+      deps({ sandboxBashEnforced: true }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
 });
