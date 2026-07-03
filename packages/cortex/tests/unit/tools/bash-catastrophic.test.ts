@@ -463,4 +463,142 @@ describe('findCatastrophicCommand', () => {
       expect(blocked('rm -rf /System/Library/Caches', DARWIN)).toBeNull();
     });
   });
+
+  // -------------------------------------------------------------------------
+  // ANSI-C ($'...') and locale ($"...") quoting
+  // -------------------------------------------------------------------------
+  describe('ANSI-C and locale quoting', () => {
+    const mustBlock: Array<[string, CatastrophicContext]> = [
+      // hex-encoded slash -> filesystem root
+      ["rm -rf $'\\x2f'", LINUX],
+      ["rm -rf $'\\x2F'", LINUX],
+      // octal 1/2/3-digit -> filesystem root
+      ["rm -rf $'\\057'", LINUX],
+      ["rm -rf $'\\57'", LINUX],
+      // literal char inside $'...'
+      ["rm -rf $'/'", LINUX],
+      // partial ANSI-C then literal suffix -> /etc (NOT saved by --preserve-root)
+      ["rm -rf $'\\x2f'etc", LINUX],
+      // fully hex-encoded path -> /etc
+      ["rm -rf $'\\x2f\\x65\\x74\\x63'", LINUX],
+      // fully octal-encoded path -> /etc
+      ["rm -rf $'\\57\\145\\164\\143'", LINUX],
+      // unicode escapes
+      ["rm -rf $'\\u002f'System", DARWIN],
+      ["rm -rf $'\\U0000002f'", LINUX],
+      // encoded device / redirect / disk tools
+      ["dd of=$'\\x2fdev\\x2fsda'", LINUX],
+      ["> $'\\x2fdev\\x2fsda'", LINUX],
+      ["shred $'\\x2fdev\\x2fsda'", LINUX],
+      ["mkfs.ext4 $'\\x2fdev\\x2fsdb'", LINUX],
+      ["find $'\\x2f' -delete", LINUX],
+      ["chmod -R 000 $'\\x2f'", LINUX],
+      // locale quoting is a no-op expansion equal to the inner string
+      ['rm -rf $"/etc"', LINUX],
+      ['rm -rf $"/"', LINUX],
+    ];
+    for (const [cmd, ctx] of mustBlock) {
+      it(`blocks: ${JSON.stringify(cmd)}`, () => {
+        expect(blocked(cmd, ctx)).not.toBeNull();
+      });
+    }
+
+    it('fails closed on an ANSI-C escape it cannot decode', () => {
+      // \q is not a valid escape; the decoder must not silently drop it.
+      expect(blocked("rm -rf $'\\q'", { ...LINUX, cwd: '/' })).not.toBeNull();
+    });
+
+    const mustPass: Array<[string, CatastrophicContext]> = [
+      // Tab escape resolves into the workspace; not catastrophic.
+      ["rm -rf $'my\\tdir'", DARWIN],
+      ["rm -rf $'build'", DARWIN],
+      // Non-destructive verb: ANSI-C content is irrelevant.
+      ["grep $'\\t' file.txt", DARWIN],
+      ["echo $'\\x2f'", DARWIN],
+    ];
+    for (const [cmd, ctx] of mustPass) {
+      it(`passes: ${JSON.stringify(cmd)}`, () => {
+        expect(blocked(cmd, ctx)).toBeNull();
+      });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // chmod/chown --reference (no positional mode operand)
+  // -------------------------------------------------------------------------
+  describe('chmod/chown --reference', () => {
+    it('blocks recursive chmod --reference targeting root/system dirs', () => {
+      expect(blocked('chmod -R --reference=/etc/hosts /', LINUX)).not.toBeNull();
+      expect(blocked('chown -R --reference=/etc/hosts /', LINUX)).not.toBeNull();
+      expect(blocked('chmod -R --reference=/etc/hosts /etc', LINUX)?.category).toBe('system-directory');
+      expect(blocked('chmod -R --reference /etc/hosts /', LINUX)).not.toBeNull(); // space form
+      expect(blocked('chown -R --from=me:me /', LINUX)).not.toBeNull();
+    });
+
+    it('still treats a positional mode as non-target', () => {
+      // operand[0] is the mode; only ./scripts is a target -> passes.
+      expect(blocked('chmod -R 755 ./scripts', DARWIN)).toBeNull();
+      expect(blocked('chown -R me ./data', DARWIN)).toBeNull();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // find -- end-of-options and broadened -exec
+  // -------------------------------------------------------------------------
+  describe('find end-of-options and exec', () => {
+    it('consumes -- and collects the following start path', () => {
+      expect(blocked('find -- / -delete', LINUX)).not.toBeNull();
+      expect(blocked('find -L -- /etc -delete', LINUX)?.category).toBe('system-directory');
+      expect(blocked('find -H -- / -delete', LINUX)).not.toBeNull();
+    });
+
+    it('treats any -exec-family on a protected start path as destructive', () => {
+      expect(blocked('find / -exec chmod 000 {} +', LINUX)).not.toBeNull();
+      expect(blocked('find / -exec grep x {} \\;', LINUX)).not.toBeNull();
+      expect(blocked('find /etc -execdir rm {} +', LINUX)).not.toBeNull();
+      expect(blocked('find / -ok rm {} \\;', LINUX)).not.toBeNull();
+    });
+
+    it('does not over-block -exec on a project path', () => {
+      expect(blocked('find ./build -exec chmod 000 {} +', DARWIN)).toBeNull();
+      expect(blocked('find . -name "*.tmp" -delete', DARWIN)).toBeNull();
+      expect(blocked('find / -name config -print', LINUX)).toBeNull(); // read-only
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Recursion cap fails closed
+  // -------------------------------------------------------------------------
+  describe('recursion cap', () => {
+    const nestEval = (n: number, inner: string): string =>
+      `${Array(n).fill('eval').join(' ')} ${inner}`;
+
+    it('detects a catastrophic command within the cap', () => {
+      expect(blocked(nestEval(5, 'rm -rf /'), LINUX)).not.toBeNull();
+    });
+
+    it('fails closed (blocks) past the cap rather than returning null', () => {
+      const deep = blocked(nestEval(8, 'rm -rf /'), LINUX);
+      expect(deep).not.toBeNull();
+      expect(deep?.category).toBe('unresolved-target');
+      // Even a benign inner command blocks: 8 levels of eval is pathological.
+      expect(blocked(nestEval(8, 'echo hi'), LINUX)?.category).toBe('unresolved-target');
+    });
+
+    it('treats --recursive= variants as recursive', () => {
+      expect(blocked('rm --recursive=yes -f /', LINUX)).not.toBeNull();
+    });
+
+    it('blocks a leading control operator followed by a wipe', () => {
+      expect(blocked('; rm -rf /', LINUX)).not.toBeNull();
+      expect(blocked('|| rm -rf /', LINUX)).not.toBeNull();
+    });
+
+    it('lets a deep path under a system directory fall through to the prompt', () => {
+      // Design decision: the floor guards top-level system dirs, not every
+      // nested path; deleting one nested tree goes through normal permissions.
+      expect(blocked('rm -rf /usr/local/lib/node_modules/foo', LINUX)).toBeNull();
+      expect(blocked('rm -rf /System/Library/Caches', DARWIN)).toBeNull();
+    });
+  });
 });
