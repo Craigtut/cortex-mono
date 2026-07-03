@@ -574,6 +574,24 @@ export class ObservationalMemoryEngine {
   }
 
   /**
+   * Reconcile buffer state after emergency truncation spliced the source
+   * history from the front.
+   *
+   * The compaction manager's two truncation paths (Layer 3 fallback in
+   * checkAndRunCompaction and reactive handleOverflowError) drop the oldest
+   * `droppedFrontCount` messages from the post-slot source history. That is
+   * the same region the buffer watermark indexes into, so the watermark must
+   * shift down by the dropped count to stay aligned. Otherwise the next
+   * activation slices the wrong prefix, trimming unobserved messages and
+   * possibly orphaning a tool result at the new head.
+   *
+   * @param droppedFrontCount - messages removed from the front of the source
+   */
+  onSourceHistoryTruncated(droppedFrontCount: number): void {
+    this.buffering.onSourceTruncated(droppedFrontCount);
+  }
+
+  /**
    * Returns the current slot content string.
    */
   getSlotContent(): string {

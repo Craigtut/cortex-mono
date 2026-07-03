@@ -1105,6 +1105,10 @@ export class CompactionManager {
       );
       setHistory(result.newHistory);
       this.microcompaction.resetCache();
+      // Keep the observational buffer watermark aligned with the front-
+      // truncated source so the next activation neither trims unobserved
+      // messages nor orphans a tool result at the new head (H-4).
+      this.observationalEngine?.onSourceHistoryTruncated(result.turnsRemoved);
       this._currentContextTokenCount = result.tokensAfter;
     }
 
@@ -1143,6 +1147,10 @@ export class CompactionManager {
 
     setHistory(result.newHistory);
     this.microcompaction.resetCache();
+    // Keep the observational buffer watermark aligned with the front-
+    // truncated source so the next activation neither trims unobserved
+    // messages nor orphans a tool result at the new head (H-4).
+    this.observationalEngine?.onSourceHistoryTruncated(result.turnsRemoved);
     this._currentContextTokenCount = result.tokensAfter;
   }
 
