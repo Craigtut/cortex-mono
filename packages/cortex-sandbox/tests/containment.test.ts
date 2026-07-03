@@ -97,4 +97,43 @@ describe.skipIf(!isMac)('SandboxRuntimeProvider containment (macOS Seatbelt)', (
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('hello sandbox');
   }, 20000);
+
+  it('scrubs credential environment variables from the child', async () => {
+    const prev = process.env['GITHUB_TOKEN'];
+    process.env['GITHUB_TOKEN'] = 'ghp_should_not_leak';
+    try {
+      // $GITHUB_TOKEN is literal here (single-quoted JS string, not a template).
+      const r = await runContained(provider, workspaceDir, 'echo "tok=[$GITHUB_TOKEN]"');
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain('tok=[]');
+      expect(r.stdout).not.toContain('ghp_should_not_leak');
+    } finally {
+      if (prev === undefined) delete process.env['GITHUB_TOKEN'];
+      else process.env['GITHUB_TOKEN'] = prev;
+    }
+  }, 20000);
+
+  // Must run last: it re-initializes the provider with a looser policy.
+  it('applies a re-initialized policy (rung change is not a silent no-op)', async () => {
+    const target = path.join(outsideDir, 'reinit.txt');
+
+    // Under the current workspace policy, writing outside is denied.
+    const denied = await runContained(provider, workspaceDir, `echo hi > "${target}"`);
+    expect(denied.code).not.toBe(0);
+    expect(fs.existsSync(target)).toBe(false);
+
+    // Re-initialize with outsideDir added as a writable root; the write must now
+    // succeed, proving reset()+initialize() actually applied the new policy.
+    const loosened = buildDefaultPolicy('workspace', {
+      workspaceRoots: [workspaceDir, outsideDir],
+      sessionTmpDir: path.join(workspaceDir, '.tmp'),
+      extraDenyRead: [secretFile],
+    });
+    const status = await provider.initialize(loosened);
+    expect(status.backend).toBe('seatbelt');
+
+    const allowed = await runContained(provider, workspaceDir, `echo hi > "${target}"`);
+    expect(allowed.code).toBe(0);
+    expect(fs.existsSync(target)).toBe(true);
+  }, 30000);
 });
