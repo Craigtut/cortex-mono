@@ -67,38 +67,58 @@ export function makeToolResultMsg(
 }
 
 /**
- * Assert the structural invariant providers require:
- *   - every toolResult message references a toolCall that appears in an
- *     EARLIER assistant message in the same slice (an orphaned result is a
- *     hard provider 400), and
- *   - every toolCall block has a matching toolResult message later in the
- *     slice (an orphaned call gets a synthetic error result injected).
+ * Assert the structural invariant providers require. Anthropic (and the pi
+ * runtime) demand that an assistant message's `toolCall` blocks are answered
+ * by `toolResult` messages that IMMEDIATELY follow it, one per call, before
+ * any other message. This helper enforces contiguity, not just presence:
+ *   - a toolResult may only appear inside the contiguous run directly after
+ *     its own assistant tool-call message, and its id must match one of that
+ *     message's calls (otherwise it is an orphaned result → hard 400), and
+ *   - every toolCall block must be answered within that run (otherwise it is
+ *     an orphaned call → pi injects a synthetic "No result provided" error).
  */
 export function assertNoOrphans(messages: AgentMessage[]): void {
-  const seenCallIds = new Set<string>();
-  const answeredCallIds = new Set<string>();
+  let i = 0;
+  while (i < messages.length) {
+    const msg = messages[i]!;
 
-  for (const msg of messages) {
-    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
-      for (const part of msg.content) {
-        if (part.type === 'toolCall' && typeof part['id'] === 'string') {
-          seenCallIds.add(part['id']);
-        }
-      }
+    // A tool result reached here is not inside any call's contiguous run.
+    if (msg.role === 'toolResult') {
+      expect.fail(
+        `orphaned tool result at index ${i}: ${String(msg.toolCallId)} has no immediately preceding toolCall message`,
+      );
     }
-    if (msg.role === 'toolResult' && typeof msg.toolCallId === 'string') {
+
+    const callIds =
+      msg.role === 'assistant' && Array.isArray(msg.content)
+        ? msg.content
+            .filter(p => p.type === 'toolCall' && typeof p['id'] === 'string')
+            .map(p => p['id'] as string)
+        : [];
+
+    if (callIds.length === 0) {
+      i++;
+      continue;
+    }
+
+    // Consume the contiguous run of toolResult messages answering this call.
+    const remaining = new Set(callIds);
+    let j = i + 1;
+    while (j < messages.length && messages[j]!.role === 'toolResult') {
+      const id = messages[j]!.toolCallId;
       expect(
-        seenCallIds.has(msg.toolCallId),
-        `orphaned tool result: ${msg.toolCallId} has no preceding toolCall`,
+        typeof id === 'string' && remaining.has(id),
+        `tool result at index ${j} (${String(id)}) does not match an open call from the assistant message at index ${i}`,
       ).toBe(true);
-      answeredCallIds.add(msg.toolCallId);
+      remaining.delete(id as string);
+      j++;
     }
-  }
 
-  for (const id of seenCallIds) {
     expect(
-      answeredCallIds.has(id),
-      `orphaned tool call: ${id} has no toolResult`,
-    ).toBe(true);
+      remaining.size,
+      `orphaned tool call(s) with no contiguous toolResult: ${[...remaining].join(', ')}`,
+    ).toBe(0);
+
+    i = j;
   }
 }
