@@ -15,7 +15,28 @@
 
 import type { BudgetGuardConfig, CortexLogger } from './types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
-import type { EventBridge } from './event-bridge.js';
+import type { CortexEvent, EventBridge } from './event-bridge.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a turn_end event carries pi-agent-core's synthetic failure message
+ * (stopReason 'error'/'aborted', or errorMessage set). These are emitted once
+ * per failed or cancelled attempt and must not count toward maxTurns.
+ */
+function isFailureTurnEnd(event: CortexEvent): boolean {
+  const data = event.data as Record<string, unknown> | undefined;
+  const message = data?.['message'] as Record<string, unknown> | undefined;
+  if (!message) return false;
+  const stopReason = message['stopReason'];
+  return (
+    stopReason === 'error' ||
+    stopReason === 'aborted' ||
+    message['errorMessage'] != null
+  );
+}
 
 // ---------------------------------------------------------------------------
 // BudgetGuard
@@ -66,6 +87,12 @@ export class BudgetGuard {
     this.unsubscribers.push(
       bridge.on('turn_end', (event) => {
         if (event.childTaskId) return;
+        // Skip synthetic failure/abort turns. pi-agent-core emits a turn_end
+        // for its synthetic failure message (empty usage, stopReason
+        // error/aborted) on every failed or cancelled attempt; counting it
+        // would burn a maxTurns slot per retry attempt rather than per real
+        // model turn.
+        if (isFailureTurnEnd(event)) return;
         this.turnCount++;
 
         // Read cost from typed usage (extracted by EventBridge)

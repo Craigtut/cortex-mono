@@ -34,21 +34,25 @@ function createRetryMock(outcomes: Outcome[], failStopReason: 'error' | 'aborted
     const outcome = queue.shift() ?? 'ok';
     if (outcome === 'fail') {
       agent.state.errorMessage = 'Connection error.';
-      agent.state.messages.push({
+      const failMsg = {
         role: 'assistant',
         content: [],
         stopReason: failStopReason,
         errorMessage: 'Connection error.',
-      } as never);
+      };
+      agent.state.messages.push(failMsg as never);
+      // pi emits turn_end carrying its synthetic failure message. The budget
+      // guard skips these (they are not real model turns).
+      eventHandler?.({ type: 'turn_end', message: failMsg } as PiEvent);
     } else {
-      agent.state.messages.push({
+      const okMsg = {
         role: 'assistant',
         content: 'done',
         stopReason: 'end_turn',
-      } as never);
+      };
+      agent.state.messages.push(okMsg as never);
+      eventHandler?.({ type: 'turn_end', message: okMsg } as PiEvent);
     }
-    // Pi emits turn_end for both success and synthetic failure turns.
-    eventHandler?.({ type: 'turn_end' });
   };
 
   const agent: RetryMockAgent = {
@@ -229,19 +233,21 @@ describe('CortexAgent background retry', () => {
     expect(errored.mock.calls[0][0].category).toBe('network');
   });
 
-  it('budget counts turns across retry attempts of one logical prompt', async () => {
+  it('budget counts real turns per logical prompt, skipping synthetic failures', async () => {
     mock = createRetryMock(['fail', 'ok']);
     const agent = build(mock, createConfig());
 
     await agent.prompt('hi');
 
-    // One logical turn, two attempts (fail + successful retry). Each pi run
-    // emitted agent_start, but the budget must span the whole logical turn
-    // instead of resetting per attempt.
+    // One logical turn, two attempts (fail + successful retry). Both pi runs
+    // emit agent_start (which no longer resets the budget) and a turn_end;
+    // the failed attempt's turn_end is synthetic (stopReason 'error') and is
+    // skipped, so only the single real turn counts.
     expect(mock.continueCalls).toBe(1);
-    expect(agent.getBudgetGuard().getTurnCount()).toBe(2);
+    expect(agent.getBudgetGuard().getTurnCount()).toBe(1);
 
-    // The next logical prompt starts a fresh budget.
+    // The next logical prompt resets the budget, so its real turn counts as 1
+    // (proving the reset is per logical prompt, not accumulated).
     await agent.prompt('again');
     expect(agent.getBudgetGuard().getTurnCount()).toBe(1);
   });
