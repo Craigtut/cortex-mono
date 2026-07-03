@@ -817,7 +817,7 @@ function checkPosixRm(words: ShellWord[], ec: EvalContext, viaXargs: boolean): C
       return finding('filesystem-root',
         'Catastrophic command blocked: rm --no-preserve-root explicitly requests deletion of the filesystem root.');
     }
-    if (t === '--recursive' || (isCombinedShortFlags(t) && /[rR]/.test(t))) { recursive = true; continue; }
+    if (/^--recursive(=|$)/.test(t) || (isCombinedShortFlags(t) && /[rR]/.test(t))) { recursive = true; continue; }
     if (t.startsWith('-') && t.length > 1) continue;
     operands.push(w);
   }
@@ -836,7 +836,7 @@ function checkChmodFamily(verb: string, words: ShellWord[], ec: EvalContext): Ca
     const t = w.text;
     if (afterDashDash) { operands.push(w); continue; }
     if (t === '--') { afterDashDash = true; continue; }
-    if (t === '--recursive' || (isCombinedShortFlags(t) && /[rR]/.test(t))) { recursive = true; continue; }
+    if (/^--recursive(=|$)/.test(t) || (isCombinedShortFlags(t) && /[rR]/.test(t))) { recursive = true; continue; }
     if (t.startsWith('-') && t.length > 1) continue;
     operands.push(w);
   }

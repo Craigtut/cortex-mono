@@ -446,5 +446,21 @@ describe('findCatastrophicCommand', () => {
     it('uses process.platform when ctx.platform is omitted', () => {
       expect(findCatastrophicCommand('rm -rf /', { cwd: process.cwd(), home: '/Users/dev' })).not.toBeNull();
     });
+
+    it('treats --recursive= variants as recursive', () => {
+      expect(blocked('rm --recursive=yes -f /', LINUX)).not.toBeNull();
+    });
+
+    it('blocks a leading control operator followed by a wipe', () => {
+      expect(blocked('; rm -rf /', LINUX)).not.toBeNull();
+      expect(blocked('|| rm -rf /', LINUX)).not.toBeNull();
+    });
+
+    it('lets a deep path under a system directory fall through to the prompt', () => {
+      // Design decision: the floor guards top-level system dirs, not every
+      // nested path; deleting one nested tree goes through normal permissions.
+      expect(blocked('rm -rf /usr/local/lib/node_modules/foo', LINUX)).toBeNull();
+      expect(blocked('rm -rf /System/Library/Caches', DARWIN)).toBeNull();
+    });
   });
 });
