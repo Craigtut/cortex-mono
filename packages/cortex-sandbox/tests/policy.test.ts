@@ -47,13 +47,15 @@ describe('buildDefaultPolicy', () => {
     expect(p.filesystem.denyWrite.some((x) => x.includes('.git') && x.endsWith('config'))).toBe(true);
   });
 
-  it('applies consumer extras (extra deny/allow)', () => {
+  it('applies consumer extras (extra deny-write/deny-read/allow)', () => {
     const p = buildDefaultPolicy('workspace', {
       ...opts,
       extraDenyWrite: ['/nope/home/.cortex/settings.json'],
+      extraDenyRead: ['/nope/home/.cortex/credentials.json'],
       extraAllowedDomains: ['registry.example.com'],
     });
     expect(p.filesystem.denyWrite).toContain('/nope/home/.cortex/settings.json');
+    expect(p.filesystem.denyRead).toContain('/nope/home/.cortex/credentials.json');
     expect(p.network.allowedDomains).toContain('registry.example.com');
   });
 
