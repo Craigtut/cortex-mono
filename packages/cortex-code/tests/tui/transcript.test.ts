@@ -94,6 +94,7 @@ vi.mock('../../src/tui/renderers/tool-group.js', () => ({
     readonly groupKind: string;
     isExpanded = false;
     starts: string[] = [];
+    completeArgs: unknown[][] = [];
 
     constructor(groupKind: string) {
       this.groupKind = groupKind;
@@ -103,7 +104,9 @@ vi.mock('../../src/tui/renderers/tool-group.js', () => ({
       this.starts.push(id);
     }
 
-    completeToolCall(): void {}
+    completeToolCall(...args: unknown[]): void {
+      this.completeArgs.push(args);
+    }
     failToolCall(): void {}
     close(): void {}
 
@@ -178,6 +181,23 @@ describe('TranscriptManager', () => {
     transcript.startToolCall('tool-2', 'Read', { file_path: '/tmp/project/src/index.ts' });
 
     expect(chat.children).toHaveLength(1);
+  });
+
+  it('forwards the tool result (not just details) to the grouped component', () => {
+    const chat = new Container();
+    const tui = { requestRender: requestRenderSpy };
+    const transcript = new TranscriptManager(chat as never, tui as never);
+
+    transcript.startToolCall('w-1', 'Write', { file_path: '/etc/hosts' });
+    const result = { content: [{ type: 'text', text: 'You must Read this file first.' }] };
+    const details = { filePath: '/etc/hosts', isCreate: false, bytesWritten: 0, diff: null };
+    transcript.completeToolCall('w-1', result, details, 5);
+
+    // The grouped component must receive (id, result, details, durationMs) so it
+    // can detect a refusal and show the message. Dropping result was the bug.
+    const group = chat.children[0] as { completeArgs: unknown[][] };
+    expect(group.completeArgs).toHaveLength(1);
+    expect(group.completeArgs[0]).toEqual(['w-1', result, details, 5]);
   });
 
   it('keeps exploration grouped across hidden assistant turns', () => {

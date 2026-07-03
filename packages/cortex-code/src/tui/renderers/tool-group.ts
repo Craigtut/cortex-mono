@@ -14,6 +14,7 @@ import chalk from 'chalk';
 import type { DiffHunk, EditDetails, WriteDetails } from '@animus-labs/cortex';
 import { getToolTheme, type ToolTheme } from '../theme.js';
 import { formatDuration, shortenPath } from './path-utils.js';
+import { sanitizeTerminalText, sanitizeTerminalLine } from './sanitize-terminal.js';
 
 export type ToolGroupKind = 'exploration' | 'web' | 'changes';
 
@@ -57,6 +58,35 @@ const MAX_DIFF_LINES = 12;
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+/** Extract the text payload from a tool result (string or content-array shape). */
+function extractResultText(result: unknown): string {
+  if (typeof result === 'string') return result;
+  if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
+    const content = (result as Record<string, unknown>)['content'];
+    if (Array.isArray(content)) {
+      return content
+        .filter((c: unknown) => c && typeof c === 'object' && (c as Record<string, unknown>)['type'] === 'text')
+        .map((c: unknown) => (c as Record<string, string>)['text'])
+        .join('\n');
+    }
+  }
+  return '';
+}
+
+/**
+ * Detect a soft refusal on a grouped change tool: the tool returns "success"
+ * but nothing was written. Edit rejects with replacementCount 0 and no diff;
+ * Write rejects an existing file with bytesWritten 0 and no diff (a legitimate
+ * truncate-to-empty still carries a real diff, so the diff guard is required).
+ */
+function isRefusedChange(toolName: string, details: unknown): boolean {
+  const d = asRecord(details);
+  const noDiff = !d['diff'] || (Array.isArray(d['diff']) && d['diff'].length === 0);
+  if (toolName === 'Edit') return d['replacementCount'] === 0 && noDiff;
+  if (toolName === 'Write') return d['bytesWritten'] === 0 && d['isCreate'] === false && noDiff;
+  return false;
 }
 
 function pluralize(noun: string, count: number): string {
@@ -104,10 +134,12 @@ function formatDiffBody(diff: DiffHunk[] | null | undefined, theme: ToolTheme): 
     truncated = true;
   }
 
+  // The diff body is raw FILE content: strip control chars before it reaches
+  // the terminal so a crafted file cannot inject ANSI/OSC via the diff view.
   const out = windowed.map(line => {
-    if (line.startsWith('+')) return chalk.hex(theme.diffAdd)('+ ' + line.slice(1));
-    if (line.startsWith('-')) return chalk.hex(theme.diffRemove)('- ' + line.slice(1));
-    return chalk.hex(theme.diffContext)('  ' + line.slice(1));
+    if (line.startsWith('+')) return chalk.hex(theme.diffAdd)('+ ' + sanitizeTerminalText(line.slice(1)));
+    if (line.startsWith('-')) return chalk.hex(theme.diffRemove)('- ' + sanitizeTerminalText(line.slice(1)));
+    return chalk.hex(theme.diffContext)('  ' + sanitizeTerminalText(line.slice(1)));
   });
   if (truncated) out.push(chalk.hex(theme.muted)('…'));
   return out;
@@ -194,20 +226,32 @@ export class ToolGroupComponent implements Component {
       args,
       status: 'pending',
       startedAt: Date.now(),
-      summary: startSummary(toolName, args),
+      summary: sanitizeTerminalLine(startSummary(toolName, args)),
     });
   }
 
-  completeToolCall(id: string, details: unknown, durationMs: number): void {
+  completeToolCall(id: string, result: unknown, details: unknown, durationMs: number): void {
     const entry = this.findEntry(id);
     if (!entry) return;
-    entry.status = 'success';
     entry.durationMs = durationMs;
 
     if (this.groupKind === 'changes') {
+      // A refused Edit/Write reports "success" but wrote nothing. Surface it as
+      // an error with the tool's refusal text instead of a silent green dot.
+      if (isRefusedChange(entry.toolName, details)) {
+        entry.status = 'error';
+        const message = extractResultText(result).split('\n')[0] ?? '';
+        entry.error = sanitizeTerminalLine(message || 'change refused');
+        entry.summary = sanitizeTerminalLine(
+          shortenPath(String(asRecord(details)['filePath'] ?? entry.args['file_path'] ?? '')),
+        );
+        return;
+      }
+      entry.status = 'success';
       this.applyChangeDetails(entry, details);
     } else {
-      entry.summary = resultSummary(entry.toolName, entry.args, details);
+      entry.status = 'success';
+      entry.summary = sanitizeTerminalLine(resultSummary(entry.toolName, entry.args, details));
     }
   }
 
@@ -216,7 +260,7 @@ export class ToolGroupComponent implements Component {
     if (!entry) return;
     entry.status = 'error';
     entry.durationMs = durationMs;
-    entry.error = error.split('\n')[0] ?? error;
+    entry.error = sanitizeTerminalLine(error.split('\n')[0] ?? error);
   }
 
   close(): void {
@@ -274,7 +318,7 @@ export class ToolGroupComponent implements Component {
     const theme = getToolTheme();
     const d = details as (EditDetails & WriteDetails) | undefined;
     const filePath = String(d?.filePath ?? entry.args['file_path'] ?? '');
-    const shortPath = shortenPath(filePath);
+    const shortPath = sanitizeTerminalLine(shortenPath(filePath));
     const { additions, removals } = diffCounts(d?.diff);
     const isCreate = (d as WriteDetails | undefined)?.isCreate === true;
 
@@ -350,7 +394,7 @@ export class ToolGroupComponent implements Component {
         ?? (entry.args['file_path'] != null ? String(entry.args['file_path']) : '');
       if (!path || seen.has(path)) continue;
       seen.add(path);
-      lines.push(`   ${chalk.hex(theme.muted)(shortenPath(path))}`);
+      lines.push(`   ${chalk.hex(theme.muted)(sanitizeTerminalLine(shortenPath(path)))}`);
     }
     return lines;
   }
