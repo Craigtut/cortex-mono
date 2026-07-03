@@ -1264,33 +1264,55 @@ export class Session {
       return undefined;
     }
 
-    const provider = new SandboxRuntimeProvider({
-      onDegraded: (degradations) => log.warn('Sandbox enforcement reduced', { degradations }),
-    });
-    const policy = buildDefaultPolicy(rung, {
-      workspaceRoots: [this.cwd],
-      // The agent's shell must never write Cortex's own config, permission rules,
-      // or stored credentials (they live under ~/.cortex).
-      extraDenyWrite: [path.join(homedir(), '.cortex')],
-      ...(sb?.allowedDomains ? { extraAllowedDomains: sb.allowedDomains } : {}),
-    });
+    try {
+      const provider = new SandboxRuntimeProvider({
+        onDegraded: (degradations) => log.warn('Sandbox enforcement reduced', { degradations }),
+      });
+      const cortexHome = path.join(homedir(), '.cortex');
+      const policy = buildDefaultPolicy(rung, {
+        workspaceRoots: [this.cwd],
+        // A sandboxed shell must not WRITE Cortex's own config, permission rules,
+        // or the project's .cortex (which now carries the sandbox policy itself),
+        // and must not READ Cortex's stored API keys / OAuth tokens.
+        extraDenyWrite: [cortexHome, path.join(this.cwd, '.cortex')],
+        extraDenyRead: [path.join(cortexHome, 'credentials.json')],
+        ...(sb?.allowedDomains ? { extraAllowedDomains: sb.allowedDomains } : {}),
+      });
 
-    const status = await provider.initialize(policy);
-    this.sandboxStatus = status;
-    if (status.backend === 'none') {
-      log.warn('Sandbox not enforced; shell commands run uncontained', {
-        platform: process.platform,
-        reason: status.degradations.join('; '),
+      const status = await provider.initialize(policy);
+      this.sandboxStatus = status;
+      if (status.backend === 'none') {
+        log.warn('Sandbox not enforced; shell commands run uncontained', {
+          platform: process.platform,
+          reason: status.degradations.join('; '),
+        });
+      } else {
+        log.info('Sandbox active', {
+          rung,
+          backend: status.backend,
+          filesystem: status.filesystem,
+          network: status.network,
+        });
+      }
+      return provider;
+    } catch (err) {
+      // Never let sandbox setup crash startup: some provider preflight runs before
+      // its own internal try. Warn and continue uncontained.
+      log.warn('Sandbox initialization threw; shell commands run uncontained', {
+        error: err instanceof Error ? err.message : String(err),
       });
-    } else {
-      log.info('Sandbox active', {
-        rung,
-        backend: status.backend,
-        filesystem: status.filesystem,
-        network: status.network,
-      });
+      this.sandboxStatus = undefined;
+      return undefined;
     }
-    return provider;
+  }
+
+  /**
+   * Best-effort teardown of the OS sandbox (stops the egress proxy and the macOS
+   * violation log-stream child, removes temp profiles). Idempotent and safe to
+   * call outside a full shutdown, e.g. from a signal handler.
+   */
+  async disposeSandbox(): Promise<void> {
+    await this.sandboxProvider?.dispose();
   }
 
   private async resolvePermission(
@@ -1303,8 +1325,12 @@ export class Session {
       matchRule: (t, a) => this.rules.matchRule(t, a),
       isReadOnlyInProject: (t, a) => this.isReadOnlyInProject(t, a),
       // Sandboxed shell commands past the catastrophic floor and any deny rule
-      // auto-run inside the OS boundary instead of prompting.
-      sandboxBashEnforced: this.sandboxStatus?.filesystem === 'enforced',
+      // auto-run inside the OS boundary instead of prompting. Gate on BOTH axes:
+      // a filesystem-only backend (e.g. future Windows Tier 1, fs enforced but
+      // network none) must keep prompting rather than auto-run with open egress.
+      sandboxBashEnforced:
+        this.sandboxStatus?.filesystem === 'enforced' &&
+        this.sandboxStatus?.network === 'enforced',
     };
 
     // Fast path: deterministic decision (catastrophic floor > yolo > deny rule

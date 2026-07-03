@@ -64,6 +64,8 @@ export async function preflightPermission(
 
   // 3b. Sandbox auto-allow: when the OS boundary contains shell commands, a Bash
   //     call past the catastrophic floor and any deny rule runs without a prompt.
+  //     Rules are allow/deny only today; if an "ask every time" rule type is
+  //     added, reorder so this fires only when the engine did not request a prompt.
   if (deps.sandboxBashEnforced && toolName === 'Bash') return { decision: 'allow' };
 
   // 4. Read-only tools contained in the workspace auto-approve.
