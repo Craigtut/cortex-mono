@@ -182,6 +182,50 @@ describe('Edit tool', () => {
     expect(content).toBe('hi\r\nthere\r\n');
   });
 
+  it('does not rewrite untouched lines in a mixed-ending file', async () => {
+    const filePath = path.join(tmpDir, 'mixed.txt');
+    // line1 + line3 use CRLF; line2 + line4 use bare LF.
+    const original = 'line1\r\nline2\nline3\r\nline4\n';
+    fs.writeFileSync(filePath, original);
+    markFileRead(registry, filePath);
+
+    const result = await editTool.execute({
+      file_path: filePath,
+      old_string: 'line2',
+      new_string: 'changed2',
+    });
+
+    expect(result.details.replacementCount).toBe(1);
+
+    // Only line2 changed. Every other line keeps its exact original ending:
+    // the two CRLF lines are NOT converted to LF (the old global conversion
+    // would have rewritten every line, producing a large spurious diff).
+    const content = fs.readFileSync(filePath, 'utf8');
+    expect(content).toBe('line1\r\nchanged2\nline3\r\nline4\n');
+
+    // The diff reflects a single-line change, not a whole-file rewrite.
+    expect(result.details.diff.length).toBe(1);
+    expect(result.details.diff[0]!.lines).toEqual(['-line2', '+changed2']);
+  });
+
+  it('preserves a CRLF line ending when editing within a mixed-ending file', async () => {
+    const filePath = path.join(tmpDir, 'mixed-crlf.txt');
+    const original = 'alpha\r\nbeta\ngamma\r\n';
+    fs.writeFileSync(filePath, original);
+    markFileRead(registry, filePath);
+
+    // Replace the content of a CRLF-terminated line; its CRLF must survive
+    // and the bare-LF line must stay bare.
+    const result = await editTool.execute({
+      file_path: filePath,
+      old_string: 'alpha',
+      new_string: 'ALPHA',
+    });
+
+    expect(result.details.replacementCount).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('ALPHA\r\nbeta\ngamma\r\n');
+  });
+
   it('produces a diff in details', async () => {
     const filePath = path.join(tmpDir, 'test.txt');
     fs.writeFileSync(filePath, 'hello world\n');
