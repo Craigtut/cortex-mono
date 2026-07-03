@@ -570,6 +570,100 @@ describe('McpClientManager', () => {
   });
 
   // -----------------------------------------------------------------------
+  // Tool name collisions
+  // -----------------------------------------------------------------------
+
+  describe('tool name collisions', () => {
+    it('deduplicates names that collide after sanitization within one server', async () => {
+      // 'get.forecast' and 'get_forecast' both sanitize to 'weather__get_forecast'.
+      mockListTools.mockResolvedValueOnce({
+        tools: [
+          { name: 'get.forecast', description: 'dotted' },
+          { name: 'get_forecast', description: 'underscored' },
+        ],
+      });
+
+      await manager.connect('weather', { transport: 'stdio', command: 'node', args: ['w.js'] });
+
+      const names = manager.getTools().map(t => t.name);
+      expect(names).toHaveLength(2);
+      // Both survive with distinct names (no shadowing, no duplicate in the set).
+      expect(new Set(names).size).toBe(2);
+      expect(names).toContain('weather__get_forecast');
+      expect(names).toContain('weather__get_forecast_2');
+      // getServerToolNames reflects the final (deduped) names.
+      expect(manager.getServerToolNames('weather')).toEqual([
+        'weather__get_forecast',
+        'weather__get_forecast_2',
+      ]);
+    });
+
+    it('a renamed tool still calls its original MCP tool name', async () => {
+      mockListTools.mockResolvedValueOnce({
+        tools: [
+          { name: 'get.forecast', description: 'dotted' },
+          { name: 'get_forecast', description: 'underscored' },
+        ],
+      });
+      await manager.connect('weather', { transport: 'stdio', command: 'node', args: ['w.js'] });
+
+      const renamed = manager.getTools().find(t => t.name === 'weather__get_forecast_2')!;
+      expect(renamed).toBeDefined();
+
+      mockCallTool.mockResolvedValueOnce({ content: [{ type: 'text', text: 'ok' }], isError: false });
+      await renamed.execute({});
+
+      // The suffixed tool corresponds to the second MCP tool ('get_forecast'),
+      // and execution must use the unsanitized original name for tools/call.
+      expect(mockCallTool).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'get_forecast' }),
+      );
+    });
+
+    it('deduplicates names that collide across servers', async () => {
+      // Server 'a.b' and server 'a_b' both yield the prefix 'a_b__' after
+      // sanitization, so tool 'c' collides across the two servers.
+      mockListTools.mockResolvedValueOnce({ tools: [{ name: 'c', description: 'first' }] });
+      await manager.connect('a.b', { transport: 'stdio', command: 'node', args: ['1.js'] });
+
+      mockListTools.mockResolvedValueOnce({ tools: [{ name: 'c', description: 'second' }] });
+      await manager.connect('a_b', { transport: 'stdio', command: 'node', args: ['2.js'] });
+
+      const names = manager.getTools().map(t => t.name);
+      expect(names).toHaveLength(2);
+      expect(new Set(names).size).toBe(2);
+      expect(names).toContain('a_b__c');
+      expect(names).toContain('a_b__c_2');
+      // The first-connected server keeps the unsuffixed name.
+      expect(manager.getServerToolNames('a.b')).toEqual(['a_b__c']);
+      expect(manager.getServerToolNames('a_b')).toEqual(['a_b__c_2']);
+    });
+
+    it('logs a warning when a tool name is renamed', async () => {
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      manager.logger = logger;
+
+      mockListTools.mockResolvedValueOnce({
+        tools: [
+          { name: 'get.forecast', description: 'dotted' },
+          { name: 'get_forecast', description: 'underscored' },
+        ],
+      });
+      await manager.connect('weather', { transport: 'stdio', command: 'node', args: ['w.js'] });
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        '[MCP] tool name collision after sanitization; renamed to avoid shadowing',
+        expect.objectContaining({
+          serverName: 'weather',
+          mcpTool: 'get_forecast',
+          collidingName: 'weather__get_forecast',
+          assignedName: 'weather__get_forecast_2',
+        }),
+      );
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Connection state
   // -----------------------------------------------------------------------
 

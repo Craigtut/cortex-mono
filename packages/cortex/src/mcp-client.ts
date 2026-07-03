@@ -80,6 +80,18 @@ function sanitizeToolName(name: string): string {
 }
 
 /**
+ * Append a deterministic numeric suffix (`_2`, `_3`, ...) to a tool name while
+ * keeping it within the provider's {@link TOOL_NAME_MAX_LENGTH} cap. The base
+ * name is truncated as needed so the suffix always fits.
+ */
+function appendToolNameSuffix(name: string, ordinal: number): string {
+  const suffix = `_${ordinal}`;
+  const maxBase = TOOL_NAME_MAX_LENGTH - suffix.length;
+  const base = name.length > maxBase ? name.slice(0, maxBase) : name;
+  return `${base}${suffix}`;
+}
+
+/**
  * Redact secret-bearing fields from a transport config before it leaves the
  * manager. Stdio `env` and HTTP `headers` carry credentials (API keys, auth
  * tokens); they are dropped entirely and replaced with a boolean presence flag
@@ -272,9 +284,24 @@ export class McpClientManager {
    */
   getTools(): AgentTool[] {
     const allTools: AgentTool[] = [];
+    // Tool names are made unique at discovery time (see discoverTools), so the
+    // aggregate set should already be collision-free. Guard defensively here
+    // anyway: a duplicate name in the provider-facing list can make the
+    // provider reject the whole request (Anthropic 400s) or silently shadow a
+    // tool. Skip any residual duplicate rather than emit an invalid tool list.
+    const seen = new Set<string>();
     for (const conn of this.connections.values()) {
-      if (conn.connected) {
-        allTools.push(...conn.tools);
+      if (!conn.connected) continue;
+      for (const tool of conn.tools) {
+        if (seen.has(tool.name)) {
+          this.logger.debug('[MCP] dropping duplicate tool name from aggregate set', {
+            serverName: conn.serverName,
+            toolName: tool.name,
+          });
+          continue;
+        }
+        seen.add(tool.name);
+        allTools.push(tool);
       }
     }
     return allTools;
@@ -394,8 +421,14 @@ export class McpClientManager {
     const response = await client.listTools();
     const tools: AgentTool[] = [];
 
+    // Seed the used-name set with names already claimed by OTHER connected
+    // servers so a new server cannot shadow an existing tool. The connecting
+    // server itself is excluded (on reconnect its old tools are still in the
+    // map and would otherwise collide with themselves).
+    const usedNames = this.collectUsedToolNames(serverName);
+
     for (const mcpTool of response.tools) {
-      tools.push(this.wrapMcpTool(
+      const tool = this.wrapMcpTool(
         serverName,
         config,
         {
@@ -404,10 +437,64 @@ export class McpClientManager {
           inputSchema: mcpTool.inputSchema as Record<string, unknown> | undefined,
         },
         client,
-      ));
+      );
+
+      // Sanitization and the 128-char cap can collapse distinct MCP tool names
+      // to the same provider-facing name (within this server or against another
+      // server). Assign a unique name so both tools remain callable.
+      const uniqueName = this.dedupeToolName(usedNames, tool.name, serverName, mcpTool.name);
+      tools.push(uniqueName === tool.name ? tool : { ...tool, name: uniqueName });
     }
 
     return tools;
+  }
+
+  /**
+   * Collect the provider-facing names of every tool on all connected servers
+   * except `excludeServer`. Used to seed collision detection at discovery time.
+   */
+  private collectUsedToolNames(excludeServer: string): Set<string> {
+    const used = new Set<string>();
+    for (const [name, conn] of this.connections) {
+      if (name === excludeServer) continue;
+      for (const tool of conn.tools) {
+        used.add(tool.name);
+      }
+    }
+    return used;
+  }
+
+  /**
+   * Return a unique provider-facing tool name, appending a deterministic
+   * numeric suffix on collision and recording the result in `used`. Logs a
+   * warning (once, at discovery) whenever a rename is required.
+   */
+  private dedupeToolName(
+    used: Set<string>,
+    name: string,
+    serverName: string,
+    mcpToolName: string,
+  ): string {
+    if (!used.has(name)) {
+      used.add(name);
+      return name;
+    }
+
+    let ordinal = 2;
+    let candidate = appendToolNameSuffix(name, ordinal);
+    while (used.has(candidate)) {
+      ordinal++;
+      candidate = appendToolNameSuffix(name, ordinal);
+    }
+    used.add(candidate);
+
+    this.logger.warn('[MCP] tool name collision after sanitization; renamed to avoid shadowing', {
+      serverName,
+      mcpTool: mcpToolName,
+      collidingName: name,
+      assignedName: candidate,
+    });
+    return candidate;
   }
 
   /**
