@@ -35,9 +35,7 @@ import {
   type ToolCallStartPayload,
   type ToolCallUpdatePayload,
   stripWorkingTags,
-  findCatastrophicCommand,
 } from '@animus-labs/cortex';
-import { homedir } from 'node:os';
 import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import { App, type AppCallbacks } from './tui/app.js';
 import { randomThinkingLabel } from './tui/spinner.js';
@@ -48,6 +46,7 @@ import { CredentialStore, type CredentialEntry } from './config/credentials.js';
 import { singleFlight } from './utils/single-flight.js';
 import { resolveStoredOAuthApiKey } from './utils/oauth-credentials.js';
 import { PermissionRuleManager } from './permissions/rules.js';
+import { preflightPermission, type PreflightDeps } from './permissions/preflight.js';
 import { isPathWithinRealCwd } from './permissions/path-containment.js';
 import { discoverProjectContext } from './discovery/context.js';
 import { discoverSkills } from './discovery/skills.js';
@@ -1125,28 +1124,20 @@ export class Session {
     toolName: string,
     toolArgs: unknown,
   ): Promise<boolean | CortexToolPermissionResult> {
-    // Catastrophic commands (e.g. rm -rf /) are blocked unconditionally, ahead
-    // of yolo mode, the read-only bypass, and any allow rule. There is no
-    // override: such a command should never run, however it is reached.
-    if (toolName === 'Bash') {
-      const finding = findCatastrophicCommand(
-        String((toolArgs as Record<string, unknown>)['command'] ?? ''),
-        { cwd: this.cwd, home: homedir() },
-      );
-      if (finding) {
-        return { decision: 'block', reason: finding.reason };
-      }
+    const preflightDeps: PreflightDeps = {
+      yoloMode: this.yoloMode,
+      cwd: this.cwd,
+      matchRule: (t, a) => this.rules.matchRule(t, a),
+      isReadOnlyInProject: (t, a) => this.isReadOnlyInProject(t, a),
+    };
+
+    // Fast path: deterministic decision (catastrophic floor > yolo > deny rule
+    // > read-only-in-project > allow rule) before acquiring the prompt lock.
+    const pre = await preflightPermission(toolName, toolArgs, preflightDeps);
+    if (pre.decision === 'allow') return true;
+    if (pre.decision === 'block') {
+      return pre.reason ? { decision: 'block', reason: pre.reason } : { decision: 'block' };
     }
-
-    if (this.yoloMode) return true;
-
-    // Auto-allow read-only tools within the project directory
-    if (await this.isReadOnlyInProject(toolName, toolArgs)) return true;
-
-    // Fast path: check rules before acquiring the lock
-    const rule = this.rules.matchRule(toolName, toolArgs);
-    if (rule === 'allow') return true;
-    if (rule === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
 
     if (!this.app) return { decision: 'block', reason: 'TUI not initialized' };
 
@@ -1155,10 +1146,14 @@ export class Session {
       await this.permissionLockPromise;
     }
 
-    // Re-check rules: a previous prompt may have added an "always allow" rule
-    const ruleAfterWait = this.rules.matchRule(toolName, toolArgs);
-    if (ruleAfterWait === 'allow') return true;
-    if (ruleAfterWait === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
+    // Re-check: a previous prompt may have added an "always allow"/deny rule.
+    const preAfterWait = await preflightPermission(toolName, toolArgs, preflightDeps);
+    if (preAfterWait.decision === 'allow') return true;
+    if (preAfterWait.decision === 'block') {
+      return preAfterWait.reason
+        ? { decision: 'block', reason: preAfterWait.reason }
+        : { decision: 'block' };
+    }
 
     // Acquire lock and show the prompt
     this.permissionLockPromise = new Promise<void>((resolve) => {
@@ -1213,7 +1208,9 @@ export class Session {
     const args = toolArgs as Record<string, unknown>;
     switch (toolName) {
       case 'Read': {
-        const filePath = String(args['file_path'] ?? '');
+        // Mirror getMatchValue/matchRule's `file_path ?? path` so the read-only
+        // auto-approve and the rule layer can never disagree on the target.
+        const filePath = String(args['file_path'] ?? args['path'] ?? '');
         return this.isWithinCwd(filePath);
       }
       case 'Glob':

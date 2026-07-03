@@ -1,10 +1,15 @@
 import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
-import { findCatastrophicCommand } from '@animus-labs/cortex';
+import {
+  findCatastrophicCommand,
+  isPathSameOrDescendant,
+  resolveThroughExistingAncestor,
+} from '@animus-labs/cortex';
 import { extractPattern } from './patterns.js';
+import { isPathWithinRealCwd } from './path-containment.js';
 import { splitBashCommand, stripLeadingAssignments, isCompoundBash } from './bash-command.js';
 
 export type PermissionDecision = 'allow' | 'deny';
@@ -123,6 +128,23 @@ function getMatchValue(toolName: string, toolArgs: unknown): string {
   }
 }
 
+/**
+ * The directory (or file) a path-based rule pattern is scoped to, with any
+ * trailing wildcard stripped. Used to canonicalize the rule's scope so a
+ * resolved target can be tested for containment inside it.
+ *
+ *   "${cwd}/*"     -> "${cwd}"        (whole workspace)
+ *   "src/auth/*"   -> "src/auth"      (a subdirectory, relative to cwd)
+ *   "*"            -> ""              (workspace root; resolved against cwd)
+ *   "/etc/*"       -> "/etc"          (an explicit external directory)
+ *   "notes.txt"    -> "notes.txt"     (an exact path)
+ */
+function patternBaseDir(pattern: string): string {
+  if (pattern.endsWith('/*')) return pattern.slice(0, -2);
+  if (pattern.endsWith('*')) return pattern.slice(0, -1);
+  return pattern;
+}
+
 export class PermissionRuleManager {
   private sessionRules: PermissionRule[] = [];
   private projectRules: PermissionRule[] = [];
@@ -149,8 +171,14 @@ export class PermissionRuleManager {
    * Check if a tool call matches any rule.
    * Precedence: session > project > user.
    * Returns the decision if matched, null if no rule applies.
+   *
+   * Path-based tools (Edit/Write/Read/Glob/Grep) are matched through real
+   * filesystem containment, not a raw string prefix, so a model-authored
+   * `..`/symlink path cannot satisfy a workspace-scoped rule and let the
+   * tool's own `path.resolve()` complete a traversal. The method is async
+   * because that containment check reads the filesystem (realpath).
    */
-  matchRule(toolName: string, toolArgs: unknown): PermissionDecision | null {
+  async matchRule(toolName: string, toolArgs: unknown): Promise<PermissionDecision | null> {
     // Bash is evaluated per simple-command so a prefix rule cannot auto-approve
     // a second command chained on with && / ; / | etc.
     if (toolName === 'Bash') {
@@ -158,11 +186,21 @@ export class PermissionRuleManager {
       return this.matchBashCommand(String(args['command'] ?? ''));
     }
 
-    const value = getMatchValue(toolName, toolArgs);
+    if (toolName === 'Edit' || toolName === 'Write' || toolName === 'Read') {
+      const args = toolArgs as Record<string, unknown>;
+      return this.matchFilePathRule(toolName, String(args['file_path'] ?? args['path'] ?? ''));
+    }
 
-    // Check in precedence order: session first, then project, then user
+    if (toolName === 'Glob' || toolName === 'Grep') {
+      return this.matchSearchRule(toolName, toolArgs);
+    }
+
+    return this.matchByValue(toolName, getMatchValue(toolName, toolArgs));
+  }
+
+  /** Precedence walk (session > project > user, deny before allow) over a plain string value. */
+  private matchByValue(toolName: string, value: string): PermissionDecision | null {
     for (const rules of [this.sessionRules, this.projectRules, this.userRules]) {
-      // Deny rules take priority within the same scope
       for (const rule of rules) {
         if (rule.toolName === toolName && rule.decision === 'deny' && matchPattern(rule.pattern, value)) {
           return 'deny';
@@ -174,8 +212,105 @@ export class PermissionRuleManager {
         }
       }
     }
-
     return null;
+  }
+
+  /**
+   * Match a rule for a file tool (Edit/Write/Read) by containment.
+   *
+   * The target is resolved to its real absolute path (through `..` and
+   * symlinks, via the nearest existing ancestor) and tested for containment
+   * inside each rule pattern's canonicalized scope. This means:
+   *
+   *  - A workspace allow rule (`${cwd}/*`) only fires when the resolved target
+   *    genuinely lives inside the workspace, so `${cwd}/../../etc/passwd` and a
+   *    workspace symlink pointing outside are both refused (fall through to a
+   *    prompt) instead of being auto-approved.
+   *  - Legitimate in-workspace paths, absolute or relative to cwd, still match.
+   *  - Deny additionally matches the raw, unresolved string, so a workspace
+   *    deny still catches a literal `${cwd}/..` escape attempt, and a deny on
+   *    an explicit directory still catches a path that resolves into it.
+   */
+  private async matchFilePathRule(
+    toolName: string,
+    filePath: string,
+  ): Promise<PermissionDecision | null> {
+    const resolvedTarget = filePath ? await this.resolveTarget(filePath) : '';
+
+    for (const rules of [this.sessionRules, this.projectRules, this.userRules]) {
+      for (const rule of rules) {
+        if (rule.toolName !== toolName || rule.decision !== 'deny') continue;
+        if (matchPattern(rule.pattern, filePath)) return 'deny';
+        if (resolvedTarget && (await this.patternContainsTarget(rule.pattern, resolvedTarget))) {
+          return 'deny';
+        }
+      }
+      for (const rule of rules) {
+        if (rule.toolName !== toolName || rule.decision !== 'allow') continue;
+        // A tool-wide allow (empty pattern, e.g. a hand-written `Edit` with no
+        // parens) is a deliberate unscoped grant and intentionally skips
+        // containment. suggestPattern never emits an empty pattern for a file
+        // tool, so this is not reachable from the "always allow" UI: it only
+        // exists when a user authors it explicitly.
+        if (!rule.pattern) return 'allow';
+        if (resolvedTarget && (await this.patternContainsTarget(rule.pattern, resolvedTarget))) {
+          return 'allow';
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Match a rule for a search tool (Glob/Grep). The rule value is a glob or
+   * regex (not a filesystem path), so pattern matching stays string-based, but
+   * an allow only fires when the search root resolves inside the workspace.
+   * A search rooted outside the workspace falls through to a prompt rather than
+   * being auto-approved by a (workspace-oriented) allow rule.
+   */
+  private async matchSearchRule(
+    toolName: string,
+    toolArgs: unknown,
+  ): Promise<PermissionDecision | null> {
+    const args = toolArgs as Record<string, unknown>;
+    const value = getMatchValue(toolName, toolArgs);
+    const searchRoot = String(args['path'] ?? '');
+    // No explicit path means the tool searches the workspace root, which is
+    // trivially contained.
+    const rootWithinWorkspace = searchRoot ? await isPathWithinRealCwd(searchRoot, this.cwd) : true;
+
+    for (const rules of [this.sessionRules, this.projectRules, this.userRules]) {
+      for (const rule of rules) {
+        if (rule.toolName === toolName && rule.decision === 'deny' && matchPattern(rule.pattern, value)) {
+          return 'deny';
+        }
+      }
+      for (const rule of rules) {
+        if (rule.toolName === toolName && rule.decision === 'allow' && matchPattern(rule.pattern, value)) {
+          return rootWithinWorkspace ? 'allow' : null;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Resolve a tool path argument to its real absolute path (relative paths are cwd-based). */
+  private resolveTarget(filePath: string): Promise<string> {
+    const absolute = isAbsolute(filePath) ? filePath : resolve(this.cwd, filePath);
+    return resolveThroughExistingAncestor(absolute);
+  }
+
+  /**
+   * True if a resolved absolute target is the same as, or a descendant of, the
+   * rule pattern's canonicalized scope. The pattern base is resolved relative
+   * to the workspace and realpath-canonicalized so a symlinked workspace root
+   * does not produce false negatives for legitimate in-workspace paths.
+   */
+  private async patternContainsTarget(pattern: string, resolvedTarget: string): Promise<boolean> {
+    const baseSpec = patternBaseDir(pattern);
+    const baseAbsolute = isAbsolute(baseSpec) ? baseSpec : resolve(this.cwd, baseSpec);
+    const resolvedBase = await resolveThroughExistingAncestor(baseAbsolute);
+    return isPathSameOrDescendant(resolvedTarget, resolvedBase);
   }
 
   /**
