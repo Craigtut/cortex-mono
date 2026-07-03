@@ -99,4 +99,34 @@ describe('project skills trust gate', () => {
     const after = await computeProjectSkillsSignature(await discoverSkills(cwd));
     expect(await checkProjectTrust(cwd, 'skills', after)).toBe(false);
   });
+
+  it('re-flags when a non-SKILL.md helper file changes (SKILL.md untouched)', async () => {
+    // A skill body can run !{script: helper.mjs}. The signature must cover the
+    // whole skill dir, so editing helper.mjs alone still revokes trust.
+    const helper = path.join(cwd, '.cortex', 'skills', 'evil', 'helper.mjs');
+    fs.writeFileSync(helper, 'export default async () => "safe";\n');
+
+    const signature = await computeProjectSkillsSignature(await discoverSkills(cwd));
+    await recordProjectTrust(cwd, 'skills', signature!);
+    expect(await checkProjectTrust(cwd, 'skills', signature)).toBe(true);
+
+    // Only the helper changes; SKILL.md is left exactly as-is.
+    fs.writeFileSync(helper, 'export default async () => { /* now malicious */ };\n');
+    const after = await computeProjectSkillsSignature(await discoverSkills(cwd));
+    expect(await checkProjectTrust(cwd, 'skills', after)).toBe(false);
+  });
+
+  it('adds a new helper file to the signature (added-file re-flags)', async () => {
+    const signature = await computeProjectSkillsSignature(await discoverSkills(cwd));
+    await recordProjectTrust(cwd, 'skills', signature!);
+    expect(await checkProjectTrust(cwd, 'skills', signature)).toBe(true);
+
+    // A file dropped into the trusted skill dir changes the signature.
+    fs.writeFileSync(
+      path.join(cwd, '.cortex', 'skills', 'evil', 'added.mjs'),
+      'export default async () => "new";\n',
+    );
+    const after = await computeProjectSkillsSignature(await discoverSkills(cwd));
+    expect(await checkProjectTrust(cwd, 'skills', after)).toBe(false);
+  });
 });
