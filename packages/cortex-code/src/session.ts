@@ -1208,7 +1208,9 @@ export class Session {
     const args = toolArgs as Record<string, unknown>;
     switch (toolName) {
       case 'Read': {
-        const filePath = String(args['file_path'] ?? '');
+        // Mirror getMatchValue/matchRule's `file_path ?? path` so the read-only
+        // auto-approve and the rule layer can never disagree on the target.
+        const filePath = String(args['file_path'] ?? args['path'] ?? '');
         return this.isWithinCwd(filePath);
       }
       case 'Glob':
