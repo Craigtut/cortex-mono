@@ -5,9 +5,50 @@
  * Consumer-specific paths (a product's own settings/credential files) are added
  * by the consumer via the extra* options, not hardcoded here.
  */
+import * as fs from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SandboxPolicy, SandboxRung } from '@animus-labs/cortex';
+
+/**
+ * Credential environment-variable names unset inside the sandbox by default
+ * (mode "deny"). Filesystem deny-reads do not cover secrets that live in the
+ * environment, and the seeded registry allowlist is a ready exfil channel, so
+ * these are scrubbed from the child. Consumers can extend or replace the list.
+ */
+export const DEFAULT_CREDENTIAL_ENV_VARS: readonly string[] = [
+  // Cloud providers
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SESSION_TOKEN',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_API_KEY',
+  'AZURE_CLIENT_SECRET',
+  // Source hosting and CI
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
+  'GITLAB_TOKEN',
+  // Package registries
+  'NPM_TOKEN',
+  'NODE_AUTH_TOKEN',
+  'PYPI_TOKEN',
+  'TWINE_PASSWORD',
+  'CARGO_REGISTRY_TOKEN',
+  // AI / LLM providers
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'GEMINI_API_KEY',
+  'HF_TOKEN',
+  'HUGGING_FACE_HUB_TOKEN',
+  // Other common tokens
+  'CLOUDFLARE_API_TOKEN',
+  'VERCEL_TOKEN',
+  'NETLIFY_AUTH_TOKEN',
+  'DIGITALOCEAN_TOKEN',
+  'SLACK_TOKEN',
+  'STRIPE_SECRET_KEY',
+  'DOCKER_PASSWORD',
+];
 
 /**
  * Package registries pre-allowed at the Workspace rung so installs and fetches
@@ -58,6 +99,16 @@ export function defaultSecretReadDenies(home: string): string[] {
     join(home, '.config', 'gcloud'),
     join(home, '.docker', 'config.json'),
     join(home, '.netrc'),
+    // Tool and CI credential files. Each has a matching seeded exfil destination
+    // (npm, github, pypi, crates), so they belong in the default deny, not left
+    // to consumer opt-in.
+    join(home, '.npmrc'),
+    join(home, '.git-credentials'),
+    join(home, '.config', 'gh', 'hosts.yml'),
+    join(home, '.pypirc'),
+    join(home, '.cargo', 'credentials'),
+    join(home, '.cargo', 'credentials.toml'),
+    join(home, '.terraform.d', 'credentials.tfrc.json'),
   ];
 }
 
@@ -105,12 +156,22 @@ export interface DefaultPolicyOptions {
  * (no containment) rather than rely on this.
  */
 export function buildDefaultPolicy(rung: SandboxRung, opts: DefaultPolicyOptions): SandboxPolicy {
-  const home = opts.home ?? homedir();
-  const tmp = opts.sessionTmpDir ?? tmpdir();
-  const roots = opts.workspaceRoots;
+  // Canonicalize real paths so they match what the OS backend enforces on (macOS
+  // resolves /var to /private/var; a symlinked workspace root must resolve too).
+  // Non-existent paths (a secret file the user does not have) pass through as-is.
+  const canon = (p: string): string => {
+    try {
+      return fs.realpathSync.native(p);
+    } catch {
+      return p;
+    }
+  };
+  const home = canon(opts.home ?? homedir());
+  const tmp = canon(opts.sessionTmpDir ?? tmpdir());
+  const roots = opts.workspaceRoots.map(canon);
 
-  const denyRead = [...defaultSecretReadDenies(home), ...(opts.extraDenyRead ?? [])];
-  const denyWrite = [...defaultDangerousWriteDenies(home, roots), ...(opts.extraDenyWrite ?? [])];
+  const denyRead = [...defaultSecretReadDenies(home), ...(opts.extraDenyRead ?? [])].map(canon);
+  const denyWrite = [...defaultDangerousWriteDenies(home, roots), ...(opts.extraDenyWrite ?? [])].map(canon);
   const allowedDomains = [...SEEDED_REGISTRY_DOMAINS, ...(opts.extraAllowedDomains ?? [])];
 
   const writableRoots = rung === 'restricted' ? [] : [...roots, tmp];
