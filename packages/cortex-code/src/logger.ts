@@ -13,7 +13,10 @@ let currentSize = 0;
 function ensureLogDir(): void {
   if (initialized) return;
   try {
-    mkdirSync(LOG_DIR, { recursive: true });
+    // Owner-only (0o700) to match the rest of the app's credential/config
+    // storage. On Windows the mode is ignored (harmless), so it is not a
+    // security control there.
+    mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 });
     // Seed in-memory size from the existing file
     try {
       currentSize = statSync(LOG_FILE).size;
@@ -67,7 +70,10 @@ function write(level: string, message: string, data?: unknown): void {
       }
     }
     line += '\n';
-    appendFileSync(LOG_FILE, line);
+    // 0o600 so the log (which can contain diagnostic detail) is owner-only when
+    // first created. The mode only applies on file creation and is ignored on
+    // Windows.
+    appendFileSync(LOG_FILE, line, { mode: 0o600 });
     currentSize += Buffer.byteLength(line);
   } catch {
     // Swallow write errors
