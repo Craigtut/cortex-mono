@@ -1,10 +1,22 @@
 /**
  * Skill Preprocessor: processes SKILL.md body at load time.
  *
- * Three preprocessor types run in order:
- * 1. Variable substitution: ${VAR}, $ARGUMENTS, $N
- * 2. Shell commands: !`command` (parallel execution)
- * 3. Script execution: !{script: path} (parallel execution)
+ * Processing order (security-critical):
+ * 1. Extract shell (!`cmd`) and script (!{script: path}) markers from the RAW
+ *    body, BEFORE any variable substitution. This guarantees attacker-
+ *    controlled argument VALUES (from a model-issued `load_skill` call) can
+ *    never be spliced into the body and then re-scanned as executable markers.
+ * 2. Substitute variables (${VAR}, $ARGUMENTS, $N) in the remaining prose only.
+ *    Prose is injected into context as text, never executed, so substitution
+ *    there is safe.
+ * 3. Execute the markers:
+ *    - Shell markers: variable references inside the author's command are
+ *      substituted with SHELL-QUOTED values, so a value like `; rm -rf ~`
+ *      stays a single inert string instead of becoming shell syntax. The
+ *      resolved command is then screened by the framework catastrophic-command
+ *      floor (findCatastrophicCommand) and hard-blocked if it is irreversible.
+ *    - Script markers: run via dynamic import with a context object (no shell),
+ *      so their path/args are substituted with plain (unquoted) values.
  *
  * Shell commands use the same shell selection logic as the Bash tool
  * (PowerShell on Windows, bash/zsh on Unix).
@@ -15,9 +27,12 @@
  */
 
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { homedir } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { findCatastrophicCommand } from './tools/bash/catastrophic.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,6 +53,9 @@ export interface PreprocessorConfig {
 
 /** Timeout for each shell command or script execution. */
 const COMMAND_TIMEOUT_MS = 10_000;
+
+/** Private, non-collidable sentinel wrapping an extracted marker placeholder. */
+const MARKER_SENTINEL = '\u0000';
 
 // ---------------------------------------------------------------------------
 // Regex patterns
@@ -105,66 +123,98 @@ function getShellConfig(): ShellConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Preprocessor implementation
+// Shell-safe value quoting
 // ---------------------------------------------------------------------------
 
 /**
- * Preprocess a SKILL.md body. Runs all three stages:
- * 1. Variable substitution
- * 2. Shell commands and scripts (in parallel)
- * 3. Assemble final content
+ * Quote an arbitrary value so it is a single, inert shell token on the current
+ * platform. This is what stops attacker-controlled argument values from
+ * becoming shell syntax: `; rm -rf ~` quotes to `'; rm -rf ~'` (POSIX) and is
+ * passed to the command as one literal string.
+ */
+function quoteForShell(value: string): string {
+  if (process.platform === 'win32') {
+    // PowerShell single-quoted string: a literal single quote is doubled.
+    return `'${value.replace(/'/g, "''")}'`;
+  }
+  // POSIX single-quoted string: close, emit an escaped quote, reopen.
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+// ---------------------------------------------------------------------------
+// Preprocessor implementation
+// ---------------------------------------------------------------------------
+
+interface ExtractedMarker {
+  token: string;
+  kind: 'shell' | 'script';
+  /** Raw author text: the shell command, or the script path. */
+  raw: string;
+  /** Script-only: the extra-args string from `!{script: path, k: v}`. */
+  extra: string;
+}
+
+/**
+ * Preprocess a SKILL.md body. Runs all stages:
+ * 1. Extract shell/script markers from the raw body (before substitution).
+ * 2. Substitute variables in the remaining prose.
+ * 3. Execute markers (in parallel) and splice their output back in.
  */
 export async function preprocessSkillBody(
   body: string,
   config: PreprocessorConfig,
 ): Promise<string> {
-  // Stage 1: Variable substitution (runs first so vars are available
-  // inside shell commands and script arguments)
-  let content = substituteVariables(body, config.variables);
+  // Stage 1: extract markers from the RAW body, BEFORE variable substitution.
+  // Substituting first would let a model-controlled argument value (e.g. one
+  // containing a "!`...`" sequence) be re-scanned and executed as a marker.
+  const markers: ExtractedMarker[] = [];
+  let counter = 0;
+  // Per-invocation nonce so a crafted argument value cannot forge a placeholder
+  // token and hijack a marker's output slot during the final splice.
+  const nonce = randomUUID();
+  const mask = (kind: 'shell' | 'script', raw: string, extra: string): string => {
+    const token = `${MARKER_SENTINEL}SKILLMARK-${nonce}-${counter++}${MARKER_SENTINEL}`;
+    markers.push({ token, kind, raw, extra });
+    return token;
+  };
 
-  // Stage 2: Collect shell command and script markers, execute in parallel
-  const shellReplacements: Array<{ marker: string; promise: Promise<string> }> = [];
-  const scriptReplacements: Array<{ marker: string; promise: Promise<string> }> = [];
+  // Shell markers first, then scripts. Both patterns are line-anchored, so
+  // masking one does not disturb the other.
+  let masked = body.replace(
+    new RegExp(SHELL_COMMAND_PATTERN.source, 'gm'),
+    (_full, command: string) => mask('shell', command, ''),
+  );
+  masked = masked.replace(
+    new RegExp(SCRIPT_PATTERN.source, 'gm'),
+    (_full, scriptPath: string, extraArgs: string | undefined) =>
+      mask('script', scriptPath.trim(), (extraArgs ?? '').trim()),
+  );
 
-  // Find shell commands
-  let match: RegExpExecArray | null;
-  const shellRegex = new RegExp(SHELL_COMMAND_PATTERN.source, 'gm');
-  while ((match = shellRegex.exec(content)) !== null) {
-    const fullMatch = match[0]!;
-    const command = match[1]!;
-    shellReplacements.push({
-      marker: fullMatch,
-      promise: executeShellCommand(command, config.skillDir),
-    });
-  }
+  // Stage 2: variable substitution over the prose only (markers are masked).
+  let content = substituteVariables(masked, config.variables);
 
-  // Find scripts
-  const scriptRegex = new RegExp(SCRIPT_PATTERN.source, 'gm');
-  while ((match = scriptRegex.exec(content)) !== null) {
-    const fullMatch = match[0]!;
-    const scriptPath = match[1]!.trim();
-    const extraArgs = match[2]?.trim() ?? '';
-    scriptReplacements.push({
-      marker: fullMatch,
-      promise: executeScript(scriptPath, extraArgs, config),
-    });
-  }
-
-  // Execute all in parallel
-  const allReplacements = [...shellReplacements, ...scriptReplacements];
-  if (allReplacements.length > 0) {
+  // Stage 3: execute markers in parallel.
+  if (markers.length > 0) {
     const results = await Promise.allSettled(
-      allReplacements.map(r => r.promise),
+      markers.map((m) =>
+        m.kind === 'shell'
+          ? executeShellMarker(m.raw, config)
+          : executeScript(
+              substituteVariables(m.raw, config.variables),
+              substituteVariables(m.extra, config.variables),
+              config,
+            ),
+      ),
     );
 
-    for (let i = 0; i < allReplacements.length; i++) {
-      const replacement = allReplacements[i]!;
+    for (let i = 0; i < markers.length; i++) {
+      const marker = markers[i]!;
       const result = results[i]!;
       const output = result.status === 'fulfilled'
         ? result.value
         : `[Error: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}]`;
-      // Use callback to prevent $& and other replacement patterns in output
-      content = content.replace(replacement.marker, () => output);
+      // Use a callback to prevent $& and other replacement patterns in output.
+      content = content.replace(marker.token, () => output);
     }
   }
 
@@ -194,6 +244,46 @@ export function substituteVariables(
   });
 
   return result;
+}
+
+/**
+ * Substitute variable references into a shell command, quoting each value so it
+ * stays a single inert token. Author markers reference `$ARGUMENTS`/`$1`/
+ * `${VAR}` exactly as before; only the substituted VALUE is quoted, so
+ * attacker data can never become shell syntax.
+ */
+function substituteVariablesQuoted(
+  command: string,
+  variables: Record<string, string>,
+): string {
+  let result = command;
+  result = result.replace(ARGUMENTS_PATTERN, () => quoteForShell(variables['ARGUMENTS'] ?? ''));
+  result = result.replace(POSITIONAL_PATTERN, (_match, num: string) => quoteForShell(variables[num] ?? ''));
+  result = result.replace(VARIABLE_PATTERN, (_match, varName: string) => quoteForShell(variables[varName] ?? ''));
+  return result;
+}
+
+/**
+ * Resolve and run a single shell marker. Variable values are shell-quoted, then
+ * the resolved command is screened by the framework catastrophic-command floor
+ * before execution. A catastrophic command (e.g. `rm -rf /`, or `rm -rf $1`
+ * whose argument resolves to `/`) is hard-blocked and never runs.
+ */
+async function executeShellMarker(
+  rawCommand: string,
+  config: PreprocessorConfig,
+): Promise<string> {
+  const command = substituteVariablesQuoted(rawCommand, config.variables);
+
+  const catastrophic = findCatastrophicCommand(command, {
+    cwd: config.skillDir,
+    home: homedir(),
+  });
+  if (catastrophic) {
+    return `[Error: blocked by catastrophic-command floor: ${catastrophic.reason}]`;
+  }
+
+  return executeShellCommand(command, config.skillDir);
 }
 
 /**

@@ -314,21 +314,24 @@ export class SkillRegistry {
 
     const { body } = parseFrontmatter(content);
 
-    // Build merged variables (consumer + built-ins, consumer wins on collision)
-    const variables: Record<string, string> = {
-      SKILL_DIR: entry.dir,
-      ARGUMENTS: callArgs.rawArgs,
-    };
-    // Add positional args
-    for (let i = 0; i < 9; i++) {
-      variables[String(i + 1)] = callArgs.args[i] ?? '';
-    }
-    // Merge per-skill variables (e.g., PLUGIN_ROOT for plugin skills)
+    // Build merged variables. Consumer + per-skill vars form the base; Cortex
+    // built-ins (SKILL_DIR, ARGUMENTS, positional $N) are applied LAST so they
+    // always win, matching the scriptContext invariant two blocks below. A
+    // consumer or plugin variable named ARGUMENTS/SKILL_DIR/"1" must never
+    // shadow the real call arguments.
+    const variables: Record<string, string> = {};
+    // Per-skill variables (e.g., PLUGIN_ROOT for plugin skills)
     if (entry.variables) {
       Object.assign(variables, entry.variables);
     }
-    // Merge consumer variables (consumer wins on collision)
+    // Consumer-provided variables
     Object.assign(variables, this.preprocessorVariables);
+    // Cortex built-ins (authoritative; cannot be overridden)
+    variables['SKILL_DIR'] = entry.dir;
+    variables['ARGUMENTS'] = callArgs.rawArgs;
+    for (let i = 0; i < 9; i++) {
+      variables[String(i + 1)] = callArgs.args[i] ?? '';
+    }
 
     // Build merged script context (consumer first, Cortex built-ins last so
     // they cannot be overridden — skillDir, args, rawArgs are Cortex-owned)
