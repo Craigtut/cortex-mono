@@ -20,6 +20,7 @@ import { computeDiff, type DiffHunk } from './write.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
 import { isCriticalPathOrDescendant } from './bash/safety.js';
+import { atomicWrite, CriticalPathWriteError } from './shared/atomic-write.js';
 import {
   findMatch,
   findNearestMatch,
@@ -350,19 +351,15 @@ export function createEditTool(config: EditToolConfig): {
         // Compute diff
         const diff = computeDiff(originalContent, finalContent);
 
-        // Atomic write: write to temp file, then rename
-        const tempPath = path.join(path.dirname(filePath), `.edit-${crypto.randomUUID()}.tmp`);
+        // Atomic write: temp file + rename, preserving the target's mode and
+        // refusing to write through a symlink to a critical path.
         try {
-          await fs.promises.writeFile(tempPath, finalContent, 'utf8');
-          try {
-            await fs.promises.rename(tempPath, filePath);
-          } catch {
-            // Rename may fail on Windows if target is open. Fall back to direct write.
-            await fs.promises.writeFile(filePath, finalContent, 'utf8');
-            try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
-          }
+          await atomicWrite(filePath, finalContent);
         } catch (writeErr) {
-          try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
+          if (writeErr instanceof CriticalPathWriteError) {
+            return noChange(filePath, oldString, newString, replaceAll,
+              `Refusing to edit critical system path: ${writeErr.resolvedPath}`, originalContent);
+          }
           throw writeErr;
         }
 

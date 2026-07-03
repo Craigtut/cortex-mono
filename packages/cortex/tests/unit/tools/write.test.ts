@@ -87,6 +87,21 @@ describe('Write tool', () => {
     expect(fs.readFileSync(filePath, 'utf8')).toBe('new content');
   });
 
+  it.skipIf(process.platform === 'win32')(
+    'preserves the file mode when overwriting a 0600 file',
+    async () => {
+      const filePath = path.join(tmpDir, 'secret.env');
+      fs.writeFileSync(filePath, 'TOKEN=old');
+      fs.chmodSync(filePath, 0o600);
+      markFileRead(registry, filePath);
+
+      await writeTool.execute({ file_path: filePath, content: 'TOKEN=new' });
+
+      expect(fs.readFileSync(filePath, 'utf8')).toBe('TOKEN=new');
+      expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
+    },
+  );
+
   it('rejects write without prior read', async () => {
     const filePath = path.join(tmpDir, 'existing.txt');
     fs.writeFileSync(filePath, 'original content');
