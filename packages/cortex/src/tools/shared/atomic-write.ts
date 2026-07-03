@@ -108,6 +108,10 @@ export async function atomicWrite(filePath: string, content: string): Promise<vo
   let existingMode: number | undefined;
   try {
     const st = await fs.promises.stat(realTarget);
+    // Preserve the permission bits only. Masking with 0o777 intentionally
+    // drops setuid/setgid/sticky bits (0o7000) on overwrite: this tool writes
+    // ordinary project files, and carrying those special bits onto a freshly
+    // written file would be a privilege-escalation footgun, not a convenience.
     if (st.isFile()) existingMode = st.mode & 0o777;
   } catch {
     // No existing file: create-new path. Leave mode to the platform default.
