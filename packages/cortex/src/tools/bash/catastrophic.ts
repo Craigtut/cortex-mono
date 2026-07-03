@@ -240,6 +240,62 @@ function newWord(): ShellWord {
 }
 
 /**
+ * Decode one ANSI-C ($'...') escape sequence beginning at `s[at]` (which is the
+ * backslash). Returns the decoded text and the index just past the escape, or
+ * null if the escape is not understood (caller must then fail closed). Handles
+ * `\a \b \e \E \f \n \r \t \v \\ \' \" \?`, octal `\NNN` (1-3 digits, so `\57`
+ * and `\057` both decode), hex `\xHH` (1-2), unicode `\uHHHH`/`\UHHHHHHHH`, and
+ * `\cX` control chars. This is what makes `rm -rf $'\x2f'` resolve to `/` so it
+ * hits the protected-path check instead of slipping through as literal text.
+ */
+function decodeAnsiCEscape(s: string, at: number): { text: string; next: number } | null {
+  const c = s[at + 1];
+  if (c === undefined) return null;
+  switch (c) {
+    case 'a': return { text: '\x07', next: at + 2 };
+    case 'b': return { text: '\b', next: at + 2 };
+    case 'e': case 'E': return { text: '\x1b', next: at + 2 };
+    case 'f': return { text: '\f', next: at + 2 };
+    case 'n': return { text: '\n', next: at + 2 };
+    case 'r': return { text: '\r', next: at + 2 };
+    case 't': return { text: '\t', next: at + 2 };
+    case 'v': return { text: '\v', next: at + 2 };
+    case '\\': return { text: '\\', next: at + 2 };
+    case "'": return { text: "'", next: at + 2 };
+    case '"': return { text: '"', next: at + 2 };
+    case '?': return { text: '?', next: at + 2 };
+    case 'x': {
+      const m = /^[0-9a-fA-F]{1,2}/.exec(s.slice(at + 2));
+      if (!m) return null;
+      return { text: String.fromCharCode(parseInt(m[0], 16)), next: at + 2 + m[0].length };
+    }
+    case 'u': {
+      const m = /^[0-9a-fA-F]{1,4}/.exec(s.slice(at + 2));
+      if (!m) return null;
+      return { text: String.fromCodePoint(parseInt(m[0], 16)), next: at + 2 + m[0].length };
+    }
+    case 'U': {
+      const m = /^[0-9a-fA-F]{1,8}/.exec(s.slice(at + 2));
+      if (!m) return null;
+      const cp = parseInt(m[0], 16);
+      if (cp > 0x10ffff) return null;
+      return { text: String.fromCodePoint(cp), next: at + 2 + m[0].length };
+    }
+    case 'c': {
+      const ctl = s[at + 2];
+      if (ctl === undefined) return null;
+      return { text: String.fromCharCode(ctl.toUpperCase().charCodeAt(0) ^ 0x40), next: at + 3 };
+    }
+    default: {
+      // Octal \NNN (1-3 digits), including a leading \0.
+      const m = /^[0-7]{1,3}/.exec(s.slice(at + 1));
+      if (m) return { text: String.fromCharCode(parseInt(m[0], 8) & 0xff), next: at + 1 + m[0].length };
+      return null; // unknown escape -> fail closed
+    }
+  }
+}
+
+/**
  * Tokenize a single simple-command into words, processing quotes and escapes
  * and applying the expansions we can resolve statically.
  */
@@ -313,9 +369,41 @@ function tokenizeWords(input: string, opts: TokenizeOptions): ParsedCommand {
     w.unresolved = true;
   };
 
+  // Read an ANSI-C `$'...'` string starting at the `$`. Backslash escapes are
+  // decoded; any escape we don't understand fails closed (marks the word
+  // unresolved) so an encoded catastrophic target can never slip through as
+  // inert text.
+  const readAnsiCQuote = (): void => {
+    const w = ensure();
+    curQuoted = true;
+    i += 2; // skip `$'`
+    while (i < n) {
+      const ch = input[i]!;
+      if (ch === "'") { i++; return; }
+      if (ch === '\\') {
+        const decoded = decodeAnsiCEscape(input, i);
+        if (decoded === null) {
+          w.unresolved = true;
+          i += 2; // consume backslash + next char and keep scanning
+        } else {
+          w.text += decoded.text;
+          i = decoded.next;
+        }
+        continue;
+      }
+      w.text += ch;
+      i++;
+    }
+    w.unresolved = true; // unterminated $'...': fail closed
+  };
+
   const readVariable = (): void => {
     // Cursor is at '$'. Applies in unquoted and double-quoted contexts.
     const next = input[i + 1];
+    // ANSI-C and locale quoting only apply in an unquoted context; inside
+    // double quotes `$'` / `$"` are a literal `$` followed by a literal quote.
+    if (quote === null && next === "'") { readAnsiCQuote(); return; }
+    if (quote === null && next === '"') { i += 1; return; } // $"..." locale == "..."
     if (next === '(') {
       // Should have been extracted by the splitter; treat as substitution.
       ensure().substitution = true;

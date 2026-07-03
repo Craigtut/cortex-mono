@@ -1075,10 +1075,12 @@ export function checkAnsiCQuoting(command: string): SafetyCheckResult {
   while ((match = ansiCPattern.exec(command)) !== null) {
     const content = match[1] ?? '';
 
-    // Check for hex escapes (\xHH)
-    const hasHex = /\\x[0-9a-fA-F]{2}/.test(content);
-    // Check for octal escapes (\0NNN or \NNN where N are 3 octal digits)
-    const hasOctal = /\\0[0-7]{1,3}/.test(content) || /\\[1-3][0-7]{2}/.test(content);
+    // Check for hex escapes (\xH or \xHH)
+    const hasHex = /\\x[0-9a-fA-F]{1,2}/.test(content);
+    // Check for octal escapes: \NNN with 1-3 digits (so \57 and \057 both
+    // match), including a leading \0. Aligns with the catastrophic floor's
+    // ANSI-C decoder, which resolves these to real bytes.
+    const hasOctal = /\\[0-7]{1,3}/.test(content);
 
     if (hasHex || hasOctal) {
       return {

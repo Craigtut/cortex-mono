@@ -983,6 +983,16 @@ describe('Bash safety layers', () => {
       expect(result.reason).toContain('ANSI-C');
     });
 
+    it('blocks 1-2 digit octal escapes (e.g. \\57 -> /)', () => {
+      // Previously the octal regex missed short forms like \57.
+      expect(checkAnsiCQuoting("rm -rf $'\\57'").allowed).toBe(false);
+      expect(checkAnsiCQuoting("rm -rf $'\\162'").allowed).toBe(false);
+    });
+
+    it('blocks 1-digit hex escapes (e.g. \\xf)', () => {
+      expect(checkAnsiCQuoting("echo $'\\xf'").allowed).toBe(false);
+    });
+
     it('allows commands without ANSI-C quoting', () => {
       expect(checkAnsiCQuoting('echo hello').allowed).toBe(true);
     });
