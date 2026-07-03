@@ -32,7 +32,7 @@ Most users should never think about the two axes directly. They pick one rung on
 |------|-----------|---------|-------------------|-----------|
 | Restricted | read-only, secrets denied | none | run reads freely; any write or network is blocked | exploring or reviewing code you do not trust |
 | Workspace (default) | read broadly, write workspace + temp | allowlist (package registries seeded) | run inside the boundary without asking; asked to step outside | normal development on your own project |
-| Trusted | write workspace + temp, secrets still denied | open | auto-run almost everything; still asked for out-of-workspace writes | a task you trust and want to run with minimal friction |
+| Trusted | write workspace + temp, secrets still denied | open (HTTP/S via the proxy) | auto-run almost everything; still asked for out-of-workspace writes | a task you trust and want to run with minimal friction |
 | Off | full user access, no containment | full | behaves like the current permission-only mode | environments already isolated, or when you accept the risk |
 
 Properties that make this workable:
@@ -201,6 +201,9 @@ One design rule from Codex's CVE-2025-59532: writable roots come from trusted se
 - MCP servers. A stdio MCP server is arbitrary consumer-configured code with its own filesystem and network access, and it is a live injection-to-exfiltration path. Routing MCP stdio spawns through the same provider is a Phase 2+ item; until then, an MCP tool is an uncontained egress path even when Bash is contained. A consumer whose threat model needs this closed should know it is open.
 - In-process egress. The LLM provider's own API calls, WebFetch, and MCP HTTP run inside the Node process and never traverse the OS sandbox. Phase 2 projects the policy into WebFetch and MCP HTTP; the provider API endpoint itself is trusted and treating it as an exfil channel is out of scope for now.
 - Denial attribution is platform-asymmetric. sandbox-runtime surfaces real violation events on macOS (it taps the unified log) but only an `EPERM` on Linux, so self-explaining denials and auto-escalation are precise on macOS and best-effort on Linux.
+- Grep reads bypass the boundary. The built-in Grep tool spawns ripgrep directly, not through the shell seam, so a Grep with a `path` under a denied secret store returns file contents regardless of `denyRead`. Routing Grep through the provider (or projecting `denyRead` into its path check) is a Phase 2 item; until then Grep is the one built-in that can read a denied path.
+- Only top-level `.git` internals are protected. `denyWrite` covers `<root>/.git/hooks` and `<root>/.git/config` per workspace root, not nested repos or submodules. Glob-expanding `**/.git/hooks` is a Phase 2 item; the related `GIT_CONFIG*` env-redirection vector is already blocked in the env sanitizer.
+- "Trusted" network is proxy-mediated, not raw. `full` still routes egress through the HTTP/SOCKS proxy (sandbox-runtime cannot express filesystem-contained + network-unrestricted), so tools that ignore proxy env vars (ssh, raw TCP to a database) fail on Trusted; those belong on Off.
 
 ## Build plan
 
