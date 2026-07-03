@@ -171,7 +171,12 @@ async function main(): Promise<void> {
       const contextWindow = provider === 'ollama'
         ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), modelId) ?? undefined
         : undefined;
-      model = await providerManager.createCustomModel({ baseUrl, modelId, contextWindow });
+      model = await providerManager.createCustomModel({
+        baseUrl,
+        modelId,
+        contextWindow,
+        ...(entry?.apiKey ? { apiKey: entry.apiKey } : {}),
+      });
     } else {
       model = await providerManager.resolveModel(provider, modelId);
     }

@@ -47,6 +47,8 @@ export class ProviderSetupFlow {
   private model: string | null = null;
   private result: SetupResult | null = null;
   private history: SetupStep[] = [];
+  private customBaseUrl: string | null = null;
+  private customApiKey: string | null = null;
 
   constructor(
     private ollamaDetected: boolean,
@@ -63,6 +65,16 @@ export class ProviderSetupFlow {
 
   getResult(): SetupResult | null {
     return this.result;
+  }
+
+  /**
+   * Record the custom-endpoint connection details captured by the renderer so
+   * they can be threaded into the final result. The custom tier has no static
+   * provider entry, so baseUrl (and any API key) must be carried explicitly.
+   */
+  setCustomConnection(baseUrl: string, apiKey?: string): void {
+    this.customBaseUrl = baseUrl;
+    this.customApiKey = apiKey && apiKey.length > 0 ? apiKey : null;
   }
 
   isComplete(): boolean {
@@ -144,15 +156,23 @@ export class ProviderSetupFlow {
         };
         break;
 
-      case 'model-selection':
+      case 'model-selection': {
         this.model = input;
-        this.result = {
+        const result: SetupResult = {
           provider: this.provider!,
           method: this.tier === 'oauth' ? 'oauth' : this.tier === 'custom' ? 'custom' : 'api_key',
           model: input,
         };
+        // Custom endpoints have no registry entry, so carry the connection
+        // details through to model resolution and credential storage.
+        if (this.tier === 'custom') {
+          if (this.customBaseUrl) result.baseUrl = this.customBaseUrl;
+          if (this.customApiKey) result.apiKey = this.customApiKey;
+        }
+        this.result = result;
         this.currentStep = { type: 'complete' };
         break;
+      }
     }
 
     return this.currentStep;
@@ -225,6 +245,9 @@ export class ProviderSetupFlow {
         };
 
       case 'custom':
+        // The custom tier skips provider-selection, so pin the provider id here
+        // (used for the model-selection step and the final result).
+        this.provider = 'custom';
         return {
           type: 'custom-entry',
           tier: 'custom',

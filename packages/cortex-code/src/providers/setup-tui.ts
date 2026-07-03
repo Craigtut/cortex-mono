@@ -252,18 +252,15 @@ class SetupRenderer {
 
       case 'custom-entry': {
         this.contentContainer.addChild(new Text(`  ${colors.white('Base URL:')}`, 0, 0));
+        this.contentContainer.addChild(new Spacer(1));
         const urlInput = new Input();
         urlInput.handleInput = (data: string) => {
           if (matchesKey(data, Key.enter)) {
             const text = (urlInput as unknown as { text: string }).text?.trim();
             if (text) {
               this.customBaseUrl = text;
-              this.flow.advance(text);
-              this.handleStep({
-                type: 'custom-validation',
-                loading: true,
-                message: 'Testing connection...',
-              });
+              // Base URL captured; collect the API key before validating.
+              this.renderCustomApiKeyEntry();
             }
           } else if (matchesKey(data, Key.escape)) {
             this.renderStep(this.flow.goBack());
@@ -284,6 +281,7 @@ class SetupRenderer {
         this.providerManager.createCustomModel({
           baseUrl: this.customBaseUrl ?? '',
           modelId: 'default',
+          ...(this.customApiKey ? { apiKey: this.customApiKey } : {}),
         }).then(async () => {
           loader.stop();
           const entry: CredentialEntry = {
@@ -296,11 +294,28 @@ class SetupRenderer {
           if (this.customApiKey) entry.apiKey = this.customApiKey;
           await this.credentialStore.setProvider('custom', entry);
 
+          // Carry the connection details into the flow so the completed result
+          // resolves against this endpoint (not the Ollama fallback).
+          this.flow.setCustomConnection(this.customBaseUrl ?? '', this.customApiKey ?? undefined);
+
           this.contentContainer.clear();
           this.contentContainer.addChild(new Text(`  ${colors.success('\u2713')} Connected`, 0, 0));
+          this.contentContainer.addChild(new Spacer(1));
 
+          // Advance to model selection and populate it from the endpoint's
+          // /models listing. If the endpoint advertises none, fall back to a
+          // free-text model entry so setup can still complete.
           const modelStep = this.flow.advance('valid');
-          this.renderStep(modelStep);
+          const modelIds = await listCustomEndpointModels(
+            this.customBaseUrl ?? '',
+            this.customApiKey ?? undefined,
+          );
+          if (modelIds.length > 0) {
+            modelStep.options = modelIds.map(id => ({ value: id, label: id }));
+            this.renderStep(modelStep);
+          } else {
+            this.renderCustomModelEntry();
+          }
         }).catch(() => {
           loader.stop();
           this.contentContainer.clear();
@@ -327,6 +342,62 @@ class SetupRenderer {
     } else {
       this.renderStep(step);
     }
+  }
+
+  /**
+   * Second step of the custom tier: collect the API key (optional; many local
+   * OpenAI-compatible servers are keyless), then advance to validation.
+   */
+  private renderCustomApiKeyEntry(): void {
+    this.contentContainer.clear();
+    this.contentContainer.addChild(new Text(`  ${colors.white('API key (leave blank if not required):')}`, 0, 0));
+    this.contentContainer.addChild(new Spacer(1));
+
+    const input = new Input();
+    input.handleInput = (data: string) => {
+      if (matchesKey(data, Key.enter)) {
+        const text = (input as unknown as { text: string }).text?.trim() ?? '';
+        this.customApiKey = text.length > 0 ? text : null;
+        this.flow.advance(text); // custom-entry -> custom-validation
+        this.handleStep({
+          type: 'custom-validation',
+          loading: true,
+          message: 'Testing connection...',
+        });
+      } else if (matchesKey(data, Key.escape)) {
+        // Back to the base-URL entry.
+        this.renderStep(this.flow.getCurrentStep());
+      } else {
+        Input.prototype.handleInput.call(input, data);
+      }
+    };
+    this.contentContainer.addChild(input);
+    this.tui.setFocus(input);
+  }
+
+  /**
+   * Fallback model entry for custom endpoints that do not advertise a /models
+   * listing. Lets the operator type the model id so setup can complete.
+   */
+  private renderCustomModelEntry(): void {
+    this.contentContainer.clear();
+    this.contentContainer.addChild(new Text(`  ${colors.white('Model ID:')}`, 0, 0));
+    this.contentContainer.addChild(new Spacer(1));
+
+    const input = new Input();
+    input.handleInput = (data: string) => {
+      if (matchesKey(data, Key.enter)) {
+        const text = (input as unknown as { text: string }).text?.trim();
+        if (text) {
+          // flow is at model-selection; advancing produces the complete result.
+          this.handleStep(this.flow.advance(text));
+        }
+      } else {
+        Input.prototype.handleInput.call(input, data);
+      }
+    };
+    this.contentContainer.addChild(input);
+    this.tui.setFocus(input);
   }
 
   /**
@@ -426,6 +497,33 @@ class SetupRenderer {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: enumerate models from a custom OpenAI-compatible endpoint
+// ---------------------------------------------------------------------------
+
+/**
+ * Query GET {baseUrl}/models on an OpenAI-compatible endpoint and return the
+ * advertised model ids. Best-effort: any failure (unreachable, non-JSON, no
+ * /models route) yields an empty list, and the caller falls back to manual
+ * model entry.
+ */
+async function listCustomEndpointModels(baseUrl: string, apiKey?: string): Promise<string[]> {
+  if (!baseUrl) return [];
+  try {
+    const url = `${baseUrl.replace(/\/+$/, '')}/models`;
+    const headers: Record<string, string> = {};
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(5_000) });
+    if (!res.ok) return [];
+    const json = await res.json() as { data?: Array<{ id?: unknown }> };
+    return (json.data ?? [])
+      .map(m => m.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Helper: create the flow
 // ---------------------------------------------------------------------------
 
@@ -467,6 +565,7 @@ async function resolveModelForResult(
       baseUrl,
       modelId: result.model,
       contextWindow,
+      ...(result.apiKey ? { apiKey: result.apiKey } : {}),
     });
   }
   return providerManager.resolveModel(result.provider, result.model);
