@@ -1144,7 +1144,7 @@ export class Session {
     if (await this.isReadOnlyInProject(toolName, toolArgs)) return true;
 
     // Fast path: check rules before acquiring the lock
-    const rule = this.rules.matchRule(toolName, toolArgs);
+    const rule = await this.rules.matchRule(toolName, toolArgs);
     if (rule === 'allow') return true;
     if (rule === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
 
@@ -1156,7 +1156,7 @@ export class Session {
     }
 
     // Re-check rules: a previous prompt may have added an "always allow" rule
-    const ruleAfterWait = this.rules.matchRule(toolName, toolArgs);
+    const ruleAfterWait = await this.rules.matchRule(toolName, toolArgs);
     if (ruleAfterWait === 'allow') return true;
     if (ruleAfterWait === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
 
