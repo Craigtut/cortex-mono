@@ -274,7 +274,7 @@ Message Array:
 │ RAW MESSAGE REGION (N+1..M)             │  Unobserved messages, append-only
 │   [user message]                        │  Grows between observation cycles
 │   [assistant response]                  │
-│   [tool_use + tool_result]              │
+│   [toolCall + toolResult messages]      │
 │   [user message]                        │
 │   ...                                   │
 │                                         │

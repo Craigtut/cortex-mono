@@ -303,7 +303,7 @@ interface CompactionConfig {
 
 **How**:
 - Remove the oldest conversation turns (post-slot region) one at a time
-- Preserve structural integrity: if a turn contains a tool call, also remove its corresponding tool result (and vice versa)
+- Preserve structural integrity: an assistant message with `toolCall` blocks and its consecutive `toolResult` messages form an atomic group (one result message per call for parallel calls). The whole group is dropped together or kept together, so truncation never orphans a tool call or a tool result
 - Log a warning for each removed turn
 - Continue until estimated tokens drop below the 90% threshold
 
