@@ -501,8 +501,15 @@ export class Session {
       void this.activity.recordError(err instanceof Error ? err : String(err));
       // Classified errors are already surfaced by the onError handler, which
       // both emits and lets the error re-throw here. Only handle throws it did
-      // NOT show: stream interruptions and truly-unexpected errors.
-      if (this.agent?.state !== 'destroyed' && !this.lastTurnErrorHandled) {
+      // NOT show: stream interruptions and truly-unexpected errors. Shutdown
+      // (destroying/destroyed) rejects a pending prompt with a lifecycle
+      // error that must not surface as an error toast.
+      const agentState = this.agent?.state;
+      if (
+        agentState !== 'destroyed' &&
+        agentState !== 'destroying' &&
+        !this.lastTurnErrorHandled
+      ) {
         const message = err instanceof Error ? err.message : String(err);
         // Check if this is a stream interruption (partial response already displayed)
         if (message.includes('stream') || message.includes('aborted') || message.includes('interrupted')) {
