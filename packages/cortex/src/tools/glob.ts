@@ -15,7 +15,7 @@ import {
   readGitignorePatterns,
   DEFAULT_IGNORE_PATTERNS,
 } from './shared/gitignore.js';
-import { globToRegex } from './shared/glob-to-regex.js';
+import { compileGlob, type GlobMatcher } from './shared/glob-matcher.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -76,7 +76,7 @@ function isIgnored(relativePath: string, ignorePatterns: string[]): boolean {
     if (!cleanPattern.includes('/')) {
       if (parts.some((part) => {
         if (cleanPattern.includes('*') || cleanPattern.includes('?')) {
-          return globToRegex(cleanPattern).test(part);
+          return compileGlob(cleanPattern).test(part);
         }
         return part === cleanPattern;
       })) {
@@ -84,7 +84,7 @@ function isIgnored(relativePath: string, ignorePatterns: string[]): boolean {
       }
     } else {
       // Full path pattern match
-      if (globToRegex(cleanPattern).test(relativePath)) {
+      if (compileGlob(cleanPattern).test(relativePath)) {
         return true;
       }
     }
@@ -203,11 +203,11 @@ export function createGlobTool(config: GlobToolConfig): {
       // Walk directory tree
       const allFiles = await walkDirectory(searchPath, searchPath, ignorePatterns);
 
-      // Convert glob pattern to regex for filtering
+      // Compile the glob pattern into a matcher for filtering
       const pattern = params.pattern;
-      let regex: RegExp;
+      let matcher: GlobMatcher;
       try {
-        regex = globToRegex(pattern);
+        matcher = compileGlob(pattern);
       } catch {
         return {
           content: [{ type: 'text', text: `Invalid glob pattern: ${pattern}` }],
@@ -223,7 +223,7 @@ export function createGlobTool(config: GlobToolConfig): {
       // Filter files by pattern
       const matchingFiles = allFiles.filter((filePath) => {
         const relativePath = path.relative(searchPath, filePath).split(path.sep).join('/');
-        return regex.test(relativePath);
+        return matcher.test(relativePath);
       });
 
       // Sort by modification time (newest first)

@@ -21,7 +21,7 @@ import {
   readGitignorePatterns,
   DEFAULT_IGNORE_PATTERNS,
 } from './shared/gitignore.js';
-import { globToRegex } from './shared/glob-to-regex.js';
+import { compileGlob } from './shared/glob-matcher.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -441,12 +441,12 @@ function matchesGitignorePattern(name: string, relativePath: string, patterns: s
     const cleanPattern = pattern.endsWith('/') ? pattern.slice(0, -1) : pattern;
     if (!cleanPattern.includes('/')) {
       if (cleanPattern.includes('*') || cleanPattern.includes('?')) {
-        if (globToRegex(cleanPattern).test(name)) return true;
+        if (compileGlob(cleanPattern).test(name)) return true;
       } else {
         if (name === cleanPattern) return true;
       }
     } else {
-      if (globToRegex(cleanPattern).test(relativePath)) return true;
+      if (compileGlob(cleanPattern).test(relativePath)) return true;
     }
   }
   return false;
@@ -575,11 +575,11 @@ async function searchWithFallback(
   }
 
   if (params.glob) {
-    const globRegex = globToRegex(params.glob);
+    const globMatcher = compileGlob(params.glob);
     const existingFilter = fileFilter;
     fileFilter = (rel: string, ext: string) => {
       if (existingFilter && !existingFilter(rel, ext)) return false;
-      return globRegex.test(rel);
+      return globMatcher.test(rel);
     };
   }
 
