@@ -71,12 +71,15 @@ export class CustomEditor extends Editor {
         this.callbacks.onExit();
         return;
       }
-      this.lastCtrlCTime = now;
 
-      // If editor has text, clear it; otherwise abort and show exit hint
+      // If editor has text, the first Ctrl+C just clears it: do NOT arm the
+      // exit timer, since no "press again to exit" hint was shown. Only arm it
+      // in the empty-editor branch that actually shows the hint, so the exit
+      // window always matches what the user was told.
       if (this.getText().trim()) {
         this.setText('');
       } else {
+        this.lastCtrlCTime = now;
         this.callbacks.onAbort();
         this.callbacks.onExitHint();
       }
