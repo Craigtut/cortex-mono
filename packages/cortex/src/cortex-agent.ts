@@ -466,6 +466,12 @@ export class CortexAgent {
   private loopGateTail: Promise<void> = Promise.resolve();
   private loopGateDepth = 0;
 
+  // Resolves when the current turn's unwind (catch/finally of runPromptOnce)
+  // has completed. abort() awaits this so its controller reset can never land
+  // before the cancelled turn's error classification observes the abort.
+  private turnUnwound: Promise<void> = Promise.resolve();
+  private resolveTurnUnwound: (() => void) | null = null;
+
   // Tracked subprocess PIDs for synchronous exit cleanup (Level 3 safety net)
   private readonly trackedPids = new Set<number>();
 
@@ -856,6 +862,17 @@ export class CortexAgent {
       this.lifecycleState = 'active';
     }
 
+    // A previous turn's abort must not bleed into this one. The aborted
+    // controller is replaced here, at the start of the next turn, rather
+    // than inside abort(): resetting there raced the cancelled turn's own
+    // unwind and could reclassify it as a retryable failure. See abort().
+    if (this.abortController.signal.aborted) {
+      this.abortController = new AbortController();
+    }
+    this.turnUnwound = new Promise<void>((resolve) => {
+      this.resolveTurnUnwound = resolve;
+    });
+
     const effectiveRetention = options?.cacheRetention ?? this._cacheRetention;
     this._activePromptCacheRetention = effectiveRetention ?? null;
 
@@ -910,6 +927,11 @@ export class CortexAgent {
         currentContextTokens: this.compactionManager.currentContextTokenCount,
         pendingBackgroundResults: this.pendingBackgroundResults.length,
       });
+
+      // Signal that this turn has fully unwound (status classified, flags
+      // cleared). abort() waits on this before resetting the controller.
+      this.resolveTurnUnwound?.();
+      this.resolveTurnUnwound = null;
     }
   }
 
@@ -2467,18 +2489,35 @@ export class CortexAgent {
    * The agent remains usable for subsequent prompts.
    */
   async abort(): Promise<void> {
+    // Capture the controller and the current turn's unwind promise BEFORE
+    // aborting, so the wait below is scoped to the turn being cancelled and
+    // never to a later turn started by a background delivery.
+    const controller = this.abortController;
+    const unwound = this.turnUnwound;
+
     this.promptDiagnostics.recordAbortRequested();
     this.logger.info('[CortexAgent] abort requested', { isPrompting: this._isPrompting });
-    this.abortController.abort();
+    controller.abort();
     this.agent.abort();
     this.promptDiagnostics.startAbortWait();
     try {
       await this.agent.waitForIdle();
+      // waitForIdle() only covers pi-agent-core's run promise (it resolves,
+      // never rejects). The Cortex-side unwind (retry classification, the
+      // prompt finally block) may not have observed the abort yet, so wait
+      // for it too. Resetting the controller before that classification ran
+      // used to reclassify a cancelled turn as a retryable failure and
+      // resurrect it as a background retry.
+      await unwound;
     } finally {
       this.promptDiagnostics.finishAbortWait();
     }
-    // Reset the controller so the agent can be reused for subsequent prompts
-    this.abortController = new AbortController();
+    // Reset so the agent is reusable, unless a newer turn (e.g. a background
+    // delivery that started during the wait) already installed its own
+    // controller.
+    if (this.abortController === controller) {
+      this.abortController = new AbortController();
+    }
     this.logger.info('[CortexAgent] abort complete');
   }
 

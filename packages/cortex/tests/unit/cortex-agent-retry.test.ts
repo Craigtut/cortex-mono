@@ -220,6 +220,58 @@ describe('CortexAgent background retry', () => {
     expect(errored.mock.calls[0][0].category).toBe('network');
   });
 
+  it('abort() mid-turn does not resurrect the turn as a background retry', async () => {
+    // The failure message deliberately does NOT match /abort|cancelled/, so
+    // classification must rely on the abort controller alone. Before the
+    // fix, abort() reset the controller as soon as pi went idle, racing the
+    // turn's own catch: the cancelled turn was reclassified as a retryable
+    // network failure and resurrected via continue().
+    mock = createRetryMock(['fail', 'ok']);
+    let releasePrompt: (() => void) | null = null;
+    let idleResolve: (() => void) | null = null;
+    const basePrompt = mock.prompt.bind(mock);
+    mock.prompt = async (input: string): Promise<unknown> => {
+      await new Promise<void>((resolve) => { releasePrompt = resolve; });
+      const result = await basePrompt(input);
+      // Mirror pi-agent-core's settlement order: finishRun() resolves the
+      // activeRun promise (waitForIdle) BEFORE the caller's own await on
+      // prompt() resumes, so abort()'s continuation races ahead of the
+      // turn's catch block exactly as it does against the real Agent.
+      idleResolve?.();
+      idleResolve = null;
+      return result;
+    };
+    mock.waitForIdle = (): Promise<void> => new Promise<void>((resolve) => {
+      idleResolve = resolve;
+    });
+    mock.abort = (): void => {
+      mock.abortCalled = true;
+      releasePrompt?.();
+      releasePrompt = null;
+    };
+
+    const agent = build(mock, createConfig());
+    const scheduled = vi.fn();
+    const errored = vi.fn();
+    agent.onRetryScheduled(scheduled);
+    agent.onError(errored);
+
+    const turn = agent.prompt('hi');
+    const settled = turn.then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await agent.abort();
+
+    expect(await settled).toBe('rejected');
+    expect(scheduled).not.toHaveBeenCalled();
+    expect(mock.continueCalls).toBe(0);
+    expect(errored).toHaveBeenCalledTimes(1);
+    expect(errored.mock.calls[0][0].category).toBe('cancelled');
+  });
+
   it('cancels a pending retry when aborted during the backoff wait', async () => {
     mock = createRetryMock(['fail', 'ok']);
     const agent = build(mock, createConfig({ retryPolicy: { backoffMs: [1000], maxBackoffMs: 1000, maxAttempts: 3 } }));
