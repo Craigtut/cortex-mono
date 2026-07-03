@@ -44,6 +44,7 @@ import { OverlayBox } from './tui/overlay-box.js';
 import { type CortexCodeConfig } from './config/config.js';
 import { CredentialStore, type CredentialEntry } from './config/credentials.js';
 import { singleFlight } from './utils/single-flight.js';
+import { resolveStoredOAuthApiKey } from './utils/oauth-credentials.js';
 import { PermissionRuleManager } from './permissions/rules.js';
 import { findDangerousCommand } from './permissions/dangerous-commands.js';
 import { isPathWithinRealCwd } from './permissions/path-containment.js';
@@ -1274,21 +1275,9 @@ export class Session {
    * it reads the rotated credential rather than replaying the spent one.
    */
   private resolveOAuthApiKey(provider: string, entry: CredentialEntry): Promise<string> {
-    return singleFlight(this.oauthResolveInFlight, provider, async () => {
-      const result = await this.providerManager.resolveOAuthApiKey(
-        provider,
-        entry.oauthCredentials!,
-      );
-      // Persist refreshed credentials if they changed (rotation).
-      if (result.changed) {
-        await this.credentialStore.setProvider(provider, {
-          ...entry,
-          oauthCredentials: result.credentials,
-          oauthMeta: result.meta,
-        });
-      }
-      return result.apiKey;
-    });
+    return singleFlight(this.oauthResolveInFlight, provider, () =>
+      resolveStoredOAuthApiKey(this.providerManager, this.credentialStore, provider, entry),
+    );
   }
 
   /** Resume a previous session by loading and restoring its history. */

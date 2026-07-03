@@ -9,6 +9,7 @@ import {
 
 import { loadConfig } from './config/config.js';
 import { CredentialStore, type CredentialEntry } from './config/credentials.js';
+import { resolveStoredOAuthApiKey } from './utils/oauth-credentials.js';
 import { getOllamaContextWindow, getOllamaHost } from './providers/ollama.js';
 
 interface CompleteArgs {
@@ -254,18 +255,10 @@ async function resolveApiKey(
   }
 
   if (entry.method === 'oauth' && entry.oauthCredentials) {
-    const result = await providerManager.resolveOAuthApiKey(
-      credentialProvider,
-      entry.oauthCredentials,
-    );
-    if (result.changed) {
-      await credentialStore.setProvider(credentialProvider, {
-        ...entry,
-        oauthCredentials: result.credentials,
-        oauthMeta: result.meta,
-      });
-    }
-    return result.apiKey;
+    // Shared with the interactive path: refreshes, persists rotation, and
+    // recovers from a cross-process refresh race (another `cortex -p` run or
+    // interactive session rotating the same token concurrently).
+    return resolveStoredOAuthApiKey(providerManager, credentialStore, credentialProvider, entry);
   }
 
   if (entry.method === 'custom') {
