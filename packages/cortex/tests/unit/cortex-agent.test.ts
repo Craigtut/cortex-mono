@@ -1059,6 +1059,74 @@ You have 12 emotions.`;
       expect(elapsed).toBeLessThan(500);
       expect(agent.state).toBe('destroyed');
     });
+
+    it('concurrent destroy() calls share one teardown', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const resetSpy = vi.spyOn(piAgent, 'reset');
+
+      await Promise.all([agent.destroy(), agent.destroy()]);
+
+      expect(resetSpy).toHaveBeenCalledTimes(1);
+      expect(agent.state).toBe('destroyed');
+    });
+
+    it('rejects prompt() issued while destroy is in progress', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+
+      const teardown = agent.destroy();
+      expect(agent.state).toBe('destroying');
+      await expect(agent.prompt('Hello')).rejects.toThrow('Agent is being destroyed');
+
+      await teardown;
+      expect(agent.state).toBe('destroyed');
+    });
+
+    it('does not start a new loop for a background completion pending at destroy', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as {
+        toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
+        deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
+        pendingBackgroundResults: unknown[];
+      };
+      internal.toolRuntime.backgroundTasks.set({
+        id: 'task_d',
+        command: 'sleep 1',
+        process: {},
+        stdout: 'late result',
+        stderr: '',
+        exitCode: 0,
+        completed: true,
+        notified: false,
+        startTime: Date.now() - 1000,
+      });
+
+      // Hold a turn open so the completion is queued behind a live loop.
+      let release!: () => void;
+      const originalPrompt = piAgent.prompt.bind(piAgent);
+      const promptCalls: string[] = [];
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        promptCalls.push(input);
+        if (promptCalls.length === 1) {
+          await new Promise<void>((resolve) => { release = resolve; });
+        }
+        return originalPrompt(input);
+      };
+
+      const turn = agent.prompt('long turn');
+      await new Promise((resolve) => setImmediate(resolve));
+      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_d' });
+
+      const teardown = agent.destroy();
+      release();
+      await turn;
+      await delivery;
+      await teardown;
+
+      // The pending completion never restarted the loop mid-teardown.
+      expect(promptCalls).toHaveLength(1);
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(agent.state).toBe('destroyed');
+    });
   });
 
   // -----------------------------------------------------------------------

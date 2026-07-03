@@ -272,6 +272,32 @@ describe('CortexAgent background retry', () => {
     expect(errored.mock.calls[0][0].category).toBe('cancelled');
   });
 
+  it('destroy() during a retry backoff cancels the pending retry timer', async () => {
+    mock = createRetryMock(['fail', 'ok']);
+    // A backoff long enough that the test would time out if destroy() left
+    // the retry timer running instead of cancelling it.
+    const agent = build(
+      mock,
+      createConfig({ retryPolicy: { backoffMs: [60_000], maxBackoffMs: 60_000, maxAttempts: 3 } }),
+    );
+    const scheduledPromise = new Promise<void>((resolve) => {
+      agent.onRetryScheduled(() => resolve());
+    });
+
+    const turn = agent.prompt('hi');
+    const settled = turn.then(
+      () => 'resolved',
+      (e: Error) => e.name,
+    );
+    await scheduledPromise;
+
+    await agent.destroy();
+
+    expect(await settled).toBe('AbortError');
+    expect(mock.continueCalls).toBe(0);
+    expect(agent.state).toBe('destroyed');
+  });
+
   it('cancels a pending retry when aborted during the backoff wait', async () => {
     mock = createRetryMock(['fail', 'ok']);
     const agent = build(mock, createConfig({ retryPolicy: { backoffMs: [1000], maxBackoffMs: 1000, maxAttempts: 3 } }));

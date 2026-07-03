@@ -472,6 +472,9 @@ export class CortexAgent {
   private turnUnwound: Promise<void> = Promise.resolve();
   private resolveTurnUnwound: (() => void) | null = null;
 
+  // In-flight destroy(). Concurrent destroy() calls share one teardown.
+  private destroyPromise: Promise<void> | null = null;
+
   // Tracked subprocess PIDs for synchronous exit cleanup (Level 3 safety net)
   private readonly trackedPids = new Set<number>();
 
@@ -792,9 +795,7 @@ export class CortexAgent {
    * @throws Error if the agent has been destroyed or is already prompting
    */
   async prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
-    if (this.lifecycleState === 'destroyed') {
-      throw new Error('Agent has been destroyed');
-    }
+    this.assertNotShuttingDown();
     if (!this.hasConfiguredSystemPrompt()) {
       throw new Error(
         'CortexAgent prompt is not configured. Call setBasePrompt() before prompt(), ' +
@@ -809,6 +810,21 @@ export class CortexAgent {
     }
 
     return this.enqueueLoopTask(() => this.runPromptCycle(input, options));
+  }
+
+  /** Whether teardown has started (no new loops may start). */
+  private isShuttingDown(): boolean {
+    return this.lifecycleState === 'destroying' || this.lifecycleState === 'destroyed';
+  }
+
+  /** Throw the consumer-facing lifecycle error when teardown has started. */
+  private assertNotShuttingDown(): void {
+    if (this.lifecycleState === 'destroying') {
+      throw new Error('Agent is being destroyed');
+    }
+    if (this.lifecycleState === 'destroyed') {
+      throw new Error('Agent has been destroyed');
+    }
   }
 
   /**
@@ -837,9 +853,7 @@ export class CortexAgent {
    * enqueue and dequeue can never start a new loop.
    */
   private async runPromptCycle(input: string, options?: DirectCompletionOptions): Promise<unknown> {
-    if (this.lifecycleState === 'destroyed') {
-      throw new Error('Agent has been destroyed');
-    }
+    this.assertNotShuttingDown();
     try {
       return await this.runPromptOnce(input, options);
     } finally {
@@ -2542,35 +2556,50 @@ export class CortexAgent {
     if (this.lifecycleState === 'destroyed') {
       return; // Already destroyed, idempotent
     }
+    if (this.destroyPromise) {
+      return this.destroyPromise; // Teardown already in progress, share it
+    }
 
     this.logger.info('[CortexAgent] destroy start', {
       activeSubAgents: this.subAgentManager.activeCount,
       mcpConnections: this.mcpClientManager.connectionCount,
     });
 
-    // Set up a force-kill deadline
-    let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-    const forceKillPromise = new Promise<void>((resolve) => {
-      forceKillTimer = setTimeout(() => {
-        this.forceKillAll();
-        resolve();
-      }, timeoutMs);
-    });
+    // Transition BEFORE any await so nothing can start a new loop while
+    // teardown runs: prompt() rejects, queued gate tasks no-op, background
+    // completions are dropped, and the end-of-cycle drain is skipped.
+    this.lifecycleState = 'destroying';
+    // Cancel Cortex-side waits immediately: a pending retry-backoff timer is
+    // cleared by its abort listener, and the current turn's unwind is
+    // classified as cancelled instead of scheduling further retries.
+    this.abortController.abort();
 
-    try {
-      // Race the cleanup against the deadline
-      await Promise.race([
-        this.orderedCleanup(),
-        forceKillPromise,
-      ]);
-    } finally {
-      if (forceKillTimer) {
-        clearTimeout(forceKillTimer);
+    this.destroyPromise = (async () => {
+      // Set up a force-kill deadline
+      let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+      const forceKillPromise = new Promise<void>((resolve) => {
+        forceKillTimer = setTimeout(() => {
+          this.forceKillAll();
+          resolve();
+        }, timeoutMs);
+      });
+
+      try {
+        // Race the cleanup against the deadline
+        await Promise.race([
+          this.orderedCleanup(),
+          forceKillPromise,
+        ]);
+      } finally {
+        if (forceKillTimer) {
+          clearTimeout(forceKillTimer);
+        }
+        this.promptDiagnostics.stop();
+        this.lifecycleState = 'destroyed';
+        this.logger.info('[CortexAgent] destroy complete');
       }
-      this.promptDiagnostics.stop();
-      this.lifecycleState = 'destroyed';
-      this.logger.info('[CortexAgent] destroy complete');
-    }
+    })();
+    return this.destroyPromise;
   }
 
   /**
@@ -3974,6 +4003,11 @@ export class CortexAgent {
       // Ignore errors during wait (agent may already be idle)
     }
 
+    // 1b. Wait for the loop gate to drain: the aborted cycle's Cortex-side
+    // unwind plus any queued delivery tasks (which no-op now that the
+    // lifecycle is 'destroying'). Bounded by destroy()'s force-kill race.
+    await this.loopGateTail;
+
     // 2. Cancel all sub-agents
     try {
       await this.subAgentManager.cancelAll(async (agent) => {
@@ -4605,7 +4639,7 @@ export class CortexAgent {
   private async deliverOrQueueBackgroundCompletion(
     item: PendingBackgroundCompletion,
   ): Promise<void> {
-    if (this.lifecycleState === 'destroyed') return;
+    if (this.isShuttingDown()) return;
 
     this.pendingBackgroundResults.push(item);
     await this.schedulePendingResultDelivery();
@@ -4618,7 +4652,7 @@ export class CortexAgent {
    */
   private schedulePendingResultDelivery(): Promise<void> {
     return this.enqueueLoopTask(async () => {
-      if (this.lifecycleState === 'destroyed') return;
+      if (this.isShuttingDown()) return;
       try {
         await this.drainPendingBackgroundResults();
       } catch (err) {
@@ -4647,7 +4681,7 @@ export class CortexAgent {
    * if nothing remains to deliver the loop is not restarted.
    */
   private async drainPendingBackgroundResults(): Promise<void> {
-    if (this.lifecycleState === 'destroyed') return;
+    if (this.isShuttingDown()) return;
     if (this.pendingBackgroundResults.length === 0) return;
 
     const pending = this.pendingBackgroundResults.splice(0);
