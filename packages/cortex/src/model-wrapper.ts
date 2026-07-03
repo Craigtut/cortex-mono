@@ -65,6 +65,14 @@ export function wrapModel(
   modelId: string,
   contextWindow?: number,
 ): CortexModel {
+  // A nullish model would produce a branded handle that passes isCortexModel()
+  // yet has nothing to unwrap, deferring the failure to deep inside the agentic
+  // loop. Reject it here so the caller gets an actionable error at the source.
+  if (model == null) {
+    throw new Error(
+      `wrapModel: cannot wrap a nullish model (provider "${provider}", model "${modelId}")`,
+    );
+  }
   const wrapped: WrappedModel = {
     __brand: 'CortexModel' as const,
     provider,

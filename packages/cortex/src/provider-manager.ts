@@ -1215,16 +1215,30 @@ export class ProviderManager implements IProviderManager {
   /**
    * Resolve a provider + model ID into a CortexModel.
    *
+   * Only resolves models that pi-ai ships a definition for. For custom or
+   * keyless OpenAI-compatible endpoints pi-ai does not know about, use
+   * {@link createCustomModel} instead.
+   *
    * @param provider - The provider identifier
    * @param modelId - The model identifier
    * @returns A CortexModel handle
-   * @throws Error if pi-ai is not installed or the model is not found
+   * @throws Error if pi-ai is not installed
+   * @throws Error if the provider/model is unknown to pi-ai
    */
   async resolveModel(provider: string, modelId: string): Promise<CortexModel> {
     const piAi = await loadPiAi();
     const piModel = piAi.getModel(provider, modelId);
+    // pi-ai's getModel returns undefined for ids it has no definition for.
+    // Fail loudly instead of wrapping undefined into a fake-valid model that
+    // would later crash deep inside the agentic loop with an opaque error.
+    if (piModel == null) {
+      throw new Error(
+        `Unknown model "${modelId}" for provider "${provider}". ` +
+          `Use ProviderManager.createCustomModel() for endpoints pi-ai has no built-in definition for.`,
+      );
+    }
     let contextWindow: number | undefined;
-    if (piModel && typeof piModel === 'object') {
+    if (typeof piModel === 'object') {
       const raw = piModel as Record<string, unknown>;
       const cw = raw['contextWindow'];
       if (typeof cw === 'number') {

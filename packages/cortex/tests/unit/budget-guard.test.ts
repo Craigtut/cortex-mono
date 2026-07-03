@@ -193,6 +193,79 @@ describe('BudgetGuard', () => {
   });
 
   // -----------------------------------------------------------------------
+  // Forwarded child (sub-agent) events
+  // -----------------------------------------------------------------------
+
+  describe('forwarded child events', () => {
+    it('does not count forwarded child turn_end events toward the parent budget', () => {
+      const guard = new BudgetGuard({ maxTurns: Infinity, maxCost: Infinity }, abortFn);
+      guard.wire(bridge);
+
+      // A child agent's own bridge, forwarded onto the parent bridge with a
+      // childTaskId. This is how sub-agent events reach the parent in practice.
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+      const stopForwarding = bridge.forwardFrom(childBridge, 'child-1');
+
+      // Child turns and cost must not touch the parent's counters.
+      childSource.emit(turnEndWithCost(0.05));
+      childSource.emit(turnEndWithCost(0.05));
+
+      expect(guard.getTurnCount()).toBe(0);
+      expect(guard.getTotalCost()).toBe(0);
+
+      // Parent's own turns/cost still count.
+      source.emit(turnEndWithCost(0.02));
+
+      expect(guard.getTurnCount()).toBe(1);
+      expect(guard.getTotalCost()).toBeCloseTo(0.02);
+
+      stopForwarding();
+    });
+
+    it('does not abort the parent when child turns exceed the parent limit', () => {
+      const guard = new BudgetGuard({ maxTurns: 2 }, abortFn);
+      guard.wire(bridge);
+
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+      bridge.forwardFrom(childBridge, 'child-1');
+
+      // Ten child turns would blow past maxTurns=2 if counted.
+      for (let i = 0; i < 10; i++) {
+        childSource.emit({ type: 'turn_end' });
+      }
+
+      expect(abortFn).not.toHaveBeenCalled();
+      expect(guard.getTurnCount()).toBe(0);
+      expect(guard.isBreached()).toBe(false);
+    });
+
+    it('does not reset the parent counters on a forwarded child loop_start', () => {
+      const guard = new BudgetGuard({ maxTurns: Infinity, maxCost: Infinity }, abortFn);
+      guard.wire(bridge);
+
+      // Accumulate parent state.
+      source.emit(turnEndWithCost(0.05));
+      expect(guard.getTurnCount()).toBe(1);
+      expect(guard.getTotalCost()).toBeCloseTo(0.05);
+
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+      bridge.forwardFrom(childBridge, 'child-1');
+
+      // A child starting its own loop must not wipe the parent's counters.
+      childSource.emit({ type: 'agent_start' });
+
+      expect(guard.getTurnCount()).toBe(1);
+      expect(guard.getTotalCost()).toBeCloseTo(0.05);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Reset on loop_start
   // -----------------------------------------------------------------------
 

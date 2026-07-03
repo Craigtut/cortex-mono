@@ -912,6 +912,22 @@ describe('ProviderManager', () => {
 
       expect(mockGetModel).toHaveBeenCalledWith('google', 'gemini-2.0-flash');
     });
+
+    it('throws for a model pi-ai does not know (getModel returns undefined)', async () => {
+      mockGetModel.mockReturnValue(undefined);
+
+      await expect(pm.resolveModel('anthropic', 'no-such-model')).rejects.toThrow(
+        'Unknown model "no-such-model" for provider "anthropic"',
+      );
+    });
+
+    it('throws when getModel returns null', async () => {
+      mockGetModel.mockReturnValue(null);
+
+      await expect(pm.resolveModel('openai', 'ghost')).rejects.toThrow(
+        /Unknown model "ghost" for provider "openai"/,
+      );
+    });
   });
 
   describe('createCustomModel', () => {
