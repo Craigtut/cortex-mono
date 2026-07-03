@@ -58,6 +58,43 @@ describe('globToRegex', () => {
       expect(regex.test('root.js')).toBe(false);
     });
 
+    it('trailing ** matches the rest of the path including separators', () => {
+      // Regression: trailing `**` must compile to `.*`, not `(?:.+/)?`.
+      // The latter matches only empty-or-slash-terminated strings, so it
+      // would match no file path at all.
+      const src = globToRegex('src/**');
+      expect(src.test('src/foo.ts')).toBe(true);
+      expect(src.test('src/a/b.ts')).toBe(true);
+      expect(src.test('src/a/b/c/deep.ts')).toBe(true);
+      // A sibling that merely starts with "src" is not under src/.
+      expect(src.test('srcfoo.ts')).toBe(false);
+
+      const docs = globToRegex('docs/**');
+      expect(docs.test('docs/readme.md')).toBe(true);
+      expect(docs.test('docs/guide/intro.md')).toBe(true);
+    });
+
+    it('**/ stays anchored at a directory boundary', () => {
+      // `**/foo` must not match `xfoo` — the `**/` is a path boundary.
+      const regex = globToRegex('**/foo');
+      expect(regex.test('foo')).toBe(true);
+      expect(regex.test('a/foo')).toBe(true);
+      expect(regex.test('a/b/foo')).toBe(true);
+      expect(regex.test('xfoo')).toBe(false);
+    });
+
+    it('gitignore-style `dir/**` matches nested files (full-path branch)', () => {
+      // This is exactly what grep.ts matchesGitignorePattern feeds to the
+      // compiler for a `.gitignore` line like `dist/**`. It must match files
+      // nested at any depth beneath the directory.
+      const regex = globToRegex('dist/**');
+      expect(regex.test('dist/bundle.js')).toBe(true);
+      expect(regex.test('dist/assets/app.css')).toBe(true);
+      expect(regex.test('dist/a/b/c/chunk.js')).toBe(true);
+      // Not the sibling `distfoo`.
+      expect(regex.test('distfoo/x.js')).toBe(false);
+    });
+
     it('? matches exactly one non-separator character', () => {
       expect(globToRegex('file?.ts').test('file1.ts')).toBe(true);
       expect(globToRegex('file?.ts').test('file.ts')).toBe(false);

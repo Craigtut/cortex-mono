@@ -41,10 +41,21 @@ export function globToRegex(pattern: string): RegExp {
 
     if (char === '*') {
       if (pattern[i + 1] === '*') {
-        // `**` (optionally followed by `/`) matches across path segments.
-        if (pattern[i + 2] === '/' || pattern[i + 2] === undefined) {
+        if (pattern[i + 2] === '/') {
+          // `**/` matches zero or more complete path segments (each ending
+          // in a separator), so `**/foo` stays anchored at a directory
+          // boundary and does not match `xfoo`.
           regex += '(?:.+/)?';
-          i += pattern[i + 2] === '/' ? 3 : 2;
+          i += 3;
+          continue;
+        }
+        if (pattern[i + 2] === undefined) {
+          // Trailing `**` matches the rest of the path, separators included.
+          // Paths we test against are files (no trailing slash), so this must
+          // be `.*`, NOT `(?:.+/)?` (which would match only empty or a
+          // slash-terminated string and so match no file at all).
+          regex += '.*';
+          i += 2;
           continue;
         }
       }
