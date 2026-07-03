@@ -22,13 +22,12 @@ function makeFakeProvider() {
     async initialize(): Promise<SandboxStatus> {
       return { filesystem: 'enforced', network: 'enforced', backend: 'seatbelt', degradations: [] };
     },
-    wrapSpawn(spec: SandboxSpawnSpec): WrappedSpawn {
+    async wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn> {
       calls.push(spec);
-      const args = [...spec.args];
-      // The last arg is the fully-composed command (with the cwd-capture suffix).
-      // Prefix a marker so the wrapping is observable without disturbing the suffix.
-      args[args.length - 1] = `echo SANDBOXED; ${args[args.length - 1]}`;
-      return { file: spec.file, args, env: spec.env };
+      // Compose like the unsandboxed path would, but prefix an observable marker
+      // so the wrapping is detectable in the command output.
+      const args = [...spec.shellArgs, `echo SANDBOXED; ${spec.command}`];
+      return { file: spec.shell, args, env: spec.env };
     },
     async dispose(): Promise<void> {},
   };
@@ -72,10 +71,10 @@ describe('Bash tool sandbox seam', () => {
     expect(text).toContain('hello');
     expect(result.details.exitCode).toBe(0);
 
-    // wrapSpawn was invoked once with the resolved shell, args, and cwd.
+    // wrapSpawn was invoked once with the resolved shell, command, and cwd.
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.file).toBeTruthy();
-    expect(calls[0]!.args.length).toBeGreaterThanOrEqual(2);
+    expect(calls[0]!.shell).toBeTruthy();
+    expect(calls[0]!.command).toContain('echo hello');
     expect(calls[0]!.cwd).toBe(expectedCwd);
 
     // The env handed to the provider is already sanitized (injection vectors

@@ -75,12 +75,14 @@ export interface SandboxStatus {
   degradations: string[];
 }
 
-/** An already-composed spawn the provider will wrap. */
+/** A shell command spawn the provider will wrap. */
 export interface SandboxSpawnSpec {
-  /** Executable to run (e.g. the resolved shell). */
-  file: string;
-  /** Arguments, including the fully-composed command. */
-  args: string[];
+  /** The resolved shell binary that will execute the command. */
+  shell: string;
+  /** Shell flags that precede the command in an unsandboxed spawn (e.g. ['-c']). */
+  shellArgs: string[];
+  /** The fully-composed command string, including any cwd-capture suffix. */
+  command: string;
   /** Working directory for the spawn. */
   cwd: string;
   /** Environment for the child (already sanitized by buildSafeEnv). */
@@ -117,11 +119,11 @@ export interface SandboxProvider {
    */
   initialize(policy: SandboxPolicy): Promise<SandboxStatus>;
   /**
-   * Wrap an already-composed spawn so it launches contained. Synchronous so it
-   * composes with the Bash tool's shell selection and cwd-capture suffix. Must
-   * be a pure transform (it prepares the argv/env; it does not launch a process).
+   * Wrap a shell command spawn so it launches contained, returning the argv and
+   * env to spawn. Async because a backend may generate an OS profile or await a
+   * proxy per call. It prepares the invocation; it does not launch a process.
    */
-  wrapSpawn(spec: SandboxSpawnSpec): WrappedSpawn;
+  wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn>;
   /**
    * Optionally classify a completed tool result as a sandbox denial so the
    * caller can surface a self-explaining message and offer escalation. Returns

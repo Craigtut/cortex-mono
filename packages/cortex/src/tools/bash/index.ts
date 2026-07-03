@@ -366,9 +366,10 @@ export function createBashTool(config: BashToolConfig): {
       let spawnArgs = [...shellConfig.args, fullCommand];
       let spawnEnv: Record<string, string> = safeEnv;
       if (config.sandbox) {
-        const wrapped = config.sandbox.wrapSpawn({
-          file: spawnFile,
-          args: spawnArgs,
+        const wrapped = await config.sandbox.wrapSpawn({
+          shell: shellConfig.shell,
+          shellArgs: shellConfig.args,
+          command: fullCommand,
           cwd: spawnCwd,
           env: safeEnv,
         });
