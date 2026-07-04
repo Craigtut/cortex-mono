@@ -17,11 +17,13 @@ import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { Type, type Static } from 'typebox';
 import type { ToolContentDetails } from '../types.js';
+import type { SandboxProvider } from '../sandbox/types.js';
 import {
   readGitignorePatterns,
   DEFAULT_IGNORE_PATTERNS,
 } from './shared/gitignore.js';
 import { compileGlob } from './shared/glob-matcher.js';
+import { buildSafeEnv } from './shared/safe-env.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -124,6 +126,16 @@ export interface GrepToolConfig {
   defaultCwd: string;
   /** Whether to respect .gitignore. Default: true. */
   respectGitignore?: boolean | undefined;
+  /**
+   * Optional OS-level sandbox. When present and it implements wrapExec, the
+   * bundled ripgrep spawn is wrapped so it runs inside the same OS boundary as
+   * shell commands, enforcing denyRead over secrets (~/.ssh, ~/.aws, credential
+   * stores). Without it, content search bypasses the sandbox and a prompt-
+   * injected `Grep 'AKIA' ~/.aws/credentials` could read secret contents even
+   * with the sandbox on. When absent (or wrapExec is not implemented), ripgrep
+   * runs exactly as before. See docs/cortex/sandboxing.md.
+   */
+  sandbox?: SandboxProvider | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,20 +173,45 @@ function getRipgrepPath(): string | false {
 
 /**
  * Execute ripgrep and return the output lines.
+ *
+ * When a sandbox provider with wrapExec is supplied, the ripgrep spawn is
+ * wrapped so it runs inside the same OS boundary as shell commands. This closes
+ * the hole where content search would otherwise bypass the sandbox's denyRead
+ * (secrets like ~/.ssh, ~/.aws). Without a provider, ripgrep runs directly,
+ * exactly as before (no explicit env, inheriting process.env).
  */
-function execRipgrep(
+async function execRipgrep(
   args: string[],
   cwd: string,
+  sandbox?: SandboxProvider | undefined,
 ): Promise<string[]> {
   const rgPath = getRipgrepPath();
-  if (!rgPath) return Promise.reject(new Error('rg binary not available'));
+  if (!rgPath) throw new Error('rg binary not available');
+
+  let file = rgPath;
+  let execArgs = args;
+  // Undefined env keeps the unsandboxed path byte-identical to before (execFile
+  // inherits process.env). Only the sandboxed path pins a sanitized env.
+  let env: Record<string, string> | undefined;
+
+  if (sandbox?.wrapExec) {
+    // Same sanitized env the Bash tool and stdio MCP servers use. The sandbox
+    // additionally scrubs credential vars at the OS boundary; ripgrep does not
+    // read them, but this keeps the child's env consistent with contained shells.
+    const safeEnv = buildSafeEnv(process.env);
+    const wrapped = await sandbox.wrapExec({ file: rgPath, args, cwd, env: safeEnv });
+    file = wrapped.file;
+    execArgs = wrapped.args;
+    env = wrapped.env;
+  }
 
   return new Promise((resolve, reject) => {
     child_process.execFile(
-      rgPath,
-      args,
+      file,
+      execArgs,
       {
         cwd,
+        ...(env ? { env } : {}),
         maxBuffer: 10 * 1024 * 1024, // 10 MB
         timeout: 30_000,
         encoding: 'utf8',
@@ -322,7 +359,7 @@ async function searchWithRipgrep(
   const rgCwd = path.dirname(searchPath);
 
   if (outputMode === 'content') {
-    const rawLines = await execRipgrep(args, rgCwd);
+    const rawLines = await execRipgrep(args, rgCwd, config.sandbox);
     const durationMs = Date.now() - startTime;
 
     const { items: limited, truncated } = applyHeadLimit(
@@ -358,7 +395,7 @@ async function searchWithRipgrep(
   }
 
   if (outputMode === 'count') {
-    const rawLines = await execRipgrep(args, rgCwd);
+    const rawLines = await execRipgrep(args, rgCwd, config.sandbox);
     const durationMs = Date.now() - startTime;
 
     const { items: limited, truncated } = applyHeadLimit(
@@ -395,7 +432,7 @@ async function searchWithRipgrep(
   }
 
   // files_with_matches: rg returns absolute paths, sort by mtime (newest first)
-  const results = await execRipgrep(args, rgCwd);
+  const results = await execRipgrep(args, rgCwd, config.sandbox);
   const durationMs = Date.now() - startTime;
 
   const stats = await Promise.allSettled(

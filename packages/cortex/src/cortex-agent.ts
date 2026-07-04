@@ -662,6 +662,11 @@ export class CortexAgent {
     if (this.envOverrides) {
       this.mcpClientManager.envOverrides = this.envOverrides;
     }
+    // Contain stdio MCP server subprocesses in the same OS sandbox as shell
+    // commands (enforces denyRead over secrets). No-op when no provider is set.
+    if (this.config.sandbox) {
+      this.mcpClientManager.sandbox = this.config.sandbox;
+    }
     this.mcpClientManager.onToolsChanged = () => {
       this.refreshTools();
     };
@@ -3443,7 +3448,10 @@ export class CortexAgent {
       tools.push(createGlobTool({ defaultCwd: cwd }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.Grep)) {
-      tools.push(createGrepTool({ defaultCwd: cwd }) as RegisteredTool);
+      // Thread the sandbox so ripgrep content search runs inside the same OS
+      // boundary as shell commands (enforces denyRead over secrets). No-op when
+      // no provider is configured.
+      tools.push(createGrepTool({ defaultCwd: cwd, sandbox: this.config.sandbox }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.Bash)) {
       tools.push(createBashTool({

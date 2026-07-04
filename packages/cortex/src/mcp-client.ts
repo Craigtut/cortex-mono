@@ -30,6 +30,7 @@ import type {
   CortexLogger,
 } from './types.js';
 import type { CortexTool } from './tool-contract.js';
+import type { SandboxProvider } from './sandbox/types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { buildSafeEnv } from './tools/shared/safe-env.js';
 
@@ -179,6 +180,15 @@ export class McpClientManager {
   envOverrides?: Record<string, string>;
 
   /**
+   * Optional OS-level sandbox. When present and it implements wrapExec, each
+   * stdio MCP server subprocess is wrapped so it runs inside the same OS
+   * boundary as shell commands, enforcing denyRead over secrets. Without it a
+   * stdio server spawns uncontained and bypasses the sandbox. Set by CortexAgent
+   * from its config. HTTP transports are unaffected (no subprocess to contain).
+   */
+  sandbox?: SandboxProvider;
+
+  /**
    * Optional callback fired when an MCP server emits a
    * `notifications/progress` during a long-running `tools/call`. The MCP
    * SDK's `resetTimeoutOnProgress` is enabled whenever a per-tool timeout is
@@ -213,7 +223,7 @@ export class McpClientManager {
 
     this.logger.info('[MCP] connecting', { serverName, transport: config.transport });
 
-    const transport = this.createTransport(config);
+    const transport = await this.createTransport(config);
     const client = new Client(
       { name: `cortex-${serverName}`, version: '1.0.0' },
       { capabilities: {} },
@@ -418,14 +428,14 @@ export class McpClientManager {
   // Private: Transport creation
   // -----------------------------------------------------------------------
 
-  private createTransport(config: McpTransportConfig): StdioClientTransport | StreamableHTTPClientTransport {
+  private async createTransport(config: McpTransportConfig): Promise<StdioClientTransport | StreamableHTTPClientTransport> {
     if (config.transport === 'stdio') {
       return this.createStdioTransport(config);
     }
     return this.createHttpTransport(config);
   }
 
-  private createStdioTransport(config: McpStdioConfig): StdioClientTransport {
+  private async createStdioTransport(config: McpStdioConfig): Promise<StdioClientTransport> {
     // Sanitize environment variables for the subprocess.
     // Strip dangerous vars (LD_PRELOAD, NODE_OPTIONS, etc.) to prevent
     // injection via environment. Uses the same blocklist as the Bash tool.
@@ -433,6 +443,23 @@ export class McpClientManager {
     // consumer-specified variables (e.g., macOS dock icon suppression).
     const baseEnv = config.env ?? process.env;
     const safeEnv = buildSafeEnv(baseEnv, undefined, this.envOverrides);
+
+    let command = config.command;
+    let args = config.args ?? [];
+    let env = safeEnv;
+
+    // Contain the MCP server subprocess in the same OS sandbox as shell commands
+    // when a wrapExec-capable provider is configured. Without this the server
+    // spawns uncontained and bypasses the sandbox's denyRead over secrets.
+    // Pass-through when the provider is not enforcing (wrapExec returns the spec
+    // unchanged), so behavior is identical with no provider or on Windows.
+    if (this.sandbox?.wrapExec) {
+      const cwd = config.cwd ?? process.cwd();
+      const wrapped = await this.sandbox.wrapExec({ file: command, args, cwd, env });
+      command = wrapped.file;
+      args = wrapped.args;
+      env = wrapped.env;
+    }
 
     // Build params object, only including defined optional fields to satisfy
     // exactOptionalPropertyTypes
@@ -443,9 +470,9 @@ export class McpClientManager {
       cwd?: string;
       stderr: 'pipe';
     } = {
-      command: config.command,
-      args: config.args ?? [],
-      env: safeEnv,
+      command,
+      args,
+      env,
       stderr: 'pipe',
     };
     if (config.cwd !== undefined) params.cwd = config.cwd;
@@ -773,7 +800,7 @@ export class McpClientManager {
 
     try {
       // Attempt fresh connection
-      const transport = this.createTransport(config);
+      const transport = await this.createTransport(config);
       client = new Client(
         { name: `cortex-${serverName}`, version: '1.0.0' },
         { capabilities: {} },
