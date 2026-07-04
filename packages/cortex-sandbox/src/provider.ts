@@ -221,8 +221,8 @@ export class SandboxRuntimeProvider implements SandboxProvider {
     // Linux heuristic: generic permission markers need corroboration against
     // the active policy (a referenced blocked path or a network tool).
     if (!this.policy) return null;
-    const { writableRoots, denyRead, denyWrite } = this.policy.filesystem;
-    return denialFromFailureHeuristic(failure, { writableRoots, denyRead, denyWrite });
+    const { denyRead, denyWrite } = this.policy.filesystem;
+    return denialFromFailureHeuristic(failure, { denyRead, denyWrite });
   }
 
   async dispose(): Promise<void> {

@@ -132,8 +132,6 @@ const COMMAND_WRAPPERS = new Set(['sudo', 'env', 'nohup', 'time', 'command', 'ex
  * games are irrelevant here because this gates a hint, not a boundary.
  */
 export interface DenialCorroborationContext {
-  /** The policy's writable roots; a referenced path outside them corroborates. */
-  writableRoots: readonly string[];
   /** The policy's read denies; a referenced path under one corroborates. */
   denyRead: readonly string[];
   /** The policy's write denies; a referenced path under one corroborates. */
@@ -170,7 +168,7 @@ function referencedPaths(command: string, home: string): string[] {
  * position keeps an argument merely named "curl" or "ping" from corroborating.
  */
 function referencedNetworkTool(command: string): string | null {
-  const segments = command.split(/\|\||&&|\$\(|[;|&`]/);
+  const segments = command.split(/\|\||&&|\$\(|[;|&`\n]/);
   for (const segment of segments) {
     const tokens = segment.trim().split(/\s+/).filter(Boolean);
     let i = 0;
@@ -217,12 +215,12 @@ function corroborate(command: string, ctx: DenialCorroborationContext): Corrobor
   }
   const tool = referencedNetworkTool(command);
   if (tool) return { dimension: 'network', detail: `the command runs the network tool ${tool}` };
-  // A referenced path outside every writable root could be a blocked write,
-  // but reads out there are allowed, so the dimension stays unknown.
-  const outside = paths.find((p) => !isUnderAny(p, ctx.writableRoots));
-  if (outside) {
-    return { dimension: 'unknown', detail: `the command references ${outside}, outside the writable roots` };
-  }
+  // Deliberately no "path outside the writable roots" branch: reads out there
+  // are allowed in-sandbox, so a failing read like `cat /etc/shadow` (a DAC
+  // denial, never the sandbox) would falsely corroborate. The deny-path and
+  // network branches above cover the real sandbox denials; a write to a
+  // non-denied path outside the workspace surfaces the distinctive read-only
+  // marker instead.
   return null;
 }
 

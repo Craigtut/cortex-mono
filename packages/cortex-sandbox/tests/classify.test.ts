@@ -22,7 +22,6 @@ function failure(overrides: Partial<SandboxCommandFailure> = {}): SandboxCommand
 
 function ctx(overrides: Partial<DenialCorroborationContext> = {}): DenialCorroborationContext {
   return {
-    writableRoots: ['/workspace', '/tmp'],
     denyRead: ['/home/user/.ssh', '/home/user/.aws'],
     denyWrite: ['/home/user/.zshrc', '/workspace/.git/hooks'],
     home: '/home/user',
@@ -141,17 +140,25 @@ describe('denialFromFailureHeuristic (Linux stderr heuristic)', () => {
     ).toBeNull();
   });
 
-  it('corroborates a generic marker with a referenced path outside the writable roots', () => {
-    const denial = denialFromFailureHeuristic(
-      failure({ command: 'touch /etc/blocked', stderr: 'touch: Permission denied' }),
+  it('does not corroborate a bare generic marker on a path outside the writable roots', () => {
+    // Reads outside the workspace are allowed in-sandbox, so a generic
+    // "Permission denied" on an outside path (e.g. cat /etc/shadow, a DAC
+    // denial) must not be mistaken for a sandbox block. A real write out there
+    // surfaces the distinctive read-only marker, which attributes on its own.
+    expect(
+      denialFromFailureHeuristic(
+        failure({ command: 'touch /etc/blocked', stderr: 'touch: Permission denied' }),
+        ctx(),
+      ),
+    ).toBeNull();
+    const readOnly = denialFromFailureHeuristic(
+      failure({ command: 'touch /etc/blocked', stderr: 'touch: Read-only file system' }),
       ctx(),
     );
-    expect(denial?.dimension).toBe('unknown');
-    expect(denial?.detail).toContain('Permission denied');
-    expect(denial?.detail).toContain('/etc/blocked');
+    expect(readOnly?.dimension).toBe('filesystem-write');
   });
 
-  it('does not corroborate from a path inside the writable roots', () => {
+  it('does not corroborate a generic marker from a path inside the writable roots', () => {
     expect(
       denialFromFailureHeuristic(
         failure({ command: 'touch /workspace/out.txt', stderr: 'touch: Permission denied' }),
