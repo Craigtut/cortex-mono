@@ -18,10 +18,8 @@ const { version: PKG_VERSION } = require('../package.json');
 import {
   CortexAgent,
   ProviderManager,
-  type CortexAgentConfig,
   type CortexModel,
   type CortexEvent,
-  type CortexToolPermissionDecision,
   type CortexToolPermissionResult,
   type AgentTextOutput,
   type ClassifiedError,
@@ -34,7 +32,6 @@ import {
   type ToolCallEndPayload,
   type ToolCallStartPayload,
   type ToolCallUpdatePayload,
-  stripWorkingTags,
 } from '@animus-labs/cortex';
 import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import { App, type AppCallbacks } from './tui/app.js';
@@ -1195,7 +1192,7 @@ export class Session {
     });
 
     // Compaction exhausted (all layers failed)
-    this.agent.onCompactionExhausted((info) => {
+    this.agent.onCompactionExhausted(() => {
       this.app!.transcript.addNotification(
         'Context Limit Reached',
         'All compaction layers have failed. Use /context-window to increase the limit or /clear to start fresh.',
