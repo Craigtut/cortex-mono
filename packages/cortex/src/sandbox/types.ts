@@ -142,6 +142,18 @@ export interface SandboxDenial {
 }
 
 /**
+ * A completed, failed shell command that ran inside the sandbox, as the Bash
+ * tool hands it to classifyFailure for denial attribution.
+ */
+export interface SandboxCommandFailure {
+  /** The composed command string exactly as it was passed to wrapSpawn. */
+  command: string;
+  exitCode: number | null;
+  stderr: string;
+  stdout: string;
+}
+
+/**
  * OS-level enforcement supplied by a consumer. Core calls into this at the
  * subprocess boundary; it never implements enforcement itself. The consumer
  * constructs and initializes the provider (it owns policy computation and any
@@ -161,12 +173,12 @@ export interface SandboxProvider {
    */
   wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn>;
   /**
-   * Optionally classify a completed tool result as a sandbox denial so the
+   * Optionally classify a failed sandboxed command as a sandbox denial so the
    * caller can surface a self-explaining message and offer escalation. Returns
-   * null when the result is not attributable to the sandbox. Reliable on macOS
-   * (violation log), best-effort on Linux (EPERM only).
+   * null when the failure is not attributable to the sandbox. Reliable on macOS
+   * (violation log), best-effort on Linux (stderr heuristic).
    */
-  classifyFailure?(result: unknown): SandboxDenial | null;
+  classifyFailure?(failure: SandboxCommandFailure): SandboxDenial | null;
   /** Current enforcement status (after initialize), for transparency surfaces. */
   status?(): SandboxStatus;
   /** Tear down the egress proxy and any transient OS state. */

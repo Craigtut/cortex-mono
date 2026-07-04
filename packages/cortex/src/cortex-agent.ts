@@ -59,7 +59,11 @@ import { createEditTool } from './tools/edit.js';
 import { createUndoEditTool } from './tools/undo-edit.js';
 import { createGlobTool } from './tools/glob.js';
 import { createGrepTool } from './tools/grep.js';
-import { createBashTool } from './tools/bash/index.js';
+import {
+  createBashTool,
+  BASH_ESCALATION_PERMISSION_NAME,
+  isBashEscalationRequest,
+} from './tools/bash/index.js';
 import { createTaskOutputTool } from './tools/task-output.js';
 import { createWebFetchTool } from './tools/web-fetch/index.js';
 import { TOOL_NAMES } from './tools/index.js';
@@ -1665,17 +1669,27 @@ export class CortexAgent {
 
     if (cortexConfig.resolvePermission) {
       const resolver = cortexConfig.resolvePermission;
+      const sandboxConfigured = cortexConfig.sandbox !== undefined;
       agentConfig['beforeToolCall'] = async (ctx: unknown) => {
         const { toolCall, args } = ctx as { toolCall: { name: string }; args: unknown };
         // Spawning a sub-agent is an internal orchestration decision, not a
         // side-effecting operation. Always allow without prompting.
         if (toolCall.name === SUB_AGENT_TOOL_NAME) return undefined;
-        const resolution = await resolver(toolCall.name, args);
+        // A Bash call requesting to run outside the sandbox reaches the
+        // resolver under a distinct synthetic name, so plain-Bash rules and
+        // auto-approve paths cannot silently authorize an uncontained run and
+        // the consumer can prompt the human distinctly. Only meaningful when a
+        // sandbox is configured; without one the flag changes nothing.
+        const escalation = sandboxConfigured && isBashEscalationRequest(toolCall.name, args);
+        const permissionName = escalation ? BASH_ESCALATION_PERMISSION_NAME : toolCall.name;
+        const resolution = await resolver(permissionName, args);
         const decision = CortexAgent.normalizePermissionDecision(resolution);
         if (decision.decision !== 'allow') {
           return {
             block: true,
-            reason: decision.reason ?? CortexAgent.buildPermissionReason(toolCall.name, decision.decision),
+            reason: decision.reason ?? (escalation
+              ? 'Escalation outside the sandbox was denied for this command; it was not run. Re-run without escalateOutsideSandbox to execute inside the sandbox.'
+              : CortexAgent.buildPermissionReason(permissionName, decision.decision)),
           };
         }
         return undefined;
@@ -3452,6 +3466,11 @@ export class CortexAgent {
           void this.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId });
         },
         sandbox: this.config.sandbox,
+        // The resolvePermission adaptation (beforeToolCall) screens every call
+        // before execute(), presenting escalation requests under a distinct
+        // name. That gate is what authorizes escalateOutsideSandbox; without a
+        // resolver the tool refuses escalation (fail closed).
+        permissionGated: this.config.resolvePermission !== undefined,
       }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.TaskOutput)) {

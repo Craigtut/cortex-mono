@@ -13,7 +13,7 @@ import * as fs from 'node:fs';
 import { Type, type Static } from 'typebox';
 import type { CwdTracker } from '../shared/cwd-tracker.js';
 import type { ToolContentDetails, ToolExecuteContext } from '../../types.js';
-import type { SandboxProvider } from '../../sandbox/types.js';
+import type { SandboxDenial, SandboxProvider } from '../../sandbox/types.js';
 import { killProcessTree } from '../shared/process-tree.js';
 import { buildSafeEnv, runSafetyChecks } from './safety.js';
 import {
@@ -38,9 +38,33 @@ export const BashParams = Type.Object({
   background: Type.Optional(
     Type.Boolean({ description: 'Run the command in the background immediately. Default: false. You are woken automatically when a backgrounded command finishes, so do not poll in a loop. To wait for an external condition, background a SINGLE command that blocks until the condition holds (e.g. `gh run watch <id> --exit-status`, or `until gh release view "$TAG" >/dev/null 2>&1; do sleep 20; done`) rather than re-running a quick check.' }),
   ),
+  escalateOutsideSandbox: Type.Optional(
+    Type.Boolean({ description: 'Request to run this ONE command outside the OS sandbox. Use only after a command failed because the sandbox blocked it (a sandbox-denial note on the failure). Requires explicit human approval; every other command stays sandboxed. Default: false.' }),
+  ),
 });
 
 export type BashParamsType = Static<typeof BashParams>;
+
+/**
+ * Synthetic tool name a Bash escalation request is presented under at the
+ * permission layer. A call with `escalateOutsideSandbox: true` (while a sandbox
+ * provider is configured) reaches the consumer's resolvePermission under this
+ * name instead of "Bash", so rules and auto-approve paths keyed on plain Bash
+ * never silently approve an uncontained run, and the consumer can render a
+ * distinct "run outside the sandbox?" prompt.
+ */
+export const BASH_ESCALATION_PERMISSION_NAME = 'Bash(escalate)';
+
+/**
+ * True when a tool call is a Bash escalation request: the Bash tool invoked
+ * with `escalateOutsideSandbox: true`. Shared by the permission adaptation in
+ * CortexAgent and by consumers that need to recognize the same shape.
+ */
+export function isBashEscalationRequest(toolName: string, toolArgs: unknown): boolean {
+  if (toolName !== 'Bash') return false;
+  const args = toolArgs as Record<string, unknown> | null | undefined;
+  return args?.['escalateOutsideSandbox'] === true;
+}
 
 // ---------------------------------------------------------------------------
 // Details type
@@ -116,6 +140,16 @@ export interface BashToolConfig {
    * the command inside an OS boundary. No-op when omitted.
    */
   sandbox?: SandboxProvider | undefined;
+  /**
+   * Assert that a permission gate screens calls BEFORE they reach execute()
+   * (CortexAgent sets this when the consumer configured resolvePermission,
+   * which runs via beforeToolCall and can block the call). Security-relevant
+   * for escalation: `escalateOutsideSandbox` is honored only when true, because
+   * reaching execute() then means the gate approved the escalation. When
+   * false/omitted, an escalation request is refused (fail closed) rather than
+   * granting the model an unapproved uncontained run.
+   */
+  permissionGated?: boolean | undefined;
 }
 
 export function getBackgroundTask(id: string): BackgroundTask | undefined {
@@ -317,6 +351,30 @@ export function createBashTool(config: BashToolConfig): {
         };
       }
 
+      // Single-command escalation out of the sandbox. Only meaningful when a
+      // provider is configured; otherwise the flag is ignored (there is no
+      // sandbox to escape). Honoring it requires a permission gate in front of
+      // this tool: the gate saw the call as BASH_ESCALATION_PERMISSION_NAME and
+      // approving it is what authorizes the uncontained run. Without a gate,
+      // refuse (fail closed) so the model can never grant itself escalation.
+      const escalated = params.escalateOutsideSandbox === true && config.sandbox !== undefined;
+      if (escalated && config.permissionGated !== true) {
+        return {
+          content: [{ type: 'text', text: 'Escalation outside the sandbox is unavailable: no permission gate is configured to approve it. The command was not run. Re-run without escalateOutsideSandbox to execute inside the sandbox.' }],
+          details: {
+            stdout: '',
+            stderr: '',
+            exitCode: null,
+            duration: Date.now() - startTime,
+            interrupted: false,
+            timedOut: false,
+            backgrounded: false,
+            taskId: null,
+            finalCwd: cwdTracker.getCwd(),
+          },
+        };
+      }
+
       // Select shell
       const shellConfig = selectShell(config.shellPath);
 
@@ -360,12 +418,14 @@ export function createBashTool(config: BashToolConfig): {
       // Resolve the spawn, optionally wrapped by an OS sandbox. The wrapper is a
       // pure transform applied AFTER safety checks and the cwd-capture suffix, so
       // the working-directory tracking and all safety layers still run first.
-      // No-op when no provider is configured.
+      // No-op when no provider is configured. An approved escalation skips the
+      // wrap for this one command; the provider stays active for every other.
+      const sandboxWrapped = config.sandbox !== undefined && !escalated;
       const spawnCwd = cwdTracker.getCwd();
       let spawnFile = shellConfig.shell;
       let spawnArgs = [...shellConfig.args, fullCommand];
       let spawnEnv: Record<string, string> = safeEnv;
-      if (config.sandbox) {
+      if (config.sandbox && sandboxWrapped) {
         const wrapped = await config.sandbox.wrapSpawn({
           shell: shellConfig.shell,
           shellArgs: shellConfig.args,
@@ -590,6 +650,33 @@ export function createBashTool(config: BashToolConfig): {
           }
           if (code !== null && code !== 0) {
             text += `\nExit code: ${code}`;
+          }
+
+          // Self-explaining denial (best-effort): when a sandboxed command
+          // fails, ask the provider whether the failure is attributable to the
+          // sandbox, so the model learns what was blocked and that escalation
+          // exists instead of blindly retrying. Attribution is precise on macOS
+          // (violation log) and heuristic on Linux; a missed match just means
+          // no note.
+          if (sandboxWrapped && !timedOut && code !== null && code !== 0) {
+            let denial: SandboxDenial | null = null;
+            try {
+              denial = config.sandbox?.classifyFailure?.({
+                command: fullCommand,
+                exitCode: code,
+                stderr,
+                stdout: cleanedOutput,
+              }) ?? null;
+            } catch {
+              // Attribution is advisory; never let it break the result.
+            }
+            if (denial) {
+              text += `\n[This command ran inside the OS sandbox and the failure looks like a sandbox denial (${denial.dimension}): ${denial.detail}.`;
+              if (denial.escalatable) {
+                text += ' If it genuinely needs the blocked access, you may re-run it with escalateOutsideSandbox: true to request running this ONE command outside the sandbox; the user must approve.';
+              }
+              text += ']';
+            }
           }
 
           resolve({

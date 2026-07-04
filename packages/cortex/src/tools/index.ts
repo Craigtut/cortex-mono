@@ -55,7 +55,13 @@ export { createGrepTool } from './grep.js';
 export type { GrepToolConfig, GrepDetails, GrepParamsType } from './grep.js';
 export { GrepParams } from './grep.js';
 
-export { createBashTool, getBackgroundTask, getAllBackgroundTasks } from './bash/index.js';
+export {
+  createBashTool,
+  getBackgroundTask,
+  getAllBackgroundTasks,
+  BASH_ESCALATION_PERMISSION_NAME,
+  isBashEscalationRequest,
+} from './bash/index.js';
 export type { BashToolConfig, BashDetails, BashStreamUpdate, BashParamsType } from './bash/index.js';
 export { BashParams } from './bash/index.js';
 

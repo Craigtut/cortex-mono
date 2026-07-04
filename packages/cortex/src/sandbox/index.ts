@@ -16,6 +16,7 @@ export type {
   SandboxSpawnSpec,
   WrappedSpawn,
   SandboxDenial,
+  SandboxCommandFailure,
   SandboxProvider,
   NetworkAccessRequest,
   NetworkAccessScope,
