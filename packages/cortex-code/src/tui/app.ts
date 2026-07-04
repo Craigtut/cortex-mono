@@ -8,9 +8,12 @@ import { CustomEditor, type CustomEditorCallbacks } from './editor.js';
 import { StatusBar, type StatusBarState } from './status.js';
 import { TranscriptManager } from './transcript.js';
 import { PermissionPromptComponent, type PermissionResult } from './permissions.js';
+import { NetworkPromptComponent } from './network-prompt.js';
 import { StatusSpinner } from './spinner.js';
 import { editorTheme } from './theme.js';
 import type { FreezeDiagnostics } from '../diagnostics/freeze.js';
+import type { NetworkAccessRequest } from '@animus-labs/cortex';
+import type { NetworkPromptChoice } from '../permissions/network.js';
 import { log } from '../logger.js';
 
 export interface AppCallbacks {
@@ -185,6 +188,36 @@ export class App {
       // out-of-band. The first of the inline prompt or the external decision
       // wins; the settle guard cleans up the prompt either way.
       externalDecision?.then((decision) => finish({ decision })).catch(() => {});
+    });
+  }
+
+  /**
+   * Show the unified network access prompt (shared by sandboxed shell egress
+   * and WebFetch) and wait for the user's choice. The session layer serializes
+   * these with tool permission prompts through the same lock.
+   */
+  showNetworkPrompt(
+    req: NetworkAccessRequest,
+    externalDecision?: Promise<'allow' | 'deny'>,
+  ): Promise<NetworkPromptChoice> {
+    return new Promise<NetworkPromptChoice>((resolve) => {
+      let settled = false;
+      let prompt!: NetworkPromptComponent;
+      const finish = (choice: NetworkPromptChoice) => {
+        if (settled) return;
+        settled = true;
+        this.transcript.removePermissionPrompt(prompt);
+        this.editor.activePermissionPrompt = null;
+        resolve(choice);
+      };
+
+      prompt = new NetworkPromptComponent(req, finish);
+      this.transcript.addPermissionPrompt(prompt);
+      this.editor.activePermissionPrompt = prompt;
+
+      // An out-of-band decision (companion app) can answer first. It carries
+      // no scope, so an external allow is applied to this request only.
+      externalDecision?.then((decision) => finish(decision === 'allow' ? 'once' : 'deny')).catch(() => {});
     });
   }
 

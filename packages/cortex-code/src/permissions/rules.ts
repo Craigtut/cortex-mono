@@ -33,6 +33,26 @@ interface PermissionRuleManagerOptions {
 }
 
 /**
+ * Stable per-workspace settings file path (keyed by a hash of the realpathed
+ * cwd). Shared by every store that persists workspace-scoped settings (the
+ * permission rules and the network domain grants), so they read and write the
+ * same file, each owning its own top-level key.
+ */
+export function workspaceSettingsPath(
+  cwd: string,
+  configDir: string = join(homedir(), '.cortex'),
+): string {
+  let realCwd = cwd;
+  try {
+    realCwd = realpathSync(cwd);
+  } catch {
+    // Fall back to the provided cwd if the workspace disappears mid-startup.
+  }
+  const workspaceId = createHash('sha256').update(realCwd).digest('hex');
+  return join(configDir, 'workspaces', workspaceId, 'settings.json');
+}
+
+/**
  * Match a glob-like pattern against a string.
  * Supports only trailing wildcards: "git *" matches "git push origin main".
  */
@@ -156,8 +176,7 @@ export class PermissionRuleManager {
   constructor(cwd: string, options: PermissionRuleManagerOptions = {}) {
     this.cwd = cwd;
     const configDir = options.configDir ?? join(homedir(), '.cortex');
-    const workspaceId = this.workspaceId(cwd);
-    this.workspaceSettingsPath = join(configDir, 'workspaces', workspaceId, 'settings.json');
+    this.workspaceSettingsPath = workspaceSettingsPath(cwd, configDir);
     this.userSettingsPath = join(configDir, 'settings.json');
   }
 
@@ -381,16 +400,6 @@ export class PermissionRuleManager {
         await this.persistRules(this.userSettingsPath, this.userRules);
         break;
     }
-  }
-
-  private workspaceId(cwd: string): string {
-    let realCwd = cwd;
-    try {
-      realCwd = realpathSync(cwd);
-    } catch {
-      // Fall back to the provided cwd if the workspace disappears mid-startup.
-    }
-    return createHash('sha256').update(realCwd).digest('hex');
   }
 
   /** Get all rules for display purposes. */

@@ -15,7 +15,7 @@ import './renderers/glob-renderer.js';
 import './renderers/web-fetch-renderer.js';
 import './renderers/sub-agent-renderer.js';
 import './renderers/task-output-renderer.js';
-import type { PermissionPromptComponent } from './permissions.js';
+import type { InlinePromptComponent } from './permissions.js';
 import type { FreezeDiagnostics } from '../diagnostics/freeze.js';
 
 /**
@@ -417,15 +417,15 @@ export class TranscriptManager {
     this.immediateRender();
   }
 
-  /** Add a permission prompt inline in the transcript. */
-  addPermissionPrompt(prompt: PermissionPromptComponent): void {
+  /** Add an inline prompt (tool permission or network access) to the transcript. */
+  addPermissionPrompt(prompt: InlinePromptComponent): void {
     this.closeActiveToolGroups();
     this.chatContainer.addChild(prompt);
     this.diagnostics?.recordTranscriptMutation('permission_prompt_added');
   }
 
-  /** Remove a permission prompt after the user has decided. */
-  removePermissionPrompt(prompt: PermissionPromptComponent): void {
+  /** Remove an inline prompt after the user has decided. */
+  removePermissionPrompt(prompt: InlinePromptComponent): void {
     this.chatContainer.removeChild(prompt);
     this.diagnostics?.recordTranscriptMutation('permission_prompt_removed');
   }

@@ -130,4 +130,33 @@ describe('preflightPermission', () => {
     );
     expect(out.decision).toBe('prompt');
   });
+
+  it('network-gated WebFetch auto-runs (the per-host gate is the control)', async () => {
+    const promptOut = await preflightPermission('WebFetch', { url: 'https://example.com/' }, deps());
+    expect(promptOut.decision).toBe('prompt');
+    const allowOut = await preflightPermission(
+      'WebFetch',
+      { url: 'https://example.com/' },
+      deps({ webFetchNetworkGated: true }),
+    );
+    expect(allowOut.decision).toBe('allow');
+  });
+
+  it('network-gated WebFetch still honors an explicit deny rule', async () => {
+    const out = await preflightPermission(
+      'WebFetch',
+      { url: 'https://example.com/' },
+      deps({ webFetchNetworkGated: true, matchRule: async () => 'deny' }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('the WebFetch gate flag does not auto-allow other tools', async () => {
+    const out = await preflightPermission(
+      'Bash',
+      { command: 'npm test' },
+      deps({ webFetchNetworkGated: true }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
 });

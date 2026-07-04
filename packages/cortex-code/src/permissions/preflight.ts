@@ -22,6 +22,13 @@ export interface PreflightDeps {
    * then auto-runs inside the boundary instead of prompting.
    */
   sandboxBashEnforced?: boolean;
+  /**
+   * True when the unified network policy gates WebFetch in-process (an active
+   * sandbox policy projects into the tool). The per-host network decision is
+   * then the control, so the per-call tool prompt would be a second ask for
+   * the same question and is skipped. Deny rules still block above.
+   */
+  webFetchNetworkGated?: boolean;
 }
 
 /**
@@ -67,6 +74,11 @@ export async function preflightPermission(
   //     Rules are allow/deny only today; if an "ask every time" rule type is
   //     added, reorder so this fires only when the engine did not request a prompt.
   if (deps.sandboxBashEnforced && toolName === 'Bash') return { decision: 'allow' };
+
+  // 3c. Same shape for WebFetch: when the network policy gates each fetch by
+  //     host (one decision shared with shell egress), that gate is the control
+  //     and the tool call itself auto-runs.
+  if (deps.webFetchNetworkGated && toolName === 'WebFetch') return { decision: 'allow' };
 
   // 4. Read-only tools contained in the workspace auto-approve.
   if (await deps.isReadOnlyInProject(toolName, toolArgs)) return { decision: 'allow' };

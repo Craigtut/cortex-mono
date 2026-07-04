@@ -68,7 +68,18 @@ import { AVAILABLE_MODES } from './modes/index.js';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { SandboxRuntimeProvider, buildDefaultPolicy } from '@animus-labs/cortex-sandbox';
-import type { SandboxStatus } from '@animus-labs/cortex';
+import type {
+  SandboxStatus,
+  SandboxPolicy,
+  NetworkAccessRequest,
+  NetworkAccessDecision,
+} from '@animus-labs/cortex';
+import {
+  NetworkAccessController,
+  NetworkGrantStore,
+  type NetworkPromptChoice,
+} from './permissions/network.js';
+import { workspaceSettingsPath } from './permissions/rules.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { log } from './logger.js';
@@ -113,6 +124,14 @@ export class Session {
   private agent: CortexAgent | null = null;
   private sandboxProvider: SandboxRuntimeProvider | undefined;
   private sandboxStatus: SandboxStatus | undefined;
+  /**
+   * The policy handed to the provider. Kept even when OS enforcement is
+   * degraded or failed: it still projects into in-process egress (WebFetch),
+   * so the rung's network intent holds policy-only where the OS cannot.
+   */
+  private sandboxPolicy: SandboxPolicy | undefined;
+  private readonly networkGrants: NetworkGrantStore;
+  private readonly networkAccess: NetworkAccessController;
   private app: App | null = null;
   private rules: PermissionRuleManager;
   private yoloMode: boolean;
@@ -186,6 +205,12 @@ export class Session {
     this.preferredEffort = options.initialEffort;
     this.effectiveEffort = this.preferredEffort;
     this.rules = new PermissionRuleManager(options.cwd);
+    this.networkGrants = new NetworkGrantStore(workspaceSettingsPath(options.cwd));
+    this.networkAccess = new NetworkAccessController({
+      getPolicy: () => this.sandboxPolicy?.network,
+      prompt: (req) => this.promptNetworkAccess(req),
+      store: this.networkGrants,
+    });
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.isResume = options.resumeSessionId !== undefined;
     this.saver = createDebouncedSaver(this.sessionId);
@@ -223,8 +248,9 @@ export class Session {
     // Register commands
     registerBuiltinCommands();
 
-    // Load persisted permission rules
+    // Load persisted permission rules and network domain grants
     await this.rules.loadPersistedRules();
+    await this.networkGrants.load();
 
     // Create TUI
     const callbacks: AppCallbacks = {
@@ -247,6 +273,9 @@ export class Session {
       initialBasePrompt: this.mode.systemPrompt,
       slots: this.mode.contextSlots,
       resolvePermission: (toolName, toolArgs) => this.resolvePermission(toolName, toolArgs),
+      // WebFetch's egress gate: the same decision function the sandbox egress
+      // proxy consults for shell commands, so one grant covers both paths.
+      resolveNetworkAccess: (req) => this.resolveNetworkAccess(req),
       isAutoApprove: () => this.yoloMode,
       ...(this.sandboxProvider ? { sandbox: this.sandboxProvider } : {}),
       getApiKey: (provider) => this.getApiKey(provider),
@@ -1267,6 +1296,14 @@ export class Session {
     try {
       const provider = new SandboxRuntimeProvider({
         onDegraded: (degradations) => log.warn('Sandbox enforcement reduced', { degradations }),
+        // Shell egress to a host outside the allowlist asks the same unified
+        // decision function WebFetch uses, so one grant covers both paths.
+        onNetworkRequest: (r) =>
+          this.resolveNetworkAccess({
+            host: r.host,
+            port: r.port,
+            via: 'shell',
+          }).then((d) => d.decision === 'allow'),
       });
       const cortexHome = path.join(homedir(), '.cortex');
       const policy = buildDefaultPolicy(rung, {
@@ -1278,6 +1315,10 @@ export class Session {
         extraDenyRead: [path.join(cortexHome, 'credentials.json')],
         ...(sb?.allowedDomains ? { extraAllowedDomains: sb.allowedDomains } : {}),
       });
+
+      // Record the policy before initialize: even if OS enforcement fails, the
+      // policy still gates in-process egress (WebFetch) at the app level.
+      this.sandboxPolicy = policy;
 
       const status = await provider.initialize(policy);
       this.sandboxStatus = status;
@@ -1331,6 +1372,11 @@ export class Session {
       sandboxBashEnforced:
         this.sandboxStatus?.filesystem === 'enforced' &&
         this.sandboxStatus?.network === 'enforced',
+      // With an active sandbox policy, WebFetch is gated per host by the same
+      // network decision as shell egress; that gate replaces the per-call tool
+      // prompt. Purely policy-level, so it applies even where OS enforcement
+      // is degraded (the gate runs in-process).
+      webFetchNetworkGated: this.sandboxPolicy !== undefined,
     };
 
     // Fast path: deterministic decision (catastrophic floor > yolo > deny rule
@@ -1398,6 +1444,67 @@ export class Session {
     } finally {
       externalController.abort();
       await this.activity.recordPermissionResolved(permission.id, toolName, permissionResolution);
+      const release = this.permissionLockRelease;
+      this.permissionLockPromise = null;
+      this.permissionLockRelease = null;
+      release?.();
+    }
+  }
+
+  /**
+   * The single network egress decision, shared by sandboxed shell commands
+   * (the provider's ask-callback) and WebFetch (Cortex's resolveNetworkAccess
+   * seam). Auto-allows the seeded registry allowlist and prior grants;
+   * otherwise prompts once per host with once/session/always scope.
+   */
+  private resolveNetworkAccess(req: NetworkAccessRequest): Promise<NetworkAccessDecision> {
+    return this.networkAccess.resolve(req);
+  }
+
+  /**
+   * Show the unified network prompt, serialized with tool permission prompts
+   * through the same lock so shell and WebFetch asks never overlap. Recorded
+   * in the activity stream so a companion app can answer out-of-band.
+   */
+  private async promptNetworkAccess(req: NetworkAccessRequest): Promise<NetworkPromptChoice> {
+    // Yolo mode never prompts. Allow this request only (no lasting grant);
+    // deniedDomains and the restricted rung are enforced before we get here.
+    if (this.yoloMode) return 'once';
+    if (!this.app) return 'deny';
+
+    // Serialize: wait for any active permission or network prompt to finish.
+    while (this.permissionLockPromise) {
+      await this.permissionLockPromise;
+    }
+    this.permissionLockPromise = new Promise<void>((resolve) => {
+      this.permissionLockRelease = resolve;
+    });
+
+    const permission = this.activity.recordPermissionRequested('NetworkAccess', {
+      host: req.host,
+      via: req.via,
+      ...(req.url ? { url: req.url } : {}),
+    });
+    await permission.written;
+    let permissionResolution: PermissionResolution = 'denied';
+
+    const externalController = new AbortController();
+    const externalDecision = watchDecisionFile(
+      this.activity.decisionPath(permission.id),
+      externalController.signal,
+    );
+
+    try {
+      const choice = await this.app.showNetworkPrompt(req, externalDecision);
+      permissionResolution = choice === 'deny' ? 'denied' : 'allowed';
+      return choice;
+    } catch (error) {
+      permissionResolution = 'error';
+      void this.activity.recordError(error instanceof Error ? error : String(error));
+      throw error;
+    } finally {
+      externalController.abort();
+      await this.activity.recordPermissionResolved(permission.id, 'NetworkAccess', permissionResolution);
       const release = this.permissionLockRelease;
       this.permissionLockPromise = null;
       this.permissionLockRelease = null;

@@ -11,6 +11,15 @@ export interface PermissionResult {
   scope?: 'session' | 'project' | 'user' | 'project-edits';
 }
 
+/**
+ * Structural contract for inline prompts that capture editor input while
+ * active (tool permission, network access). The editor routes keystrokes to
+ * whichever prompt is active; the transcript hosts it inline.
+ */
+export interface InlinePromptComponent extends Component {
+  handleInput(data: string): void;
+}
+
 type PermissionCallback = (result: PermissionResult) => void;
 
 /**
