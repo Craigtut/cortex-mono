@@ -45,6 +45,17 @@ export interface PreflightDeps {
    */
   sandboxDenyWrite?: readonly string[];
   sandboxDenyRead?: readonly string[];
+  /**
+   * The active sandbox policy's writableRoots (absolute paths), projected onto
+   * the in-process write tools as a POSITIVE floor. The OS sandbox confines a
+   * shell to write only inside these roots (an allowlist), but Write/Edit/
+   * UndoEdit run in-process on fs and would auto-approve a write to any path a
+   * denylist did not enumerate. This mirrors the shell's confinement: a write
+   * whose resolved target lands outside every root leaves the workspace, so it
+   * must not auto-approve. Present only when a policy is active; absent when the
+   * sandbox is off, leaving in-process write behavior unchanged.
+   */
+  sandboxWritableRoots?: readonly string[];
 }
 
 const IN_PROCESS_WRITE_TOOLS = new Set(['Write', 'Edit', 'UndoEdit']);
@@ -101,6 +112,26 @@ function targetsProtectedPath(candidates: string[], protectedPaths: readonly str
     }
   }
   return false;
+}
+
+/**
+ * True only when EVERY symlink-resolved form of the target sits at or under some
+ * writable root. Mirrors targetsProtectedPath's walk (at-or-under with the path
+ * separator, case-folded on case-insensitive filesystems) but with "within"
+ * semantics: if any candidate escapes every root, the write leaves the workspace.
+ * That is what catches a workspace symlink whose real target is outside, the
+ * lexical form looks contained while the realpath candidate does not. Roots are
+ * canonicalized too, so a symlinked workspace root (/workspace -> /private/...)
+ * still contains its own files.
+ */
+function isWithinWritableRoots(candidates: string[], roots: readonly string[]): boolean {
+  const resolvedRoots = roots.flatMap((r) => [r, canonSync(r)]).map(foldPathCase);
+  for (const c of candidates) {
+    const cf = foldPathCase(c);
+    const within = resolvedRoots.some((r) => cf === r || cf.startsWith(r + sep));
+    if (!within) return false;
+  }
+  return true;
 }
 
 /**
@@ -161,6 +192,7 @@ function sandboxPolicyFileDenial(
  *   1. Catastrophic Bash command  -> block   (never overridable; covers escalation too)
  *   1b. Write to Cortex config    -> block   (never overridable)
  *   1c. Sandbox policy deny path  -> block   (in-process file tool on a denyWrite/denyRead path)
+ *   1c-bis. Write outside roots   -> rule|prompt (in-process write leaving the writable roots)
  *   1d. Sandbox escalation        -> prompt  (Bash deny rules still block; nothing auto-approves)
  *   2. Yolo mode                  -> allow
  *   3. Explicit deny rule         -> block   (beats the read-only auto-approve)
@@ -205,6 +237,32 @@ export async function preflightPermission(
   //     are resolved, so a workspace link into ~/.zshrc does not slip through.
   const policyDenial = sandboxPolicyFileDenial(toolName, toolArgs, deps);
   if (policyDenial) return { decision: 'block', reason: policyDenial };
+
+  // 1c-bis. Positive write floor: the sandboxed shell may write ONLY inside the
+  //     policy's writableRoots (an allowlist), but the in-process write tools run
+  //     on fs and a denylist (1c) cannot enumerate every dangerous target outside
+  //     the workspace (~/.local/bin on PATH, ~/.claude hooks, cron dirs). So a
+  //     write whose resolved target escapes every writable root is treated like
+  //     the shell could never make it: it must NOT ride yolo (2) or the read-only
+  //     shortcut (4). It still yields to the deny/config/catastrophic floors above.
+  //     Require a real decision: an explicit deny blocks, an explicit allow rule
+  //     for that path is honored, otherwise prompt. Symlinks are resolved first,
+  //     so a workspace link whose real target is outside counts as outside.
+  //     No-op when the sandbox is off (no writableRoots) and for in-workspace
+  //     writes, which fall through to the normal flow (yolo may still allow them).
+  const writableRoots = deps.sandboxWritableRoots ?? [];
+  if (writableRoots.length > 0 && IN_PROCESS_WRITE_TOOLS.has(toolName)) {
+    const target = fileToolTarget(toolArgs);
+    if (target) {
+      const candidates = resolvedTargetCandidates(target, deps.cwd);
+      if (!isWithinWritableRoots(candidates, writableRoots)) {
+        const rule = await deps.matchRule(toolName, toolArgs);
+        if (rule === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
+        if (rule === 'allow') return { decision: 'allow' };
+        return { decision: 'prompt' };
+      }
+    }
+  }
 
   // 1d. Sandbox escalation: the model asking to run ONE command outside the OS
   //     boundary. A deliberate exit from containment, so it is always a fresh

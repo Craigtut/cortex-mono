@@ -391,3 +391,110 @@ describe('preflightPermission: sandbox policy projection onto in-process file to
     }
   });
 });
+
+describe('preflightPermission: positive writableRoots write floor', () => {
+  const floorDeps = (overrides: Partial<PreflightDeps> = {}): PreflightDeps =>
+    deps({ sandboxWritableRoots: ['/workspace'], ...overrides });
+
+  it('prompts on an out-of-workspace in-process Write even in yolo mode', async () => {
+    // ~/.local/bin is on PATH; the sandboxed shell could never write there, so
+    // the in-process Write must not ride yolo's auto-approve either.
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.local/bin/evil' },
+      floorDeps({ yoloMode: true }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
+
+  it('lets yolo auto-approve an in-workspace Write (floor is a no-op inside roots)', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/workspace/src/x.ts' },
+      floorDeps({ yoloMode: true }),
+    );
+    expect(out.decision).toBe('allow');
+  });
+
+  it('honors an explicit allow rule for an out-of-workspace Write', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/notes.txt' },
+      floorDeps({ matchRule: async () => 'allow' }),
+    );
+    expect(out.decision).toBe('allow');
+  });
+
+  it('blocks an out-of-workspace Write under an explicit deny rule', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/notes.txt' },
+      floorDeps({ matchRule: async () => 'deny' }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('is a no-op when the sandbox is off (no writableRoots): yolo still allows', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.local/bin/evil' },
+      deps({ yoloMode: true }),
+    );
+    expect(out.decision).toBe('allow');
+  });
+
+  it('yields to the config floor for an out-of-roots Write to ~/.cortex', async () => {
+    // 1b (config floor) sits above the write floor, so this blocks rather than
+    // prompts even though the target is also outside the writable roots.
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.cortex/settings.json' },
+      floorDeps({ yoloMode: true, home: '/home/user' }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('yields to the deny projection for an out-of-roots Write to a denyWrite path', async () => {
+    // 1c (deny projection) sits above the write floor; the reason is the
+    // write-protected message, not the generic prompt.
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.zshrc' },
+      floorDeps({ yoloMode: true, sandboxDenyWrite: ['/home/user/.zshrc'] }),
+    );
+    expect(out.decision).toBe('block');
+    if (out.decision === 'block') expect(out.reason).toContain('write-protected');
+  });
+
+  it('prompts on a Write through an in-workspace symlink whose real target is outside the roots', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-floor-symlink-'));
+    const ws = path.join(tmp, 'ws');
+    const outside = path.join(tmp, 'outside');
+    fs.mkdirSync(ws, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    const realTarget = path.join(outside, 'grabbed.txt');
+    fs.writeFileSync(realTarget, 'x\n');
+    // The link file sits in the workspace but points outside the writable root.
+    const link = path.join(ws, 'notes.txt');
+    fs.symlinkSync(realTarget, link);
+    try {
+      const out = await preflightPermission(
+        'Write',
+        { file_path: link },
+        floorDeps({ yoloMode: true, cwd: ws, sandboxWritableRoots: [ws] }),
+      );
+      expect(out.decision).toBe('prompt');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('never applies the write floor to Bash (the OS boundary is Bash\'s control)', async () => {
+    const out = await preflightPermission(
+      'Bash',
+      { command: 'echo hi > /home/user/outside.txt' },
+      floorDeps({ yoloMode: true }),
+    );
+    expect(out.decision).toBe('allow');
+  });
+});

@@ -1547,11 +1547,14 @@ export class Session {
       webFetchNetworkGated: this.sandboxPolicy !== undefined,
       // Project the policy's filesystem deny sets onto the in-process file
       // tools (Write/Edit/UndoEdit/Read), which bypass the OS boundary the
-      // shell is contained by. Absent when the sandbox is off.
+      // shell is contained by. writableRoots is the positive floor: the shell
+      // may write only inside it, so an in-process write escaping it must not
+      // auto-approve either. Absent when the sandbox is off.
       ...(this.sandboxPolicy
         ? {
             sandboxDenyWrite: this.sandboxPolicy.filesystem.denyWrite,
             sandboxDenyRead: this.sandboxPolicy.filesystem.denyRead,
+            sandboxWritableRoots: this.sandboxPolicy.filesystem.writableRoots,
           }
         : {}),
     };
