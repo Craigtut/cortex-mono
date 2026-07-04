@@ -322,6 +322,11 @@ function handleFatalCrash(kind: string, err: unknown): void {
   } catch {
     // Best-effort terminal restore; never mask the original crash.
   }
+  // Sweep the per-session sandbox temp dir so a crash does not leak it. The OS
+  // reclaims the sandbox boundary itself when the process dies; only this
+  // writable temp dir needs an explicit, synchronous best-effort removal. Never
+  // throws, so crash semantics below (exit non-zero) are preserved.
+  activeSession?.removeSessionTmpDir();
   console.error(`Fatal ${kind}:`, err instanceof Error ? (err.stack ?? err.message) : String(err));
   process.exit(1);
 }
@@ -332,6 +337,7 @@ process.on('unhandledRejection', (reason) => handleFatalCrash('rejection', reaso
 // Run
 main().catch((err) => {
   activeSession?.restoreTerminal();
+  activeSession?.removeSessionTmpDir();
   console.error('Fatal error:', err instanceof Error ? err.message : String(err));
   process.exit(1);
 });
