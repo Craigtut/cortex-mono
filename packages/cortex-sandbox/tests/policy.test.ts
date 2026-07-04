@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildDefaultPolicy,
+  matchesDomainPattern,
+  matchesAnyDomainPattern,
   SEEDED_REGISTRY_DOMAINS,
   DEFAULT_CREDENTIAL_ENV_VARS,
 } from '../src/policy.js';
@@ -64,5 +66,39 @@ describe('buildDefaultPolicy', () => {
     expect(DEFAULT_CREDENTIAL_ENV_VARS).toContain('GITHUB_TOKEN');
     expect(DEFAULT_CREDENTIAL_ENV_VARS).toContain('AWS_SECRET_ACCESS_KEY');
     expect(DEFAULT_CREDENTIAL_ENV_VARS).toContain('ANTHROPIC_API_KEY');
+  });
+});
+
+// Mirrors sandbox-runtime's proxy matcher; both egress paths (OS proxy for
+// shell, this matcher for WebFetch) must agree on what an allowlist entry means.
+describe('matchesDomainPattern', () => {
+  it('matches exactly, case-insensitively', () => {
+    expect(matchesDomainPattern('GitHub.com', 'github.com')).toBe(true);
+    expect(matchesDomainPattern('github.com', 'GitHub.com')).toBe(true);
+    expect(matchesDomainPattern('notgithub.com', 'github.com')).toBe(false);
+  });
+
+  it('wildcard matches strict subdomains only', () => {
+    expect(matchesDomainPattern('api.github.com', '*.github.com')).toBe(true);
+    expect(matchesDomainPattern('deep.api.github.com', '*.github.com')).toBe(true);
+    expect(matchesDomainPattern('github.com', '*.github.com')).toBe(false);
+    expect(matchesDomainPattern('evilgithub.com', '*.github.com')).toBe(false);
+  });
+
+  it('bare * matches everything', () => {
+    expect(matchesDomainPattern('anything.example', '*')).toBe(true);
+  });
+
+  it('wildcards never match IP literals', () => {
+    expect(matchesDomainPattern('1.2.3.4', '*.3.4')).toBe(false);
+    expect(matchesDomainPattern('[2001:db8::1]', '*.db8::1')).toBe(false);
+    // exact IP entries still match
+    expect(matchesDomainPattern('1.2.3.4', '1.2.3.4')).toBe(true);
+  });
+
+  it('matchesAnyDomainPattern walks a list', () => {
+    expect(matchesAnyDomainPattern('registry.npmjs.org', SEEDED_REGISTRY_DOMAINS)).toBe(true);
+    expect(matchesAnyDomainPattern('files.pythonhosted.org', SEEDED_REGISTRY_DOMAINS)).toBe(true);
+    expect(matchesAnyDomainPattern('evil.example.com', SEEDED_REGISTRY_DOMAINS)).toBe(false);
   });
 });

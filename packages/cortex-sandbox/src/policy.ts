@@ -6,6 +6,7 @@
  * by the consumer via the extra* options, not hardcoded here.
  */
 import * as fs from 'node:fs';
+import { isIP } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SandboxPolicy, SandboxRung } from '@animus-labs/cortex';
@@ -87,6 +88,34 @@ export const SEEDED_REGISTRY_DOMAINS: readonly string[] = [
   'archive.ubuntu.com',
   'security.ubuntu.com',
 ];
+
+/**
+ * Match a hostname against one domain pattern, with the same semantics as
+ * sandbox-runtime's egress proxy (its matcher is not exported, so this mirrors
+ * it; keep the two in agreement when bumping the pinned version):
+ *   - `*` matches everything.
+ *   - `*.example.com` matches strict subdomains only (not example.com itself).
+ *     Wildcards never match IP literals, so an address cannot ride a suffix.
+ *   - Anything else matches exactly, case-insensitively.
+ *
+ * Consumers use this to answer the shared egress decision for in-process
+ * paths (WebFetch) identically to how the OS proxy answers it for shell
+ * commands, so one allowlist gives one behavior on both paths.
+ */
+export function matchesDomainPattern(hostname: string, pattern: string): boolean {
+  const h = hostname.toLowerCase();
+  if (pattern === '*') return true;
+  if (pattern.startsWith('*.')) {
+    if (isIP(h.replace(/^\[|\]$/g, ''))) return false;
+    return h.endsWith('.' + pattern.slice(2).toLowerCase());
+  }
+  return h === pattern.toLowerCase();
+}
+
+/** True when the hostname matches any pattern in the list. */
+export function matchesAnyDomainPattern(hostname: string, patterns: readonly string[]): boolean {
+  return patterns.some((p) => matchesDomainPattern(hostname, p));
+}
 
 /** Secret stores denied for reading on every contained rung. */
 export function defaultSecretReadDenies(home: string): string[] {

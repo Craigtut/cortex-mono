@@ -16,6 +16,8 @@ export {
   buildDefaultPolicy,
   defaultSecretReadDenies,
   defaultDangerousWriteDenies,
+  matchesDomainPattern,
+  matchesAnyDomainPattern,
   SEEDED_REGISTRY_DOMAINS,
 } from './policy.js';
 export type { DefaultPolicyOptions } from './policy.js';
