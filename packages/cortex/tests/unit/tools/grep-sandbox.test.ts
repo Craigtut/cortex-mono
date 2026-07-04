@@ -6,6 +6,7 @@ import { createGrepTool } from '../../../src/tools/grep.js';
 import type {
   SandboxProvider,
   SandboxExecSpec,
+  SandboxStatus,
   WrappedSpawn,
 } from '../../../src/sandbox/types.js';
 
@@ -38,6 +39,43 @@ function makeRecordingProvider(overrides?: {
 
 const readText = (result: { content: Array<{ type: string }> }): string =>
   (result.content[0] as { type: 'text'; text: string }).text;
+
+const ENFORCED: SandboxStatus = {
+  filesystem: 'enforced',
+  network: 'enforced',
+  backend: 'seatbelt',
+  degradations: [],
+};
+const NONE: SandboxStatus = {
+  filesystem: 'none',
+  network: 'none',
+  backend: 'none',
+  degradations: [],
+};
+
+/**
+ * A provider whose wrapExec maps every invocation to a process that exits 2 with
+ * empty stdout, exactly how Seatbelt/bwrap surface a denied read to ripgrep.
+ * `process.execPath` keeps it cross-platform. `status` sets the reported
+ * enforcement so a test can pick contained vs uncontained behavior.
+ */
+function denyingProvider(status: SandboxStatus): SandboxProvider {
+  return {
+    async initialize() {
+      return status;
+    },
+    status() {
+      return status;
+    },
+    async wrapSpawn(spec) {
+      return { file: spec.shell, args: [...spec.shellArgs, spec.command], env: spec.env };
+    },
+    async wrapExec(spec: SandboxExecSpec): Promise<WrappedSpawn> {
+      return { file: process.execPath, args: ['-e', 'process.exit(2)'], env: spec.env };
+    },
+    async dispose() {},
+  };
+}
 
 describe('Grep tool sandbox routing', () => {
   let tmpDir: string;
@@ -118,5 +156,43 @@ describe('Grep tool sandbox routing', () => {
     const text = readText(result);
     expect(text).toContain('match.ts');
     expect(result.details.usingFallback).toBe(false);
+  });
+
+  it('does not fall back to an in-process read when a sandboxed ripgrep read is denied', async () => {
+    // The regression this guards: a kernel-denied ripgrep read (exit 2) used to
+    // throw, the tool swallowed it, and the pure-JS fallback then fs.readFile'd
+    // the same path uncontained, returning the secret the sandbox just blocked.
+    const secret = path.join(tmpDir, 'credentials');
+    fs.writeFileSync(secret, 'aws_secret = SUPERSECRET_AKIA_DO_NOT_LEAK\n');
+
+    const grep = createGrepTool({ defaultCwd: tmpDir, sandbox: denyingProvider(ENFORCED) });
+    const result = await grep.execute({
+      pattern: 'SUPERSECRET_AKIA_DO_NOT_LEAK',
+      path: secret,
+      output_mode: 'content',
+    });
+
+    const text = readText(result);
+    expect(text).not.toContain('SUPERSECRET_AKIA_DO_NOT_LEAK'); // the secret never leaks
+    expect(result.details.usingFallback).toBe(false); // the in-process JS path never ran
+  });
+
+  it('still falls back to JS on a ripgrep failure when filesystem is not enforced', async () => {
+    // Guard the other direction: without filesystem enforcement, a ripgrep
+    // failure must still fall back to the JS engine (the resilience the fix
+    // disables only under containment).
+    const file = path.join(tmpDir, 'notes.txt');
+    fs.writeFileSync(file, 'token FINDME_UNCONTAINED here\n');
+
+    const grep = createGrepTool({ defaultCwd: tmpDir, sandbox: denyingProvider(NONE) });
+    const result = await grep.execute({
+      pattern: 'FINDME_UNCONTAINED',
+      path: file,
+      output_mode: 'content',
+    });
+
+    const text = readText(result);
+    expect(text).toContain('FINDME_UNCONTAINED'); // JS fallback read the file and matched
+    expect(result.details.usingFallback).toBe(true);
   });
 });

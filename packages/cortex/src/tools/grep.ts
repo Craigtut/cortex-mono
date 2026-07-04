@@ -172,6 +172,20 @@ function getRipgrepPath(): string | false {
 // ---------------------------------------------------------------------------
 
 /**
+ * True when the sandbox is enforcing filesystem containment, so an in-process
+ * read (the JS fallback) would bypass the OS boundary. Under it, Grep must never
+ * fall back to fs: a ripgrep read the kernel denied (rg exit 2) must not be
+ * retried in-process, or the fallback hands the model the very secret the sandbox
+ * blocked. A provider that reports status is trusted (`none` => not enforcing); a
+ * provider with wrapExec but no status() is assumed enforcing (fail safe).
+ */
+function sandboxEnforcesFilesystem(sandbox?: SandboxProvider | undefined): boolean {
+  if (!sandbox) return false;
+  const fs = sandbox.status?.().filesystem;
+  return fs === undefined ? !!sandbox.wrapExec : fs !== 'none';
+}
+
+/**
  * Execute ripgrep and return the output lines.
  *
  * When a sandbox provider with wrapExec is supplied, the ripgrep spawn is
@@ -188,6 +202,7 @@ async function execRipgrep(
   const rgPath = getRipgrepPath();
   if (!rgPath) throw new Error('rg binary not available');
 
+  const contained = sandboxEnforcesFilesystem(sandbox);
   let file = rgPath;
   let execArgs = args;
   // Undefined env keeps the unsandboxed path byte-identical to before (execFile
@@ -218,10 +233,22 @@ async function execRipgrep(
       },
       (error, stdout) => {
         if (error) {
-          // rg exits with code 1 when no matches found (not an error)
           const exitCode = (error as { code?: number | string }).code;
+          // rg exits 1 when no matches are found (not an error).
           if (exitCode === 1) {
             resolve([]);
+            return;
+          }
+          // rg exits 2 when a path could not be read. Under an enforcing sandbox
+          // this is how a kernel-denied read surfaces, and rejecting here would
+          // let the caller fall back to an uncontained in-process read of that
+          // path. Instead resolve with only what rg could read (the denied bytes
+          // were never in stdout), so a denied target yields no matches, not a
+          // leak. When not contained, keep the old behavior (reject -> JS
+          // fallback) so an rg-syntax failure can still retry in JS.
+          if (exitCode === 2 && contained) {
+            const partial = stdout ? stdout.split('\n').filter(Boolean) : [];
+            resolve(partial);
             return;
           }
           reject(error);
@@ -802,17 +829,31 @@ export function createGrepTool(config: GrepToolConfig): {
     async execute(params: GrepParamsType): Promise<ToolContentDetails<GrepDetails>> {
       const searchPath = params.path ? path.resolve(params.path) : path.resolve(config.defaultCwd);
 
-      // Use bundled ripgrep as primary engine, fall back to pure JS
+      // The JS fallback (searchWithFallback -> fs.readFile) reads in-process and
+      // bypasses the OS sandbox. When the sandbox enforces filesystem
+      // containment, wrapped ripgrep is the ONLY search path we may take: falling
+      // back to fs would re-read a path the kernel just denied and hand the model
+      // the secret. So under containment we never fall back; we fail closed.
+      const contained = sandboxEnforcesFilesystem(config.sandbox);
+
+      // Bundled ripgrep is the primary engine; fall back to pure JS only when uncontained.
       if (getRipgrepPath()) {
         try {
           return await searchWithRipgrep(params, searchPath, config, respectGitignore);
-        } catch {
-          // rg failed (timeout, bad args, etc.), fall back to JS
+        } catch (err) {
+          if (contained) throw err; // fail closed: never read uncontained under the sandbox
+          // Uncontained: rg failed (timeout, bad args, etc.), fall back to JS.
         }
       }
 
+      if (contained) {
+        throw new Error(
+          'Grep is unavailable: the bundled ripgrep is required while the sandbox enforces filesystem containment',
+        );
+      }
       return searchWithFallback(params, searchPath, config, respectGitignore);
     },
+
   };
 }
 
