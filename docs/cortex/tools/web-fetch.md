@@ -64,6 +64,7 @@ When a URL redirects to a different host, the tool returns the redirect URL and 
 ### Security
 
 - Validate URLs: reject `file://`, `data://`, and private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+- Network policy gate: when the consumer configures `CortexAgentConfig.resolveNetworkAccess`, every fetch first asks that single egress decision function (the same one the OS sandbox proxy consults for shell commands; see [sandboxing](../sandboxing.md)). A deny returns "Blocked by network policy: {host} is not allowed" without touching the network; a resolver failure also fails closed. The SSRF/private-IP guard above is separate and always on: a private target stays blocked even when the host is allowed. Without the callback, behavior is unchanged.
 - Set a reasonable request timeout (30 seconds)
 - Set a User-Agent header identifying the bot
 - Will fail for authenticated/private URLs (Google Docs, Confluence, Jira). The system prompt should direct the model to use MCP tools for authenticated services if available.
@@ -86,6 +87,7 @@ Cortex enforces a per-loop rate limit on WebFetch calls to prevent the agent fro
 | SSL error | Return error in `content`: "SSL certificate error for {url}" |
 | Timeout (30s) | Return error in `content`: "Request timed out: {url}" |
 | URL validation failure | Return error in `content`: "URL rejected: {reason}" (private IP, file://, etc.) |
+| Network policy denial | Return error in `content`: "Blocked by network policy: {host} is not allowed. The user declined access or the active network policy denies this host." |
 | JavaScript-only page (no content after HTML strip) | Return in `content`: "The page appears to require JavaScript to render. No extractable content found." |
 | Rate limit exceeded | Return error in `content`: "WebFetch rate limit reached ({limit} per loop). Wait for the next loop or use Bash with curl for direct access." |
 

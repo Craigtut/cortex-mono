@@ -1,6 +1,6 @@
 # Sandboxing
 
-Status: accepted design. Phase 0 (core seam) implemented 2026-07-03; Phases 1-4 pending. The decisions in the final section are settled.
+Status: accepted design. Phase 0 (core seam) and Phase 1 (macOS/Linux enforcement, cortex-code wiring) implemented; Phase 2's unified network access (one policy and one prompt for shell egress and WebFetch) implemented 2026-07-03. MCP egress and the later phases are pending. The decisions in the final section are settled.
 
 This document specifies OS-level sandboxing for Cortex: what it protects against, how it is structured so users can progressively opt out (all the way to fully off), how it stays transparent, and the build plan. It is written to be understandable, because the prior art (Codex in particular) is powerful but hard to reason about. The guiding idea here is a small number of clean concepts, not a pile of platform mechanics.
 
@@ -126,6 +126,23 @@ interface SandboxProvider {
 // part of core's spawn seam: the static allowedDomains list is only the
 // pre-approved set, and the callback resolves everything else at runtime.
 
+// Core also exposes the unified egress decision as a first-class seam, so
+// in-process egress (WebFetch) answers to the same policy as shell commands:
+
+interface NetworkAccessRequest { host: string; port?: number; via: 'shell' | 'webfetch'; url?: string; }
+type NetworkAccessScope = 'once' | 'session' | 'always';
+interface NetworkAccessDecision { decision: 'allow' | 'deny'; scope?: NetworkAccessScope; }
+type ResolveNetworkAccess = (req: NetworkAccessRequest) => Promise<NetworkAccessDecision>;
+
+// CortexAgentConfig.resolveNetworkAccess?: ResolveNetworkAccess
+//
+// The consumer implements ONE decision function (allowlist + grants + prompt)
+// and wires it twice: into CortexAgentConfig.resolveNetworkAccess (WebFetch
+// consults it before every fetch) and into the provider's ask callback (the
+// egress proxy consults it for shell commands). A domain granted once then
+// covers both paths. WebFetch's SSRF/private-IP guard stays separate and
+// always on: a private target is blocked even when its host is allowed.
+
 interface SandboxStatus {          // the honesty contract
   filesystem: 'enforced' | 'partial' | 'none';
   network: 'enforced' | 'partial' | 'none';
@@ -169,7 +186,7 @@ Costs to plan for: code-signing the helper (an unsigned token-manipulating, chil
 ### Unifying in-process tools
 
 A subprocess sandbox does not cover Cortex's in-process tools: WebFetch runs on Node `fetch`, MCP HTTP is in-process, and Read/Write/Edit use `fs` directly. Claude Code solves this by keeping one source of truth for policy and projecting it two ways. We do the same: `SandboxPolicy` is the single source, and the in-process tools read from it.
-- WebFetch already resolves DNS and blocks private IPs (`web-fetch/index.ts`); it additionally consults `network.allowedDomains` / `deniedDomains`.
+- WebFetch (implemented): resolves DNS and blocks private IPs as an always-on SSRF guard, and additionally consults the consumer's `resolveNetworkAccess` before every fetch. That is the same decision function the egress proxy's ask callback calls for shell commands, so WebFetch and shell egress share one allowlist (seeded registries + config extras + grants) and one prompt. A policy deny comes back to the model as a readable tool result ("Blocked by network policy: example.com is not allowed"), matching the self-explaining denial rule. In cortex-code, an active policy also auto-allows the WebFetch tool call itself at the permission layer (same shape as sandboxed Bash auto-run): the per-host network decision is the control, so the user is asked one question, not two.
 - Write and Edit already contain writes at the app level; they consult `filesystem.writableRoots` and `denyWrite` so their policy matches the shell sandbox exactly.
 
 The field names line up with sandbox-runtime's on purpose, which is why the projection is close to a straight mapping.
@@ -178,15 +195,15 @@ The field names line up with sandbox-runtime's on purpose, which is why the proj
 
 Already built (kept, and unified under the policy):
 - Bash safety layers (env strip, critical-path guard, write-path containment, obfuscation and injection detection, auto-mode classifier) at `packages/cortex/src/tools/bash/safety.ts`. These remain as a complementary pre-exec layer; containment does not replace them, it backstops them.
-- WebFetch SSRF guard (`web-fetch/index.ts`).
+- WebFetch SSRF guard (`web-fetch/index.ts`), now alongside the unified network policy gate (`resolveNetworkAccess`).
 - Write and Edit path containment.
 - cortex-code permission rules engine: allow/deny, session/project/user scopes, persisted 0600, catastrophic-command hard block (`findCatastrophicCommand`, already shared from `@animus-labs/cortex`), auto-approve (yolo) mode, serialized TUI prompts, out-of-band decision watching (`packages/cortex-code/src/session.ts:1124`, `permissions/rules.ts`).
 
 To build:
-- Core: `SandboxPolicy` / `SandboxProvider` / `SandboxStatus`; the `wrapSpawn` seam in `BashToolConfig`; the skill-preprocessor env fix; policy projection into WebFetch/Write/Edit; bridge events (`sandbox:degraded`, `sandbox:violation`, `sandbox:escalation-requested`, `sandbox:grant-added`).
+- Core: `SandboxPolicy` / `SandboxProvider` / `SandboxStatus`; the `wrapSpawn` seam in `BashToolConfig`; the skill-preprocessor env fix; bridge events (`sandbox:degraded`, `sandbox:violation`, `sandbox:escalation-requested`, `sandbox:grant-added`). The network projection into WebFetch is built (the `resolveNetworkAccess` seam); Write/Edit projection and MCP HTTP remain.
 - `@animus-labs/cortex-sandbox`: the sandbox-runtime-backed provider for macOS and Linux, policy translation, egress proxy wiring, preflight and degradation reporting.
 - Windows: the Tier 1 restricted-token helper and its signing pipeline; Tier 2 elevated WFP later.
-- cortex-code: the trust ladder (`/sandbox <rung>`), status indicator, self-explaining denials, escalation prompts, surgical-grant prompts with once/session/always scope, the `sandbox` block in the settings schema, a first-open folder-trust default, and container detection.
+- cortex-code: the trust ladder (`/sandbox <rung>`), status indicator, self-explaining denials, escalation prompts, and container detection. Built: the `sandbox` block in the settings schema, and network surgical grants with once/session/always scope through the unified prompt ("Allow the agent to reach <host>?"), persisted per workspace.
 
 ## Threat model and non-goals
 
@@ -199,7 +216,7 @@ One design rule from Codex's CVE-2025-59532: writable roots come from trusted se
 ### Known coverage gaps (named, not hidden)
 
 - MCP servers. A stdio MCP server is arbitrary consumer-configured code with its own filesystem and network access, and it is a live injection-to-exfiltration path. Routing MCP stdio spawns through the same provider is a Phase 2+ item; until then, an MCP tool is an uncontained egress path even when Bash is contained. A consumer whose threat model needs this closed should know it is open.
-- In-process egress. The LLM provider's own API calls, WebFetch, and MCP HTTP run inside the Node process and never traverse the OS sandbox. Phase 2 projects the policy into WebFetch and MCP HTTP; the provider API endpoint itself is trusted and treating it as an exfil channel is out of scope for now.
+- In-process egress (partially closed). WebFetch is now covered by the unified network model: it consults the same decision function and allowlist as shell egress, so it is no longer an ungated exfiltration channel. Still open: MCP HTTP runs in-process and unmatched, and the LLM provider's own API calls are trusted by design (treating the provider endpoint as an exfil channel is out of scope for now).
 - Denial attribution is platform-asymmetric. sandbox-runtime surfaces real violation events on macOS (it taps the unified log) but only an `EPERM` on Linux, so self-explaining denials and auto-escalation are precise on macOS and best-effort on Linux.
 - Grep reads bypass the boundary. The built-in Grep tool spawns ripgrep directly, not through the shell seam, so a Grep with a `path` under a denied secret store returns file contents regardless of `denyRead`. Routing Grep through the provider (or projecting `denyRead` into its path check) is a Phase 2 item; until then Grep is the one built-in that can read a denied path.
 - Only top-level `.git` internals are protected. `denyWrite` covers `<root>/.git/hooks` and `<root>/.git/config` per workspace root, not nested repos or submodules. Glob-expanding `**/.git/hooks` is a Phase 2 item; the related `GIT_CONFIG*` env-redirection vector is already blocked in the env sanitizer.
@@ -211,7 +228,7 @@ Phase 0, core seam (small, no new dependencies). The three types, the `wrapSpawn
 
 Phase 1, macOS and Linux enforcement (roughly one to two weeks). `@animus-labs/cortex-sandbox` on pinned sandbox-runtime, the default Workspace policy, the escalation and surgical-grant loop, and cortex-code UX: status indicator, ladder command, self-explaining denials, settings schema, folder-trust default, container detection. This is where on-by-default and the prompt reduction land. Because a silently-broken sandbox is worse than none, every backend ships with adversarial containment tests (attempt to write outside the workspace, read a denied secret, and reach a blocked domain, asserting each is denied) run per platform. When on-by-default enforcement cannot initialize, the default is warn-and-continue with `SandboxStatus` reported as `none`, surfaced to the user; a consumer can opt into refuse-to-run instead. That silent-downgrade tension is an explicit choice, not a hidden default.
 
-Phase 2, network completion (about a week). Egress proxy wiring, domain-grant prompts, and projecting the policy into WebFetch and MCP HTTP so in-process egress matches the shell sandbox.
+Phase 2, network completion. Implemented for WebFetch: the `resolveNetworkAccess` seam in core, the unified decision function in cortex-code (seeded allowlist auto-allow, once/session/always grants with the "Always" grant persisted per workspace under `network.allowedDomains`, prompts serialized with the permission lock), wired into both the egress proxy's ask callback and WebFetch. One grant covers both paths; denied hosts fail with self-explaining results on both. Remaining: projecting the policy into MCP HTTP.
 
 Phase 3, native Windows (multi-week). The Tier 1 restricted-token helper and signing pipeline, then the optional elevated WFP tier. Until it ships, Windows runs policy-only with honest `none` status. Watch sandbox-runtime's Windows rewrite, which is heading toward Codex's dedicated-user design; if it matures first we may get a stronger tier for less.
 
