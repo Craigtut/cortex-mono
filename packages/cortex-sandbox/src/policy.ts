@@ -161,7 +161,15 @@ export function defaultDangerousWriteDenies(home: string, workspaceRoots: string
     join(root, '.git', 'hooks'),
     join(root, '.git', 'config'),
   ]);
-  return [...rcFiles, ...gitInternals];
+  // Auto-run-on-login locations: a write here is cross-session code execution.
+  // The shell is write-confined to the workspace, but the in-process file tools
+  // (deny-list-only) could otherwise reach these under auto-approve, so deny them.
+  const persistenceDirs = [
+    join(home, 'Library', 'LaunchAgents'),
+    join(home, '.config', 'autostart'),
+    join(home, '.config', 'systemd', 'user'),
+  ];
+  return [...rcFiles, ...persistenceDirs, ...gitInternals];
 }
 
 export interface DefaultPolicyOptions {

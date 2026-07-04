@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import * as path from 'node:path';
 import {
   buildDefaultPolicy,
   matchesDomainPattern,
@@ -47,6 +48,10 @@ describe('buildDefaultPolicy', () => {
     expect(p.filesystem.denyWrite.some((x) => x.endsWith('.zshrc'))).toBe(true);
     expect(p.filesystem.denyWrite.some((x) => x.includes('.git') && x.endsWith('hooks'))).toBe(true);
     expect(p.filesystem.denyWrite.some((x) => x.includes('.git') && x.endsWith('config'))).toBe(true);
+    // Auto-run-on-login locations: a write here is cross-session code execution.
+    expect(p.filesystem.denyWrite).toContain(path.join('/nope/home', 'Library', 'LaunchAgents'));
+    expect(p.filesystem.denyWrite).toContain(path.join('/nope/home', '.config', 'autostart'));
+    expect(p.filesystem.denyWrite).toContain(path.join('/nope/home', '.config', 'systemd', 'user'));
   });
 
   it('applies consumer extras (extra deny-write/deny-read/allow)', () => {
