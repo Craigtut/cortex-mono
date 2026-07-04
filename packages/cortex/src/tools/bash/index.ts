@@ -436,6 +436,13 @@ export function createBashTool(config: BashToolConfig): {
         spawnFile = wrapped.file;
         spawnArgs = wrapped.args;
         spawnEnv = wrapped.env;
+      } else if (config.sandbox && escalated) {
+        // An approved escalation leaves the OS boundary for this one command, but
+        // must not also hand it the ambient credential env vars the sandbox
+        // scrubs (AWS/GITHUB/NPM tokens, etc.): escalation is a single-command
+        // fs/network exit, not a move to Off, so "secrets stay unreadable" still
+        // holds. The command runs uncontained on disk and network, without them.
+        spawnEnv = config.sandbox.scrubCredentialEnv?.(safeEnv) ?? safeEnv;
       }
 
       // Spawn the process

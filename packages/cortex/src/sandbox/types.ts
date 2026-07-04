@@ -173,6 +173,14 @@ export interface SandboxProvider {
    */
   wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn>;
   /**
+   * Strip the credential environment variables this provider scrubs from a
+   * sandboxed child. The Bash tool applies this to an approved escalation (which
+   * skips wrapSpawn), so a command that leaves the OS boundary for one run still
+   * does not inherit ambient secrets: escalation is a single-command fs/network
+   * exit, not a move to the uncontained Off rung.
+   */
+  scrubCredentialEnv?(env: Record<string, string>): Record<string, string>;
+  /**
    * Optionally classify a failed sandboxed command as a sandbox denial so the
    * caller can surface a self-explaining message and offer escalation. Returns
    * null when the failure is not attributable to the sandbox. Reliable on macOS
