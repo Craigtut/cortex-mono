@@ -498,3 +498,45 @@ describe('preflightPermission: positive writableRoots write floor', () => {
     expect(out.decision).toBe('allow');
   });
 });
+
+describe('preflightPermission: sandbox denyRead projection onto Glob', () => {
+  const globDeps = (overrides: Partial<PreflightDeps> = {}): PreflightDeps =>
+    deps({ sandboxDenyRead: ['/home/user/.ssh'], ...overrides });
+
+  it('blocks a Glob whose explicit path is under a denyRead directory, even in yolo', async () => {
+    const out = await preflightPermission(
+      'Glob',
+      { pattern: '*', path: '/home/user/.ssh' },
+      globDeps({ yoloMode: true }),
+    );
+    expect(out.decision).toBe('block');
+    if (out.decision === 'block') expect(out.reason).toContain('read-protected');
+  });
+
+  it('blocks a Glob whose absolute pattern is rooted under a denyRead directory', async () => {
+    const out = await preflightPermission(
+      'Glob',
+      { pattern: '/home/user/.ssh/**/*.pub' },
+      globDeps(),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('does not block a normal in-workspace Glob', async () => {
+    const out = await preflightPermission(
+      'Glob',
+      { pattern: '**/*.ts', path: '/workspace/src' },
+      globDeps(),
+    );
+    expect(out.decision).not.toBe('block');
+  });
+
+  it('does not apply the Glob projection when the sandbox is off', async () => {
+    const out = await preflightPermission(
+      'Glob',
+      { pattern: '*', path: '/home/user/.ssh' },
+      deps(),
+    );
+    expect(out.decision).not.toBe('block');
+  });
+});

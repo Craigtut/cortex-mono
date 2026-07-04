@@ -1546,7 +1546,7 @@ export class Session {
       // is degraded (the gate runs in-process).
       webFetchNetworkGated: this.sandboxPolicy !== undefined,
       // Project the policy's filesystem deny sets onto the in-process file
-      // tools (Write/Edit/UndoEdit/Read), which bypass the OS boundary the
+      // tools (Write/Edit/UndoEdit/Read/Glob), which bypass the OS boundary the
       // shell is contained by. writableRoots is the positive floor: the shell
       // may write only inside it, so an in-process write escaping it must not
       // auto-approve either. Absent when the sandbox is off.

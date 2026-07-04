@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { isAbsolute, join, resolve, sep } from 'node:path';
 import {
   BASH_ESCALATION_PERMISSION_NAME,
   findCatastrophicCommand,
@@ -39,9 +39,9 @@ export interface PreflightDeps {
    * The active sandbox policy's filesystem deny sets, projected onto the
    * in-process file tools. The OS sandbox denies a shell these paths (rc
    * files, git hooks/config, secret stores, the Cortex config tree), but
-   * Write/Edit/UndoEdit/Read run in-process on fs and bypass that boundary,
-   * so the same sets block them here, above yolo. Absent when the sandbox is
-   * off: Off is genuinely off.
+   * Write/Edit/UndoEdit/Read (and Glob's listing) run in-process on fs and
+   * bypass that boundary, so the same sets block them here, above yolo. Absent
+   * when the sandbox is off: Off is genuinely off.
    */
   sandboxDenyWrite?: readonly string[];
   sandboxDenyRead?: readonly string[];
@@ -61,6 +61,8 @@ export interface PreflightDeps {
 const IN_PROCESS_WRITE_TOOLS = new Set(['Write', 'Edit', 'UndoEdit']);
 /** Edit reads the target to apply its replacement, so it is on both lists. */
 const IN_PROCESS_READ_TOOLS = new Set(['Read', 'Edit']);
+/** Glob enumerates filenames under a directory in-process (no subprocess). */
+const IN_PROCESS_LIST_TOOLS = new Set(['Glob']);
 
 /** Realpath a path if it exists, else return it unchanged (never throws). */
 function canonSync(p: string): string {
@@ -135,6 +137,39 @@ function isWithinWritableRoots(candidates: string[], roots: readonly string[]): 
 }
 
 /**
+ * The static (glob-free) prefix directory of an absolute glob pattern: the walk
+ * stops at the first segment carrying a glob magic character, so
+ * "/home/user/.ssh/**\/*.pub" yields "/home/user/.ssh". Used to project denyRead
+ * onto an absolute Glob pattern; a pattern with no magic returns its own path.
+ */
+function globPatternBase(pattern: string): string {
+  const staticSegments: string[] = [];
+  for (const seg of pattern.split('/')) {
+    if (/[*?[\]{}!()+@]/.test(seg)) break;
+    staticSegments.push(seg);
+  }
+  const base = staticSegments.join('/');
+  return base.length > 0 ? base : sep;
+}
+
+/**
+ * Glob's effective search root: the directory it enumerates. From the args, the
+ * explicit `path`, else the base directory of an absolute `pattern`, else the
+ * cwd. The tool walks this directory in-process, so it is a read target.
+ * TODO(sandbox): a relative pattern that climbs out with "../" segments
+ * (e.g. "../../.ssh/*") is not decomposed here; the common cases (explicit
+ * path, absolute pattern) are covered, and any climb still resolves against cwd.
+ */
+function globSearchRoot(toolArgs: unknown, cwd: string): string {
+  const args = toolArgs as Record<string, unknown> | null | undefined;
+  const p = args?.['path'];
+  if (typeof p === 'string' && p.length > 0) return resolve(cwd, p);
+  const pattern = args?.['pattern'];
+  if (typeof pattern === 'string' && isAbsolute(pattern)) return globPatternBase(pattern);
+  return resolve(cwd);
+}
+
+/**
  * True when a file-writing tool targets Cortex's own config tree (~/.cortex or
  * the project .cortex), which holds config, permission rules, network grants,
  * and stored credentials. The OS sandbox denies a shell from writing these; the
@@ -169,6 +204,18 @@ function sandboxPolicyFileDenial(
 ): string | null {
   const denyWrite = deps.sandboxDenyWrite ?? [];
   const denyRead = deps.sandboxDenyRead ?? [];
+
+  // Glob lists filenames in-process; its search root is a read target, so an
+  // enumeration rooted at or under a denyRead path (e.g. ~/.ssh) would reveal
+  // key filenames just by skipping the shell. Project denyRead onto it too.
+  if (denyRead.length > 0 && IN_PROCESS_LIST_TOOLS.has(toolName)) {
+    const root = globSearchRoot(toolArgs, deps.cwd);
+    if (targetsProtectedPath(resolvedTargetCandidates(root, deps.cwd), denyRead)) {
+      return `Blocked by sandbox policy: listing ${root} is read-protected`;
+    }
+    return null;
+  }
+
   const checksWrite = denyWrite.length > 0 && IN_PROCESS_WRITE_TOOLS.has(toolName);
   const checksRead = denyRead.length > 0 && IN_PROCESS_READ_TOOLS.has(toolName);
   if (!checksWrite && !checksRead) return null;
