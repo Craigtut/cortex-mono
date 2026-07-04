@@ -211,9 +211,11 @@ function validateUrl(urlStr: string): { valid: boolean; reason?: string | undefi
     return { valid: false, reason: `URL scheme "${url.protocol}" is not allowed. Only http: and https: are supported.` };
   }
 
-  // Auto-upgrade HTTP to HTTPS
+  // Auto-upgrade HTTP to HTTPS. Mutate the parsed protocol rather than running a
+  // case-sensitive regex on the raw string, so `HTTP://` upgrades too instead of
+  // silently proceeding over plaintext.
   if (url.protocol === 'http:') {
-    url = new URL(urlStr.replace(/^http:/, 'https:'));
+    url.protocol = 'https:';
   }
 
   const hostname = url.hostname;
