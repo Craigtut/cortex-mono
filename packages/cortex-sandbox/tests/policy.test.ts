@@ -34,6 +34,23 @@ describe('buildDefaultPolicy', () => {
     expect(p.network.allowedDomains).toContain('github.com');
   });
 
+  it('records the scoped session temp as both a writable root and sessionTmpDir', () => {
+    const p = buildDefaultPolicy('workspace', opts);
+    expect(p.filesystem.writableRoots).toContain('/nope/tmp');
+    expect(p.filesystem.sessionTmpDir).toBe('/nope/tmp');
+  });
+
+  it('omits sessionTmpDir when the consumer did not scope a session temp', () => {
+    const p = buildDefaultPolicy('workspace', { workspaceRoots: ['/nope/ws'], home: '/nope/home' });
+    // Falls back to the whole os.tmpdir(): no scoped temp to redirect the child at.
+    expect(p.filesystem.sessionTmpDir).toBeUndefined();
+  });
+
+  it('names no session temp at the restricted rung (it writes nowhere)', () => {
+    const p = buildDefaultPolicy('restricted', opts);
+    expect(p.filesystem.sessionTmpDir).toBeUndefined();
+  });
+
   it('trusted: writable roots + open (proxy-mediated) network', () => {
     const p = buildDefaultPolicy('trusted', opts);
     expect(p.filesystem.writableRoots).toContain('/nope/ws');

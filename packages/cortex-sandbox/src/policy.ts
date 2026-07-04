@@ -213,6 +213,15 @@ export function buildDefaultPolicy(rung: SandboxRung, opts: DefaultPolicyOptions
 
   const writableRoots = rung === 'restricted' ? [] : [...roots, tmp];
 
+  const filesystem: SandboxPolicy['filesystem'] = { writableRoots, denyRead, denyWrite };
+  // Record the scoped session temp so providers can point the child's
+  // TMPDIR/TEMP/TMP at the one writable temp. Only when the consumer scoped it
+  // (vs the whole os.tmpdir() fallback) and the rung actually grants writes:
+  // the restricted rung writes nowhere, so it names no session temp.
+  if (opts.sessionTmpDir !== undefined && rung !== 'restricted') {
+    filesystem.sessionTmpDir = tmp;
+  }
+
   let network: SandboxPolicy['network'];
   if (rung === 'restricted') {
     network = { mode: 'deny', allowedDomains: [], deniedDomains: [], allowLocalBinding: true };
@@ -225,7 +234,7 @@ export function buildDefaultPolicy(rung: SandboxRung, opts: DefaultPolicyOptions
 
   return {
     rung,
-    filesystem: { writableRoots, denyRead, denyWrite },
+    filesystem,
     network,
   };
 }

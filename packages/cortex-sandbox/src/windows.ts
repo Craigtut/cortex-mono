@@ -526,10 +526,12 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
   }
 
   private resolveSandboxTemp(policy: SandboxPolicy): string {
-    // Prefer a writable root that already looks like a per-session temp; else
-    // fall back to a fresh temp dir. When lowIntegrity is on, the helper labels
-    // this dir Low so the Low child can write it; only this dedicated dir is
-    // ever labeled, never the host temp root itself.
+    // Prefer the session temp the policy names explicitly; else a writable root
+    // that already looks like a per-session temp; else a fresh temp dir. When
+    // lowIntegrity is on, the helper labels this dir Low so the Low child can
+    // write it; only this dedicated dir is ever labeled, never the host temp
+    // root itself.
+    if (policy.filesystem.sessionTmpDir) return policy.filesystem.sessionTmpDir;
     const provided = policy.filesystem.writableRoots.find((r) => /cortex-sbx-/i.test(r));
     if (provided) return provided;
     return mkdtempSync(join(tmpdir(), 'cortex-sbx-'));

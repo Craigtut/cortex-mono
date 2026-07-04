@@ -27,6 +27,14 @@ export interface SandboxFilesystemPolicy {
   denyWrite: string[];
   /** Absolute paths re-allowed for read within a denyRead subtree. */
   allowRead?: string[];
+  /**
+   * The per-session writable temp dir (a member of writableRoots), created by
+   * the consumer to scope temp writes instead of granting the whole machine
+   * temp root. When set, a provider points the sandboxed child's TMPDIR/TEMP/TMP
+   * at it so a tool writing to its default temp lands inside the boundary.
+   * Absent when the whole os.tmpdir() is the writable temp (legacy behavior).
+   */
+  sessionTmpDir?: string;
 }
 
 export type SandboxNetworkMode = 'deny' | 'allowlist' | 'full';

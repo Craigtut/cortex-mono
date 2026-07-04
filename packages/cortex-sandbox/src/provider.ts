@@ -134,9 +134,21 @@ export function composeShellCommand(file: string, args: string[]): string {
   return [file, ...args].map(singleQuoteShellToken).join(' ');
 }
 
+/**
+ * Env var sandbox-runtime reads to place the sandboxed child's TMPDIR (falling
+ * back to CLAUDE_TMPDIR, then /tmp/claude). The runtime overrides the child's
+ * TMPDIR itself and adds this path to the child's writable set, so this, not the
+ * spawn env, is the lever for redirecting "write to the temp dir".
+ */
+const SANDBOX_TMPDIR_ENV = 'CLAUDE_CODE_TMPDIR';
+
 export class SandboxRuntimeProvider implements SandboxProvider {
   private currentStatus: SandboxStatus = UNCONTAINED('not initialized');
   private policy: SandboxPolicy | undefined;
+  /** Prior CLAUDE_CODE_TMPDIR, captured when we point it at the session temp. */
+  private priorTmpdirEnv: string | undefined;
+  /** True once we have overridden CLAUDE_CODE_TMPDIR (so dispose restores it). */
+  private managesTmpdirEnv = false;
   private readonly credentialEnvVars: string[];
 
   constructor(private readonly options: SandboxRuntimeProviderOptions = {}) {
@@ -145,6 +157,7 @@ export class SandboxRuntimeProvider implements SandboxProvider {
 
   async initialize(policy: SandboxPolicy): Promise<SandboxStatus> {
     this.policy = policy;
+    this.applySessionTmpdirEnv(policy.filesystem.sessionTmpDir);
     const backend = backendForPlatform();
 
     if (backend === 'none' || !SandboxManager.isSupportedPlatform()) {
@@ -232,6 +245,39 @@ export class SandboxRuntimeProvider implements SandboxProvider {
     return { file: file ?? spec.file, args, env: spec.env };
   }
 
+  /**
+   * Point the sandboxed child's temp dir at the per-session writable temp. The
+   * scoped policy makes only that subdir writable under the machine temp root,
+   * so a tool writing to its default temp must land there or be denied. On the
+   * sandbox-runtime backend the child's TMPDIR is NOT taken from the spawn env:
+   * the runtime overrides it (see SANDBOX_TMPDIR_ENV) and adds that path to the
+   * child's writable set. So the lever is that env var, which we point at the
+   * scoped session temp (already a writable root, and one that actually exists,
+   * unlike the runtime's /tmp/claude default). No-op, and the var is left as-is,
+   * when the policy did not scope a session temp (the whole temp root is
+   * writable, legacy behavior). The prior value is restored on dispose.
+   */
+  private applySessionTmpdirEnv(sessionTmpDir: string | undefined): void {
+    if (sessionTmpDir === undefined) return;
+    if (!this.managesTmpdirEnv) {
+      this.priorTmpdirEnv = process.env[SANDBOX_TMPDIR_ENV];
+      this.managesTmpdirEnv = true;
+    }
+    process.env[SANDBOX_TMPDIR_ENV] = sessionTmpDir;
+  }
+
+  /** Restore CLAUDE_CODE_TMPDIR to the value it held before this provider set it. */
+  private restoreSessionTmpdirEnv(): void {
+    if (!this.managesTmpdirEnv) return;
+    if (this.priorTmpdirEnv === undefined) {
+      delete process.env[SANDBOX_TMPDIR_ENV];
+    } else {
+      process.env[SANDBOX_TMPDIR_ENV] = this.priorTmpdirEnv;
+    }
+    this.managesTmpdirEnv = false;
+    this.priorTmpdirEnv = undefined;
+  }
+
   status(): SandboxStatus {
     return this.currentStatus;
   }
@@ -279,6 +325,7 @@ export class SandboxRuntimeProvider implements SandboxProvider {
     if (this.currentStatus.backend !== 'none') {
       await SandboxManager.reset();
     }
+    this.restoreSessionTmpdirEnv();
     this.currentStatus = UNCONTAINED('disposed');
   }
 

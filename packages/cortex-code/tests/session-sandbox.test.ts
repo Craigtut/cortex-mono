@@ -256,6 +256,46 @@ describe('Session.setSandboxRung', () => {
   });
 });
 
+describe('Session per-session sandbox temp dir', () => {
+  it('scopes the writable temp to a cortex-sbx- dir and threads it into the policy', async () => {
+    const { session } = makeSession();
+    const provider = stubProvider();
+    injectSandbox(session, provider, 'off');
+
+    await session.setSandboxRung('workspace');
+
+    const policy = provider.initialize.mock.calls[0]![0] as SandboxPolicy;
+    const tmp = policy.filesystem.sessionTmpDir;
+    expect(tmp).toBeDefined();
+    expect(path.basename(tmp!)).toMatch(/^cortex-sbx-/);
+    // It is a real writable root and exists on disk.
+    expect(policy.filesystem.writableRoots).toContain(tmp);
+    expect(fs.existsSync(tmp!)).toBe(true);
+
+    // Removal is best-effort and idempotent: it sweeps the dir and a second call
+    // is a no-op rather than a throw.
+    session.removeSessionTmpDir();
+    expect(fs.existsSync(tmp!)).toBe(false);
+    session.removeSessionTmpDir();
+  });
+
+  it('reuses the same session temp dir across rung changes', async () => {
+    const { session } = makeSession();
+    const provider = stubProvider();
+    injectSandbox(session, provider, 'off');
+
+    await session.setSandboxRung('workspace');
+    await session.setSandboxRung('trusted');
+
+    const first = (provider.initialize.mock.calls[0]![0] as SandboxPolicy).filesystem.sessionTmpDir;
+    const second = (provider.initialize.mock.calls[1]![0] as SandboxPolicy).filesystem.sessionTmpDir;
+    expect(first).toBeDefined();
+    expect(second).toBe(first);
+
+    session.removeSessionTmpDir();
+  });
+});
+
 describe('Session.resolveInitialRung (folder-trust default)', () => {
   async function resolveRung(session: Session): Promise<SandboxRung> {
     const s = session as unknown as {

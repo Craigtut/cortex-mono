@@ -66,7 +66,8 @@ import { runNpmUpgrade } from './updates/upgrade.js';
 import type { Mode } from './modes/types.js';
 import { AVAILABLE_MODES } from './modes/index.js';
 import path from 'node:path';
-import { homedir } from 'node:os';
+import * as fs from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { SandboxRuntimeProvider, buildDefaultPolicy } from '@animus-labs/cortex-sandbox';
 import type {
   SandboxStatus,
@@ -139,6 +140,13 @@ export class Session {
    * human through /sandbox; never exposed to the model.
    */
   private sandboxRung: SandboxRung = 'off';
+  /**
+   * Per-session writable temp dir. Scopes the sandbox's writable temp to this
+   * subdir instead of the whole os.tmpdir(); the provider points sandboxed
+   * children's TMPDIR/TEMP/TMP here. Created when a contained rung is first
+   * activated, removed on shutdown and crash/signal paths.
+   */
+  private sessionTmpDir: string | undefined;
   /** Per-workspace remembered rung and one-time notice flags. */
   private readonly sandboxSettings: SandboxSettingsStore;
   private readonly networkGrants: NetworkGrantStore;
@@ -1366,6 +1374,10 @@ export class Session {
     const cortexHome = path.join(homedir(), '.cortex');
     return buildDefaultPolicy(rung, {
       workspaceRoots: [this.cwd],
+      // Scope the writable temp to a per-session subdir (vs the whole
+      // os.tmpdir()); the provider redirects the sandboxed child's
+      // TMPDIR/TEMP/TMP here so tools writing to "the temp dir" stay in-bounds.
+      sessionTmpDir: this.getOrCreateSessionTmpDir(),
       // A sandboxed shell must not WRITE Cortex's own config, permission rules,
       // or the project's .cortex (which now carries the sandbox policy itself),
       // and must not READ Cortex's stored API keys / OAuth tokens.
@@ -1516,12 +1528,47 @@ export class Session {
   }
 
   /**
+   * The per-session writable temp dir, created on first use. Scoping the
+   * sandbox's writable temp to this subdir (vs the whole os.tmpdir()) keeps a
+   * sandboxed command from writing anywhere under the machine temp root; the
+   * provider redirects the child's TMPDIR/TEMP/TMP here so tools that write to
+   * "the temp dir" still land inside the boundary. Named with the shared
+   * `cortex-sbx-` prefix the Windows helper also recognizes.
+   */
+  private getOrCreateSessionTmpDir(): string {
+    if (this.sessionTmpDir === undefined) {
+      this.sessionTmpDir = fs.mkdtempSync(path.join(tmpdir(), 'cortex-sbx-'));
+    }
+    return this.sessionTmpDir;
+  }
+
+  /**
+   * Best-effort synchronous removal of the per-session temp dir. Safe to call
+   * from crash and signal handlers: never throws, idempotent. The OS reclaims
+   * the sandbox boundary itself (Seatbelt profile, bubblewrap namespace, egress
+   * proxy) when the process dies, so this only sweeps the scoped writable temp
+   * dir, which would otherwise leak under the machine temp root.
+   */
+  removeSessionTmpDir(): void {
+    const dir = this.sessionTmpDir;
+    if (dir === undefined) return;
+    this.sessionTmpDir = undefined;
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // A leaked temp dir is preferable to masking the crash or exit.
+    }
+  }
+
+  /**
    * Best-effort teardown of the OS sandbox (stops the egress proxy and the macOS
-   * violation log-stream child, removes temp profiles). Idempotent and safe to
-   * call outside a full shutdown, e.g. from a signal handler.
+   * violation log-stream child, removes temp profiles) plus the session temp
+   * dir. Idempotent and safe to call outside a full shutdown, e.g. from a
+   * signal handler.
    */
   async disposeSandbox(): Promise<void> {
     await this.sandboxProvider?.dispose();
+    this.removeSessionTmpDir();
   }
 
   private async resolvePermission(
@@ -1880,6 +1927,7 @@ export class Session {
     // Reset the terminal title before tearing down the TUI.
     this.titleManager?.dispose();
     await this.sandboxProvider?.dispose();
+    this.removeSessionTmpDir();
 
     await this.activity.recordDone({ code: 0, signal: null, reason: 'normal_shutdown' });
     await this.activity.flush();
