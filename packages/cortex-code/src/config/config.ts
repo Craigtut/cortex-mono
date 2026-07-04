@@ -104,9 +104,19 @@ export async function loadConfig(cwd: string): Promise<CortexCodeConfig> {
       }
     : undefined;
 
+  // Sandbox posture is security-sensitive and must come from TRUSTED config
+  // only (the user's global config), never from the project working tree. A
+  // cloned untrusted repo could otherwise ship `.cortex/config.json` that
+  // disables or weakens the sandbox before the user acts, defeating the whole
+  // "safe to open untrusted code" premise. Drop any project-level sandbox block.
+  const projectRest: CortexCodeConfig = { ...(projectConfig ?? {}) };
+  if (projectRest.sandbox !== undefined) {
+    delete projectRest.sandbox;
+  }
+
   return {
     ...globalConfig,
-    ...projectConfig,
+    ...projectRest,
     ...(diagnostics ? { diagnostics } : {}),
   };
 }
