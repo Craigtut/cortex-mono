@@ -12,6 +12,8 @@
  */
 export { SandboxRuntimeProvider } from './provider.js';
 export type { SandboxRuntimeProviderOptions } from './provider.js';
+export { denialFromViolations, denialFromFailureHeuristic } from './classify.js';
+export type { ViolationLike } from './classify.js';
 export {
   buildDefaultPolicy,
   defaultSecretReadDenies,

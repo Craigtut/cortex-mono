@@ -16,12 +16,15 @@ import {
   type SandboxAskCallback,
 } from '@anthropic-ai/sandbox-runtime';
 import { DEFAULT_CREDENTIAL_ENV_VARS } from './policy.js';
+import { denialFromViolations, denialFromFailureHeuristic } from './classify.js';
 import type {
   SandboxProvider,
   SandboxPolicy,
   SandboxStatus,
   SandboxSpawnSpec,
   SandboxBackend,
+  SandboxCommandFailure,
+  SandboxDenial,
   WrappedSpawn,
 } from '@animus-labs/cortex';
 
@@ -181,6 +184,27 @@ export class SandboxRuntimeProvider implements SandboxProvider {
 
   status(): SandboxStatus {
     return this.currentStatus;
+  }
+
+  /**
+   * Attribute a failed sandboxed command to a sandbox denial (or return null).
+   * macOS is precise: sandbox-runtime's unified-log monitor records violation
+   * events tagged with the command, so a match IS a denial. Linux has no
+   * per-violation signal, so a conservative stderr heuristic answers instead.
+   * Best-effort either way; the caller treats null as "no note", and a macOS
+   * violation that has not landed in the log tail yet is simply missed.
+   */
+  classifyFailure(failure: SandboxCommandFailure): SandboxDenial | null {
+    // Not enforcing: spawns passed through unwrapped, so no failure here can
+    // be the sandbox's doing.
+    if (this.currentStatus.backend === 'none') return null;
+    if (failure.exitCode === null || failure.exitCode === 0) return null;
+
+    if (this.currentStatus.backend === 'seatbelt') {
+      const store = SandboxManager.getSandboxViolationStore();
+      return denialFromViolations(store.getViolationsForCommand(failure.command));
+    }
+    return denialFromFailureHeuristic(failure);
   }
 
   async dispose(): Promise<void> {
