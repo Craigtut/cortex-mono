@@ -76,7 +76,7 @@ The user (and the consumer's end user) must always be able to answer "what can t
 
 | Scenario | Rung | Notes |
 |----------|------|-------|
-| Reviewing a PR or exploring an unfamiliar repo | Restricted | read-only, no network; nothing the injected content says can write or exfiltrate |
+| Reviewing a PR or exploring an unfamiliar repo | Restricted | no network, no workspace or user writes (a fixed set of OS temp/log paths stays writable, see known gaps); injected content can neither modify the repo nor exfiltrate |
 | Day-to-day work on your own project | Workspace | the default; no prompts for in-boundary work |
 | Big trusted refactor needing broad network and writes | Trusted | or stay on Workspace and grant the specific domains and dirs |
 | Command that legitimately must escape (docker, a system install, another repo) | any | surgical grant or single-command escalation, not Off |
@@ -221,6 +221,8 @@ One design rule from Codex's CVE-2025-59532: writable roots come from trusted se
 - Grep reads (now routed). The built-in Grep tool spawned ripgrep directly, bypassing the boundary, so a Grep under a denied secret store returned contents regardless of `denyRead`. Ripgrep now runs through the provider's `wrapExec`, so the kernel enforces `denyRead` for it. The tool's pure-JS fallback (which reads via `fs`) is disabled whenever the sandbox enforces filesystem containment: a kernel-denied read (ripgrep exit 2) is never retried in-process, so Grep fails closed rather than leaking. When the sandbox is off, the fallback behaves exactly as before. One DX cost of this fail-safe: under containment a ripgrep exit 2 (a denied read, but also a bad regex or a nonexistent path) resolves to "no matches" rather than a distinct error, because the fallback that would have surfaced those is off.
 - Only top-level `.git` internals are protected. `denyWrite` covers `<root>/.git/hooks` and `<root>/.git/config` per workspace root, not nested repos or submodules. Glob-expanding `**/.git/hooks` is a Phase 2 item; the related `GIT_CONFIG*` env-redirection vector is already blocked in the env sanitizer.
 - "Trusted" network is proxy-mediated, not raw. `full` still routes egress through the HTTP/SOCKS proxy (sandbox-runtime cannot express filesystem-contained + network-unrestricted), so tools that ignore proxy env vars (ssh, raw TCP to a database) fail on Trusted; those belong on Off.
+- "Restricted" is not literally zero-write. sandbox-runtime always grants a small fixed set of write paths regardless of `writableRoots` (a temp dir, `~/.npm/_logs`, `~/.claude/debug`, and device nodes such as `/dev/null` that ordinary commands must have). So the Restricted rung blocks every workspace and user-data write but is not a total write lockout; device nodes in particular cannot be denied without breaking normal tooling. The guarantee is "no meaningful writes," not "no writes at all."
+- Writable temp is scoped per session. The consumer scopes the sandbox's writable temp to a per-session `mkdtemp` dir rather than the whole `os.tmpdir()`, and the provider points the child's `TMPDIR`/`TEMP`/`TMP` at it (on the sandbox-runtime backend via `CLAUDE_CODE_TMPDIR`, which that backend reads and adds to the child's writable set). A tool writing to its default temp lands inside the boundary; a write to an unrelated `/tmp` path is denied.
 
 ## Build plan
 

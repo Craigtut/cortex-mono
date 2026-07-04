@@ -216,8 +216,8 @@ export function buildDefaultPolicy(rung: SandboxRung, opts: DefaultPolicyOptions
   const filesystem: SandboxPolicy['filesystem'] = { writableRoots, denyRead, denyWrite };
   // Record the scoped session temp so providers can point the child's
   // TMPDIR/TEMP/TMP at the one writable temp. Only when the consumer scoped it
-  // (vs the whole os.tmpdir() fallback) and the rung actually grants writes:
-  // the restricted rung writes nowhere, so it names no session temp.
+  // (vs the whole os.tmpdir() fallback) and the rung grants writable roots: the
+  // restricted rung has an empty writableRoots, so it names no session temp.
   if (opts.sessionTmpDir !== undefined && rung !== 'restricted') {
     filesystem.sessionTmpDir = tmp;
   }
