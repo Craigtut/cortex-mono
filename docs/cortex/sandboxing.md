@@ -203,7 +203,7 @@ To build:
 - Core: `SandboxPolicy` / `SandboxProvider` / `SandboxStatus`; the `wrapSpawn` seam in `BashToolConfig`; the skill-preprocessor env fix; bridge events (`sandbox:degraded`, `sandbox:violation`, `sandbox:escalation-requested`, `sandbox:grant-added`). The network projection into WebFetch is built (the `resolveNetworkAccess` seam); Write/Edit projection and MCP HTTP remain.
 - `@animus-labs/cortex-sandbox`: the sandbox-runtime-backed provider for macOS and Linux, policy translation, egress proxy wiring, preflight and degradation reporting.
 - Windows: the Tier 1 restricted-token helper and its signing pipeline; Tier 2 elevated WFP later.
-- cortex-code: the trust ladder (`/sandbox <rung>`), status indicator, self-explaining denials, escalation prompts, and container detection. Built: the `sandbox` block in the settings schema, and network surgical grants with once/session/always scope through the unified prompt ("Allow the agent to reach <host>?"), persisted per workspace.
+- cortex-code: self-explaining denials and escalation prompts. Built: the `sandbox` block in the settings schema; network surgical grants with once/session/always scope through the unified prompt ("Allow the agent to reach <host>?"), persisted per workspace; the trust ladder (`/sandbox <rung>`, human-only, re-initializes the provider live and remembers the rung per workspace); the effective-policy inspector (`/sandbox status`); the always-visible status-line indicator (enforced / partial / not enforced / off); the folder-trust default (fresh workspaces start at Workspace and remember it); and container detection (recommend-only, never auto-disables).
 
 ## Threat model and non-goals
 
