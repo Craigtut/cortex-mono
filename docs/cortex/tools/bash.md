@@ -10,6 +10,19 @@ Execute shell commands in the host environment. Cross-platform: bash/zsh on macO
 | `timeout` | number | No | Timeout in milliseconds. Default: 120000 (2 min). Max: 600000 (10 min). |
 | `description` | string | No | Human-readable explanation of the command. Shown in permission UI and used for auto-approval pattern matching. |
 | `background` | boolean | No | Run the command in the background immediately. Default: false. |
+| `escalateOutsideSandbox` | boolean | No | Request to run this one command outside the OS sandbox, after a sandbox denial. Requires human approval through the permission layer; see [Sandbox escalation](#sandbox-escalation). Default: false. |
+
+## Sandbox escalation
+
+When a `SandboxProvider` is configured (`BashToolConfig.sandbox`), every spawn is wrapped in the OS boundary. If a command fails because the sandbox blocked it, the tool appends a best-effort denial note to the result (via the provider's `classifyFailure`; precise on macOS, heuristic on Linux) telling the model the failure may be a sandbox denial and that escalation exists.
+
+The model may then re-issue the command with `escalateOutsideSandbox: true`. That call reaches the consumer's `resolvePermission` under the synthetic name `BASH_ESCALATION_PERMISSION_NAME` (`Bash(escalate)`) instead of `Bash`, so plain-Bash rules and auto-approve paths never silently authorize it and the consumer can show a distinct "run outside the sandbox?" prompt. Only if approved does the tool skip `wrapSpawn` for that one command; the sandbox stays on for everything else, and nothing persists.
+
+Fail-closed invariants:
+
+- Without a permission gate in front of the tool (`BashToolConfig.permissionGated` is set by `CortexAgent` only when `resolvePermission` is configured), an escalation request is refused outright.
+- The catastrophic command floor (Layer 0) still blocks an approved escalation; a catastrophic command can never leave the sandbox.
+- Without a sandbox provider the flag is ignored (there is no boundary to exit).
 
 ## Returns
 

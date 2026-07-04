@@ -117,7 +117,7 @@ interface SandboxProvider {
   // and the cwd-capture suffix untouched.
   wrapSpawn(spec: { file: string; args: string[]; cwd: string; env: Record<string,string> })
     : { file: string; args: string[]; env: Record<string,string> };
-  classifyFailure?(result: unknown): SandboxDenial | null; // for self-explaining denials
+  classifyFailure?(failure: SandboxCommandFailure): SandboxDenial | null; // for self-explaining denials
   status?(): SandboxStatus;                                 // current enforcement, for transparency
   dispose(): Promise<void>;
 }
@@ -203,7 +203,7 @@ To build:
 - Core: `SandboxPolicy` / `SandboxProvider` / `SandboxStatus`; the `wrapSpawn` seam in `BashToolConfig`; the skill-preprocessor env fix; bridge events (`sandbox:degraded`, `sandbox:violation`, `sandbox:escalation-requested`, `sandbox:grant-added`). The network projection into WebFetch is built (the `resolveNetworkAccess` seam); Write/Edit projection and MCP HTTP remain.
 - `@animus-labs/cortex-sandbox`: the sandbox-runtime-backed provider for macOS and Linux, policy translation, egress proxy wiring, preflight and degradation reporting.
 - Windows: the Tier 1 restricted-token helper and its signing pipeline; Tier 2 elevated WFP later.
-- cortex-code: self-explaining denials and escalation prompts. Built: the `sandbox` block in the settings schema; network surgical grants with once/session/always scope through the unified prompt ("Allow the agent to reach <host>?"), persisted per workspace; the trust ladder (`/sandbox <rung>`, human-only, re-initializes the provider live and remembers the rung per workspace); the effective-policy inspector (`/sandbox status`); the always-visible status-line indicator (enforced / partial / not enforced / off); the folder-trust default (fresh workspaces start at Workspace and remember it); and container detection (recommend-only, never auto-disables).
+- cortex-code: built: the `sandbox` block in the settings schema; network surgical grants with once/session/always scope through the unified prompt ("Allow the agent to reach <host>?"), persisted per workspace; the trust ladder (`/sandbox <rung>`, human-only, re-initializes the provider live and remembers the rung per workspace); the effective-policy inspector (`/sandbox status`); the always-visible status-line indicator (enforced / partial / not enforced / off); the folder-trust default (fresh workspaces start at Workspace and remember it); container detection (recommend-only, never auto-disables); and single-command escalation with self-explaining denials (implemented 2026-07-03): a failed sandboxed command gets a best-effort denial note (provider `classifyFailure`: macOS violation log, Linux stderr heuristic), the model may re-issue it with `escalateOutsideSandbox: true`, and that request reaches the permission layer as `Bash(escalate)`, always prompting the human (never auto-approved by yolo, sandbox auto-run, or allow rules; plain-Bash deny rules and the catastrophic floor still block; allow-once only, nothing persists).
 
 ## Threat model and non-goals
 
