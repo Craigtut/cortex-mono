@@ -1,6 +1,7 @@
+import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { findCatastrophicCommand } from '@animus-labs/cortex';
+import { findCatastrophicCommand, resolveThroughExistingAncestorSync } from '@animus-labs/cortex';
 import type { PermissionDecision } from './rules.js';
 
 export type PreflightOutcome =
@@ -34,11 +35,26 @@ export interface PreflightDeps {
 
 const IN_PROCESS_WRITE_TOOLS = new Set(['Write', 'Edit', 'UndoEdit']);
 
+/** Realpath a path if it exists, else return it unchanged (never throws). */
+function canonSync(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return p;
+  }
+}
+
 /**
  * True when a file-writing tool targets Cortex's own config tree (~/.cortex or
  * the project .cortex), which holds config, permission rules, network grants,
  * and stored credentials. The OS sandbox denies a shell from writing these; the
  * in-process file tools bypass that boundary, so this closes the same hole.
+ *
+ * The comparison resolves symlinks: an in-workspace link file (allowed to create
+ * inside the sandbox) pointing into ~/.cortex would look in-workspace lexically
+ * while the real write lands in the config tree, so we check the symlink-resolved
+ * target (both a fully-followed realpath and an existing-ancestor resolution, to
+ * catch a symlinked leaf and a symlinked parent) against the resolved dirs.
  */
 function isProtectedConfigWrite(
   toolName: string,
@@ -50,9 +66,24 @@ function isProtectedConfigWrite(
   const args = toolArgs as Record<string, unknown> | null | undefined;
   const target = String(args?.['file_path'] ?? args?.['path'] ?? '');
   if (!target) return false;
-  const resolved = resolve(cwd, target);
-  const protectedDirs = [join(home, '.cortex'), join(cwd, '.cortex')];
-  return protectedDirs.some((d) => resolved === d || resolved.startsWith(d + sep));
+
+  const lexical = resolve(cwd, target);
+  const candidates = new Set([
+    lexical,
+    canonSync(lexical),
+    resolveThroughExistingAncestorSync(lexical),
+  ]);
+  const protectedDirs = [join(home, '.cortex'), join(cwd, '.cortex')].flatMap((d) => [
+    d,
+    canonSync(d),
+  ]);
+
+  for (const c of candidates) {
+    for (const d of protectedDirs) {
+      if (c === d || c.startsWith(d + sep)) return true;
+    }
+  }
+  return false;
 }
 
 /**

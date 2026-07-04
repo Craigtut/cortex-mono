@@ -186,4 +186,24 @@ describe('preflightPermission', () => {
     );
     expect(out.decision).toBe('prompt');
   });
+
+  it('blocks a Write through an in-workspace symlink into ~/.cortex (no lexical bypass)', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-symlink-'));
+    const home = path.join(tmp, 'home');
+    const ws = path.join(tmp, 'ws');
+    fs.mkdirSync(path.join(home, '.cortex', 'workspaces', 'x'), { recursive: true });
+    fs.mkdirSync(ws, { recursive: true });
+    const realTarget = path.join(home, '.cortex', 'workspaces', 'x', 'settings.json');
+    fs.writeFileSync(realTarget, '{}');
+    // The link file sits in the workspace (creating it is allowed inside the
+    // sandbox) but points into the config tree.
+    const link = path.join(ws, 'notes.txt');
+    fs.symlinkSync(realTarget, link);
+    try {
+      const out = await preflightPermission('Write', { file_path: link }, deps({ home, cwd: ws }));
+      expect(out.decision).toBe('block');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
