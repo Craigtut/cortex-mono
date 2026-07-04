@@ -30,9 +30,10 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 use crate::winutil::{to_wide, OwnedHandle};
@@ -113,6 +114,11 @@ pub fn spawn_and_wait(token: &OwnedHandle, job: &OwnedHandle, argv: &[String]) -
     si.StartupInfo.hStdError = stderr;
     si.lpAttributeList = attr_list.as_ptr();
 
+    // TODO(windows-build): create a private window station + desktop and point
+    // STARTUPINFO.lpDesktop at it. The restricted child currently runs on the
+    // parent's interactive winsta/desktop, which exposes UI-message attack
+    // surface (SetWindowsHookEx, SendMessage, clipboard) to sandboxed code.
+    // Documented as a Tier-1 limitation in docs/cortex/windows-sandbox-build.md.
     let mut pi = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessAsUserW(
@@ -134,8 +140,16 @@ pub fn spawn_and_wait(token: &OwnedHandle, job: &OwnedHandle, argv: &[String]) -
     let process = OwnedHandle::new(pi.hProcess).ok_or_else(Error::from_win32)?;
     let thread = OwnedHandle::new(pi.hThread).ok_or_else(Error::from_win32)?;
 
-    // Into the job BEFORE it runs, then release it.
-    crate::job::assign_process(job, process.get())?;
+    // Into the job BEFORE it runs. If the assign fails, kill the suspended
+    // child before propagating: fail-closed already holds (the command never
+    // ran), but without the terminate the suspended process would linger after
+    // its handles close.
+    if let Err(err) = crate::job::assign_process(job, process.get()) {
+        unsafe {
+            let _ = TerminateProcess(process.get(), 1);
+        }
+        return Err(err);
+    }
     unsafe {
         ResumeThread(thread.get());
         WaitForSingleObject(process.get(), INFINITE);

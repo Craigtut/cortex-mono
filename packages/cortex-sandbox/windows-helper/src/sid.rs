@@ -8,8 +8,11 @@
 //! that SID write ACEs on the workspace roots, is what confines writes to the
 //! workspace while leaving reads (which do not consult the restricting list)
 //! broad. `DeriveCapabilitySidsFromName` makes the SID a deterministic function
-//! of a per-install name, so the same install reuses one SID and its ACEs
-//! instead of accumulating fresh ones each run.
+//! of the policy's name, which the Node side derives per install AND per
+//! workspace (base name + hash of the canonical workspace roots): the same
+//! install+workspace reuses one SID and its ACEs instead of accumulating fresh
+//! ones each run, and one workspace's persisted grants never match another
+//! workspace's SID.
 
 use std::ffi::c_void;
 use windows::core::Result;
@@ -78,7 +81,8 @@ pub fn low_integrity_sid() -> Result<SidBuf> {
     well_known_sid(WinLowLabelSid)
 }
 
-/// Derive the restricting capability SID from a stable per-install name.
+/// Derive the restricting capability SID from the policy's stable
+/// per-install + per-workspace name.
 ///
 /// `DeriveCapabilitySidsFromName` allocates two arrays (group SIDs and capability
 /// SIDs) plus their elements, all via LocalAlloc. We copy the single capability

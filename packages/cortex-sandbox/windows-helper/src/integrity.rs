@@ -18,9 +18,13 @@
 //!
 //! Tradeoff (documented in the runbook): a Low-IL process is more constrained
 //! than the cap-SID scheme alone (UIPI blocks messaging higher-IL windows, some
-//! tools misbehave at Low). Codex ships Medium (LUA_TOKEN only) for
-//! compatibility; we make Low the default but keep it a policy toggle
-//! (`lowIntegrity`) so a consumer hitting a broken tool can drop back to Medium.
+//! tools misbehave at Low, the child may be unable to edit pre-existing
+//! Medium-labeled files inside the workspace, and the Low label persists on the
+//! labeled dirs). Codex ships Medium (LUA_TOKEN only) for compatibility; we
+//! match that: Medium is the default and Low is the opt-in policy toggle
+//! (`lowIntegrity`). Only the workspace roots and the dedicated sandbox temp
+//! are ever labeled; the Node side keeps the machine's real temp root out of
+//! writableRoots so it is never labeled.
 
 use std::ffi::c_void;
 use std::path::Path;

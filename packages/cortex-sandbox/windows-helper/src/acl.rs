@@ -8,11 +8,13 @@
 //! All ACEs are inheritable (CONTAINER_INHERIT | OBJECT_INHERIT) so a grant/deny
 //! on a root covers files and subdirectories created later.
 //!
-//! Teardown: we key every ACE to a STABLE capability SID (derived from the
-//! per-install name), so re-running reuses the same ACEs instead of
-//! accumulating fresh ones. That is the design's "stable cap SID" branch, so the
-//! happy path needs no teardown; `revoke` exists for a consumer that wants to
-//! scrub the synthetic principal's ACEs entirely.
+//! Teardown: we key every ACE to a capability SID that is stable PER WORKSPACE
+//! (the Node side derives the name from a per-install base plus a hash of the
+//! canonical workspace roots), so re-running the same workspace reuses the same
+//! ACEs instead of accumulating fresh ones, and grant ACEs persisted on one
+//! workspace never match the SID a session in another workspace runs under.
+//! The happy path needs no teardown; `revoke` exists for a consumer that wants
+//! to scrub a synthetic principal's ACEs entirely.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -70,7 +72,10 @@ pub fn grant_write(path: &Path, cap: &SidBuf) -> Result<()> {
     apply_ace(path, cap.psid(), GRANT_ACCESS, WRITE_ALLOW_MASK)
 }
 
-/// Deny the capability SID read on a secret path.
+/// Deny the capability SID read on a secret path. INERT at Tier 1: a same-user
+/// WRITE_RESTRICTED token evaluates the restricting SID for write access only,
+/// so this ACE never fires on a read there. Applied anyway (harmless) so a
+/// Tier-2 dedicated-user token inherits the protection.
 pub fn deny_read(path: &Path, cap: &SidBuf) -> Result<()> {
     apply_ace(path, cap.psid(), DENY_ACCESS, READ_DENY_MASK)
 }

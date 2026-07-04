@@ -22,9 +22,12 @@ pub struct Policy {
     /// Schema version; must equal `SUPPORTED_VERSION`.
     pub version: u32,
 
-    /// Stable per-install name fed to `DeriveCapabilitySidsFromName` to derive
-    /// the restricting capability SID. Deterministic, so ACEs are reused across
-    /// runs rather than accumulated.
+    /// Name fed to `DeriveCapabilitySidsFromName` to derive the restricting
+    /// capability SID. The Node side derives it per install AND per workspace
+    /// (base name + a stable hash of the canonical workspace roots), so one
+    /// workspace's persisted grant ACEs never authorize a token created for
+    /// another workspace. Deterministic per workspace, so ACEs are reused
+    /// across runs rather than accumulated.
     #[serde(rename = "capabilitySidName")]
     pub capability_sid_name: String,
 
@@ -38,11 +41,14 @@ pub struct Policy {
     #[serde(rename = "sandboxTemp")]
     pub sandbox_temp: PathBuf,
 
-    /// Absolute paths that must never be readable (secret stores, credential files).
+    /// Secret paths given deny-read ACEs. INERT at Tier 1 (a same-user
+    /// WRITE_RESTRICTED token only restricts writes; reads ride the normal
+    /// token); kept for a Tier-2 dedicated-user token, which evaluates them.
     #[serde(rename = "denyReadPaths")]
     pub deny_read_paths: Vec<PathBuf>,
 
-    /// Absolute paths that must never be written (agent config, `.git/hooks`, `.git/config`).
+    /// Absolute paths that must never be written (agent config, `.git/hooks`,
+    /// `.git/config`, and the policy file's own directory).
     #[serde(rename = "denyWritePaths")]
     pub deny_write_paths: Vec<PathBuf>,
 
@@ -79,6 +85,14 @@ impl std::error::Error for PolicyError {}
 
 impl Policy {
     /// Load, parse, and validate the policy from a JSON file path.
+    ///
+    /// TODO(windows-build): before trusting the file, reject one not owned by
+    /// the current user (GetNamedSecurityInfoW with OWNER_SECURITY_INFORMATION
+    /// and compare against the process token's user SID). The Node side already
+    /// keeps the file outside every writable root and deny-writes its
+    /// directory, but an owner check closes the remaining local-tamper window
+    /// (another process of a different user swapping in attacker-chosen
+    /// writable roots).
     pub fn load(path: &std::path::Path) -> Result<Self, PolicyError> {
         let text = std::fs::read_to_string(path).map_err(PolicyError::Read)?;
         let policy: Policy = serde_json::from_str(&text).map_err(PolicyError::Parse)?;

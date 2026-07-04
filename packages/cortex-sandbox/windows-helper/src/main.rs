@@ -6,10 +6,11 @@
 //!
 //! It reads the policy, builds a WRITE_RESTRICTED restricted token carrying a
 //! synthetic capability SID, grants that SID write ACEs on the workspace roots +
-//! sandbox temp, layers deny-read/deny-write ACEs over secrets and the agent
-//! config, optionally drops to Low integrity, and launches the command inside a
-//! kill-on-close job object with process mitigations. It inherits stdio straight
-//! through to Node and exits with the child's exit code.
+//! sandbox temp, layers deny-write ACEs over the agent config (and deny-read
+//! ACEs over secrets, though those are INERT at Tier 1; see the note in run()),
+//! optionally drops to Low integrity (off by default), and launches the command
+//! inside a kill-on-close job object with process mitigations. It inherits stdio
+//! straight through to Node and exits with the child's exit code.
 //!
 //! FAIL CLOSED: if any containment step fails, the helper prints an error and
 //! exits non-zero WITHOUT running the command. It never runs the command
@@ -39,10 +40,14 @@ mod token;
 #[cfg(windows)]
 mod winutil;
 
-/// Exit code when sandbox setup fails (distinct from any plausible child code so
-/// the Node side can tell "the sandbox could not be established" from "the
-/// command ran and failed"). 87 == ERROR_INVALID_PARAMETER, a nod to the class
-/// of failure and unlikely to collide with a real command's exit code.
+/// Exit code when sandbox setup fails, so the Node side can tell "the sandbox
+/// could not be established" from "the command ran and failed". 87 ==
+/// ERROR_INVALID_PARAMETER, a nod to the class of failure; but a real child CAN
+/// exit 87, so this is ambiguous on its own. The helper also prints a
+/// `cortex-sandbox-helper:` line on stderr before exiting this way.
+/// TODO(windows-build): replace with an unambiguous signal (the Node side
+/// keying on the stderr sentinel, or a dedicated status pipe) instead of an
+/// exit code a child could also produce.
 #[cfg(windows)]
 const SETUP_FAILURE_EXIT: i32 = 87;
 
@@ -78,6 +83,8 @@ fn run() -> Result<u32, Box<dyn std::error::Error>> {
     }
 
     // ---- policy ----
+    // TODO(windows-build): reject a policy file not owned by the current user
+    // (see the note on Policy::load in policy.rs).
     let policy = policy::Policy::load(Path::new(policy_path))?;
 
     // ---- principals ----
@@ -96,6 +103,16 @@ fn run() -> Result<u32, Box<dyn std::error::Error>> {
     // Deny read on secret paths and deny write on the agent config. Applied only
     // to paths that exist (a missing secret has nothing to read); an existing
     // path that fails to get its deny ACE is a containment hole => fatal.
+    //
+    // HONESTY NOTE: under this Tier-1 same-user token the deny-READ ACEs are
+    // INERT. WRITE_RESTRICTED means the restricting-SID check applies to write
+    // access only; reads are evaluated against the normal token, which allows
+    // the user's own files, so secret files stay readable. They are applied
+    // anyway because they are harmless here and a Tier-2 dedicated-user token
+    // (which does evaluate them) inherits the protection. Tier 1's actual
+    // credential control is the env scrub on the Node side. The deny-WRITE ACEs
+    // are effective: writes do consult the restricting SID and deny ACEs are
+    // ordered before allows.
     for secret in &policy.deny_read_paths {
         if secret.exists() {
             acl::deny_read(secret, &cap)
