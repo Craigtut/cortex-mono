@@ -8,26 +8,33 @@
  *   1. builds a WRITE_RESTRICTED restricted token carrying a synthetic
  *      capability SID (writes must pass BOTH the normal token AND a restricting
  *      SID, so a write succeeds only where that cap SID has an allow ACE),
- *   2. grants the cap SID write ACEs on the workspace roots + a sandbox temp,
- *      layers deny-read ACEs over secret paths and deny-write over the agent
- *      config, then drops the token to Low integrity,
- *   3. launches the child in a kill-on-close job object with process
- *      mitigations, relays stdio, and returns the child's exit code.
+ *   2. grants the cap SID write ACEs on the workspace roots + a sandbox temp
+ *      and layers deny-write ACEs over the agent config and the policy file's
+ *      own directory; deny-read ACEs are also applied to secret paths but are
+ *      INERT at Tier 1 (see the honesty contract below),
+ *   3. optionally drops the token to Low integrity (off by default), launches
+ *      the child in a kill-on-close job object with process mitigations, relays
+ *      stdio, and returns the child's exit code.
  *
  * Honesty contract (see docs/cortex/sandboxing.md, "Layer 3: native Windows"):
- * Tier 1 is unelevated, so the FILESYSTEM boundary is real (`enforced`) but the
- * NETWORK boundary is NOT: proxy env vars are the only control and a command
- * that opens a socket directly ignores them. So status reports network `none`,
- * never `partial`. Hard network enforcement is the future elevated Tier 2 (WFP).
- * When the helper binary is absent we report fully UNCONTAINED `none` and pass
- * spawns through unchanged, exactly like the POSIX provider on an unsupported
- * host.
+ * Tier 1 is unelevated and same-user. That buys real WRITE confinement and
+ * env-credential scrubbing, but NOT secret-file-read denial: a WRITE_RESTRICTED
+ * token evaluates the restricting capability SID for write access only, reads
+ * ride the normal (same-user) token, so a deny-read ACE keyed to the cap SID
+ * never fires and secret files stay readable. Read denial needs the elevated
+ * Tier-2 dedicated-user backend. The NETWORK boundary is also absent: proxy env
+ * vars are the only control and a command that opens a socket directly ignores
+ * them. So status reports filesystem `partial` (never `enforced`) and network
+ * `none` (never `partial`). When the helper binary is absent we report fully
+ * UNCONTAINED `none` and pass spawns through unchanged, exactly like the POSIX
+ * provider on an unsupported host.
  *
  * The policy serialization and argv construction are pure functions
  * (`serializeWindowsPolicy`, `buildHelperInvocation`) so they are unit-testable
  * on any platform without the helper binary or a Windows host.
  */
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -58,25 +65,44 @@ export const WINDOWS_POLICY_VERSION = 1 as const;
 export interface WindowsHelperPolicy {
   version: typeof WINDOWS_POLICY_VERSION;
   /**
-   * Stable per-install name the helper feeds to DeriveCapabilitySidsFromName to
-   * derive the restricting capability SID. Deterministic: the same name yields
-   * the same SID across runs, so ACEs are reused, not accumulated. Must come
+   * Name the helper feeds to DeriveCapabilitySidsFromName to derive the
+   * restricting capability SID. Derived per install AND per workspace (the base
+   * name plus a stable hash of the canonical workspace roots, see
+   * `deriveWorkspaceCapabilitySidName`): grant-write ACEs persist on disk, so a
+   * workspace-specific SID keeps one workspace's accreted grants from
+   * authorizing a token created for another workspace. Deterministic for a
+   * given workspace: re-running reuses ACEs rather than accumulating. Must come
    * from trusted config, never model input.
    */
   capabilitySidName: string;
   /**
    * Absolute paths the sandboxed process may write. Established from trusted
    * session config, NEVER widened by a model-controlled cwd (CVE-2025-59532).
-   * Includes the sandbox temp.
+   * Includes the sandbox temp but never the host's real temp root (which would
+   * otherwise be granted to the cap SID and, with lowIntegrity, persistently
+   * Low-labeled).
    */
   writableRoots: string[];
   /** The per-session sandbox temp dir (a member of writableRoots, named so the helper can label it). */
   sandboxTemp: string;
-  /** Absolute paths that must never be readable (secret stores, credential files). */
+  /**
+   * Secret paths (stores, credential files) given deny-read ACEs for the
+   * capability SID. INERT at Tier 1: under a same-user WRITE_RESTRICTED token,
+   * reads never consult the restricting SID, so these ACEs do NOT stop the
+   * child reading secrets (credential env scrubbing is Tier 1's actual
+   * control). Kept in the contract because the ACEs are harmless here and a
+   * Tier-2 dedicated-user token evaluates them for real.
+   */
   denyReadPaths: string[];
-  /** Absolute paths that must never be written (agent config, .git/hooks, .git/config). */
+  /**
+   * Absolute paths that must never be written (agent config, .git/hooks,
+   * .git/config, and the policy file's own directory so a sandboxed command
+   * cannot rewrite the policy that governs the next command). Effective at
+   * Tier 1: writes DO consult the restricting SID and deny ACEs are evaluated
+   * first.
+   */
   denyWritePaths: string[];
-  /** Drop the child token to Low integrity (default true). See the runbook for the MIC tradeoff. */
+  /** Drop the child token to Low integrity (default false). See the runbook for the MIC tradeoff. */
   lowIntegrity: boolean;
 }
 
@@ -88,13 +114,24 @@ export interface WindowsRestrictedTokenProviderOptions {
    */
   helperPath?: string;
   /**
-   * Stable, per-install-unique name used to derive the capability SID. Two
-   * installs on a shared machine SHOULD pass different names so their ACEs never
-   * cross-grant. Defaults to a fixed name; consumers are strongly encouraged to
-   * override with a per-install identifier.
+   * Base name used to derive the capability SID name; the provider appends a
+   * stable per-workspace hash (`deriveWorkspaceCapabilitySidName`) so grant
+   * ACEs persisted on one workspace never authorize a session in another. Two
+   * installs on a shared machine SHOULD still pass different base names so
+   * their ACEs never cross-grant even for the same workspace path. Defaults to
+   * DEFAULT_CAPABILITY_SID_NAME.
    */
   capabilitySidName?: string;
-  /** Drop the child to Low integrity. Default true. */
+  /**
+   * Drop the child to Low integrity for a third, MIC-level write gate. Default
+   * FALSE, matching Codex (which ships Medium/LUA_TOKEN): Low persistently
+   * Low-labels the writable roots and can block the child from editing
+   * pre-existing Medium-integrity files inside the workspace. The
+   * WRITE_RESTRICTED cap-SID mechanism fully confines writes without it. When
+   * enabled, only the workspace roots and the dedicated sandbox temp are ever
+   * labeled; the host's real temp root never is (it is excluded from
+   * writableRoots).
+   */
   lowIntegrity?: boolean;
   /** Notified with the honest degradation reasons whenever enforcement is reduced. */
   onDegraded?: (degradations: string[]) => void;
@@ -106,19 +143,34 @@ export interface WindowsRestrictedTokenProviderOptions {
   credentialEnvVars?: string[];
   /** Test seam: existence check for the helper binary. Defaults to fs.existsSync. */
   fileExists?: (path: string) => boolean;
-  /** Test seam: writes the policy JSON and returns the file path. Defaults to a temp file. */
-  writePolicyFile?: (json: string) => string;
-  /** Test seam: removes the policy file on dispose. Defaults to fs.rmSync. */
-  removePolicyFile?: (path: string) => void;
+  /**
+   * Test seam: creates the per-session directory that will hold the policy
+   * file and returns it. The directory MUST NOT be under any writable root
+   * (initialize verifies and refuses to enforce otherwise): a policy file the
+   * sandboxed child could rewrite would let one command choose the next
+   * command's writable roots. Defaults to a fresh dir under os.tmpdir(), which
+   * is itself never a writable root (see serializeWindowsPolicy).
+   */
+  createPolicyDir?: () => string;
+  /** Test seam: writes the policy JSON into the directory and returns the file path. Defaults to `<dir>/policy.json`, mode 0600. */
+  writePolicyFile?: (dir: string, json: string) => string;
+  /** Test seam: removes the policy directory on dispose/re-init. Defaults to fs.rmSync recursive. */
+  removePolicyDir?: (dir: string) => void;
 }
 
-/** The default per-install cap SID name when the consumer does not supply one. */
+/** The default capability SID BASE name; the per-workspace hash is appended. */
 export const DEFAULT_CAPABILITY_SID_NAME = 'cortex-sandbox';
+
+const FILESYSTEM_TIER1_DEGRADATION =
+  'Tier 1 confines writes and scrubs credential env vars, but does not deny ' +
+  'secret file reads (a same-user restricted token cannot: WRITE_RESTRICTED ' +
+  'only restricts write access); reads are broad. Read denial requires the ' +
+  'elevated Tier-2 dedicated-user backend.';
 
 const NETWORK_TIER1_DEGRADATION =
   'Network egress is not enforced on Windows Tier 1 (unelevated): only proxy ' +
-  'env vars constrain it and a direct socket bypasses them. Filesystem is ' +
-  'enforced; hard network enforcement needs the elevated Tier 2 (WFP).';
+  'env vars constrain it and a direct socket bypasses them. Hard network ' +
+  'enforcement needs the elevated Tier 2 (WFP).';
 
 const UNCONTAINED = (reason: string): SandboxStatus => ({
   filesystem: 'none',
@@ -138,26 +190,89 @@ export function defaultHelperPath(): string {
   return join(here, '..', 'vendor', 'win32-x64', 'cortex-sandbox-helper.exe');
 }
 
+/** Normalize a Windows path for comparison: one separator style, no trailing separator, case-folded. */
+function normalizeWindowsPath(path: string): string {
+  return path.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+}
+
+function isSameWindowsPath(a: string, b: string): boolean {
+  return normalizeWindowsPath(a) === normalizeWindowsPath(b);
+}
+
+/** True when `child` is strictly inside `parent` (not equal to it). */
+function isWindowsPathUnder(child: string, parent: string): boolean {
+  return normalizeWindowsPath(child).startsWith(normalizeWindowsPath(parent) + '\\');
+}
+
+function isUnderAnyRoot(path: string, roots: string[]): boolean {
+  return roots.some((root) => isSameWindowsPath(path, root) || isWindowsPathUnder(path, root));
+}
+
+/**
+ * Derive the per-workspace capability SID name: the trusted base name plus a
+ * stable hash of the canonical workspace roots (case-folded and sorted, so
+ * `C:\WS` vs `c:\ws` and root ordering do not change the identity).
+ *
+ * Why per-workspace: grant-write ACEs keyed to the cap SID persist on the
+ * workspace directories after the session ends. With one machine-wide SID, a
+ * later session in workspace B would run under a token whose cap SID still
+ * matches the ACEs left on workspace A, silently keeping A writable. A
+ * workspace-derived SID scopes each boundary to its own workspace while staying
+ * deterministic, so re-running the same workspace reuses ACEs instead of
+ * accumulating new ones.
+ */
+export function deriveWorkspaceCapabilitySidName(
+  baseName: string,
+  workspaceRoots: string[],
+): string {
+  const canonical = workspaceRoots.map(normalizeWindowsPath).sort().join('|');
+  const hash = createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 16);
+  return `${baseName}-${hash}`;
+}
+
 /**
  * Project a SandboxPolicy plus per-session metadata into the helper's on-disk
- * contract. Pure: no fs, no platform checks, no clock. The sandbox temp is
- * appended to writableRoots if the caller has not already included it, so the
- * child can always write its own temp.
+ * contract. Pure: no fs, no platform checks, no clock.
+ *
+ *   - The sandbox temp is appended to writableRoots if not already present, so
+ *     the child can always write its own temp.
+ *   - `hostTempDir` (the machine's real temp root) is EXCLUDED from
+ *     writableRoots: the child's TEMP/TMP point at the dedicated sandbox temp
+ *     instead (see buildHelperInvocation), so the real temp root is never
+ *     granted to the cap SID nor Low-labeled.
+ *   - `policyFileDir` is appended to denyWritePaths so the sandbox itself
+ *     denies rewriting the policy that governs subsequent commands.
  */
 export function serializeWindowsPolicy(
   policy: SandboxPolicy,
-  meta: { sandboxTemp: string; capabilitySidName: string; lowIntegrity: boolean },
+  meta: {
+    sandboxTemp: string;
+    capabilitySidName: string;
+    lowIntegrity: boolean;
+    hostTempDir?: string;
+    policyFileDir?: string;
+  },
 ): WindowsHelperPolicy {
-  const writableRoots = policy.filesystem.writableRoots.includes(meta.sandboxTemp)
-    ? [...policy.filesystem.writableRoots]
-    : [...policy.filesystem.writableRoots, meta.sandboxTemp];
+  const roots = policy.filesystem.writableRoots.filter(
+    (root) => meta.hostTempDir === undefined || !isSameWindowsPath(root, meta.hostTempDir),
+  );
+  const writableRoots = roots.some((root) => isSameWindowsPath(root, meta.sandboxTemp))
+    ? [...roots]
+    : [...roots, meta.sandboxTemp];
+  const denyWritePaths = [...policy.filesystem.denyWrite];
+  if (
+    meta.policyFileDir !== undefined &&
+    !denyWritePaths.some((p) => isSameWindowsPath(p, meta.policyFileDir as string))
+  ) {
+    denyWritePaths.push(meta.policyFileDir);
+  }
   return {
     version: WINDOWS_POLICY_VERSION,
     capabilitySidName: meta.capabilitySidName,
     writableRoots,
     sandboxTemp: meta.sandboxTemp,
     denyReadPaths: [...policy.filesystem.denyRead],
-    denyWritePaths: [...policy.filesystem.denyWrite],
+    denyWritePaths,
     lowIntegrity: meta.lowIntegrity,
   };
 }
@@ -167,19 +282,22 @@ export function serializeWindowsPolicy(
  *   file = helperPath
  *   args = [policyFilePath, '--', shell, ...shellArgs, command]
  * The env is passed through the provided scrubber so ambient credential env
- * vars never reach the child. Pure given its inputs.
+ * vars never reach the child, and TEMP/TMP are pointed at the dedicated
+ * sandbox temp: the host's real temp root is not a writable root, so a child
+ * writing to its default %TEMP% would otherwise fail. Pure given its inputs.
  */
 export function buildHelperInvocation(params: {
   helperPath: string;
   policyFilePath: string;
+  sandboxTemp: string;
   spec: SandboxSpawnSpec;
   scrubEnv: (env: Record<string, string>) => Record<string, string>;
 }): WrappedSpawn {
-  const { helperPath, policyFilePath, spec, scrubEnv } = params;
+  const { helperPath, policyFilePath, sandboxTemp, spec, scrubEnv } = params;
   return {
     file: helperPath,
     args: [policyFilePath, '--', spec.shell, ...spec.shellArgs, spec.command],
-    env: scrubEnv(spec.env),
+    env: { ...scrubEnv(spec.env), TEMP: sandboxTemp, TMP: sandboxTemp },
   };
 }
 
@@ -195,22 +313,27 @@ const WINDOWS_DENIAL_MARKERS: Array<{ pattern: RegExp; dimension: SandboxDenial[
 export class WindowsRestrictedTokenProvider implements SandboxProvider {
   private currentStatus: SandboxStatus = UNCONTAINED('not initialized');
   private policyFilePath: string | undefined;
+  private policyDir: string | undefined;
+  private sandboxTemp: string | undefined;
   private readonly helperPath: string;
-  private readonly capabilitySidName: string;
+  private readonly capabilitySidBaseName: string;
   private readonly lowIntegrity: boolean;
   private readonly credentialEnvVars: string[];
   private readonly fileExists: (path: string) => boolean;
-  private readonly writePolicyFile: (json: string) => string;
-  private readonly removePolicyFile: (path: string) => void;
+  private readonly createPolicyDir: () => string;
+  private readonly writePolicyFile: (dir: string, json: string) => string;
+  private readonly removePolicyDir: (dir: string) => void;
 
   constructor(private readonly options: WindowsRestrictedTokenProviderOptions = {}) {
     this.helperPath = options.helperPath ?? defaultHelperPath();
-    this.capabilitySidName = options.capabilitySidName ?? DEFAULT_CAPABILITY_SID_NAME;
-    this.lowIntegrity = options.lowIntegrity ?? true;
+    this.capabilitySidBaseName = options.capabilitySidName ?? DEFAULT_CAPABILITY_SID_NAME;
+    this.lowIntegrity = options.lowIntegrity ?? false;
     this.credentialEnvVars = options.credentialEnvVars ?? [...DEFAULT_CREDENTIAL_ENV_VARS];
     this.fileExists = options.fileExists ?? ((p) => existsSync(p));
+    this.createPolicyDir = options.createPolicyDir ?? defaultCreatePolicyDir;
     this.writePolicyFile = options.writePolicyFile ?? defaultWritePolicyFile;
-    this.removePolicyFile = options.removePolicyFile ?? ((p) => rmSync(p, { force: true }));
+    this.removePolicyDir =
+      options.removePolicyDir ?? ((dir) => rmSync(dir, { recursive: true, force: true }));
   }
 
   async initialize(policy: SandboxPolicy): Promise<SandboxStatus> {
@@ -230,18 +353,66 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
       );
     }
 
-    // A rung change re-initializes: drop the previous policy file first.
-    this.cleanupPolicyFile();
+    // A rung change re-initializes: drop the previous policy dir first.
+    this.cleanupPolicyDir();
 
+    const hostTempDir = canonicalHostTempDir();
     const sandboxTemp = this.resolveSandboxTemp(policy);
+    // The workspace identity for the cap SID: writable roots minus anything
+    // temp-flavored (the host temp root, dirs under it, the sandbox temp).
+    // Per-session temp dirs would otherwise churn the hash every session and
+    // reintroduce the cross-session ACE accretion the hash exists to stop.
+    const workspaceRoots = policy.filesystem.writableRoots.filter(
+      (root) =>
+        !isSameWindowsPath(root, hostTempDir) &&
+        !isWindowsPathUnder(root, hostTempDir) &&
+        !isSameWindowsPath(root, sandboxTemp),
+    );
+    const capabilitySidName = deriveWorkspaceCapabilitySidName(
+      this.capabilitySidBaseName,
+      workspaceRoots,
+    );
+
+    let policyDir: string;
+    try {
+      policyDir = this.createPolicyDir();
+    } catch (err) {
+      return this.setStatus(
+        UNCONTAINED(
+          `Could not create the Windows sandbox policy directory: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        ),
+      );
+    }
+
     const helperPolicy = serializeWindowsPolicy(policy, {
       sandboxTemp,
-      capabilitySidName: this.capabilitySidName,
+      capabilitySidName,
       lowIntegrity: this.lowIntegrity,
+      hostTempDir,
+      policyFileDir: policyDir,
     });
+
+    // TOCTOU guard: a policy file inside a writable root could be rewritten by
+    // a sandboxed command, letting one command choose the next command's
+    // writable roots. Refuse to claim enforcement rather than enforce a
+    // rewritable policy.
+    if (isUnderAnyRoot(policyDir, helperPolicy.writableRoots)) {
+      this.removePolicyDirSafe(policyDir);
+      return this.setStatus(
+        UNCONTAINED(
+          `Windows sandbox policy directory ${policyDir} is inside a writable root; ` +
+            `a sandboxed command could rewrite the policy, so the sandbox was not established.`,
+        ),
+      );
+    }
+
     try {
-      this.policyFilePath = this.writePolicyFile(JSON.stringify(helperPolicy, null, 2));
+      this.policyFilePath = this.writePolicyFile(policyDir, JSON.stringify(helperPolicy, null, 2));
+      this.policyDir = policyDir;
     } catch (err) {
+      this.removePolicyDirSafe(policyDir);
       return this.setStatus(
         UNCONTAINED(
           `Could not write the Windows sandbox policy file: ${
@@ -250,25 +421,33 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
         ),
       );
     }
+    this.sandboxTemp = sandboxTemp;
 
-    // Filesystem is genuinely enforced by the helper; network is not (Tier 1).
+    // Honest Tier-1 status: writes confined + env creds scrubbed, but secret
+    // READS are not denied (so filesystem `partial`, never `enforced`) and
+    // there is no network boundary (`none`, never `partial`).
     return this.setStatus({
-      filesystem: 'enforced',
+      filesystem: 'partial',
       network: 'none',
       backend: 'win-restricted-token',
-      degradations: [NETWORK_TIER1_DEGRADATION],
+      degradations: [FILESYSTEM_TIER1_DEGRADATION, NETWORK_TIER1_DEGRADATION],
     });
   }
 
   async wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn> {
     // Not enforcing (non-win32 or helper absent): pass through so the command
     // still runs. Status already reports this as uncontained.
-    if (this.currentStatus.backend === 'none' || this.policyFilePath === undefined) {
+    if (
+      this.currentStatus.backend === 'none' ||
+      this.policyFilePath === undefined ||
+      this.sandboxTemp === undefined
+    ) {
       return { file: spec.shell, args: [...spec.shellArgs, spec.command], env: spec.env };
     }
     return buildHelperInvocation({
       helperPath: this.helperPath,
       policyFilePath: this.policyFilePath,
+      sandboxTemp: this.sandboxTemp,
       spec,
       scrubEnv: (env) => this.scrubCredentialEnv(env),
     });
@@ -281,7 +460,8 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
   /**
    * Remove the credential env vars this provider strips, so a sandboxed (or
    * escalated) command never inherits ambient secrets. Same contract as the
-   * POSIX provider: filesystem deny-reads do not cover env-var secrets.
+   * POSIX provider. On Tier-1 Windows this is the PRIMARY credential control:
+   * filesystem deny-reads are inert under the same-user restricted token.
    */
   scrubCredentialEnv(env: Record<string, string>): Record<string, string> {
     if (this.credentialEnvVars.length === 0) return env;
@@ -315,27 +495,34 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
   }
 
   async dispose(): Promise<void> {
-    this.cleanupPolicyFile();
+    this.cleanupPolicyDir();
+    this.sandboxTemp = undefined;
     this.currentStatus = UNCONTAINED('disposed');
   }
 
   private resolveSandboxTemp(policy: SandboxPolicy): string {
     // Prefer a writable root that already looks like a per-session temp; else
-    // fall back to a fresh temp dir. The helper labels this dir Low so a
-    // Low-integrity child can write it (see the MIC note in the runbook).
+    // fall back to a fresh temp dir. When lowIntegrity is on, the helper labels
+    // this dir Low so the Low child can write it; only this dedicated dir is
+    // ever labeled, never the host temp root itself.
     const provided = policy.filesystem.writableRoots.find((r) => /cortex-sbx-/i.test(r));
     if (provided) return provided;
     return mkdtempSync(join(tmpdir(), 'cortex-sbx-'));
   }
 
-  private cleanupPolicyFile(): void {
-    if (this.policyFilePath !== undefined) {
-      try {
-        this.removePolicyFile(this.policyFilePath);
-      } catch {
-        // Best-effort: a leftover policy file is inert (the helper only reads it).
-      }
-      this.policyFilePath = undefined;
+  private cleanupPolicyDir(): void {
+    if (this.policyDir !== undefined) {
+      this.removePolicyDirSafe(this.policyDir);
+      this.policyDir = undefined;
+    }
+    this.policyFilePath = undefined;
+  }
+
+  private removePolicyDirSafe(dir: string): void {
+    try {
+      this.removePolicyDir(dir);
+    } catch {
+      // Best-effort: a leftover policy file is inert (the helper only reads it).
     }
   }
 
@@ -348,8 +535,24 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
   }
 }
 
-function defaultWritePolicyFile(json: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'cortex-sbx-policy-'));
+/** The host's real temp root, canonicalized the same way buildDefaultPolicy does. */
+function canonicalHostTempDir(): string {
+  const t = tmpdir();
+  try {
+    return realpathSync.native(t);
+  } catch {
+    return t;
+  }
+}
+
+function defaultCreatePolicyDir(): string {
+  // Under the host temp root, which is never a writable root (the dedicated
+  // sandbox temp replaces it), so the sandboxed child cannot reach this file.
+  // initialize() verifies that and denyWritePaths covers it as well.
+  return mkdtempSync(join(tmpdir(), 'cortex-sbx-policy-'));
+}
+
+function defaultWritePolicyFile(dir: string, json: string): string {
   const path = join(dir, 'policy.json');
   writeFileSync(path, json, { encoding: 'utf8', mode: 0o600 });
   return path;

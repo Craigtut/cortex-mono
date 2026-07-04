@@ -3,6 +3,7 @@ import {
   WindowsRestrictedTokenProvider,
   serializeWindowsPolicy,
   buildHelperInvocation,
+  deriveWorkspaceCapabilitySidName,
   WINDOWS_POLICY_VERSION,
   DEFAULT_CAPABILITY_SID_NAME,
 } from '../src/windows.js';
@@ -17,6 +18,7 @@ import type { SandboxPolicy, SandboxSpawnSpec } from '@animus-labs/cortex';
 
 const WS_ROOT = 'C:\\Users\\dev\\project';
 const SBX_TEMP = 'C:\\Users\\dev\\AppData\\Local\\Temp\\cortex-sbx-abc';
+const POLICY_DIR = 'C:\\ProgramData\\cortex\\cortex-sbx-policy-1';
 
 function windowsWorkspacePolicy(): SandboxPolicy {
   // buildDefaultPolicy canonicalizes via realpath; these Windows paths do not
@@ -39,19 +41,31 @@ function spec(overrides: Partial<SandboxSpawnSpec> = {}): SandboxSpawnSpec {
   };
 }
 
+async function onWin32<T>(fn: () => Promise<T>): Promise<T> {
+  // Force the win32 branch regardless of the host running the test.
+  const original = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    return await fn();
+  } finally {
+    if (original) Object.defineProperty(process, 'platform', original);
+  }
+}
+
 describe('serializeWindowsPolicy', () => {
   it('projects the policy into the helper contract with the version stamp', () => {
     const json = serializeWindowsPolicy(windowsWorkspacePolicy(), {
       sandboxTemp: SBX_TEMP,
-      capabilitySidName: 'cortex-sandbox-install-42',
+      capabilitySidName: 'cortex-sandbox-install-42-abc123',
       lowIntegrity: true,
     });
     expect(json.version).toBe(WINDOWS_POLICY_VERSION);
-    expect(json.capabilitySidName).toBe('cortex-sandbox-install-42');
+    expect(json.capabilitySidName).toBe('cortex-sandbox-install-42-abc123');
     expect(json.lowIntegrity).toBe(true);
     expect(json.writableRoots).toContain(WS_ROOT);
     expect(json.sandboxTemp).toBe(SBX_TEMP);
     // Secret stores and persistence targets flow through from the default policy.
+    // (The deny-read ACEs are inert at Tier 1 but stay in the contract.)
     expect(json.denyReadPaths.some((p) => p.endsWith('.ssh'))).toBe(true);
     expect(json.denyWritePaths.some((p) => p.endsWith('.gitconfig'))).toBe(true);
   });
@@ -79,6 +93,43 @@ describe('serializeWindowsPolicy', () => {
     expect(json.lowIntegrity).toBe(false);
   });
 
+  it('excludes the host temp root from writableRoots (never granted, never Low-labeled)', () => {
+    const hostTemp = 'C:\\Users\\dev\\AppData\\Local\\Temp';
+    const policy = windowsWorkspacePolicy();
+    policy.filesystem.writableRoots = [WS_ROOT, hostTemp];
+    const json = serializeWindowsPolicy(policy, {
+      sandboxTemp: SBX_TEMP,
+      capabilitySidName: 'x',
+      lowIntegrity: false,
+      // Case and separator differences must not defeat the exclusion.
+      hostTempDir: 'c:/users/dev/appdata/local/temp',
+    });
+    expect(json.writableRoots).toEqual([WS_ROOT, SBX_TEMP]);
+  });
+
+  it('adds the policy file directory to denyWritePaths so the sandbox protects its own policy', () => {
+    const json = serializeWindowsPolicy(windowsWorkspacePolicy(), {
+      sandboxTemp: SBX_TEMP,
+      capabilitySidName: 'x',
+      lowIntegrity: false,
+      policyFileDir: POLICY_DIR,
+    });
+    expect(json.denyWritePaths).toContain(POLICY_DIR);
+  });
+
+  it('does not duplicate the policy dir in denyWritePaths when already present', () => {
+    const policy = windowsWorkspacePolicy();
+    policy.filesystem.denyWrite = [...policy.filesystem.denyWrite, POLICY_DIR.toLowerCase()];
+    const json = serializeWindowsPolicy(policy, {
+      sandboxTemp: SBX_TEMP,
+      capabilitySidName: 'x',
+      lowIntegrity: false,
+      policyFileDir: POLICY_DIR,
+    });
+    const matches = json.denyWritePaths.filter((p) => p.toLowerCase() === POLICY_DIR.toLowerCase());
+    expect(matches).toHaveLength(1);
+  });
+
   it('is JSON-round-trippable (no undefined or non-serializable fields)', () => {
     const json = serializeWindowsPolicy(windowsWorkspacePolicy(), {
       sandboxTemp: SBX_TEMP,
@@ -89,11 +140,27 @@ describe('serializeWindowsPolicy', () => {
   });
 });
 
+describe('deriveWorkspaceCapabilitySidName', () => {
+  it('is deterministic and scoped per workspace', () => {
+    const a = deriveWorkspaceCapabilitySidName('cortex-sandbox', ['C:\\ws-a']);
+    const b = deriveWorkspaceCapabilitySidName('cortex-sandbox', ['C:\\ws-b']);
+    expect(a).toBe(deriveWorkspaceCapabilitySidName('cortex-sandbox', ['C:\\ws-a']));
+    expect(a).not.toBe(b);
+    expect(a).toMatch(/^cortex-sandbox-[0-9a-f]{16}$/);
+  });
+
+  it('ignores path case, separator style, and root ordering', () => {
+    const one = deriveWorkspaceCapabilitySidName('base', ['C:\\WS', 'D:\\Other']);
+    expect(deriveWorkspaceCapabilitySidName('base', ['d:/other', 'c:/ws'])).toBe(one);
+  });
+});
+
 describe('buildHelperInvocation', () => {
   it('puts the policy file first, then -- then shell+args+command', () => {
     const wrapped = buildHelperInvocation({
       helperPath: 'C:\\cortex\\helper.exe',
       policyFilePath: 'C:\\Temp\\policy.json',
+      sandboxTemp: SBX_TEMP,
       spec: spec(),
       scrubEnv: (e) => e,
     });
@@ -113,6 +180,7 @@ describe('buildHelperInvocation', () => {
     const wrapped = buildHelperInvocation({
       helperPath: 'h.exe',
       policyFilePath: 'p.json',
+      sandboxTemp: SBX_TEMP,
       spec: spec(),
       scrubEnv: (e) => {
         const { GITHUB_TOKEN: _drop, ...rest } = e;
@@ -123,10 +191,26 @@ describe('buildHelperInvocation', () => {
     expect(wrapped.env['PATH']).toBe('C:\\Windows\\System32');
   });
 
+  it('points TEMP and TMP at the dedicated sandbox temp (the real temp root is not writable)', () => {
+    const wrapped = buildHelperInvocation({
+      helperPath: 'h.exe',
+      policyFilePath: 'p.json',
+      sandboxTemp: SBX_TEMP,
+      spec: spec({
+        env: { PATH: 'x', TEMP: 'C:\\Users\\dev\\AppData\\Local\\Temp', TMP: 'C:\\OtherTemp' },
+      }),
+      scrubEnv: (e) => e,
+    });
+    expect(wrapped.env['TEMP']).toBe(SBX_TEMP);
+    expect(wrapped.env['TMP']).toBe(SBX_TEMP);
+    expect(wrapped.env['PATH']).toBe('x');
+  });
+
   it('preserves the -- separator so a command starting with a dash is not read as a flag', () => {
     const wrapped = buildHelperInvocation({
       helperPath: 'h.exe',
       policyFilePath: 'p.json',
+      sandboxTemp: SBX_TEMP,
       spec: spec({ command: '--version' }),
       scrubEnv: (e) => e,
     });
@@ -138,32 +222,102 @@ describe('buildHelperInvocation', () => {
 });
 
 describe('WindowsRestrictedTokenProvider.initialize (honest status)', () => {
-  it('reports filesystem enforced + network none when the helper is present (on win32)', async () => {
+  it('reports filesystem partial + network none when the helper is present (on win32)', async () => {
     let writtenJson: string | undefined;
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'C:\\cortex\\helper.exe',
       capabilitySidName: 'cortex-sandbox-install-7',
       fileExists: () => true,
-      writePolicyFile: (json) => {
+      createPolicyDir: () => POLICY_DIR,
+      writePolicyFile: (dir, json) => {
         writtenJson = json;
-        return 'C:\\Temp\\policy.json';
+        return `${dir}\\policy.json`;
       },
-      removePolicyFile: () => {},
+      removePolicyDir: () => {},
     });
-    // Force the win32 branch regardless of the host running the test.
-    const original = Object.getOwnPropertyDescriptor(process, 'platform');
-    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    try {
-      const status = await provider.initialize(windowsWorkspacePolicy());
-      expect(status.backend).toBe('win-restricted-token');
-      expect(status.filesystem).toBe('enforced');
-      expect(status.network).toBe('none');
-      expect(status.degradations.join(' ')).toMatch(/network/i);
-      expect(writtenJson).toBeDefined();
-      expect(JSON.parse(writtenJson as string).capabilitySidName).toBe('cortex-sandbox-install-7');
-    } finally {
-      if (original) Object.defineProperty(process, 'platform', original);
+    const status = await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
+    expect(status.backend).toBe('win-restricted-token');
+    // 'partial', never 'enforced': Tier 1 confines writes and scrubs credential
+    // env vars but cannot deny secret file reads (a same-user WRITE_RESTRICTED
+    // token restricts writes only; reads ride the normal token).
+    expect(status.filesystem).toBe('partial');
+    expect(status.network).toBe('none');
+    expect(status.degradations.some((d) => /secret file reads/i.test(d))).toBe(true);
+    expect(status.degradations.some((d) => /network/i.test(d))).toBe(true);
+
+    expect(writtenJson).toBeDefined();
+    const parsed = JSON.parse(writtenJson as string);
+    // The cap SID name is the base plus a stable per-workspace hash.
+    expect(parsed.capabilitySidName).toBe(
+      deriveWorkspaceCapabilitySidName('cortex-sandbox-install-7', [WS_ROOT]),
+    );
+    // Default integrity is Medium (Codex parity); Low is opt-in.
+    expect(parsed.lowIntegrity).toBe(false);
+    // The emitted policy protects its own directory from sandboxed writes.
+    expect(parsed.denyWritePaths).toContain(POLICY_DIR);
+  });
+
+  it('derives a different capability SID name per workspace', async () => {
+    async function capNameFor(root: string): Promise<string> {
+      let writtenJson = '';
+      const provider = new WindowsRestrictedTokenProvider({
+        helperPath: 'h.exe',
+        fileExists: () => true,
+        createPolicyDir: () => POLICY_DIR,
+        writePolicyFile: (_dir, json) => {
+          writtenJson = json;
+          return 'p.json';
+        },
+        removePolicyDir: () => {},
+      });
+      const policy = buildDefaultPolicy('workspace', {
+        workspaceRoots: [root],
+        home: 'C:\\Users\\dev',
+        sessionTmpDir: SBX_TEMP,
+      });
+      await onWin32(() => provider.initialize(policy));
+      return JSON.parse(writtenJson).capabilitySidName as string;
     }
+    const a = await capNameFor('C:\\Users\\dev\\workspace-a');
+    const b = await capNameFor('C:\\Users\\dev\\workspace-b');
+    expect(a).not.toBe(b);
+    expect(a).toBe(await capNameFor('C:\\Users\\dev\\workspace-a'));
+  });
+
+  it('honors the lowIntegrity opt-in', async () => {
+    let writtenJson = '';
+    const provider = new WindowsRestrictedTokenProvider({
+      helperPath: 'h.exe',
+      fileExists: () => true,
+      lowIntegrity: true,
+      createPolicyDir: () => POLICY_DIR,
+      writePolicyFile: (_dir, json) => {
+        writtenJson = json;
+        return 'p.json';
+      },
+      removePolicyDir: () => {},
+    });
+    await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
+    expect(JSON.parse(writtenJson).lowIntegrity).toBe(true);
+  });
+
+  it('refuses to enforce when the policy dir is inside a writable root (TOCTOU)', async () => {
+    const removed: string[] = [];
+    const nestedDir = 'C:\\Users\\dev\\project\\nested-policy';
+    const provider = new WindowsRestrictedTokenProvider({
+      helperPath: 'h.exe',
+      fileExists: () => true,
+      createPolicyDir: () => nestedDir,
+      writePolicyFile: () => {
+        throw new Error('must not be called: the policy dir is rewritable by the sandbox');
+      },
+      removePolicyDir: (dir) => removed.push(dir),
+    });
+    const status = await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
+    expect(status.backend).toBe('none');
+    expect(status.filesystem).toBe('none');
+    expect(status.degradations[0]).toMatch(/inside a writable root/i);
+    expect(removed).toEqual([nestedDir]);
   });
 
   it('reports fully uncontained none when the helper binary is absent (on win32)', async () => {
@@ -173,18 +327,12 @@ describe('WindowsRestrictedTokenProvider.initialize (honest status)', () => {
       fileExists: () => false,
       onDegraded: (d) => degraded.push(d),
     });
-    const original = Object.getOwnPropertyDescriptor(process, 'platform');
-    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    try {
-      const status = await provider.initialize(windowsWorkspacePolicy());
-      expect(status.backend).toBe('none');
-      expect(status.filesystem).toBe('none');
-      expect(status.network).toBe('none');
-      expect(status.degradations[0]).toMatch(/helper not found/i);
-      expect(degraded).toHaveLength(1);
-    } finally {
-      if (original) Object.defineProperty(process, 'platform', original);
-    }
+    const status = await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
+    expect(status.backend).toBe('none');
+    expect(status.filesystem).toBe('none');
+    expect(status.network).toBe('none');
+    expect(status.degradations[0]).toMatch(/helper not found/i);
+    expect(degraded).toHaveLength(1);
   });
 
   it('reports uncontained none on a non-win32 platform', async () => {
@@ -209,20 +357,15 @@ describe('WindowsRestrictedTokenProvider.wrapSpawn', () => {
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'C:\\cortex\\helper.exe',
       fileExists: () => true,
+      createPolicyDir: () => POLICY_DIR,
       writePolicyFile: () => 'C:\\Temp\\policy.json',
-      removePolicyFile: () => {},
+      removePolicyDir: () => {},
     });
-    const original = Object.getOwnPropertyDescriptor(process, 'platform');
-    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    try {
-      await provider.initialize(windowsWorkspacePolicy());
-    } finally {
-      if (original) Object.defineProperty(process, 'platform', original);
-    }
+    await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
     return provider;
   }
 
-  it('wraps through the helper and scrubs credential env vars from the child', async () => {
+  it('wraps through the helper, scrubs credential env vars, and wires TEMP/TMP to the sandbox temp', async () => {
     const provider = await enforcingProvider();
     const wrapped = await provider.wrapSpawn(spec());
     expect(wrapped.file).toBe('C:\\cortex\\helper.exe');
@@ -231,6 +374,9 @@ describe('WindowsRestrictedTokenProvider.wrapSpawn', () => {
     // GITHUB_TOKEN is a default credential var, scrubbed from the child.
     expect(wrapped.env).not.toHaveProperty('GITHUB_TOKEN');
     expect(wrapped.env['PATH']).toBe('C:\\Windows\\System32');
+    // Child temp writes land in the dedicated (writable) sandbox temp.
+    expect(wrapped.env['TEMP']).toBe(SBX_TEMP);
+    expect(wrapped.env['TMP']).toBe(SBX_TEMP);
   });
 
   it('passes the command through unwrapped when not enforcing', async () => {
@@ -251,16 +397,11 @@ describe('WindowsRestrictedTokenProvider.classifyFailure', () => {
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'h.exe',
       fileExists: () => true,
+      createPolicyDir: () => POLICY_DIR,
       writePolicyFile: () => 'p.json',
-      removePolicyFile: () => {},
+      removePolicyDir: () => {},
     });
-    const original = Object.getOwnPropertyDescriptor(process, 'platform');
-    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    try {
-      await provider.initialize(windowsWorkspacePolicy());
-    } finally {
-      if (original) Object.defineProperty(process, 'platform', original);
-    }
+    await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
     return provider;
   }
 
@@ -304,24 +445,21 @@ describe('createSandboxProvider factory', () => {
     );
   });
 
-  it('defaults the capability SID name when the consumer omits it', async () => {
+  it('derives the capability SID name from the default base when the consumer omits it', async () => {
     let writtenJson = '';
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'h.exe',
       fileExists: () => true,
-      writePolicyFile: (json) => {
+      createPolicyDir: () => POLICY_DIR,
+      writePolicyFile: (_dir, json) => {
         writtenJson = json;
         return 'p.json';
       },
-      removePolicyFile: () => {},
+      removePolicyDir: () => {},
     });
-    const original = Object.getOwnPropertyDescriptor(process, 'platform');
-    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    try {
-      await provider.initialize(windowsWorkspacePolicy());
-    } finally {
-      if (original) Object.defineProperty(process, 'platform', original);
-    }
-    expect(JSON.parse(writtenJson).capabilitySidName).toBe(DEFAULT_CAPABILITY_SID_NAME);
+    await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
+    expect(JSON.parse(writtenJson).capabilitySidName).toBe(
+      deriveWorkspaceCapabilitySidName(DEFAULT_CAPABILITY_SID_NAME, [WS_ROOT]),
+    );
   });
 });

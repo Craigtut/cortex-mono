@@ -8,8 +8,9 @@
  *
  * Both implement the same @animus-labs/cortex SandboxProvider interface, so the
  * consumer constructs one of these and wires it into CortexAgent identically.
- * Each provider still reports honest status (Windows: filesystem enforced,
- * network none; POSIX: enforced or a degraded `none` with reasons), so the
+ * Each provider still reports honest status (Windows Tier 1: filesystem
+ * `partial` because writes are confined but secret reads are not denied, and
+ * network `none`; POSIX: enforced or a degraded `none` with reasons), so the
  * consumer's warn/degrade/refuse decision is unchanged across platforms.
  */
 import { SandboxRuntimeProvider, type SandboxRuntimeProviderOptions } from './provider.js';
