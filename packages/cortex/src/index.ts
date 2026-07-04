@@ -274,6 +274,10 @@ export type {
   WrappedSpawn,
   SandboxDenial,
   SandboxProvider,
+  NetworkAccessRequest,
+  NetworkAccessScope,
+  NetworkAccessDecision,
+  ResolveNetworkAccess,
 } from './sandbox/index.js';
 
 // Compaction (Phase 5)

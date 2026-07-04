@@ -3467,6 +3467,9 @@ export class CortexAgent {
           systemPrompt: string;
           messages: Array<{ role: string; content: string }>;
         }),
+        // The consumer's unified egress gate, shared with sandboxed shell
+        // egress. Undefined = ungated, exactly as before.
+        resolveNetworkAccess: this.config.resolveNetworkAccess,
       }) as RegisteredTool);
     }
     // ToolSearch is auto-registered when deferred tools are enabled. The
@@ -4896,6 +4899,11 @@ export class CortexAgent {
     // contained by the same OS boundary. Sharing the instance (not cloning) is
     // correct: the underlying SandboxManager is a process-global singleton.
     if (this.config.sandbox) childCortexConfig.sandbox = this.config.sandbox;
+    // Share the egress gate so a sub-agent's WebFetch answers to the same
+    // network policy and grant set as the parent's.
+    if (this.config.resolveNetworkAccess) {
+      childCortexConfig.resolveNetworkAccess = this.config.resolveNetworkAccess;
+    }
     if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
     // Inherit tool result persistence so child tool calls (Bash, Grep, WebFetch
     // inside a sub-agent doing research) get the same protection as the parent.

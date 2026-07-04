@@ -96,6 +96,42 @@ export interface WrappedSpawn {
   env: Record<string, string>;
 }
 
+/**
+ * One network egress request, regardless of which path it travels. Shell
+ * commands reach the network through the sandbox egress proxy; WebFetch runs
+ * in-process on Node fetch. Both are the same question to the end user
+ * ("the agent wants to reach example.com"), so both are described by this
+ * shape and resolved by the same consumer decision function.
+ */
+export interface NetworkAccessRequest {
+  /** Hostname being reached (no scheme, no port). */
+  host: string;
+  /** Destination port when known (shell CONNECT requests carry one). */
+  port?: number | undefined;
+  /** Which egress path is asking: a sandboxed shell command or the in-process WebFetch tool. */
+  via: 'shell' | 'webfetch';
+  /** Full URL for webfetch requests. Shell egress only sees host and port. */
+  url?: string | undefined;
+}
+
+/** How durable an allow is. The consumer owns grant storage; this is its vocabulary. */
+export type NetworkAccessScope = 'once' | 'session' | 'always';
+
+export interface NetworkAccessDecision {
+  decision: 'allow' | 'deny';
+  /** Scope of an allow, when the consumer wants to report it (informational to core). */
+  scope?: NetworkAccessScope | undefined;
+}
+
+/**
+ * The single egress decision function, supplied by the consumer. Core calls it
+ * from in-process egress points (WebFetch); the consumer additionally wires the
+ * same function into its SandboxProvider's ask-callback so shell egress and
+ * in-process egress share one allowlist and one prompt. The consumer owns the
+ * allow logic (seeded allowlist, grants, prompting); core only asks.
+ */
+export type ResolveNetworkAccess = (req: NetworkAccessRequest) => Promise<NetworkAccessDecision>;
+
 /** Attribution of a failed tool result to a sandbox denial, for self-explaining UX. */
 export interface SandboxDenial {
   dimension: 'filesystem-read' | 'filesystem-write' | 'network' | 'unknown';

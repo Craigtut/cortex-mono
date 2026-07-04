@@ -17,4 +17,8 @@ export type {
   WrappedSpawn,
   SandboxDenial,
   SandboxProvider,
+  NetworkAccessRequest,
+  NetworkAccessScope,
+  NetworkAccessDecision,
+  ResolveNetworkAccess,
 } from './types.js';

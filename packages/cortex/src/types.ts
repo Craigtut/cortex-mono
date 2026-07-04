@@ -19,7 +19,7 @@ import type {
   ObservationEvent,
   ReflectionEvent,
 } from './compaction/observational/types.js';
-import type { SandboxProvider } from './sandbox/types.js';
+import type { SandboxProvider, ResolveNetworkAccess } from './sandbox/types.js';
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -248,6 +248,17 @@ export interface CortexAgentConfig {
    * When omitted, subprocess execution is unchanged. See docs/cortex/sandboxing.md.
    */
   sandbox?: SandboxProvider;
+
+  /**
+   * Single network egress decision, mirroring resolvePermission's shape. When
+   * configured, in-process egress points (WebFetch) call it before reaching the
+   * network and honor a deny with a policy-blocked tool result. The consumer
+   * should wire the same function into its SandboxProvider's ask-callback so
+   * shell egress and WebFetch share one allowlist and one prompt. Independent
+   * of the always-on SSRF guard: a private IP stays blocked even when the host
+   * is allowed. When omitted, in-process egress is ungated (as before).
+   */
+  resolveNetworkAccess?: ResolveNetworkAccess;
 
   /**
    * Whether the consumer is currently auto-approving tool calls.

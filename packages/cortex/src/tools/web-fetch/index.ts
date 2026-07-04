@@ -15,6 +15,7 @@ import { promises as dns } from 'node:dns';
 import { isIPv4, isIPv6 } from 'node:net';
 import { Type, type Static } from 'typebox';
 import type { ToolContentDetails } from '../../types.js';
+import type { ResolveNetworkAccess } from '../../sandbox/types.js';
 import { WebFetchCache } from './cache.js';
 import type { CortexToolRuntime } from '../runtime.js';
 import { attachRuntimeAwareTool } from '../runtime.js';
@@ -161,6 +162,13 @@ export interface WebFetchToolConfig {
   utilityComplete?: ((context: unknown) => Promise<unknown>) | undefined;
   /** Max fetches per agentic loop. */
   maxPerLoop?: number | undefined;
+  /**
+   * Consumer network policy gate, shared with sandboxed shell egress. Called
+   * before each network fetch; a deny returns a policy-blocked tool result.
+   * The SSRF/private-IP guard is separate and always on: it blocks a private
+   * target even when this callback allows the host. Omitted = no gating.
+   */
+  resolveNetworkAccess?: ResolveNetworkAccess | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +349,40 @@ export function createWebFetchTool(config: WebFetchToolConfig): {
         runtimeWebFetch.incrementFetchCount();
       } else {
         fetchesThisLoop++;
+      }
+
+      // Network policy gate: the same consumer decision function that governs
+      // sandboxed shell egress. Runs before any network I/O so a denied host is
+      // never reached (WebFetch is itself an exfiltration channel: a secret can
+      // ride out in the URL). Separate from the SSRF guard below, which stays
+      // always-on regardless of what the policy allows.
+      if (config.resolveNetworkAccess) {
+        const port = url.port
+          ? Number(url.port)
+          : (url.protocol === 'https:' ? 443 : 80);
+        let decision;
+        try {
+          decision = await config.resolveNetworkAccess({
+            host: url.hostname,
+            port,
+            via: 'webfetch',
+            url: urlStr,
+          });
+        } catch (err) {
+          // A failed policy resolution fails closed: without a decision we do
+          // not reach the network.
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: 'text', text: `Blocked by network policy: could not resolve access for ${url.hostname} (${msg})` }],
+            details: { finalUrl: urlStr, statusCode: 0, cacheHit: false, rawSize: 0, markdownSize: 0 },
+          };
+        }
+        if (decision.decision !== 'allow') {
+          return {
+            content: [{ type: 'text', text: `Blocked by network policy: ${url.hostname} is not allowed. The user declined access or the active network policy denies this host.` }],
+            details: { finalUrl: urlStr, statusCode: 0, cacheHit: false, rawSize: 0, markdownSize: 0 },
+          };
+        }
       }
 
       // DNS pre-resolution: resolve hostname and validate the IP is not private.

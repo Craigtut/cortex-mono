@@ -486,6 +486,156 @@ describe('WebFetch tool', () => {
     });
   });
 
+  // Unified egress gate: the consumer's resolveNetworkAccess decision
+  describe('network policy gate', () => {
+    it('deny returns a policy-blocked result and never fetches', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected network call'));
+      const tool = createWebFetchTool({
+        resolveNetworkAccess: async () => ({ decision: 'deny' }),
+      });
+
+      const result = await tool.execute({ url: 'https://evil.example.com/?leak=secret', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('Blocked by network policy');
+      expect(text).toContain('evil.example.com');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      tool.getCache().destroy();
+    });
+
+    it('allow proceeds with the fetch', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('<html><body><p>Allowed content</p></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+      const tool = createWebFetchTool({
+        resolveNetworkAccess: async () => ({ decision: 'allow', scope: 'once' }),
+      });
+
+      const result = await tool.execute({ url: 'https://example.com/page', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).not.toContain('Blocked by network policy');
+      expect(text).toContain('Allowed content');
+      tool.getCache().destroy();
+    });
+
+    it('passes host, port, via, and url to the resolver', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('<html><body>ok</body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+      const requests: unknown[] = [];
+      const tool = createWebFetchTool({
+        resolveNetworkAccess: async (req) => {
+          requests.push(req);
+          return { decision: 'allow' };
+        },
+      });
+
+      await tool.execute({ url: 'https://example.com/page', prompt: 'test' });
+
+      expect(requests).toEqual([{
+        host: 'example.com',
+        port: 443,
+        via: 'webfetch',
+        url: 'https://example.com/page',
+      }]);
+      tool.getCache().destroy();
+    });
+
+    it('no resolver configured leaves behavior unchanged', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('<html><body><p>Ungated content</p></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+
+      const result = await webFetchTool.execute({ url: 'https://example.com/page', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).not.toContain('Blocked by network policy');
+      expect(text).toContain('Ungated content');
+    });
+
+    it('SSRF guard still blocks a host that resolves privately even when the policy allows it', async () => {
+      vi.mocked(dns.lookup).mockResolvedValue({ address: '10.0.0.5', family: 4 } as never);
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected network call'));
+      const tool = createWebFetchTool({
+        resolveNetworkAccess: async () => ({ decision: 'allow', scope: 'always' }),
+      });
+
+      const result = await tool.execute({ url: 'https://internal.example.com/', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('URL rejected');
+      expect(text).toContain('private IP');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      tool.getCache().destroy();
+    });
+
+    it('SSRF guard rejects a literal private IP before the policy is even consulted', async () => {
+      const resolver = vi.fn(async () => ({ decision: 'allow' as const }));
+      const tool = createWebFetchTool({ resolveNetworkAccess: resolver });
+
+      const result = await tool.execute({ url: 'https://127.0.0.1/admin', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('URL rejected');
+      expect(resolver).not.toHaveBeenCalled();
+      tool.getCache().destroy();
+    });
+
+    it('fails closed when the resolver throws', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected network call'));
+      const tool = createWebFetchTool({
+        resolveNetworkAccess: async () => {
+          throw new Error('prompt infrastructure unavailable');
+        },
+      });
+
+      const result = await tool.execute({ url: 'https://example.com/', prompt: 'test' });
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+      expect(text).toContain('Blocked by network policy');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      tool.getCache().destroy();
+    });
+
+    it('serves a cached page without re-consulting the gate (no new egress happens)', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('<html><body><p>Cache me</p></body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+      let calls = 0;
+      let behavior: 'allow' | 'deny' = 'allow';
+      const tool = createWebFetchTool({
+        resolveNetworkAccess: async () => {
+          calls++;
+          return { decision: behavior };
+        },
+      });
+
+      await tool.execute({ url: 'https://example.com/cached', prompt: 'first' });
+      expect(calls).toBe(1);
+
+      // A later policy flip does not retract content already obtained: the
+      // cache hit performs no network I/O, so the gate is not consulted.
+      behavior = 'deny';
+      const result = await tool.execute({ url: 'https://example.com/cached', prompt: 'second' });
+      expect(result.details.cacheHit).toBe(true);
+      expect(calls).toBe(1);
+      tool.getCache().destroy();
+    });
+  });
+
   // Cross-host redirect detection tests
   describe('redirect handling', () => {
     it('returns redirect message for cross-host 301 redirect', async () => {
