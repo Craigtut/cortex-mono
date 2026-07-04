@@ -2,6 +2,7 @@ import { appendFile, mkdir, open, readFile, rename, rm, stat, unlink } from 'nod
 import { randomUUID } from 'node:crypto';
 import { dirname, join, basename } from 'node:path';
 import { homedir } from 'node:os';
+import { BASH_ESCALATION_PERMISSION_NAME } from '@animus-labs/cortex';
 import type { ClassifiedError } from '@animus-labs/cortex';
 
 const ACTIVITY_VERSION = 1;
@@ -169,6 +170,14 @@ export function buildActivityDisplaySummary(
     case 'Bash': {
       const command = firstString(args, ['command']);
       return command ? `Run shell: ${truncateForSummary(command)}` : 'Run shell';
+    }
+    case BASH_ESCALATION_PERMISSION_NAME: {
+      // An out-of-band decider (companion app) sees only this summary, so the
+      // uncontained-run stakes and the exact command must both be in it.
+      const command = firstString(args, ['command']);
+      return command
+        ? `Run shell OUTSIDE the sandbox: ${truncateForSummary(command)}`
+        : 'Run shell OUTSIDE the sandbox';
     }
     case 'Edit': {
       const filePath = firstString(args, ['file_path', 'path']);

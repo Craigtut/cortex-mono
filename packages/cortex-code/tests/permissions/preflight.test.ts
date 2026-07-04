@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { BASH_ESCALATION_PERMISSION_NAME } from '@animus-labs/cortex';
 import { preflightPermission, type PreflightDeps } from '../../src/permissions/preflight.js';
 import { PermissionRuleManager } from '../../src/permissions/rules.js';
 
@@ -158,6 +159,60 @@ describe('preflightPermission', () => {
       deps({ webFetchNetworkGated: true }),
     );
     expect(out.decision).toBe('prompt');
+  });
+
+  it('sandbox escalation always prompts, even in yolo mode', async () => {
+    const out = await preflightPermission(
+      BASH_ESCALATION_PERMISSION_NAME,
+      { command: 'docker build .', escalateOutsideSandbox: true },
+      deps({ yoloMode: true }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
+
+  it('sandbox escalation prompts even while the sandbox auto-run is active', async () => {
+    const out = await preflightPermission(
+      BASH_ESCALATION_PERMISSION_NAME,
+      { command: 'npm test', escalateOutsideSandbox: true },
+      deps({ sandboxBashEnforced: true }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
+
+  it('sandbox escalation is never auto-approved by an allow rule', async () => {
+    const out = await preflightPermission(
+      BASH_ESCALATION_PERMISSION_NAME,
+      { command: 'npm test', escalateOutsideSandbox: true },
+      deps({ matchRule: async () => 'allow' }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
+
+  it('a plain-Bash deny rule blocks escalation of the same command', async () => {
+    const seen: string[] = [];
+    const out = await preflightPermission(
+      BASH_ESCALATION_PERMISSION_NAME,
+      { command: 'git push', escalateOutsideSandbox: true },
+      deps({
+        matchRule: async (toolName) => {
+          seen.push(toolName);
+          return 'deny';
+        },
+      }),
+    );
+    expect(out.decision).toBe('block');
+    // Deny rules are written for the Bash tool; escalation must consult them
+    // under that name rather than dodging them via the synthetic one.
+    expect(seen).toEqual(['Bash']);
+  });
+
+  it('the catastrophic floor blocks escalation regardless of mode', async () => {
+    const out = await preflightPermission(
+      BASH_ESCALATION_PERMISSION_NAME,
+      { command: 'rm -rf /', escalateOutsideSandbox: true },
+      deps({ yoloMode: true, sandboxBashEnforced: true }),
+    );
+    expect(out.decision).toBe('block');
   });
 
   it('blocks a Write to ~/.cortex even in yolo mode (config-integrity floor)', async () => {

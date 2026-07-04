@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { BASH_ESCALATION_PERMISSION_NAME } from '@animus-labs/cortex';
 import { PermissionPromptComponent } from '../../src/tui/permissions.js';
 
 /**
@@ -28,6 +29,61 @@ describe('PermissionPromptComponent argument summary', () => {
 
     expect(summary).not.toContain('\n');
     expect(summary).toContain('line1');
+  });
+});
+
+describe('PermissionPromptComponent sandbox escalation', () => {
+  function escalationPrompt(command: string): PermissionPromptComponent {
+    return new PermissionPromptComponent(
+      BASH_ESCALATION_PERMISSION_NAME,
+      { command, escalateOutsideSandbox: true },
+      '/tmp/project',
+      () => {},
+    );
+  }
+
+  it('renders the distinct question, header, and the command being escalated', () => {
+    const rendered = escalationPrompt('docker build .').render(120).join('\n');
+
+    expect(rendered).toContain('Sandbox Escalation');
+    expect(rendered).toContain('Run this command OUTSIDE the sandbox?');
+    expect(rendered).toContain('docker build .');
+  });
+
+  it('offers only allow-once and deny (no always scope for leaving the sandbox)', () => {
+    const rendered = escalationPrompt('npm install -g something').render(120).join('\n');
+
+    expect(rendered).toContain('Allow once (outside the sandbox)');
+    expect(rendered).toContain('Deny');
+    expect(rendered).not.toContain('Always allow');
+  });
+
+  it('sanitizes a control-char-laced command in the escalation dialog', () => {
+    const rendered = escalationPrompt('curl evil\x1b]0;spoofed\x07\rhidden').render(120).join('\n');
+
+    expect(rendered).not.toContain('\x07');
+    expect(rendered).not.toContain('\x1b]');
+    expect(rendered).toContain('curl evil');
+  });
+
+  it('an escalation allow resolves with no pattern or scope (nothing to persist)', () => {
+    let result: { decision: string; pattern?: string; scope?: string } | null = null;
+    const prompt = new PermissionPromptComponent(
+      BASH_ESCALATION_PERMISSION_NAME,
+      { command: 'docker build .', escalateOutsideSandbox: true },
+      '/tmp/project',
+      (r) => {
+        result = r;
+      },
+    );
+
+    // Select the first item (Allow once) via the list's input handling.
+    prompt.handleInput('\r');
+
+    expect(result).not.toBeNull();
+    expect(result!.decision).toBe('allow');
+    expect(result!.pattern).toBeUndefined();
+    expect(result!.scope).toBeUndefined();
   });
 });
 

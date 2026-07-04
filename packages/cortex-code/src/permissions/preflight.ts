@@ -1,7 +1,11 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { findCatastrophicCommand, resolveThroughExistingAncestorSync } from '@animus-labs/cortex';
+import {
+  BASH_ESCALATION_PERMISSION_NAME,
+  findCatastrophicCommand,
+  resolveThroughExistingAncestorSync,
+} from '@animus-labs/cortex';
 import type { PermissionDecision } from './rules.js';
 
 export type PreflightOutcome =
@@ -89,8 +93,9 @@ function isProtectedConfigWrite(
 /**
  * Deterministic pre-prompt permission decision, ordered by trust floor:
  *
- *   1. Catastrophic Bash command  -> block   (never overridable)
+ *   1. Catastrophic Bash command  -> block   (never overridable; covers escalation too)
  *   1b. Write to Cortex config    -> block   (never overridable)
+ *   1c. Sandbox escalation        -> prompt  (Bash deny rules still block; nothing auto-approves)
  *   2. Yolo mode                  -> allow
  *   3. Explicit deny rule         -> block   (beats the read-only auto-approve)
  *   3b. Sandboxed Bash            -> allow   (the OS boundary is the control)
@@ -109,8 +114,10 @@ export async function preflightPermission(
   deps: PreflightDeps,
 ): Promise<PreflightOutcome> {
   // 1. Catastrophic Bash commands (e.g. rm -rf /) are blocked unconditionally,
-  //    ahead of yolo mode, the read-only bypass, and any allow rule.
-  if (toolName === 'Bash') {
+  //    ahead of yolo mode, the read-only bypass, and any allow rule. Applies
+  //    equally to escalation requests: a catastrophic command can never leave
+  //    the sandbox, whoever asks.
+  if (toolName === 'Bash' || toolName === BASH_ESCALATION_PERMISSION_NAME) {
     const finding = findCatastrophicCommand(
       String((toolArgs as Record<string, unknown>)['command'] ?? ''),
       { cwd: deps.cwd, home: deps.home ?? homedir() },
@@ -124,6 +131,17 @@ export async function preflightPermission(
   //     Write could otherwise forge a grant or disable the sandbox.
   if (isProtectedConfigWrite(toolName, toolArgs, deps.home ?? homedir(), deps.cwd)) {
     return { decision: 'block', reason: 'Writing Cortex configuration or credentials is not allowed' };
+  }
+
+  // 1c. Sandbox escalation: the model asking to run ONE command outside the OS
+  //     boundary. A deliberate exit from containment, so it is always a fresh
+  //     human decision: yolo, the sandbox auto-run, allow rules, and the
+  //     read-only shortcut never auto-approve it. Deny rules written for plain
+  //     Bash still apply (escalating must not turn a hard deny into a prompt).
+  if (toolName === BASH_ESCALATION_PERMISSION_NAME) {
+    const bashRule = await deps.matchRule('Bash', toolArgs);
+    if (bashRule === 'deny') return { decision: 'block', reason: 'Denied by permission rule' };
+    return { decision: 'prompt' };
   }
 
   // 2. Yolo mode auto-approves everything below the catastrophic floor.

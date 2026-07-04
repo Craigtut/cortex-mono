@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { Box, Text, SelectList, type SelectItem, type Component } from '@earendil-works/pi-tui';
+import { BASH_ESCALATION_PERMISSION_NAME } from '@animus-labs/cortex';
 import { colors, selectListTheme } from './theme.js';
 import { extractPattern, formatRule } from '../permissions/patterns.js';
 import { sanitizeTerminalLine } from './renderers/sanitize-terminal.js';
@@ -42,25 +43,37 @@ export class PermissionPromptComponent implements Component {
     this.suggestedPattern = extractPattern(toolName, toolArgs);
     const argsSummary = this.getArgsSummary();
     const isEditInProject = this.isEditWithinCwd();
+    // A sandbox escalation is a deliberate exit from the OS boundary for one
+    // command: distinct header and question, and never an "always" scope.
+    const isEscalation = toolName === BASH_ESCALATION_PERMISSION_NAME;
 
     // Build the prompt box
     this.box = new Box(1, 0);
 
     // Header
-    const headerLine = colors.primaryMuted('\u2500\u2500\u2500 Permission Required ' + '\u2500'.repeat(40));
+    const headerTitle = isEscalation ? 'Sandbox Escalation' : 'Permission Required';
+    const headerColor = isEscalation ? colors.accent : colors.primaryMuted;
+    const headerLine = headerColor(`\u2500\u2500\u2500 ${headerTitle} ` + '\u2500'.repeat(40));
     this.box.addChild(new Text(headerLine));
 
     // Tool name and action
-    this.box.addChild(new Text(colors.bold(toolName)));
+    if (isEscalation) {
+      this.box.addChild(new Text(colors.bold('Run this command OUTSIDE the sandbox?')));
+    } else {
+      this.box.addChild(new Text(colors.bold(toolName)));
+    }
     this.box.addChild(new Text(colors.white(argsSummary)));
     this.box.addChild(new Text('')); // spacing
 
-    // Build options
+    // Build options. Escalation is per-command by design: allow-once or deny,
+    // no persisted "always escalate" rule.
     const items: SelectItem[] = [
-      { value: 'allow', label: 'Allow' },
+      { value: 'allow', label: isEscalation ? 'Allow once (outside the sandbox)' : 'Allow' },
     ];
 
-    if (isEditInProject) {
+    if (isEscalation) {
+      // No always-scope options for escalation.
+    } else if (isEditInProject) {
       // For Edit/Write within the project, offer project-wide edit access
       items.push({
         value: 'always-allow-edits',
@@ -158,6 +171,7 @@ export class PermissionPromptComponent implements Component {
     const args = this.toolArgs as Record<string, unknown>;
     switch (this.toolName) {
       case 'Bash':
+      case BASH_ESCALATION_PERMISSION_NAME:
         return String(args['command'] ?? '');
       case 'Edit':
       case 'Write':
