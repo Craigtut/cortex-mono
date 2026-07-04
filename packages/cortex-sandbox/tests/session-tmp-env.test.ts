@@ -76,6 +76,32 @@ describe('SandboxRuntimeProvider: session temp routing via CLAUDE_CODE_TMPDIR', 
     expect(process.env[TMPDIR_ENV]).toBe('/host/tmp');
   });
 
+  it('restores CLAUDE_CODE_TMPDIR when reinitialized down to restricted (no scoped temp)', async () => {
+    // setSandboxRung reinitializes the live provider (only "off" disposes), so a
+    // workspace -> restricted change must not leave the env pointing at the old
+    // session dir, which is no longer writable at restricted -> a broken $TMPDIR.
+    process.env[TMPDIR_ENV] = '/host/tmp';
+    const provider = new SandboxRuntimeProvider();
+
+    await provider.initialize(policyWith(SBX_TEMP));
+    expect(process.env[TMPDIR_ENV]).toBe(SBX_TEMP);
+
+    // Restricted drops the session temp even though the consumer still passes it.
+    const restricted = buildDefaultPolicy('restricted', {
+      workspaceRoots: ['/nope/ws'],
+      home: '/nope/home',
+      sessionTmpDir: SBX_TEMP,
+    });
+    expect(restricted.filesystem.sessionTmpDir).toBeUndefined();
+
+    await provider.initialize(restricted);
+    // The override is undone (back to the ambient host value), not left at SBX_TEMP.
+    expect(process.env[TMPDIR_ENV]).toBe('/host/tmp');
+
+    await provider.dispose();
+    expect(process.env[TMPDIR_ENV]).toBe('/host/tmp');
+  });
+
   it('passes the spawn env through unchanged (the child TMPDIR is set by the runtime, not the env)', async () => {
     vi.spyOn(SandboxManager, 'wrapWithSandboxArgv').mockResolvedValue({
       argv: ['/usr/bin/sandbox-exec', '-p', '(profile)', '/bin/bash', '-c', 'echo hi'],

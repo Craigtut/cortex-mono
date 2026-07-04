@@ -253,12 +253,19 @@ export class SandboxRuntimeProvider implements SandboxProvider {
    * the runtime overrides it (see SANDBOX_TMPDIR_ENV) and adds that path to the
    * child's writable set. So the lever is that env var, which we point at the
    * scoped session temp (already a writable root, and one that actually exists,
-   * unlike the runtime's /tmp/claude default). No-op, and the var is left as-is,
-   * when the policy did not scope a session temp (the whole temp root is
-   * writable, legacy behavior). The prior value is restored on dispose.
+   * unlike the runtime's /tmp/claude default). When the policy scopes no session
+   * temp (legacy whole-temp-root behavior, or a reinit DOWN to the restricted
+   * rung), any override we applied is undone: leaving it pointed at the prior
+   * session dir, which is no longer a writable root, would give the child a
+   * broken $TMPDIR. The prior value is also restored on dispose.
    */
   private applySessionTmpdirEnv(sessionTmpDir: string | undefined): void {
-    if (sessionTmpDir === undefined) return;
+    if (sessionTmpDir === undefined) {
+      // No scoped temp for this policy: undo any override so the child does not
+      // inherit a stale, now-unwritable $TMPDIR after a downgrade to restricted.
+      this.restoreSessionTmpdirEnv();
+      return;
+    }
     if (!this.managesTmpdirEnv) {
       this.priorTmpdirEnv = process.env[SANDBOX_TMPDIR_ENV];
       this.managesTmpdirEnv = true;
