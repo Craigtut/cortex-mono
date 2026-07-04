@@ -44,6 +44,7 @@ import type {
   SandboxPolicy,
   SandboxStatus,
   SandboxSpawnSpec,
+  SandboxExecSpec,
   SandboxCommandFailure,
   SandboxDenial,
   WrappedSpawn,
@@ -451,6 +452,30 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
       spec,
       scrubEnv: (env) => this.scrubCredentialEnv(env),
     });
+  }
+
+  /**
+   * Wrap a bare program+args invocation (the Grep tool's ripgrep, a stdio MCP
+   * server) under the same helper as wrapSpawn, so those subprocesses get the
+   * same restricted-token write-confinement Bash gets. Without this they would
+   * spawn uncontained even when Bash is contained. Mirrors wrapSpawn, minus the
+   * shell: the helper runs `<file> <args...>` directly after the `--` separator.
+   * Like the rest of the Windows path this is scaffolded and unverified on a real
+   * Windows build; the mac/Linux provider is the enforced one today.
+   */
+  async wrapExec(spec: SandboxExecSpec): Promise<WrappedSpawn> {
+    if (
+      this.currentStatus.backend === 'none' ||
+      this.policyFilePath === undefined ||
+      this.sandboxTemp === undefined
+    ) {
+      return { file: spec.file, args: spec.args, env: spec.env };
+    }
+    return {
+      file: this.helperPath,
+      args: [this.policyFilePath, '--', spec.file, ...spec.args],
+      env: { ...this.scrubCredentialEnv(spec.env), TEMP: this.sandboxTemp, TMP: this.sandboxTemp },
+    };
   }
 
   status(): SandboxStatus {
