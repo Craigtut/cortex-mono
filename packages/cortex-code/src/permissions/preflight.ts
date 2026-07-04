@@ -104,9 +104,25 @@ function foldPathCase(p: string): string {
   return FS_CASE_INSENSITIVE ? p.toLowerCase() : p;
 }
 
+/**
+ * Strip a single trailing path separator so an at-or-under comparison built as
+ * `p + sep` does not become a double separator that never matches. A root or
+ * protected path configured as "/workspace/" would otherwise never contain
+ * "/workspace/src". The filesystem root ("/" alone) is left as-is: reducing it
+ * to "" would make every absolute path compare as under it.
+ */
+function stripTrailingSep(p: string): string {
+  return p.length > 1 && p.endsWith(sep) ? p.slice(0, -1) : p;
+}
+
+/** Fold case (on case-insensitive FS) and drop a trailing separator. */
+function normalizeBoundary(p: string): string {
+  return stripTrailingSep(foldPathCase(p));
+}
+
 /** True when any candidate form of the target is at or under any protected path. */
 function targetsProtectedPath(candidates: string[], protectedPaths: readonly string[]): boolean {
-  const resolved = protectedPaths.flatMap((p) => [p, canonSync(p)]).map(foldPathCase);
+  const resolved = protectedPaths.flatMap((p) => [p, canonSync(p)]).map(normalizeBoundary);
   for (const c of candidates) {
     const cf = foldPathCase(c);
     for (const p of resolved) {
@@ -127,7 +143,7 @@ function targetsProtectedPath(candidates: string[], protectedPaths: readonly str
  * still contains its own files.
  */
 function isWithinWritableRoots(candidates: string[], roots: readonly string[]): boolean {
-  const resolvedRoots = roots.flatMap((r) => [r, canonSync(r)]).map(foldPathCase);
+  const resolvedRoots = roots.flatMap((r) => [r, canonSync(r)]).map(normalizeBoundary);
   for (const c of candidates) {
     const cf = foldPathCase(c);
     const within = resolvedRoots.some((r) => cf === r || cf.startsWith(r + sep));

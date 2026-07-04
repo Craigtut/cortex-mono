@@ -369,6 +369,19 @@ describe('preflightPermission: sandbox policy projection onto in-process file to
     expect(out.decision).toBe('allow');
   });
 
+  it('blocks a Write under a denyWrite directory configured with a trailing separator', async () => {
+    // A denyWrite dir configured as "/home/user/.ssh/" must still protect
+    // "/home/user/.ssh/authorized_keys". Trailing-separator normalization keeps
+    // the at-or-under check from silently under-restricting.
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.ssh/authorized_keys' },
+      deps({ sandboxDenyWrite: ['/home/user/.ssh/'] }),
+    );
+    expect(out.decision).toBe('block');
+    if (out.decision === 'block') expect(out.reason).toContain('write-protected');
+  });
+
   it('blocks a Write through an in-workspace symlink into a denyWrite path', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-policy-symlink-'));
     const home = path.join(tmp, 'home');
@@ -507,6 +520,19 @@ describe('preflightPermission: positive writableRoots write floor', () => {
       'Bash',
       { command: 'echo hi > /home/user/outside.txt' },
       floorDeps({ yoloMode: true }),
+    );
+    expect(out.decision).toBe('allow');
+  });
+
+  it('treats a writable root with a trailing separator as containing its own files', async () => {
+    // A root configured as "/workspace/" must still contain "/workspace/src/x.ts".
+    // Without trailing-separator normalization, "/workspace/" + sep is a double
+    // separator that never matches, so the floor would wrongly prompt on an
+    // in-workspace write.
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/workspace/src/x.ts' },
+      floorDeps({ yoloMode: true, sandboxWritableRoots: ['/workspace/'] }),
     );
     expect(out.decision).toBe('allow');
   });
