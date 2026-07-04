@@ -187,6 +187,20 @@ export class SandboxRuntimeProvider implements SandboxProvider {
   }
 
   /**
+   * Remove the credential env vars this provider scrubs inside the sandbox, so an
+   * escalated (unsandboxed) command still does not inherit ambient secrets. See
+   * the SandboxProvider.scrubCredentialEnv contract.
+   */
+  scrubCredentialEnv(env: Record<string, string>): Record<string, string> {
+    if (this.credentialEnvVars.length === 0) return env;
+    const scrubbed: Record<string, string> = { ...env };
+    for (const name of this.credentialEnvVars) {
+      delete scrubbed[name];
+    }
+    return scrubbed;
+  }
+
+  /**
    * Attribute a failed sandboxed command to a sandbox denial (or return null).
    * macOS is precise: sandbox-runtime's unified-log monitor records violation
    * events tagged with the command, so a match IS a denial. Linux has no
