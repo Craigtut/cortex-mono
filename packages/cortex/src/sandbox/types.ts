@@ -89,6 +89,24 @@ export interface SandboxSpawnSpec {
   env: Record<string, string>;
 }
 
+/**
+ * A direct program+args invocation the provider will wrap. Unlike
+ * SandboxSpawnSpec, this is NOT a shell command: it is a bare binary plus its
+ * arguments (e.g. the bundled ripgrep, a stdio MCP server). The provider is
+ * responsible for composing a safely-quoted shell command from it so arbitrary
+ * arguments (regex patterns, paths) cannot break out.
+ */
+export interface SandboxExecSpec {
+  /** The program to run (an absolute path, or a name resolved via PATH). */
+  file: string;
+  /** Arguments passed to the program, exactly as they would be without a sandbox. */
+  args: string[];
+  /** Working directory for the spawn. */
+  cwd: string;
+  /** Environment for the child (already sanitized by buildSafeEnv). */
+  env: Record<string, string>;
+}
+
 /** A wrapped spawn that launches the same command under the sandbox. */
 export interface WrappedSpawn {
   file: string;
@@ -172,6 +190,19 @@ export interface SandboxProvider {
    * proxy per call. It prepares the invocation; it does not launch a process.
    */
   wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn>;
+  /**
+   * Wrap a direct program+args invocation (NOT a shell command) so it launches
+   * contained, returning the argv and env to spawn. This exists so subprocess-
+   * spawning tools OTHER than Bash (the Grep tool's ripgrep, a stdio MCP server)
+   * run inside the same OS boundary as shell commands. Without it their spawns
+   * bypass the sandbox and its denyRead protection over secrets (~/.ssh, ~/.aws,
+   * credential stores). Optional for interface compatibility, but any provider
+   * that reports `filesystem: 'enforced'` should implement it. Async for the same
+   * reason as wrapSpawn (a backend may generate an OS profile or await a proxy
+   * per call). It must pass through unchanged when the sandbox is not enforcing,
+   * so behavior is identical to having no provider on unsupported platforms.
+   */
+  wrapExec?(spec: SandboxExecSpec): Promise<WrappedSpawn>;
   /**
    * Strip the credential environment variables this provider scrubs from a
    * sandboxed child. The Bash tool applies this to an approved escalation (which

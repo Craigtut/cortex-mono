@@ -273,6 +273,7 @@ export type {
   SandboxBackend,
   SandboxStatus,
   SandboxSpawnSpec,
+  SandboxExecSpec,
   WrappedSpawn,
   SandboxDenial,
   SandboxCommandFailure,
