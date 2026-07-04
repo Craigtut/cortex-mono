@@ -154,22 +154,44 @@ describe('NetworkAccessController', () => {
     expect(prompts).toHaveLength(2);
   });
 
-  it('coalesces concurrent requests for the same host onto one prompt', async () => {
+  it('coalesces concurrent requests for the same host and channel onto one prompt', async () => {
     let release!: (choice: NetworkPromptChoice) => void;
     const { controller, prompts } = makeController({
       policy: allowlistPolicy(),
       onPrompt: () => new Promise<NetworkPromptChoice>((resolve) => { release = resolve; }),
     });
 
+    // Same host, same channel (one curl opening several connections).
     const a = controller.resolve(shellReq('burst.example.com'));
-    const b = controller.resolve({ host: 'burst.example.com', via: 'webfetch', url: 'https://burst.example.com/' });
-    // Let both calls reach the pending-prompt map before answering.
+    const b = controller.resolve(shellReq('burst.example.com'));
     await new Promise((r) => setImmediate(r));
     release('once');
 
     expect((await a).decision).toBe('allow');
     expect((await b).decision).toBe('allow');
     expect(prompts).toHaveLength(1);
+  });
+
+  it('does not coalesce across channels: shell and webfetch to one host prompt separately', async () => {
+    const releases: Array<(c: NetworkPromptChoice) => void> = [];
+    const { controller, prompts } = makeController({
+      policy: allowlistPolicy(),
+      onPrompt: () => new Promise<NetworkPromptChoice>((resolve) => { releases.push(resolve); }),
+    });
+
+    // A webfetch carries a URL that may hold exfiltrated data; it must not be
+    // answered behind an in-flight shell prompt showing the wrong context.
+    const a = controller.resolve(shellReq('burst.example.com'));
+    const b = controller.resolve({
+      host: 'burst.example.com',
+      via: 'webfetch',
+      url: 'https://burst.example.com/?leak=secret',
+    });
+    await new Promise((r) => setImmediate(r));
+    expect(prompts).toHaveLength(2);
+    releases.forEach((r) => r('once'));
+    expect((await a).decision).toBe('allow');
+    expect((await b).decision).toBe('allow');
   });
 
   it('fails closed when the prompt throws', async () => {

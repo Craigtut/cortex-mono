@@ -159,4 +159,31 @@ describe('preflightPermission', () => {
     );
     expect(out.decision).toBe('prompt');
   });
+
+  it('blocks a Write to ~/.cortex even in yolo mode (config-integrity floor)', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.cortex/workspaces/abc/settings.json' },
+      deps({ yoloMode: true, home: '/home/user' }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('blocks an Edit to the project .cortex config', async () => {
+    const out = await preflightPermission(
+      'Edit',
+      { file_path: '/workspace/.cortex/config.json' },
+      deps({ cwd: '/workspace' }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('does not block a Write to a normal workspace file', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/workspace/src/x.ts' },
+      deps({ cwd: '/workspace' }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
 });

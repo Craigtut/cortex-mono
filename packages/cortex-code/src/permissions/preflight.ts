@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import { join, resolve, sep } from 'node:path';
 import { findCatastrophicCommand } from '@animus-labs/cortex';
 import type { PermissionDecision } from './rules.js';
 
@@ -31,10 +32,34 @@ export interface PreflightDeps {
   webFetchNetworkGated?: boolean;
 }
 
+const IN_PROCESS_WRITE_TOOLS = new Set(['Write', 'Edit', 'UndoEdit']);
+
+/**
+ * True when a file-writing tool targets Cortex's own config tree (~/.cortex or
+ * the project .cortex), which holds config, permission rules, network grants,
+ * and stored credentials. The OS sandbox denies a shell from writing these; the
+ * in-process file tools bypass that boundary, so this closes the same hole.
+ */
+function isProtectedConfigWrite(
+  toolName: string,
+  toolArgs: unknown,
+  home: string,
+  cwd: string,
+): boolean {
+  if (!IN_PROCESS_WRITE_TOOLS.has(toolName)) return false;
+  const args = toolArgs as Record<string, unknown> | null | undefined;
+  const target = String(args?.['file_path'] ?? args?.['path'] ?? '');
+  if (!target) return false;
+  const resolved = resolve(cwd, target);
+  const protectedDirs = [join(home, '.cortex'), join(cwd, '.cortex')];
+  return protectedDirs.some((d) => resolved === d || resolved.startsWith(d + sep));
+}
+
 /**
  * Deterministic pre-prompt permission decision, ordered by trust floor:
  *
  *   1. Catastrophic Bash command  -> block   (never overridable)
+ *   1b. Write to Cortex config    -> block   (never overridable)
  *   2. Yolo mode                  -> allow
  *   3. Explicit deny rule         -> block   (beats the read-only auto-approve)
  *   3b. Sandboxed Bash            -> allow   (the OS boundary is the control)
@@ -60,6 +85,14 @@ export async function preflightPermission(
       { cwd: deps.cwd, home: deps.home ?? homedir() },
     );
     if (finding) return { decision: 'block', reason: finding.reason };
+  }
+
+  // 1b. Protected in-process writes: never let a file tool write Cortex's own
+  //     config, permission rules, network grants, or credentials. The OS sandbox
+  //     denies this for shell; the in-process tools bypass it, so a prompt-injected
+  //     Write could otherwise forge a grant or disable the sandbox.
+  if (isProtectedConfigWrite(toolName, toolArgs, deps.home ?? homedir(), deps.cwd)) {
+    return { decision: 'block', reason: 'Writing Cortex configuration or credentials is not allowed' };
   }
 
   // 2. Yolo mode auto-approves everything below the catastrophic floor.
