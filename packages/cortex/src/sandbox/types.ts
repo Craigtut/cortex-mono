@@ -101,7 +101,12 @@ export interface SandboxExecSpec {
   file: string;
   /** Arguments passed to the program, exactly as they would be without a sandbox. */
   args: string[];
-  /** Working directory for the spawn. */
+  /**
+   * Working directory context for the spawn. The caller sets the child's ACTUAL
+   * cwd on the spawn itself (execFile / transport option); a backend may read
+   * this to scope a profile. The macOS/Linux provider derives containment from
+   * absolute writableRoots and does not consult it, matching SandboxSpawnSpec.cwd.
+   */
   cwd: string;
   /** Environment for the child (already sanitized by buildSafeEnv). */
   env: Record<string, string>;
