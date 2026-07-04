@@ -295,10 +295,14 @@ export async function preflightPermission(
   //     Require a real decision: an explicit deny blocks, an explicit allow rule
   //     for that path is honored, otherwise prompt. Symlinks are resolved first,
   //     so a workspace link whose real target is outside counts as outside.
-  //     No-op when the sandbox is off (no writableRoots) and for in-workspace
-  //     writes, which fall through to the normal flow (yolo may still allow them).
-  const writableRoots = deps.sandboxWritableRoots ?? [];
-  if (writableRoots.length > 0 && IN_PROCESS_WRITE_TOOLS.has(toolName)) {
+  //     Gate on policy PRESENCE, not root count: the Restricted rung ships an
+  //     EMPTY writableRoots (write nowhere), and treating that like "sandbox off"
+  //     would leave the most locked-down rung with NO in-process write floor at
+  //     all (every write is outside zero roots, so all correctly prompt). Absent
+  //     (undefined) means the sandbox is off: no floor. In-workspace writes fall
+  //     through to the normal flow (yolo may still allow them).
+  const writableRoots = deps.sandboxWritableRoots;
+  if (writableRoots !== undefined && IN_PROCESS_WRITE_TOOLS.has(toolName)) {
     const target = fileToolTarget(toolArgs);
     if (target) {
       const candidates = resolvedTargetCandidates(target, deps.cwd);

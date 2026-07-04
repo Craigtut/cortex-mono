@@ -443,6 +443,19 @@ describe('preflightPermission: positive writableRoots write floor', () => {
     expect(out.decision).toBe('allow');
   });
 
+  it('still applies at the Restricted rung (writableRoots present but empty): yolo does not auto-approve', async () => {
+    // Restricted ships writableRoots: [] (write nowhere), which is NOT the same
+    // as "sandbox off" (undefined). Every in-process write is outside the empty
+    // root set, so the floor must prompt rather than let yolo auto-approve a
+    // PATH-shadowing write at the most locked-down rung.
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.local/bin/evil' },
+      deps({ yoloMode: true, sandboxWritableRoots: [] }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
+
   it('yields to the config floor for an out-of-roots Write to ~/.cortex', async () => {
     // 1b (config floor) sits above the write floor, so this blocks rather than
     // prompts even though the target is also outside the writable roots.
