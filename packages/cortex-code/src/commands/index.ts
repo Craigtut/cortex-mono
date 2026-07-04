@@ -14,11 +14,14 @@ import { exitCommand } from './exit.js';
 import { debugCommand } from './debug.js';
 import { updateCommand } from './update.js';
 import { mcpReloadCommand } from './mcp-reload.js';
+import { sandboxCommand } from './sandbox.js';
 
 // Handler type uses `any` for the session parameter to avoid circular
 // dependency with session.ts. Type safety is enforced at the call site.
+// `args` carries whitespace-split tokens after the command name (e.g.
+// "/sandbox off" -> ['off']); handlers that take no arguments ignore it.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type CommandHandler = (session: any) => Promise<void> | void;
+export type CommandHandler = (session: any, args: string[]) => Promise<void> | void;
 
 export interface Command {
   name: string;
@@ -74,4 +77,5 @@ export function registerBuiltinCommands(): void {
   registerCommand(debugCommand);
   registerCommand(updateCommand);
   registerCommand(mcpReloadCommand);
+  registerCommand(sandboxCommand);
 }

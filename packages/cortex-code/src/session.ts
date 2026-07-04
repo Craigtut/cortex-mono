@@ -71,9 +71,12 @@ import { SandboxRuntimeProvider, buildDefaultPolicy } from '@animus-labs/cortex-
 import type {
   SandboxStatus,
   SandboxPolicy,
+  SandboxRung,
   NetworkAccessRequest,
   NetworkAccessDecision,
 } from '@animus-labs/cortex';
+import { SandboxSettingsStore } from './config/sandbox-settings.js';
+import { detectContainer } from './utils/container.js';
 import {
   NetworkAccessController,
   NetworkGrantStore,
@@ -130,6 +133,14 @@ export class Session {
    * so the rung's network intent holds policy-only where the OS cannot.
    */
   private sandboxPolicy: SandboxPolicy | undefined;
+  /**
+   * The active trust rung. 'off' means no containment (user choice, config
+   * kill switch, or before initSandbox has resolved it). Changed only by a
+   * human through /sandbox; never exposed to the model.
+   */
+  private sandboxRung: SandboxRung = 'off';
+  /** Per-workspace remembered rung and one-time notice flags. */
+  private readonly sandboxSettings: SandboxSettingsStore;
   private readonly networkGrants: NetworkGrantStore;
   private readonly networkAccess: NetworkAccessController;
   private app: App | null = null;
@@ -205,7 +216,9 @@ export class Session {
     this.preferredEffort = options.initialEffort;
     this.effectiveEffort = this.preferredEffort;
     this.rules = new PermissionRuleManager(options.cwd);
-    this.networkGrants = new NetworkGrantStore(workspaceSettingsPath(options.cwd));
+    const settingsPath = workspaceSettingsPath(options.cwd);
+    this.networkGrants = new NetworkGrantStore(settingsPath);
+    this.sandboxSettings = new SandboxSettingsStore(settingsPath);
     this.networkAccess = new NetworkAccessController({
       getPolicy: () => this.sandboxPolicy?.network,
       prompt: (req) => this.promptNetworkAccess(req),
@@ -387,7 +400,11 @@ export class Session {
       yoloMode: this.yoloMode,
       effortLevel: initialEffort,
       observationalMode: this.compactionStrategy === 'observational',
+      ...this.sandboxIndicatorState(),
     });
+
+    // Recommend (never apply) /sandbox off when already inside a container.
+    void this.surfaceContainerRecommendation();
 
     // Start TUI event loop
     this.app.start();
@@ -488,7 +505,7 @@ export class Session {
         if (cmd) {
           await this.activity.recordWorking();
           try {
-            await cmd.handler(this);
+            await cmd.handler(this, parts.slice(1).filter((p) => p.length > 0));
           } finally {
             void this.activity.recordAwaitingInput();
           }
@@ -1279,47 +1296,103 @@ export class Session {
    * rule that now covers this request.
    */
   /**
-   * Construct and initialize the OS sandbox provider for this session. Returns
-   * undefined when disabled (or rung 'off'), so the agent runs uncontained. On a
-   * host that cannot enforce, the provider still returns (status 'none') and we
-   * warn rather than fail.
+   * Construct the OS sandbox provider for this session and initialize it at the
+   * workspace's remembered rung (Workspace on first open). Returns undefined
+   * only when the config kill switch (sandbox.enabled=false) is set.
+   *
+   * The provider is constructed even when the rung is 'off': the agent captures
+   * this one reference at creation (and shares it with sub-agents), so a later
+   * /sandbox <rung> can only take effect by re-initializing this same object.
+   * Un-initialized, it passes spawns through unchanged. On a host that cannot
+   * enforce, the provider still returns (status 'none') and we warn rather than
+   * fail.
    */
   private async initSandbox(): Promise<SandboxRuntimeProvider | undefined> {
-    const sb = this.config.sandbox;
-    const enabled = sb?.enabled ?? true;
-    const rung = sb?.rung ?? 'workspace';
-    if (!enabled || rung === 'off') {
-      log.info('Sandbox disabled', { enabled, rung });
+    if (this.config.sandbox?.enabled === false) {
+      // Hard kill switch: no provider at all. /sandbox reports this state but
+      // cannot re-enable; the user edits config to turn the feature back on.
+      this.sandboxRung = 'off';
+      log.info('Sandbox disabled by config (sandbox.enabled=false)');
       return undefined;
     }
 
+    await this.sandboxSettings.load();
+    this.sandboxRung = await this.resolveInitialRung();
+
+    const provider = new SandboxRuntimeProvider({
+      onDegraded: (degradations) => log.warn('Sandbox enforcement reduced', { degradations }),
+      // Shell egress to a host outside the allowlist asks the same unified
+      // decision function WebFetch uses, so one grant covers both paths.
+      onNetworkRequest: (r) =>
+        this.resolveNetworkAccess({
+          host: r.host,
+          port: r.port,
+          via: 'shell',
+        }).then((d) => d.decision === 'allow'),
+    });
+
+    if (this.sandboxRung === 'off') {
+      log.info('Sandbox off for this workspace; shell commands run uncontained');
+      return provider;
+    }
+
+    await this.activateSandboxRung(provider, this.sandboxRung);
+    return provider;
+  }
+
+  /**
+   * The rung this session starts at: the workspace's remembered rung when one
+   * exists, otherwise the configured default (Workspace unless config says
+   * otherwise), which is then remembered so the rung is a stable per-workspace
+   * fact from the first open on (the folder-trust pattern).
+   */
+  private async resolveInitialRung(): Promise<SandboxRung> {
+    const saved = this.sandboxSettings.getRung();
+    if (saved) return saved;
+
+    const rung = this.config.sandbox?.rung ?? 'workspace';
     try {
-      const provider = new SandboxRuntimeProvider({
-        onDegraded: (degradations) => log.warn('Sandbox enforcement reduced', { degradations }),
-        // Shell egress to a host outside the allowlist asks the same unified
-        // decision function WebFetch uses, so one grant covers both paths.
-        onNetworkRequest: (r) =>
-          this.resolveNetworkAccess({
-            host: r.host,
-            port: r.port,
-            via: 'shell',
-          }).then((d) => d.decision === 'allow'),
+      await this.sandboxSettings.setRung(rung);
+    } catch (err) {
+      log.warn('Could not persist initial sandbox rung', {
+        error: err instanceof Error ? err.message : String(err),
       });
-      const cortexHome = path.join(homedir(), '.cortex');
-      const policy = buildDefaultPolicy(rung, {
-        workspaceRoots: [this.cwd],
-        // A sandboxed shell must not WRITE Cortex's own config, permission rules,
-        // or the project's .cortex (which now carries the sandbox policy itself),
-        // and must not READ Cortex's stored API keys / OAuth tokens.
-        extraDenyWrite: [cortexHome, path.join(this.cwd, '.cortex')],
-        extraDenyRead: [path.join(cortexHome, 'credentials.json')],
-        ...(sb?.allowedDomains ? { extraAllowedDomains: sb.allowedDomains } : {}),
-      });
+    }
+    return rung;
+  }
 
-      // Record the policy before initialize: even if OS enforcement fails, the
-      // policy still gates in-process egress (WebFetch) at the app level.
-      this.sandboxPolicy = policy;
+  /** The rung-to-policy projection, shared by startup and /sandbox changes. */
+  private buildSandboxPolicy(rung: SandboxRung): SandboxPolicy {
+    const cortexHome = path.join(homedir(), '.cortex');
+    return buildDefaultPolicy(rung, {
+      workspaceRoots: [this.cwd],
+      // A sandboxed shell must not WRITE Cortex's own config, permission rules,
+      // or the project's .cortex (which now carries the sandbox policy itself),
+      // and must not READ Cortex's stored API keys / OAuth tokens.
+      extraDenyWrite: [cortexHome, path.join(this.cwd, '.cortex')],
+      extraDenyRead: [path.join(cortexHome, 'credentials.json')],
+      ...(this.config.sandbox?.allowedDomains
+        ? { extraAllowedDomains: this.config.sandbox.allowedDomains }
+        : {}),
+    });
+  }
 
+  /**
+   * Build the policy for a contained rung and (re)initialize the provider with
+   * it. The provider resets-then-reinitializes, so calling this on a live
+   * provider applies the new policy. Never throws: enforcement failure degrades
+   * to warn-and-continue, with the recorded policy still gating in-process
+   * egress (WebFetch).
+   */
+  private async activateSandboxRung(
+    provider: SandboxRuntimeProvider,
+    rung: Exclude<SandboxRung, 'off'>,
+  ): Promise<void> {
+    const policy = this.buildSandboxPolicy(rung);
+    // Record the policy before initialize: even if OS enforcement fails, the
+    // policy still gates in-process egress (WebFetch) at the app level.
+    this.sandboxPolicy = policy;
+    try {
       const status = await provider.initialize(policy);
       this.sandboxStatus = status;
       if (status.backend === 'none') {
@@ -1335,15 +1408,107 @@ export class Session {
           network: status.network,
         });
       }
-      return provider;
     } catch (err) {
-      // Never let sandbox setup crash startup: some provider preflight runs before
-      // its own internal try. Warn and continue uncontained.
+      // Never let sandbox setup crash the session: some provider preflight runs
+      // before its own internal try. Warn and continue uncontained.
       log.warn('Sandbox initialization threw; shell commands run uncontained', {
         error: err instanceof Error ? err.message : String(err),
       });
       this.sandboxStatus = undefined;
-      return undefined;
+    }
+  }
+
+  /**
+   * Change the trust rung for this session and remember it per-workspace.
+   *
+   * A HUMAN action only: the sole caller is the /sandbox slash command the user
+   * types. It is never registered as a tool or otherwise reachable by the
+   * model, matching the design rule that an agent cannot widen its own
+   * containment.
+   *
+   * 'off' stands the provider down (dispose) so commands run uncontained and
+   * drops the policy so in-process gating (WebFetch) opens up too. Moving from
+   * off back to a contained rung re-initializes the same provider object with
+   * a freshly built policy, which the agent's Bash tool already references.
+   */
+  async setSandboxRung(rung: SandboxRung): Promise<{ changed: boolean; reason?: string }> {
+    if (this.config.sandbox?.enabled === false || !this.sandboxProvider) {
+      return {
+        changed: false,
+        reason:
+          'The sandbox is disabled by config (sandbox.enabled=false). Edit your config and restart to re-enable it.',
+      };
+    }
+    if (rung === this.sandboxRung) {
+      return { changed: false, reason: `Sandbox is already at the ${rung} rung.` };
+    }
+
+    if (rung === 'off') {
+      await this.sandboxProvider.dispose();
+      this.sandboxPolicy = undefined;
+      this.sandboxStatus = undefined;
+    } else {
+      await this.activateSandboxRung(this.sandboxProvider, rung);
+    }
+    this.sandboxRung = rung;
+
+    try {
+      await this.sandboxSettings.setRung(rung);
+    } catch (err) {
+      log.warn('Could not persist sandbox rung', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    this.app?.updateStatus(this.sandboxIndicatorState());
+    log.info('Sandbox rung changed', { rung, enforced: this.sandboxStatus?.backend ?? 'none' });
+    return { changed: true };
+  }
+
+  /** The status-bar fields for the always-visible sandbox indicator. */
+  private sandboxIndicatorState(): {
+    sandboxRung: string;
+    sandboxEnforcement: 'enforced' | 'partial' | 'none';
+  } {
+    const s = this.sandboxStatus;
+    const enforcement =
+      !s || s.backend === 'none'
+        ? 'none'
+        : s.filesystem === 'enforced' && s.network === 'enforced'
+          ? 'enforced'
+          : 'partial';
+    return { sandboxRung: this.sandboxRung, sandboxEnforcement: enforcement };
+  }
+
+  /**
+   * P1 container detection: when this session already runs inside a container,
+   * the OS sandbox stacks a second boundary that mostly adds friction. Surface
+   * a recommendation (log line always; transcript note once per workspace) that
+   * the user may prefer /sandbox off. Detection is heuristic, so this NEVER
+   * changes the rung automatically.
+   */
+  private async surfaceContainerRecommendation(): Promise<void> {
+    if (this.sandboxRung === 'off') return;
+    try {
+      const detection = await detectContainer();
+      if (!detection.inContainer) return;
+      log.info('Container detected; the OS sandbox is redundant inside an isolated environment', {
+        marker: detection.marker,
+      });
+      if (this.sandboxSettings.isContainerNoticeShown()) return;
+      this.app?.transcript.addNotification(
+        'Container detected',
+        `This session appears to be running inside a container (${detection.marker}).\n` +
+          'The environment is already an isolation boundary, so the OS sandbox is\n' +
+          'redundant here and can add friction. If that is intentional, keep it;\n' +
+          'otherwise you may prefer /sandbox off for this workspace.\n' +
+          'Detection is heuristic; nothing was changed automatically.',
+      );
+      await this.sandboxSettings.markContainerNoticeShown();
+    } catch (err) {
+      log.debug('Container detection failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -1740,12 +1905,22 @@ export class Session {
 
     const branch = await this.getGitBranch();
     const currentContextTokens = this.getDisplayedCurrentContextTokens();
+    // The rung is stated so the model can adapt to denials instead of blindly
+    // retrying; changing it stays human-only (there is no tool for it).
+    const enforcementLabel = {
+      enforced: 'OS-enforced',
+      partial: 'partially OS-enforced',
+      none: 'not OS-enforced',
+    }[this.sandboxIndicatorState().sandboxEnforcement];
     const lines = [
       `Current date: ${new Date().toISOString().split('T')[0]}`,
       `Current working directory: ${this.cwd}`,
       branch ? `Git branch: ${branch}` : '',
       `Model: ${this.provider}/${this.modelId}`,
       this.yoloMode ? 'YOLO mode is active: all tools auto-approved' : '',
+      this.sandboxRung !== 'off'
+        ? `Sandbox: ${this.sandboxRung} rung, ${enforcementLabel}`
+        : '',
       currentContextTokens > 0
         ? `Current context usage: ${(currentContextTokens / 1000).toFixed(1)}k / ${(this.agent.effectiveContextWindow / 1000).toFixed(0)}k`
         : '',
@@ -2128,6 +2303,18 @@ export class Session {
   getSessionId(): string { return this.sessionId; }
   /** Reset the terminal title on a fresh-start signal (e.g. /clear). */
   resetTitle(): void { this.titleManager?.reset(); }
+  getSandboxRung(): SandboxRung { return this.sandboxRung; }
+  getSandboxStatus(): SandboxStatus | undefined { return this.sandboxStatus; }
+  getSandboxPolicy(): SandboxPolicy | undefined { return this.sandboxPolicy; }
+  /** False when the config kill switch (sandbox.enabled=false) is set. */
+  isSandboxConfigEnabled(): boolean { return this.config.sandbox?.enabled !== false; }
+  /** Domain grants for transparency surfaces (/sandbox status). */
+  getNetworkGrantInfo(): { persisted: readonly string[]; session: readonly string[] } {
+    return {
+      persisted: this.networkGrants.getDomains(),
+      session: this.networkAccess.getSessionGrants(),
+    };
+  }
   getRules(): PermissionRuleManager { return this.rules; }
   getProviderManager(): ProviderManager { return this.providerManager; }
   getCredentialStore(): CredentialStore { return this.credentialStore; }

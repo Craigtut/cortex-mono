@@ -37,9 +37,13 @@ export interface CortexCodeConfig {
 }
 
 export interface SandboxCodeConfig {
-  /** Enable the sandbox. Default: true. */
+  /** Enable the sandbox feature at all. Default: true. False hides /sandbox re-enabling too. */
   enabled?: boolean;
-  /** Trust rung. Default: 'workspace'. 'off' disables containment. */
+  /**
+   * Starting rung for a FRESH workspace. Default: 'workspace'. Once a workspace
+   * has been opened (or the user runs /sandbox <rung>), the per-workspace
+   * remembered rung wins over this value.
+   */
   rung?: SandboxRung;
   /** Extra domains to pre-allow beyond the seeded package registries. */
   allowedDomains?: string[];

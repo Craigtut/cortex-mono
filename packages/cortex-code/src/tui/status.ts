@@ -21,6 +21,13 @@ export interface StatusBarState {
   observerActive: boolean;
   /** Whether the reflector is currently running in the background. */
   reflectorActive: boolean;
+  /**
+   * Active sandbox rung ('restricted' | 'workspace' | 'trusted' | 'off').
+   * Empty string hides the badge (state not yet known).
+   */
+  sandboxRung: string;
+  /** How completely the OS enforces the rung. Ignored while rung is 'off'. */
+  sandboxEnforcement: 'enforced' | 'partial' | 'none';
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +96,8 @@ export class StatusBar implements Component {
     observationTokenCount: 0,
     observerActive: false,
     reflectorActive: false,
+    sandboxRung: '',
+    sandboxEnforcement: 'none',
   };
 
   private hintText: string | null = null;
@@ -152,23 +161,29 @@ export class StatusBar implements Component {
     const effortBadge = s.effortLevel && s.effortLevel !== 'off'
       ? `E:${s.effortLevel.charAt(0).toUpperCase() + s.effortLevel.slice(1)}`
       : '';
+    const sandboxBadge = this.buildSandboxBadge();
     const modelStr = this.hintText ?? (s.provider ? `${s.provider}/${s.model}` : s.model);
     const tokenStr = this.formatTokens(s.contextTokenCount, s.contextTokenLimit);
     const branchStr = s.gitBranch;
     const memStr = this.buildMemSegment();
 
-    // Try layouts from most detailed to most minimal
+    // Try layouts from most detailed to most minimal. The sandbox badge is the
+    // honesty surface ("am I contained right now"), so it outlives the effort,
+    // branch, and mem segments and is only dropped just before the minimal
+    // layout on very narrow terminals.
     const layouts = [
-      // Full: mode [YOLO] [effort] | provider/model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, modelStr, tokenStr, memStr, branchStr, width),
-      // No provider: mode [YOLO] [effort] | model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, s.model, tokenStr, memStr, branchStr, width),
-      // No effort badge: mode [YOLO] | model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, '', s.model, tokenStr, memStr, branchStr, width),
-      // No branch: mode [YOLO] | model    tokens  mem Xk ●
-      () => this.layoutFull(modeBadge, yoloBadge, '', s.model, tokenStr, memStr, '', width),
-      // No mem: mode [YOLO] | model    tokens
-      () => this.layoutFull(modeBadge, yoloBadge, '', s.model, tokenStr, '', '', width),
+      // Full: mode [YOLO] [effort] [sandbox] | provider/model    tokens  mem Xk ●    branch
+      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, sandboxBadge, modelStr, tokenStr, memStr, branchStr, width),
+      // No provider: mode [YOLO] [effort] [sandbox] | model    tokens  mem Xk ●    branch
+      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, sandboxBadge, s.model, tokenStr, memStr, branchStr, width),
+      // No effort badge: mode [YOLO] [sandbox] | model    tokens  mem Xk ●    branch
+      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, branchStr, width),
+      // No branch: mode [YOLO] [sandbox] | model    tokens  mem Xk ●
+      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, '', width),
+      // No mem: mode [YOLO] [sandbox] | model    tokens
+      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, '', '', width),
+      // No sandbox: mode [YOLO] | model    tokens
+      () => this.layoutFull(modeBadge, yoloBadge, '', '', s.model, tokenStr, '', '', width),
       // Minimal: mode    tokens
       () => this.layoutMinimal(modeBadge, tokenStr, width),
     ];
@@ -190,6 +205,7 @@ export class StatusBar implements Component {
     modeBadge: string,
     yoloBadge: string,
     effortBadge: string,
+    sandboxBadge: string,
     modelStr: string,
     tokenStr: string,
     memStr: string,
@@ -200,6 +216,7 @@ export class StatusBar implements Component {
     if (modeBadge) flags.push(colors.bold(colors.primary(modeBadge)));
     if (yoloBadge) flags.push(colors.bold(colors.accent(yoloBadge)));
     if (effortBadge) flags.push(colors.muted(effortBadge));
+    if (sandboxBadge) flags.push(sandboxBadge); // pre-colored (state-dependent)
     const flagStr = flags.join('  ');
 
     const left = (flagStr ? flagStr + colors.muted(' | ') : '')
@@ -230,6 +247,33 @@ export class StatusBar implements Component {
 
     const gap = width - leftWidth - rightWidth;
     return left + ' '.repeat(gap) + right;
+  }
+
+  // -------------------------------------------------------------------------
+  // Sandbox badge
+  // -------------------------------------------------------------------------
+
+  /**
+   * The always-visible containment indicator. Honest by construction:
+   * - enforced contained rung   -> "sandbox: workspace" (calm, muted)
+   * - partial OS enforcement    -> "sandbox: workspace (partial)" (warning)
+   * - configured, not enforced  -> "sandbox: workspace (not enforced)" (error)
+   * - off                       -> "sandbox: off" (loud, like the YOLO badge)
+   * Empty rung (state not yet reported) hides the badge.
+   */
+  private buildSandboxBadge(): string {
+    const s = this.state;
+    if (!s.sandboxRung) return '';
+    if (s.sandboxRung === 'off') return colors.bold(colors.accent('sandbox: off'));
+    const label = `sandbox: ${s.sandboxRung}`;
+    switch (s.sandboxEnforcement) {
+      case 'enforced':
+        return colors.muted(label);
+      case 'partial':
+        return colors.accent(`${label} (partial)`);
+      case 'none':
+        return colors.error(`${label} (not enforced)`);
+    }
   }
 
   // -------------------------------------------------------------------------
