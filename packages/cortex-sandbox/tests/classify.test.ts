@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { denialFromViolations, denialFromFailureHeuristic } from '../src/classify.js';
+import {
+  denialFromViolations,
+  denialFromFailureHeuristic,
+  type DenialCorroborationContext,
+} from '../src/classify.js';
 import { SandboxRuntimeProvider } from '../src/provider.js';
 import type { SandboxCommandFailure } from '@animus-labs/cortex';
 
@@ -12,6 +16,16 @@ function failure(overrides: Partial<SandboxCommandFailure> = {}): SandboxCommand
     exitCode: 1,
     stderr: '',
     stdout: '',
+    ...overrides,
+  };
+}
+
+function ctx(overrides: Partial<DenialCorroborationContext> = {}): DenialCorroborationContext {
+  return {
+    writableRoots: ['/workspace', '/tmp'],
+    denyRead: ['/home/user/.ssh', '/home/user/.aws'],
+    denyWrite: ['/home/user/.zshrc', '/workspace/.git/hooks'],
+    home: '/home/user',
     ...overrides,
   };
 }
@@ -67,44 +81,158 @@ describe('denialFromViolations (macOS violation log)', () => {
 
 describe('denialFromFailureHeuristic (Linux stderr heuristic)', () => {
   it('returns null for a successful or signal-terminated command', () => {
-    expect(denialFromFailureHeuristic(failure({ exitCode: 0, stderr: 'Permission denied' }))).toBeNull();
-    expect(denialFromFailureHeuristic(failure({ exitCode: null, stderr: 'Permission denied' }))).toBeNull();
+    expect(
+      denialFromFailureHeuristic(failure({ exitCode: 0, stderr: 'Permission denied' }), ctx()),
+    ).toBeNull();
+    expect(
+      denialFromFailureHeuristic(failure({ exitCode: null, stderr: 'Permission denied' }), ctx()),
+    ).toBeNull();
   });
 
   it('returns null when stderr carries no denial marker', () => {
-    expect(denialFromFailureHeuristic(failure({ stderr: 'error: tests failed (3 of 7)' }))).toBeNull();
+    expect(
+      denialFromFailureHeuristic(failure({ stderr: 'error: tests failed (3 of 7)' }), ctx()),
+    ).toBeNull();
   });
 
-  it('attributes a read-only filesystem error to filesystem-write', () => {
+  it('attributes a read-only filesystem error to filesystem-write without corroboration', () => {
     const denial = denialFromFailureHeuristic(
       failure({ stderr: 'touch: /etc/x: Read-only file system' }),
+      ctx(),
     );
     expect(denial?.dimension).toBe('filesystem-write');
     expect(denial?.escalatable).toBe(true);
   });
 
-  it('attributes unreachable-network and DNS failures to network', () => {
+  it('attributes unreachable-network and DNS failures to network without corroboration', () => {
     expect(
-      denialFromFailureHeuristic(failure({ stderr: 'connect: Network is unreachable' }))?.dimension,
+      denialFromFailureHeuristic(failure({ stderr: 'connect: Network is unreachable' }), ctx())
+        ?.dimension,
     ).toBe('network');
     expect(
       denialFromFailureHeuristic(
         failure({ stderr: 'Temporary failure in name resolution' }),
+        ctx(),
       )?.dimension,
     ).toBe('network');
   });
 
-  it('reports generic permission errors with unknown dimension', () => {
+  it('does NOT attribute a generic permission error with no corroborating signal', () => {
+    // The command touches nothing outside the workspace and no network tool;
+    // this shape (missing exec bit, root-owned file) is the classic false
+    // positive the corroboration requirement removes.
+    expect(
+      denialFromFailureHeuristic(
+        failure({
+          command: 'mkdir data',
+          stderr: 'mkdir: cannot create directory: Permission denied',
+        }),
+        ctx(),
+      ),
+    ).toBeNull();
+    expect(
+      denialFromFailureHeuristic(failure({ command: './gradlew build', stderr: 'spawn EACCES' }), ctx()),
+    ).toBeNull();
+    expect(
+      denialFromFailureHeuristic(
+        failure({ command: 'npm install', stderr: 'EPERM: operation not permitted' }),
+        ctx(),
+      ),
+    ).toBeNull();
+  });
+
+  it('corroborates a generic marker with a referenced path outside the writable roots', () => {
     const denial = denialFromFailureHeuristic(
-      failure({ stderr: 'mkdir: cannot create directory: Permission denied' }),
+      failure({ command: 'touch /etc/blocked', stderr: 'touch: Permission denied' }),
+      ctx(),
     );
     expect(denial?.dimension).toBe('unknown');
     expect(denial?.detail).toContain('Permission denied');
+    expect(denial?.detail).toContain('/etc/blocked');
   });
 
-  it('recognizes bare errno markers', () => {
-    expect(denialFromFailureHeuristic(failure({ stderr: 'spawn EACCES' }))).not.toBeNull();
-    expect(denialFromFailureHeuristic(failure({ stderr: 'EPERM: operation not permitted' }))).not.toBeNull();
+  it('does not corroborate from a path inside the writable roots', () => {
+    expect(
+      denialFromFailureHeuristic(
+        failure({ command: 'touch /workspace/out.txt', stderr: 'touch: Permission denied' }),
+        ctx(),
+      ),
+    ).toBeNull();
+  });
+
+  it('pins the dimension when the referenced path is under a deny set', () => {
+    const write = denialFromFailureHeuristic(
+      failure({ command: 'cp payload ~/.zshrc', stderr: 'cp: Permission denied' }),
+      ctx(),
+    );
+    expect(write?.dimension).toBe('filesystem-write');
+    expect(write?.detail).toContain('write-protected');
+
+    const read = denialFromFailureHeuristic(
+      failure({ command: 'cat /home/user/.ssh/id_ed25519', stderr: 'cat: Permission denied' }),
+      ctx(),
+    );
+    expect(read?.dimension).toBe('filesystem-read');
+    expect(read?.detail).toContain('read-protected');
+  });
+
+  it('corroborates a generic marker with a network tool in command position', () => {
+    const denial = denialFromFailureHeuristic(
+      failure({ command: 'curl https://example.com/x', stderr: 'curl: (7) EACCES' }),
+      ctx(),
+    );
+    expect(denial?.dimension).toBe('network');
+    expect(denial?.detail).toContain('curl');
+  });
+
+  it('treats git remote subcommands as network, but not local git', () => {
+    expect(
+      denialFromFailureHeuristic(
+        failure({ command: 'git push origin main', stderr: 'git: Permission denied' }),
+        ctx(),
+      )?.dimension,
+    ).toBe('network');
+    expect(
+      denialFromFailureHeuristic(
+        failure({ command: 'git status', stderr: 'git: Permission denied' }),
+        ctx(),
+      ),
+    ).toBeNull();
+  });
+
+  it('does not corroborate from a network tool name in argument position', () => {
+    expect(
+      denialFromFailureHeuristic(
+        failure({ command: 'cat curl', stderr: 'cat: Permission denied' }),
+        ctx(),
+      ),
+    ).toBeNull();
+  });
+
+  it('does not corroborate from the program path itself (exec is allowed in-sandbox)', () => {
+    expect(
+      denialFromFailureHeuristic(
+        failure({ command: '/usr/local/bin/tool build', stderr: 'sh: Permission denied' }),
+        ctx(),
+      ),
+    ).toBeNull();
+  });
+
+  it('sees a network tool through a wrapper and a shell operator', () => {
+    expect(
+      denialFromFailureHeuristic(
+        failure({ command: 'cd /workspace && sudo curl https://x.dev', stderr: 'EACCES' }),
+        ctx(),
+      )?.dimension,
+    ).toBe('network');
+  });
+
+  it('expands ~ against the provided home when checking deny sets', () => {
+    const denial = denialFromFailureHeuristic(
+      failure({ command: 'ls ~/.aws', stderr: 'ls: Permission denied' }),
+      ctx(),
+    );
+    expect(denial?.dimension).toBe('filesystem-read');
   });
 });
 

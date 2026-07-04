@@ -218,7 +218,11 @@ export class SandboxRuntimeProvider implements SandboxProvider {
       const store = SandboxManager.getSandboxViolationStore();
       return denialFromViolations(store.getViolationsForCommand(failure.command));
     }
-    return denialFromFailureHeuristic(failure);
+    // Linux heuristic: generic permission markers need corroboration against
+    // the active policy (a referenced blocked path or a network tool).
+    if (!this.policy) return null;
+    const { writableRoots, denyRead, denyWrite } = this.policy.filesystem;
+    return denialFromFailureHeuristic(failure, { writableRoots, denyRead, denyWrite });
   }
 
   async dispose(): Promise<void> {
