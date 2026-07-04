@@ -22,6 +22,7 @@ import type {
   SandboxPolicy,
   SandboxStatus,
   SandboxSpawnSpec,
+  SandboxExecSpec,
   SandboxBackend,
   SandboxCommandFailure,
   SandboxDenial,
@@ -105,6 +106,34 @@ const UNCONTAINED = (reason: string): SandboxStatus => ({
   degradations: [reason],
 });
 
+/**
+ * Single-quote one shell token. sandbox-runtime only wraps a shell command
+ * STRING, so wrapExec composes one from a bare argv; that composition is a
+ * security boundary, and a quoting bug would let a crafted ripgrep pattern or
+ * path break out and run arbitrary shell. POSIX single quotes suppress EVERY
+ * metacharacter ($, `, ;, &, |, >, *, quotes, spaces, newlines), so each token
+ * reaches the program verbatim. The one character that cannot appear inside
+ * single quotes is the single quote itself: close the quote, emit an escaped
+ * literal quote ('\''), then reopen. Do not use metacharacter stripping here;
+ * full single-quoting is what makes arbitrary arguments safe.
+ *
+ * @internal exported for unit testing.
+ */
+export function singleQuoteShellToken(token: string): string {
+  return `'${token.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Compose a POSIX shell command string from a program and its arguments by
+ * single-quoting every token. The result is safe to hand to a shell (and to
+ * SandboxManager.wrapWithSandboxArgv, which wraps a command string).
+ *
+ * @internal exported for unit testing.
+ */
+export function composeShellCommand(file: string, args: string[]): string {
+  return [file, ...args].map(singleQuoteShellToken).join(' ');
+}
+
 export class SandboxRuntimeProvider implements SandboxProvider {
   private currentStatus: SandboxStatus = UNCONTAINED('not initialized');
   private policy: SandboxPolicy | undefined;
@@ -180,6 +209,27 @@ export class SandboxRuntimeProvider implements SandboxProvider {
     const { argv } = await SandboxManager.wrapWithSandboxArgv(spec.command, spec.shell);
     const [file, ...args] = argv;
     return { file: file ?? spec.shell, args, env: spec.env };
+  }
+
+  /**
+   * Wrap a bare program+args invocation (ripgrep, a stdio MCP server) so it runs
+   * inside the same OS boundary as shell commands, enforcing denyRead over
+   * secrets. sandbox-runtime has no argv-native wrap, so compose a POSIX-safe
+   * command string from the argv (every token single-quoted) and wrap that.
+   */
+  async wrapExec(spec: SandboxExecSpec): Promise<WrappedSpawn> {
+    // Not enforcing (unsupported platform or failed init): pass through so the
+    // program still runs. Status already reports this as uncontained. Mirrors
+    // wrapSpawn so behavior is unchanged when there is no real sandbox.
+    if (this.currentStatus.backend === 'none') {
+      return { file: spec.file, args: spec.args, env: spec.env };
+    }
+    const command = composeShellCommand(spec.file, spec.args);
+    // No explicit shell: let the runtime pick its default. The single-quoted
+    // command string is safe under any POSIX shell.
+    const { argv } = await SandboxManager.wrapWithSandboxArgv(command, undefined);
+    const [file, ...args] = argv;
+    return { file: file ?? spec.file, args, env: spec.env };
   }
 
   status(): SandboxStatus {
