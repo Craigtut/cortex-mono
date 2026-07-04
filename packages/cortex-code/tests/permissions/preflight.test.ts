@@ -242,6 +242,19 @@ describe('preflightPermission', () => {
     expect(out.decision).toBe('prompt');
   });
 
+  it('blocks a case-variant Write to ~/.cortex on a case-insensitive filesystem', async () => {
+    // On APFS/Windows a not-yet-existing ~/.CORTEX folds onto the real ~/.cortex,
+    // so the config-integrity floor must still block it; on a case-sensitive FS
+    // it is a genuinely different path and takes the normal prompt path.
+    const caseInsensitive = process.platform === 'darwin' || process.platform === 'win32';
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.CORTEX/settings.json' },
+      deps({ home: '/home/user' }),
+    );
+    expect(out.decision).toBe(caseInsensitive ? 'block' : 'prompt');
+  });
+
   it('blocks a Write through an in-workspace symlink into ~/.cortex (no lexical bypass)', async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-symlink-'));
     const home = path.join(tmp, 'home');
@@ -333,6 +346,18 @@ describe('preflightPermission: sandbox policy projection onto in-process file to
   it('does not apply when the sandbox is off (no policy deny sets)', async () => {
     const out = await preflightPermission('Write', { file_path: '/home/user/.zshrc' }, deps());
     expect(out.decision).toBe('prompt');
+  });
+
+  it('blocks a case-variant Write to a denyWrite path on a case-insensitive filesystem', async () => {
+    // ~/.ZSHRC folds onto the denied ~/.zshrc on APFS/Windows; the projection
+    // must not be dodged by spelling. Case-sensitive FS: a different path.
+    const caseInsensitive = process.platform === 'darwin' || process.platform === 'win32';
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.ZSHRC' },
+      policyDeps(),
+    );
+    expect(out.decision).toBe(caseInsensitive ? 'block' : 'prompt');
   });
 
   it('never applies to Bash (the OS boundary is Bash\'s control)', async () => {

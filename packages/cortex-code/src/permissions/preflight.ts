@@ -80,12 +80,24 @@ function resolvedTargetCandidates(target: string, cwd: string): string[] {
   ];
 }
 
+// macOS (APFS) and Windows default to case-insensitive filesystems, so a write
+// to a case-variant of a not-yet-existing protected path (~/.ZPROFILE for
+// ~/.zprofile) would fold onto the real file while a case-sensitive compare
+// missed it. Fold both sides there so the floor cannot be dodged by spelling.
+// Existing targets are already case-normalized by realpath; this covers the
+// not-yet-created leaf.
+const FS_CASE_INSENSITIVE = process.platform === 'darwin' || process.platform === 'win32';
+function foldPathCase(p: string): string {
+  return FS_CASE_INSENSITIVE ? p.toLowerCase() : p;
+}
+
 /** True when any candidate form of the target is at or under any protected path. */
 function targetsProtectedPath(candidates: string[], protectedPaths: readonly string[]): boolean {
-  const resolved = protectedPaths.flatMap((p) => [p, canonSync(p)]);
+  const resolved = protectedPaths.flatMap((p) => [p, canonSync(p)]).map(foldPathCase);
   for (const c of candidates) {
+    const cf = foldPathCase(c);
     for (const p of resolved) {
-      if (c === p || c.startsWith(p + sep)) return true;
+      if (cf === p || cf.startsWith(p + sep)) return true;
     }
   }
   return false;
