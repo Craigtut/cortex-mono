@@ -11,6 +11,7 @@ import {
 import { extractPattern } from './patterns.js';
 import { isPathWithinRealCwd } from './path-containment.js';
 import { splitBashCommand, stripLeadingAssignments, isCompoundBash } from './bash-command.js';
+import { withFileLock } from '../utils/file-lock.js';
 
 export type PermissionDecision = 'allow' | 'deny';
 export type RuleScope = 'session' | 'project' | 'user';
@@ -437,26 +438,31 @@ export class PermissionRuleManager {
     }
   }
 
-  private async persistRules(path: string, rules: PermissionRule[]): Promise<void> {
-    let settings: SettingsFile;
-    try {
-      const content = await readFile(path, 'utf-8');
-      settings = JSON.parse(content) as SettingsFile;
-    } catch {
-      settings = {};
-    }
+  private persistRules(path: string, rules: PermissionRule[]): Promise<void> {
+    // The workspace settings file is shared with the network grant and sandbox
+    // stores (each owns one top-level key); the lock keeps the read-modify-write
+    // atomic against theirs.
+    return withFileLock(path, async () => {
+      let settings: SettingsFile;
+      try {
+        const content = await readFile(path, 'utf-8');
+        settings = JSON.parse(content) as SettingsFile;
+      } catch {
+        settings = {};
+      }
 
-    settings.permissions = {
-      allow: rules
-        .filter(r => r.decision === 'allow')
-        .map(r => ruleToString(r.toolName, r.pattern)),
-      deny: rules
-        .filter(r => r.decision === 'deny')
-        .map(r => ruleToString(r.toolName, r.pattern)),
-    };
+      settings.permissions = {
+        allow: rules
+          .filter(r => r.decision === 'allow')
+          .map(r => ruleToString(r.toolName, r.pattern)),
+        deny: rules
+          .filter(r => r.decision === 'deny')
+          .map(r => ruleToString(r.toolName, r.pattern)),
+      };
 
-    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-    await writeFile(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
-    await chmod(path, 0o600);
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      await writeFile(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
+      await chmod(path, 0o600);
+    });
   }
 }

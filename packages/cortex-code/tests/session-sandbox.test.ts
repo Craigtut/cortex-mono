@@ -231,6 +231,29 @@ describe('Session.setSandboxRung', () => {
     expect(result.changed).toBe(false);
     expect(result.reason).toContain('disabled by config');
   });
+
+  it('refreshes the model-facing <environment> block immediately on a rung change', async () => {
+    const { session } = makeSession();
+    injectSandbox(session, stubProvider(), 'workspace');
+    // Enough of the agent for updateEphemeralContext: a context manager to
+    // receive the ephemeral block plus the token accounting it reads.
+    const setEphemeral = vi.fn();
+    (session as unknown as { agent: unknown }).agent = {
+      getContextManager: () => ({ setEphemeral }),
+      effectiveContextWindow: 200_000,
+      currentContextTokenCount: 0,
+      estimateCurrentContextTokens: () => 0,
+    };
+
+    await session.setSandboxRung('trusted');
+
+    expect(setEphemeral).toHaveBeenCalledTimes(1);
+    expect(String(setEphemeral.mock.calls[0]![0])).toContain('Sandbox: trusted rung');
+
+    // Off drops the sandbox line entirely rather than showing a stale rung.
+    await session.setSandboxRung('off');
+    expect(String(setEphemeral.mock.calls.at(-1)![0])).not.toContain('Sandbox:');
+  });
 });
 
 describe('Session.resolveInitialRung (folder-trust default)', () => {

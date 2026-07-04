@@ -262,3 +262,107 @@ describe('preflightPermission', () => {
     }
   });
 });
+
+describe('preflightPermission: sandbox policy projection onto in-process file tools', () => {
+  const policyDeps = (overrides: Partial<PreflightDeps> = {}): PreflightDeps =>
+    deps({
+      sandboxDenyWrite: ['/home/user/.zshrc', '/workspace/.git/hooks'],
+      sandboxDenyRead: ['/home/user/.ssh'],
+      ...overrides,
+    });
+
+  it('blocks a Write to a denyWrite path even in yolo mode', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/home/user/.zshrc' },
+      policyDeps({ yoloMode: true }),
+    );
+    expect(out.decision).toBe('block');
+    if (out.decision === 'block') expect(out.reason).toContain('write-protected');
+  });
+
+  it('blocks Edit and UndoEdit under a denyWrite directory', async () => {
+    const edit = await preflightPermission(
+      'Edit',
+      { file_path: '/workspace/.git/hooks/pre-commit' },
+      policyDeps(),
+    );
+    expect(edit.decision).toBe('block');
+    const undo = await preflightPermission(
+      'UndoEdit',
+      { file_path: '/workspace/.git/hooks/pre-commit' },
+      policyDeps(),
+    );
+    expect(undo.decision).toBe('block');
+  });
+
+  it('blocks a Read and an Edit under a denyRead path, even in yolo mode', async () => {
+    const read = await preflightPermission(
+      'Read',
+      { file_path: '/home/user/.ssh/id_ed25519' },
+      policyDeps({ yoloMode: true }),
+    );
+    expect(read.decision).toBe('block');
+    if (read.decision === 'block') expect(read.reason).toContain('read-protected');
+    const edit = await preflightPermission(
+      'Edit',
+      { file_path: '/home/user/.ssh/config' },
+      policyDeps(),
+    );
+    expect(edit.decision).toBe('block');
+  });
+
+  it('does not block a Read of a denyWrite-only path (rc files stay readable)', async () => {
+    const out = await preflightPermission(
+      'Read',
+      { file_path: '/home/user/.zshrc' },
+      policyDeps(),
+    );
+    expect(out.decision).toBe('prompt');
+  });
+
+  it('leaves a normal workspace write on the normal prompt path', async () => {
+    const out = await preflightPermission(
+      'Write',
+      { file_path: '/workspace/src/x.ts' },
+      policyDeps(),
+    );
+    expect(out.decision).toBe('prompt');
+  });
+
+  it('does not apply when the sandbox is off (no policy deny sets)', async () => {
+    const out = await preflightPermission('Write', { file_path: '/home/user/.zshrc' }, deps());
+    expect(out.decision).toBe('prompt');
+  });
+
+  it('never applies to Bash (the OS boundary is Bash\'s control)', async () => {
+    const out = await preflightPermission(
+      'Bash',
+      { command: 'echo hi > /home/user/.zshrc' },
+      policyDeps({ sandboxBashEnforced: true }),
+    );
+    expect(out.decision).toBe('allow');
+  });
+
+  it('blocks a Write through an in-workspace symlink into a denyWrite path', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-policy-symlink-'));
+    const home = path.join(tmp, 'home');
+    const ws = path.join(tmp, 'ws');
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(ws, { recursive: true });
+    const zshrc = path.join(home, '.zshrc');
+    fs.writeFileSync(zshrc, '# rc\n');
+    const link = path.join(ws, 'notes.txt');
+    fs.symlinkSync(zshrc, link);
+    try {
+      const out = await preflightPermission(
+        'Write',
+        { file_path: link },
+        deps({ home, cwd: ws, sandboxDenyWrite: [zshrc] }),
+      );
+      expect(out.decision).toBe('block');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

@@ -35,9 +35,21 @@ export interface PreflightDeps {
    * the same question and is skipped. Deny rules still block above.
    */
   webFetchNetworkGated?: boolean;
+  /**
+   * The active sandbox policy's filesystem deny sets, projected onto the
+   * in-process file tools. The OS sandbox denies a shell these paths (rc
+   * files, git hooks/config, secret stores, the Cortex config tree), but
+   * Write/Edit/UndoEdit/Read run in-process on fs and bypass that boundary,
+   * so the same sets block them here, above yolo. Absent when the sandbox is
+   * off: Off is genuinely off.
+   */
+  sandboxDenyWrite?: readonly string[];
+  sandboxDenyRead?: readonly string[];
 }
 
 const IN_PROCESS_WRITE_TOOLS = new Set(['Write', 'Edit', 'UndoEdit']);
+/** Edit reads the target to apply its replacement, so it is on both lists. */
+const IN_PROCESS_READ_TOOLS = new Set(['Read', 'Edit']);
 
 /** Realpath a path if it exists, else return it unchanged (never throws). */
 function canonSync(p: string): string {
@@ -48,17 +60,43 @@ function canonSync(p: string): string {
   }
 }
 
+/** The path a file tool call targets, or '' when the call carries none. */
+function fileToolTarget(toolArgs: unknown): string {
+  const args = toolArgs as Record<string, unknown> | null | undefined;
+  return String(args?.['file_path'] ?? args?.['path'] ?? '');
+}
+
+/**
+ * Symlink-resolved forms of a tool's target path: the lexical resolution plus
+ * a fully-followed realpath and an existing-ancestor resolution, to catch a
+ * symlinked leaf and a symlinked parent. An in-workspace link file (allowed to
+ * create inside the sandbox) pointing at a protected path would look clean
+ * lexically while the real access lands on the protected target.
+ */
+function resolvedTargetCandidates(target: string, cwd: string): string[] {
+  const lexical = resolve(cwd, target);
+  return [
+    ...new Set([lexical, canonSync(lexical), resolveThroughExistingAncestorSync(lexical)]),
+  ];
+}
+
+/** True when any candidate form of the target is at or under any protected path. */
+function targetsProtectedPath(candidates: string[], protectedPaths: readonly string[]): boolean {
+  const resolved = protectedPaths.flatMap((p) => [p, canonSync(p)]);
+  for (const c of candidates) {
+    for (const p of resolved) {
+      if (c === p || c.startsWith(p + sep)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * True when a file-writing tool targets Cortex's own config tree (~/.cortex or
  * the project .cortex), which holds config, permission rules, network grants,
  * and stored credentials. The OS sandbox denies a shell from writing these; the
  * in-process file tools bypass that boundary, so this closes the same hole.
- *
- * The comparison resolves symlinks: an in-workspace link file (allowed to create
- * inside the sandbox) pointing into ~/.cortex would look in-workspace lexically
- * while the real write lands in the config tree, so we check the symlink-resolved
- * target (both a fully-followed realpath and an existing-ancestor resolution, to
- * catch a symlinked leaf and a symlinked parent) against the resolved dirs.
+ * Unconditional: it holds even when the sandbox is off.
  */
 function isProtectedConfigWrite(
   toolName: string,
@@ -67,27 +105,42 @@ function isProtectedConfigWrite(
   cwd: string,
 ): boolean {
   if (!IN_PROCESS_WRITE_TOOLS.has(toolName)) return false;
-  const args = toolArgs as Record<string, unknown> | null | undefined;
-  const target = String(args?.['file_path'] ?? args?.['path'] ?? '');
+  const target = fileToolTarget(toolArgs);
   if (!target) return false;
-
-  const lexical = resolve(cwd, target);
-  const candidates = new Set([
-    lexical,
-    canonSync(lexical),
-    resolveThroughExistingAncestorSync(lexical),
+  return targetsProtectedPath(resolvedTargetCandidates(target, cwd), [
+    join(home, '.cortex'),
+    join(cwd, '.cortex'),
   ]);
-  const protectedDirs = [join(home, '.cortex'), join(cwd, '.cortex')].flatMap((d) => [
-    d,
-    canonSync(d),
-  ]);
+}
 
-  for (const c of candidates) {
-    for (const d of protectedDirs) {
-      if (c === d || c.startsWith(d + sep)) return true;
-    }
+/**
+ * Project the active sandbox policy's denyWrite/denyRead onto the in-process
+ * file tools, so a prompt-injected Write cannot land on ~/.zshrc or .git/hooks
+ * just because it skipped the shell. Returns the self-explaining block reason,
+ * or null when the call is not denied by the policy.
+ */
+function sandboxPolicyFileDenial(
+  toolName: string,
+  toolArgs: unknown,
+  deps: PreflightDeps,
+): string | null {
+  const denyWrite = deps.sandboxDenyWrite ?? [];
+  const denyRead = deps.sandboxDenyRead ?? [];
+  const checksWrite = denyWrite.length > 0 && IN_PROCESS_WRITE_TOOLS.has(toolName);
+  const checksRead = denyRead.length > 0 && IN_PROCESS_READ_TOOLS.has(toolName);
+  if (!checksWrite && !checksRead) return null;
+
+  const target = fileToolTarget(toolArgs);
+  if (!target) return null;
+
+  const candidates = resolvedTargetCandidates(target, deps.cwd);
+  if (checksWrite && targetsProtectedPath(candidates, denyWrite)) {
+    return `Blocked by sandbox policy: ${target} is write-protected`;
   }
-  return false;
+  if (checksRead && targetsProtectedPath(candidates, denyRead)) {
+    return `Blocked by sandbox policy: ${target} is read-protected`;
+  }
+  return null;
 }
 
 /**
@@ -95,7 +148,8 @@ function isProtectedConfigWrite(
  *
  *   1. Catastrophic Bash command  -> block   (never overridable; covers escalation too)
  *   1b. Write to Cortex config    -> block   (never overridable)
- *   1c. Sandbox escalation        -> prompt  (Bash deny rules still block; nothing auto-approves)
+ *   1c. Sandbox policy deny path  -> block   (in-process file tool on a denyWrite/denyRead path)
+ *   1d. Sandbox escalation        -> prompt  (Bash deny rules still block; nothing auto-approves)
  *   2. Yolo mode                  -> allow
  *   3. Explicit deny rule         -> block   (beats the read-only auto-approve)
  *   3b. Sandboxed Bash            -> allow   (the OS boundary is the control)
@@ -133,7 +187,14 @@ export async function preflightPermission(
     return { decision: 'block', reason: 'Writing Cortex configuration or credentials is not allowed' };
   }
 
-  // 1c. Sandbox escalation: the model asking to run ONE command outside the OS
+  // 1c. Sandbox policy projection: the OS boundary denies a shell the policy's
+  //     denyWrite/denyRead paths; the in-process file tools bypass it, so the
+  //     same sets block them here, above yolo, like the config floor. Symlinks
+  //     are resolved, so a workspace link into ~/.zshrc does not slip through.
+  const policyDenial = sandboxPolicyFileDenial(toolName, toolArgs, deps);
+  if (policyDenial) return { decision: 'block', reason: policyDenial };
+
+  // 1d. Sandbox escalation: the model asking to run ONE command outside the OS
   //     boundary. A deliberate exit from containment, so it is always a fresh
   //     human decision: yolo, the sandbox auto-run, allow rules, and the
   //     read-only shortcut never auto-approve it. Deny rules written for plain

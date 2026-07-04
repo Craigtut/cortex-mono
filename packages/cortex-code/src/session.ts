@@ -1461,6 +1461,9 @@ export class Session {
     }
 
     this.app?.updateStatus(this.sandboxIndicatorState());
+    // The model reads the rung from the ephemeral <environment> block; refresh
+    // it now so the change is visible mid-session, not at the next user prompt.
+    await this.updateEphemeralContext();
     log.info('Sandbox rung changed', { rung, enforced: this.sandboxStatus?.backend ?? 'none' });
     return { changed: true };
   }
@@ -1542,6 +1545,15 @@ export class Session {
       // prompt. Purely policy-level, so it applies even where OS enforcement
       // is degraded (the gate runs in-process).
       webFetchNetworkGated: this.sandboxPolicy !== undefined,
+      // Project the policy's filesystem deny sets onto the in-process file
+      // tools (Write/Edit/UndoEdit/Read), which bypass the OS boundary the
+      // shell is contained by. Absent when the sandbox is off.
+      ...(this.sandboxPolicy
+        ? {
+            sandboxDenyWrite: this.sandboxPolicy.filesystem.denyWrite,
+            sandboxDenyRead: this.sandboxPolicy.filesystem.denyRead,
+          }
+        : {}),
     };
 
     // Fast path: deterministic decision (catastrophic floor > yolo > deny rule
