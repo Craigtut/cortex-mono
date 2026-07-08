@@ -21,7 +21,10 @@ export {
   buildHelperInvocation,
   deriveWorkspaceCapabilitySidName,
   defaultHelperPath,
+  isHelperSetupFailure,
   WINDOWS_POLICY_VERSION,
+  WINDOWS_HELPER_SETUP_FAILURE_EXIT,
+  WINDOWS_HELPER_SETUP_FAILURE_SENTINEL,
   DEFAULT_CAPABILITY_SID_NAME,
 } from './windows.js';
 export type {

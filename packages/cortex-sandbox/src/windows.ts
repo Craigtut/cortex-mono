@@ -54,6 +54,40 @@ import type {
 export const WINDOWS_POLICY_VERSION = 1 as const;
 
 /**
+ * Exit code the helper uses when containment setup fails before the child ran.
+ * A cheap pre-filter only: a real child can also exit 87, so pair it with the
+ * sentinel below (see `isHelperSetupFailure`).
+ */
+export const WINDOWS_HELPER_SETUP_FAILURE_EXIT = 87 as const;
+
+/**
+ * Stderr sentinel the helper prints ONLY on a containment-setup failure (when
+ * the child never started). Kept in exact lockstep with `SETUP_FAILURE_SENTINEL`
+ * in the Rust helper's main.rs. Because the child never runs on setup failure,
+ * this line is the helper's alone and cannot be interleaved with child stderr,
+ * so it disambiguates "the sandbox could not be established" (fail-closed, the
+ * command did NOT run) from "the command ran and exited 87".
+ */
+export const WINDOWS_HELPER_SETUP_FAILURE_SENTINEL = 'cortex-sandbox-helper[setup-failure]:';
+
+/**
+ * True when a failed wrapped spawn is a helper containment-setup failure (the
+ * command never ran) rather than a real command failure. Keys on the stderr
+ * sentinel, gated by the setup-failure exit code as a cheap pre-check. Use this
+ * to surface "the sandbox could not be established" distinctly from a command
+ * that legitimately failed, and to know the command did NOT execute.
+ */
+export function isHelperSetupFailure(failure: {
+  exitCode: number | null;
+  stderr: string;
+}): boolean {
+  return (
+    failure.exitCode === WINDOWS_HELPER_SETUP_FAILURE_EXIT &&
+    failure.stderr.includes(WINDOWS_HELPER_SETUP_FAILURE_SENTINEL)
+  );
+}
+
+/**
  * The exact JSON contract the helper exe reads from its policy file (argv[1]).
  * Keep this in lockstep with `policy.rs::Policy` in the Rust helper: a field
  * rename on either side silently breaks containment, so both carry
