@@ -5,14 +5,22 @@ plus exactly what it does and does not enforce. This is the operational
 companion to the design in [`sandboxing.md`](./sandboxing.md) ("Layer 3: native
 Windows (no WSL2)").
 
-> **Status: scaffolded, unverified.** The helper crate
-> (`packages/cortex-sandbox/windows-helper`) was authored on macOS following the
-> Codex-shipped restricted-token recipe. It has **not** been compiled, run,
-> tested, or code-signed. The Win32 call sequence and flags are the deliverable;
-> the exact `windows`-crate symbol paths and return-type wrapping may need small
-> adjustments on the first real Windows build. Nothing here is a verified
-> security boundary until a Windows engineer completes the build/test/sign loop
-> below and the adversarial containment tests pass.
+> **Status: built and behaviorally verified on Windows; code-signing still
+> pending.** The helper crate (`packages/cortex-sandbox/windows-helper`) now
+> compiles clean on `x86_64-pc-windows-msvc` (Rust 1.94 / `windows` crate 0.58),
+> its `cargo test` suite passes, and the full adversarial containment suite
+> (`tests/windows-containment.integration.test.ts`, run through the real
+> `WindowsRestrictedTokenProvider` with a locally-built binary) passes: writes
+> are confined to the workspace roots and the per-session sandbox temp; writes to
+> the agent config, `.git/hooks`, `.git/config`, and outside the workspace are
+> denied; reads stay broad; credential env vars are scrubbed; and exit codes and
+> stdio pass through. Two corrections were needed on the first real build and are
+> called out below (the restricting principal is a synthetic `S-1-5-21` SID, not
+> a capability SID; the policy loader tolerates a UTF-8 BOM). What remains before
+> a production ship is the **Authenticode signing + CI pipeline** (an unsigned
+> token-manipulating exe is flagged by Defender/SmartScreen) and the ARM64 build.
+> The bundled binary at `vendor/win32-x64/` is git-ignored precisely because the
+> repo must never carry an unsigned native binary; CI builds, signs, and packs it.
 
 ## What ships, and how the pieces fit
 
@@ -58,20 +66,42 @@ almost always a feature that needs adding or a symbol path that moved between
 `windows` crate versions; fix the feature list / import rather than widening the
 recipe.
 
-Known first-build checklist (expected fixes; the scaffold was authored off
-Windows and has never compiled):
+First-build findings (all resolved; recorded so the reasoning is not lost):
 
-- **Return-type wrapping.** `windows` crate 0.58 is inconsistent about
-  `WIN32_ERROR` / `BOOL` / `HRESULT` returns: some APIs come back as
-  `Result<()>`, others as raw `WIN32_ERROR`/`BOOL` values. The scaffold mixes
-  `?` and `.is_err()` accordingly, but expect the compiler to disagree in a few
-  places; fix the wrapping per call site rather than changing the call sequence.
-- **`SETUP_FAILURE_EXIT` (87) is ambiguous.** A real child process can also exit
-  87, so the Node side cannot distinguish "sandbox setup failed" from "command
-  ran and exited 87" by exit code alone. The helper prints a
-  `cortex-sandbox-helper:` line on stderr in the failure case; replace the exit
-  code with an unambiguous signal (key on that stderr sentinel or add a
-  dedicated status pipe) before relying on the distinction.
+- **Symbol paths and return-type wrapping (mechanical).** On `windows` 0.58 a
+  handful of imports moved or needed newtype wrapping: `PSID` lives under
+  `Win32::Security` (not `Foundation`), `LocalFree` under `Win32::Foundation`,
+  `CreateRestrictedToken`'s flags take `CREATE_RESTRICTED_TOKEN_FLAGS(_)`,
+  `CreateWellKnownSid`/`ConvertStringSidToSidW` take a `PSID` (use
+  `PSID::default()` for the sizing call, not `None`), the `*W` security-info
+  setters take `PCWSTR`, and the `BOOL` params take a bare `bool`. Each was fixed
+  at the call site without changing the Win32 call sequence.
+- **The restricting principal must be a normal account SID, not a capability
+  SID (behavioral).** The scaffold derived the restricting SID with
+  `DeriveCapabilitySidsFromName` (an `S-1-15-3-…` capability SID). `windows`
+  0.58 does not expose that symbol under the enabled features, and more
+  importantly `CreateRestrictedToken` **rejects a capability SID in its
+  `SidsToRestrict` list with `ERROR_INVALID_PARAMETER`** — capability SIDs are
+  only meaningful inside an AppContainer. Codex's shipped helper uses a synthetic
+  account SID for exactly this reason. The helper now derives a deterministic
+  `S-1-5-21-a-b-c-d` SID from the per-install + per-workspace name (a 128-bit
+  hash fills the four sub-authorities) via `ConvertStringSidToSidW`. This keeps
+  every property the design wanted (per-workspace determinism, ACE reuse across
+  runs, no cross-workspace authorization) using the SID type the API accepts.
+  The design note's phrase "the official `windows` crate covers every API" and
+  its reference to `DeriveCapabilitySidsFromName` are superseded by this.
+- **Policy loader tolerates a UTF-8 BOM.** The TS provider writes the policy
+  file without a BOM, but a hand-authored policy (PowerShell `Set-Content`,
+  Notepad) usually carries one and `serde_json` rejects it. `Policy::load` now
+  strips a leading BOM before parsing so a manually-produced policy still loads.
+- **`SETUP_FAILURE_EXIT` (87) disambiguation is implemented.** Because a real
+  child can also exit 87, the helper now prints a stable stderr sentinel
+  `cortex-sandbox-helper[setup-failure]:` ONLY on a containment-setup failure
+  (when the child never ran). The TS side exports
+  `WINDOWS_HELPER_SETUP_FAILURE_SENTINEL` and `isHelperSetupFailure({exitCode,
+  stderr})`, which keys on the sentinel with the exit code as a cheap pre-check.
+  A real child exiting 87 does not print the helper's own sentinel line, so the
+  two cases are now distinguishable.
 
 Output: `target\x86_64-pc-windows-msvc\release\cortex-sandbox-helper.exe`.
 
@@ -137,6 +167,13 @@ when the ARM64 binary is added.
 
 Because secret reads are NOT denied (below), the provider reports filesystem
 **`partial`**, never `enforced`, alongside network `none`.
+
+> Terminology: "capability SID" below (and the `capabilitySidName` field in code)
+> is a historical name for the **synthetic restricting SID**. As the first-build
+> findings above explain, that SID is a deterministic `S-1-5-21` account SID, not
+> a literal AppContainer capability SID (`S-1-15-3-…`); the field name was kept
+> to avoid churning the TS interface and the Rust policy contract. Everything the
+> word describes (a restricting principal that gates writes) is accurate.
 
 **Enforced (writes + environment):**
 
@@ -221,8 +258,19 @@ Both are called out here so a reviewer can weigh them.
 
 ## Adversarial containment tests (run on Windows before trusting it)
 
-Mirror the macOS/Linux adversarial suite. With the helper active at the
-Workspace rung, assert each of these is **denied** (non-zero, access-denied):
+These are codified as an automated suite in
+`packages/cortex-sandbox/tests/windows-containment.integration.test.ts`, which
+drives the real `WindowsRestrictedTokenProvider` with the bundled binary and
+skips on any non-win32 host or when the binary is absent. It uses **PowerShell**
+as the shell, matching cortex's own `selectWindowsShell` and the helper's
+command-line reconstruction (Node's `child_process.spawn` and PowerShell both
+use CommandLineToArgvW quoting; `cmd.exe` has its own quote parser and is never
+used by cortex on Windows, so the helper matches `spawn`, not `cmd`). Run it with
+`npx vitest run tests/windows-containment.integration.test.ts` from
+`packages/cortex-sandbox`.
+
+The suite asserts (verified passing on a local build) that each of these is
+**denied** (non-zero, and the write does not land on disk):
 
 - Write outside the workspace: `echo x > %USERPROFILE%\escape.txt`.
 - Write the agent config: `echo x > %USERPROFILE%\.cortex\settings.json`.
