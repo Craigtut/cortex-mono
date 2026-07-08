@@ -40,23 +40,32 @@ mod token;
 #[cfg(windows)]
 mod winutil;
 
-/// Exit code when sandbox setup fails, so the Node side can tell "the sandbox
-/// could not be established" from "the command ran and failed". 87 ==
-/// ERROR_INVALID_PARAMETER, a nod to the class of failure; but a real child CAN
-/// exit 87, so this is ambiguous on its own. The helper also prints a
-/// `cortex-sandbox-helper:` line on stderr before exiting this way.
-/// TODO(windows-build): replace with an unambiguous signal (the Node side
-/// keying on the stderr sentinel, or a dedicated status pipe) instead of an
-/// exit code a child could also produce.
+/// Exit code when sandbox setup fails, so the Node side has a first-pass filter
+/// for "the sandbox could not be established" vs "the command ran and failed".
+/// 87 == ERROR_INVALID_PARAMETER, a nod to the class of failure. A real child
+/// CAN also exit 87, so the exit code alone is NOT authoritative: the
+/// unambiguous signal is the sentinel line below, which the helper prints to
+/// stderr ONLY on a setup failure (when the child never ran). The Node side
+/// (`isHelperSetupFailure` in windows.ts) keys on the sentinel, using the exit
+/// code only as a cheap pre-check.
 #[cfg(windows)]
 const SETUP_FAILURE_EXIT: i32 = 87;
+
+/// Stderr sentinel prefix emitted verbatim on (and only on) a containment-setup
+/// failure. Kept in exact lockstep with `WINDOWS_HELPER_SETUP_FAILURE_SENTINEL`
+/// in `packages/cortex-sandbox/src/windows.ts`. Because the child process never
+/// starts when setup fails, this line cannot be interleaved with or forged by
+/// child output: a real child exiting 87 produces its own stderr, never this
+/// exact prefix as the helper's own line.
+#[cfg(windows)]
+const SETUP_FAILURE_SENTINEL: &str = "cortex-sandbox-helper[setup-failure]:";
 
 #[cfg(windows)]
 fn main() {
     let code = match run() {
         Ok(code) => code as i32,
         Err(err) => {
-            eprintln!("cortex-sandbox-helper: {err}");
+            eprintln!("{SETUP_FAILURE_SENTINEL} {err}");
             SETUP_FAILURE_EXIT
         }
     };
@@ -88,15 +97,20 @@ fn run() -> Result<u32, Box<dyn std::error::Error>> {
     let policy = policy::Policy::load(Path::new(policy_path))?;
 
     // ---- principals ----
-    let cap = sid::derive_capability_sid(&policy.capability_sid_name)?;
-    let everyone = sid::everyone_sid()?;
-    let base = token::open_process_token()?;
-    let logon = unsafe { sid::logon_sid_from_token(base.get())? };
+    let cap = sid::derive_capability_sid(&policy.capability_sid_name)
+        .map_err(|e| format!("derive capability SID: {e}"))?;
+    let everyone = sid::everyone_sid().map_err(|e| format!("build Everyone SID: {e}"))?;
+    let base = token::open_process_token().map_err(|e| format!("open process token: {e}"))?;
+    let logon = unsafe {
+        sid::logon_sid_from_token(base.get()).map_err(|e| format!("read logon SID: {e}"))?
+    };
 
     // ---- filesystem ACLs (fail closed) ----
-    // Grant the capability SID write on each writable root. A failure here means
-    // the child could not write its own workspace, so it is fatal.
-    for root in &policy.writable_roots {
+    // Grant the capability SID write on each writable root (always including
+    // the sandbox temp, which the child's TEMP/TMP point at). A failure here
+    // means the child could not write its own workspace, so it is fatal.
+    let writable_roots = policy.effective_writable_roots();
+    for root in &writable_roots {
         acl::grant_write(root, &cap)
             .map_err(|e| format!("grant write on writable root {}: {e}", root.display()))?;
     }
@@ -127,14 +141,15 @@ fn run() -> Result<u32, Box<dyn std::error::Error>> {
     }
 
     // ---- restricted token ----
-    let restricted = token::create_restricted_token(&base, &[&cap], &logon, &everyone)?;
+    let restricted = token::create_restricted_token(&base, &[&cap], &logon, &everyone)
+        .map_err(|e| format!("create restricted token: {e}"))?;
 
     // ---- Low integrity (optional) ----
     // Order: Low-label the writable roots BEFORE lowering the token, so the Low
     // child can write them (MIC blocks a Low subject writing a Medium object).
     if policy.low_integrity {
         let low = sid::low_integrity_sid()?;
-        for root in &policy.writable_roots {
+        for root in &writable_roots {
             integrity::label_path_low(root, &low)
                 .map_err(|e| format!("Low-label writable root {}: {e}", root.display()))?;
         }
@@ -142,10 +157,11 @@ fn run() -> Result<u32, Box<dyn std::error::Error>> {
     }
 
     // ---- job object ----
-    let job = job::create_sandbox_job()?;
+    let job = job::create_sandbox_job().map_err(|e| format!("create job object: {e}"))?;
 
     // ---- launch + wait ----
-    let exit_code = process::spawn_and_wait(&restricted, &job, &command_argv)?;
+    let exit_code = process::spawn_and_wait(&restricted, &job, &command_argv)
+        .map_err(|e| format!("spawn child under sandbox: {e}"))?;
     Ok(exit_code)
 }
 

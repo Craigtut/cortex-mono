@@ -28,7 +28,7 @@
 
 use std::ffi::c_void;
 use std::path::Path;
-use windows::core::{Error, Result, PWSTR};
+use windows::core::{Error, Result, PCWSTR};
 use windows::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows::Win32::Security::{
     AddMandatoryAce, InitializeAcl, SetTokenInformation, ACL, ACL_REVISION,
@@ -87,7 +87,7 @@ pub fn label_path_low(path: &Path, low_sid: &SidBuf) -> Result<()> {
 
         let wpath = path_to_wide(path);
         let rc = SetNamedSecurityInfoW(
-            PWSTR(wpath.as_ptr() as *mut u16),
+            PCWSTR(wpath.as_ptr()),
             SE_FILE_OBJECT,
             LABEL_SECURITY_INFORMATION,
             PSID::default(),

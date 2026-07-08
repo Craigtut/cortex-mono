@@ -58,6 +58,16 @@ pub struct Policy {
     pub low_integrity: bool,
 }
 
+/// Case-folded, separator-normalized, trailing-separator-stripped key for
+/// comparing two Windows paths for identity (mirrors the TS provider's
+/// `normalizeWindowsPath`).
+fn normalized_path_key(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
 #[derive(Debug)]
 pub enum PolicyError {
     Read(std::io::Error),
@@ -84,6 +94,24 @@ impl std::fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {}
 
 impl Policy {
+    /// The writable roots to enforce: `writable_roots` plus `sandbox_temp` if
+    /// the policy did not already list it. The TS provider always includes the
+    /// sandbox temp in `writableRoots`, but the helper must not depend on that:
+    /// the child's TEMP/TMP point at `sandbox_temp`, so a policy that omitted it
+    /// would break every temp write while still claiming containment.
+    /// Comparison is case-insensitive with separators normalized, matching how
+    /// Windows treats paths and how the TS side canonicalizes them.
+    pub fn effective_writable_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.writable_roots.clone();
+        let has_temp = roots
+            .iter()
+            .any(|r| normalized_path_key(r) == normalized_path_key(&self.sandbox_temp));
+        if !has_temp {
+            roots.push(self.sandbox_temp.clone());
+        }
+        roots
+    }
+
     /// Load, parse, and validate the policy from a JSON file path.
     ///
     /// TODO(windows-build): before trusting the file, reject one not owned by
@@ -95,7 +123,11 @@ impl Policy {
     /// writable roots).
     pub fn load(path: &std::path::Path) -> Result<Self, PolicyError> {
         let text = std::fs::read_to_string(path).map_err(PolicyError::Read)?;
-        let policy: Policy = serde_json::from_str(&text).map_err(PolicyError::Parse)?;
+        // Tolerate a UTF-8 BOM: the TS provider writes without one, but a
+        // hand-authored policy from PowerShell/Notepad usually carries it and
+        // serde_json rejects it as a parse error.
+        let text = text.trim_start_matches('\u{feff}');
+        let policy: Policy = serde_json::from_str(text).map_err(PolicyError::Parse)?;
         policy.validate()?;
         Ok(policy)
     }
@@ -168,6 +200,35 @@ mod tests {
         );
         let p: Policy = serde_json::from_str(&none).expect("parse");
         assert!(matches!(p.validate(), Err(PolicyError::Empty("writableRoots"))));
+    }
+
+    #[test]
+    fn effective_writable_roots_reuses_a_listed_sandbox_temp() {
+        let p: Policy = serde_json::from_str(sample_json()).expect("parse");
+        // sample lists the temp in writableRoots (differing only in case would also match)
+        assert_eq!(p.effective_writable_roots().len(), 2);
+    }
+
+    #[test]
+    fn effective_writable_roots_appends_a_missing_sandbox_temp() {
+        let missing = sample_json().replace(
+            "\"writableRoots\": [\"C:\\\\ws\", \"C:\\\\Temp\\\\cortex-sbx-1\"]",
+            "\"writableRoots\": [\"C:\\\\ws\"]",
+        );
+        let p: Policy = serde_json::from_str(&missing).expect("parse");
+        let roots = p.effective_writable_roots();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[1], std::path::PathBuf::from("C:\\Temp\\cortex-sbx-1"));
+    }
+
+    #[test]
+    fn effective_writable_roots_matches_temp_case_insensitively() {
+        let cased = sample_json().replace(
+            "\"sandboxTemp\": \"C:\\\\Temp\\\\cortex-sbx-1\"",
+            "\"sandboxTemp\": \"c:\\\\temp\\\\CORTEX-SBX-1\\\\\"",
+        );
+        let p: Policy = serde_json::from_str(&cased).expect("parse");
+        assert_eq!(p.effective_writable_roots().len(), 2);
     }
 
     #[test]

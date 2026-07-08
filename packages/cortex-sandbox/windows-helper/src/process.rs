@@ -24,7 +24,7 @@
 
 use std::ffi::c_void;
 use windows::core::{Error, Result, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
@@ -86,7 +86,7 @@ pub fn spawn_and_wait(token: &OwnedHandle, job: &OwnedHandle, argv: &[String]) -
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) }?;
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }?;
     let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) }?;
-    let mut handles = [stdin, stdout, stderr];
+    let handles = [stdin, stdout, stderr];
     for h in handles {
         unsafe {
             SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)?;
@@ -94,15 +94,15 @@ pub fn spawn_and_wait(token: &OwnedHandle, job: &OwnedHandle, argv: &[String]) -
     }
 
     let mut attr_list = ProcThreadAttrList::with_capacity(2)?;
-    let mut mitigations: u64 = DEFAULT_MITIGATIONS;
+    let mitigations: u64 = DEFAULT_MITIGATIONS;
     attr_list.set(
         PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
-        &mut mitigations as *mut _ as *mut c_void,
+        &mitigations as *const _ as *const c_void,
         std::mem::size_of::<u64>(),
     )?;
     attr_list.set(
         PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        handles.as_mut_ptr() as *mut c_void,
+        handles.as_ptr() as *const c_void,
         std::mem::size_of_val(&handles),
     )?;
 
@@ -127,7 +127,7 @@ pub fn spawn_and_wait(token: &OwnedHandle, job: &OwnedHandle, argv: &[String]) -
             PWSTR(cmdline_wide.as_mut_ptr()),
             None,        // default process security
             None,        // default thread security
-            true.into(), // bInheritHandles: required for the std handle inheritance
+            true, // bInheritHandles: required for the std handle inheritance
             CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
             None,             // inherit the helper's (scrubbed) environment
             PCWSTR::null(),   // inherit the helper's current directory (Node set it)
@@ -198,7 +198,7 @@ impl ProcThreadAttrList {
         LPPROC_THREAD_ATTRIBUTE_LIST(self.buffer.as_mut_ptr() as *mut c_void)
     }
 
-    fn set(&mut self, attribute: usize, value: *mut c_void, size: usize) -> Result<()> {
+    fn set(&mut self, attribute: usize, value: *const c_void, size: usize) -> Result<()> {
         unsafe {
             UpdateProcThreadAttribute(self.as_ptr(), 0, attribute, Some(value), size, None, None)?;
         }

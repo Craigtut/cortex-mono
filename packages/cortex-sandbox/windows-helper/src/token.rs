@@ -29,10 +29,10 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, CreateRestrictedToken, LookupPrivilegeValueW, SetTokenInformation,
-    ACL, LUID_AND_ATTRIBUTES, NO_INHERITANCE, PSID, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
-    TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    TokenDefaultDacl,
+    ACL, CREATE_RESTRICTED_TOKEN_FLAGS, LUID_AND_ATTRIBUTES, NO_INHERITANCE, PSID,
+    SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL,
+    TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenDefaultDacl,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -85,12 +85,13 @@ pub fn create_restricted_token(
     unsafe {
         CreateRestrictedToken(
             base.get(),
-            DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
+            CREATE_RESTRICTED_TOKEN_FLAGS(DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED),
             None,            // SidsToDisable: none (WRITE_RESTRICTED handles the write gate)
             None,            // PrivilegesToDelete: none beyond DISABLE_MAX_PRIVILEGE
             Some(&restrict), // SidsToRestrict
             &mut new_token,
-        )?;
+        )
+        .map_err(|e| Error::new(e.code(), format!("CreateRestrictedToken: {e}")))?;
     }
     let token = OwnedHandle::new(new_token).ok_or_else(Error::from_win32)?;
 
@@ -100,10 +101,12 @@ pub fn create_restricted_token(
         .into_iter()
         .chain(capabilities.iter().map(|c| c.psid()))
         .collect::<Vec<_>>();
-    set_default_dacl(&token, &dacl_sids)?;
+    set_default_dacl(&token, &dacl_sids)
+        .map_err(|e| Error::new(e.code(), format!("set default DACL: {e}")))?;
 
     // Restore traverse-checking bypass (stripped by DISABLE_MAX_PRIVILEGE).
-    enable_privilege(&token, "SeChangeNotifyPrivilege")?;
+    enable_privilege(&token, "SeChangeNotifyPrivilege")
+        .map_err(|e| Error::new(e.code(), format!("enable SeChangeNotifyPrivilege: {e}")))?;
 
     Ok(token)
 }
@@ -183,7 +186,7 @@ fn enable_privilege(token: &OwnedHandle, name: &str) -> Result<()> {
                 Attributes: SE_PRIVILEGE_ENABLED,
             }],
         };
-        AdjustTokenPrivileges(token.get(), false.into(), Some(&tp), 0, None, None)?;
+        AdjustTokenPrivileges(token.get(), false, Some(&tp), 0, None, None)?;
     }
     Ok(())
 }

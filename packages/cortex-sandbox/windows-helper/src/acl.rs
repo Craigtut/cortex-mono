@@ -18,7 +18,7 @@
 
 use std::ffi::c_void;
 use std::path::Path;
-use windows::core::{Error, Result, PCWSTR, PWSTR};
+use windows::core::{Error, Result, PCWSTR};
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, DENY_ACCESS, GRANT_ACCESS,
@@ -85,7 +85,10 @@ pub fn deny_write(path: &Path, cap: &SidBuf) -> Result<()> {
     apply_ace(path, cap.psid(), DENY_ACCESS, WRITE_DENY_MASK)
 }
 
-/// Remove the capability SID's ACEs from a path (optional teardown).
+/// Remove the capability SID's ACEs from a path (optional teardown). Not called
+/// on the happy path (ACEs are deliberately reused per workspace); kept for a
+/// consumer-facing scrub command.
+#[allow(dead_code)]
 pub fn revoke(path: &Path, cap: &SidBuf) -> Result<()> {
     apply_ace(path, cap.psid(), REVOKE_ACCESS, 0)
 }
@@ -123,7 +126,7 @@ fn apply_ace(path: &Path, psid: PSID, mode: ACCESS_MODE, mask: u32) -> Result<()
             Err(Error::from(merge.to_hresult()))
         } else {
             let set = SetNamedSecurityInfoW(
-                PWSTR(wpath.as_ptr() as *mut u16),
+                PCWSTR(wpath.as_ptr()),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 PSID::default(),

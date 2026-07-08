@@ -36,13 +36,6 @@ impl OwnedHandle {
     pub fn get(&self) -> HANDLE {
         self.0
     }
-
-    /// Give up ownership; the caller becomes responsible for closing it.
-    pub fn into_raw(self) -> HANDLE {
-        let h = self.0;
-        std::mem::forget(self);
-        h
-    }
 }
 
 impl Drop for OwnedHandle {
