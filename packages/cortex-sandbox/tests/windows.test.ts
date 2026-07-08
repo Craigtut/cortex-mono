@@ -4,7 +4,10 @@ import {
   serializeWindowsPolicy,
   buildHelperInvocation,
   deriveWorkspaceCapabilitySidName,
+  isHelperSetupFailure,
   WINDOWS_POLICY_VERSION,
+  WINDOWS_HELPER_SETUP_FAILURE_EXIT,
+  WINDOWS_HELPER_SETUP_FAILURE_SENTINEL,
   DEFAULT_CAPABILITY_SID_NAME,
 } from '../src/windows.js';
 import { createSandboxProvider } from '../src/factory.js';
@@ -425,6 +428,36 @@ describe('WindowsRestrictedTokenProvider.classifyFailure', () => {
     expect(
       provider.classifyFailure({ command: 'x', exitCode: 1, stderr: 'command not found', stdout: '' }),
     ).toBeNull();
+  });
+});
+
+describe('isHelperSetupFailure', () => {
+  it('is true only when the setup-failure exit code AND the stderr sentinel are both present', () => {
+    expect(
+      isHelperSetupFailure({
+        exitCode: WINDOWS_HELPER_SETUP_FAILURE_EXIT,
+        stderr: `${WINDOWS_HELPER_SETUP_FAILURE_SENTINEL} create restricted token: boom`,
+      }),
+    ).toBe(true);
+  });
+
+  it('is false for a real child that merely exits 87 without the sentinel', () => {
+    expect(
+      isHelperSetupFailure({ exitCode: WINDOWS_HELPER_SETUP_FAILURE_EXIT, stderr: 'my tool exited 87' }),
+    ).toBe(false);
+  });
+
+  it('is false when the sentinel is present but the exit code is not the setup-failure code', () => {
+    // Defense in depth: the sentinel is the authoritative signal, but a non-87
+    // exit means the helper did not take the setup-failure path.
+    expect(
+      isHelperSetupFailure({ exitCode: 1, stderr: WINDOWS_HELPER_SETUP_FAILURE_SENTINEL }),
+    ).toBe(false);
+  });
+
+  it('is false for a normal successful/failed command', () => {
+    expect(isHelperSetupFailure({ exitCode: 0, stderr: '' })).toBe(false);
+    expect(isHelperSetupFailure({ exitCode: 2, stderr: 'error: bad regex' })).toBe(false);
   });
 });
 
