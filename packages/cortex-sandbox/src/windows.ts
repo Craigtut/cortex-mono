@@ -634,6 +634,30 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
     return null;
   }
 
+  /**
+   * The Bash tool calls this when a wrapped spawn fails to launch the helper
+   * itself (spawn ENOENT/EACCES) — the mid-session counterpart to the
+   * initialize() preflight. The canonical cause is antivirus/EDR quarantining
+   * the helper after it passed the preflight. Degrade to honest `none` so every
+   * subsequent wrapSpawn/wrapExec passes the command through uncontained (rather
+   * than failing each one), and surface the reason via onDegraded. The failed
+   * command itself did not run; the Bash tool reports that to the model.
+   */
+  notifyWrappedSpawnFailure(error: { code?: string | undefined; message: string }): void {
+    if (this.currentStatus.backend === 'none') return;
+    this.cleanupPolicyDir();
+    this.sandboxTemp = undefined;
+    this.setStatus(
+      UNCONTAINED(
+        `The Windows sandbox helper failed to launch (${error.code ?? error.message}), so OS ` +
+          `containment is now disabled for this session and shell commands run WITHOUT it. This ` +
+          `is most often antivirus or endpoint-security software quarantining the helper after ` +
+          `it started. Restore cortex-sandbox-helper.exe in your security software (or use a ` +
+          `signed build), then restart the session to re-enable containment.`,
+      ),
+    );
+  }
+
   async dispose(): Promise<void> {
     this.cleanupPolicyDir();
     this.sandboxTemp = undefined;

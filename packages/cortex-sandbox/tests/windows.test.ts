@@ -448,6 +448,49 @@ describe('WindowsRestrictedTokenProvider.wrapSpawn', () => {
   });
 });
 
+describe('WindowsRestrictedTokenProvider.notifyWrappedSpawnFailure', () => {
+  it('degrades to uncontained and passes subsequent spawns through', async () => {
+    const degraded: string[][] = [];
+    const provider = new WindowsRestrictedTokenProvider({
+      helperPath: 'C:\\cortex\\helper.exe',
+      fileExists: () => true,
+      selfTest: () => ({ ok: true }),
+      createPolicyDir: () => POLICY_DIR,
+      writePolicyFile: () => 'C:\\Temp\\policy.json',
+      removePolicyDir: () => {},
+      onDegraded: (d) => degraded.push(d),
+    });
+    const before = await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
+    expect(before.backend).toBe('win-restricted-token');
+    degraded.length = 0;
+
+    provider.notifyWrappedSpawnFailure({ code: 'ENOENT', message: 'spawn ENOENT' });
+
+    const after = provider.status();
+    expect(after.backend).toBe('none');
+    expect(after.filesystem).toBe('none');
+    expect(after.degradations.join(' ')).toMatch(/failed to launch|antivirus|ENOENT/i);
+    expect(degraded).toHaveLength(1);
+
+    // Subsequent spawns are no longer wrapped — the command still runs.
+    const wrapped = await provider.wrapSpawn(spec());
+    expect(wrapped.file).toBe(spec().shell);
+    expect(wrapped.args).toEqual([...spec().shellArgs, spec().command]);
+  });
+
+  it('is a no-op when already uncontained', () => {
+    const provider = new WindowsRestrictedTokenProvider({
+      helperPath: 'C:\\cortex\\missing.exe',
+      fileExists: () => false,
+    });
+    // Never initialized to an enforcing state; must not throw or fire onDegraded.
+    expect(() =>
+      provider.notifyWrappedSpawnFailure({ code: 'ENOENT', message: 'spawn ENOENT' }),
+    ).not.toThrow();
+    expect(provider.status().backend).toBe('none');
+  });
+});
+
 describe('WindowsRestrictedTokenProvider.classifyFailure', () => {
   async function enforcing(): Promise<WindowsRestrictedTokenProvider> {
     const provider = new WindowsRestrictedTokenProvider({
