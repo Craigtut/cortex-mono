@@ -306,11 +306,14 @@ describe('Session.resolveInitialRung (folder-trust default)', () => {
     return s.resolveInitialRung();
   }
 
-  it('defaults a fresh workspace to Workspace and remembers it', async () => {
+  it('defaults a fresh workspace to the platform default and remembers it', async () => {
     const { session } = makeSession();
 
-    expect(await resolveRung(session)).toBe('workspace');
-    expect(readPersistedRung()).toBe('workspace');
+    // On-by-default everywhere except Windows, where the unsigned Tier-1 helper
+    // is opt-in (default 'off' so nothing is spawned until the user opts in).
+    const expected = process.platform === 'win32' ? 'off' : 'workspace';
+    expect(await resolveRung(session)).toBe(expected);
+    expect(readPersistedRung()).toBe(expected);
   });
 
   it('starts a fresh workspace at the configured default rung', async () => {

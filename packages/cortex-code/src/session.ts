@@ -65,8 +65,9 @@ import { AVAILABLE_MODES } from './modes/index.js';
 import path from 'node:path';
 import * as fs from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { SandboxRuntimeProvider, buildDefaultPolicy } from '@animus-labs/cortex-sandbox';
+import { createSandboxProvider, buildDefaultPolicy } from '@animus-labs/cortex-sandbox';
 import type {
+  SandboxProvider,
   SandboxStatus,
   SandboxPolicy,
   SandboxRung,
@@ -123,7 +124,7 @@ export interface SessionOptions {
 
 export class Session {
   private agent: CortexAgent | null = null;
-  private sandboxProvider: SandboxRuntimeProvider | undefined;
+  private sandboxProvider: SandboxProvider | undefined;
   private sandboxStatus: SandboxStatus | undefined;
   /**
    * The policy handed to the provider. Kept even when OS enforcement is
@@ -1312,7 +1313,7 @@ export class Session {
    * enforce, the provider still returns (status 'none') and we warn rather than
    * fail.
    */
-  private async initSandbox(): Promise<SandboxRuntimeProvider | undefined> {
+  private async initSandbox(): Promise<SandboxProvider | undefined> {
     if (this.config.sandbox?.enabled === false) {
       // Hard kill switch: no provider at all. /sandbox reports this state but
       // cannot re-enable; the user edits config to turn the feature back on.
@@ -1324,8 +1325,20 @@ export class Session {
     await this.sandboxSettings.load();
     this.sandboxRung = await this.resolveInitialRung();
 
-    const provider = new SandboxRuntimeProvider({
-      onDegraded: (degradations) => log.warn('Sandbox enforcement reduced', { degradations }),
+    // The factory selects the platform provider: sandbox-runtime on macOS/Linux,
+    // the native restricted-token helper on Windows. Options are a superset; each
+    // provider reads only the keys it understands.
+    const provider = createSandboxProvider({
+      onDegraded: (degradations) => {
+        log.warn('Sandbox enforcement reduced', { degradations });
+        // A degradation can arrive AFTER startup (e.g. the Windows helper gets
+        // quarantined by antivirus mid-session and the provider drops to `none`).
+        // Refresh the cached status and the status line so it stops showing
+        // "enforced" once containment is actually gone.
+        const live = this.sandboxProvider?.status?.();
+        if (live) this.sandboxStatus = live;
+        this.app?.updateStatus(this.sandboxIndicatorState());
+      },
       // Shell egress to a host outside the allowlist asks the same unified
       // decision function WebFetch uses, so one grant covers both paths.
       onNetworkRequest: (r) =>
@@ -1355,7 +1368,15 @@ export class Session {
     const saved = this.sandboxSettings.getRung();
     if (saved) return saved;
 
-    const rung = this.config.sandbox?.rung ?? 'workspace';
+    // Default starting rung for a fresh workspace. On Windows the Tier-1 helper
+    // is not yet code-signed, so it is opt-in there: default to 'off' (no helper
+    // is ever spawned, so nothing can be flagged by antivirus) unless the
+    // consumer config explicitly sets a rung. A user opts in with
+    // `/sandbox workspace`, which is then remembered per workspace. Every other
+    // platform defaults to 'workspace' (on-by-default). A consumer that ships a
+    // signed helper flips Windows on by setting sandbox.rung.
+    const rung =
+      this.config.sandbox?.rung ?? (process.platform === 'win32' ? 'off' : 'workspace');
     try {
       await this.sandboxSettings.setRung(rung);
     } catch (err) {
@@ -1394,7 +1415,7 @@ export class Session {
    * egress (WebFetch).
    */
   private async activateSandboxRung(
-    provider: SandboxRuntimeProvider,
+    provider: SandboxProvider,
     rung: Exclude<SandboxRung, 'off'>,
   ): Promise<void> {
     const policy = this.buildSandboxPolicy(rung);
