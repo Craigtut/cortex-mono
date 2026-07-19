@@ -5,11 +5,15 @@ import {
   buildHelperInvocation,
   deriveWorkspaceCapabilitySidName,
   isHelperSetupFailure,
+  runHelperSelfTest,
+  defaultHelperPath,
   WINDOWS_POLICY_VERSION,
   WINDOWS_HELPER_SETUP_FAILURE_EXIT,
   WINDOWS_HELPER_SETUP_FAILURE_SENTINEL,
+  WINDOWS_HELPER_SELFTEST_OK,
   DEFAULT_CAPABILITY_SID_NAME,
 } from '../src/windows.js';
+import { existsSync } from 'node:fs';
 import { createSandboxProvider } from '../src/factory.js';
 import { SandboxRuntimeProvider } from '../src/provider.js';
 import { buildDefaultPolicy } from '../src/policy.js';
@@ -231,6 +235,7 @@ describe('WindowsRestrictedTokenProvider.initialize (honest status)', () => {
       helperPath: 'C:\\cortex\\helper.exe',
       capabilitySidName: 'cortex-sandbox-install-7',
       fileExists: () => true,
+      selfTest: () => ({ ok: true }),
       createPolicyDir: () => POLICY_DIR,
       writePolicyFile: (dir, json) => {
         writtenJson = json;
@@ -266,6 +271,7 @@ describe('WindowsRestrictedTokenProvider.initialize (honest status)', () => {
       const provider = new WindowsRestrictedTokenProvider({
         helperPath: 'h.exe',
         fileExists: () => true,
+        selfTest: () => ({ ok: true }),
         createPolicyDir: () => POLICY_DIR,
         writePolicyFile: (_dir, json) => {
           writtenJson = json;
@@ -292,6 +298,7 @@ describe('WindowsRestrictedTokenProvider.initialize (honest status)', () => {
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'h.exe',
       fileExists: () => true,
+      selfTest: () => ({ ok: true }),
       lowIntegrity: true,
       createPolicyDir: () => POLICY_DIR,
       writePolicyFile: (_dir, json) => {
@@ -310,6 +317,7 @@ describe('WindowsRestrictedTokenProvider.initialize (honest status)', () => {
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'h.exe',
       fileExists: () => true,
+      selfTest: () => ({ ok: true }),
       createPolicyDir: () => nestedDir,
       writePolicyFile: () => {
         throw new Error('must not be called: the policy dir is rewritable by the sandbox');
@@ -338,10 +346,54 @@ describe('WindowsRestrictedTokenProvider.initialize (honest status)', () => {
     expect(degraded).toHaveLength(1);
   });
 
+  it('degrades to honest none when the helper is present but the execution preflight fails', async () => {
+    // The file exists, but the self-test cannot run it (antivirus quarantine,
+    // corrupted binary, or a system policy). The provider must NOT claim
+    // `partial` and then fail every command; it reports `none` up front.
+    const degraded: string[][] = [];
+    const provider = new WindowsRestrictedTokenProvider({
+      helperPath: 'C:\\cortex\\helper.exe',
+      fileExists: () => true,
+      selfTest: () => ({ ok: false, detail: 'spawn error EACCES' }),
+      onDegraded: (d) => degraded.push(d),
+      writePolicyFile: () => {
+        throw new Error('must not be reached: the helper cannot execute');
+      },
+    });
+    const status = await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
+    expect(status.backend).toBe('none');
+    expect(status.filesystem).toBe('none');
+    expect(status.network).toBe('none');
+    // The reason names the most likely cause and how to restore or dismiss it.
+    const reason = status.degradations.join(' ');
+    expect(reason).toMatch(/antivirus|security software/i);
+    expect(reason).toMatch(/cortex-sandbox-helper\.exe/);
+    expect(reason).toContain('spawn error EACCES');
+    expect(degraded).toHaveLength(1);
+  });
+
+  it('runs the execution preflight only after confirming the helper exists', async () => {
+    // A missing helper must report "not found", never invoke the self-test.
+    let selfTestCalls = 0;
+    const provider = new WindowsRestrictedTokenProvider({
+      helperPath: 'C:\\cortex\\missing.exe',
+      fileExists: () => false,
+      selfTest: () => {
+        selfTestCalls += 1;
+        return { ok: true };
+      },
+    });
+    const status = await onWin32(() => provider.initialize(windowsWorkspacePolicy()));
+    expect(status.backend).toBe('none');
+    expect(status.degradations[0]).toMatch(/not found/i);
+    expect(selfTestCalls).toBe(0);
+  });
+
   it('reports uncontained none on a non-win32 platform', async () => {
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'C:\\cortex\\helper.exe',
       fileExists: () => true,
+      selfTest: () => ({ ok: true }),
     });
     const original = Object.getOwnPropertyDescriptor(process, 'platform');
     Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
@@ -360,6 +412,7 @@ describe('WindowsRestrictedTokenProvider.wrapSpawn', () => {
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'C:\\cortex\\helper.exe',
       fileExists: () => true,
+      selfTest: () => ({ ok: true }),
       createPolicyDir: () => POLICY_DIR,
       writePolicyFile: () => 'C:\\Temp\\policy.json',
       removePolicyDir: () => {},
@@ -400,6 +453,7 @@ describe('WindowsRestrictedTokenProvider.classifyFailure', () => {
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'h.exe',
       fileExists: () => true,
+      selfTest: () => ({ ok: true }),
       createPolicyDir: () => POLICY_DIR,
       writePolicyFile: () => 'p.json',
       removePolicyDir: () => {},
@@ -428,6 +482,27 @@ describe('WindowsRestrictedTokenProvider.classifyFailure', () => {
     expect(
       provider.classifyFailure({ command: 'x', exitCode: 1, stderr: 'command not found', stdout: '' }),
     ).toBeNull();
+  });
+});
+
+describe('runHelperSelfTest', () => {
+  const helperPresent = process.platform === 'win32' && existsSync(defaultHelperPath());
+
+  it.skipIf(!helperPresent)('reports ok for the real bundled helper', () => {
+    const result = runHelperSelfTest(defaultHelperPath());
+    expect(result.ok).toBe(true);
+  });
+
+  it('reports not-ok with a detail when the helper path does not exist', () => {
+    const result = runHelperSelfTest('C:\\definitely\\not\\here\\cortex-sandbox-helper.exe');
+    expect(result.ok).toBe(false);
+    expect(result.detail && result.detail.length).toBeGreaterThan(0);
+  });
+
+  it('keeps the ok sentinel in lockstep with the helper', () => {
+    // If this constant drifts from SELFTEST_OK_SENTINEL in main.rs, the preflight
+    // silently starts failing for a healthy helper. Pin it.
+    expect(WINDOWS_HELPER_SELFTEST_OK).toBe('cortex-sandbox-helper[selftest]: ok');
   });
 });
 
@@ -483,6 +558,7 @@ describe('createSandboxProvider factory', () => {
     const provider = new WindowsRestrictedTokenProvider({
       helperPath: 'h.exe',
       fileExists: () => true,
+      selfTest: () => ({ ok: true }),
       createPolicyDir: () => POLICY_DIR,
       writePolicyFile: (_dir, json) => {
         writtenJson = json;

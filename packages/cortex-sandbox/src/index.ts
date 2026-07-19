@@ -22,14 +22,17 @@ export {
   deriveWorkspaceCapabilitySidName,
   defaultHelperPath,
   isHelperSetupFailure,
+  runHelperSelfTest,
   WINDOWS_POLICY_VERSION,
   WINDOWS_HELPER_SETUP_FAILURE_EXIT,
   WINDOWS_HELPER_SETUP_FAILURE_SENTINEL,
+  WINDOWS_HELPER_SELFTEST_OK,
   DEFAULT_CAPABILITY_SID_NAME,
 } from './windows.js';
 export type {
   WindowsRestrictedTokenProviderOptions,
   WindowsHelperPolicy,
+  HelperSelfTestResult,
 } from './windows.js';
 export { createSandboxProvider } from './factory.js';
 export type { CreateSandboxProviderOptions } from './factory.js';

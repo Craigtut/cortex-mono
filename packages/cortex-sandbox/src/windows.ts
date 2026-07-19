@@ -33,6 +33,7 @@
  * (`serializeWindowsPolicy`, `buildHelperInvocation`) so they are unit-testable
  * on any platform without the helper binary or a Windows host.
  */
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -85,6 +86,56 @@ export function isHelperSetupFailure(failure: {
     failure.exitCode === WINDOWS_HELPER_SETUP_FAILURE_EXIT &&
     failure.stderr.includes(WINDOWS_HELPER_SETUP_FAILURE_SENTINEL)
   );
+}
+
+/**
+ * Stdout sentinel the helper prints on a successful `--selftest`. Kept in
+ * lockstep with `SELFTEST_OK_SENTINEL` in the Rust helper's main.rs.
+ */
+export const WINDOWS_HELPER_SELFTEST_OK = 'cortex-sandbox-helper[selftest]: ok';
+
+/** Result of the helper execution preflight. */
+export interface HelperSelfTestResult {
+  /** True only when the helper launched, created a restricted token, and exited 0. */
+  ok: boolean;
+  /** Human-readable reason when it did not (stderr, error code, or message). */
+  detail?: string;
+}
+
+/**
+ * Run the helper's `--selftest` and report whether it executed cleanly. This is
+ * the execution preflight: `fileExists` proves the binary is on disk, but an
+ * unsigned token-manipulating exe is a prime antivirus/EDR false-positive, so
+ * "present" does not imply "runnable." The self-test exercises the AV-sensitive
+ * step (building a restricted token) with no filesystem side effects; if it
+ * cannot run, the provider degrades to honest `none` rather than claiming
+ * containment it would then fail to deliver on every command.
+ *
+ * Both failure shapes are treated as "cannot run": a spawn error (ENOENT/EACCES
+ * when the file is present but blocked/quarantined) and a non-zero exit (the
+ * helper ran but a setup step was blocked).
+ */
+export function runHelperSelfTest(helperPath: string): HelperSelfTestResult {
+  try {
+    const out = execFileSync(helperPath, ['--selftest'], {
+      timeout: 5000,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+    });
+    if (out.includes(WINDOWS_HELPER_SELFTEST_OK)) return { ok: true };
+    return { ok: false, detail: 'self-test produced no success sentinel' };
+  } catch (err) {
+    const e = err as { code?: string; status?: number; stderr?: Buffer | string; message?: string };
+    const stderr = typeof e.stderr === 'string' ? e.stderr : (e.stderr?.toString() ?? '');
+    const detail =
+      stderr.trim() ||
+      (e.code ? `spawn error ${e.code}` : undefined) ||
+      (typeof e.status === 'number' ? `exit ${e.status}` : undefined) ||
+      e.message ||
+      'self-test failed';
+    return { ok: false, detail };
+  }
 }
 
 /**
@@ -178,6 +229,14 @@ export interface WindowsRestrictedTokenProviderOptions {
   credentialEnvVars?: string[];
   /** Test seam: existence check for the helper binary. Defaults to fs.existsSync. */
   fileExists?: (path: string) => boolean;
+  /**
+   * Test seam / override: the execution preflight. `initialize` runs this after
+   * confirming the helper exists, and degrades to honest `none` when it reports
+   * `ok: false` (the helper is present but cannot run: quarantined by antivirus,
+   * corrupted, or a wrong-arch build). Defaults to spawning `<helper> --selftest`
+   * via `runHelperSelfTest`. Pass `() => ({ ok: true })` to skip it.
+   */
+  selfTest?: (helperPath: string) => HelperSelfTestResult;
   /**
    * Test seam: creates the per-session directory that will hold the policy
    * file and returns it. The directory MUST NOT be under any writable root
@@ -355,6 +414,7 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
   private readonly lowIntegrity: boolean;
   private readonly credentialEnvVars: string[];
   private readonly fileExists: (path: string) => boolean;
+  private readonly selfTest: (helperPath: string) => HelperSelfTestResult;
   private readonly createPolicyDir: () => string;
   private readonly writePolicyFile: (dir: string, json: string) => string;
   private readonly removePolicyDir: (dir: string) => void;
@@ -365,6 +425,7 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
     this.lowIntegrity = options.lowIntegrity ?? false;
     this.credentialEnvVars = options.credentialEnvVars ?? [...DEFAULT_CREDENTIAL_ENV_VARS];
     this.fileExists = options.fileExists ?? ((p) => existsSync(p));
+    this.selfTest = options.selfTest ?? runHelperSelfTest;
     this.createPolicyDir = options.createPolicyDir ?? defaultCreatePolicyDir;
     this.writePolicyFile = options.writePolicyFile ?? defaultWritePolicyFile;
     this.removePolicyDir =
@@ -390,6 +451,26 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
 
     // A rung change re-initializes: drop the previous policy dir first.
     this.cleanupPolicyDir();
+
+    // Execution preflight. `fileExists` proved the binary is on disk, but an
+    // unsigned token-manipulating exe is a prime antivirus/EDR false-positive,
+    // so "present" does not imply "runnable." A helper that is quarantined,
+    // blocked by policy, corrupted, or wrong-arch would otherwise claim `partial`
+    // and then fail every command. Detect it here and report honest `none`.
+    const selfTest = this.selfTest(this.helperPath);
+    if (!selfTest.ok) {
+      return this.setStatus(
+        UNCONTAINED(
+          `The Windows sandbox helper is present but could not run, so shell commands run ` +
+            `WITHOUT OS containment. This is most often antivirus or endpoint-security software ` +
+            `quarantining the helper (it creates restricted tokens, which looks suspicious for an ` +
+            `unsigned binary); it can also be a corrupted binary or a system security policy. ` +
+            `Allow or restore cortex-sandbox-helper.exe in your security software to restore ` +
+            `containment, or turn the sandbox off to dismiss this` +
+            (selfTest.detail ? ` (self-test: ${selfTest.detail}).` : '.'),
+        ),
+      );
+    }
 
     const hostTempDir = canonicalHostTempDir();
     const sandboxTemp = this.resolveSandboxTemp(policy);

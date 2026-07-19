@@ -60,6 +60,13 @@ const SETUP_FAILURE_EXIT: i32 = 87;
 #[cfg(windows)]
 const SETUP_FAILURE_SENTINEL: &str = "cortex-sandbox-helper[setup-failure]:";
 
+/// Stdout sentinel printed on a successful `--selftest`. Kept in lockstep with
+/// `WINDOWS_HELPER_SELFTEST_OK` in `windows.ts`. The Node provider runs the
+/// self-test at initialize() and treats "exit 0 AND this line present" as "the
+/// helper can actually run here."
+#[cfg(windows)]
+const SELFTEST_OK_SENTINEL: &str = "cortex-sandbox-helper[selftest]: ok";
+
 #[cfg(windows)]
 fn main() {
     let code = match run() {
@@ -76,8 +83,23 @@ fn main() {
 fn run() -> Result<u32, Box<dyn std::error::Error>> {
     use std::path::Path;
 
-    // ---- argv: <policy.json> -- <shell> <shellArgs...> <command> ----
     let args: Vec<String> = std::env::args().collect();
+
+    // ---- preflight self-test (`--selftest`) ----
+    // Exercise the antivirus-sensitive setup steps (open our own token, build a
+    // WRITE_RESTRICTED restricted token, create a job object) WITHOUT editing any
+    // ACLs or spawning a child, then print an ok sentinel and exit 0. The Node
+    // provider runs this at initialize() to distinguish "the helper is present
+    // and can actually run here" from "present but blocked" (quarantined by
+    // antivirus/EDR, a corrupted binary, or a wrong-arch build), so it can
+    // degrade to honest `none` up front instead of claiming containment and then
+    // failing every command. On failure the error propagates to main(), which
+    // prints the setup-failure sentinel and exits non-zero.
+    if args.get(1).map(String::as_str) == Some("--selftest") {
+        return self_test().map(|()| 0);
+    }
+
+    // ---- argv: <policy.json> -- <shell> <shellArgs...> <command> ----
     let policy_path = args
         .get(1)
         .filter(|a| *a != "--")
@@ -163,6 +185,27 @@ fn run() -> Result<u32, Box<dyn std::error::Error>> {
     let exit_code = process::spawn_and_wait(&restricted, &job, &command_argv)
         .map_err(|e| format!("spawn child under sandbox: {e}"))?;
     Ok(exit_code)
+}
+
+/// Preflight: run the antivirus-sensitive containment-setup steps in isolation,
+/// with no filesystem side effects. Builds a restricted token from a throwaway
+/// SID name and a kill-on-close job object (the two operations behavioral AV is
+/// most likely to flag on an unsigned binary), then reports success. It edits no
+/// ACLs and spawns no child, so it is safe to run on every initialize().
+#[cfg(windows)]
+fn self_test() -> Result<(), Box<dyn std::error::Error>> {
+    let cap = sid::derive_capability_sid("cortex-sandbox-selftest")
+        .map_err(|e| format!("derive capability SID: {e}"))?;
+    let everyone = sid::everyone_sid().map_err(|e| format!("build Everyone SID: {e}"))?;
+    let base = token::open_process_token().map_err(|e| format!("open process token: {e}"))?;
+    let logon = unsafe {
+        sid::logon_sid_from_token(base.get()).map_err(|e| format!("read logon SID: {e}"))?
+    };
+    let _restricted = token::create_restricted_token(&base, &[&cap], &logon, &everyone)
+        .map_err(|e| format!("create restricted token: {e}"))?;
+    let _job = job::create_sandbox_job().map_err(|e| format!("create job object: {e}"))?;
+    println!("{SELFTEST_OK_SENTINEL}");
+    Ok(())
 }
 
 #[cfg(not(windows))]
