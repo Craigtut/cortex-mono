@@ -231,6 +231,19 @@ export interface SandboxProvider {
    * (violation log), best-effort on Linux (stderr heuristic).
    */
   classifyFailure?(failure: SandboxCommandFailure): SandboxDenial | null;
+  /**
+   * Called by the Bash tool when a sandbox-WRAPPED spawn fails at the process
+   * 'error' stage: the wrapper itself (e.g. the Windows helper exe) could not be
+   * launched. Because a wrapped command runs INSIDE the wrapper, a spawn 'error'
+   * is never the user's command failing (that arrives as normal stdout/stderr/
+   * exit); it is the wrapper binary failing to start. The canonical cause is
+   * security software quarantining or blocking the helper mid-session. The
+   * provider should mark itself uncontained so subsequent spawns pass through
+   * (self-heal to warn-and-continue) and surface the reason via its status /
+   * onDegraded channel. Optional: a provider whose wrapper is a system tool
+   * (Seatbelt/bubblewrap) may omit it.
+   */
+  notifyWrappedSpawnFailure?(error: { code?: string | undefined; message: string }): void;
   /** Current enforcement status (after initialize), for transparency surfaces. */
   status?(): SandboxStatus;
   /** Tear down the egress proxy and any transient OS state. */

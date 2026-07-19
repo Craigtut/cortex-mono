@@ -75,6 +75,35 @@ describe('Bash tool sandbox seam', () => {
     expect(result.details.exitCode).toBe(0);
   });
 
+  it('reports gracefully and notifies the provider when the wrapper fails to launch', async () => {
+    // The wrapper's file points at a binary that does not exist, so the spawn
+    // emits an 'error' (ENOENT) — the mid-session "helper quarantined by
+    // antivirus" case. The tool must (a) call notifyWrappedSpawnFailure and
+    // (b) return an actionable message, not a raw "spawn ENOENT".
+    const notifyCalls: Array<{ code?: string; message: string }> = [];
+    const missingHelper = path.join(tmpDir, 'no-such-helper-binary.exe');
+    const provider: SandboxProvider = {
+      async initialize(): Promise<SandboxStatus> {
+        return { filesystem: 'partial', network: 'none', backend: 'win-restricted-token', degradations: [] };
+      },
+      async wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn> {
+        return { file: missingHelper, args: ['whatever', spec.command], env: spec.env };
+      },
+      notifyWrappedSpawnFailure(error): void {
+        notifyCalls.push(error);
+      },
+      async dispose(): Promise<void> {},
+    };
+    const tool = createBashTool({ cwdTracker, sandbox: provider });
+    const result = await tool.execute({ command: 'echo hello' });
+    const text = (result.content[0] as { type: 'text'; text: string }).text;
+
+    expect(notifyCalls).toHaveLength(1);
+    expect(text).toContain('OS sandbox wrapper could not be launched');
+    expect(text).not.toMatch(/^Failed to execute command/);
+    expect(result.details.exitCode).toBeNull();
+  });
+
   it('routes the spawn through the provider when configured', async () => {
     const { provider, calls } = makeFakeProvider();
     const tool = createBashTool({ cwdTracker, sandbox: provider });

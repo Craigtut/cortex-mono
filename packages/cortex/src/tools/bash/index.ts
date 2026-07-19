@@ -712,8 +712,28 @@ export function createBashTool(config: BashToolConfig): {
 
           if (autoYielded) return;
 
+          let text = `Failed to execute command: ${err.message}`;
+          if (sandboxWrapped && config.sandbox) {
+            // The wrapped spawn's file IS the sandbox wrapper (e.g. the Windows
+            // helper exe), so a spawn 'error' means the WRAPPER could not launch,
+            // never the user's command (which runs inside it). The canonical
+            // cause is security software quarantining/blocking the helper
+            // mid-session. Tell the provider so it degrades to uncontained
+            // (subsequent commands pass through, surfaced via status/onDegraded),
+            // and report clearly that THIS command did not run.
+            config.sandbox.notifyWrappedSpawnFailure?.({
+              code: (err as NodeJS.ErrnoException).code,
+              message: err.message,
+            });
+            text =
+              `The command did not run: the OS sandbox wrapper could not be launched ` +
+              `(${err.message}). This often means security software blocked or quarantined it. ` +
+              `OS containment is now disabled for the rest of this session; re-run the command ` +
+              `(it will run without the sandbox) or restore the sandbox helper in your security software.`;
+          }
+
           resolve({
-            content: [{ type: 'text', text: `Failed to execute command: ${err.message}` }],
+            content: [{ type: 'text', text }],
             details: {
               stdout,
               stderr,
