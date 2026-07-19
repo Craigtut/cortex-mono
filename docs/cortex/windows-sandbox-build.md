@@ -105,11 +105,25 @@ First-build findings (all resolved; recorded so the reasoning is not lost):
 
 Output: `target\x86_64-pc-windows-msvc\release\cortex-sandbox-helper.exe`.
 
-## Sign (mandatory) and timestamp
+## Sign and timestamp (required for public distribution, not to run)
 
-An unsigned exe that manipulates tokens, edits ACLs, and spawns child processes
-is exactly the behavior profile Microsoft Defender, SmartScreen, and third-party
-EDR flag as malware. **Ship only a signed, timestamped binary.**
+Signing is **not** required for the helper to run or contain: Windows runs an
+unelevated unsigned exe, and the adversarial suite passes against a locally-built
+unsigned binary. What signing buys is *trust/reputation* so that when you
+distribute the binary to other people's machines, antivirus/EDR does not flag it.
+An exe that manipulates tokens, edits ACLs, and spawns children is exactly the
+behavior profile Microsoft Defender, SmartScreen, and third-party EDR treat as
+suspicious, so **a publicly distributed build should be signed and timestamped.**
+When you cannot sign (yet), the provider degrades gracefully rather than breaking
+(see "Running unsigned" below).
+
+For an open-source project publishing to npm, the practical signing paths are
+[SignPath Foundation](https://signpath.io/solutions/open-source-community) (free
+OV code signing for qualifying OSS, CI-integrated) or
+[Azure Artifact Signing](https://learn.microsoft.com/en-us/azure/artifact-signing/)
+(cheap, self-serve, Microsoft-trusted root). Pair either with `npm publish
+--provenance` (a sigstore attestation proving the tarball was built from a
+specific commit) for the OSS supply-chain trust story. `signtool` recipe:
 
 ```powershell
 signtool sign `
@@ -132,6 +146,46 @@ signtool verify /pa /v cortex-sandbox-helper.exe
 - The app manifest (`app.manifest`, embedded by `build.rs`) sets
   `requestedExecutionLevel=asInvoker`: the helper is unelevated and must never
   raise a UAC prompt.
+
+## Running unsigned: graceful degradation and opt-in posture
+
+Because an unsigned token-manipulating helper is a plausible antivirus
+false-positive, the system is built so the worst case is "honestly reports
+uncontained," never "breaks the user's shell." Four mechanisms:
+
+1. **Execution preflight (`--selftest`).** `initialize()` does not just check that
+   the binary exists; it runs `helper --selftest`, which opens the process token,
+   builds a `WRITE_RESTRICTED` restricted token, and creates a job object (the
+   AV-sensitive operations) with no filesystem side effects, then prints
+   `cortex-sandbox-helper[selftest]: ok`. If the helper is present but cannot run
+   (quarantined/blocked by security software, corrupted, or wrong-arch), the
+   provider reports honest `none` up front instead of claiming `partial` and then
+   failing every command. (`runHelperSelfTest` in `src/windows.ts`.)
+2. **Mid-session degradation (`notifyWrappedSpawnFailure`).** If the helper passes
+   the preflight but is quarantined LATER in the session, the next wrapped spawn
+   fails to launch. Because a wrapped command runs *inside* the helper, a spawn
+   error is unambiguously the helper failing (never the user's command), so the
+   Bash tool tells the provider to drop to `none` (subsequent commands pass
+   through uncontained, surfaced via `onDegraded` and the status line) and reports
+   that the command did not run.
+3. **Windows containment is opt-in until signed.** In cortex-code a fresh
+   workspace defaults to rung `off` on Windows (every other platform defaults to
+   `workspace`), so the unsigned helper is never spawned unless a user opts in
+   with `/sandbox workspace`. A consumer shipping a signed helper flips this by
+   setting `sandbox.rung`.
+4. **Optional refuse-to-run (`sandbox.requireEnforcement`).** The opposite lever:
+   a consumer who would rather fail closed than silently run uncontained sets
+   this, and at a contained rung with no working backend, shell commands are
+   blocked (not run uncontained). A working-but-partial backend (Tier 1: writes
+   confined, secret reads not) still counts as enforcing and is allowed.
+
+On the user-facing wording for a blocked helper: lead with the observable and the
+consequence ("the helper is present but could not run, so shell commands run
+WITHOUT OS containment"), name antivirus as the *likely* cause hedged rather than
+asserted (it can also be a corrupted binary or a system policy), and give both
+the restore action (allow/restore the exe, or use a signed build) and the dismiss
+action (turn the sandbox off). Naming antivirus helps users resolve it fast
+without misdirecting the ones whose cause is something else.
 
 ## Ship / bundle
 
