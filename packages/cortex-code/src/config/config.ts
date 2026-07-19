@@ -47,6 +47,17 @@ export interface SandboxCodeConfig {
   rung?: SandboxRung;
   /** Extra domains to pre-allow beyond the seeded package registries. */
   allowedDomains?: string[];
+  /**
+   * Refuse-to-run instead of the default warn-and-continue. When true, at a
+   * contained rung (anything but 'off') where the OS sandbox is NOT actually
+   * enforcing (backend 'none' — e.g. the Windows helper is missing, blocked, or
+   * quarantined), shell commands are BLOCKED rather than run uncontained. A
+   * working backend that only partially enforces (Windows Tier 1: writes
+   * confined, secret reads not) still counts as enforcing and is allowed. For
+   * consumers who would rather fail closed than silently drop containment.
+   * Default: false.
+   */
+  requireEnforcement?: boolean;
 }
 
 export interface FreezeDiagnosticsConfig {

@@ -1593,6 +1593,29 @@ export class Session {
     toolName: string,
     toolArgs: unknown,
   ): Promise<boolean | CortexToolPermissionResult> {
+    // Refuse-to-run (opt-in). When the consumer requires enforcement and the
+    // rung is contained but the OS sandbox is not actually enforcing (backend
+    // 'none': helper missing/blocked/quarantined), block shell commands rather
+    // than silently run them uncontained. A working-but-partial backend
+    // (Windows Tier 1) still enforces, so it is NOT refused.
+    if (
+      toolName === 'Bash' &&
+      this.config.sandbox?.requireEnforcement === true &&
+      this.sandboxRung !== 'off' &&
+      (this.sandboxStatus === undefined || this.sandboxStatus.backend === 'none')
+    ) {
+      const why = this.sandboxStatus?.degradations[0];
+      return {
+        decision: 'block',
+        reason:
+          `Sandbox enforcement is required (sandbox.requireEnforcement) but the OS sandbox is ` +
+          `not active at the "${this.sandboxRung}" rung, so this shell command was not run.` +
+          (why ? ` Reason: ${why}` : '') +
+          ` Restore the sandbox (see /sandbox status), pick a lower rung, or set ` +
+          `sandbox.requireEnforcement=false to allow uncontained execution.`,
+      };
+    }
+
     const preflightDeps: PreflightDeps = {
       yoloMode: this.yoloMode,
       cwd: this.cwd,

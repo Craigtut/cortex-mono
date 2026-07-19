@@ -332,3 +332,66 @@ describe('Session.resolveInitialRung (folder-trust default)', () => {
     expect(await resolveRung(second.session)).toBe('restricted');
   });
 });
+
+describe('Session.resolvePermission (sandbox.requireEnforcement refuse-to-run)', () => {
+  const NONE: SandboxStatus = { filesystem: 'none', network: 'none', backend: 'none', degradations: ['helper blocked'] };
+  const ENFORCED: SandboxStatus = { filesystem: 'enforced', network: 'enforced', backend: 'seatbelt', degradations: [] };
+  const PARTIAL: SandboxStatus = { filesystem: 'partial', network: 'none', backend: 'win-restricted-token', degradations: [] };
+
+  function primeSession(
+    opts: { requireEnforcement?: boolean; rung: SandboxRung; status: SandboxStatus | undefined },
+  ): Session {
+    const cfg: Record<string, unknown> = { sandbox: {} };
+    if (opts.requireEnforcement !== undefined) {
+      (cfg.sandbox as Record<string, unknown>).requireEnforcement = opts.requireEnforcement;
+    }
+    const { session } = makeSession(cfg);
+    const s = session as unknown as {
+      sandboxRung: SandboxRung;
+      sandboxStatus: SandboxStatus | undefined;
+      yoloMode: boolean;
+    };
+    s.sandboxRung = opts.rung;
+    s.sandboxStatus = opts.status;
+    s.yoloMode = true; // so a non-refused Bash resolves to allow without prompting
+    return session;
+  }
+
+  function resolveBash(session: Session): Promise<boolean | { decision: string; reason?: string }> {
+    return (
+      session as unknown as {
+        resolvePermission(n: string, a: unknown): Promise<boolean | { decision: string; reason?: string }>;
+      }
+    ).resolvePermission('Bash', { command: 'echo hi' });
+  }
+
+  it('blocks a shell command at a contained rung when enforcement is required but absent', async () => {
+    const session = primeSession({ requireEnforcement: true, rung: 'workspace', status: NONE });
+    const result = await resolveBash(session);
+    expect(typeof result).toBe('object');
+    const r = result as { decision: string; reason?: string };
+    expect(r.decision).toBe('block');
+    expect(r.reason).toMatch(/requireEnforcement/);
+    expect(r.reason).toMatch(/helper blocked/);
+  });
+
+  it('does not refuse when the rung is off (uncontained is the chosen state)', async () => {
+    const session = primeSession({ requireEnforcement: true, rung: 'off', status: NONE });
+    expect(await resolveBash(session)).toBe(true);
+  });
+
+  it('does not refuse when a backend is actually enforcing', async () => {
+    const session = primeSession({ requireEnforcement: true, rung: 'workspace', status: ENFORCED });
+    expect(await resolveBash(session)).toBe(true);
+  });
+
+  it('does not refuse a working-but-partial backend (Windows Tier 1 still enforces writes)', async () => {
+    const session = primeSession({ requireEnforcement: true, rung: 'workspace', status: PARTIAL });
+    expect(await resolveBash(session)).toBe(true);
+  });
+
+  it('warn-and-continues by default (requireEnforcement unset) even with no enforcement', async () => {
+    const session = primeSession({ rung: 'workspace', status: NONE });
+    expect(await resolveBash(session)).toBe(true);
+  });
+});
