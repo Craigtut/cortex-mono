@@ -368,3 +368,19 @@ provider must keep reporting UNCONTAINED `none` rather than claim the Tier-1
 - **CI signing pipeline.** Automating the build + sign + notarize + bundle on a
   Windows runner is not wired here; the commands above are the manual recipe.
 - **ARM64 binary.** The build supports it; producing and bundling it is pending.
+- **Unforgeable per-command setup-failure signal.** The helper prints the
+  `cortex-sandbox-helper[setup-failure]:` sentinel to stderr, and Node exposes
+  `isHelperSetupFailure` to recognize it, but nothing acts on it to change
+  containment state. That is deliberate: stderr is the sandboxed child's own
+  channel, so a malicious command could forge the sentinel (and exit 87) to trick
+  the Node layer into degrading to uncontained — a self-inflicted escape. Only the
+  helper-LAUNCH failure (an unforgeable spawn `'error'` on the helper itself, which
+  the child cannot cause because the helper lives outside every writable root)
+  drives a degrade. Making the *per-command* setup failure trustworthy needs a
+  dedicated status channel: a pipe/handle Node creates and passes to the helper
+  but NOT to the child, which the helper writes setup-success/failure to before
+  spawning. Until then, a genuine per-command setup failure surfaces as exit 87
+  with its human-readable reason on stderr, and the honest fix for a persistent
+  one is `/sandbox off` or clearing the antivirus block. The preflight
+  (`--selftest`) already catches the dominant case (a helper that cannot run or
+  create a restricted token at all) at initialize time.
