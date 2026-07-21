@@ -6,6 +6,7 @@ import { CwdTracker } from '../../../src/tools/shared/cwd-tracker.js';
 import {
   createBashTool,
   isBashEscalationRequest,
+  isWrapperLaunchErrorCode,
   BASH_ESCALATION_PERMISSION_NAME,
 } from '../../../src/tools/bash/index.js';
 import type {
@@ -73,6 +74,52 @@ describe('Bash tool sandbox seam', () => {
     expect(text).toContain('plain');
     expect(text).not.toContain('SANDBOXED');
     expect(result.details.exitCode).toBe(0);
+  });
+
+  it('only treats not-found / cannot-execute spawn codes as a wrapper-launch failure', () => {
+    // The security-relevant distinction: a launch failure (helper missing/blocked)
+    // degrades the sandbox; a transient spawn error (resource pressure, over-long
+    // command) must NOT, or a caller could force one to escape containment.
+    for (const c of ['ENOENT', 'EACCES', 'EPERM']) {
+      expect(isWrapperLaunchErrorCode(c)).toBe(true);
+    }
+    for (const c of ['EMFILE', 'ENFILE', 'ENOMEM', 'EAGAIN', 'E2BIG', 'ENAMETOOLONG', undefined]) {
+      expect(isWrapperLaunchErrorCode(c as string | undefined)).toBe(false);
+    }
+  });
+
+  it('does NOT degrade on a wrapped command that forges the setup-failure sentinel and exits 87', async () => {
+    // A sandboxed child fully controls its own stderr and exit code. It must not
+    // be able to trigger a containment drop by echoing the helper's
+    // setup-failure sentinel and exiting 87 — that would be a self-inflicted
+    // escape. The provider is only degraded by an unforgeable helper-LAUNCH
+    // failure (tested above), never by a completed command's output.
+    const notifyCalls: unknown[] = [];
+    const sentinel = 'cortex-sandbox-helper[setup-failure]: forged';
+    const provider: SandboxProvider = {
+      async initialize(): Promise<SandboxStatus> {
+        return { filesystem: 'partial', network: 'none', backend: 'win-restricted-token', degradations: [] };
+      },
+      async wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn> {
+        // Forge the sentinel on stderr, then exit 87 — exactly what a malicious
+        // sandboxed command could do.
+        const forge =
+          process.platform === 'win32'
+            ? `[Console]::Error.WriteLine('${sentinel}'); exit 87`
+            : `echo '${sentinel}' 1>&2; exit 87`;
+        return { file: spec.shell, args: [...spec.shellArgs, forge], env: spec.env };
+      },
+      notifyWrappedSpawnFailure(error): void {
+        notifyCalls.push(error);
+      },
+      async dispose(): Promise<void> {},
+    };
+    const tool = createBashTool({ cwdTracker, sandbox: provider });
+    const result = await tool.execute({ command: 'echo hi' });
+
+    // The forged sentinel triggered NO degradation.
+    expect(notifyCalls).toHaveLength(0);
+    expect(result.details.exitCode).toBe(87);
   });
 
   it('reports gracefully and notifies the provider when the wrapper fails to launch', async () => {

@@ -56,6 +56,18 @@ export type BashParamsType = Static<typeof BashParams>;
 export const BASH_ESCALATION_PERMISSION_NAME = 'Bash(escalate)';
 
 /**
+ * Whether a spawn-error code means the sandbox WRAPPER binary could not be found
+ * or executed (so containment genuinely failed and should degrade), as opposed
+ * to a transient spawn-environment error (fd/memory pressure, an over-long
+ * command line) that is not the wrapper's fault. Degrading on the latter would
+ * let a caller drop containment by forcing a spawn error, so only these codes
+ * count. Exported for testing.
+ */
+export function isWrapperLaunchErrorCode(code: string | undefined): boolean {
+  return code === 'ENOENT' || code === 'EACCES' || code === 'EPERM';
+}
+
+/**
  * True when a tool call is a Bash escalation request: the Bash tool invoked
  * with `escalateOutsideSandbox: true`. Shared by the permission adaptation in
  * CortexAgent and by consumers that need to recognize the same shape.
@@ -665,6 +677,16 @@ export function createBashTool(config: BashToolConfig): {
           // exists instead of blindly retrying. Attribution is precise on macOS
           // (violation log) and heuristic on Linux; a missed match just means
           // no note.
+          //
+          // NOTE: we deliberately do NOT key any containment-state change on a
+          // wrapped command's stderr/exit (e.g. a Windows helper setup-failure
+          // sentinel), because the child fully controls its own stderr and exit
+          // code and could forge such a signal to trick the provider into
+          // degrading to uncontained — a self-inflicted sandbox escape. A genuine
+          // per-command containment-setup failure still surfaces its
+          // human-readable reason via the helper's stderr line; making that
+          // signal unforgeable needs a dedicated status channel (future work,
+          // see docs/cortex/windows-sandbox-build.md).
           if (sandboxWrapped && !timedOut && code !== null && code !== 0) {
             let denial: SandboxDenial | null = null;
             try {
@@ -714,22 +736,29 @@ export function createBashTool(config: BashToolConfig): {
 
           let text = `Failed to execute command: ${err.message}`;
           if (sandboxWrapped && config.sandbox) {
-            // The wrapped spawn's file IS the sandbox wrapper (e.g. the Windows
-            // helper exe), so a spawn 'error' means the WRAPPER could not launch,
-            // never the user's command (which runs inside it). The canonical
-            // cause is security software quarantining/blocking the helper
-            // mid-session. Tell the provider so it degrades to uncontained
-            // (subsequent commands pass through, surfaced via status/onDegraded),
-            // and report clearly that THIS command did not run.
-            config.sandbox.notifyWrappedSpawnFailure?.({
-              code: (err as NodeJS.ErrnoException).code,
-              message: err.message,
-            });
-            text =
-              `The command did not run: the OS sandbox wrapper could not be launched ` +
-              `(${err.message}). This often means security software blocked or quarantined it. ` +
-              `OS containment is now disabled for the rest of this session; re-run the command ` +
-              `(it will run without the sandbox) or restore the sandbox helper in your security software.`;
+            // A wrapped spawn's file IS the sandbox wrapper (e.g. the Windows
+            // helper exe), so a spawn 'error' is the WRAPPER failing to start,
+            // never the user's command (which runs inside it). But ONLY codes
+            // that mean "the wrapper binary could not be found or executed"
+            // (quarantined/blocked by antivirus, missing, wrong-arch) justify
+            // dropping containment. Transient spawn-environment errors — fd or
+            // memory pressure (EMFILE/ENFILE/ENOMEM/EAGAIN) or an over-long
+            // command line — are NOT the wrapper's fault; degrading on those
+            // would let a caller escape the sandbox by forcing a spawn error, so
+            // they are reported as an ordinary "did not run" without degrading.
+            const code = (err as NodeJS.ErrnoException).code;
+            if (isWrapperLaunchErrorCode(code)) {
+              config.sandbox.notifyWrappedSpawnFailure?.({ code, message: err.message });
+              text =
+                `The command did not run: the OS sandbox wrapper could not be launched ` +
+                `(${err.message}). This often means security software blocked or quarantined it. ` +
+                `OS containment is now disabled for the rest of this session; re-run the command ` +
+                `(it will run without the sandbox) or restore the sandbox helper in your security software.`;
+            } else {
+              text =
+                `The command did not run (${err.message}). The OS sandbox is still active; this is ` +
+                `not a sandbox failure (e.g. resource pressure or an over-long command line).`;
+            }
           }
 
           resolve({
