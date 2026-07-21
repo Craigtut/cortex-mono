@@ -14,8 +14,10 @@
 //!   4. Set a permissive token default DACL (GENERIC_ALL for logon/Everyone/cap)
 //!      so the restricted process can still create its own pipes and job/IPC
 //!      objects instead of hitting ACCESS_DENIED (PowerShell pipelines need this).
-//!   5. Re-enable SeChangeNotifyPrivilege, which DISABLE_MAX_PRIVILEGE stripped,
-//!      so directory traversal ("bypass traverse checking") still works.
+//!   5. Ensure SeChangeNotifyPrivilege is enabled so directory traversal
+//!      ("bypass traverse checking") works. DISABLE_MAX_PRIVILEGE is documented
+//!      to KEEP this one privilege while dropping the rest, so this is a
+//!      defensive no-op in the common case; we assert it rather than assume it.
 //!
 //! DISABLE_MAX_PRIVILEGE drops every privilege; LUA_TOKEN produces a filtered,
 //! Medium-integrity token. Integrity is lowered further to Low separately (see
@@ -104,7 +106,8 @@ pub fn create_restricted_token(
     set_default_dacl(&token, &dacl_sids)
         .map_err(|e| Error::new(e.code(), format!("set default DACL: {e}")))?;
 
-    // Restore traverse-checking bypass (stripped by DISABLE_MAX_PRIVILEGE).
+    // Ensure traverse-checking bypass is enabled. DISABLE_MAX_PRIVILEGE keeps
+    // SeChangeNotify while dropping the rest, so this normally just re-asserts it.
     enable_privilege(&token, "SeChangeNotifyPrivilege")
         .map_err(|e| Error::new(e.code(), format!("enable SeChangeNotifyPrivilege: {e}")))?;
 

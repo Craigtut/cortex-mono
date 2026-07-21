@@ -184,6 +184,30 @@ describe.skipIf(!HELPER_PRESENT)('Windows Tier-1 helper adversarial containment'
     expect(fs.existsSync(objects)).toBe(true);
   });
 
+  it('denies DELETING a deny-write file (no delete-then-recreate bypass)', async () => {
+    // The writable-root grant is inheritable and includes FILE_DELETE_CHILD, so
+    // a child could hold delete-child on .git. If that let the sandbox delete the
+    // deny-write .git/config (and then recreate it fresh, inheriting the allow
+    // with no deny), the deny-write protection would be bypassed. Assert delete
+    // is refused and the file survives.
+    const cfg = path.join(ws, '.git', 'config');
+    const before = fs.readFileSync(cfg, 'utf8');
+    const r = await runContained(
+      `try { Remove-Item -LiteralPath '${cfg}' -Force -ErrorAction Stop } catch { exit 13 }`,
+    );
+    expect(r.code).not.toBe(0);
+    expect(fs.existsSync(cfg)).toBe(true);
+    expect(fs.readFileSync(cfg, 'utf8')).toBe(before);
+  });
+
+  it('denies DELETING the agent config (deny-write)', async () => {
+    const r = await runContained(
+      `try { Remove-Item -LiteralPath '${agentConfig}' -Force -ErrorAction Stop } catch { exit 13 }`,
+    );
+    expect(r.code).not.toBe(0);
+    expect(fs.existsSync(agentConfig)).toBe(true);
+  });
+
   it('scrubs credential env vars from the child', async () => {
     const r = await runContained('Write-Output "TOKEN=[$env:GITHUB_TOKEN]"', {
       GITHUB_TOKEN: 'ghp_secret_value',

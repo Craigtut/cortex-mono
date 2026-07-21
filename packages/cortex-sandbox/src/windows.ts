@@ -3,8 +3,10 @@
  *
  * On Windows there is no Seatbelt/bubblewrap, and sandbox-runtime's Windows
  * support is alpha and explicitly "not a security boundary". Instead we spawn a
- * small, code-signed Rust helper exe (packages/cortex-sandbox/windows-helper)
- * in place of the shell. For each command the helper:
+ * small Rust helper exe (packages/cortex-sandbox/windows-helper) in place of the
+ * shell. (The helper runs and contains unsigned; Authenticode signing is for
+ * DISTRIBUTION, to avoid antivirus false-positives on other machines, not to
+ * run — see docs/cortex/windows-sandbox-build.md.) For each command the helper:
  *   1. builds a WRITE_RESTRICTED restricted token carrying a synthetic
  *      capability SID (writes must pass BOTH the normal token AND a restricting
  *      SID, so a write succeeds only where that cap SID has an allow ACE),
@@ -118,7 +120,10 @@ export interface HelperSelfTestResult {
 export function runHelperSelfTest(helperPath: string): HelperSelfTestResult {
   try {
     const out = execFileSync(helperPath, ['--selftest'], {
-      timeout: 5000,
+      // Generous: the FIRST execution of an unsigned exe can be slow while
+      // Defender real-time scan / SmartScreen inspects it. Too short a timeout
+      // would false-degrade a perfectly good helper on the first session.
+      timeout: 20000,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf8',
@@ -194,7 +199,8 @@ export interface WindowsHelperPolicy {
 
 export interface WindowsRestrictedTokenProviderOptions {
   /**
-   * Absolute path to the signed helper exe. Defaults to the binary bundled at
+   * Absolute path to the helper exe (signed for distribution; an unsigned local
+   * build runs and contains too). Defaults to the binary bundled at
    * `<package>/vendor/win32-x64/cortex-sandbox-helper.exe`. When it is absent,
    * the provider degrades to honest UNCONTAINED `none` rather than failing.
    */
@@ -636,12 +642,14 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
 
   /**
    * The Bash tool calls this when a wrapped spawn fails to launch the helper
-   * itself (spawn ENOENT/EACCES) — the mid-session counterpart to the
+   * itself (spawn ENOENT/EACCES/EPERM) — the mid-session counterpart to the
    * initialize() preflight. The canonical cause is antivirus/EDR quarantining
    * the helper after it passed the preflight. Degrade to honest `none` so every
    * subsequent wrapSpawn/wrapExec passes the command through uncontained (rather
    * than failing each one), and surface the reason via onDegraded. The failed
-   * command itself did not run; the Bash tool reports that to the model.
+   * command itself did not run; the Bash tool reports that to the model. Safe to
+   * act on: a sandboxed child cannot forge a helper-launch failure (the helper
+   * lives outside every writable root, so the child cannot make it un-launchable).
    */
   notifyWrappedSpawnFailure(error: { code?: string | undefined; message: string }): void {
     if (this.currentStatus.backend === 'none') return;
