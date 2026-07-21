@@ -97,10 +97,15 @@ function injectSandbox(session: Session, provider: StubProvider | undefined, run
 }
 
 function readPersistedRung(): unknown {
-  const settings = JSON.parse(fs.readFileSync(workspaceSettingsPath(cwd), 'utf-8')) as {
-    sandbox?: { rung?: unknown };
-  };
-  return settings.sandbox?.rung;
+  try {
+    const settings = JSON.parse(fs.readFileSync(workspaceSettingsPath(cwd), 'utf-8')) as {
+      sandbox?: { rung?: unknown };
+    };
+    return settings.sandbox?.rung;
+  } catch {
+    // No settings file written yet (e.g. Windows default 'off' is not persisted).
+    return undefined;
+  }
 }
 
 describe('Session.setSandboxRung', () => {
@@ -306,14 +311,20 @@ describe('Session.resolveInitialRung (folder-trust default)', () => {
     return s.resolveInitialRung();
   }
 
-  it('defaults a fresh workspace to the platform default and remembers it', async () => {
+  it('defaults a fresh workspace to the platform default', async () => {
     const { session } = makeSession();
 
-    // On-by-default everywhere except Windows, where the unsigned Tier-1 helper
-    // is opt-in (default 'off' so nothing is spawned until the user opts in).
-    const expected = process.platform === 'win32' ? 'off' : 'workspace';
-    expect(await resolveRung(session)).toBe(expected);
-    expect(readPersistedRung()).toBe(expected);
+    if (process.platform === 'win32') {
+      // Windows: the unsigned Tier-1 helper is opt-in — default 'off', and NOT
+      // persisted, so a later config default or a signed-helper rollout can
+      // still raise it (only /sandbox workspace persists an opt-in).
+      expect(await resolveRung(session)).toBe('off');
+      expect(readPersistedRung()).toBeUndefined();
+    } else {
+      // On-by-default at Workspace and remembered (folder-trust).
+      expect(await resolveRung(session)).toBe('workspace');
+      expect(readPersistedRung()).toBe('workspace');
+    }
   });
 
   it('starts a fresh workspace at the configured default rung', async () => {
@@ -373,6 +384,20 @@ describe('Session.resolvePermission (sandbox.requireEnforcement refuse-to-run)',
     expect(r.decision).toBe('block');
     expect(r.reason).toMatch(/requireEnforcement/);
     expect(r.reason).toMatch(/helper blocked/);
+  });
+
+  it('also refuses a single-command escalation when enforcement is required but absent', async () => {
+    // With no working backend there is no sandbox to escape, so an escalated run
+    // is just an uncontained run — requireEnforcement must block it too.
+    const session = primeSession({ requireEnforcement: true, rung: 'workspace', status: NONE });
+    const result = await (
+      session as unknown as {
+        resolvePermission(n: string, a: unknown): Promise<boolean | { decision: string; reason?: string }>;
+      }
+    ).resolvePermission('Bash(escalate)', { command: 'echo hi', escalateOutsideSandbox: true });
+    const r = result as { decision: string; reason?: string };
+    expect(r.decision).toBe('block');
+    expect(r.reason).toMatch(/requireEnforcement/);
   });
 
   it('does not refuse when the rung is off (uncontained is the chosen state)', async () => {

@@ -18,6 +18,7 @@ const { version: PKG_VERSION } = require('../package.json');
 import {
   CortexAgent,
   ProviderManager,
+  BASH_ESCALATION_PERMISSION_NAME,
   type CortexModel,
   type CortexEvent,
   type CortexToolPermissionResult,
@@ -1368,15 +1369,31 @@ export class Session {
     const saved = this.sandboxSettings.getRung();
     if (saved) return saved;
 
-    // Default starting rung for a fresh workspace. On Windows the Tier-1 helper
-    // is not yet code-signed, so it is opt-in there: default to 'off' (no helper
-    // is ever spawned, so nothing can be flagged by antivirus) unless the
-    // consumer config explicitly sets a rung. A user opts in with
-    // `/sandbox workspace`, which is then remembered per workspace. Every other
-    // platform defaults to 'workspace' (on-by-default). A consumer that ships a
-    // signed helper flips Windows on by setting sandbox.rung.
-    const rung =
-      this.config.sandbox?.rung ?? (process.platform === 'win32' ? 'off' : 'workspace');
+    // An explicit consumer default is honored and remembered (folder-trust).
+    const configured = this.config.sandbox?.rung;
+    if (configured) {
+      await this.persistInitialRung(configured);
+      return configured;
+    }
+
+    // On Windows the Tier-1 helper is not yet code-signed, so it is opt-in:
+    // default to 'off' (no helper is ever spawned, so nothing can be flagged by
+    // antivirus). Do NOT persist that 'off' — leaving the remembered rung empty
+    // means a later consumer default (sandbox.rung, e.g. once a signed helper
+    // ships) or a future on-by-default flip still takes effect, while
+    // `/sandbox workspace` remains the explicit, remembered opt-in. Persisting
+    // it would make 'off' sticky and defeat the signed-helper rollout.
+    if (process.platform === 'win32') {
+      return 'off';
+    }
+
+    // Every other platform is on-by-default at Workspace, remembered per
+    // workspace (the folder-trust pattern).
+    await this.persistInitialRung('workspace');
+    return 'workspace';
+  }
+
+  private async persistInitialRung(rung: SandboxRung): Promise<void> {
     try {
       await this.sandboxSettings.setRung(rung);
     } catch (err) {
@@ -1384,7 +1401,6 @@ export class Session {
         error: err instanceof Error ? err.message : String(err),
       });
     }
-    return rung;
   }
 
   /** The rung-to-policy projection, shared by startup and /sandbox changes. */
@@ -1597,9 +1613,12 @@ export class Session {
     // rung is contained but the OS sandbox is not actually enforcing (backend
     // 'none': helper missing/blocked/quarantined), block shell commands rather
     // than silently run them uncontained. A working-but-partial backend
-    // (Windows Tier 1) still enforces, so it is NOT refused.
+    // (Windows Tier 1) still enforces, so it is NOT refused. This also covers the
+    // single-command escalation (`Bash(escalate)`): with no working backend there
+    // is no sandbox to escape, so an "escalated" run is just an uncontained run,
+    // which requireEnforcement forbids.
     if (
-      toolName === 'Bash' &&
+      (toolName === 'Bash' || toolName === BASH_ESCALATION_PERMISSION_NAME) &&
       this.config.sandbox?.requireEnforcement === true &&
       this.sandboxRung !== 'off' &&
       (this.sandboxStatus === undefined || this.sandboxStatus.backend === 'none')
