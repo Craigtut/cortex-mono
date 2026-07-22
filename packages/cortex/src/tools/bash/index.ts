@@ -749,11 +749,22 @@ export function createBashTool(config: BashToolConfig): {
             const code = (err as NodeJS.ErrnoException).code;
             if (isWrapperLaunchErrorCode(code)) {
               config.sandbox.notifyWrappedSpawnFailure?.({ code, message: err.message });
-              text =
-                `The command did not run: the OS sandbox wrapper could not be launched ` +
-                `(${err.message}). This often means security software blocked or quarantined it. ` +
-                `OS containment is now disabled for the rest of this session; re-run the command ` +
-                `(it will run without the sandbox) or restore the sandbox helper in your security software.`;
+              // Only tell the model containment dropped if the provider ACTUALLY
+              // degraded. A provider that omits the hook (or chose to stay
+              // contained) leaves the boundary intact, so claiming it is gone
+              // would be false and would invite an uncontained retry that still
+              // wraps. Absent status() we assume still-contained (the safe
+              // direction). This keeps the message honest regardless of which
+              // provider is wired.
+              const dropped = config.sandbox.status?.().backend === 'none';
+              text = dropped
+                ? `The command did not run: the OS sandbox wrapper could not be launched ` +
+                  `(${err.message}). This often means security software blocked or quarantined it. ` +
+                  `OS containment is now disabled for the rest of this session; re-run the command ` +
+                  `(it will run without the sandbox) or restore the sandbox helper in your security software.`
+                : `The command did not run: the OS sandbox wrapper could not be launched ` +
+                  `(${err.message}). This often means security software blocked or quarantined it. ` +
+                  `OS containment is still active; retry, or restore the sandbox helper in your security software.`;
             } else {
               text =
                 `The command did not run (${err.message}). The OS sandbox is still active; this is ` +

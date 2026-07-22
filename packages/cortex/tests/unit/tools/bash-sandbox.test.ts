@@ -151,6 +151,57 @@ describe('Bash tool sandbox seam', () => {
     expect(result.details.exitCode).toBeNull();
   });
 
+  it('claims containment dropped only when the provider actually degraded', async () => {
+    // The message must track the provider's real status, not just the fact that
+    // the hook was called: a provider that degrades to `none` earns the "now
+    // disabled" wording.
+    let degraded = false;
+    const missingHelper = path.join(tmpDir, 'gone-helper.exe');
+    const provider: SandboxProvider = {
+      async initialize(): Promise<SandboxStatus> {
+        return { filesystem: 'partial', network: 'none', backend: 'win-restricted-token', degradations: [] };
+      },
+      status(): SandboxStatus {
+        return degraded
+          ? { filesystem: 'none', network: 'none', backend: 'none', degradations: ['helper gone'] }
+          : { filesystem: 'partial', network: 'none', backend: 'win-restricted-token', degradations: [] };
+      },
+      async wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn> {
+        return { file: missingHelper, args: ['x', spec.command], env: spec.env };
+      },
+      notifyWrappedSpawnFailure(): void {
+        degraded = true;
+      },
+      async dispose(): Promise<void> {},
+    };
+    const tool = createBashTool({ cwdTracker, sandbox: provider });
+    const text = ((await tool.execute({ command: 'echo hi' })).content[0] as { text: string }).text;
+    expect(text).toContain('OS containment is now disabled');
+  });
+
+  it('does not claim containment dropped when the provider stays contained', async () => {
+    // Same wrapper-launch failure, but the provider does NOT degrade (no hook /
+    // system wrapper still intact), so the message must not tell the model the
+    // boundary is gone and invite an uncontained retry.
+    const missingHelper = path.join(tmpDir, 'gone-helper-2.exe');
+    const provider: SandboxProvider = {
+      async initialize(): Promise<SandboxStatus> {
+        return { filesystem: 'enforced', network: 'enforced', backend: 'seatbelt', degradations: [] };
+      },
+      status(): SandboxStatus {
+        return { filesystem: 'enforced', network: 'enforced', backend: 'seatbelt', degradations: [] };
+      },
+      async wrapSpawn(spec: SandboxSpawnSpec): Promise<WrappedSpawn> {
+        return { file: missingHelper, args: ['x', spec.command], env: spec.env };
+      },
+      async dispose(): Promise<void> {},
+    };
+    const tool = createBashTool({ cwdTracker, sandbox: provider });
+    const text = ((await tool.execute({ command: 'echo hi' })).content[0] as { text: string }).text;
+    expect(text).toContain('OS containment is still active');
+    expect(text).not.toContain('now disabled');
+  });
+
   it('routes the spawn through the provider when configured', async () => {
     const { provider, calls } = makeFakeProvider();
     const tool = createBashTool({ cwdTracker, sandbox: provider });
