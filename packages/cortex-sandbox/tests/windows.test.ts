@@ -124,6 +124,17 @@ describe('serializeWindowsPolicy', () => {
     expect(json.denyWritePaths).toContain(POLICY_DIR);
   });
 
+  it('adds the helper directory to denyWritePaths so a child cannot delete the helper it depends on', () => {
+    const helperDir = 'C:\\app\\node_modules\\@animus-labs\\cortex-sandbox\\vendor\\win32-x64';
+    const json = serializeWindowsPolicy(windowsWorkspacePolicy(), {
+      sandboxTemp: SBX_TEMP,
+      capabilitySidName: 'x',
+      lowIntegrity: false,
+      helperDir,
+    });
+    expect(json.denyWritePaths).toContain(helperDir);
+  });
+
   it('does not duplicate the policy dir in denyWritePaths when already present', () => {
     const policy = windowsWorkspacePolicy();
     policy.filesystem.denyWrite = [...policy.filesystem.denyWrite, POLICY_DIR.toLowerCase()];

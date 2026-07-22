@@ -340,8 +340,9 @@ export function deriveWorkspaceCapabilitySidName(
  *     writableRoots: the child's TEMP/TMP point at the dedicated sandbox temp
  *     instead (see buildHelperInvocation), so the real temp root is never
  *     granted to the cap SID nor Low-labeled.
- *   - `policyFileDir` is appended to denyWritePaths so the sandbox itself
- *     denies rewriting the policy that governs subsequent commands.
+ *   - `policyFileDir` and `helperDir` are appended to denyWritePaths so the
+ *     sandbox denies rewriting the policy that governs subsequent commands and
+ *     denies deleting the helper binary its next spawn depends on.
  */
 export function serializeWindowsPolicy(
   policy: SandboxPolicy,
@@ -351,6 +352,7 @@ export function serializeWindowsPolicy(
     lowIntegrity: boolean;
     hostTempDir?: string;
     policyFileDir?: string;
+    helperDir?: string;
   },
 ): WindowsHelperPolicy {
   const roots = policy.filesystem.writableRoots.filter(
@@ -360,11 +362,17 @@ export function serializeWindowsPolicy(
     ? [...roots]
     : [...roots, meta.sandboxTemp];
   const denyWritePaths = [...policy.filesystem.denyWrite];
-  if (
-    meta.policyFileDir !== undefined &&
-    !denyWritePaths.some((p) => isSameWindowsPath(p, meta.policyFileDir as string))
-  ) {
-    denyWritePaths.push(meta.policyFileDir);
+  // Deny writing the sandbox's own control surfaces even when they fall inside a
+  // writable root: the policy file's directory (rewriting the policy that governs
+  // later commands) and the helper binary's directory (a child that deletes or
+  // renames the helper makes the NEXT spawn fail to launch, a self-induced
+  // containment drop). This matters mainly when cortex-code runs from a source
+  // checkout whose workspace contains the helper (dogfooding); an installed CLI
+  // keeps the helper outside the workspace.
+  for (const dir of [meta.policyFileDir, meta.helperDir]) {
+    if (dir !== undefined && !denyWritePaths.some((p) => isSameWindowsPath(p, dir))) {
+      denyWritePaths.push(dir);
+    }
   }
   return {
     version: WINDOWS_POLICY_VERSION,
@@ -514,6 +522,9 @@ export class WindowsRestrictedTokenProvider implements SandboxProvider {
       lowIntegrity: this.lowIntegrity,
       hostTempDir,
       policyFileDir: policyDir,
+      // Deny the helper's own directory so a sandboxed child cannot delete the
+      // binary the next spawn needs (relevant when the workspace contains it).
+      helperDir: dirname(this.helperPath),
     });
 
     // TOCTOU guard: a policy file inside a writable root could be rewritten by
