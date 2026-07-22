@@ -114,11 +114,15 @@ pub fn derive_capability_sid(name: &str) -> Result<SidBuf> {
 }
 
 /// Build the deterministic `S-1-5-21-a-b-c-d` string for a name. The four
-/// sub-authorities are a 128-bit FNV-1a hash of the name (four 32-bit lanes with
-/// distinct offset bases), so distinct names practically never collide and the
-/// same name is always the same SID. This is a synthetic principal, not a
-/// security-grade hash: collisions would only ever merge two workspaces'
-/// write-grant scopes, and 2^-128 makes that a non-event.
+/// sub-authorities are four 32-bit FNV-1a lanes over the name (distinct offset
+/// bases), so the same name always maps to the same SID. This is a synthetic
+/// principal, NOT a cryptographic hash: the lanes share the byte stream and
+/// diffuse weakly, so do not lean on "128-bit collision resistance" here. It is
+/// sound only because `name` is already `<base>-<truncated-sha256>` derived from
+/// TRUSTED config (the install id and canonical workspace roots), never model
+/// input, so the collision resistance that matters lives in that upstream
+/// SHA-256; even then a collision would at worst merge two workspaces'
+/// write-grant scopes.
 fn synthetic_sid_string(name: &str) -> String {
     // FNV-1a 32-bit, seeded with distinct offset bases for four independent lanes.
     const PRIME: u32 = 0x0100_0193;

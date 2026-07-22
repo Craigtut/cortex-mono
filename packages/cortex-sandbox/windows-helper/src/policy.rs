@@ -22,8 +22,8 @@ pub struct Policy {
     /// Schema version; must equal `SUPPORTED_VERSION`.
     pub version: u32,
 
-    /// Name fed to `DeriveCapabilitySidsFromName` to derive the restricting
-    /// capability SID. The Node side derives it per install AND per workspace
+    /// Name used to derive the restricting capability SID (via a deterministic
+    /// synthetic SID string, see sid.rs). The Node side derives it per install AND per workspace
     /// (base name + a stable hash of the canonical workspace roots), so one
     /// workspace's persisted grant ACEs never authorize a token created for
     /// another workspace. Deterministic per workspace, so ACEs are reused
