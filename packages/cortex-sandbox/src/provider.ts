@@ -328,6 +328,35 @@ export class SandboxRuntimeProvider implements SandboxProvider {
     return denialFromFailureHeuristic(failure, { denyRead, denyWrite });
   }
 
+  /**
+   * The Bash tool calls this when a wrapped spawn fails to launch the wrapper
+   * itself (spawn ENOENT/EACCES/EPERM). Here the wrapper is the system tool
+   * sandbox-exec (macOS) or bwrap (Linux); if it cannot launch, containment is
+   * broken, so degrade to honest `none`: subsequent wrapSpawn/wrapExec pass the
+   * command through uncontained (rather than failing every one), the temp-env
+   * override is undone, and the reason surfaces via status / onDegraded. The
+   * failed command itself did not run. Safe to act on: a sandboxed child cannot
+   * forge a wrapper-launch failure (the wrapper binary lives outside every
+   * writable root, so the child cannot make it un-launchable). Unlikely in
+   * practice since both wrappers are OS-managed, but kept so every provider
+   * self-heals identically to the Windows helper.
+   */
+  notifyWrappedSpawnFailure(error: { code?: string | undefined; message: string }): void {
+    if (this.currentStatus.backend === 'none') return;
+    // Tear down the now-unused egress proxy/monitor, best-effort. A command
+    // spawned after the status flips below passes through and never touches it,
+    // so this async teardown cannot race a wrapped spawn.
+    void SandboxManager.reset().catch(() => {});
+    this.restoreSessionTmpdirEnv();
+    this.setStatus(
+      UNCONTAINED(
+        `The OS sandbox wrapper failed to launch (${error.code ?? error.message}), so containment ` +
+          `is now disabled for this session and shell commands run WITHOUT it. Restart the session ` +
+          `to re-enable it.`,
+      ),
+    );
+  }
+
   async dispose(): Promise<void> {
     if (this.currentStatus.backend !== 'none') {
       await SandboxManager.reset();
