@@ -4129,12 +4129,14 @@ export class CortexAgent {
     // lifecycle is 'destroying'). Bounded by destroy()'s force-kill race.
     await this.loopGateTail;
 
-    // 2. Cancel all sub-agents
+    // 2. Cancel all sub-agents. Full child destroy(), not just a pi-level
+    // abort: an abort alone left the child's MCP connections, event
+    // subscriptions, and compaction timers alive until (and unless) its
+    // completion continuation got around to destroying it. Bounded by this
+    // destroy()'s own force-kill deadline.
     try {
       await this.subAgentManager.cancelAll(async (agent) => {
-        const cortexAgent = agent as CortexAgent;
-        cortexAgent.agent.abort();
-        await cortexAgent.agent.waitForIdle();
+        await (agent as CortexAgent).destroy();
       });
     } catch {
       // Best-effort sub-agent cleanup
@@ -4328,6 +4330,28 @@ export class CortexAgent {
       );
     }
     return this.spawnBackgroundSubAgentInternal(params);
+  }
+
+  /**
+   * Cancel a running sub-agent: destroy the child agent, untrack it, resolve
+   * its completion promise as cancelled, and discard any pending or late
+   * result so cancelled work is never delivered to the loop.
+   * Returns false when the task ID is not an active sub-agent.
+   */
+  async cancelSubAgent(taskId: string): Promise<boolean> {
+    const cancelled = await this.subAgentManager.cancel(taskId, async (agent) => {
+      await (agent as CortexAgent).destroy();
+    });
+    if (cancelled) {
+      // Purge a result that already completed and sits queued for delivery.
+      // Results arriving after this point are dropped by the drain's
+      // isCancelled() check.
+      this.pendingBackgroundResults = this.pendingBackgroundResults.filter(
+        item => !(item.kind === 'subagent' && item.taskId === taskId),
+      );
+      this.logger.info('[CortexAgent] subagent cancelled', { taskId });
+    }
+    return cancelled;
   }
 
   /**
@@ -4785,6 +4809,14 @@ export class CortexAgent {
     item: PendingBackgroundCompletion,
   ): Promise<void> {
     if (this.isShuttingDown()) return;
+    // A cancelled sub-agent can settle after its cancel (its completion path
+    // survives the abort); its result must never wake the loop.
+    if (item.kind === 'subagent' && this.subAgentManager.isCancelled(item.taskId)) {
+      this.logger.info('[CortexAgent] dropping result of cancelled subagent', {
+        taskId: item.taskId,
+      });
+      return;
+    }
 
     this.pendingBackgroundResults.push(item);
     await this.schedulePendingResultDelivery();
@@ -4834,6 +4866,11 @@ export class CortexAgent {
     const parts: string[] = [];
     const firstAttemptTaskIds: string[] = [];
     for (const item of pending) {
+      // Cancelled sub-agent work is discarded, including re-queued items
+      // whose cancel landed between delivery attempts.
+      if (item.kind === 'subagent' && this.subAgentManager.isCancelled(item.taskId)) {
+        continue;
+      }
       // Re-queued items reuse the message formatted on their first attempt
       // (formatting marks Bash tasks notified, so it must not re-run).
       const message = item.formattedMessage ?? this.formatPendingCompletion(item);

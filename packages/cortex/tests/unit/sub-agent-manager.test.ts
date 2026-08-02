@@ -187,7 +187,99 @@ describe('SubAgentManager', () => {
     });
   });
 
+  describe('cancel', () => {
+    it('untracks the entry, calls abortFn, and resolves the completion as cancelled', async () => {
+      const abortFn = vi.fn().mockResolvedValue(undefined);
+      const childAgent = { fake: true };
+      const entry = createTrackedEntry({ taskId: 'task-1', agent: childAgent });
+      manager.track(entry);
+
+      const cancelled = await manager.cancel('task-1', abortFn);
+
+      expect(cancelled).toBe(true);
+      expect(abortFn).toHaveBeenCalledWith(childAgent);
+      expect(manager.get('task-1')).toBeUndefined();
+      expect(manager.activeCount).toBe(0);
+
+      const result = await entry.completion;
+      expect(result.status).toBe('cancelled');
+    });
+
+    it('returns false for an unknown task ID', async () => {
+      const abortFn = vi.fn();
+      const cancelled = await manager.cancel('nope', abortFn);
+      expect(cancelled).toBe(false);
+      expect(abortFn).not.toHaveBeenCalled();
+    });
+
+    it('marks the task cancelled so late completions are discardable', async () => {
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+      expect(manager.isCancelled('task-1')).toBe(false);
+
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+      expect(manager.isCancelled('task-1')).toBe(true);
+    });
+
+    it('marks the task cancelled before running the async teardown', async () => {
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+
+      let cancelledDuringTeardown: boolean | null = null;
+      const abortFn = vi.fn().mockImplementation(async () => {
+        cancelledDuringTeardown = manager.isCancelled('task-1');
+      });
+
+      await manager.cancel('task-1', abortFn);
+      expect(cancelledDuringTeardown).toBe(true);
+    });
+
+    it('suppresses onCompleted for a completion arriving after the cancel', async () => {
+      const onCompleted = vi.fn();
+      manager.setHooks({ onCompleted });
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+      manager.complete('task-1', {
+        output: 'late result',
+        status: 'completed',
+        usage: { turns: 1, cost: 0, durationMs: 100 },
+      });
+
+      expect(onCompleted).not.toHaveBeenCalled();
+    });
+
+    it('fires onFailed with Cancelled', async () => {
+      const onFailed = vi.fn();
+      manager.setHooks({ onFailed });
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+      expect(onFailed).toHaveBeenCalledWith('task-1', 'Cancelled');
+    });
+
+    it('still cancels when abortFn throws', async () => {
+      const entry = createTrackedEntry({ taskId: 'task-1' });
+      manager.track(entry);
+
+      const cancelled = await manager.cancel('task-1', vi.fn().mockRejectedValue(new Error('boom')));
+
+      expect(cancelled).toBe(true);
+      expect(manager.isCancelled('task-1')).toBe(true);
+      const result = await entry.completion;
+      expect(result.status).toBe('cancelled');
+    });
+  });
+
   describe('cancelAll', () => {
+    it('marks every task cancelled', async () => {
+      manager.track(createTrackedEntry({ taskId: 'a' }));
+      manager.track(createTrackedEntry({ taskId: 'b' }));
+
+      await manager.cancelAll(vi.fn().mockResolvedValue(undefined));
+
+      expect(manager.isCancelled('a')).toBe(true);
+      expect(manager.isCancelled('b')).toBe(true);
+    });
+
     it('cancels all active sub-agents', async () => {
       const abortFn = vi.fn().mockResolvedValue(undefined);
 

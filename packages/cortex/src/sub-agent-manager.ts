@@ -32,10 +32,14 @@ export interface SubAgentLifecycleHooks {
 // SubAgentManager
 // ---------------------------------------------------------------------------
 
+/** Cancelled task IDs retained for late-completion discard checks. */
+const MAX_CANCELLED_TASK_IDS = 200;
+
 export class SubAgentManager {
   private readonly agents = new Map<string, TrackedSubAgent>();
   private readonly maxConcurrent: number;
   private hooks: SubAgentLifecycleHooks = {};
+  private readonly cancelledTaskIds = new Set<string>();
 
   constructor(config?: Partial<SubAgentManagerConfig>) {
     this.maxConcurrent = config?.maxConcurrent ?? 4;
@@ -144,6 +148,63 @@ export class SubAgentManager {
   }
 
   /**
+   * Cancel a single running sub-agent: untrack it, mark it cancelled so its
+   * late completion work is discarded, tear the child down via `abortFn`,
+   * and resolve its completion promise as cancelled.
+   *
+   * Marking happens before the (async) teardown so a child that finishes
+   * during teardown cannot slip its result through: complete()/fail() no-op
+   * once the entry is untracked, and delivery paths consult isCancelled().
+   *
+   * @param abortFn - Aborts and tears down the child agent (passed to avoid a circular dep)
+   * @returns true when the task was active and is now cancelled
+   */
+  async cancel(taskId: string, abortFn: (agent: unknown) => Promise<void>): Promise<boolean> {
+    const entry = this.agents.get(taskId);
+    if (!entry) return false;
+
+    this.agents.delete(taskId);
+    this.markCancelled(taskId);
+
+    try {
+      await abortFn(entry.agent);
+    } catch {
+      // Best-effort abort
+    }
+
+    entry.resolve({
+      output: '',
+      status: 'cancelled',
+      usage: { turns: 0, cost: 0, durationMs: Date.now() - entry.spawnedAt, contextTokens: 0 },
+    });
+
+    try {
+      this.hooks.onFailed?.(taskId, 'Cancelled');
+    } catch {
+      // Swallow hook errors
+    }
+
+    return true;
+  }
+
+  /**
+   * Whether a task was cancelled. Delivery paths use this to discard results
+   * produced by a child that survived long enough to finish after its cancel.
+   */
+  isCancelled(taskId: string): boolean {
+    return this.cancelledTaskIds.has(taskId);
+  }
+
+  /** Record a cancelled task ID, evicting the oldest past the cap. */
+  private markCancelled(taskId: string): void {
+    this.cancelledTaskIds.add(taskId);
+    if (this.cancelledTaskIds.size > MAX_CANCELLED_TASK_IDS) {
+      const oldest = this.cancelledTaskIds.values().next().value;
+      if (oldest !== undefined) this.cancelledTaskIds.delete(oldest);
+    }
+  }
+
+  /**
    * Get a tracked sub-agent by task ID.
    */
   get(taskId: string): TrackedSubAgent | undefined {
@@ -186,13 +247,17 @@ export class SubAgentManager {
 
   /**
    * Cancel all active sub-agents. Called during parent destroy().
-   * Aborts each sub-agent and removes it from tracking.
+   * Marks each as cancelled, tears it down via `abortFn`, and removes it
+   * from tracking.
    *
-   * @param abortFn - Function to abort a CortexAgent (passed to avoid circular dep)
+   * @param abortFn - Function to tear down a CortexAgent (passed to avoid circular dep)
    */
   async cancelAll(abortFn: (agent: unknown) => Promise<void>): Promise<void> {
     const entries = [...this.agents.values()];
     this.agents.clear();
+    for (const entry of entries) {
+      this.markCancelled(entry.taskId);
+    }
 
     const settled = await Promise.allSettled(
       entries.map(async (entry) => {
@@ -231,6 +296,7 @@ export class SubAgentManager {
    */
   destroy(): void {
     this.agents.clear();
+    this.cancelledTaskIds.clear();
     this.hooks = {};
   }
 }

@@ -31,10 +31,13 @@ function createMockPiAgent(): PiAgent {
   } as unknown as PiAgent;
 }
 
-function createTestCortexAgent(config?: Partial<CortexAgentConfig>): CortexAgent {
+function createTestCortexAgent(
+  config?: Partial<CortexAgentConfig>,
+  piAgent?: PiAgent,
+): CortexAgent {
   const Ctor = CortexAgent as unknown as TestCortexAgentConstructor;
   return new Ctor(
-    createMockPiAgent(),
+    piAgent ?? createMockPiAgent(),
     {
       model: makeModel({
         provider: 'anthropic',
@@ -141,6 +144,173 @@ describe('CortexAgent spawn-path lifecycle', () => {
 
       releasePrompt();
       await agent.getSubAgentManager().get(taskId)?.completion;
+    });
+  });
+
+  describe('cancelSubAgent', () => {
+    interface DeliveryInternals {
+      pendingBackgroundResults: Array<Record<string, unknown>>;
+      drainPendingBackgroundResults: () => Promise<void>;
+    }
+
+    /** A child stub whose prompt hangs until destroy() rejects it (like a real abort). */
+    function createHangingChild() {
+      let rejectPrompt!: (err: Error) => void;
+      const promptGate = new Promise<never>((_, reject) => { rejectPrompt = reject; });
+      // Swallow the rejection when nothing has picked the promise up yet.
+      promptGate.catch(() => {});
+      return {
+        destroy: vi.fn().mockImplementation(async () => {
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          rejectPrompt(err);
+        }),
+        prompt: vi.fn().mockReturnValue(promptGate),
+        getConversationHistory: () => [],
+        getBudgetGuard: () => ({ getTurnCount: () => 0, getTotalCost: () => 0 }),
+        currentContextTokenCount: 0,
+      };
+    }
+
+    it('destroys the child, resolves the completion as cancelled, and drops the late result', async () => {
+      const piAgent = createMockPiAgent();
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+      const agent = createTestCortexAgent({}, piAgent);
+      const child = createHangingChild();
+      (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
+
+      const { taskId } = await agent.spawnBackgroundSubAgent({ instructions: 'long task' });
+      const completion = agent.getSubAgentManager().get(taskId)!.completion;
+
+      const cancelled = await agent.cancelSubAgent(taskId);
+
+      expect(cancelled).toBe(true);
+      expect(child.destroy).toHaveBeenCalled();
+      expect(agent.getSubAgentManager().get(taskId)).toBeUndefined();
+      await expect(completion).resolves.toMatchObject({ status: 'cancelled' });
+
+      // Let the child's completion continuation settle: its failed result
+      // must be discarded, never delivered as a background completion.
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(promptSpy).not.toHaveBeenCalled();
+    });
+
+    it('returns false for an unknown task ID', async () => {
+      const agent = createTestCortexAgent();
+      await expect(agent.cancelSubAgent('nope')).resolves.toBe(false);
+    });
+
+    it('purges a queued pending result for the cancelled task', async () => {
+      const agent = createTestCortexAgent();
+      const internal = agent as unknown as DeliveryInternals;
+      const manager = agent.getSubAgentManager();
+
+      const child = createHangingChild();
+      manager.track({
+        taskId: 'queued-task',
+        agent: child,
+        instructions: 'work',
+        background: true,
+        spawnedAt: Date.now(),
+        completion: Promise.resolve({
+          output: '',
+          status: 'cancelled',
+          usage: { turns: 0, cost: 0, durationMs: 0, contextTokens: 0 },
+        }),
+        resolve: () => {},
+        toolCount: 0,
+        lastToolName: null,
+        lastToolSummary: null,
+        lastToolStartedAt: null,
+        pendingPermission: null,
+      });
+      internal.pendingBackgroundResults.push({
+        kind: 'subagent',
+        taskId: 'queued-task',
+        result: {
+          output: 'finished before cancel',
+          status: 'completed',
+          usage: { turns: 1, cost: 0, durationMs: 10, contextTokens: 0 },
+        },
+      });
+
+      await agent.cancelSubAgent('queued-task');
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+    });
+
+    it('drops a cancelled task result at drain time', async () => {
+      const piAgent = createMockPiAgent();
+      const promptSpy = vi.spyOn(piAgent, 'prompt');
+      const agent = createTestCortexAgent({}, piAgent);
+      const internal = agent as unknown as DeliveryInternals;
+      const manager = agent.getSubAgentManager();
+
+      // Cancel directly through the manager (bypassing cancelSubAgent's
+      // queue purge) so the drain-level check is what drops the item.
+      manager.track({
+        taskId: 'late-task',
+        agent: {},
+        instructions: 'work',
+        background: true,
+        spawnedAt: Date.now(),
+        completion: Promise.resolve({
+          output: '',
+          status: 'cancelled',
+          usage: { turns: 0, cost: 0, durationMs: 0, contextTokens: 0 },
+        }),
+        resolve: () => {},
+        toolCount: 0,
+        lastToolName: null,
+        lastToolSummary: null,
+        lastToolStartedAt: null,
+        pendingPermission: null,
+      });
+      await manager.cancel('late-task', async () => {});
+
+      internal.pendingBackgroundResults.push({
+        kind: 'subagent',
+        taskId: 'late-task',
+        result: {
+          output: 'late output',
+          status: 'completed',
+          usage: { turns: 1, cost: 0, durationMs: 10, contextTokens: 0 },
+        },
+      });
+      await internal.drainPendingBackgroundResults();
+
+      expect(promptSpy).not.toHaveBeenCalled();
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+    });
+  });
+
+  describe('destroy cascading to children', () => {
+    it('destroys tracked children via cancelAll', async () => {
+      const agent = createTestCortexAgent();
+      const manager = agent.getSubAgentManager();
+      const childDestroy = vi.fn().mockResolvedValue(undefined);
+
+      manager.track({
+        taskId: 'child-1',
+        agent: { destroy: childDestroy },
+        instructions: 'work',
+        background: true,
+        spawnedAt: Date.now(),
+        completion: Promise.resolve({
+          output: '',
+          status: 'cancelled',
+          usage: { turns: 0, cost: 0, durationMs: 0, contextTokens: 0 },
+        }),
+        resolve: () => {},
+        toolCount: 0,
+        lastToolName: null,
+        lastToolSummary: null,
+        lastToolStartedAt: null,
+        pendingPermission: null,
+      });
+
+      await agent.destroy();
+      expect(childDestroy).toHaveBeenCalledTimes(1);
     });
   });
 });
