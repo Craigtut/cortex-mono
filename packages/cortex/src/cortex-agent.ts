@@ -3572,6 +3572,9 @@ export class CortexAgent {
         // name. That gate is what authorizes escalateOutsideSandbox; without a
         // resolver the tool refuses escalation (fail closed).
         permissionGated: this.config.resolvePermission !== undefined,
+        // Consumer tool tuning (CortexAgentConfig.bash).
+        shellPath: this.config.bash?.shellPath,
+        autoYieldThreshold: this.config.bash?.autoYieldThreshold,
       }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.TaskOutput)) {
@@ -3590,6 +3593,8 @@ export class CortexAgent {
         // The consumer's unified egress gate, shared with sandboxed shell
         // egress. Undefined = ungated, exactly as before.
         resolveNetworkAccess: this.config.resolveNetworkAccess,
+        // Consumer tool tuning (CortexAgentConfig.webFetch).
+        maxPerLoop: this.config.webFetch?.maxPerLoop,
       }) as RegisteredTool);
     }
     // ToolSearch is auto-registered when deferred tools are enabled. The
@@ -5141,6 +5146,10 @@ export class CortexAgent {
     }
     if (this.config.logger) childCortexConfig.logger = this.config.logger;
     if (this.envOverrides) childCortexConfig.envOverrides = this.envOverrides;
+    // Inherit tool tuning so a child's Bash and WebFetch behave like the
+    // parent's (shell override, auto-yield timing, fetch rate limit).
+    if (this.config.bash) childCortexConfig.bash = this.config.bash;
+    if (this.config.webFetch) childCortexConfig.webFetch = this.config.webFetch;
     // Share the parent's sandbox provider so a sub-agent's shell commands are
     // contained by the same OS boundary. Sharing the instance (not cloning) is
     // correct: the underlying SandboxManager is a process-global singleton.

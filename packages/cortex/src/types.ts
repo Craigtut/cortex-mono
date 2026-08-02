@@ -246,7 +246,10 @@ export interface CortexAgentConfig {
 
   /** Bash tool configuration. */
   bash?: {
-    /** Token threshold at which Bash auto-yields control back to the agent. */
+    /**
+     * Milliseconds after which a still-running Bash command auto-yields into
+     * a background task (the agent is notified on completion). Default: 10000.
+     */
     autoYieldThreshold?: number;
     /** Path to the shell executable. */
     shellPath?: string;
