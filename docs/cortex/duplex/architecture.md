@@ -60,6 +60,18 @@ The reasoner is also the scheduler of all work. New direction reaches it as deli
 
 Exactly one reasoner exists per session. Parallel reasoners were rejected because they fragment the session's accumulated context (decisions.md D3).
 
+### Reasoner Lifecycle
+
+The reasoner is session-lifetime, like the talker. Completing a delegation makes it idle, never dead: an idle loop makes no LLM calls, so persistence is free, while a teardown-and-respawn model pays spawn latency plus a cold cache on exactly the critical path of the next delegation, and every respawn discards the reasoner's memory of its own work (which never fully round-trips through conversational summaries).
+
+The context-rot argument for fresh-per-delegation is answered by mechanism, not lifecycle:
+
+- **Compaction is controlled forgetting.** Observational memory continuously does what a respawn crudely approximates: microcompaction sheds tool-call debris while the observer/reflector distill history into durable knowledge. The persistent reasoner's steady state is a fresh loop with a perfectly curated seed, maintained incrementally.
+- **Freshness is a tool, not a lifecycle.** When clean-room context is genuinely desirable, the reasoner spawns a sub-agent. Fresh contexts exist on demand without sacrificing the durable one.
+- **Renewal as repair (post-launch).** Observational state is serializable, so an explicit rebirth primitive (fresh loop, restored observation log, dropped raw transcript) can exist as a recovery operation for degraded context. It is never the normal path.
+
+Idle periods are also when the facade runs the reasoner's deferred digestion (pending observation buffers, threshold compaction), so blocking compaction paths fire while nobody is waiting.
+
 ## Role: Sub-Agents
 
 Tier 3. Spawned by the reasoner for parallel, long-running, or isolated work; also spawned by the facade in a restricted read-only form for talker-initiated quick lookups (decisions.md D13). Results deliver to the spawner through the existing background-completion path (hardened in P0; see migration-plan.md). Sub-agents cannot spawn further sub-agents.
