@@ -4841,14 +4841,24 @@ export class CortexAgent {
       throw new Error('Concurrency limit reached');
     }
 
-    // Background sub-agents do NOT wire event forwarding.
-    // Real-time visibility is foreground-only; background agents provide
-    // a post-completion tool call summary via SubAgentResult.toolCalls.
+    // Forward child events to the parent's EventBridge, exactly like the
+    // foreground path: this is what makes background children visible live
+    // (tool activity for the headline block, usage accounting) instead of
+    // only via a post-completion summary. Note _sessionUsage accumulates
+    // forwarded child turn usage, so background child spend now lands in
+    // getSessionUsage() just as foreground child spend always has.
+    const unsubForward = this.eventBridge.forwardFrom(
+      (childAgent as CortexAgent).getEventBridge(),
+      taskId,
+    );
 
     // Run the sub-agent in the background. When it completes, deliver the
     // result back to the parent agent and restart its agentic loop.
     this.runSubAgent(childAgent, params.instructions, taskId, startTime)
       .then((result) => {
+        // The child has settled (and been destroyed by runSubAgent); stop
+        // forwarding before delivery so listeners never leak per task.
+        unsubForward();
         this.logger.info('[CortexAgent] subagent complete', {
           taskId,
           background: true,
@@ -4860,6 +4870,7 @@ export class CortexAgent {
         return this.deliverOrQueueBackgroundCompletion({ kind: 'subagent', taskId, result });
       })
       .catch((err) => {
+        unsubForward();
         this.logger.error('[CortexAgent] subagent failed', {
           taskId,
           background: true,

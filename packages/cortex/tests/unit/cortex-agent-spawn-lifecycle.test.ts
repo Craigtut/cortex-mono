@@ -3,6 +3,8 @@ import { CortexAgent } from '../../src/cortex-agent.js';
 import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
 import type { CortexAgentConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
+import { EventBridge } from '../../src/event-bridge.js';
+import type { CortexEvent, PiEvent } from '../../src/event-bridge.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -133,6 +135,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
         prompt: vi.fn().mockReturnValue(promptGate),
         getConversationHistory: () => [{ role: 'assistant', content: 'done' }],
         getBudgetGuard: () => ({ getTurnCount: () => 1, getTotalCost: () => 0 }),
+        getEventBridge: () => new EventBridge(false),
         currentContextTokenCount: 0,
       };
       const internal = agent as unknown as SpawnInternals;
@@ -168,6 +171,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
         prompt: vi.fn().mockReturnValue(promptGate),
         getConversationHistory: () => [],
         getBudgetGuard: () => ({ getTurnCount: () => 0, getTotalCost: () => 0 }),
+        getEventBridge: () => new EventBridge(false),
         currentContextTokenCount: 0,
       };
     }
@@ -281,6 +285,136 @@ describe('CortexAgent spawn-path lifecycle', () => {
 
       expect(promptSpy).not.toHaveBeenCalled();
       expect(internal.pendingBackgroundResults).toHaveLength(0);
+    });
+  });
+
+  describe('background child event forwarding', () => {
+    /**
+     * A child stub carrying a real EventBridge so the test can emit pi-shaped
+     * events "from the child" and observe them on the parent's bridge.
+     */
+    function createForwardingChild() {
+      const childBridge = new EventBridge(false);
+      let emitPi!: (event: PiEvent) => void;
+      childBridge.wire({
+        subscribe(handler) {
+          emitPi = handler;
+          return () => {};
+        },
+      });
+
+      let releasePrompt!: () => void;
+      const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+      const child = {
+        getEventBridge: () => childBridge,
+        destroy: vi.fn().mockResolvedValue(undefined),
+        prompt: vi.fn().mockReturnValue(promptGate),
+        getConversationHistory: () => [{ role: 'assistant', content: 'done' }],
+        getBudgetGuard: () => ({ getTurnCount: () => 1, getTotalCost: () => 0.01 }),
+        currentContextTokenCount: 0,
+      };
+      return { child, emit: (event: PiEvent) => emitPi(event), releasePrompt };
+    }
+
+    async function settle(): Promise<void> {
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    it('forwards background child events to the parent bridge with childTaskId set', async () => {
+      const agent = createTestCortexAgent();
+      const { child, emit, releasePrompt } = createForwardingChild();
+      (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
+
+      const seen: CortexEvent[] = [];
+      agent.getEventBridge().on('tool_call_start', (event) => seen.push(event));
+
+      const { taskId } = await agent.spawnBackgroundSubAgent({ instructions: 'bg work' });
+      emit({
+        type: 'tool_execution_start',
+        toolCallId: 'tc1',
+        toolName: 'Bash',
+        args: { command: 'npm test' },
+      } as PiEvent);
+
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.childTaskId).toBe(taskId);
+
+      // Forwarding also drives live tool activity for the headline block.
+      const snapshot = agent.getActiveSubAgents();
+      expect(snapshot[0]).toMatchObject({
+        taskId,
+        toolCount: 1,
+        lastToolName: 'Bash',
+        lastToolSummary: 'npm test',
+      });
+
+      releasePrompt();
+      await settle();
+    });
+
+    it('accumulates background child usage into session usage', async () => {
+      const agent = createTestCortexAgent();
+      const { child, emit, releasePrompt } = createForwardingChild();
+      (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
+
+      await agent.spawnBackgroundSubAgent({ instructions: 'bg work' });
+      emit({
+        type: 'turn_end',
+        message: {
+          role: 'assistant',
+          content: [],
+          usage: {
+            input: 100,
+            output: 50,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 150,
+            cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
+          },
+        },
+      } as unknown as PiEvent);
+
+      const usage = agent.getSessionUsage();
+      expect(usage.totalCost).toBeCloseTo(0.003, 10);
+      expect(usage.tokens.input).toBe(100);
+      expect(usage.tokens.output).toBe(50);
+
+      releasePrompt();
+      await settle();
+    });
+
+    it('stops forwarding once the child completes (no listener leak per task)', async () => {
+      const agent = createTestCortexAgent();
+      const { child, emit, releasePrompt } = createForwardingChild();
+      (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
+
+      const seen: CortexEvent[] = [];
+      agent.getEventBridge().on('tool_call_start', (event) => seen.push(event));
+
+      const { taskId } = await agent.spawnBackgroundSubAgent({ instructions: 'bg work' });
+      const completion = agent.getSubAgentManager().get(taskId)!.completion;
+      emit({
+        type: 'tool_execution_start',
+        toolCallId: 'tc1',
+        toolName: 'Bash',
+        args: { command: 'ls' },
+      } as PiEvent);
+      expect(seen).toHaveLength(1);
+
+      releasePrompt();
+      await completion;
+      await settle();
+
+      // Events emitted after completion no longer reach the parent.
+      emit({
+        type: 'tool_execution_start',
+        toolCallId: 'tc2',
+        toolName: 'Bash',
+        args: { command: 'ls again' },
+      } as PiEvent);
+      expect(seen).toHaveLength(1);
     });
   });
 
