@@ -19,6 +19,7 @@ export type {
   CortexLifecycleState,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
+  ToolPermissionRequestContext,
   CortexAgentConfig,
   CortexDiagnosticsConfig,
   ContextManagerConfig,

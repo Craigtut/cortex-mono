@@ -380,6 +380,13 @@ type PendingBackgroundCompletion = (
   formattedMessage?: string;
 };
 
+/** Returned by the permission race when the run aborted before the consumer answered. */
+const PERMISSION_RACE_ABORTED = Symbol('permission-race-aborted');
+
+/** Block reason for a tool call whose permission ask was cut short by abort. */
+const ABORTED_PERMISSION_REASON =
+  'The run was aborted before this tool call was approved; it was not run.';
+
 /** Delivery attempts per background completion before dead-lettering. */
 const MAX_BACKGROUND_DELIVERY_ATTEMPTS = 3;
 
@@ -1693,11 +1700,17 @@ export class CortexAgent {
     if (cortexConfig.resolvePermission) {
       const resolver = cortexConfig.resolvePermission;
       const sandboxConfigured = cortexConfig.sandbox !== undefined;
-      agentConfig['beforeToolCall'] = async (ctx: unknown) => {
+      agentConfig['beforeToolCall'] = async (ctx: unknown, signal?: AbortSignal) => {
         const { toolCall, args } = ctx as { toolCall: { name: string }; args: unknown };
         // Spawning a sub-agent is an internal orchestration decision, not a
         // side-effecting operation. Always allow without prompting.
         if (toolCall.name === SUB_AGENT_TOOL_NAME) return undefined;
+        // An already-aborted run never consults the resolver: pi only checks
+        // the signal AFTER this hook, and a consumer prompt for a dead run
+        // would flash pointlessly.
+        if (signal?.aborted) {
+          return { block: true, reason: ABORTED_PERMISSION_REASON };
+        }
         // A Bash call requesting to run outside the sandbox reaches the
         // resolver under a distinct synthetic name, so plain-Bash rules and
         // auto-approve paths cannot silently authorize an uncontained run and
@@ -1705,7 +1718,18 @@ export class CortexAgent {
         // sandbox is configured; without one the flag changes nothing.
         const escalation = sandboxConfigured && isBashEscalationRequest(toolCall.name, args);
         const permissionName = escalation ? BASH_ESCALATION_PERMISSION_NAME : toolCall.name;
-        const resolution = await resolver(permissionName, args);
+        // Race the consumer's decision against the run's abort signal. pi
+        // awaits this hook before checking the signal, so without the race a
+        // pending human approval would hang abort/destroy into the force-kill
+        // path. The signal is also passed to the resolver so the consumer UI
+        // can dismiss the moot prompt.
+        const resolution = await CortexAgent.raceResolutionAgainstAbort(
+          resolver(permissionName, args, signal ? { signal } : {}),
+          signal,
+        );
+        if (resolution === PERMISSION_RACE_ABORTED) {
+          return { block: true, reason: ABORTED_PERMISSION_REASON };
+        }
         const decision = CortexAgent.normalizePermissionDecision(resolution);
         if (decision.decision !== 'allow') {
           return {
@@ -1767,6 +1791,38 @@ export class CortexAgent {
       return { decision: resolution ? 'allow' : 'block' };
     }
     return resolution;
+  }
+
+  /**
+   * Race a permission resolution against the run's abort signal. Resolves
+   * with PERMISSION_RACE_ABORTED when the signal fires first, so a pending
+   * consumer ask can never keep the loop from observing an abort. A late
+   * settlement of the resolver promise is ignored (its rejection handled).
+   */
+  private static raceResolutionAgainstAbort<T>(
+    resolution: Promise<T>,
+    signal: AbortSignal | undefined,
+  ): Promise<T | typeof PERMISSION_RACE_ABORTED> {
+    if (!signal) return resolution;
+    if (signal.aborted) {
+      // Consume a possible late rejection so it never surfaces as unhandled.
+      resolution.catch(() => {});
+      return Promise.resolve(PERMISSION_RACE_ABORTED);
+    }
+    return new Promise<T | typeof PERMISSION_RACE_ABORTED>((resolve, reject) => {
+      const onAbort = (): void => resolve(PERMISSION_RACE_ABORTED);
+      signal.addEventListener('abort', onAbort, { once: true });
+      resolution.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(value);
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        },
+      );
+    });
   }
 
   /**
@@ -5084,11 +5140,13 @@ export class CortexAgent {
       const parentResolver = this.config.resolvePermission;
       const subAgentMgr = this.subAgentManager;
       const childTaskId = params.taskId;
-      childCortexConfig.resolvePermission = async (toolName, toolArgs) => {
+      childCortexConfig.resolvePermission = async (toolName, toolArgs, context) => {
         const entry = subAgentMgr.get(childTaskId);
         if (entry) entry.pendingPermission = { toolName, args: toolArgs };
         try {
-          return await parentResolver(toolName, toolArgs);
+          // Forward the child run's abort signal so the consumer UI can
+          // dismiss a prompt made moot by the child being cancelled.
+          return await parentResolver(toolName, toolArgs, context);
         } finally {
           const e = subAgentMgr.get(childTaskId);
           if (e) e.pendingPermission = null;

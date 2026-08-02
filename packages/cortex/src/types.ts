@@ -153,6 +153,18 @@ export interface CortexToolPermissionResult {
   reason?: string;
 }
 
+/**
+ * Context passed to resolvePermission alongside the tool name and args.
+ */
+export interface ToolPermissionRequestContext {
+  /**
+   * Fires when the run that asked is aborted. Cortex stops waiting for the
+   * resolver's answer at that point, so a consumer UI showing an approval
+   * prompt should listen and dismiss the now-moot prompt.
+   */
+  signal?: AbortSignal;
+}
+
 // ---------------------------------------------------------------------------
 // Agent Configuration
 // ---------------------------------------------------------------------------
@@ -279,10 +291,16 @@ export interface CortexAgentConfig {
    * - `allow`: proceed immediately
    * - `block`: deny the call
    * - `ask`: consumer requires approval before the call can proceed
+   *
+   * The context carries the run's abort signal. Cortex races the returned
+   * promise against that signal (an abort blocks the call and unblocks the
+   * loop immediately), so a resolver awaiting human input should dismiss its
+   * prompt when the signal fires: the answer is no longer consulted.
    */
   resolvePermission?: (
     toolName: string,
     toolArgs: unknown,
+    context?: ToolPermissionRequestContext,
   ) => Promise<boolean | CortexToolPermissionResult>;
 
   /**
