@@ -1,0 +1,75 @@
+# The Session Log and Context Mechanics
+
+> **STATUS: DESIGN, NOT IMPLEMENTED**
+
+## What the Log Is
+
+The log is the facade-owned, append-only record of the session: every user utterance, talker reply, directive, delivery, permission ask and answer, and task lifecycle event, in one totally ordered sequence. It is:
+
+- the routing bus between loops
+- the wake policy's input
+- the consumer's persistence artifact
+- the audit trail of the session
+
+## What the Log Is Not
+
+The log is not a context surface. No loop's prompt is built by projecting log entries into synthetic view messages. This was the original design and it was rejected (decisions.md D7) after the context-pipeline audit identified three violations, all in current code:
+
+1. **View injections vanish on compaction turns.** After observational activation or L2 summarization, the post-slot view is rebuilt from the source array (`compaction/observational/index.ts:317-339`, `compaction/index.ts:916-921`), so anything that existed only in the returned view silently disappears from the prompt on exactly those turns.
+2. **The observational watermark requires an append-only source.** Buffering tracks an index into the post-slot source history (`compaction/observational/buffering.ts:409-459`); the only sanctioned mutation is front-truncation. Foreign insertions desync the watermark into silent observation loss or an orphaned-toolResult provider 400.
+3. **Tool-call-group adjacency.** Any insertion between an assistant tool call and its consecutive tool results corrupts group detection (`compaction/tool-call-groups.ts:39-81`), L2/L3 atomicity, toolResult merge runs, and the cache-breakpoint index simulation (`cache-breakpoints.ts:190-195`) simultaneously.
+
+## The Two Sanctioned Channels
+
+Content reaches a model through exactly two mechanisms, chosen by durability:
+
+### Durable Content: Real Messages
+
+Deliverables, directives, conversation deltas, permission asks: anything a loop must remember becomes a real message in that loop's transcript, delivered at a turn boundary via the loop's `deliver()` primitive (prompt-if-idle, steer-if-running, queue otherwise; built in P0). This is the same path background sub-agent results use today (`drainPendingBackgroundResults`, hardened in P0 for re-queue-on-failure).
+
+Real messages are append-only source content, which makes them:
+
+- cache-friendly (the prefix only extends)
+- compaction-safe (they participate in summarization and observation like any message)
+- persistence-free (they ride the loop's existing history)
+
+Message shape constraints from the audit: user-role, non-whitespace string content, timestamp set. Whitespace-only content is silently dropped at conversion; toolResult-role synthetics merge into adjacent runs and can 400; assistant-role synthetics with error stop reasons get stripped.
+
+### Churn: View Injection Outside BP3
+
+Task headlines and live activity (current tool, duration, token count, last output lines) change every tick and must never enter a transcript or the cached prefix. They use the existing `<background-tasks>` mechanism: view-injected in `transformContext` after the BP3 boundary (`cortex-agent.ts:3340-3350`), rebuilt every call, absent on compaction turns by design, never observed, never persisted.
+
+Rules for the headline block, from the audit:
+
+- It stays outside `stableInjectionCount` so BP3 accounting is untouched.
+- It is built inside `buildInjectedAndSanitizedContextSnapshot` so token estimation and compaction utilization see it.
+- It budgets its own tokens (hard cap); injected user-role content is never trimmed by microcompaction, so an unbounded block would inflate utilization and trigger early source compaction without itself shrinking.
+
+## Log Entry Types
+
+| Entry | Producer | Routed to | Channel |
+|---|---|---|---|
+| `utterance` | consumer via facade | talker (its prompt), reasoner (delivered delta) | real message |
+| `reply` | talker | log only (record of what was said) | none (talker authored it) |
+| `directive` | talker stream parser | facade router, then reasoner or target sub-agent | real message (steer) |
+| `delivery` | reasoner | talker, per wake policy | real message |
+| `headline` | event bridges, task registry | talker (and reasoner for its children) | view injection |
+| `ask` / `ask_answer` | permission broker | talker / originating resolver | real message / promise settle |
+| `lookup_result` | quick-lookup sub-agent | talker (wake) and reasoner (delta at next turn) | real message |
+| `lifecycle` | facade | log only | none |
+
+`lookup_result` routing is the shared-context guarantee of decisions.md D13: the reasoner sees everything the talker learned, so context never forks.
+
+## Cache Discipline Per Loop
+
+Each loop keeps its own transcript, its own stable session ID (`sessionId` per instance for prefix-cache routing; children already use taskId, `cortex-agent.ts:4917-4918`), and its own cache breakpoints. The composite adds no cross-loop cache coupling:
+
+- Talker prefix: system prompt + slots + compacted history. Deliveries append; headlines stay outside BP3. Target: near-total cache reads per utterance.
+- Reasoner prefix: unchanged from today.
+- The step-0 mirror rule holds everywhere: mid-loop writes to `agent.state.messages` (including `setSlot`) are clobbered by the next `transformContext` mirror (`cortex-agent.ts:3275`) and never reach pi's loop array. The facade therefore writes slots only between prompts, or uses the per-call re-patch pattern (`cortex-agent.ts:3319-3333`) if a mid-loop surface ever becomes necessary.
+
+## Compaction Interactions
+
+- Every loop runs its own compaction manager. The talker compacts (infinite conversation is a consumer expectation); observational is the default strategy on both resident loops, with classic as a talker tuning option if duplicate observation cost across overlapping content proves material (decisions.md D4).
+- Compaction cliffs should be staggered: both resident loops receiving the conversation means both cross activation thresholds around the same time, and the sync-observer fallback paths block inside `transformContext` (`compaction/observational/index.ts:249-285`). The facade offsets their thresholds so blocking observation never hits both loops in the same window.
+- Persisted-result breadcrumbs (`[Result persisted: <path>]`) inside delivered content assume a shared filesystem; both resident loops share `workingDirectory` and the persist layout, so a delivered breadcrumb remains resolvable by the reasoner. The talker has no Read tool and simply speaks around them.

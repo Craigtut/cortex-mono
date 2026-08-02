@@ -136,6 +136,7 @@ Detailed documentation lives in `/docs/cortex/`. Use `/doc-explorer <topic>` to 
 - **Architecture**: `docs/cortex/cortex-architecture.md` (core design, exports, patterns)
 - **Context**: `docs/cortex/context-manager.md` (slots, prefix caching, ephemeral context)
 - **Compaction**: `docs/cortex/observational-memory-architecture.md` (default: observational memory), `docs/cortex/compaction-strategy.md` (classic strategy)
+- **Duplex (planned)**: `docs/cortex/duplex/` (talker/reasoner restructure: design decisions, architecture, migration plan)
 - **Tool Result Persistence**: `docs/cortex/tool-result-persistence.md` (proactive bookend + persist for oversized tool results)
 - **Skills**: `docs/cortex/skill-system.md` (progressive disclosure, SKILL.md format, registry)
 - **Providers**: `docs/cortex/provider-manager.md` (discovery, OAuth, model resolution)

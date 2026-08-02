@@ -8,6 +8,8 @@ Start here if you are integrating `@animus-labs/cortex` into an application:
 
 Architecture and implementation references:
 
+- [Duplex Architecture](./duplex/README.md): the planned talker/reasoner restructure for responsive interaction (design phase)
+
 - [Product Vision](./product-vision.md)
 - [Cortex Architecture](./cortex-architecture.md)
 - [Context Manager](./context-manager.md)
