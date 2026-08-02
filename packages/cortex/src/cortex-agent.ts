@@ -393,6 +393,23 @@ const MAX_BACKGROUND_DELIVERY_ATTEMPTS = 3;
 /** Dead-lettered completions retained for consumer inspection. */
 const MAX_DEAD_LETTERED_RESULTS = 50;
 
+/**
+ * Escape text interpolated into the <background-tasks> block. Task
+ * instructions, tool summaries, commands, and stdout tails are untrusted;
+ * without escaping they could forge or terminate the block's XML-ish tags.
+ */
+function escapeBackgroundStateText(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+/** Attribute values additionally escape double quotes (they sit inside "..."). */
+function escapeBackgroundStateAttribute(value: string): string {
+  return escapeBackgroundStateText(value).replaceAll('"', '&quot;');
+}
+
 // ---------------------------------------------------------------------------
 // CortexAgent
 // ---------------------------------------------------------------------------
@@ -4619,22 +4636,24 @@ export class CortexAgent {
       const turnsUsed = budget.getTurnCount();
       const turnsMax = budget.getMaxTurns();
       const turnsStr = turnsMax < Infinity ? `${turnsUsed}/${turnsMax}` : `${turnsUsed}`;
-      const instructions = entry.instructions.slice(0, 120);
+      const instructions = escapeBackgroundStateText(entry.instructions.slice(0, 120));
 
       let status = 'running';
       let activityLine = '';
 
       if (entry.pendingPermission) {
         status = 'waiting-for-permission';
-        activityLine = `  Waiting for permission: ${entry.pendingPermission.toolName}`;
+        activityLine = `  Waiting for permission: ${escapeBackgroundStateText(entry.pendingPermission.toolName)}`;
       } else if (entry.lastToolName && entry.lastToolStartedAt) {
         const activityAgeSec = Math.round((now - entry.lastToolStartedAt) / 1000);
-        const summary = entry.lastToolSummary ? ` ${entry.lastToolSummary}` : '';
-        activityLine = `  Current: ${entry.lastToolName}${summary} (started ${activityAgeSec}s ago)`;
+        const summary = entry.lastToolSummary
+          ? ` ${escapeBackgroundStateText(entry.lastToolSummary)}`
+          : '';
+        activityLine = `  Current: ${escapeBackgroundStateText(entry.lastToolName)}${summary} (started ${activityAgeSec}s ago)`;
       }
 
       sections.push(
-        `<sub-agent id="${taskId}" status="${status}" duration="${durationSec}s" tools="${entry.toolCount}" tokens="${tokens}k" turns="${turnsStr}">\n` +
+        `<sub-agent id="${escapeBackgroundStateAttribute(taskId)}" status="${status}" duration="${durationSec}s" tools="${entry.toolCount}" tokens="${tokens}k" turns="${turnsStr}">\n` +
         `  Instructions: ${instructions}\n` +
         (activityLine ? `${activityLine}\n` : '') +
         `</sub-agent>`,
@@ -4649,7 +4668,7 @@ export class CortexAgent {
       const durationSec = Math.round((now - task.startTime) / 1000);
       const command = task.command || taskId;
       const lastLines = task.stdout
-        ? task.stdout.split('\n').filter(Boolean).slice(-3).join('\n  ')
+        ? escapeBackgroundStateText(task.stdout.split('\n').filter(Boolean).slice(-3).join('\n  '))
         : '';
 
       let content = '';
@@ -4658,7 +4677,7 @@ export class CortexAgent {
       }
 
       sections.push(
-        `<bash id="${taskId}" status="running" duration="${durationSec}s" command="${String(command).slice(0, 80)}">\n` +
+        `<bash id="${escapeBackgroundStateAttribute(taskId)}" status="running" duration="${durationSec}s" command="${escapeBackgroundStateAttribute(String(command).slice(0, 80))}">\n` +
         content +
         `</bash>`,
       );
