@@ -4316,8 +4316,17 @@ export class CortexAgent {
   /**
    * Spawn a background sub-agent and return its task ID immediately.
    * Used by consumers that manage delegated work outside the SubAgent tool.
+   * Throws when the concurrency limit is reached.
    */
   async spawnBackgroundSubAgent(params: Omit<SubAgentSpawnConfig, 'background'>): Promise<{ taskId: string }> {
+    // Cap pre-check: fail before building the child agent. track() still
+    // re-checks under the same limit, so a concurrent spawn cannot slip past.
+    if (!this.subAgentManager.canSpawn()) {
+      throw new Error(
+        `Cannot spawn sub-agent: concurrency limit reached ` +
+        `(${this.subAgentManager.activeCount}/${this.subAgentManager.limit} active).`,
+      );
+    }
     return this.spawnBackgroundSubAgentInternal(params);
   }
 
@@ -4609,6 +4618,13 @@ export class CortexAgent {
           active: this.subAgentManager.activeCount,
           limit: this.subAgentManager.limit,
         });
+        // The child was fully constructed but never tracked; tear it down or
+        // it leaks (event subscriptions, compaction timers, tool runtime).
+        try {
+          await childAgent.destroy();
+        } catch {
+          // Best-effort cleanup
+        }
         return {
           taskId,
           output: '',
@@ -4711,6 +4727,13 @@ export class CortexAgent {
         active: this.subAgentManager.activeCount,
         limit: this.subAgentManager.limit,
       });
+      // The child was fully constructed but never tracked; tear it down or
+      // it leaks (event subscriptions, compaction timers, tool runtime).
+      try {
+        await childAgent.destroy();
+      } catch {
+        // Best-effort cleanup
+      }
       throw new Error('Concurrency limit reached');
     }
 
