@@ -1291,6 +1291,28 @@ export interface SubAgentResult {
 }
 
 /**
+ * A background completion (sub-agent result or backgrounded Bash command)
+ * whose delivery to the loop failed repeatedly and was dropped from the
+ * delivery queue. Returned by getDeadLetteredBackgroundResults() so a
+ * consumer can surface or re-drive the work; without this, a deterministic
+ * delivery failure would either redeliver forever or vanish silently.
+ */
+export interface DeadLetteredBackgroundResult {
+  /** What kind of background work produced the result. */
+  kind: 'subagent' | 'bash';
+  /** Task ID of the sub-agent or background Bash command. */
+  taskId: string;
+  /** Delivery attempts made before giving up. */
+  attempts: number;
+  /** Message of the last delivery failure. */
+  lastError: string;
+  /** When the item was dead-lettered (epoch ms). */
+  deadLetteredAt: number;
+  /** The formatted delivery message that never reached the loop. */
+  message: string;
+}
+
+/**
  * Tracked sub-agent record managed by SubAgentManager.
  */
 export interface TrackedSubAgent {

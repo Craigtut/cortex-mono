@@ -1976,4 +1976,161 @@ You have 12 emotions.`;
       expect(promptSpy).toHaveBeenCalledTimes(1);
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Background result delivery durability (re-queue + dead-letter)
+  // -----------------------------------------------------------------------
+
+  describe('background result delivery durability', () => {
+    interface InternalAgent {
+      toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
+      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
+      pendingBackgroundResults: unknown[];
+    }
+
+    function seedCompletedTask(agent: CortexAgent, id: string, stdout: string): void {
+      (agent as unknown as InternalAgent).toolRuntime.backgroundTasks.set({
+        id,
+        command: 'npm run check',
+        process: {},
+        stdout,
+        stderr: '',
+        exitCode: 0,
+        completed: true,
+        notified: false,
+        startTime: Date.now() - 1000,
+      });
+    }
+
+    /** Replace piAgent.prompt with one that fails the first `failures` calls. */
+    function installFailingPrompt(failures: number): string[] {
+      const originalPrompt = piAgent.prompt.bind(piAgent);
+      const promptCalls: string[] = [];
+      let remaining = failures;
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        promptCalls.push(input);
+        if (remaining > 0) {
+          remaining -= 1;
+          throw new Error('delivery misconfigured');
+        }
+        return originalPrompt(input);
+      };
+      return promptCalls;
+    }
+
+    beforeEach(() => {
+      // Disable background retry so delivery failures surface immediately
+      // instead of scheduling multi-minute backoff waits.
+      config = createDefaultConfig({ retryPolicy: { enabled: false } });
+    });
+
+    it('re-queues a failed bash delivery and delivers it on the next attempt', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      seedCompletedTask(agent, 'task_r1', 'durable output');
+      const promptCalls = installFailingPrompt(1);
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_r1' });
+
+      // First attempt failed, second delivered the same formatted message
+      // (Bash tasks are marked notified on first format, so the re-queued
+      // item must carry the message rather than re-formatting to null).
+      expect(promptCalls).toHaveLength(2);
+      expect(promptCalls[1]).toContain('task_r1');
+      expect(promptCalls[1]).toContain('durable output');
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(0);
+    });
+
+    it('re-queues a failed sub-agent result delivery without losing the result', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const promptCalls = installFailingPrompt(1);
+
+      await internal.deliverOrQueueBackgroundCompletion({
+        kind: 'subagent',
+        taskId: 'sa_1',
+        result: {
+          output: 'research findings',
+          status: 'completed',
+          usage: { turns: 2, cost: 0.01, durationMs: 500, contextTokens: 100 },
+        },
+      });
+
+      expect(promptCalls).toHaveLength(2);
+      expect(promptCalls[1]).toContain('sa_1');
+      expect(promptCalls[1]).toContain('research findings');
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+    });
+
+    it('dead-letters a completion after repeated delivery failures', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      seedCompletedTask(agent, 'task_dead', 'lost output');
+      const promptCalls = installFailingPrompt(Infinity);
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_dead' });
+
+      // Exactly the capped number of attempts, then the item leaves the queue
+      // permanently instead of redelivering forever.
+      expect(promptCalls).toHaveLength(3);
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+
+      const dead = agent.getDeadLetteredBackgroundResults();
+      expect(dead).toHaveLength(1);
+      expect(dead[0]).toMatchObject({
+        kind: 'bash',
+        taskId: 'task_dead',
+        attempts: 3,
+        lastError: 'delivery misconfigured',
+      });
+      expect(dead[0].message).toContain('lost output');
+    });
+
+    it('fires onBackgroundResultDelivery once per completion, not per attempt', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      seedCompletedTask(agent, 'task_h1', 'output');
+      installFailingPrompt(1);
+
+      const seen: string[][] = [];
+      agent.onBackgroundResultDelivery((taskIds) => seen.push(taskIds));
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_h1' });
+
+      expect(seen).toEqual([['task_h1']]);
+    });
+
+    it('delivers completions that arrive during a failed delivery', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      seedCompletedTask(agent, 'task_a', 'first output');
+      seedCompletedTask(agent, 'task_b', 'second output');
+
+      const originalPrompt = piAgent.prompt.bind(piAgent);
+      const promptCalls: string[] = [];
+      let failed = false;
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        promptCalls.push(input);
+        if (!failed) {
+          failed = true;
+          // A second completion lands while the first delivery is failing.
+          (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
+            { kind: 'bash', taskId: 'task_b' },
+          );
+          throw new Error('delivery misconfigured');
+        }
+        return originalPrompt(input);
+      };
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_a' });
+
+      // The re-queued first completion is delivered ahead of the new one,
+      // both in the same follow-up message.
+      expect(promptCalls).toHaveLength(2);
+      expect(promptCalls[1]).toContain('task_a');
+      expect(promptCalls[1]).toContain('task_b');
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+    });
+  });
 });

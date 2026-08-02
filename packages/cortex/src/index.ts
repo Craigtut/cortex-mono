@@ -62,6 +62,7 @@ export type {
   SubAgentSpawnAugmentation,
   SubAgentSnapshot,
   SubAgentResult,
+  DeadLetteredBackgroundResult,
   TrackedSubAgent,
   ThinkingLevel,
   ModelThinkingCapabilities,

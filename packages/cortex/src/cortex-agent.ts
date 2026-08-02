@@ -100,6 +100,7 @@ import type {
   SubAgentSpawnConfig,
   SubAgentSpawnAugmentation,
   SubAgentResult,
+  DeadLetteredBackgroundResult,
   SubAgentSnapshot,
   TrackedSubAgent,
   CortexToolPermissionDecision,
@@ -365,9 +366,25 @@ export interface DirectCompletionOptions {
  * result) or a backgrounded Bash command (read live from the task store at
  * delivery time, so dedup against polling/kill stays correct).
  */
-type PendingBackgroundCompletion =
+type PendingBackgroundCompletion = (
   | { kind: 'subagent'; taskId: string; result: SubAgentResult }
-  | { kind: 'bash'; taskId: string };
+  | { kind: 'bash'; taskId: string }
+) & {
+  /** Failed delivery attempts so far. Set by the drain's re-queue path. */
+  deliveryAttempts?: number;
+  /**
+   * Message formatted on the first delivery attempt. Re-queued items reuse
+   * it because formatting marks Bash tasks notified, so re-formatting would
+   * return null and silently drop the completion.
+   */
+  formattedMessage?: string;
+};
+
+/** Delivery attempts per background completion before dead-lettering. */
+const MAX_BACKGROUND_DELIVERY_ATTEMPTS = 3;
+
+/** Dead-lettered completions retained for consumer inspection. */
+const MAX_DEAD_LETTERED_RESULTS = 50;
 
 // ---------------------------------------------------------------------------
 // CortexAgent
@@ -453,6 +470,7 @@ export class CortexAgent {
   private subAgentFailedHandlers: Array<(taskId: string, error: string) => void> = [];
   private backgroundResultDeliveryHandlers: Array<(taskIds: string[]) => void> = [];
   private pendingBackgroundResults: PendingBackgroundCompletion[] = [];
+  private deadLetteredBackgroundResults: DeadLetteredBackgroundResult[] = [];
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -4171,6 +4189,7 @@ export class CortexAgent {
     this.subAgentFailedHandlers = [];
     this.backgroundResultDeliveryHandlers = [];
     this.pendingBackgroundResults = [];
+    this.deadLetteredBackgroundResults = [];
   }
 
   /**
@@ -4788,27 +4807,92 @@ export class CortexAgent {
     if (this.pendingBackgroundResults.length === 0) return;
 
     const pending = this.pendingBackgroundResults.splice(0);
+    const batch: PendingBackgroundCompletion[] = [];
     const parts: string[] = [];
-    const taskIds: string[] = [];
+    const firstAttemptTaskIds: string[] = [];
     for (const item of pending) {
-      const message = this.formatPendingCompletion(item);
+      // Re-queued items reuse the message formatted on their first attempt
+      // (formatting marks Bash tasks notified, so it must not re-run).
+      const message = item.formattedMessage ?? this.formatPendingCompletion(item);
       if (message === null) continue;
+      item.formattedMessage = message;
+      batch.push(item);
       parts.push(message);
-      taskIds.push(item.taskId);
+      if (!item.deliveryAttempts) firstAttemptTaskIds.push(item.taskId);
     }
-    if (parts.length === 0) return;
+    if (batch.length === 0) return;
 
     const message = parts.join('\n\n---\n\n');
-    this.fireBackgroundResultDeliveryHandlers(taskIds);
+    // Notify consumers once per completion (not again on re-attempts).
+    if (firstAttemptTaskIds.length > 0) {
+      this.fireBackgroundResultDeliveryHandlers(firstAttemptTaskIds);
+    }
     try {
       // fromDrain: deliver via a fresh loop even if a prior turn was
       // aborted; background completions are not cancelled by user abort.
       await this.runPromptOnce(message, undefined, true);
+    } catch (err) {
+      // The delivery loop failed before completing: the results were spliced
+      // out but never reached the model, so put them back for another
+      // attempt (or dead-letter them) instead of dropping completed work.
+      this.requeueOrDeadLetter(batch, err);
+      throw err;
     } finally {
-      // Deliver anything that arrived during this delivery, even when it
-      // failed, matching the pre-gate recursive prompt() behavior.
+      // Deliver anything that arrived during this delivery (including items
+      // the catch above re-queued), even when it failed, matching the
+      // pre-gate recursive prompt() behavior. Bounded: each re-queued item
+      // carries an attempt count and dead-letters at the cap.
       await this.drainPendingBackgroundResults();
     }
+  }
+
+  /**
+   * After a failed delivery, put the batch back at the front of the queue
+   * (preserving order relative to completions that arrived meanwhile), or
+   * dead-letter items that exhausted their attempts so a deterministic
+   * delivery failure cannot redeliver forever.
+   */
+  private requeueOrDeadLetter(batch: PendingBackgroundCompletion[], err: unknown): void {
+    const lastError = err instanceof Error ? err.message : String(err);
+    const requeue: PendingBackgroundCompletion[] = [];
+    for (const item of batch) {
+      const attempts = (item.deliveryAttempts ?? 0) + 1;
+      item.deliveryAttempts = attempts;
+      if (attempts < MAX_BACKGROUND_DELIVERY_ATTEMPTS) {
+        requeue.push(item);
+        continue;
+      }
+      this.logger.error('[CortexAgent] background result dead-lettered', {
+        kind: item.kind,
+        taskId: item.taskId,
+        attempts,
+        lastError,
+      });
+      this.deadLetteredBackgroundResults.push({
+        kind: item.kind,
+        taskId: item.taskId,
+        attempts,
+        lastError,
+        deadLetteredAt: Date.now(),
+        message: item.formattedMessage ?? '',
+      });
+      if (this.deadLetteredBackgroundResults.length > MAX_DEAD_LETTERED_RESULTS) {
+        this.deadLetteredBackgroundResults.splice(
+          0,
+          this.deadLetteredBackgroundResults.length - MAX_DEAD_LETTERED_RESULTS,
+        );
+      }
+    }
+    this.pendingBackgroundResults.unshift(...requeue);
+  }
+
+  /**
+   * Background completions whose delivery failed repeatedly and were dropped
+   * from the delivery queue (newest last, bounded). The consumer can surface
+   * these to the user or re-drive the work; Cortex will not retry them.
+   */
+  getDeadLetteredBackgroundResults(): DeadLetteredBackgroundResult[] {
+    return [...this.deadLetteredBackgroundResults];
   }
 
   /**
