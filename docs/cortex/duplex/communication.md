@@ -13,10 +13,14 @@ Control toolset (initial):
 | Tool | Arguments | Facade action |
 |---|---|---|
 | `spawn_task` | `{ instructions }` | deliver new work to the reasoner |
-| `steer_task` | `{ taskId?, message }` | deliver a redirect to the reasoner, or fast-path to a named running sub-agent |
-| `cancel_task` | `{ taskId }` | abort the target, log a lifecycle entry |
-| `answer_ask` | `{ askId, decision, reason? }` | settle the pending permission ask (validated against the pending-ask set) |
+| `steer_task` | `{ taskAlias?, message }` | deliver a redirect to the reasoner (always; no fast-path, D20) |
+| `cancel_task` | `{ taskAlias }` | cancel the target, log a lifecycle entry |
+| `answer_ask` | `{ askId, decision: 'allow' \| 'deny', reason? }` | settle the pending ask, subject to the consent rules in D16 |
 | `quick_lookup` | `{ question }` | spawn a read-only ephemeral sub-agent |
+
+Task references use short human-friendly aliases surfaced in the headline block, not the underlying UUIDs, so a fast-tier model is never asked to reproduce a UUID exactly.
+
+Result contract (D17): every call returns `{content: [...], terminate: true}` regardless of outcome. Control tools never throw and never return `isError`, because pi's error results omit `terminate` and would reopen the talker's loop. A bare string return silently loses `terminate` through the result-wrapping path, so the shape is asserted in tests by checking that the batch terminates, not by checking the return value.
 
 Design properties:
 
@@ -32,9 +36,11 @@ Working tags remain in use on the talker for their original purpose only: separa
 
 Two speeds, mapped to the two context channels (log-and-context.md):
 
-**Headlines** (continuous): the facade maintains a compact status block per active loop and running sub-agent: state, current tool, duration, turns, token spend, last output lines. Sourced from event-bridge forwarding (enabled for background children in P0; today they are event-invisible, which makes the existing `Current:` surface dead code). View-injected into the talker every turn, outside BP3, token-capped. The talker answers "how's it going" from this block, with honest staleness ("last I saw, it was running the test suite").
+**Headlines** (continuous): the facade maintains a compact status block per active loop and running sub-agent: alias, state, current tool, duration, turns, token spend, last output lines, and an `as_of` timestamp so staleness is a number rather than a vibe. Sourced from event-bridge forwarding (enabled for background children in P0; today they are event-invisible, which makes the existing `Current:` surface dead code). View-injected into the talker every turn, outside BP3, hard token cap with truncation. Interpolated values are escaped, since task instructions and stdout tails reach this block verbatim. The talker answers "how's it going" from here, with honest staleness ("as of about a minute ago, it was running the test suite").
 
-**Deliveries** (discrete): when the reasoner completes work or reaches a milestone it emits a delivery: plain content, no schema (decisions.md D9). The facade logs it and routes it to the talker under the wake policy. The talker decides phrasing; grounding rules forbid inventing anything beyond the delivered content.
+**Deliveries** (discrete): the reasoner emits a delivery through a `Deliver` tool, `{content, wake}`, symmetric with the talker's control tools. Content is plain text with no schema (decisions.md D9); `wake` proposes a class the router may demote. A reasoner run that ends without calling `Deliver` produces an implicit `when_idle` delivery from its final assistant text, so results always surface even if the model forgets the tool. The talker decides phrasing; grounding rules forbid inventing anything beyond the delivered content.
+
+A facade watchdog synthesizes periodic `when_idle` progress deliveries when a reasoner run has produced nothing for an extended period, so a working reasoner is distinguishable from a hung one.
 
 ## Wake Policy
 
@@ -42,11 +48,13 @@ Adopted vocabulary from Gemini Live's result scheduling (decisions.md D10). Ever
 
 | Class | Behavior |
 |---|---|
-| `interrupt` | start an unprompted talker turn immediately (the existing background-completion drain pattern: a delivered message starts a loop run) |
-| `when_idle` | queue until the consumer-supplied idle signal fires (user not speaking, TTS not playing), then deliver |
-| `silent` | append to the talker's transcript at its next natural turn; surfaced only when relevant |
+| `interrupt` | deliver at the next gate release, ahead of queued input. Not "abort the in-flight turn": turn abortion is reserved for barge-in |
+| `when_idle` | hold until the consumer-supplied idle signal reports a lull, then deliver |
+| `silent` | queue without waking; the content is present at the loop's next natural turn |
 
-The producer proposes the class (the reasoner can mark a milestone `silent` and a final result `when_idle`; permission asks are `interrupt`), and the facade's router applies defaults per entry type. The consumer supplies the idle signal; without one, `when_idle` degrades to `interrupt` after a configurable delay.
+The producer proposes a class and the router may demote it (D19). The idle signal is advisory: the facade enforces its own minimum inter-delivery spacing regardless, so an always-idle signal cannot collapse the dampening properties.
+
+Defaults per entry type: milestones `silent`, final results `when_idle`, permission asks `interrupt`, conversation deltas to the reasoner `silent` (D18). Without a consumer idle signal, `when_idle` degrades to `interrupt` after a configurable delay; the same delay bounds the case where a signal exists but never reports a lull.
 
 Stale results are never dropped (the Nova 2 Sonic position): a delivery that arrives after the user changed direction still enters the log and the talker's context; the talker reconciles conversationally. Explicit `cancel_task` is the only discard path.
 
@@ -56,19 +64,25 @@ Today a permission ask blocks the asking loop while the consumer's `resolvePermi
 
 ```
 sub-agent hits ask-gated tool
-  -> resolver wrapper creates ask entry {askId, loopPath, toolName, args}  (log, wake: interrupt)
-  -> talker voices the ask
+  -> resolver wrapper creates ask entry
+       {askId (nonce), loopPath, toolName, renderedRequest, voiced: false}   (log, wake: interrupt)
+  -> router marks it voiced (one at a time) and the talker reads it out
   -> user answers in speech/text
   -> talker calls answer_ask({askId, decision, reason})
+  -> router checks the D16 consent rules
   -> facade settles the pending resolver promise
   -> asking loop proceeds or receives the block
 ```
 
-Required mechanics, from the coordination audit:
+Required mechanics:
 
 - **Ask identity.** The current resolver signature `(toolName, args)` is anonymous; with N loops the consumer cannot attribute or correlate. The wrapper adds `{askId, loopPath}` context (P1 loop-identity work).
-- **Queryable pending set.** Today `pendingPermission` is one nullable slot per tracked child, readable only via snapshots. The broker keeps a facade-level collection so asks can be enumerated, voiced in order, and answered out of order.
-- **Abort-race.** pi awaits `beforeToolCall` before checking the abort signal, so a pending ask currently hangs abort/destroy into the 8-second force-kill path. The Cortex wrapper races the consumer's decision against the loop's abort signal and returns a block on abort (P0; no pi change).
-- **Timeout.** Asks carry an optional timeout with a configurable default resolution (deny with reason), so an unanswered ask cannot wedge a task forever.
+- **Consent binding.** See D16. One ask voiced at a time; `allow` only for the most-recently-voiced ask, only once, only with a user utterance timestamped after the voicing. Enforced in the router.
+- **Verbatim payload.** Ask entries carry `renderedRequest`: the tool name plus the actual command or path, truncated but never summarized. Without it the talker sees only a tool name (and for sandbox escalation, only the synthetic `Bash(escalate)`), which forces vague voicing regardless of model behavior. Destructive-verb and escalation asks are read verbatim.
+- **Full coverage.** `resolveNetworkAccess` and the sandbox provider's ask callback have the same blocking shape and route through the same broker; previously they bypassed it entirely and would have blocked a loop invisibly.
+- **Abort-race.** pi awaits `beforeToolCall` before checking the abort signal, so a pending ask currently hangs abort/destroy into the 8-second force-kill path. The Cortex wrapper races the consumer's decision against the loop's abort signal and returns a block on abort (P0; no pi change). The resolver context receives an abort signal so a consumer UI can dismiss a moot prompt.
+- **Timeout.** Asks carry an optional timeout with a configurable default resolution (deny with reason). Escalation-class asks get a longer or absent default, since auto-denying an escalation leaves the command running contained and failing, which invites a retry loop.
+
+The talker itself must never enter `beforeToolCall`: Cortex installs it whenever `resolvePermission` is configured, so wiring the broker as the talker's resolver would deadlock `answer_ask` against the ask it is answering. The talker is constructed without a resolver, or the control tools join the hook's exemption list; either way it is asserted in tests.
 
 In passthrough mode the broker is bypassed and `resolvePermission` behaves exactly as today.

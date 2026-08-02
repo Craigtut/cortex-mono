@@ -21,6 +21,7 @@ Consumers interact with one `CortexAgent`. Internally it runs two instances of t
 | [sub-agents.md](sub-agents.md) | Tier rules, quick lookups, parent-to-child steering, lifecycle and budgets |
 | [facade-api.md](facade-api.md) | Consumer-facing API: config, slots, tools, events, persistence, modes |
 | [migration-plan.md](migration-plan.md) | Phased build plan (P0 through P3), rollout, and the rename |
+| [review-findings.md](review-findings.md) | Pre-implementation review register: what two independent reviews found and how each is resolved |
 
 ## Design Anchors
 
@@ -32,4 +33,6 @@ The architecture follows the pattern the industry converged on during 2025-2026:
 - **Gemini Live API**: the `INTERRUPT` / `WHEN_IDLE` / `SILENT` result-scheduling vocabulary, adopted here as the wake policy.
 - **OpenAI Realtime API**: the documented pending-result hallucination failure mode, addressed here by grounding rules on the talker.
 
-Three internal audits of the existing codebase (public API surface, context pipeline, sub-agent coordination) shaped the mechanics; their constraints are folded into the relevant documents.
+Three internal audits of the existing codebase (public API surface, context pipeline, sub-agent coordination) shaped the mechanics; their constraints are folded into the relevant documents. Two further reviews (design-versus-code consistency, and an adversarial red-team) ran against the completed design before implementation; see review-findings.md.
+
+Work happens on the `duplex-restructure` branch.

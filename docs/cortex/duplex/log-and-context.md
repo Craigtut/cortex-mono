@@ -25,7 +25,18 @@ Content reaches a model through exactly two mechanisms, chosen by durability:
 
 ### Durable Content: Real Messages
 
-Deliverables, directives, conversation deltas, permission asks: anything a loop must remember becomes a real message in that loop's transcript, delivered at a turn boundary via the loop's `deliver()` primitive (prompt-if-idle, steer-if-running, queue otherwise; built in P0). This is the same path background sub-agent results use today (`drainPendingBackgroundResults`, hardened in P0 for re-queue-on-failure).
+Deliverables, directives, conversation deltas, permission asks: anything a loop must remember becomes a real message in that loop's transcript, delivered at a turn boundary via the loop's `deliver()` primitive. This is the same path background sub-agent results use today (`drainPendingBackgroundResults`, hardened in P0 for capped re-queue-on-failure).
+
+`deliver()` is a state machine over (loop-gate depth, pi run state, abort state) with four outcomes, specified in P1 rather than P0 because the semantics are subtle:
+
+| State | Action | Note |
+|---|---|---|
+| idle, wake wanted | prompt | starts a turn |
+| idle, no wake (`silent`) | pi steering queue | drains at the *start* of the next run; Cortex's wrapper currently no-ops steering when idle, so the facade reaches pi directly |
+| running | steer | lands at the next turn boundary |
+| gate held, pi idle (retry backoff, drain window) | steer | the state the original three-way spec omitted |
+
+A message delivered into a running turn extends that turn, so it inherits its budget window, retry window, and consumer promise. The implementation lives inside the loop gate; a check-then-call version has a time-of-check race against `prompt()`, which throws whenever the gate is held.
 
 Real messages are append-only source content, which makes them:
 
@@ -49,8 +60,9 @@ Rules for the headline block, from the audit:
 
 | Entry | Producer | Routed to | Channel |
 |---|---|---|---|
-| `utterance` | consumer via facade | talker (its prompt), reasoner (delivered delta) | real message |
-| `reply` | talker | log only (record of what was said) | none (talker authored it) |
+| `utterance` | consumer via facade | talker (its prompt), reasoner (silent delta, D18) | real message |
+| `reply` | talker | log; reasoner (silent delta, batched with the utterance it answers) | real message |
+| `error` / `retrying` | error and retry handlers | talker (retrying: headline; fatal: interrupt delivery) | mixed |
 | `directive` | talker control tools | facade router, then reasoner or target sub-agent | real message (steer) |
 | `delivery` | reasoner | talker, per wake policy | real message |
 | `headline` | event bridges, task registry | talker (and reasoner for its children) | view injection |
@@ -71,5 +83,7 @@ Each loop keeps its own transcript, its own stable session ID (`sessionId` per i
 ## Compaction Interactions
 
 - Every loop runs its own compaction manager. The talker compacts (infinite conversation is a consumer expectation); observational is the default strategy on both resident loops, with classic as a talker tuning option if duplicate observation cost across overlapping content proves material (decisions.md D4).
-- Compaction cliffs should be staggered: both resident loops receiving the conversation means both cross activation thresholds around the same time, and the sync-observer fallback paths block inside `transformContext` (`compaction/observational/index.ts:249-285`). The facade offsets their thresholds so blocking observation never hits both loops in the same window.
+- **The talker runs a non-blocking compaction posture.** Its synchronous observer fallback is disabled, leaving emergency truncation as the only in-band path, because a blocking observer call inside `transformContext` is multi-second dead air on the presence loop and would recur at every activation for the whole session. Staggering thresholds between loops does not help the user who is mid-conversation when the talker crosses its own.
+- The facade schedules deferred digestion (pending observation buffers, threshold compaction) during idle-signal windows for both loops, and staggers their thresholds so blocking work on the reasoner never coincides with a talker activation.
+- The log itself never compacts. Since it is also the persistence artifact, it carries a retention policy (ring buffer over lifecycle and headline-source entries, spill to `persistResult`) defined before the v2 schema freezes.
 - Persisted-result breadcrumbs (`[Result persisted: <path>]`) inside delivered content assume a shared filesystem; both resident loops share `workingDirectory` and the persist layout, so a delivered breadcrumb remains resolvable by the reasoner. The talker has no Read tool and simply speaks around them.

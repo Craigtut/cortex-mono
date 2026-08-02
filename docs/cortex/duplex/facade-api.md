@@ -30,28 +30,57 @@ Consumers set config once; the facade routes it. This table is the contract:
 | `model`, `thinkingLevel` | reasoner (talker has its own dial) |
 | `tools` (consumer-supplied) | reasoner only (decisions.md D5) |
 | `slots` | both loops, identical content, no per-slot routing (decisions.md D6) |
-| `initialBasePrompt` | reasoner; talker gets its own role prompt plus the consumer's identity content |
-| `compaction` | both (independent managers); talker strategy tunable internally |
-| `budgetGuard` | facade aggregate + per-loop lifetime budgets (P1) |
-| `resolvePermission` | facade broker in duplex; direct passthrough otherwise |
+| `initialBasePrompt` | both loops in full; the talker's role prompt is appended to it. (Consumers supply one undifferentiated prompt, and D6 forbids a routing knob, so splitting identity from domain instructions is not possible without inventing a config field.) |
+| `compaction` | both (independent managers); talker forced to a non-blocking posture internally |
+| `budgetGuard` | facade aggregate (P2) + per-loop lifetime budgets (P1); the talker additionally gets a facade-set hard `maxTurns` that consumer config cannot raise |
+| `retryPolicy` | reasoner and sub-agents; the talker gets fail-fast defaults so a transient error never becomes minutes of silence |
+| `resolvePermission` | facade broker in duplex; direct passthrough otherwise. The talker loop receives no resolver (see communication.md deadlock note) |
+| `resolveNetworkAccess` | facade broker, same ask pipeline |
+| `toolExecution`, `disableTools`, `deferredTools`, `toolResultThresholds` | reasoner and sub-agents |
+| `workingTags` | both (talker uses it to separate thinking from speech) |
+| `contextWindowLimit`, `cacheRetention` | per loop, derived from each loop's model |
+| `utilityModel` | per loop (the same-provider constraint is enforced per loop, not globally) |
+| `maxConcurrentSubAgents`, `onBeforeSubAgentSpawn`, `canSpawnSubAgent` | reasoner pool; quick lookups have a separate small pool |
+| `isAutoApprove` | facade broker (bypasses voicing when set) |
 | `getApiKey`, `sandbox`, `envOverrides`, `logger`, `workingDirectory` | shared |
-| MCP servers, skills | facade services, projected to reasoner and sub-agents |
+| MCP servers, skills | facade services, projected to reasoner and sub-agents; never to the talker |
 | `sessionId` | facade derives distinct stable per-loop IDs from it |
+| `persistResult` | shared, with origin context added |
+| compaction/loop-complete/error callback family | facade-level, fanned in with origin context; see persistence trigger below |
 
 Known cleanup folded into this work: `webFetch.maxPerLoop` and `bash.autoYieldThreshold`/`shellPath` are declared today but never threaded to the built-in tools; they get threaded or deleted (P0).
 
 ## Interaction Surface
 
-- `prompt(input)`: routes to the talker (duplex) or reasoner (passthrough). Returns when the immediate conversational turn settles, not when background work finishes.
-- `deliver(message)`: fire-and-forget input that must not throw regardless of loop state (replaces the sharp prompt-throws/steer-drops dichotomy).
-- `abort(scope?)`: `'conversation'` (talker turn), `'work'` (reasoner + its children), or `'all'` (default).
-- `getLog()` / log subscription: the append-only session record (see log-and-context.md), including entry metadata (wake class, loop path, timestamps).
+- `prompt(input)`: routes to the talker (duplex) or reasoner (passthrough). Never throws on a busy loop: internally it always uses `deliver()`, never `AgentLoop.prompt()`, because the talker's gate is held during interrupt-woken turns and queued drains, and barge-in is voice's core event. Resolves against the turn that carries the input.
+- `deliver(message)`: fire-and-forget input, same non-throwing guarantee, explicit target (`'conversation'` by default).
+- `abort(scope?)`: `'conversation'`, `'work'`, or `'all'` (default). Semantics per scope below.
+- `getLog(fromOffset?)` / log subscription: the append-only session record (see log-and-context.md), including entry metadata (wake class, loop path, timestamps).
+
+Abort semantics, per scope:
+
+| | `conversation` | `work` | `all` |
+|---|---|---|---|
+| in-flight turns | talker | reasoner + children | both |
+| queued deliveries to the target | dropped | dropped | dropped |
+| pending asks from the target | resolved as deny | resolved as deny | resolved as deny |
+| quick lookups | cancelled | untouched | cancelled |
+| pi steering/follow-up queues | cleared | cleared | cleared |
+| completed-but-undelivered results | retained in the log, not delivered | same | same |
+
+Concurrency contract: concurrent `prompt()` calls are serialized by the facade rather than throwing; `restore()` is rejected while any loop is running; the consumer idle signal is advisory, with the facade enforcing its own minimum inter-delivery spacing so an always-idle or never-idle signal cannot break the wake policy.
 
 ## Events
 
-One merged stream via `getEventBridge()`, every event labeled with a loop path (`talker`, `reasoner`, `reasoner/task-7`, `lookup/lk-2`). The existing single-level `childTaskId` becomes this path (P1). Voice consumers route `talker` response deltas to TTS and everything else to UI; nothing else changes in the event vocabulary.
+One merged stream via `getEventBridge()`, every event labeled with a loop path (`talker`, `reasoner`, `reasoner/task-7`, `lookup/lk-2`). The existing single-level `childTaskId` becomes this path (P1).
+
+**Voice consumers must use the sanitized delta stream, not raw `response_chunk`.** Working tags are stripped only at `turn_end` today, so raw deltas carry `<working>` content that TTS would speak aloud. The facade emits a separate sanitized talker-delta event with holdback buffering across chunk boundaries (text after a `<` is held until the tag is disambiguated). Consumers cannot do this themselves because tags split across chunks.
 
 Callbacks (`onError`, `onTurnComplete`, `persistResult`, `resolvePermission` in passthrough) gain an origin context argument for the same reason.
+
+Usage and cost: a single aggregate across every loop, sub-agent, quick lookup, and utility call (observer, reflector, summarization), with per-loop attribution preserved so consumers can render a breakdown. Today background children forward nothing, direct and utility completions bypass session usage entirely, and restore is additive; all three are fixed as part of the aggregate.
+
+Persistence trigger: `onLoopComplete` is ambiguous with multiple loops, so the facade exposes an explicit `onStateChanged` (debounced) plus `getState()`, and the consumer persists on that rather than on any single loop's completion. `isRunning` reports conversation and work separately, since "the conversation settled" and "all background work settled" are now different facts.
 
 ## Persistence
 

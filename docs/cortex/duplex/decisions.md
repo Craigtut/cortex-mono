@@ -55,7 +55,7 @@ The talker delegates via five fire-and-forget control tools: `spawn_task`, `stee
 Rejected, after initially being chosen: in-band directive tags parsed from the talker's text stream. The reversal rationale:
 
 - **Wrong-layer transposition.** The control-token systems (MoshiRAG `<ret>`, DuplexOmni `[THINK]`, DuplexSLA's action channel) are custom-trained models that control decode; a token is their only possible interface. Every production system at the HTTP API layer (OpenAI Realtime, Gemini Live, LiveKit, Pipecat, ElevenLabs) uses tool calls for the fast loop's control surface. AsyncFC formalizes the pattern: standard call-return contract, future-style immediate return, no retraining.
-- **Injection.** Tags are parsed from text, and untrusted text (tool output in deliveries, stdout in headlines, file contents in lookup results, users saying tag syntax) constantly enters the talker's context; an echoed `<answer>` would forge a permission decision. Tool calls cannot be echoed into existence, and `answer_ask` arguments validate against the pending-ask set.
+- **Injection by echo.** Tags are parsed from text, and untrusted text (tool output in deliveries, stdout in headlines, file contents in lookup results, users saying tag syntax) constantly enters the talker's context; an echoed `<answer>` would forge a permission decision. Tool calls cannot be echoed into existence: invocation requires a deliberate structured call. This closes echo, and only echo. **Persuasion is a separate threat and is not mitigated here**: injected text can still argue the talker into making a deliberate call, and tools are marginally worse than tags in this respect because each control-tool result lands in the talker's transcript, so prior `answer_ask(..., allow)` calls accumulate as few-shot precedent. Persuasion is handled by the router rules in D16, not by this decision.
 - **Reliability.** Models are trained heavily on schema'd tool calls with validation and structured retryable errors; bespoke tag grammar on a fast-tier model fails silently.
 - **The latency case for tags was overstated.** With `terminate: true` there is no follow-up call; the only remaining difference is dispatch-at-tag-close versus dispatch-at-message-end, which equals the duration of any post-delegation speech, typically nothing and promptable to nothing.
 
@@ -92,3 +92,34 @@ Both modes are built. Passthrough routes the facade straight to the reasoner and
 ## D15: Tier Depth Is Hard-Capped
 
 Tasks at tier 3 (sub-agents) cannot spawn further sub-agents. The reasoner spawns sub-agents; sub-agents are leaves. The existing `enableSubAgentTool: false` hardcode for children becomes configuration that the facade sets by tier.
+
+---
+
+The decisions below were added after the pre-implementation reviews. See review-findings.md for the findings that produced them.
+
+## D16: Consent Is Bound by the Router, Not by the Talker
+
+Validating that an askId exists and is pending establishes well-formedness, not authorization. The router enforces:
+
+- exactly one ask is voiced at a time;
+- `allow` is accepted only for the most-recently-voiced ask, only once, and only when a user utterance is timestamped after that voicing;
+- `deny` is unrestricted;
+- anything else returns a voiceable refusal and re-voices the pending ask.
+
+These are router rules and never prompt rules, because the talker's judgment is precisely what an attacker targets (review-findings.md F2). Ask entries carry per-ask nonces, a `voiced` state, and a mandatory verbatim `renderedRequest`; the talker reads destructive and escalation requests verbatim rather than summarizing them (F14).
+
+## D17: Control Tools Never Fail Loudly
+
+Every control-tool outcome, including schema-validation failure, unknown task id, and dispatch error, returns `terminate: true` with plain text the talker can voice. Control tools never throw and never return `isError`, because pi's error results omit `terminate` and therefore reopen the loop; combined with an unbounded default `maxTurns` that produces an unbounded retry cycle with no attacker involved (F9). The facade additionally sets a hard low `maxTurns` on the talker rather than inheriting consumer budget config, and failed dispatches produce a lifecycle entry the talker voices so a user instruction never vanishes silently.
+
+## D18: Conversation Is Context, Not Instruction
+
+Conversation deltas (both user utterances and talker replies) are delivered to the reasoner queued rather than prompted, wrapped as explicitly context-only. Only a control-tool dispatch starts a reasoner turn. Without this, every "thanks, that's great" runs a full primary-model turn over the whole session context, and any utterance can drive an agent that acts (F3). Talker replies are included because the reasoner cannot interpret "yes, do that" without its antecedent (F4).
+
+## D19: The Router Applies Backpressure
+
+Wake classes describe intent; they do not bound rate. The router enforces an interrupt token bucket with demotion to `when_idle`, content-hash dedup across recent deliveries, per-turn and per-exchange delegation caps, dispatch dedup on `(loopPath, turnIndex, toolName, argsHash)` to absorb retry-induced double dispatch, and a facade-level aggregate budget guard that exists from the moment duplex is first assembled (F13, F3).
+
+## D20: The Steer Fast-Path Is Removed
+
+Steers always route through the reasoner. Delivering a steer straight to a named child saved one hop and removed the only loop exercising judgment between injected content and a tool-carrying agent (F11).
