@@ -34,15 +34,17 @@ The breaking-change phase. Wants clean CI before starting; lands as a small numb
 7. **Ask registry.** Facade-queryable pending-ask collection with per-ask nonces, a `voiced` state field, and a mandatory verbatim `renderedRequest` (today: one anonymous nullable slot per tracked child). **[R-F2, R-F14]**
 8. **Headline feed API.** A small `AgentLoop` surface letting the facade feed the headline block into a loop's `transformContext`; `buildBackgroundTaskState` and its injection point are private and loop-local today. **[R-plan]**
 9. **Non-blocking compaction posture.** A loop mode that disables the synchronous observer fallback, leaving emergency truncation as the only in-band path (for the talker). **[R-F7]**
+10. **Idle-digestion entry point.** An `AgentLoop` API to run pending observation buffers and threshold compaction outside a prompt. Observation currently triggers on `turn_end` and compaction runs inside `transformContext`; there is no way to do either between turns, so the committed claim that the facade digests during idle windows has no primitive behind it. **[R2-idle]**
+11. **Usage accounting.** Accumulate direct/utility completion usage into per-loop session usage under a category tag and emit a usage event, so the P2 aggregate guard can see observer, reflector, and summarization spend instead of shipping blind. **[R2-B4]**
 
 ## Phase 2: The Facade
 
 The new `CortexAgent`. Built against the hardened primitive; passthrough mode first, duplex assembled behind it.
 
 1. Facade class: talker + persistent reasoner, mode routing, the completed config routing table (facade-api.md), per-loop session IDs, staggered compaction thresholds, talker constructed with no `resolvePermission` and a facade-set hard `maxTurns`, **and the aggregate budget guard active from the first assembly** (moved up from P3: duplex must never run with per-prompt budgets as its only bound). **[R-F1, R-F3]**
-2. The session log: entry types (including `error`/`retrying`), append/subscribe with offsets, retention/ring-buffer policy, versioned composite persistence (v2; idempotent usage restore; restore-while-running rejection; v1 upgrade path), and the `onStateChanged` persistence trigger. **[R-F8, R-plan]**
-3. Router: wake policy (`interrupt` / `when_idle` / `silent` with producer-proposes/router-disposes), advisory idle signal with facade-enforced minimum spacing, and backpressure per D19 (interrupt token bucket, content-hash dedup, per-turn and per-exchange delegation caps, dispatch dedup on `(loopPath, turnIndex, toolName, argsHash)`). **[R-F13]**
-4. Control toolset on the talker: `spawn_task`, `steer_task`, `cancel_task`, `answer_ask`, `quick_lookup`; local dispatch into the router; **every outcome returns `{content, terminate: true}` and control tools never throw or return `isError`** (D17); required result shape asserted by testing that the batch terminates; failed dispatch produces a voiceable lifecycle entry. **[R-F9]**
+2. The session log: entry types (including `error`/`retrying`; headlines are facade state, not entries), monotonic sequence numbers and `causedBy` causation stamps (load-bearing for D16 consent, so not deferrable), snapshot `getLog(fromSeq)` and replayable subscription with a bounded buffer, append-then-emit ordering, retention/ring-buffer policy, versioned composite persistence (v2; per-loop usage breakdown; baseline-plus-delta restore; restore-while-running rejection; v1 upgrade path), and the `onStateChanged` persistence trigger with atomic snapshotting. **[R-F8, R2-B1/B2/B3/B5]**
+3. Router: wake policy (`interrupt` / `when_idle` / `silent` with producer-proposes/router-disposes), a **facade-owned silent queue** flushed into the next prompt (never pi's steering queue, which drains after terminated batches and would speak the content unprompted), advisory idle signal with facade-enforced minimum spacing, aggregate budget guard, and backpressure per D19 (interrupt token bucket, content-hash dedup, per-turn and per-exchange delegation caps, dispatch dedup on `(loopPath, turnIndex, toolName, argsHash)`). Also the facade settlement predicates (`conversationIdle`, `workSettled`), built on gate depth and awaitable, since P3's tests cannot be written without them. **[R-F13, R2-A1, R2-B6]**
+4. Control toolset on the talker: `spawn_task`, `steer_task`, `cancel_task`, `answer_ask`, `quick_lookup`; local dispatch into the router; **every outcome returns `{content, terminate: true}` as a bare receipt, and control tools never throw or return `isError`** (D17); required result shape asserted by testing that the batch terminates. Plus the two D17 terminate-suppression guards (empty spoken text, `maxTokens` truncation with no dispatched call), the talker constructed with no permission resolver, and control tools exempted from the working-tags reminder wrapper. Failed dispatch produces a voiceable lifecycle entry. **[R-F9, R2-A2/A3/A4/A6]**
 5. Headlines: generalize `buildBackgroundTaskState` (`cortex-agent.ts:4474-4538`) into the facade-fed, hard-capped status block with aliases and `as_of` timestamps, injected outside BP3 for the talker.
 6. Permission broker end-to-end (communication.md): D16 consent binding in the router, verbatim `renderedRequest`, one-voiced-at-a-time, escalation-class timeouts, `resolveNetworkAccess` and the sandbox ask callback routed through the same pipeline, passthrough bypass. **[R-F2, R-F14]**
 7. `Deliver` tool for the reasoner (`{content, wake}`), implicit `when_idle` delivery from final assistant text, and the liveness watchdog for long silent runs. `SteerSubAgent` tool; no steer fast-path (D20). **[R-F1, R-F11]**
@@ -60,7 +62,8 @@ The new `CortexAgent`. Built against the hardened primitive; passthrough mode fi
    - iterative design against the persistent reasoner
    - permission brokering through conversation (including timeout and abort paths)
    - passthrough parity, measured against the **post-P0/P1 baseline**, not against today (P0.5 and the P1 signature additions change behavior legitimately) **[R-plan]**
-2. Adversarial scenario tests: **[red-team]**
+2. Terminated-batch transcript shape (build this first; nothing in the codebase sets `terminate` today, so the path is entirely unexercised and becomes the talker's steady state): talker dispatches, run ends on a `toolResult`, the next utterance prompts cleanly, cache-breakpoint simulation handles history ending on a toolResult, restore round-trips, and microcompaction trimming a control-tool result does not orphan its tool call. **[R2-A5]**
+3. Adversarial scenario tests: **[red-team]**
    - persuasion attempt against a live pending ask via planted content in a delivery
    - two-pending-ask mis-binding under a bare "yes"
    - injected `cancel_task`/`steer_task` using an alias harvested from headlines
@@ -68,9 +71,9 @@ The new `CortexAgent`. Built against the hardened primitive; passthrough mode fi
    - retry-induced double dispatch
    - cancel-during-completion, abort-during-drain, user-speaks-during-interrupt-turn
    - grounding held under repeated user pressure ("just tell me what it found so far")
-3. Latency measurement harness: talker TTFT (warm and cold-cache), control-tool dispatch latency, delivery-to-voiced latency, and a talker-prefix size guardrail.
-4. Docs sync (this folder moves from DESIGN to IMPLEMENTED status; consumer-guide.md updated).
-5. Duplex ships as the default with `mode: 'passthrough'` as the opt-out (decisions.md D14).
+4. Latency measurement harness: talker TTFT (warm and cold-cache), control-tool dispatch latency, delivery-to-voiced latency, and a talker-prefix size guardrail.
+5. Docs sync (this folder moves from DESIGN to IMPLEMENTED status; consumer-guide.md updated).
+6. Duplex ships as the default with `mode: 'passthrough'` as the opt-out (decisions.md D14).
 
 ## Out of Scope for Launch
 

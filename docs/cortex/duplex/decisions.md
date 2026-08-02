@@ -102,15 +102,22 @@ The decisions below were added after the pre-implementation reviews. See review-
 Validating that an askId exists and is pending establishes well-formedness, not authorization. The router enforces:
 
 - exactly one ask is voiced at a time;
-- `allow` is accepted only for the most-recently-voiced ask, only once, and only when a user utterance is timestamped after that voicing;
+- `allow` is accepted only for the most-recently-voiced ask, only once, and **only from a talker turn whose causation chain includes a user utterance that arrived after the ask was voiced**. A turn triggered purely by a delivery, a headline refresh, or a lookup wake cannot grant permission, which is precisely the shape an injected-content persuasion attempt takes;
 - `deny` is unrestricted;
-- anything else returns a voiceable refusal and re-voices the pending ask.
+- anything else returns a voiceable refusal and re-voices the pending ask. (The refusal costs one recovery turn and leaves the anomaly in the log.)
+
+This makes the log's causation stamps load-bearing for security, not just for observability, so they are built in P2 with the log rather than added later. Secondary mitigation for the few-shot-precedent problem named in D8: control-tool results are bare uniform receipts, so the transcript carries as little imitable decision text as possible.
 
 These are router rules and never prompt rules, because the talker's judgment is precisely what an attacker targets (review-findings.md F2). Ask entries carry per-ask nonces, a `voiced` state, and a mandatory verbatim `renderedRequest`; the talker reads destructive and escalation requests verbatim rather than summarizing them (F14).
 
 ## D17: Control Tools Never Fail Loudly
 
-Every control-tool outcome, including schema-validation failure, unknown task id, and dispatch error, returns `terminate: true` with plain text the talker can voice. Control tools never throw and never return `isError`, because pi's error results omit `terminate` and therefore reopen the loop; combined with an unbounded default `maxTurns` that produces an unbounded retry cycle with no attacker involved (F9). The facade additionally sets a hard low `maxTurns` on the talker rather than inheriting consumer budget config, and failed dispatches produce a lifecycle entry the talker voices so a user instruction never vanishes silently.
+Every control-tool outcome, including schema-validation failure, unknown task id, and dispatch error, returns `terminate: true` with a bare uniform receipt the talker can voice. Control tools never throw and never return `isError`, because pi's error results omit `terminate` and therefore reopen the loop; combined with an unbounded default `maxTurns` that produces an unbounded retry cycle with no attacker involved (F9). The facade additionally sets a hard low `maxTurns` on the talker rather than inheriting consumer budget config, and failed dispatches produce a lifecycle entry the talker voices so a user instruction never vanishes silently.
+
+**Two exceptions where terminate is deliberately withheld**, both guarding against a silent exchange (the user speaks, hears nothing, and the turn ends):
+
+- **Empty spoken text.** Fast-tier models frequently emit a tool call with no preamble, and `terminate: true` then ends the turn with nothing said. The facade's `afterToolCall` wrapper suppresses terminate when the assistant message's user-facing text (after stripping working tags) is empty, forcing exactly one follow-up turn that speaks. This converts dead air into one extra fast-model call, and uses machinery that already exists: pi passes `assistantMessage` into the hook, and `afterResult.terminate` overrides the tool's value.
+- **Truncation.** If the talker hits its output cap mid-tool-call, the call may never materialize, leaving a spoken acknowledgment with nothing dispatched and no error anywhere. The facade audits the talker's stop reason and runs a repair turn when a `maxTokens` stop produced no control-tool call.
 
 ## D18: Conversation Is Context, Not Instruction
 

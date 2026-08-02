@@ -32,9 +32,11 @@ Deliverables, directives, conversation deltas, permission asks: anything a loop 
 | State | Action | Note |
 |---|---|---|
 | idle, wake wanted | prompt | starts a turn |
-| idle, no wake (`silent`) | pi steering queue | drains at the *start* of the next run; Cortex's wrapper currently no-ops steering when idle, so the facade reaches pi directly |
+| idle, no wake (`silent`) | **facade-owned queue**, flushed into the next prompt's message array | see the warning below: pi's steering queue is the wrong mechanism |
 | running | steer | lands at the next turn boundary |
 | gate held, pi idle (retry backoff, drain window) | steer | the state the original three-way spec omitted |
+
+**The silent queue must never be pi's steering queue while a run is live.** After a terminated tool batch, `runLoop` still polls `getSteeringMessages()` and continues the inner loop if anything is queued. A silent delivery parked there during a talker turn would therefore drain immediately after the control-tool batch and produce an unprompted spoken response to content that was supposed to surface only when relevant. The facade holds silent-class content itself and prepends it to the next real prompt.
 
 A message delivered into a running turn extends that turn, so it inherits its budget window, retry window, and consumer promise. The implementation lives inside the loop gate; a check-then-call version has a time-of-check race against `prompt()`, which throws whenever the gate is held.
 
@@ -65,12 +67,15 @@ Rules for the headline block, from the audit:
 | `error` / `retrying` | error and retry handlers | talker (retrying: headline; fatal: interrupt delivery) | mixed |
 | `directive` | talker control tools | facade router, then reasoner or target sub-agent | real message (steer) |
 | `delivery` | reasoner | talker, per wake policy | real message |
-| `headline` | event bridges, task registry | talker (and reasoner for its children) | view injection |
+| `lifecycle` | facade | log (durable: spawns, completions, cancels, dispatch failures) | none |
 | `ask` / `ask_answer` | permission broker | talker / originating resolver | real message / promise settle |
 | `lookup_result` | quick-lookup sub-agent | talker (wake) and reasoner (delta at next turn) | real message |
-| `lifecycle` | facade | log only | none |
 
 `lookup_result` routing is the shared-context guarantee of decisions.md D13: the reasoner sees everything the talker learned, so context never forks.
+
+**Headlines are not log entries.** The live status block is facade state rebuilt from event-bridge activity and injected per turn; it never appends to the log. Making every headline tick an entry would grow the log at tool-call frequency and bloat the persistence artifact with exactly the churn the two-channel split exists to keep out of durable state. Durable milestones (a task started, finished, was cancelled, or a dispatch failed) are `lifecycle` entries; the moment-to-moment "currently running Grep" is not.
+
+Every entry carries a monotonic sequence number (timestamps collide under burst), and entries produced by a router-initiated run carry the sequence number of the entry that caused it. Causation is not only for observability: D16 uses it to bind consent.
 
 ## Cache Discipline Per Loop
 

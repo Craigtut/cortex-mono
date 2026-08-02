@@ -55,7 +55,10 @@ Known cleanup folded into this work: `webFetch.maxPerLoop` and `bash.autoYieldTh
 - `prompt(input)`: routes to the talker (duplex) or reasoner (passthrough). Never throws on a busy loop: internally it always uses `deliver()`, never `AgentLoop.prompt()`, because the talker's gate is held during interrupt-woken turns and queued drains, and barge-in is voice's core event. Resolves against the turn that carries the input.
 - `deliver(message)`: fire-and-forget input, same non-throwing guarantee, explicit target (`'conversation'` by default).
 - `abort(scope?)`: `'conversation'`, `'work'`, or `'all'` (default). Semantics per scope below.
-- `getLog(fromOffset?)` / log subscription: the append-only session record (see log-and-context.md), including entry metadata (wake class, loop path, timestamps).
+- `getLog(fromSeq?)`: a snapshot copy (never a live reference) of entries from a sequence number onward.
+- `subscribeLog(cb, fromSeq?)`: push callback with replay from a sequence number, so a reconnecting UI can ask for everything since it last saw. Slow subscribers are buffered to a bound and then dropped with a gap marker rather than applying backpressure to the loops.
+
+Entries carry a monotonic `seq`, a `loopPath`, a wake class, timestamps, and a `causedBy` seq when the entry belongs to a router-initiated run. The ordering rule is append-then-emit: a log entry is appended before the events of the run it triggers, so a consumer merging the two streams never sees events for an entry it has not received. A `reply` entry carries the same run identity as the response deltas that streamed it, so a UI can dedupe rather than rendering the text twice.
 
 Abort semantics, per scope:
 
@@ -78,9 +81,24 @@ One merged stream via `getEventBridge()`, every event labeled with a loop path (
 
 Callbacks (`onError`, `onTurnComplete`, `persistResult`, `resolvePermission` in passthrough) gain an origin context argument for the same reason.
 
-Usage and cost: a single aggregate across every loop, sub-agent, quick lookup, and utility call (observer, reflector, summarization), with per-loop attribution preserved so consumers can render a breakdown. Today background children forward nothing, direct and utility completions bypass session usage entirely, and restore is additive; all three are fixed as part of the aggregate.
+### Usage and cost
 
-Persistence trigger: `onLoopComplete` is ambiguous with multiple loops, so the facade exposes an explicit `onStateChanged` (debounced) plus `getState()`, and the consumer persists on that rather than on any single loop's completion. `isRunning` reports conversation and work separately, since "the conversation settled" and "all background work settled" are now different facts.
+A single aggregate across every loop, sub-agent, quick lookup, and utility call, with per-loop attribution preserved. Three current gaps make this more than bookkeeping:
+
+- **Direct and utility completions reach no accounting surface at all.** `directComplete`/`structuredComplete`/`utilityComplete` stash usage in a field with no public reader; it never reaches session usage, any budget guard, or any event. That class covers the observational observer and reflector, L2 summarization, WebFetch summarization, and Bash's utility calls. Duplex doubles the observational share (two resident loops observing overlapping content, exactly the cost D4 says to watch), so the aggregate guard would otherwise ship blind and could not stop a runaway reflector. Fix: accumulate this usage per loop under a category tag and emit a usage event for it.
+- **Composition must dedupe children.** Per-loop session usage already includes forwarded child events, so the aggregate is the sum of per-loop totals with each child counted exactly once via a bridge-of-record rule (every child forwards to exactly one parent bridge; lookups are owned by the facade's bridge). `SubAgentResult.usage` is never re-added on top; a consumer doing that today already double-counts foreground children.
+- **Restore is a baseline, not a replay.** Loops restart at zero, so the facade owns the aggregate as `restoredBaseline + live deltas` rather than summing live counters. The v2 artifact stores a per-loop breakdown, since a single blob erases attribution across a restore.
+
+### Settlement and persistence
+
+`onLoopComplete` is ambiguous with multiple loops, so the facade exposes `onStateChanged` (debounced) plus `getState()`, and the consumer persists on that rather than on any single loop's completion. A snapshot is taken only at a consistent point: the log and both histories are captured atomically, never mid-reasoner-task on a talker completion.
+
+Two distinct predicates, both awaitable, because "the conversation settled" and "all work settled" are different facts:
+
+- `conversationIdle`: the talker's gate is empty.
+- `workSettled`: reasoner idle, no active sub-agents or lookups, no queued wake deliveries, no pending asks.
+
+Both are built on loop-gate depth rather than the loop's `_isPrompting` flag, which reads idle while gate tasks are still queued. The awaitable form is needed by the P3 scenario tests, so it is built in P2.
 
 ## Persistence
 

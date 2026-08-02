@@ -138,6 +138,33 @@ Roughly ten of the config keys were routed. Every unrouted key is a divergence p
 
 Persuasion against a live pending ask via planted content; two-pending-ask mis-binding; injected cancel/steer using an id harvested from headlines; control-tool error loop asserting bounded turns; retry-induced double spawn; cancel-during-completion; abort-during-drain; user-speaks-during-interrupt-turn; grounding under repeated user pressure.
 
+## Second Round: Findings Against the Amended Design
+
+A follow-up pass verified the control-tool amendment end-to-end and covered three areas added to the brief (log observability, usage aggregation, settlement semantics).
+
+**Verified sound:** the `terminate: true` chain survives Cortex's adapter, the working-tags `afterToolCall` wrapper (which merges `afterResult.terminate ?? result.terminate`), and tool-result persistence; `shouldTerminateToolBatch` holds because the talker carries only control tools; an errored call's missing `terminate` automatically buys a recovery turn, which is the correct behavior. The injection-by-echo argument holds.
+
+### R2-A. Control-tool mechanics
+
+- **A1 (corrected a committed error).** The `silent` wake class must not use pi's steering queue. After a terminated batch, `runLoop` still polls steering and continues the inner loop, so a silent delivery parked there during a talker turn drains immediately after the control-tool batch and is spoken unprompted. The silent queue is facade-owned and flushed into the next prompt. See log-and-context.md.
+- **A3.** Speak-before-calling is a model-behavior assumption, and a preamble-less tool call plus `terminate: true` produces a silent exchange. Resolved structurally in D17: the facade's `afterToolCall` suppresses terminate when user-facing text (after stripping working tags) is empty, forcing one speaking turn.
+- **A4.** A `maxTokens` stop mid-tool-call can leave a spoken acknowledgment with nothing dispatched and no error signal. Resolved in D17 by a stop-reason audit and repair turn.
+- **A5.** Nothing in the codebase sets `terminate` today, so "run ends on a toolResult" is an unexercised transcript shape that becomes the talker's steady state. Added as the first P3 test: next-prompt conversion, cache-breakpoint simulation, restore round-trip, and microcompaction of a control-tool result.
+- **A2, A6, A7.** Talker gets no permission resolver (already specified); control tools are exempt from the working-tags reminder wrapper (permanent per-exchange tokens for a dispatch receipt); dispatch waits for argument streaming, so `spawn_task.instructions` is prompt-constrained to one sentence.
+
+### R2-B. Observability, usage, settlement
+
+- **B1.** Headlines were simultaneously a log entry type and never-persisted churn. Resolved: headlines are facade state, never log entries; durable milestones are `lifecycle` entries.
+- **B2, B3.** The subscription contract was undefined and the event and log streams had no linkage. Resolved: monotonic sequence numbers, snapshot `getLog(fromSeq)`, replayable subscription with a bounded buffer, `causedBy` causation stamps, and an append-then-emit ordering rule. D16 then makes causation load-bearing for consent, so it cannot be deferred.
+- **B4.** Direct and utility completions (observer, reflector, L2 summarization, WebFetch, Bash utility calls) reach no accounting surface at all: usage is stashed in a field with no public reader. Duplex doubles the observational share, so the aggregate guard would ship blind. Added to P1.
+- **B5.** Aggregate composition needed a bridge-of-record dedupe rule, a `restoredBaseline + live deltas` model (loops restart at zero), and a per-loop breakdown in the artifact.
+- **B6.** `onLoopComplete`, `isRunning`, and "settled" had no composite meaning. Resolved: `conversationIdle` and `workSettled`, both awaitable, built on gate depth rather than `_isPrompting` (which reads idle while gate tasks are queued), plus atomic snapshotting for persistence. Built in P2 because P3's tests need them.
+- **B7.** Per-loop watchdog diagnostics need `loopPath` in P1's identity work, not just events and callbacks.
+
+### R2-idle. A committed claim with no primitive behind it
+
+The reasoner-lifecycle section states the facade digests during idle windows, but observation triggers on `turn_end` and compaction runs inside `transformContext`; there is no way to run either between turns. An idle-digestion entry point is added to P1.
+
 ## One Claim Verified, With a Caveat
 
 The red-team confirmed that moving from in-band tags to control tools does close injection-by-echo: with no parser, untrusted text cannot dispatch by being echoed. It withdrew its own pre-amendment findings on that basis.
