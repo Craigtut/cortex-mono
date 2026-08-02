@@ -51,7 +51,7 @@ Rules for the headline block, from the audit:
 |---|---|---|---|
 | `utterance` | consumer via facade | talker (its prompt), reasoner (delivered delta) | real message |
 | `reply` | talker | log only (record of what was said) | none (talker authored it) |
-| `directive` | talker stream parser | facade router, then reasoner or target sub-agent | real message (steer) |
+| `directive` | talker control tools | facade router, then reasoner or target sub-agent | real message (steer) |
 | `delivery` | reasoner | talker, per wake policy | real message |
 | `headline` | event bridges, task registry | talker (and reasoner for its children) | view injection |
 | `ask` / `ask_answer` | permission broker | talker / originating resolver | real message / promise settle |

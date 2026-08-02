@@ -17,7 +17,7 @@ Cortex's single loop makes responsiveness and depth mutually exclusive. A user m
         |                                          |
    talker loop                               reasoner loop
    (AgentLoop)                                (AgentLoop)
-   fast model, zero tools                     full model, all tools
+   fast model, control tools only             full model, all tools
    owns the floor                             owns the work
         |                                          |
         | quick lookups                            | spawns / steers
@@ -36,9 +36,9 @@ Everything in the diagram below the facade is invisible to consumers.
 |---|---|---|---|
 | Lifetime | session | session | one task |
 | Model | fast tier (config dial) | primary | per-spawn |
-| Tools | none (default) | full set + consumer tools | task-scoped |
+| Tools | control tools only (`spawn_task`, `steer_task`, `cancel_task`, `answer_ask`, `quick_lookup`; all local, fire-and-forget) | full set + consumer tools | task-scoped |
 | Compaction | own manager (observational default) | own manager | own manager |
-| Working tags | on (thinking vs speaking, directives) | on | on |
+| Working tags | on (thinking vs speaking) | on | on |
 | Prompted by | facade router | facade router + wake deliveries | reasoner or facade |
 | Session ID | distinct, stable | distinct, stable | taskId (existing pattern) |
 
@@ -46,7 +46,7 @@ Every capability of today's agent (slots, ephemeral injection, cache breakpoints
 
 ## Role: Talker
 
-The talker's job is presence. It always has a short next turn available: small context, fast model, zero tools, capped output. It acknowledges instantly, answers what is answerable from injected context (status, conversation, small talk, clarification), delegates everything else by emitting directives, and performs the reasoner's deliveries in a register that suits the modality.
+The talker's job is presence. It always has a short next turn available: small context, fast model, no blocking tools, capped output. It acknowledges instantly, answers what is answerable from injected context (status, conversation, small talk, clarification), delegates everything else through its fire-and-forget control tools, and performs the reasoner's deliveries in a register that suits the modality.
 
 The talker is not a dumb relay. The shipped systems this design follows are explicit that the fast layer is a capable model. The split between talker and reasoner is a time budget, not intelligence: the talker handles anything answerable in one short turn from visible context; the reasoner handles anything needing tools, multi-step reasoning, or more than about a second of thought.
 
@@ -72,7 +72,7 @@ The facade owns:
 
 - the two resident loops and their configuration
 - the session log and its routing (log-and-context.md)
-- the directive parser attached to the talker's delta stream (communication.md)
+- the control-tool router (spawn/steer/cancel/answer/lookup dispatch, communication.md)
 - the wake policy and the consumer idle signal (communication.md)
 - the permission broker (communication.md)
 - quick-lookup spawning and the sub-agent caps (sub-agents.md)
@@ -94,7 +94,7 @@ pi-agent-core remains untouched. Its loop, steering queues, hooks (`transformCon
 Voice-oriented numbers, text benefits proportionally:
 
 - Talker first token: small cached prefix + fast model, target 200-500 ms.
-- Talker acknowledgment of delegated work: same turn as the directive; dispatch fires mid-stream when the tag closes, before TTS finishes the sentence.
+- Talker acknowledgment of delegated work: spoken in the same turn, streaming before the control-tool call; dispatch fires at message end, and `terminate: true` skips any follow-up call, so delegation adds no LLM round trip.
 - Reasoner pickup of new direction: its next turn boundary (seconds when it is between tools; bounded by the longest foreground tool call otherwise, hence the backgrounding nudge).
 - Deliverable to user: reasoner completion, then wake policy timing (interrupt is immediate; when_idle waits for the lull).
 

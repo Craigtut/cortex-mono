@@ -34,13 +34,13 @@ The new `CortexAgent`. Built against the hardened primitive; passthrough mode fi
 1. Facade class: talker + persistent reasoner, mode routing, config routing table (facade-api.md), per-loop session IDs, staggered compaction thresholds.
 2. The session log: entry types, append/subscribe, versioned composite persistence (v2 format; idempotent usage restore; restore-while-running guard; v1 upgrade path).
 3. Router and wake policy: `interrupt` / `when_idle` / `silent`, consumer idle signal, `when_idle` degradation delay, delivery via `deliver()`.
-4. Directive parser on the talker's delta stream: `<task>`, `<steer>`, `<cancel>`, `<answer>`, `<lookup>`; dispatch on tag close; directives stripped from user-facing text per working-tags conventions.
+4. Control toolset on the talker: `spawn_task`, `steer_task`, `cancel_task`, `answer_ask`, `quick_lookup`; local sub-millisecond dispatch into the facade router, every result `terminate: true` (pi skips the follow-up call), `answer_ask` validated against the pending-ask set. Standard tool path; no custom parser.
 5. Headlines: generalize `buildBackgroundTaskState` (`cortex-agent.ts:4474-4538`) into the facade-fed, token-capped status block, injected outside BP3 for the talker.
 6. Permission broker end-to-end (communication.md), including timeouts and passthrough bypass.
 7. `SteerSubAgent` tool for the reasoner; facade fast-path for user steers that obviously target a named task.
-8. Quick lookups: `<lookup>` directive, read-only ephemeral spawns, results wake the talker and route to the reasoner via the log.
+8. Quick lookups: `quick_lookup` control tool, read-only ephemeral spawns, results wake the talker and route to the reasoner via the log.
 9. MCP multiplexer and skill registration fan-out (single-slot callback fields become listener arrays; one stdio subprocess per server total).
-10. Talker role prompt: presence, grounding rules (never state facts absent from headlines/deliveries, never invent outcomes of unfinished work), directive usage, honest staleness phrasing.
+10. Talker role prompt: presence, grounding rules (never state facts absent from headlines/deliveries, never invent outcomes of unfinished work), control-tool usage with speak-before-calling, honest staleness phrasing.
 11. Reasoner prompt nudges: background long commands, delegate long parallelizable work, deliver milestones with appropriate wake classes.
 
 ## Phase 3: Validation and Default Flip
@@ -52,7 +52,7 @@ The new `CortexAgent`. Built against the hardened primitive; passthrough mode fi
    - permission brokering through conversation (including timeout and abort paths)
    - passthrough parity: byte-identical behavior versus a pre-facade baseline
 2. Facade-level aggregate budget guard active across all loops.
-3. Latency measurement harness: talker TTFT, directive dispatch latency, delivery-to-voiced latency.
+3. Latency measurement harness: talker TTFT, control-tool dispatch latency, delivery-to-voiced latency.
 4. Docs sync (this folder moves from DESIGN to IMPLEMENTED status; consumer-guide.md updated).
 5. Duplex ships as the default with `mode: 'passthrough'` as the opt-out (decisions.md D14).
 

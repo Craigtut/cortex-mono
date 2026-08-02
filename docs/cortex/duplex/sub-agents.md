@@ -29,13 +29,13 @@ Build:
 3. A reasoner-facing `SteerSubAgent` tool (P2). Tool calls are acceptable here: the reasoner is not latency-critical, and a tool result confirming queued delivery is useful signal.
 4. Steer events become log lifecycle entries so the talker's headlines reflect the redirect.
 
-Full chain: user speaks -> talker emits `<steer id="task-7">focus on Europe</steer>` -> facade delivers to the reasoner -> reasoner calls `SteerSubAgent("task-7", ...)` -> child's queue drains at its next turn boundary. When the user's intent obviously targets a named running task, the facade may deliver the steer directly to that child and inform the reasoner via the log, saving one hop; the router owns that choice, not the consumer.
+Full chain: user speaks -> talker calls `steer_task({taskId: "task-7", message: "focus on Europe"})` -> facade delivers to the reasoner -> reasoner calls `SteerSubAgent("task-7", ...)` -> child's queue drains at its next turn boundary. When `taskId` names a running sub-agent directly, the facade may deliver the steer straight to that child and inform the reasoner via the log, saving one hop; the router owns that choice, not the consumer.
 
 ## Quick Lookups
 
 Problem: while the reasoner is mid-turn, small factual questions ("what does resolveModel actually do?") cannot wait for its turn boundary, and the talker has no tools by design.
 
-Solution (decisions.md D13): the facade spawns an ephemeral sub-agent with a read-only toolset (Read, Grep, Glob; no Write/Edit/Bash-write, no spawning), a fast model, a short wall-clock timeout, and a small concurrency cap separate from the reasoner's. The talker triggers it with a `<lookup>` directive and covers the wait conversationally; the result wakes the talker (`interrupt`).
+Solution (decisions.md D13): the facade spawns an ephemeral sub-agent with a read-only toolset (Read, Grep, Glob; no Write/Edit/Bash-write, no spawning), a fast model, a short wall-clock timeout, and a small concurrency cap separate from the reasoner's. The talker triggers it with its `quick_lookup` control tool and covers the wait conversationally; the result wakes the talker (`interrupt`).
 
 Shared-context guarantee: lookup results are appended to the log and routed to the reasoner as a delta at its next turn. The reasoner sees everything the talker learned. Lookups carry no decision authority and mutate nothing, so no session context ever forks; the single-reasoner invariant (decisions.md D3) holds.
 

@@ -1,30 +1,32 @@
-# Communication: Directives, Headlines, Wake Policy, Permission Brokering
+# Communication: Control Tools, Headlines, Wake Policy, Permission Brokering
 
 > **STATUS: DESIGN, NOT IMPLEMENTED**
 
-No tool calls are used for cross-loop communication in either direction. The down-channel is in-band text; the up-channel is log routing.
+The down-channel is a fixed set of fire-and-forget control tools on the talker; the up-channel is log routing. Neither direction ever blocks a loop on another loop.
 
-## Down-Channel: Directives
+## Down-Channel: Control Tools
 
-The talker delegates by emitting working-tag directives inside its normal text stream. The facade attaches a streaming parser to the talker's delta events (extending the existing working-tags system, which currently parses only at `turn_end` via the event bridge) and dispatches each directive the moment its closing tag arrives, while the rest of the sentence is still streaming to TTS.
+The talker delegates through five control tools (decisions.md D8, which records the reversal from an earlier in-band-tags design). Each executes locally in under a millisecond (a dispatch into the facade router) and returns `terminate: true`, which pi-agent-core honors by skipping the automatic follow-up LLM call, so delegation costs zero extra rounds. The talker speaks its acknowledgment in the same turn, before the tool call, and the turn ends when the dispatch lands.
 
-Directive set (initial):
+Control toolset (initial):
 
-| Tag | Meaning | Facade action |
+| Tool | Arguments | Facade action |
 |---|---|---|
-| `<task>instructions</task>` | new work | deliver to reasoner |
-| `<steer id="...">text</steer>` | redirect work | deliver to reasoner (or to a named sub-agent via the reasoner) |
-| `<cancel id="..."/>` | stop work | abort target loop, log lifecycle entry |
-| `<answer ask="id">decision</answer>` | permission answer | settle the pending ask |
-| `<lookup>question</lookup>` | quick factual lookup | facade spawns read-only sub-agent |
+| `spawn_task` | `{ instructions }` | deliver new work to the reasoner |
+| `steer_task` | `{ taskId?, message }` | deliver a redirect to the reasoner, or fast-path to a named running sub-agent |
+| `cancel_task` | `{ taskId }` | abort the target, log a lifecycle entry |
+| `answer_ask` | `{ askId, decision, reason? }` | settle the pending permission ask (validated against the pending-ask set) |
+| `quick_lookup` | `{ question }` | spawn a read-only ephemeral sub-agent |
 
 Design properties:
 
-- **Zero round trips.** A directive costs nothing beyond the tokens of the tag. There is no tool-result turn, no second LLM call for the talker.
-- **Pointer, not paraphrase.** The reasoner receives the conversation deltas anyway (log routing), so the directive does not need to restate the user's request accurately; the reasoner reads the user's own words. This removes the lossy-orchestrator failure mode of tool-call delegation.
-- **Precedent.** MoshiRAG's `<ret>` token, DuplexOmni's `[THINK]`/`[WAIT]`, DuplexSLA's action channel: the convergent industry pattern is delegation as a token in the output stream.
+- **Zero extra round trips.** `terminate: true` on every control-tool result skips the follow-up call; the loop honors this today (`agent-loop.ts` `shouldTerminateToolBatch`).
+- **Pointer, not paraphrase.** The reasoner receives the conversation deltas anyway (log routing), so tool arguments do not need to restate the user's request accurately; the reasoner reads the user's own words.
+- **Injection-resistant by construction.** Untrusted text in the talker's context (tool output in deliveries, stdout in headlines, file contents in lookup results, users quoting syntax) cannot invoke a tool by being echoed; invocation requires a deliberate structured call, and `answer_ask` arguments validate against the live pending-ask set.
+- **Standard machinery.** Schema validation, argument coercion, and structured retryable errors come from the existing tool path; there is no bespoke parser to build or maintain.
+- **Precedent.** Every production system at the API layer uses tool calls for the fast loop's control surface: OpenAI Realtime async function calling, Gemini Live `NON_BLOCKING` functions, LiveKit's auto-exposed `get_running_tasks`/`cancel_task`, Pipecat, ElevenLabs. AsyncFC formalizes the fire-and-forget contract.
 
-Parsing rules follow the existing working-tags conventions (flat tags, no nesting, unclosed tag tolerated at stream end). Directives are stripped from the user-facing text exactly like `<working>` content.
+Working tags remain in use on the talker for their original purpose only: separating internal reasoning from spoken text.
 
 ## Up-Channel: Headlines and Deliveries
 
@@ -46,7 +48,7 @@ Adopted vocabulary from Gemini Live's result scheduling (decisions.md D10). Ever
 
 The producer proposes the class (the reasoner can mark a milestone `silent` and a final result `when_idle`; permission asks are `interrupt`), and the facade's router applies defaults per entry type. The consumer supplies the idle signal; without one, `when_idle` degrades to `interrupt` after a configurable delay.
 
-Stale results are never dropped (the Nova 2 Sonic position): a delivery that arrives after the user changed direction still enters the log and the talker's context; the talker reconciles conversationally. Explicit `<cancel>` is the only discard path.
+Stale results are never dropped (the Nova 2 Sonic position): a delivery that arrives after the user changed direction still enters the log and the talker's context; the talker reconciles conversationally. Explicit `cancel_task` is the only discard path.
 
 ## Permission Brokering
 
@@ -57,7 +59,7 @@ sub-agent hits ask-gated tool
   -> resolver wrapper creates ask entry {askId, loopPath, toolName, args}  (log, wake: interrupt)
   -> talker voices the ask
   -> user answers in speech/text
-  -> talker emits <answer ask="id">allow|deny reason</answer>
+  -> talker calls answer_ask({askId, decision, reason})
   -> facade settles the pending resolver promise
   -> asking loop proceeds or receives the block
 ```

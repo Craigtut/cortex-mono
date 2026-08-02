@@ -25,9 +25,11 @@ Consequences accepted: the reasoner is the scheduler of all work, and its turn-b
 
 The talker is not a stripped-down chat wrapper. It has its own compaction (consumers rely on effectively infinite conversation), slots, working tags, and cache management. Default compaction strategy is observational, same as everything else; downgrading the talker to the classic strategy is a tuning option if duplicate observation cost proves material, not an architectural decision.
 
-## D5: The Talker Has Zero Tools by Default
+## D5: The Talker Has No Blocking Tools
 
-Delegation, steering, cancellation, and permission answers are in-band directives parsed from the talker's text stream (see D8). Status arrives by injection. Nothing is left for a tool to do, and an empty toolset keeps the talker's turns structurally incapable of blocking on tool execution. Consumer-supplied tools are wired to the reasoner, not the talker. Config permits adding talker tools for unusual cases.
+The invariant is that the talker's turns are structurally incapable of blocking on tool execution, so the voice channel always has someone home. It carries exactly one fixed toolset: the control tools of D8, all of which are local, sub-millisecond dispatches into the facade. Consumer-supplied tools, I/O tools, and MCP tools are wired to the reasoner and never reach the talker. Status arrives by injection, never by a tool.
+
+(Earlier draft of this decision said "zero tools" with delegation via in-band tags; superseded by D8's reversal. The property being protected, no blocking tools, is unchanged.)
 
 ## D6: No Consumer-Facing Slot Routing
 
@@ -46,9 +48,18 @@ Instead, the log is an append-only coordination record and routing bus. Content 
 - Durable entries (deliverables, directives, permission asks, conversation deltas) are delivered as real transcript messages at turn boundaries, via the same path background results use today.
 - Churn (task headlines, live activity) is view-injected outside the BP3 cache boundary, which is today's `<background-tasks>` mechanism.
 
-## D8: Delegation Is In-Band, Not Tool Calls
+## D8: Delegation Is a Control Toolset (Reversal of the Tags Draft)
 
-The talker delegates via working-tag directives (`<task>`, `<steer>`, `<cancel>`, ask answers) parsed from its streaming deltas. Dispatch fires the moment a tag closes in the stream, while TTS is still speaking the sentence. This follows the convergent industry pattern (MoshiRAG's `<ret>` token, DuplexOmni's `[THINK]`/`[WAIT]`, DuplexSLA's action channel): delegation is a token in the output stream, not a blocking call. It also means delegation is a pointer, not a paraphrase; the reasoner reads the conversation itself, so nothing is lost in the talker's restatement.
+The talker delegates via five fire-and-forget control tools: `spawn_task`, `steer_task`, `cancel_task`, `answer_ask`, `quick_lookup`. Each executes locally in under a millisecond (an array push into the facade) and returns `terminate: true`, which pi-agent-core already honors by skipping the automatic follow-up LLM call (`agent-loop.ts` `shouldTerminateToolBatch`). The spoken acknowledgment streams before the tool call in the same turn, so delegation costs zero extra LLM round trips.
+
+Rejected, after initially being chosen: in-band directive tags parsed from the talker's text stream. The reversal rationale:
+
+- **Wrong-layer transposition.** The control-token systems (MoshiRAG `<ret>`, DuplexOmni `[THINK]`, DuplexSLA's action channel) are custom-trained models that control decode; a token is their only possible interface. Every production system at the HTTP API layer (OpenAI Realtime, Gemini Live, LiveKit, Pipecat, ElevenLabs) uses tool calls for the fast loop's control surface. AsyncFC formalizes the pattern: standard call-return contract, future-style immediate return, no retraining.
+- **Injection.** Tags are parsed from text, and untrusted text (tool output in deliveries, stdout in headlines, file contents in lookup results, users saying tag syntax) constantly enters the talker's context; an echoed `<answer>` would forge a permission decision. Tool calls cannot be echoed into existence, and `answer_ask` arguments validate against the pending-ask set.
+- **Reliability.** Models are trained heavily on schema'd tool calls with validation and structured retryable errors; bespoke tag grammar on a fast-tier model fails silently.
+- **The latency case for tags was overstated.** With `terminate: true` there is no follow-up call; the only remaining difference is dispatch-at-tag-close versus dispatch-at-message-end, which equals the duration of any post-delegation speech, typically nothing and promptable to nothing.
+
+Delegation remains a pointer, not a paraphrase: the reasoner receives the conversation deltas regardless, so tool arguments do not need to restate the user's request accurately.
 
 ## D9: No Deliverable Schema
 
@@ -62,13 +73,13 @@ Adopted from Gemini Live's result scheduling: a log entry destined for the talke
 
 ## D11: Permission Asks Broker Through the Talker
 
-A reasoner or sub-agent permission ask becomes a log entry with an ask ID, wakes the talker (`interrupt`), is voiced to the user, and the spoken answer returns as a directive that settles the pending resolver. Requires ask identity, a queryable pending-ask collection, and abort-raced resolution (the current resolver await is uninterruptible; Cortex's wrapper fixes this by racing the consumer's decision against the abort signal, no pi change needed).
+A reasoner or sub-agent permission ask becomes a log entry with an ask ID, wakes the talker (`interrupt`), is voiced to the user, and the spoken answer returns via the talker's `answer_ask` control tool, which settles the pending resolver. Requires ask identity, a queryable pending-ask collection, and abort-raced resolution (the current resolver await is uninterruptible; Cortex's wrapper fixes this by racing the consumer's decision against the abort signal, no pi change needed).
 
 ## D12: Parent-to-Child Steering Is a Launch Requirement
 
 Rejected: cancel-and-respawn as the interim redirect mechanism for running sub-agents.
 
-The reasoner must be able to steer a running sub-agent. Children are full AgentLoops and already have steering queues; the missing pieces are addressability (typed child handles, steer-by-taskId on the sub-agent manager) and a reasoner-facing `SteerSubAgent` tool. The chain: user speaks, talker emits `<steer>`, reasoner receives it, reasoner calls `SteerSubAgent(taskId, message)`, child's queue drains at its next turn boundary.
+The reasoner must be able to steer a running sub-agent. Children are full AgentLoops and already have steering queues; the missing pieces are addressability (typed child handles, steer-by-taskId on the sub-agent manager) and a reasoner-facing `SteerSubAgent` tool. The chain: user speaks, talker calls `steer_task`, facade delivers to the reasoner, reasoner calls `SteerSubAgent(taskId, message)`, child's queue drains at its next turn boundary.
 
 ## D13: Quick Lookups Are Facade-Spawned, Log-Mediated
 

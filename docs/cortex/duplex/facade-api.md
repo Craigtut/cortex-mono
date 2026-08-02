@@ -12,7 +12,8 @@ const agent = await CortexAgent.create({
   mode: 'duplex',              // default; 'passthrough' opts out
   talker: {                    // optional overrides, all have defaults
     model,                     // default: fast tier resolved from the primary provider
-    // tools intentionally absent by default (decisions.md D5)
+    // toolset is the fixed control tools only (decisions.md D5/D8);
+    // consumer tools never route here
   },
   idleSignal,                  // consumer callback: is the user/channel idle? (wake policy)
 });

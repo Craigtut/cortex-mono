@@ -8,7 +8,7 @@ The restructure was motivated by a voice-driven consumer, but the responsiveness
 
 ## The One-Paragraph Version
 
-Consumers interact with one `CortexAgent`. Internally it runs two instances of the loop primitive (renamed `AgentLoop`): a talker with zero tools and a fast model that always has the floor, and a reasoner (today's full agent, unchanged in capability) that does all real work and spawns sub-agents for parallel or long tasks. The two loops never call tools to talk to each other. The talker delegates by emitting in-band directives in its text stream; the reasoner's progress and results flow back through an append-only session log that the facade routes into each loop as ordinary messages or as ephemeral status injections. A wake policy decides when a finished piece of work interrupts the conversation, waits for a lull, or stays silent.
+Consumers interact with one `CortexAgent`. Internally it runs two instances of the loop primitive (renamed `AgentLoop`): a talker with a fast model and no blocking tools that always has the floor, and a reasoner (today's full agent, unchanged in capability) that does all real work and spawns sub-agents for parallel or long tasks. The talker delegates through five fire-and-forget control tools (spawn, steer, cancel, answer, lookup) that dispatch locally in under a millisecond and skip the follow-up LLM call; the reasoner's progress and results flow back through an append-only session log that the facade routes into each loop as ordinary messages or as ephemeral status injections. A wake policy decides when a finished piece of work interrupts the conversation, waits for a lull, or stays silent.
 
 ## Documents
 
@@ -28,7 +28,7 @@ The architecture follows the pattern the industry converged on during 2025-2026:
 
 - **Thinking Machines interaction models** (2026-05): a time-aware interaction model plus an asynchronous background model; delegation sends the full conversation, not a paraphrased query; results stream back and the interaction model chooses the moment to surface them.
 - **Talker-Reasoner** (DeepMind, 2024) and successors (Ping-Ponder, SIGDIAL 2026): two loops interacting only through shared memory, with the fast loop reading latest-available state and tolerating staleness.
-- **MoshiRAG** (Kyutai, ICML 2026) and **DuplexOmni** (2026): delegation as a control token in the output stream, not a blocking call.
+- **OpenAI Realtime, Gemini Live, LiveKit, Pipecat**: at the API layer, the fast loop's control surface is non-blocking tool calls (AsyncFC formalizes the fire-and-forget contract), which is the pattern adopted here for the talker's control tools.
 - **Gemini Live API**: the `INTERRUPT` / `WHEN_IDLE` / `SILENT` result-scheduling vocabulary, adopted here as the wake policy.
 - **OpenAI Realtime API**: the documented pending-result hallucination failure mode, addressed here by grounding rules on the talker.
 
