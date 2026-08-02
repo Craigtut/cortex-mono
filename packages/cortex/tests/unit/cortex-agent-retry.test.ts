@@ -355,3 +355,124 @@ describe('CortexAgent background retry', () => {
     expect(errored.mock.calls[0][0].category).toBe('cancelled');
   });
 });
+
+describe('CortexAgent abort-stub trim', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function lastMessage(mock: RetryMockAgent): { role?: string; stopReason?: string } {
+    return (mock.state.messages[mock.state.messages.length - 1] ?? {}) as {
+      role?: string;
+      stopReason?: string;
+    };
+  }
+
+  it('trims the aborted assistant stub left by an abort mid-turn', async () => {
+    // Same settlement choreography as the resurrect test: abort() lands
+    // while the turn is in flight, and pi appends its synthetic failure stub.
+    const mock = createRetryMock(['fail', 'ok']);
+    let releasePrompt: (() => void) | null = null;
+    let idleResolve: (() => void) | null = null;
+    const basePrompt = mock.prompt.bind(mock);
+    mock.prompt = async (input: string): Promise<unknown> => {
+      await new Promise<void>((resolve) => { releasePrompt = resolve; });
+      const result = await basePrompt(input);
+      idleResolve?.();
+      idleResolve = null;
+      return result;
+    };
+    mock.waitForIdle = (): Promise<void> => new Promise<void>((resolve) => {
+      idleResolve = resolve;
+    });
+    mock.abort = (): void => {
+      mock.abortCalled = true;
+      releasePrompt?.();
+      releasePrompt = null;
+    };
+
+    const agent = build(mock, createConfig());
+    const turn = agent.prompt('hi').catch(() => 'rejected');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await agent.abort();
+    expect(await turn).toBe('rejected');
+
+    // The synthetic failure stub is gone; history ends on the user message.
+    expect(lastMessage(mock).role).toBe('user');
+  });
+
+  it('trims a cleanly-aborted stub when the run resolves without an error state', async () => {
+    // Abort mid-stream without a throw: pi records a stopReason 'aborted'
+    // message (no errorMessage) and prompt() resolves normally.
+    const mock = createRetryMock([]);
+    let releasePrompt: (() => void) | null = null;
+    let idleResolve: (() => void) | null = null;
+    mock.prompt = async (input: string): Promise<unknown> => {
+      mock.promptCalls += 1;
+      mock.state.errorMessage = undefined;
+      mock.state.messages.push({ role: 'user', content: input } as never);
+      await new Promise<void>((resolve) => { releasePrompt = resolve; });
+      mock.state.messages.push({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'partial answer' }],
+        stopReason: 'aborted',
+      } as never);
+      idleResolve?.();
+      idleResolve = null;
+      return undefined;
+    };
+    mock.waitForIdle = (): Promise<void> => new Promise<void>((resolve) => {
+      idleResolve = resolve;
+    });
+    mock.abort = (): void => {
+      mock.abortCalled = true;
+      releasePrompt?.();
+      releasePrompt = null;
+    };
+
+    const agent = build(mock, createConfig());
+    const turn = agent.prompt('hi');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await agent.abort();
+    await turn;
+
+    expect(lastMessage(mock).role).toBe('user');
+  });
+
+  it('leaves no failure stub behind when aborted during the backoff wait', async () => {
+    const mock = createRetryMock(['fail', 'ok']);
+    const agent = build(
+      mock,
+      createConfig({ retryPolicy: { backoffMs: [1000], maxBackoffMs: 1000, maxAttempts: 3 } }),
+    );
+    agent.onRetryScheduled(() => {
+      void agent.abort();
+    });
+
+    await agent.prompt('hi').catch(() => {});
+
+    expect(lastMessage(mock).role).toBe('user');
+  });
+
+  it('keeps the failure stub for a surfaced non-abort failure', async () => {
+    // Retry disabled: the network failure surfaces immediately, un-aborted.
+    // Its stub is diagnostic state the consumer may inspect; only aborts trim.
+    const mock = createRetryMock(['fail', 'ok']);
+    const agent = build(mock, createConfig({ retryPolicy: { enabled: false } }));
+
+    await expect(agent.prompt('hi')).rejects.toThrow();
+
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'error' });
+  });
+
+  it('does not trim a normal successful turn', async () => {
+    const mock = createRetryMock(['ok']);
+    const agent = build(mock, createConfig());
+
+    await agent.prompt('hi');
+
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'end_turn' });
+  });
+});

@@ -1066,6 +1066,15 @@ export class CortexAgent {
           throw new Error(String(stateError));
         }
 
+        // An abort can end the run cleanly: the stream returns a message with
+        // stopReason 'aborted' (no error state) and prompt() resolves. Trim
+        // the aborted assistant stub so it does not linger in history and get
+        // rewritten to "(no output)" on a later turn. No-op when the last
+        // message is a normal assistant turn.
+        if (this.isAborted()) {
+          this.trimTrailingFailureMessages();
+        }
+
         if (retryIndex > 0) {
           this.fireRetrySucceeded({ attempts: retryIndex });
         }
@@ -1109,6 +1118,13 @@ export class CortexAgent {
           ) {
             this.fireRetryExhausted({ attempts: retryIndex, category: classified.category });
           }
+          // A user abort is a cancellation, not a failure to keep: remove the
+          // aborted assistant stub pi appended, exactly as the retry path
+          // does, so it cannot linger in history and later be rewritten to
+          // "(no output)". Non-abort failures keep their stub (unchanged).
+          if (aborted) {
+            this.trimTrailingFailureMessages();
+          }
           this.emitError(error, aborted);
           throw error;
         }
@@ -1139,7 +1155,10 @@ export class CortexAgent {
           // Aborted during the wait: surface as cancelled, do not retry. Throw a
           // fresh AbortError rather than the original transient failure so the
           // consumer's catch sees a cancellation (matching the in-run abort
-          // path) instead of a stale network/rate-limit message.
+          // path) instead of a stale network/rate-limit message. The synthetic
+          // failure stub that was awaiting this retry is trimmed like any
+          // other aborted turn.
+          this.trimTrailingFailureMessages();
           this.emitError(error, true);
           const abortErr = new Error('Prompt aborted during retry backoff');
           abortErr.name = 'AbortError';
