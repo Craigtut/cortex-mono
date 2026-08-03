@@ -222,6 +222,12 @@ export class SubAgentManager {
    * non-run task), where an accepted redirect would be destroyed with the
    * child moments later while the caller was told it landed.
    *
+   * The gate narrows that lie but does not close it: pi's last steering
+   * poll of a run precedes its decision to stop, so a message queued
+   * after the final poll (a near-run-end race this check cannot see) is
+   * never polled and dies with the child even though 'steered' was
+   * returned. 'steered' means queued into a live run, not consumed.
+   *
    * @returns 'steered' when the redirect was queued into the child's
    *   in-flight run; null when the task is not active, no run is in
    *   flight, or the child is already tearing down.

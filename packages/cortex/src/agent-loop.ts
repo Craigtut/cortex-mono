@@ -5829,6 +5829,14 @@ export class AgentLoop {
    * the end-of-cycle drain after its run ended): a redirect accepted in
    * those windows is never polled again and dies with the child, so it is
    * reported undeliverable and the caller decides how to re-route it.
+   *
+   * True means queued into a live run, not consumed: pi's last steering
+   * poll of a run precedes its decision to stop, so a message queued after
+   * that final poll (a near-run-end race the parent cannot detect) is
+   * never polled and dies with the child. The in-flight gate narrows the
+   * lost window to the tail of the final turn; it does not close it. A
+   * caller that cannot afford to lose the redirect should confirm the
+   * child acted on it rather than treat true as delivery.
    */
   steerSubAgent(taskId: string, message: string): boolean {
     const outcome = this.subAgentManager.steer(taskId, message);

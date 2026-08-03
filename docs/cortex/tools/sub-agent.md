@@ -89,6 +89,8 @@ Sub-agents share the parent's:
 
 `steerSubAgent(taskId, message)` on the parent agent redirects a running sub-agent by task ID. It rides the child's public steering queue: the message lands at the next turn boundary of the child's in-flight run. Returns `false` when the task ID is not an active sub-agent, the child is already tearing down, or no run is actually in flight on the child (not started yet, the settle window after its run ended, or the child's end-of-cycle drain): a redirect accepted in those windows is never polled again and would die silently with the child. A `false` return means the redirect was NOT delivered; the caller decides whether to re-route it (for example, into the next spawn or as parent context).
 
+A `true` return means the message was queued into a live run, not that the child consumed it. One residual window stays open: pi makes its last steering poll of a run before deciding the run is over, so a message queued after that final poll (a near-run-end race the parent cannot detect) is never polled and dies with the child. The in-flight gate narrows the lost window to the tail of the final turn; it does not close it. A caller that cannot afford to lose the redirect should confirm the child acted on it (in its result or events) rather than treat `true` as a delivery guarantee.
+
 Tracked entries also expose a typed handle (`TrackedSubAgent.agent: SubAgentHandle`) with the delivery, teardown, and live-usage surface, so orchestration layers no longer cast an `unknown`.
 
 Consumers may define their own command patterns for interacting with running sub-agents (e.g., decision types that trigger steering with new context).
