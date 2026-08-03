@@ -34,11 +34,14 @@ Wake class is the primary axis, loop state the secondary one. Silent never steer
 | Wake | Loop state | Action |
 |---|---|---|
 | wake | idle | prompt (starts a turn; the caller's promise is that turn) |
-| wake | gate held by a **run-bearing** task (running, queued, retry backoff, drain with work) | steer (lands at the next turn boundary) |
-| wake | gate held by a **non-run-bearing** task (`digestIdle`, an empty drain, a cycle that threw at dequeue) | steer, then enqueue a follow-up task that starts a run if pi's queue is still non-empty |
-| `silent` | any | loop-owned queue, flushed as leading messages of the next real prompt |
+| wake | gate held (any holder) | append to the loop-owned wake queue and enqueue a sweep task that starts a run if the content is still parked when it fires |
+| `silent` | any | loop-owned silent queue, flushed as leading messages of the next real prompt |
 
-**Not every gate holder drains pi's steering queue.** The obvious implementation steers whenever the gate is held, on the premise that some run will pick the message up. `digestIdle` breaks that premise: it holds the gate and calls the transform hook directly without starting a pi run, so a steer parked there waits for an unrelated later run, which may be a background drain. The caller is told the message was steered when there is no in-flight turn to carry it. Since the facade digests precisely during idle windows, and idle windows are when deliveries arrive, this is the common path rather than a corner. Gate-held is therefore two states, not one.
+**Cortex owns wake parking; pi's steering queue is only ever used by the public `steer()` API.** The obvious implementation hands wake content to pi's steering queue and reconciles afterwards, on the premise that some run will drain it. Two things defeat that. First, not every gate holder starts a run: `digestIdle` holds the gate and calls the transform hook directly, so content parked there waits for an unrelated later run, possibly a background drain. Second, and worse, pi's queue is opaque: you cannot inspect it, remove a single entry, or learn that one particular item was drained. Any after-the-fact reconciliation has to approximate, and every approximation leaks. A "was anything left queued" check duplicates already-drained content whenever a second delivery parks behind it, and clearing the queue to avoid that destroys content the public `steer()` API parked.
+
+So both wake and silent content live in loop-owned queues and are spliced into the front of the next run's message batch, which is exact by construction. They differ in one respect only: wake content enqueues a sweep so a run happens even if nothing else would start one; silent content waits for a real prompt.
+
+The accepted cost is that a wake delivery arriving during a live run lands at the start of the next run rather than at the current run's next turn boundary. That is a bounded one-turn delay, and the talker's turns are short by design (capped output, no blocking tools). Exactness is worth more than the latency here, because the failure it removes is duplicated or destroyed conversation content.
 
 **Silent must never reach pi's steering queue, including while a run is live.** After a terminated tool batch, `runLoop` still polls `getSteeringMessages()` and continues the inner loop if anything is queued. A silent delivery parked there during a talker turn would drain immediately after the control-tool batch and produce an unprompted spoken response to content that was supposed to surface only when relevant. Steering silent content into a running turn is the same mistake wearing a different hat: it lands at that run's next turn boundary and gets acted on, which is a wake by another name.
 
