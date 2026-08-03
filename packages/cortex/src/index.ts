@@ -145,7 +145,15 @@ export { BudgetGuard } from './budget-guard.js';
 
 // AgentLoop (Phase 1B)
 export { AgentLoop, MINIMUM_CONTEXT_WINDOW, TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop.js';
-export type { PiAgent, PiModel, DirectCompletionOptions } from './agent-loop.js';
+export type {
+  PiAgent,
+  PiModel,
+  DirectCompletionOptions,
+  DeliverOptions,
+  DeliverOutcome,
+  DeliverResult,
+  QueueDrainMode,
+} from './agent-loop.js';
 
 // Tool Contracts
 export { fromPiAgentTool, assertValidCortexTool } from './tool-contract.js';

@@ -125,7 +125,13 @@ import { processToolResult } from './tool-result-persistence.js';
  * passed at construction time.
  */
 export interface PiAgent extends AgentStateAccessor, PiEventSource {
-  prompt(input: string, options?: {
+  /**
+   * Start a new run. Accepts either a plain prompt string or a prepared batch
+   * of messages (pi pushes every batch message into the transcript at run
+   * start); Cortex uses the batch form to flush queued silent deliveries
+   * ahead of the real prompt.
+   */
+  prompt(input: string | AgentMessage[], options?: {
     update?: (event: unknown) => void;
     signal?: AbortSignal;
   }): Promise<unknown>;
@@ -147,10 +153,32 @@ export interface PiAgent extends AgentStateAccessor, PiEventSource {
   steer(message: { role: string; content: string }): void;
 
   /**
+   * Queue a message that pi injects only at a would-stop point: after the
+   * model has produced what would otherwise be the run's final answer.
+   * Optional because older test doubles predate it; the real pi Agent
+   * always has it.
+   */
+  followUp?(message: { role: string; content: string }): void;
+
+  /** Drain mode of pi's steering queue ('all' | 'one-at-a-time'). */
+  steeringMode?: string;
+  /** Drain mode of pi's follow-up queue ('all' | 'one-at-a-time'). */
+  followUpMode?: string;
+  /** Remove all queued steering messages. */
+  clearSteeringQueue?(): void;
+  /** Remove all queued follow-up messages. */
+  clearFollowUpQueue?(): void;
+  /** True when pi's steering or follow-up queue still holds messages. */
+  hasQueuedMessages?(): boolean;
+
+  /**
    * Context transformation hook installed by Cortex.
    */
   transformContext?: (messages: unknown[]) => Promise<unknown[]>;
 }
+
+/** Drain mode for pi's steering and follow-up queues. */
+export type QueueDrainMode = 'all' | 'one-at-a-time';
 
 /**
  * Minimal Model interface matching pi-ai's Model type.
@@ -362,6 +390,45 @@ export interface DirectCompletionOptions {
   signal?: AbortSignal;
 }
 
+/** Options for {@link AgentLoop.deliver}. */
+export interface DeliverOptions {
+  /**
+   * Whether the delivery may wake an idle loop by starting a turn. Default
+   * true. When false and the loop is idle, the content is queued on the
+   * AgentLoop itself and flushed into the next real prompt's message batch;
+   * it never starts a run and never enters pi's steering queue (which would
+   * drain into whatever run starts next and produce an unprompted response).
+   */
+  wake?: boolean;
+}
+
+/** Which branch of the deliver() state machine handled a delivery. */
+export type DeliverOutcome = 'prompted' | 'steered' | 'queued';
+
+/** Result of {@link AgentLoop.deliver}. */
+export interface DeliverResult {
+  outcome: DeliverOutcome;
+  /**
+   * Present only for 'prompted': the promise of the turn this delivery
+   * started (the same promise prompt() would return). A 'steered' delivery
+   * extends the turn already in flight instead: it inherits that turn's
+   * budget window, retry window, and the consumer promise held by whoever
+   * started it, so no separate promise exists. A 'queued' delivery has no
+   * turn at all until the next real prompt flushes it.
+   */
+  turn?: Promise<unknown>;
+}
+
+/**
+ * A silent (no-wake) delivery held by the loop until the next real prompt.
+ * Facade-owned queue semantics from docs/cortex/duplex/log-and-context.md:
+ * the content must not sit in pi's steering queue while the loop can run.
+ */
+interface QueuedSilentDelivery {
+  content: string;
+  timestamp: number;
+}
+
 /**
  * A background task that finished while the agent was busy and must be
  * delivered to the loop once it goes idle. Either a sub-agent (carries its
@@ -548,6 +615,13 @@ export class AgentLoop {
   private backgroundResultDeadLetterHandlers: Array<(result: DeadLetteredBackgroundResult) => void> = [];
   private pendingBackgroundResults: PendingBackgroundCompletion[] = [];
   private deadLetteredBackgroundResults: DeadLetteredBackgroundResult[] = [];
+
+  // Silent (no-wake) deliveries held by the loop itself until the next real
+  // prompt flushes them into that prompt's message batch. Deliberately NOT
+  // pi's steering queue: pi polls steering at run start and after every tool
+  // batch (including terminated ones), so content parked there while a run
+  // can start would drain immediately and be answered unprompted.
+  private queuedSilentDeliveries: QueuedSilentDelivery[] = [];
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -1045,6 +1119,15 @@ export class AgentLoop {
     const effectiveRetention = options?.cacheRetention ?? this._cacheRetention;
     this._activePromptCacheRetention = effectiveRetention ?? null;
 
+    // Flush queued silent deliveries into this prompt's message batch. Only
+    // real prompts flush (never drain-started delivery runs): the queue's
+    // contract is "available in context at the next real prompt", and the
+    // drain's failure unwind counts messages from its own pre-delivery
+    // boundary, which flushed extras would corrupt. Taken AFTER the abort
+    // check above so a turn cancelled before it started leaves the queue
+    // intact for the next prompt.
+    const silentBatch = fromDrain ? [] : this.queuedSilentDeliveries.splice(0);
+
     this.toolRuntime.resetForLoop();
     // Budget limits cover the whole logical turn: reset here (once per
     // prompt) instead of on loop_start, which pi-agent-core emits again for
@@ -1080,7 +1163,7 @@ export class AgentLoop {
 
     let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
     try {
-      return await this.runTurnWithRetry(input, fromDrain, retryPolicyOverride);
+      return await this.runTurnWithRetry(input, fromDrain, retryPolicyOverride, silentBatch);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       promptStatus = this.isAborted() ? 'cancelled' : 'rejected';
@@ -1145,16 +1228,32 @@ export class AgentLoop {
     input: string,
     fromDrain = false,
     retryPolicyOverride?: RetryPolicy,
+    silentBatch: QueuedSilentDelivery[] = [],
   ): Promise<unknown> {
     const policy = retryPolicyOverride ?? this.retryPolicy;
     let retryIndex = 0;
     let firstFailureAt: number | undefined;
 
+    // Queued silent deliveries ride ahead of the prompt in one message
+    // batch; pi pushes every batch message into the transcript at run start,
+    // so after the first attempt they are durable history and retries
+    // (continue()) see them without re-sending.
+    const promptInput: string | AgentMessage[] = silentBatch.length > 0
+      ? [
+          ...silentBatch.map((item): AgentMessage => ({
+            role: 'user',
+            content: item.content,
+            timestamp: item.timestamp,
+          })),
+          { role: 'user', content: input, timestamp: Date.now() },
+        ]
+      : input;
+
     // Resolves to the turn result, or throws after onError has been emitted.
     for (;;) {
       try {
         const result =
-          retryIndex === 0 ? await this.agent.prompt(input) : await this.agent.continue();
+          retryIndex === 0 ? await this.agent.prompt(promptInput) : await this.agent.continue();
 
         // Pi-agent-core catches streaming/provider errors internally and stores
         // them in state.errorMessage without re-throwing. Surface these so
@@ -1468,6 +1567,138 @@ export class AgentLoop {
     // loop start) instead of being silently dropped.
     if (!this._isPrompting && this.loopGateDepth === 0) return;
     this.agent.steer({ role: 'user', content: message });
+  }
+
+  /**
+   * Deliver a message to this loop regardless of its run state. The delivery
+   * primitive behind facade routing (docs/cortex/duplex/log-and-context.md):
+   * a state machine over (loop-gate depth, pi run state, abort state) with
+   * three actions:
+   *
+   * - `wake: false` (silent class), in EVERY run state: queue on the
+   *   AgentLoop itself, flushed into the next real prompt's message batch.
+   *   Never pi's steering queue: during a live run pi polls steering after
+   *   every tool batch (including terminated ones) and continues the loop if
+   *   anything is queued, and while idle a queued steer drains into whatever
+   *   run starts next (including a background-completion delivery). Either
+   *   way silent content would surface as an unprompted response.
+   * - Wake wanted, gate held (a turn is running, queued, in retry backoff,
+   *   or in the end-of-cycle drain window): steer. Pi polls its steering
+   *   queue at run start and at every turn boundary within a run, so the
+   *   message lands inside the SAME logical turn and inherits that turn's
+   *   budget window, retry window, and consumer promise.
+   * - Wake wanted, idle: start a turn with this content as the prompt; the
+   *   returned `turn` promise settles with it.
+   *
+   * The branch decision and its action happen in one synchronous frame, so
+   * there is no time-of-check race against prompt() (which throws whenever
+   * the gate is held): nothing can acquire the gate between the depth check
+   * and the action taken here.
+   *
+   * Queued silent deliveries are dropped on destroy(); a facade that needs
+   * them durable should drain them into its own state before teardown (see
+   * {@link clearQueuedDeliveries}).
+   *
+   * @param content - Non-whitespace message content (user role)
+   * @param options - Wake behavior; default wakes an idle loop
+   */
+  deliver(content: string, options?: DeliverOptions): DeliverResult {
+    this.assertNotShuttingDown();
+    if (typeof content !== 'string' || content.trim().length === 0) {
+      // Whitespace-only content is silently dropped at provider conversion,
+      // which would turn a "delivered" message into nothing. Fail loudly.
+      throw new Error('deliver() requires non-whitespace string content');
+    }
+    const wake = options?.wake ?? true;
+
+    if (!wake) {
+      // Silent class queues in EVERY run state. Steering it into a live run
+      // would surface it at the next tool-batch boundary (pi continues the
+      // inner loop whenever steering is non-empty, even after a terminated
+      // batch), which is exactly the unprompted response silent forbids.
+      this.queuedSilentDeliveries.push({ content, timestamp: Date.now() });
+      this.logger.debug('silent delivery queued', {
+        queued: this.queuedSilentDeliveries.length,
+      });
+      return { outcome: 'queued' };
+    }
+
+    if (this.loopGateDepth > 0) {
+      // Covers both "pi running" and "gate held but pi idle" (retry backoff,
+      // drain window): in every gate-held state the steering queue is
+      // drained by the current logical turn or the queued cycle about to
+      // start, so the message extends that turn rather than starting one.
+      this.agent.steer({ role: 'user', content });
+      return { outcome: 'steered' };
+    }
+
+    // Idle + wake: the gate is empty in this same synchronous frame, so
+    // prompt() cannot fail fast on a held gate. Attach a no-op rejection
+    // handler so a fire-and-forget caller never produces an unhandled
+    // rejection; callers that await result.turn still observe the rejection,
+    // and failures surface through onError regardless.
+    const turn = this.prompt(content);
+    turn.catch(() => {});
+    return { outcome: 'prompted', turn };
+  }
+
+  /**
+   * Queue a follow-up message on pi's follow-up queue. Unlike steer(), which
+   * lands at the next turn boundary inside the current run, a follow-up
+   * drains only at a would-stop point: after the model has produced what
+   * would otherwise be the run's final answer, the loop continues with the
+   * queued message instead of stopping. Queued while idle, it drains at the
+   * end of the next run.
+   */
+  followUp(message: string): void {
+    if (!this.agent.followUp) {
+      throw new Error('The underlying agent does not expose followUp()');
+    }
+    this.agent.followUp({ role: 'user', content: message });
+  }
+
+  /** Set how pi drains queued steering messages. */
+  setSteeringQueueMode(mode: QueueDrainMode): void {
+    this.agent.steeringMode = mode;
+  }
+
+  /** Set how pi drains queued follow-up messages. */
+  setFollowUpQueueMode(mode: QueueDrainMode): void {
+    this.agent.followUpMode = mode;
+  }
+
+  /** Remove all queued steering messages from pi's steering queue. */
+  clearSteeringQueue(): void {
+    this.agent.clearSteeringQueue?.();
+  }
+
+  /** Remove all queued follow-up messages from pi's follow-up queue. */
+  clearFollowUpQueue(): void {
+    this.agent.clearFollowUpQueue?.();
+  }
+
+  /**
+   * Remove every queued message: pi's steering and follow-up queues plus
+   * this loop's silent delivery queue. Returns the silent deliveries that
+   * were dropped so a caller can re-route or persist them.
+   */
+  clearAllQueues(): string[] {
+    this.clearSteeringQueue();
+    this.clearFollowUpQueue();
+    return this.clearQueuedDeliveries();
+  }
+
+  /** Number of silent deliveries waiting for the next real prompt. */
+  get queuedDeliveryCount(): number {
+    return this.queuedSilentDeliveries.length;
+  }
+
+  /**
+   * Drop all queued silent deliveries, returning their content in queue
+   * order so the caller can re-route or persist them.
+   */
+  clearQueuedDeliveries(): string[] {
+    return this.queuedSilentDeliveries.splice(0).map((item) => item.content);
   }
 
   /**
@@ -4456,6 +4687,9 @@ export class AgentLoop {
     this.backgroundResultDeliveryHandlers = [];
     this.backgroundResultDeadLetterHandlers = [];
     this.pendingBackgroundResults = [];
+    // Queued silent deliveries are dropped on destroy by contract; a facade
+    // that needs them durable drains them first via clearQueuedDeliveries().
+    this.queuedSilentDeliveries = [];
     // deadLetteredBackgroundResults is deliberately NOT cleared: it is the
     // consumer's bounded post-mortem record of undelivered completed work,
     // and getDeadLetteredBackgroundResults() must still answer after
