@@ -578,13 +578,17 @@ export class CompactionManager {
   /**
    * Run pending observation buffering outside a prompt (see
    * ObservationalMemoryEngine.digestPendingBuffers). No-op under the
-   * classic strategy. Returns true when an observer call ran.
+   * classic strategy. Returns true when an observer call ran to completion;
+   * false also covers a wait that hit `observerTimeoutMs` (the digestion
+   * gives the gate back rather than blocking on a hung utility request).
    */
   async digestPendingObservationBuffers(
     messages: AgentMessage[],
     slotCount: number,
+    observerTimeoutMs?: number,
   ): Promise<boolean> {
-    return this.observationalEngine?.digestPendingBuffers(messages, slotCount) ?? false;
+    return this.observationalEngine?.digestPendingBuffers(messages, slotCount, observerTimeoutMs)
+      ?? false;
   }
 
   /**

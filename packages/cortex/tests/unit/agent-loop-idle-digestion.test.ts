@@ -215,6 +215,30 @@ describe('digestIdle (classic)', () => {
   });
 });
 
+describe('digestIdle observer wait bound', () => {
+  it('times out a hung observer call instead of wedging the loop gate', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    // A hung provider request: the utility completion never settles.
+    const complete = vi.fn(() => new Promise<string>(() => {}));
+    loop.getCompactionManager().setObservationalCompleteFn(complete as unknown as CompleteFn);
+    seedHistory(piAgent);
+
+    // Unbounded, this await never resolves: prompt() then throws forever
+    // and wake deliveries wait behind the wedged gate.
+    const result = await loop.digestIdle({ observerTimeoutMs: 50 });
+
+    expect(result.observerRan).toBe(false);
+    expect(complete).toHaveBeenCalledTimes(1);
+    // The gate is free again: a real prompt can run.
+    await waitUntil(() => !loop.isLoopActive);
+    await loop.prompt('after the timeout');
+    expect(piAgent.promptCalls.some(
+      (call) => typeof call === 'string' && call.includes('after the timeout'),
+    )).toBe(true);
+  });
+});
+
 describe('digestIdle gate serialization', () => {
   it('waits for a running turn instead of racing its history mutations', async () => {
     const piAgent = createMockPiAgent();

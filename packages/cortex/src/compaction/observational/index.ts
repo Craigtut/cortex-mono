@@ -65,6 +65,14 @@ export type {
 // ---------------------------------------------------------------------------
 
 /**
+ * Default wall-clock budget for idle digestion's observer waits. Idle
+ * digestion holds the caller's loop gate, so waiting on a hung utility
+ * request must be bounded; a healthy observer call settles well inside
+ * this. Overridable per call (digestIdle's observerTimeoutMs).
+ */
+export const DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS = 60_000;
+
+/**
  * Rehydrate buffered chunks loaded from persistence. `createdAt` survives
  * JSON serialization as an ISO string; convert it back to a `Date` so the
  * in-memory shape matches {@link ObservationChunk}.
@@ -425,16 +433,32 @@ export class ObservationalMemoryEngine {
    * an explicit digestion pass) is a cheap chunk merge. This is the
    * primitive behind "digest during idle windows".
    *
+   * Both waits are bounded by `timeoutMs` (a single wall-clock budget for
+   * the whole call): callers hold the loop gate while digesting, so a hung
+   * utility request must time the digestion out rather than wedge the gate.
+   * A timed-out observer stays in flight and lands its chunk whenever it
+   * settles; only the waiting is abandoned.
+   *
    * @param messages - The full message array (slot messages included)
    * @param slotCount - Number of slot messages to skip
-   * @returns true when an observer call ran during this digestion
+   * @param timeoutMs - Wall-clock budget for observer waits (default 60s)
+   * @returns true when an observer call ran to completion in this digestion
    */
-  async digestPendingBuffers(messages: AgentMessage[], slotCount: number): Promise<boolean> {
+  async digestPendingBuffers(
+    messages: AgentMessage[],
+    slotCount: number,
+    timeoutMs: number = DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS,
+  ): Promise<boolean> {
     if (!this.completeFn) return false;
+    const deadline = Date.now() + timeoutMs;
 
     // Let an already-running observer finish and record its chunk, so the
-    // tail computed below starts at the settled watermark.
-    await this.buffering.waitForObserverSettled();
+    // tail computed below starts at the settled watermark. On timeout,
+    // skip launching a second observer behind a hung one.
+    if (!(await this.buffering.waitForObserverSettledWithin(timeoutMs))) {
+      this.logger?.warn('Idle digestion timed out waiting for the in-flight observer');
+      return false;
+    }
 
     const history = messages.slice(slotCount);
     const watermark = this.buffering.getWatermark();
@@ -459,7 +483,15 @@ export class ObservationalMemoryEngine {
       this.buildObserverConfig(),
       this.logger ?? undefined,
     );
-    await this.buffering.waitForObserverSettled();
+    if (!this.buffering.isObserverInFlight()) {
+      // launchObserver declined (the coordinator was aborted): no observer
+      // ran, so do not report one.
+      return false;
+    }
+    if (!(await this.buffering.waitForObserverSettledWithin(deadline - Date.now()))) {
+      this.logger?.warn('Idle digestion timed out waiting for its observer call');
+      return false;
+    }
     return true;
   }
 

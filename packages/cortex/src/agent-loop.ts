@@ -466,9 +466,24 @@ interface QueuedSilentDelivery {
   timestamp: number;
 }
 
+/** Options for {@link AgentLoop.digestIdle}. */
+export interface IdleDigestionOptions {
+  /**
+   * Wall-clock budget for the digestion's observer waits (default 60s).
+   * Idle digestion holds the loop gate, so a hung utility request must time
+   * the digestion out (observerRan: false, the observer left in flight)
+   * rather than wedge the gate: while the gate is wedged, prompt() fails
+   * fast and wake deliveries wait on the sweep behind it.
+   */
+  observerTimeoutMs?: number;
+}
+
 /** Result of {@link AgentLoop.digestIdle}. */
 export interface IdleDigestionResult {
-  /** Whether an observer call ran to buffer unobserved history. */
+  /**
+   * Whether an observer call ran to completion to buffer unobserved
+   * history. False also covers a wait abandoned at observerTimeoutMs.
+   */
   observerRan: boolean;
   /**
    * Whether the threshold pass changed the durable history (observation
@@ -4059,9 +4074,11 @@ export class AgentLoop {
    * Serialized through the loop gate, so it can never race a running
    * turn's history mutations; called while a turn is active, it runs after
    * that turn finishes. prompt() fails fast while digestion holds the gate
-   * (deliver() steers or queues as usual).
+   * (deliver() steers or queues as usual). The observer waits are bounded
+   * (options.observerTimeoutMs, default 60s) so a hung utility request
+   * times the digestion out instead of wedging the gate.
    */
-  async digestIdle(): Promise<IdleDigestionResult> {
+  async digestIdle(options?: IdleDigestionOptions): Promise<IdleDigestionResult> {
     this.assertNotShuttingDown();
     return this.enqueueLoopTask(async () => {
       if (this.isShuttingDown()) {
@@ -4076,6 +4093,7 @@ export class AgentLoop {
         observerRan = await this.compactionManager.digestPendingObservationBuffers(
           this.agent.state.messages,
           this.contextManager.slotCount,
+          options?.observerTimeoutMs,
         );
       }
 

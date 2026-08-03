@@ -416,6 +416,25 @@ describe('ObservationalMemoryEngine', () => {
   // Tests: misc
   // -------------------------------------------------------------------------
 
+  describe('digestPendingBuffers', () => {
+    it('reports false when the coordinator is aborted and no observer launches', async () => {
+      const engine = new ObservationalMemoryEngine({ bufferMinTokens: 10 }, 0);
+      const mockComplete = vi.fn<CompleteFn>().mockResolvedValue(OBSERVER_OUTPUT);
+      engine.setCompleteFn(mockComplete);
+      engine.abort();
+
+      // launchObserver declines on the aborted coordinator, so no observer
+      // ran; reporting true here would be a false positive to digestIdle.
+      const ran = await engine.digestPendingBuffers(
+        [userMsg('long enough content '.repeat(50))],
+        0,
+      );
+
+      expect(ran).toBe(false);
+      expect(mockComplete).not.toHaveBeenCalled();
+    });
+  });
+
   describe('miscellaneous', () => {
     it('hasRecall returns false when not configured', () => {
       const engine = new ObservationalMemoryEngine({}, 0);

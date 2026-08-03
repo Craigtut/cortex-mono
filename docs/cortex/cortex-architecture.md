@@ -220,7 +220,7 @@ Both strategies preserve context slots untouched and use Layer 3 emergency trunc
 Two controls exist for latency-sensitive loops:
 
 - **Non-blocking posture** (`compaction.nonBlocking: true`): no synchronous LLM call may run inside `transformContext`. Observational activation still consumes already-buffered chunks (instant), but the forced synchronous observer, the pre-truncation catch-up observation, and inline reflection are skipped (reflection swaps in a buffered result or launches asynchronously); under the classic strategy, in-band L2 summarization is skipped. Emergency truncation remains the only blocking in-band path.
-- **Idle digestion** (`digestIdle()`): runs pending observation buffering plus the threshold pass (activation, reflection, and classic summarization) OUTSIDE a prompt, with blocking work explicitly allowed even under the non-blocking posture. Serialized through the loop gate, so it can never race a running turn; an owner schedules it during idle windows so the multi-second calls happen while nobody is waiting.
+- **Idle digestion** (`digestIdle()`): runs pending observation buffering plus the threshold pass (activation, reflection, and classic summarization) OUTSIDE a prompt, with blocking work explicitly allowed even under the non-blocking posture. Serialized through the loop gate, so it can never race a running turn; an owner schedules it during idle windows so the multi-second calls happen while nobody is waiting. The observer waits are bounded (`observerTimeoutMs`, default 60s): a hung utility request times the digestion out (`observerRan: false`, the observer left in flight) instead of wedging the gate, which would otherwise make `prompt()` throw indefinitely and park deliveries.
 
 ### Skill System
 

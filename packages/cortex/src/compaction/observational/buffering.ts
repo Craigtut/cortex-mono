@@ -411,6 +411,35 @@ export class BufferingCoordinator {
   }
 
   /**
+   * Like {@link waitForObserverSettled}, but bounded by a wall clock:
+   * resolves false when the in-flight observer has not settled within
+   * `timeoutMs`. The observer stays in flight; its chunk (or failure
+   * cleanup) is still recorded whenever it eventually settles. This bound
+   * exists for callers that hold a gate while waiting (idle digestion): an
+   * unbounded await on a hung provider request would wedge the gate
+   * forever. Never rejects.
+   */
+  async waitForObserverSettledWithin(timeoutMs: number): Promise<boolean> {
+    const inFlight = this.inFlightObserver;
+    if (!inFlight) return true;
+    const settled = inFlight.then(
+      () => true,
+      () => true,
+    );
+    if (!Number.isFinite(timeoutMs)) return settled;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([settled, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
    * Whether a reflector call is currently in flight.
    */
   isReflectorInFlight(): boolean {
