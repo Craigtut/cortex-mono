@@ -176,6 +176,45 @@ export interface ToolPermissionRequestContext {
    * several concurrent loops can attribute each prompt.
    */
   loopPath?: string;
+  /**
+   * Verbatim rendering of what is being asked: the permission name plus the
+   * actual command, path, or URL from the tool arguments, truncated but
+   * never summarized. Always set when Cortex invokes the resolver. Surfaces
+   * that present the ask to a human (a TUI prompt, a voice loop reading the
+   * request aloud) should use this text rather than re-deriving their own,
+   * so what the human hears is what the tool will actually do.
+   */
+  renderedRequest?: string;
+}
+
+/**
+ * A permission ask currently blocked on a decision, as surfaced by
+ * AgentLoop.getPendingAsks(). Each entry corresponds to one resolver
+ * invocation still awaiting its answer; entries disappear when the ask
+ * settles (answered, blocked, or aborted).
+ */
+export interface PendingAsk {
+  /**
+   * The ask's per-ask nonce (also delivered to the resolver as
+   * ToolPermissionRequestContext.askId). Security-relevant: consent binding
+   * keys on it, so ids are crypto-random, never reused, and never derived
+   * from guessable data.
+   */
+  askId: string;
+  /** Path identity of the loop that raised the ask. */
+  loopPath: string;
+  /** Permission name presented to the resolver (tool name or synthetic escalation name). */
+  toolName: string;
+  /** Verbatim request rendering (see ToolPermissionRequestContext.renderedRequest). */
+  renderedRequest: string;
+  /** Epoch ms when the ask was raised. */
+  requestedAt: number;
+  /**
+   * Whether the ask has been presented to the human. Set via
+   * AgentLoop.markAskVoiced(); a consent router should accept an allow only
+   * for the most recently voiced ask.
+   */
+  voiced: boolean;
 }
 
 /**

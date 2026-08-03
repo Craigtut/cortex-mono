@@ -20,6 +20,7 @@ export type {
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
   ToolPermissionRequestContext,
+  PendingAsk,
   LoopOriginContext,
   AgentLoopConfig,
   CortexDiagnosticsConfig,

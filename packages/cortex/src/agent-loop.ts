@@ -105,6 +105,7 @@ import type {
   TrackedSubAgent,
   BudgetScope,
   CortexCompactionConfig,
+  PendingAsk,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
   ToolPermissionRequestContext,
@@ -215,6 +216,12 @@ function mapFromPiThinkingLevel(level: string): ThinkingLevel {
 
 /** Leading context slot used to seed a sub-agent with background context. */
 const CHILD_SEED_CONTEXT_SLOT = '_seed_context';
+
+/**
+ * Hard cap on a rendered permission request. Long enough that a real command
+ * line survives verbatim; the excess is cut, never summarized.
+ */
+const RENDERED_REQUEST_MAX_CHARS = 500;
 
 const CORTEX_THINKING_LEVELS: readonly ThinkingLevel[] = [
   'off',
@@ -624,6 +631,12 @@ export class AgentLoop {
   // batch (including terminated ones), so content parked there while a run
   // can start would drain immediately and be answered unprompted.
   private queuedSilentDeliveries: QueuedSilentDelivery[] = [];
+
+  // Permission asks currently blocked on a resolver decision, keyed by their
+  // per-ask nonce. Covers this loop's own asks plus (mirrored) its
+  // children's, so one query surfaces the whole subtree. Entries are removed
+  // the moment an ask settles, however it settles.
+  private readonly pendingAsks = new Map<string, PendingAsk>();
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -1723,6 +1736,45 @@ export class AgentLoop {
     return this.queuedSilentDeliveries.splice(0).map((item) => item.content);
   }
 
+  // -----------------------------------------------------------------------
+  // Pending permission asks
+  // -----------------------------------------------------------------------
+
+  /**
+   * Snapshot of permission asks currently blocked on a resolver decision,
+   * for this loop and (mirrored) its spawned children, oldest first. Each
+   * entry's askId matches the ToolPermissionRequestContext.askId the
+   * resolver received, so a broker can correlate what it queries here with
+   * the resolver call it is answering. Entries vanish when an ask settles,
+   * however it settles (answered, blocked, or aborted).
+   */
+  getPendingAsks(): PendingAsk[] {
+    return [...this.pendingAsks.values()].map((ask) => ({ ...ask }));
+  }
+
+  /**
+   * Mark a pending ask as voiced (presented to the human). Consent binding
+   * accepts an allow only for the most recently voiced ask, so a broker
+   * calls this at the moment it actually surfaces the request. Returns
+   * false for an unknown or already-settled askId.
+   */
+  markAskVoiced(askId: string): boolean {
+    const ask = this.pendingAsks.get(askId);
+    if (!ask) return false;
+    ask.voiced = true;
+    return true;
+  }
+
+  /** Track an ask for the lifetime of its resolver call. */
+  private registerPendingAsk(ask: PendingAsk): void {
+    this.pendingAsks.set(ask.askId, ask);
+  }
+
+  /** Remove an ask once its resolver call settles (any outcome). */
+  private settlePendingAsk(askId: string): void {
+    this.pendingAsks.delete(askId);
+  }
+
   /**
    * Classify an error and dispatch it to all registered onError handlers.
    *
@@ -2157,22 +2209,42 @@ export class AgentLoop {
         const permissionName = escalation ? BASH_ESCALATION_PERMISSION_NAME : toolCall.name;
         // Each ask carries a fresh nonce plus the asking loop's identity, so
         // a consumer fielding several concurrent loops can key prompt state
-        // per ask and attribute it. (The ask registry itself is a later
-        // phase; the id is generated here so the contract is stable now.)
+        // per ask and attribute it. The nonce is security-relevant (consent
+        // binding keys on it): crypto-random, never reused, never derived.
+        const askId = `ask-${crypto.randomUUID()}`;
+        const renderedRequest = AgentLoop.renderPermissionRequest(permissionName, args);
         const askContext: ToolPermissionRequestContext = {
-          askId: `ask-${crypto.randomUUID()}`,
+          askId,
           loopPath,
+          renderedRequest,
           ...(signal ? { signal } : {}),
         };
+        // Track the ask in the loop's pending-ask registry for the lifetime
+        // of the resolver call, so a facade can enumerate what is currently
+        // blocked and voice it.
+        const owner = cacheBreakpointState.agentLoop;
+        owner?.registerPendingAsk({
+          askId,
+          loopPath,
+          toolName: permissionName,
+          renderedRequest,
+          requestedAt: Date.now(),
+          voiced: false,
+        });
         // Race the consumer's decision against the run's abort signal. pi
         // awaits this hook before checking the signal, so without the race a
         // pending human approval would hang abort/destroy into the force-kill
         // path. The signal is also passed to the resolver so the consumer UI
         // can dismiss the moot prompt.
-        const resolution = await AgentLoop.raceResolutionAgainstAbort(
-          resolver(permissionName, args, askContext),
-          signal,
-        );
+        let resolution: boolean | CortexToolPermissionResult | typeof PERMISSION_RACE_ABORTED;
+        try {
+          resolution = await AgentLoop.raceResolutionAgainstAbort(
+            resolver(permissionName, args, askContext),
+            signal,
+          );
+        } finally {
+          owner?.settlePendingAsk(askId);
+        }
         if (resolution === PERMISSION_RACE_ABORTED) {
           return { block: true, reason: ABORTED_PERMISSION_REASON };
         }
@@ -2269,6 +2341,58 @@ export class AgentLoop {
         },
       );
     });
+  }
+
+  /**
+   * Build the verbatim rendering of a permission ask: the permission name
+   * plus the actual command, path, pattern, or URL from the tool arguments.
+   * Truncated at a fixed cap but NEVER summarized or paraphrased; a surface
+   * voicing this to a human must be able to read exactly what will run
+   * (review-findings F14: a softened rendering is forced by the data, not
+   * by model misbehavior).
+   */
+  private static renderPermissionRequest(permissionName: string, params: unknown): string {
+    const p = (params && typeof params === 'object' ? params : {}) as Record<string, unknown>;
+    const verbatim = (value: unknown): string => {
+      if (typeof value === 'string') return value;
+      if (value === undefined || value === null) return '';
+      try {
+        return JSON.stringify(value) ?? '';
+      } catch {
+        return String(value);
+      }
+    };
+
+    let detail: string;
+    switch (permissionName) {
+      case 'Bash':
+      case BASH_ESCALATION_PERMISSION_NAME:
+        detail = verbatim(p['command']);
+        break;
+      case 'Read':
+      case 'Write':
+      case 'Edit':
+      case 'UndoEdit':
+        detail = verbatim(p['file_path'] ?? p['path']);
+        break;
+      case 'Glob':
+      case 'Grep': {
+        const pattern = verbatim(p['pattern']);
+        const searchPath = verbatim(p['path']);
+        detail = searchPath ? `${pattern} in ${searchPath}` : pattern;
+        break;
+      }
+      case 'WebFetch':
+        detail = verbatim(p['url']);
+        break;
+      default:
+        detail = verbatim(params);
+        break;
+    }
+
+    const rendered = detail.length > 0 ? `${permissionName}: ${detail}` : permissionName;
+    if (rendered.length <= RENDERED_REQUEST_MAX_CHARS) return rendered;
+    return `${rendered.slice(0, RENDERED_REQUEST_MAX_CHARS)} [truncated]`;
   }
 
   /**
@@ -4712,6 +4836,9 @@ export class AgentLoop {
     // Queued silent deliveries are dropped on destroy by contract; a facade
     // that needs them durable drains them first via clearQueuedDeliveries().
     this.queuedSilentDeliveries = [];
+    // Any ask still pending at teardown settles as a block via the abort
+    // race; the registry entries just have not been reaped yet.
+    this.pendingAsks.clear();
     // deadLetteredBackgroundResults is deliberately NOT cleared: it is the
     // consumer's bounded post-mortem record of undelivered completed work,
     // and getDeadLetteredBackgroundResults() must still answer after
@@ -5912,6 +6039,20 @@ export class AgentLoop {
         const e = subAgentMgr.get(childTaskId);
         if (e) e.pendingPermission = null;
       };
+      // Mirror the child's ask into this loop's registry so one
+      // getPendingAsks() query surfaces the whole subtree's blocked asks.
+      const askId = context?.askId;
+      if (askId !== undefined) {
+        this.registerPendingAsk({
+          askId,
+          loopPath: context?.loopPath ?? `${this.loopPath}/${childTaskId}`,
+          toolName,
+          renderedRequest: context?.renderedRequest
+            ?? AgentLoop.renderPermissionRequest(toolName, toolArgs),
+          requestedAt: Date.now(),
+          voiced: false,
+        });
+      }
       const signal = context?.signal;
       signal?.addEventListener('abort', clearPending, { once: true });
       try {
@@ -5921,6 +6062,7 @@ export class AgentLoop {
       } finally {
         signal?.removeEventListener('abort', clearPending);
         clearPending();
+        if (askId !== undefined) this.settlePendingAsk(askId);
       }
     };
   }
