@@ -87,7 +87,7 @@ Sub-agents share the parent's:
 
 ### Steering a Running Sub-Agent
 
-`steerSubAgent(taskId, message)` on the parent agent redirects a running sub-agent by task ID. It rides the child's `deliver()` primitive: a mid-run child is steered into its current logical turn (the message lands at the child's next turn boundary). Returns `false` when the task ID is not an active sub-agent, the child is already tearing down, or the child's gate is idle: that last case is the settle window (the child's run ended but completion has not untracked it yet, or it has not started running), where a freshly started turn would be destroyed by the completion continuation moments later. A `false` return means the redirect was NOT delivered; the caller decides whether to re-route it (for example, into the next spawn or as parent context).
+`steerSubAgent(taskId, message)` on the parent agent redirects a running sub-agent by task ID. It rides the child's public steering queue: the message lands at the next turn boundary of the child's in-flight run. Returns `false` when the task ID is not an active sub-agent, the child is already tearing down, or no run is actually in flight on the child (not started yet, the settle window after its run ended, or the child's end-of-cycle drain): a redirect accepted in those windows is never polled again and would die silently with the child. A `false` return means the redirect was NOT delivered; the caller decides whether to re-route it (for example, into the next spawn or as parent context).
 
 Tracked entries also expose a typed handle (`TrackedSubAgent.agent: SubAgentHandle`) with the delivery, teardown, and live-usage surface, so orchestration layers no longer cast an `unknown`.
 
