@@ -105,11 +105,32 @@ describe('setHeadlineProvider', () => {
   });
 
   it('stays outside the BP3 boundary: breakpoint indices match a headline-free call', async () => {
-    const loop = createLoop();
-    const internals = loop as unknown as { _cacheBreakpointIndices: CacheBreakpointIndices | null };
+    // Seed a slot and old history so the indices are non-trivial: with an
+    // empty fixture both arms compute {bp2: -1, bp3: -1} and the equality
+    // assertion holds vacuously.
+    const loop = createLoop({ slots: ['notes'] });
+    const internals = loop as unknown as {
+      _cacheBreakpointIndices: CacheBreakpointIndices | null;
+      _prePromptMessageCount: number;
+    };
+    const piAgent = (loop as unknown as { agent: PiAgent }).agent;
+    loop.getContextManager().setSlot('notes', 'stable slot content');
+    piAgent.state.messages.push(
+      { role: 'user', content: 'old question', timestamp: 1 },
+      { role: 'assistant', content: 'old answer', timestamp: 2 },
+      { role: 'user', content: 'follow-up', timestamp: 3 },
+      { role: 'assistant', content: 'more detail', timestamp: 4 },
+    );
+    // Everything above is pre-prompt history, so BP3 sits after it.
+    internals._prePromptMessageCount = piAgent.state.messages.length;
 
     await runHook(loop);
     const withoutHeadline = internals._cacheBreakpointIndices;
+
+    // Guard against the fixture going vacuous again: BP2 covers the slot,
+    // BP3 the old-history boundary beyond it.
+    expect(withoutHeadline?.bp2ApiIndex).toBe(0);
+    expect(withoutHeadline?.bp3ApiIndex).toBeGreaterThan(0);
 
     loop.setHeadlineProvider(() => '<status>churn every tick</status>');
     await runHook(loop);
