@@ -213,28 +213,26 @@ export class SubAgentManager {
   }
 
   /**
-   * Deliver a steering message to a running sub-agent by task ID, built on
-   * the child's deliver() primitive: a tracked child is normally mid-run,
-   * so the message is steered into its current logical turn and lands at
-   * the child's next turn boundary. In the window where a tracked child's
-   * gate is idle (its run just settled but completion has not untracked it
-   * yet, or it has not started running), the redirect is reported
-   * undeliverable instead: a turn started there is destroyed by the
-   * completion continuation moments later, so 'delivered' would be a lie.
+   * Deliver a steering message to a running sub-agent by task ID, through
+   * the child's public steering queue: pi drains it at the next turn
+   * boundary of the child's in-flight run. Accepted only while a run is
+   * actually in flight (isPrompting), not merely while the child's gate is
+   * held: the gate stays held through windows that never poll steering
+   * again (the end-of-cycle drain after the child's run ended, a queued
+   * non-run task), where an accepted redirect would be destroyed with the
+   * child moments later while the caller was told it landed.
    *
-   * @returns 'steered' when the redirect landed in the child's current
-   *   logical turn; null when the task is not active, the child's gate is
-   *   idle (settle window), or the child is already tearing down.
+   * @returns 'steered' when the redirect was queued into the child's
+   *   in-flight run; null when the task is not active, no run is in
+   *   flight, or the child is already tearing down.
    */
   steer(taskId: string, message: string): 'steered' | null {
     const entry = this.agents.get(taskId);
     if (!entry) return null;
     try {
-      if (!entry.agent.isLoopActive) return null;
-      const outcome = entry.agent.deliver(message).outcome;
-      // The gate check above makes deliver() steer; narrow the type rather
-      // than surface an outcome this path can no longer produce.
-      return outcome === 'steered' ? outcome : null;
+      if (!entry.agent.isPrompting) return null;
+      entry.agent.steer(message);
+      return 'steered';
     } catch {
       // The child began destroy() between tracking and this call; the
       // steer has nowhere to land.

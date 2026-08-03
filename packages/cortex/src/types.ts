@@ -1579,6 +1579,13 @@ export interface SubAgentHandle {
    */
   readonly isLoopActive: boolean;
   /**
+   * True while a logical turn is actually in flight on the child. Narrower
+   * than isLoopActive, which also stays true through the child's
+   * end-of-cycle drain window after its run ended; a steer accepted there
+   * would never be polled again and dies with the child.
+   */
+  readonly isPrompting: boolean;
+  /**
    * Deliver a message regardless of the child's run state. Mirrors
    * AgentLoop.deliver: steered into a running turn, prompted when idle with
    * wake wanted, queued when silent.

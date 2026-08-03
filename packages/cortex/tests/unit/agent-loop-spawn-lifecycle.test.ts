@@ -564,16 +564,17 @@ describe('AgentLoop spawn-path lifecycle', () => {
   });
 
   describe('steerSubAgent', () => {
-    it('reaches a running child through its deliver() primitive', async () => {
+    it('reaches a running child through its public steering queue', async () => {
       const agent = createTestAgentLoop();
       let releasePrompt!: () => void;
       const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
-      const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
+      const steer = vi.fn();
       const child = {
         destroy: vi.fn().mockResolvedValue(undefined),
         prompt: vi.fn().mockReturnValue(promptGate),
-        deliver,
-        // The child is mid-run: its gate is held for the whole prompt.
+        steer,
+        // The child is mid-run: a pi run is actually in flight.
+        isPrompting: true,
         isLoopActive: true,
         getConversationHistory: () => [{ role: 'assistant', content: 'done' }],
         getBudgetGuard: () => ({ getTurnCount: () => 1, getTotalCost: () => 0 }),
@@ -587,7 +588,7 @@ describe('AgentLoop spawn-path lifecycle', () => {
       const steered = agent.steerSubAgent(taskId, 'focus on Europe');
 
       expect(steered).toBe(true);
-      expect(deliver).toHaveBeenCalledWith('focus on Europe');
+      expect(steer).toHaveBeenCalledWith('focus on Europe');
 
       releasePrompt();
       await agent.getSubAgentManager().get(taskId)?.completion;

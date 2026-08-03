@@ -286,17 +286,17 @@ describe('SubAgentManager', () => {
   });
 
   describe('steer', () => {
-    it('delivers the message through the tracked child handle and returns the outcome', () => {
-      const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
+    it('queues the message into the child in-flight run and returns steered', () => {
+      const steer = vi.fn();
       manager.track(createTrackedEntry({
         taskId: 'task-1',
-        agent: { deliver, isLoopActive: true } as never,
+        agent: { steer, isPrompting: true, isLoopActive: true } as never,
       }));
 
       const outcome = manager.steer('task-1', 'focus on Europe');
 
       expect(outcome).toBe('steered');
-      expect(deliver).toHaveBeenCalledWith('focus on Europe');
+      expect(steer).toHaveBeenCalledWith('focus on Europe');
     });
 
     it('returns null for an unknown task ID', () => {
@@ -305,40 +305,59 @@ describe('SubAgentManager', () => {
 
     it('returns null in the settle window instead of starting a doomed turn', () => {
       // The child's run has settled but complete() has not untracked it
-      // yet: deliver() would start a fresh turn that runSubAgent destroys
-      // microtasks later, while the caller is told the redirect landed.
-      const deliver = vi.fn(() => ({ outcome: 'prompted' as const }));
+      // yet: a redirect accepted here is never polled again and dies with
+      // the child, while the caller is told it landed.
+      const steer = vi.fn();
       manager.track(createTrackedEntry({
         taskId: 'task-1',
-        agent: { deliver, isLoopActive: false } as never,
+        agent: { steer, isPrompting: false, isLoopActive: false } as never,
       }));
 
       expect(manager.steer('task-1', 'message')).toBeNull();
+      expect(steer).not.toHaveBeenCalled();
+    });
+
+    it('returns null in the end-of-cycle drain window (gate held, no run in flight)', () => {
+      // After the child's run ended its gate stays held through the
+      // end-of-cycle drain. Steering polls never happen again in that
+      // window, so an accepted redirect would be silently dropped when the
+      // parent's continuation destroys the child. A gate-depth check
+      // (isLoopActive) passes here and accepts the doomed redirect; only
+      // the run-in-flight check is honest.
+      const steer = vi.fn();
+      const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { steer, deliver, isPrompting: false, isLoopActive: true } as never,
+      }));
+
+      expect(manager.steer('task-1', 'message')).toBeNull();
+      expect(steer).not.toHaveBeenCalled();
       expect(deliver).not.toHaveBeenCalled();
     });
 
-    it('returns null when the child is already tearing down (deliver throws)', () => {
-      const deliver = vi.fn(() => {
+    it('returns null when the child is already tearing down (steer throws)', () => {
+      const steer = vi.fn(() => {
         throw new Error('Agent is being destroyed');
       });
       manager.track(createTrackedEntry({
         taskId: 'task-1',
-        agent: { deliver, isLoopActive: true } as never,
+        agent: { steer, isPrompting: true, isLoopActive: true } as never,
       }));
 
       expect(manager.steer('task-1', 'message')).toBeNull();
     });
 
     it('returns null after the task was cancelled', async () => {
-      const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
+      const steer = vi.fn();
       manager.track(createTrackedEntry({
         taskId: 'task-1',
-        agent: { deliver, isLoopActive: true } as never,
+        agent: { steer, isPrompting: true, isLoopActive: true } as never,
       }));
       await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
 
       expect(manager.steer('task-1', 'message')).toBeNull();
-      expect(deliver).not.toHaveBeenCalled();
+      expect(steer).not.toHaveBeenCalled();
     });
   });
 

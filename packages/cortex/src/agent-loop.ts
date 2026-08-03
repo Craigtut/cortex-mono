@@ -1169,6 +1169,20 @@ export class AgentLoop {
   }
 
   /**
+   * True while a logical turn is in flight: from runPromptOnce entry (the
+   * first agent.prompt attempt) through its retry continuations until the
+   * turn unwinds. Narrower than {@link isLoopActive}, which also covers
+   * gate tasks that never run pi (an idle digestion pass, an empty drain,
+   * the end-of-cycle drain window after a run ended). A steer() is only
+   * meaningful while this is true: pi polls its steering queue at run
+   * start and at turn boundaries within a run, so content queued when no
+   * turn is in flight waits for whatever run starts next.
+   */
+  get isPrompting(): boolean {
+    return this._isPrompting;
+  }
+
+  /**
    * One gate-owned loop cycle: run the logical turn, then deliver any
    * background completions that arrived while it ran. Lifecycle is
    * re-checked here (at dequeue time) so a destroy() that lands between
@@ -5419,12 +5433,13 @@ export class AgentLoop {
 
   /**
    * Deliver a steering message to a running sub-agent by task ID. The
-   * redirect rides the child's deliver() primitive, so it lands at the
-   * child's next turn boundary while it runs. Returns false when the task
-   * ID is not an active sub-agent, the child is tearing down, or the child
-   * is in its settle window (run ended, completion not yet untracked): a
-   * turn started there would be destroyed moments later, so the redirect
-   * is reported undeliverable and the caller decides how to re-route it.
+   * redirect rides the child's public steering queue, so it lands at the
+   * next turn boundary of the child's in-flight run. Returns false when
+   * the task ID is not an active sub-agent, the child is tearing down, or
+   * no run is in flight on the child (not started yet, settle window, or
+   * the end-of-cycle drain after its run ended): a redirect accepted in
+   * those windows is never polled again and dies with the child, so it is
+   * reported undeliverable and the caller decides how to re-route it.
    */
   steerSubAgent(taskId: string, message: string): boolean {
     const outcome = this.subAgentManager.steer(taskId, message);
