@@ -157,8 +157,12 @@ describe('Session.resolvePermission ask context', () => {
       { command: 'git push origin main' },
       { signal: controller.signal, askId: 'ask-test-2', loopPath: 'main' },
     );
-    // Wait for the prompt itself, not for the activity record: the record is
-    // written as the ask settles, so waiting on it here would deadlock.
+    // Wait for the prompt itself so the abort lands after the abort listener
+    // is registered: recordPermissionRequested is written BEFORE the prompt
+    // shows, and the listener registration comes after it, so waiting on the
+    // record could abort inside that window (which is its own regression
+    // test below). The record written as the ask settles is
+    // recordPermissionResolved.
     await waitUntil(() => showPermissionPrompt.mock.calls.length > 0);
     controller.abort();
     await resultPromise;
@@ -168,6 +172,44 @@ describe('Session.resolvePermission ask context', () => {
       { command: 'git push origin main' },
       { askId: 'ask-test-2' },
     );
+  });
+
+  it('settles an ask whose run aborts between the pre-check and the abort listener registration', async () => {
+    const { internals } = makeSession();
+    const controller = new AbortController();
+    const resolved = vi.spyOn(internals.activity, 'recordPermissionResolved');
+
+    // Abort synchronously inside recordPermissionRequested: after the
+    // pre-shown abort check at the top of the ask, before the abort
+    // listener is registered. addEventListener never fires for an
+    // already-aborted signal, so without the aborted-signal branch the
+    // prompt never settles and permissionLockPromise is held forever.
+    const originalRequested = internals.activity.recordPermissionRequested.bind(
+      internals.activity,
+    );
+    vi.spyOn(internals.activity, 'recordPermissionRequested').mockImplementation(
+      (...args: unknown[]) => {
+        const record = originalRequested(...args);
+        controller.abort();
+        return record;
+      },
+    );
+
+    const resultPromise = internals.resolvePermission(
+      'Bash',
+      { command: 'git push origin main' },
+      { signal: controller.signal, askId: 'ask-window', loopPath: 'main' },
+    );
+
+    const outcome = await settledWithin(resultPromise, 2000);
+    expect(outcome.settled).toBe(true);
+    expect(outcome.value).toEqual({
+      decision: 'block',
+      reason: 'Run aborted before the permission prompt was answered',
+    });
+    expect(internals.permissionLockPromise).toBeNull();
+    const lastCall = resolved.mock.calls.at(-1);
+    expect(lastCall?.[2]).toBe('cancelled');
   });
 
   it('never shows a prompt for an ask whose run aborted while waiting behind another prompt', async () => {

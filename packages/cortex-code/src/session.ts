@@ -1735,13 +1735,25 @@ export class Session {
     let onAbort: (() => void) | undefined;
     let externalDecision = fileDecision;
     if (abortSignal) {
-      const abortDecision = new Promise<'deny'>((resolve) => {
-        onAbort = () => {
-          abortDismissed = true;
-          resolve('deny');
-        };
-        abortSignal.addEventListener('abort', onAbort, { once: true });
-      });
+      // The aborted pre-check above ran BEFORE recordPermissionRequested and
+      // the awaited state write, and addEventListener never fires for a
+      // signal that is already aborted. An abort landing inside that window
+      // must settle the decision here, or the prompt sits on screen for
+      // dead work holding permissionLockPromise forever, serializing every
+      // later ask behind it.
+      let abortDecision: Promise<'deny'>;
+      if (abortSignal.aborted) {
+        abortDismissed = true;
+        abortDecision = Promise.resolve('deny');
+      } else {
+        abortDecision = new Promise<'deny'>((resolve) => {
+          onAbort = () => {
+            abortDismissed = true;
+            resolve('deny');
+          };
+          abortSignal.addEventListener('abort', onAbort, { once: true });
+        });
+      }
       externalDecision = Promise.race([fileDecision, abortDecision]);
     }
 
