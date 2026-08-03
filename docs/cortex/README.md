@@ -12,6 +12,7 @@ Architecture and implementation references:
 
 - [Product Vision](./product-vision.md)
 - [Cortex Architecture](./cortex-architecture.md)
+- [CortexAgent Facade](./cortex-agent.md): the composite facade over AgentLoop (passthrough mode today; duplex in development)
 - [Context Manager](./context-manager.md)
 - [System Prompt](./system-prompt.md)
 - [Working Tags](./working-tags.md)

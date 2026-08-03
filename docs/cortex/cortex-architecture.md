@@ -6,6 +6,8 @@
 
 It does NOT contain application-specific logic (thoughts, emotions, decisions, persona). Those are concerns of the consumer (e.g., a heartbeat system or application-specific pipeline). Think of it as: pi-agent-core provides the bare agentic loop; cortex provides everything needed to wire that loop into real applications.
 
+Two agent surfaces are exported. `AgentLoop` is the loop primitive this document describes. `CortexAgent` is the composite facade over it (session log, composite persistence, settlement predicates; a passthrough mode today, with a duplex talker/reasoner mode in development). See [cortex-agent.md](cortex-agent.md).
+
 ## Package Structure
 
 ```
@@ -13,6 +15,8 @@ packages/cortex/
   src/
     index.ts                    # Public API
     agent-loop.ts             # Wraps pi-agent-core Agent with production concerns
+    cortex-agent.ts             # Composite facade over AgentLoop (see cortex-agent.md)
+    session-log.ts              # Append-only session log owned by the facade
     context-manager.ts          # Slot-based context management
     provider-manager.ts         # Provider discovery, OAuth login/refresh, API key validation
     provider-registry.ts        # Static provider metadata and utility model defaults
