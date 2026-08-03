@@ -27,7 +27,7 @@ Content reaches a model through exactly two mechanisms, chosen by durability:
 
 Deliverables, directives, conversation deltas, permission asks: anything a loop must remember becomes a real message in that loop's transcript, delivered at a turn boundary via the loop's `deliver()` primitive. This is the same path background sub-agent results use today (`drainPendingBackgroundResults`, hardened in P0 for capped re-queue-on-failure).
 
-`deliver()` is a state machine over (loop-gate depth, pi run state, abort state) with four outcomes, specified in P1 rather than P0 because the semantics are subtle:
+`deliver()` is a state machine over (loop-gate depth, wake class, abort state) with three outcomes (`prompted`, `parked`, `queued`), specified in P1 rather than P0 because the semantics are subtle:
 
 Wake class is the primary axis, loop state the secondary one. Silent never steers, in any state:
 
