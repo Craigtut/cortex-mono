@@ -495,6 +495,33 @@ describe('CortexAgent abort-stub trim', () => {
     expect(lastMessage(mock).role).toBe('user');
   });
 
+  it('does not treat a provider error containing ABORTED as an abort', async () => {
+    // ECONNABORTED is a network failure; the abort heuristic must not match
+    // "abort" inside a larger identifier, or the error is mislabeled as a
+    // cancellation and its diagnostic stub is trimmed.
+    const mock = createRetryMock([]);
+    mock.prompt = async (input: string): Promise<unknown> => {
+      mock.promptCalls += 1;
+      mock.state.messages.push({ role: 'user', content: input } as never);
+      mock.state.errorMessage = 'read ECONNABORTED';
+      mock.state.messages.push({
+        role: 'assistant',
+        content: [],
+        stopReason: 'error',
+        errorMessage: 'read ECONNABORTED',
+      } as never);
+      return undefined;
+    };
+    const agent = build(mock, createConfig({ retryPolicy: { enabled: false } }));
+    const errored = vi.fn();
+    agent.onError(errored);
+
+    await expect(agent.prompt('hi')).rejects.toThrow();
+
+    expect(errored.mock.calls[0][0].category).not.toBe('cancelled');
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'error' });
+  });
+
   it('keeps the failure stub for a surfaced non-abort failure', async () => {
     // Retry disabled: the network failure surfaces immediately, un-aborted.
     // Its stub is diagnostic state the consumer may inspect; only aborts trim.

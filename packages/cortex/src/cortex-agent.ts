@@ -4119,7 +4119,11 @@ export class CortexAgent {
           : typeof (rawError as Record<string, unknown>)['message'] === 'string'
             ? (rawError as Record<string, unknown>)['message'] as string
             : '';
-      return /abort/i.test(errorMsg) || /cancell?ed/i.test(errorMsg);
+      // Match "abort"/"cancelled" only as its own word start, not inside a
+      // larger identifier: a provider error like ECONNABORTED is a network
+      // failure, and misreading it as an abort would trim its failure stub
+      // and mislabel the error as a cancellation.
+      return /(?<![a-z])abort/i.test(errorMsg) || /(?<![a-z])cancell?ed/i.test(errorMsg);
     }
 
     return false;
