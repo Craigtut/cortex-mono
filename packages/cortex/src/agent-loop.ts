@@ -6426,9 +6426,10 @@ export class AgentLoop {
    * When the child run aborts while the ask is pending, the race in the
    * child's beforeToolCall proceeds with a block WITHOUT settling this
    * resolver (the consumer may never answer the dismissed prompt), so the
-   * finally alone is not enough: the marker is also cleared on the abort
-   * signal, or the entry lingers as 'waiting-for-permission' in status
-   * surfaces and the headline block.
+   * finally alone is not enough: the marker AND the mirrored registry entry
+   * are also cleared on the abort signal, or the entry lingers as
+   * 'waiting-for-permission' in status surfaces and getPendingAsks() keeps
+   * reporting an ask Cortex already blocked.
    */
   private wrapChildPermissionResolver(
     parentResolver: NonNullable<AgentLoopConfig['resolvePermission']>,
@@ -6438,13 +6439,19 @@ export class AgentLoop {
     return async (toolName, toolArgs, context) => {
       const entry = subAgentMgr.get(childTaskId);
       if (entry) entry.pendingPermission = { toolName, args: toolArgs };
+      const askId = context?.askId;
       const clearPending = (): void => {
         const e = subAgentMgr.get(childTaskId);
         if (e) e.pendingPermission = null;
+        // Settle the mirrored registry entry here too: on the abort path
+        // Cortex proceeds with a block WITHOUT waiting for the consumer's
+        // resolver, so the finally below (which does wait) may not run for
+        // a long time, or ever. Without this, getPendingAsks() keeps
+        // reporting an ask the loop already blocked.
+        if (askId !== undefined) this.settlePendingAsk(askId);
       };
       // Mirror the child's ask into this loop's registry so one
       // getPendingAsks() query surfaces the whole subtree's blocked asks.
-      const askId = context?.askId;
       if (askId !== undefined) {
         this.registerPendingAsk({
           askId,
@@ -6465,7 +6472,6 @@ export class AgentLoop {
       } finally {
         signal?.removeEventListener('abort', clearPending);
         clearPending();
-        if (askId !== undefined) this.settlePendingAsk(askId);
       }
     };
   }

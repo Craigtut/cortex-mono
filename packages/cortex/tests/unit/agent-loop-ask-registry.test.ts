@@ -200,6 +200,38 @@ describe('pending-ask registry', () => {
     expect(seen[0]).not.toBe(seen[1]);
   });
 
+  it('settles a mirrored child ask when the child run aborts, even if the resolver never answers', async () => {
+    const { loop } = buildLoopWithHook(async () => true, { loopPath: 'main' });
+    // The consumer's prompt never settles: the user never answers a prompt
+    // that was dismissed by the abort.
+    const parentResolver = vi.fn(() => new Promise<boolean>(() => {}));
+    const wrap = (loop as unknown as {
+      wrapChildPermissionResolver: (
+        resolver: NonNullable<AgentLoopConfig['resolvePermission']>,
+        childTaskId: string,
+      ) => NonNullable<AgentLoopConfig['resolvePermission']>;
+    }).wrapChildPermissionResolver(parentResolver, 'task-abort');
+    const controller = new AbortController();
+
+    // The wrapper registers the mirror synchronously (before its first
+    // await), and the abort listener settles it synchronously too, so no
+    // waiting is involved in this test.
+    void wrap('Bash', { command: 'npm test' }, {
+      askId: 'ask-child-abort',
+      loopPath: 'main/task-abort',
+      renderedRequest: 'Bash: npm test',
+      signal: controller.signal,
+    });
+    expect(loop.getPendingAsks()).toHaveLength(1);
+
+    // The child run aborts: Cortex proceeds with a block without waiting on
+    // the resolver, so the registry entry must settle here, not in the
+    // wrapper's finally (which waits on the unsettled resolver forever).
+    controller.abort();
+
+    expect(loop.getPendingAsks()).toHaveLength(0);
+  });
+
   it('mirrors a child ask into the parent registry while it is pending', async () => {
     const { loop } = buildLoopWithHook(async () => true, { loopPath: 'main' });
     let answer!: (value: CortexToolPermissionResult | boolean) => void;
