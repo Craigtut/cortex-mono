@@ -647,6 +647,82 @@ describe('AgentLoop.deliver sweep failure recovery', () => {
   });
 });
 
+describe('AgentLoop.deliver and abort', () => {
+  it('abort() drops parked wake deliveries instead of waiting on a swept run', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    // Parks: the run has already made its only steering poll.
+    loop.deliver('post-abort content');
+    expect(loop.pendingWakeDeliveryCount).toBe(1);
+
+    await loop.abort();
+    await turn.catch(() => {});
+    await waitUntil(() => !loop.isLoopActive);
+
+    // The parked delivery was cancelled with the turn: no model run starts
+    // for it after the user stopped the agent, and nothing stays parked.
+    expect(piAgent.promptCalls).toHaveLength(1);
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+    expect(occurrences(piAgent, 'post-abort content')).toBe(0);
+  });
+
+  it('an abort during a swept run cancels the content instead of re-parking it', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const errored = vi.fn();
+    loop.onError(errored);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    // First call hangs until abort rejects it; a later call (the re-park
+    // path this test forbids) would succeed and show up in promptCalls.
+    let rejectRun: ((err: Error) => void) | null = null;
+    let first = true;
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      if (first) {
+        first = false;
+        await new Promise<never>((_resolve, reject) => {
+          rejectRun = reject;
+        });
+      }
+      piAgent.state.messages.push({ role: 'assistant', content: 'ok', timestamp: Date.now() });
+      return { content: 'ok' };
+    };
+    piAgent.abort = (): void => {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      rejectRun?.(err);
+      rejectRun = null;
+    };
+
+    const drain = (loop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    loop.deliver('swept then aborted');
+    await drain;
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    await loop.abort();
+    await waitUntil(() => !loop.isLoopActive);
+
+    // The aborted swept run was unwound and its content cancelled, not
+    // re-parked for a post-abort redelivery.
+    expect(piAgent.promptCalls).toHaveLength(1);
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+    expect(occurrences(piAgent, 'swept then aborted')).toBe(0);
+  });
+});
+
 describe('AgentLoop follow-up and queue surfaces', () => {
   it('followUp forwards to pi follow-up queue', () => {
     const piAgent = createMockPiAgent();
