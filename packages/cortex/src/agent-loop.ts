@@ -48,6 +48,7 @@ import { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
 import { isContextOverflow } from './compaction/failsafe.js';
 import type { ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './compaction/observational/types.js';
+import { DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS } from './compaction/observational/index.js';
 import { createRecallTool } from './compaction/observational/recall-tool.js';
 import { SubAgentManager } from './sub-agent-manager.js';
 import { SkillRegistry } from './skill-registry.js';
@@ -480,11 +481,13 @@ interface QueuedDelivery {
 /** Options for {@link AgentLoop.digestIdle}. */
 export interface IdleDigestionOptions {
   /**
-   * Wall-clock budget for the digestion's observer waits (default 60s).
-   * Idle digestion holds the loop gate, so a hung utility request must time
-   * the digestion out (observerRan: false, the observer left in flight)
+   * Wall-clock budget applied to EACH bounded phase of the digestion
+   * (default 60s): the observer catch-up waits, and then the blocking
+   * threshold pass (activation, reflection, classic summarization). Idle
+   * digestion holds the loop gate, so a hung utility request in either
+   * phase must time the digestion out (the hung call left in flight)
    * rather than wedge the gate: while the gate is wedged, prompt() fails
-   * fast and wake deliveries wait on the sweep behind it.
+   * fast and parked wake deliveries wait on the sweep behind it.
    */
   observerTimeoutMs?: number;
 }
@@ -4192,9 +4195,12 @@ export class AgentLoop {
    * Serialized through the loop gate, so it can never race a running
    * turn's history mutations; called while a turn is active, it runs after
    * that turn finishes. prompt() fails fast while digestion holds the gate
-   * (deliver() steers or queues as usual). The observer waits are bounded
-   * (options.observerTimeoutMs, default 60s) so a hung utility request
-   * times the digestion out instead of wedging the gate.
+   * (deliver() parks or queues as usual). Both phases are bounded by
+   * options.observerTimeoutMs (default 60s): the observer catch-up waits
+   * time out inside the compaction manager, and the blocking threshold
+   * pass is raced against the same deadline here, so a hung utility
+   * request (observer, reflector, or summarizer) times the digestion out
+   * instead of wedging the gate.
    */
   async digestIdle(options?: IdleDigestionOptions): Promise<IdleDigestionResult> {
     this.assertNotShuttingDown();
@@ -4219,14 +4225,40 @@ export class AgentLoop {
       // against the live source history. Source mutations (activation
       // trims, summarization rewrites) persist; the returned view is
       // discarded. _forceBlockingCompaction lets the manager run its
-      // synchronous paths regardless of the configured posture.
+      // synchronous paths regardless of the configured posture; those
+      // paths block on utility requests (reflection, summarization), so
+      // the pass shares the observer deadline rather than holding the
+      // gate indefinitely behind a hung request.
       const lengthBefore = this.agent.state.messages.length;
       const hook = this.getTransformContextHook();
       this._forceBlockingCompaction = true;
+      const thresholdPass = (async () => {
+        try {
+          await hook(this.buildAgentContextSnapshot());
+        } finally {
+          this._forceBlockingCompaction = false;
+        }
+      })();
+      const timeoutMs = options?.observerTimeoutMs ?? DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        await hook(this.buildAgentContextSnapshot());
+        const timedOut = await Promise.race([
+          thresholdPass.then(() => false),
+          new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(true), timeoutMs);
+          }),
+        ]);
+        if (timedOut) {
+          // Abandoned, not cancelled: the hung call settles into the void.
+          // Lower the blocking flag now so a later prompt's transform does
+          // not inherit the blocking posture from the abandoned pass, and
+          // swallow its eventual settlement.
+          this._forceBlockingCompaction = false;
+          thresholdPass.catch(() => {});
+          this.logger.warn('idle digestion threshold pass timed out', { timeoutMs });
+        }
       } finally {
-        this._forceBlockingCompaction = false;
+        clearTimeout(timer);
       }
       const historyCompacted = this.agent.state.messages.length !== lengthBefore;
 

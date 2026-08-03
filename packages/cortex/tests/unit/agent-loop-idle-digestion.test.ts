@@ -237,6 +237,26 @@ describe('digestIdle observer wait bound', () => {
       (call) => typeof call === 'string' && call.includes('after the timeout'),
     )).toBe(true);
   });
+
+  it('times out a hung threshold pass (classic summarizer) instead of wedging the gate', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, { compaction: { strategy: 'classic' } });
+    // A hung provider request in the BLOCKING threshold pass (step 2), the
+    // phase after the observer waits. Unbounded, digestIdle never resolves
+    // and the gate stays wedged while holding _forceBlockingCompaction.
+    const complete = vi.fn(() => new Promise<string>(() => {}));
+    loop.getCompactionManager().setCompleteFn(complete as unknown as CompleteFn);
+    for (let i = 0; i < 10; i++) seedHistory(piAgent, 2_000);
+    loop.getCompactionManager().updateCurrentContextTokenCount(15_000);
+
+    const result = await loop.digestIdle({ observerTimeoutMs: 50 });
+
+    expect(complete).toHaveBeenCalled();
+    expect(result.observerRan).toBe(false);
+    expect(result.historyCompacted).toBe(false);
+    // The gate is free again; the hung summarization was abandoned.
+    await waitUntil(() => !loop.isLoopActive);
+  });
 });
 
 describe('digestIdle gate serialization', () => {
