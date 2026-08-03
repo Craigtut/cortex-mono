@@ -634,6 +634,37 @@ describe('EventBridge', () => {
       expect(listener).toHaveBeenCalledTimes(1); // Not called again
     });
 
+    it('double unsubscribe is idempotent and scoped to its own forwarding', () => {
+      // The background completion continuation calls unsubForward in both
+      // its .then and .catch; a settled-then-failed delivery path can invoke
+      // it twice. The second call must be a no-op that cannot detach another
+      // task's forwarding.
+      const childA = new EventBridge(false);
+      const childASource = createMockSource();
+      childA.wire(childASource);
+      const childB = new EventBridge(false);
+      const childBSource = createMockSource();
+      childB.wire(childBSource);
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      const unsubA = bridge.forwardFrom(childA, 'sub-a');
+      bridge.forwardFrom(childB, 'sub-b');
+
+      unsubA();
+      expect(() => unsubA()).not.toThrow();
+
+      // sub-b's forwarding survives sub-a's double unsubscribe.
+      childBSource.emit({ type: 'tool_execution_start', toolCallId: 'b1', toolName: 'Y', args: {} });
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0][0].childTaskId).toBe('sub-b');
+
+      // And sub-a stays detached.
+      childASource.emit({ type: 'tool_execution_start', toolCallId: 'a1', toolName: 'X', args: {} });
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
     it('forwards all event types from child', () => {
       const childBridge = new EventBridge(false);
       const childSource = createMockSource();

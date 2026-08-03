@@ -220,6 +220,22 @@ describe('SubAgentManager', () => {
       expect(manager.isCancelled('task-1')).toBe(true);
     });
 
+    it('evicts the oldest cancelled task ID past the 200-entry cap', async () => {
+      // The cancelled-ID set is bounded so a long-lived agent cannot leak
+      // memory; eviction is oldest-first, so only the most recent 200
+      // cancels remain discardable.
+      const abortFn = vi.fn().mockResolvedValue(undefined);
+      for (let i = 0; i <= 200; i++) {
+        manager.track(createTrackedEntry({ taskId: `task-${i}` }));
+        await manager.cancel(`task-${i}`, abortFn);
+      }
+
+      // 201 cancels: the very first ID was evicted, the rest remain.
+      expect(manager.isCancelled('task-0')).toBe(false);
+      expect(manager.isCancelled('task-1')).toBe(true);
+      expect(manager.isCancelled('task-200')).toBe(true);
+    });
+
     it('marks the task cancelled before running the async teardown', async () => {
       manager.track(createTrackedEntry({ taskId: 'task-1' }));
 
