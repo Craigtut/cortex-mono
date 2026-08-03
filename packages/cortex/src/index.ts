@@ -34,6 +34,7 @@ export type {
   AgentTextOutput,
   ToolContentDetails,
   BudgetGuardConfig,
+  BudgetScope,
   ToolCategory,
   MicrocompactionConfig,
   CompactionConfig,

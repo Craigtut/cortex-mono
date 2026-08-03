@@ -13,7 +13,7 @@
  * Reference: cortex-architecture.md (Budget Guards section)
  */
 
-import type { BudgetGuardConfig, CortexLogger } from './types.js';
+import type { BudgetGuardConfig, BudgetScope, CortexLogger } from './types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import type { CortexEvent, EventBridge } from './event-bridge.js';
 
@@ -45,6 +45,8 @@ function isFailureTurnEnd(event: CortexEvent): boolean {
 export class BudgetGuard {
   private readonly maxTurns: number;
   private readonly maxCost: number;
+  private readonly scope: BudgetScope;
+  private readonly includeChildUsage: boolean;
   private readonly abortFn: () => void;
   private readonly logger: CortexLogger;
 
@@ -64,6 +66,8 @@ export class BudgetGuard {
   constructor(config: Partial<BudgetGuardConfig>, abortFn: () => void, logger?: CortexLogger) {
     this.maxTurns = config.maxTurns ?? Infinity;
     this.maxCost = config.maxCost ?? Infinity;
+    this.scope = config.scope ?? 'prompt';
+    this.includeChildUsage = config.includeChildUsage ?? false;
     this.abortFn = abortFn;
     this.logger = logger ?? NOOP_LOGGER;
   }
@@ -81,12 +85,13 @@ export class BudgetGuard {
     this.unwire();
 
     // Track turns and cost on turn_end. Forwarded child events arrive on the
-    // same bridge with childTaskId set; skip them so a parent's budget counts
-    // only its own turns and cost (matching the childTaskId branching in
-    // AgentLoop's own turn_end handlers).
+    // same bridge with childTaskId set; by default skip them so a parent's
+    // budget counts only its own turns and cost (matching the childTaskId
+    // branching in AgentLoop's own turn_end handlers). An aggregate guard
+    // opts into counting them via includeChildUsage.
     this.unsubscribers.push(
       bridge.on('turn_end', (event) => {
-        if (event.childTaskId) return;
+        if (event.childTaskId && !this.includeChildUsage) return;
         // Skip synthetic failure/abort turns. pi-agent-core emits a turn_end
         // for its synthetic failure message (empty usage, stopReason
         // error/aborted) on every failed or cancelled attempt; counting it
@@ -171,28 +176,38 @@ export class BudgetGuard {
 
   /**
    * Check if any limits have been exceeded and abort if so.
+   *
+   * Under 'prompt' scope a breach aborts once; the owner resets the guard at
+   * the next prompt, clearing the flag. Under 'lifetime' scope nothing ever
+   * resets it, so the guard keeps aborting every turn past the limit: a
+   * prompt started after the breach must be stopped too, not waved through
+   * because the flag was already set.
    */
   private checkLimits(): void {
-    if (this.breached) {
+    if (this.breached && this.scope === 'prompt') {
       return; // Already breached, don't abort multiple times
     }
 
     if (this.turnCount >= this.maxTurns) {
-      this.breached = true;
-      this.logger.warn('[BudgetGuard] turn limit breached', {
-        turnCount: this.turnCount,
-        maxTurns: this.maxTurns,
-      });
+      if (!this.breached) {
+        this.breached = true;
+        this.logger.warn('[BudgetGuard] turn limit breached', {
+          turnCount: this.turnCount,
+          maxTurns: this.maxTurns,
+        });
+      }
       this.abortFn();
       return;
     }
 
     if (this.totalCost >= this.maxCost) {
-      this.breached = true;
-      this.logger.warn('[BudgetGuard] cost limit breached', {
-        totalCost: this.totalCost,
-        maxCost: this.maxCost,
-      });
+      if (!this.breached) {
+        this.breached = true;
+        this.logger.warn('[BudgetGuard] cost limit breached', {
+          totalCost: this.totalCost,
+          maxCost: this.maxCost,
+        });
+      }
       this.abortFn();
     }
   }

@@ -103,6 +103,7 @@ import type {
   DeadLetteredBackgroundResult,
   SubAgentSnapshot,
   TrackedSubAgent,
+  BudgetScope,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
   ToolPermissionRequestContext,
@@ -811,12 +812,23 @@ export class AgentLoop {
     this.wireInternalEvents();
 
     // Set up BudgetGuard
-    const budgetGuardConfig: { maxTurns?: number; maxCost?: number } = {};
+    const budgetGuardConfig: {
+      maxTurns?: number;
+      maxCost?: number;
+      scope?: BudgetScope;
+      includeChildUsage?: boolean;
+    } = {};
     if (config.budgetGuard?.maxTurns !== undefined) {
       budgetGuardConfig.maxTurns = config.budgetGuard.maxTurns;
     }
     if (config.budgetGuard?.maxCost !== undefined) {
       budgetGuardConfig.maxCost = config.budgetGuard.maxCost;
+    }
+    if (config.budgetGuard?.scope !== undefined) {
+      budgetGuardConfig.scope = config.budgetGuard.scope;
+    }
+    if (config.budgetGuard?.includeChildUsage !== undefined) {
+      budgetGuardConfig.includeChildUsage = config.budgetGuard.includeChildUsage;
     }
     this.budgetGuard = new BudgetGuard(
       budgetGuardConfig,
@@ -1128,11 +1140,18 @@ export class AgentLoop {
     // intact for the next prompt.
     const silentBatch = fromDrain ? [] : this.queuedSilentDeliveries.splice(0);
 
-    this.toolRuntime.resetForLoop();
+    // Long-lived mode keeps workspace state (cwd, read-before-edit registry,
+    // undo history) across prompts; transient state resets regardless.
+    this.toolRuntime.resetForLoop(
+      this.config.persistentRuntime ? { preserveWorkspaceState: true } : undefined,
+    );
     // Budget limits cover the whole logical turn: reset here (once per
     // prompt) instead of on loop_start, which pi-agent-core emits again for
-    // every background-retry continuation.
-    this.budgetGuard.reset();
+    // every background-retry continuation. Under a lifetime budget scope the
+    // guard is never reset, so limits bound the loop's whole life.
+    if ((this.config.budgetGuard?.scope ?? 'prompt') === 'prompt') {
+      this.budgetGuard.reset();
+    }
     this._isPrompting = true;
     const loopStartMs = Date.now();
 

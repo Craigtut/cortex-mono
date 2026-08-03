@@ -518,4 +518,78 @@ describe('BudgetGuard', () => {
       expect(guard.isBreached()).toBe(true);
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Child usage inclusion (aggregate-guard plumbing)
+  // -----------------------------------------------------------------------
+
+  describe('includeChildUsage', () => {
+    it('counts forwarded child turns and cost when opted in', () => {
+      const guard = new BudgetGuard(
+        { maxTurns: Infinity, maxCost: Infinity, includeChildUsage: true },
+        abortFn,
+      );
+      guard.wire(bridge);
+
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+      bridge.forwardFrom(childBridge, 'child-1');
+
+      childSource.emit(turnEndWithCost(0.05));
+      source.emit(turnEndWithCost(0.02));
+
+      expect(guard.getTurnCount()).toBe(2);
+      expect(guard.getTotalCost()).toBeCloseTo(0.07);
+    });
+
+    it('aborts on child spend crossing the limit when opted in', () => {
+      const guard = new BudgetGuard(
+        { maxCost: 0.05, includeChildUsage: true },
+        abortFn,
+      );
+      guard.wire(bridge);
+
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+      bridge.forwardFrom(childBridge, 'child-1');
+
+      childSource.emit(turnEndWithCost(0.06));
+
+      expect(abortFn).toHaveBeenCalledTimes(1);
+      expect(guard.isBreached()).toBe(true);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Lifetime scope
+  // -----------------------------------------------------------------------
+
+  describe('lifetime scope', () => {
+    it('keeps aborting turns after a breach (a later prompt must not slip through)', () => {
+      const guard = new BudgetGuard({ maxTurns: 2, scope: 'lifetime' }, abortFn);
+      guard.wire(bridge);
+
+      source.emit({ type: 'turn_end' });
+      source.emit({ type: 'turn_end' }); // Breach
+      expect(abortFn).toHaveBeenCalledTimes(1);
+
+      // A prompt started after the breach: under lifetime scope nothing
+      // resets the guard, so its first turn must be aborted too.
+      source.emit({ type: 'turn_end' });
+      expect(abortFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('prompt scope still aborts only once per breach window', () => {
+      const guard = new BudgetGuard({ maxTurns: 2, scope: 'prompt' }, abortFn);
+      guard.wire(bridge);
+
+      source.emit({ type: 'turn_end' });
+      source.emit({ type: 'turn_end' }); // Breach
+      source.emit({ type: 'turn_end' });
+
+      expect(abortFn).toHaveBeenCalledTimes(1);
+    });
+  });
 });

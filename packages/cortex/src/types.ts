@@ -245,7 +245,33 @@ export interface AgentLoopConfig {
     maxTurns?: number;
     /** Maximum cost in USD before force-stopping the loop. Default: Infinity. */
     maxCost?: number;
+    /**
+     * What the limits span. `'prompt'` (default) resets the counters at each
+     * prompt, so limits bound one logical turn. `'lifetime'` never resets
+     * them, so limits bound the loop's whole life: the mode for a resident
+     * loop prompted many times per session, where a per-prompt `maxCost`
+     * would never trip. Once breached, a lifetime guard aborts every further
+     * turn, including turns of later prompts.
+     */
+    scope?: BudgetScope;
+    /**
+     * Whether forwarded sub-agent turn usage counts against this guard's
+     * limits. Default false (a loop's own guard bounds only its own turns;
+     * child spend is bounded by the child's guard). An aggregate guard that
+     * must cover a loop and everything it spawns sets this true.
+     */
+    includeChildUsage?: boolean;
   };
+
+  /**
+   * Keep tool-runtime workspace state (working directory, read-before-edit
+   * registry, undo history) across prompts instead of resetting it at each
+   * prompt start. For long-lived loops woken repeatedly by deliveries, where
+   * each wake continues one logical working session. Transient per-loop
+   * state (mutation lock, WebFetch rate-limit counter) still resets every
+   * prompt. Default false.
+   */
+  persistentRuntime?: boolean;
 
   /**
    * Background retry policy for transient turn failures. Sits above pi-ai's
@@ -753,6 +779,15 @@ export interface ToolCallEndPayload {
 // ---------------------------------------------------------------------------
 
 /**
+ * What a budget guard's limits span.
+ * - `'prompt'`: the owner resets counters at each prompt; limits bound one
+ *   logical turn (the historical behavior).
+ * - `'lifetime'`: counters are never reset; limits bound the guard's whole
+ *   life, and a breached guard keeps aborting turns started after the breach.
+ */
+export type BudgetScope = 'prompt' | 'lifetime';
+
+/**
  * Budget guard configuration with explicit limits.
  * Both default to Infinity (no enforcement).
  */
@@ -761,6 +796,14 @@ export interface BudgetGuardConfig {
   maxTurns: number;
   /** Maximum cost in USD. Default: Infinity. */
   maxCost: number;
+  /** What the limits span. Default: 'prompt'. */
+  scope?: BudgetScope;
+  /**
+   * Count forwarded child (sub-agent) turn_end usage against this guard's
+   * limits instead of skipping it. Default false. The plumbing an aggregate
+   * guard needs to bound a loop plus everything it spawns.
+   */
+  includeChildUsage?: boolean;
 }
 
 // ---------------------------------------------------------------------------
