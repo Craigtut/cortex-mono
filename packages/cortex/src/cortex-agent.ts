@@ -5306,13 +5306,18 @@ export class CortexAgent {
       attempts,
       lastError,
     });
+    // Items dead-lettered without ever entering a drain (teardown, a
+    // completion arriving mid-shutdown) have no formattedMessage yet, so
+    // format here to preserve the payload. Empty only when the source is
+    // already gone (a Bash completion landing after runtime teardown).
+    const message = item.formattedMessage ?? this.formatPendingCompletion(item) ?? '';
     const entry: DeadLetteredBackgroundResult = {
       kind: item.kind,
       taskId: item.taskId,
       attempts,
       lastError,
       deadLetteredAt: Date.now(),
-      message: item.formattedMessage ?? '',
+      message,
     };
     this.deadLetteredBackgroundResults.push(entry);
     const excess = this.deadLetteredBackgroundResults.length - MAX_DEAD_LETTERED_RESULTS;

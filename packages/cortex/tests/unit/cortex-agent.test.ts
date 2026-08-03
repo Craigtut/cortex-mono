@@ -2520,6 +2520,52 @@ You have 12 emotions.`;
       expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(1);
     });
 
+    it('records the formatted message body when teardown dead-letters a queued completion', async () => {
+      // A completion dead-lettered by teardown never went through a drain,
+      // so it has no formattedMessage yet. The dead-letter record must
+      // format it on the spot: teardown runs before the tool runtime is
+      // destroyed, so the Bash output is still readable there, and an empty
+      // message would make the output unrecoverable.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      seedCompletedTask(agent, 'task_sf1a', 'shutdown-orphaned output');
+      (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
+        { kind: 'bash', taskId: 'task_sf1a' },
+      );
+
+      await agent.destroy();
+
+      const dead = agent.getDeadLetteredBackgroundResults();
+      expect(dead).toHaveLength(1);
+      expect(dead[0].message).toContain('task_sf1a');
+      expect(dead[0].message).toContain('shutdown-orphaned output');
+    });
+
+    it('records the formatted message for a sub-agent result arriving after shutdown', async () => {
+      // Same gap on the other shutdown path: a completion arriving after
+      // teardown began is dead-lettered directly without a drain, so its
+      // message must be formatted at dead-letter time. Sub-agent items carry
+      // their result, so this works even after full teardown.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      await agent.destroy();
+
+      await internal.deliverOrQueueBackgroundCompletion({
+        kind: 'subagent',
+        taskId: 'sa_sf1b',
+        result: {
+          output: 'late findings',
+          status: 'completed',
+          usage: { turns: 1, cost: 0.01, durationMs: 100, contextTokens: 50 },
+        },
+      });
+
+      const dead = agent.getDeadLetteredBackgroundResults();
+      expect(dead).toHaveLength(1);
+      expect(dead[0].message).toContain('sa_sf1b');
+      expect(dead[0].message).toContain('late findings');
+    });
+
     it('dead-letters a completion that arrives after shutdown begins', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as InternalAgent;
