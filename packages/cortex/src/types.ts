@@ -1037,6 +1037,26 @@ export interface CortexCompactionConfig {
    */
   strategy?: 'observational' | 'classic';
 
+  /**
+   * Non-blocking posture: disable every synchronous LLM call inside
+   * transformContext, leaving emergency truncation as the only in-band
+   * fallback. For a presence loop whose turns must never stall on a
+   * multi-second observer or summarization call.
+   *
+   * - Observational strategy: activation still consumes already-buffered
+   *   chunks (instant), but the forced synchronous observer on the
+   *   unobserved tail and the pre-truncation catch-up observation are
+   *   skipped, and reflection at threshold swaps in a buffered result or
+   *   launches asynchronously instead of running inline.
+   * - Classic strategy: L2 summarization is skipped in-band (L1 trimming
+   *   and L3 truncation, both mechanical, still run).
+   *
+   * Explicit digestion entry points run the blocking work regardless, so an
+   * owner can schedule it during idle windows.
+   * @default false
+   */
+  nonBlocking?: boolean;
+
   /** Microcompaction (L1) configuration. Used when strategy is 'classic'. */
   microcompaction: MicrocompactionConfig;
   /** Conversation summarization (L2) configuration. Used when strategy is 'classic'. */

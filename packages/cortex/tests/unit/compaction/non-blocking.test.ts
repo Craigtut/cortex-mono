@@ -1,0 +1,246 @@
+/**
+ * Non-blocking compaction posture: with `nonBlocking: true`, no synchronous
+ * LLM call may run inside transformContext. Emergency truncation remains the
+ * only in-band fallback; observation and reflection happen through async
+ * buffering (or an explicit digestion call that re-enables blocking work via
+ * the allowBlocking override). Built for a presence loop whose turns must
+ * never stall on a multi-second observer or summarization call.
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { CompactionManager, buildCompactionConfig } from '../../../src/compaction/index.js';
+import { ObservationalMemoryEngine } from '../../../src/compaction/observational/index.js';
+import type { CompleteFn } from '../../../src/compaction/compaction.js';
+import type { AgentContext, AgentMessage } from '../../../src/context-manager.js';
+
+function makeUserMsg(content: string): AgentMessage {
+  return { role: 'user', content, timestamp: 0 };
+}
+
+function makeAssistantMsg(content: string): AgentMessage {
+  return { role: 'assistant', content, timestamp: 0 };
+}
+
+function buildHistory(turnCount: number): AgentMessage[] {
+  const history: AgentMessage[] = [];
+  for (let i = 1; i <= turnCount; i++) {
+    history.push(makeUserMsg(`User message ${i}`));
+    history.push(makeAssistantMsg(`Assistant response ${i}`));
+  }
+  return history;
+}
+
+function makeContext(messages: AgentMessage[]): AgentContext {
+  return {
+    systemPrompt: 'system',
+    model: null,
+    messages,
+    tools: [],
+    thinkingLevel: 'medium',
+  };
+}
+
+const OBSERVER_OUTPUT =
+  '<observations>\n* observed\n</observations>\n\n' +
+  '<current-task>\ntask\n</current-task>\n\n<suggested-response>\nnext\n</suggested-response>';
+
+describe('classic strategy under nonBlocking', () => {
+  function buildManager(nonBlocking: boolean): {
+    manager: CompactionManager;
+    complete: ReturnType<typeof vi.fn>;
+  } {
+    const manager = new CompactionManager(
+      buildCompactionConfig({ strategy: 'classic', nonBlocking }),
+      2,
+    );
+    manager.setContextWindow(200_000);
+    manager.setModelContextWindow(200_000);
+    const complete = vi.fn().mockResolvedValue('Summary of conversation');
+    manager.setCompleteFn(complete as unknown as CompleteFn);
+    return { manager, complete };
+  }
+
+  async function runOverL2Threshold(
+    manager: CompactionManager,
+    options?: { allowBlocking?: boolean },
+  ): Promise<AgentMessage[]> {
+    manager.updateCurrentContextTokenCount(150_000); // 75% > 70% L2 threshold
+    const slots = [makeUserMsg('slot1'), makeUserMsg('slot2')];
+    const history = buildHistory(10);
+    const context = makeContext([...slots, ...history]);
+    let sourceHistory = [...history];
+
+    await manager.applyInTransformContext(
+      context,
+      (ctx) => ctx.messages.slice(2),
+      (ctx, hist) => ({ ...ctx, messages: [...ctx.messages.slice(0, 2), ...hist] }),
+      () => sourceHistory,
+      (h) => { sourceHistory = h; },
+      options,
+    );
+    return sourceHistory;
+  }
+
+  it('skips in-band L2 summarization entirely', async () => {
+    const { manager, complete } = buildManager(true);
+    const source = await runOverL2Threshold(manager);
+
+    expect(complete).not.toHaveBeenCalled();
+    expect(source).toHaveLength(20); // untouched
+  });
+
+  it('control: the same call without nonBlocking summarizes', async () => {
+    const { manager, complete } = buildManager(false);
+    const source = await runOverL2Threshold(manager);
+
+    expect(complete).toHaveBeenCalled();
+    expect(source.length).toBeLessThan(20);
+  });
+
+  it('allowBlocking override re-enables the blocking work for one call', async () => {
+    const { manager, complete } = buildManager(true);
+    const source = await runOverL2Threshold(manager, { allowBlocking: true });
+
+    expect(complete).toHaveBeenCalled();
+    expect(source.length).toBeLessThan(20);
+  });
+
+  it('leaves L3 emergency truncation active as the only in-band path', async () => {
+    const { manager, complete } = buildManager(true);
+    manager.updateCurrentContextTokenCount(195_000); // 97.5% > 90% failsafe
+    const slots = [makeUserMsg('slot1'), makeUserMsg('slot2')];
+    const history = buildHistory(20);
+    const context = makeContext([...slots, ...history]);
+    let sourceHistory = [...history];
+
+    const result = await manager.applyInTransformContext(
+      context,
+      (ctx) => ctx.messages.slice(2),
+      (ctx, hist) => ({ ...ctx, messages: [...ctx.messages.slice(0, 2), ...hist] }),
+      () => sourceHistory,
+      (h) => { sourceHistory = h; },
+    );
+
+    expect(complete).not.toHaveBeenCalled();
+    expect(result.messages.length).toBeLessThan(context.messages.length);
+  });
+});
+
+describe('observational strategy under nonBlocking', () => {
+  it('skips the forced pre-truncation observation when over the failsafe threshold', async () => {
+    const manager = new CompactionManager(
+      buildCompactionConfig({ strategy: 'observational', nonBlocking: true }),
+      1,
+    );
+    manager.setContextWindow(100_000);
+    manager.setModelContextWindow(100_000);
+    const complete = vi.fn().mockResolvedValue(OBSERVER_OUTPUT);
+    manager.setObservationalCompleteFn(complete as unknown as CompleteFn);
+    manager.updateCurrentContextTokenCount(95_000); // over activation AND failsafe
+
+    const slots = [makeUserMsg('slot')];
+    const history = buildHistory(10);
+    const context = makeContext([...slots, ...history]);
+    let sourceHistory = [...history];
+
+    await manager.applyInTransformContext(
+      context,
+      (ctx) => ctx.messages.slice(1),
+      (ctx, hist) => ({ ...ctx, messages: [...ctx.messages.slice(0, 1), ...hist] }),
+      () => sourceHistory,
+      (h) => { sourceHistory = h; },
+    );
+
+    // No observer call anywhere in-band: neither the Step 2 forced sync
+    // observer nor the pre-L3 catch-up observation.
+    expect(complete).not.toHaveBeenCalled();
+  });
+});
+
+describe('ObservationalMemoryEngine allowSync', () => {
+  function buildEngine(): { engine: ObservationalMemoryEngine; complete: ReturnType<typeof vi.fn> } {
+    const engine = new ObservationalMemoryEngine({ activationThreshold: 0.5 }, 1);
+    engine.setContextWindow(100_000);
+    engine.setUtilityModelContextWindow(100_000);
+    const complete = vi.fn().mockResolvedValue(OBSERVER_OUTPUT);
+    engine.setCompleteFn(complete as unknown as CompleteFn);
+    return { engine, complete };
+  }
+
+  async function activate(
+    engine: ObservationalMemoryEngine,
+    source: AgentMessage[],
+    allowSync: boolean,
+  ): Promise<AgentMessage[]> {
+    let sourceHistory = [...source];
+    const context = makeContext([makeUserMsg('slot'), ...sourceHistory]);
+    await engine.applyInTransformContext(
+      context,
+      0.95,
+      1,
+      (ctx) => ctx.messages.slice(1),
+      (ctx, hist) => ({ ...ctx, messages: [...ctx.messages.slice(0, 1), ...hist] }),
+      () => sourceHistory,
+      (h) => { sourceHistory = h; },
+      { allowSync },
+    );
+    return sourceHistory;
+  }
+
+  it('with allowSync false, never runs the forced observer on the unobserved tail', async () => {
+    const { engine, complete } = buildEngine();
+    const source = buildHistory(5);
+
+    const surviving = await activate(engine, source, false);
+
+    expect(complete).not.toHaveBeenCalled();
+    // Nothing was observed, so nothing may be trimmed.
+    expect(surviving).toHaveLength(10);
+  });
+
+  it('control: with allowSync true, the forced observer runs and trims', async () => {
+    const { engine, complete } = buildEngine();
+    const source = buildHistory(5);
+
+    const surviving = await activate(engine, source, true);
+
+    expect(complete).toHaveBeenCalled();
+    expect(surviving).toHaveLength(0);
+  });
+
+  it('with allowSync false, reflection at threshold launches async instead of running inline', async () => {
+    const { engine } = buildEngine();
+    // Seed observations well past the reflection threshold via a manual
+    // trigger (the explicit digestion path, which stays synchronous).
+    const bigObservations =
+      '<observations>\n' + '* line\n'.repeat(30_000) + '</observations>';
+    const seedComplete = vi.fn().mockResolvedValue(bigObservations);
+    engine.setCompleteFn(seedComplete as unknown as CompleteFn);
+    await engine.triggerObservation([makeUserMsg('seed')], 0);
+
+    // Now a reflector-shaped completion that never settles: if reflection
+    // ran inline, activation below would hang; async launch keeps it
+    // in-flight without blocking.
+    const pendingComplete = vi.fn().mockReturnValue(new Promise<string>(() => {}));
+    engine.setCompleteFn(pendingComplete as unknown as CompleteFn);
+
+    const source = buildHistory(2);
+    let sourceHistory = [...source];
+    const context = makeContext([makeUserMsg('slot'), ...sourceHistory]);
+
+    const apply = engine.applyInTransformContext(
+      context,
+      0.95,
+      1,
+      (ctx) => ctx.messages.slice(1),
+      (ctx, hist) => ({ ...ctx, messages: [...ctx.messages.slice(0, 1), ...hist] }),
+      () => sourceHistory,
+      (h) => { sourceHistory = h; },
+      { allowSync: false },
+    );
+
+    // The apply call settles while the reflector completion is still
+    // pending: the blocking work moved off the in-band path.
+    await expect(apply).resolves.toBeDefined();
+    expect(engine.isReflectorInFlight()).toBe(true);
+  });
+});

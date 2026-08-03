@@ -188,6 +188,10 @@ export class ObservationalMemoryEngine {
    * @param setHistory - Set conversation history in the context (post-slot)
    * @param getSourceHistory - Get the original transcript history (agent.state.messages post-slot)
    * @param setSourceHistory - Replace the original transcript history
+   * @param options - allowSync (default true): whether synchronous LLM
+   *   calls may run inline. When false (the non-blocking posture),
+   *   activation only consumes already-buffered chunks, the Step 2 forced
+   *   observer is skipped, and reflection never runs inline.
    * @returns Modified context with updated observations and trimmed history
    */
   async applyInTransformContext(
@@ -198,10 +202,12 @@ export class ObservationalMemoryEngine {
     setHistory: (ctx: AgentContext, history: AgentMessage[]) => AgentContext,
     getSourceHistory: () => AgentMessage[],
     setSourceHistory: (history: AgentMessage[]) => void,
+    options?: { allowSync?: boolean },
   ): Promise<AgentContext> {
     if (utilization < this.config.activationThreshold) {
       return context;
     }
+    const allowSync = options?.allowSync ?? true;
 
     // --- Activation ---
     const sourceHistory = getSourceHistory();
@@ -246,7 +252,7 @@ export class ObservationalMemoryEngine {
     const netTokenReduction = trimmedMessageTokens - slotOverheadTokens;
     const postChunkUtilization = utilization - (this.contextWindow > 0 ? netTokenReduction / this.contextWindow : 0);
 
-    if (postChunkUtilization >= this.config.activationThreshold && this.completeFn) {
+    if (allowSync && postChunkUtilization >= this.config.activationThreshold && this.completeFn) {
       // Force sync observer on remaining unbuffered messages
       const unbufferedMessages = postChunkSource;
 
@@ -306,7 +312,7 @@ export class ObservationalMemoryEngine {
     }
 
     // Step 5: Handle reflection (may replace this.observations with condensed version)
-    await this.handleReflection();
+    await this.handleReflection(allowSync);
 
     // Step 6: Build slot content AFTER reflection so it contains post-reflection
     // observations. Previously this was captured before reflection, requiring
@@ -680,8 +686,12 @@ export class ObservationalMemoryEngine {
    * Determines whether reflection should run (sync, async, or none) based
    * on the current observation token count relative to the effective
    * reflection threshold.
+   *
+   * @param allowSync - When false (non-blocking posture), the sync branch
+   *   consumes a buffered reflection if one is ready (instant) but never
+   *   runs the reflector inline; it launches one asynchronously instead.
    */
-  private async handleReflection(): Promise<void> {
+  private async handleReflection(allowSync = true): Promise<void> {
     if (!this.completeFn) return;
 
     const effectiveThreshold = computeEffectiveReflectionThreshold(
@@ -720,7 +730,22 @@ export class ObservationalMemoryEngine {
         }
       }
 
-      // No buffered reflection, run synchronously
+      // No buffered reflection ready. Under the non-blocking posture the
+      // inline call is forbidden: launch (or keep) an async reflector so
+      // the condensed result buffers for a later swap-in instead.
+      if (!allowSync) {
+        if (!this.buffering.isReflectorInFlight()) {
+          this.buffering.launchReflector(
+            this.completeFn,
+            this.observations,
+            this.buildReflectorConfig(effectiveThreshold),
+            this.logger ?? undefined,
+          );
+        }
+        return;
+      }
+
+      // Run synchronously
       const output = await runReflector(
         this.completeFn,
         this.observations,

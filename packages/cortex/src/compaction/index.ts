@@ -111,6 +111,10 @@ export function buildCompactionConfig(
     config.strategy = partial.strategy;
   }
 
+  if (partial.nonBlocking !== undefined) {
+    config.nonBlocking = partial.nonBlocking;
+  }
+
   if (partial.observational !== undefined) {
     config.observational = partial.observational;
   }
@@ -781,6 +785,9 @@ export class CompactionManager {
    * @param setHistory - Function to set conversation history in the context
    * @param getSourceHistory - Function to get the original source transcript history (post-slot)
    * @param setSourceHistory - Function to replace the original source transcript history
+   * @param options - allowBlocking overrides the configured nonBlocking
+   *   posture for this call (an idle-digestion entry point runs the
+   *   synchronous work deliberately). Omitted: the config decides.
    * @returns Modified context with compacted history
    */
   async applyInTransformContext(
@@ -789,11 +796,17 @@ export class CompactionManager {
     setHistory: (ctx: AgentContext, history: AgentMessage[]) => AgentContext,
     getSourceHistory?: () => AgentMessage[],
     setSourceHistory?: (history: AgentMessage[]) => void,
+    options?: { allowBlocking?: boolean },
   ): Promise<AgentContext> {
     if (this._contextWindow <= 0) {
       // contextWindow not set, skip compaction
       return context;
     }
+
+    // Non-blocking posture: no synchronous LLM call may run in-band. Only
+    // mechanical work (chunk activation, L1 trimming, L3 truncation) is
+    // allowed unless the caller explicitly re-enables blocking work.
+    const allowBlocking = options?.allowBlocking ?? !(this.config.nonBlocking ?? false);
 
     let history = getHistory(context);
     if (history.length === 0) {
@@ -832,6 +845,7 @@ export class CompactionManager {
       // before they hit the LLM.
       context = await this.observationalEngine.applyInTransformContext(
         context, utilization, this.slotCount, getHistory, setHistory, getSourceHistory, setSourceHistory,
+        { allowSync: allowBlocking },
       );
       history = getHistory(context);
 
@@ -876,6 +890,7 @@ export class CompactionManager {
       });
 
       if (
+        allowBlocking &&
         this.completeFn &&
         getSourceHistory &&
         setSourceHistory &&
@@ -972,8 +987,15 @@ export class CompactionManager {
       if (shouldTruncate(totalNow, failsafeWindow, this.config.failsafe.threshold)) {
         // Force sync observation before L3 truncation to capture unobserved
         // content before it is dropped. The source history from getSourceHistory
-        // is already post-slot, so pass 0 as slotCount.
-        if (this._strategy === 'observational' && this.observationalEngine && getSourceHistory) {
+        // is already post-slot, so pass 0 as slotCount. Skipped under the
+        // non-blocking posture: truncation must be the ONLY in-band path
+        // there, even at the cost of dropping unobserved content.
+        if (
+          allowBlocking &&
+          this._strategy === 'observational' &&
+          this.observationalEngine &&
+          getSourceHistory
+        ) {
           const sourceHistory = getSourceHistory();
           await this.observationalEngine.triggerObservation(sourceHistory, 0);
         }
