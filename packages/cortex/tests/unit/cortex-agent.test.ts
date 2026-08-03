@@ -65,7 +65,19 @@ function createMockPiAgent(options?: {
         // Emit agent_start
         agent.emitEvent({ type: 'agent_start' });
 
+        // Mirrors pi-agent-core: the prompt message is pushed into
+        // state.messages at run start, BEFORE any model call, so it is in
+        // the transcript even when the run fails immediately after.
+        agent.state.messages.push({ role: 'user', content: input } as never);
+
         if (agent.promptError) {
+          // pi appends a synthetic assistant failure stub for a failed run.
+          agent.state.messages.push({
+            role: 'assistant',
+            content: [],
+            stopReason: 'error',
+            errorMessage: agent.promptError.message,
+          } as never);
           // Emit agent_end before throwing
           agent.emitEvent({ type: 'agent_end' });
           throw agent.promptError;
@@ -73,12 +85,15 @@ function createMockPiAgent(options?: {
 
         // Simulate a turn
         agent.emitEvent({ type: 'turn_start' });
-        agent.emitEvent({
-          type: 'turn_end',
-          text: typeof agent.promptResult === 'string'
-            ? agent.promptResult
-            : 'Mock response text',
-        });
+        const responseText = typeof agent.promptResult === 'string'
+          ? agent.promptResult
+          : 'Mock response text';
+        agent.emitEvent({ type: 'turn_end', text: responseText });
+        agent.state.messages.push({
+          role: 'assistant',
+          content: responseText,
+          stopReason: 'end_turn',
+        } as never);
 
         // Emit agent_end
         agent.emitEvent({ type: 'agent_end' });
@@ -415,7 +430,9 @@ describe('CortexAgent', () => {
 
     it('classifies rate limit errors', async () => {
       piAgent.promptError = new Error('Rate limit exceeded');
-      const agent = createTestCortexAgent(piAgent, config);
+      // Retry disabled: the mock leaves a resumable transcript, so a
+      // retryable category would otherwise schedule a real backoff wait.
+      const agent = createTestCortexAgent(piAgent, { ...config, retryPolicy: { enabled: false } });
 
       const errorHandler = vi.fn();
       agent.onError(errorHandler);
@@ -427,7 +444,7 @@ describe('CortexAgent', () => {
 
     it('classifies network errors', async () => {
       piAgent.promptError = new Error('ECONNREFUSED');
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestCortexAgent(piAgent, { ...config, retryPolicy: { enabled: false } });
 
       const errorHandler = vi.fn();
       agent.onError(errorHandler);
@@ -439,7 +456,7 @@ describe('CortexAgent', () => {
 
     it('swallows error handler exceptions', async () => {
       piAgent.promptError = new Error('Rate limit exceeded');
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestCortexAgent(piAgent, { ...config, retryPolicy: { enabled: false } });
 
       agent.onError(() => {
         throw new Error('Handler blew up');
@@ -936,7 +953,9 @@ You have 12 emotions.`;
 
     it('onError fires for classified errors', async () => {
       piAgent.promptError = new Error('Rate limit exceeded');
-      const agent = createTestCortexAgent(piAgent, config);
+      // Retry disabled: the mock leaves a resumable transcript, so a
+      // retryable category would otherwise schedule a real backoff wait.
+      const agent = createTestCortexAgent(piAgent, { ...config, retryPolicy: { enabled: false } });
 
       const handler = vi.fn();
       agent.onError(handler);
@@ -2125,7 +2144,14 @@ You have 12 emotions.`;
       });
     }
 
-    /** Replace piAgent.prompt with one that fails the first `failures` calls. */
+    /**
+     * Replace piAgent.prompt with one that fails the first `failures` calls.
+     * Failures mutate state.messages the way a real pi run does: the prompt
+     * message is pushed at run start (before any model call), then the
+     * synthetic assistant failure stub. Every realistic delivery failure
+     * happens after that push, so a re-queued delivery that does not unwind
+     * the transcript duplicates the completion body.
+     */
     function installFailingPrompt(failures: number): string[] {
       const originalPrompt = piAgent.prompt.bind(piAgent);
       const promptCalls: string[] = [];
@@ -2134,11 +2160,30 @@ You have 12 emotions.`;
         promptCalls.push(input);
         if (remaining > 0) {
           remaining -= 1;
+          piAgent.state.messages.push({ role: 'user', content: input } as never);
+          piAgent.state.messages.push({
+            role: 'assistant',
+            content: [],
+            stopReason: 'error',
+            errorMessage: 'delivery misconfigured',
+          } as never);
           throw new Error('delivery misconfigured');
         }
         return originalPrompt(input);
       };
       return promptCalls;
+    }
+
+    /** Role sequence of the post-slot transcript, for asserting on history. */
+    function historyRoles(agent: CortexAgent): string[] {
+      return (agent.getConversationHistory() as Array<{ role: string }>).map(m => m.role);
+    }
+
+    /** How many post-slot transcript messages contain `text` in their content. */
+    function historyOccurrences(agent: CortexAgent, text: string): number {
+      return (agent.getConversationHistory() as Array<{ content: unknown }>).filter(
+        m => typeof m.content === 'string' && m.content.includes(text),
+      ).length;
     }
 
     beforeEach(() => {
@@ -2163,6 +2208,30 @@ You have 12 emotions.`;
       expect(promptCalls[1]).toContain('durable output');
       expect(internal.pendingBackgroundResults).toHaveLength(0);
       expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(0);
+
+      // The failed attempt's transcript additions were unwound before the
+      // re-queue: the completion body appears exactly once, and no failure
+      // stub or duplicate user message survives.
+      expect(historyRoles(agent)).toEqual(['user', 'assistant']);
+      expect(historyOccurrences(agent, 'durable output')).toBe(1);
+    });
+
+    it('does not duplicate the completion message in history across re-queued attempts', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      seedCompletedTask(agent, 'task_dup', 'sixty-thousand-token payload');
+      installFailingPrompt(2);
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_dup' });
+
+      // Two failed attempts, then success. Each failed attempt pushed the
+      // delivery message into the transcript (pi does this at run start,
+      // before any model call); without unwinding, attempts 2 and 3 would
+      // append the identical body again and history would read
+      // user, user, user, assistant.
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(historyRoles(agent)).toEqual(['user', 'assistant']);
+      expect(historyOccurrences(agent, 'sixty-thousand-token payload')).toBe(1);
     });
 
     it('re-queues a failed sub-agent result delivery without losing the result', async () => {
@@ -2184,6 +2253,9 @@ You have 12 emotions.`;
       expect(promptCalls[1]).toContain('sa_1');
       expect(promptCalls[1]).toContain('research findings');
       expect(internal.pendingBackgroundResults).toHaveLength(0);
+      // The sub-agent result reaches the transcript exactly once.
+      expect(historyRoles(agent)).toEqual(['user', 'assistant']);
+      expect(historyOccurrences(agent, 'research findings')).toBe(1);
     });
 
     it('dead-letters a completion after repeated delivery failures', async () => {
@@ -2198,6 +2270,9 @@ You have 12 emotions.`;
       // permanently instead of redelivering forever.
       expect(promptCalls).toHaveLength(3);
       expect(internal.pendingBackgroundResults).toHaveLength(0);
+      // Every failed attempt was unwound; the dead-lettered body does not
+      // linger in the transcript (in any copy) after the final failure.
+      expect(historyRoles(agent)).toEqual([]);
 
       const dead = agent.getDeadLetteredBackgroundResults();
       expect(dead).toHaveLength(1);
@@ -2241,6 +2316,15 @@ You have 12 emotions.`;
           (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
             { kind: 'bash', taskId: 'task_b' },
           );
+          // Mirror pi: the prompt message and failure stub reach the
+          // transcript before the failure surfaces.
+          piAgent.state.messages.push({ role: 'user', content: input } as never);
+          piAgent.state.messages.push({
+            role: 'assistant',
+            content: [],
+            stopReason: 'error',
+            errorMessage: 'delivery misconfigured',
+          } as never);
           throw new Error('delivery misconfigured');
         }
         return originalPrompt(input);
@@ -2254,6 +2338,10 @@ You have 12 emotions.`;
       expect(promptCalls[1]).toContain('task_a');
       expect(promptCalls[1]).toContain('task_b');
       expect(internal.pendingBackgroundResults).toHaveLength(0);
+      // One combined delivery in history; each body exactly once.
+      expect(historyRoles(agent)).toEqual(['user', 'assistant']);
+      expect(historyOccurrences(agent, 'first output')).toBe(1);
+      expect(historyOccurrences(agent, 'second output')).toBe(1);
     });
   });
 });

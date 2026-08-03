@@ -1201,18 +1201,27 @@ export class CortexAgent {
     let count = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i] as unknown as Record<string, unknown>;
-      const isFailure =
-        msg['role'] === 'assistant' &&
-        (msg['stopReason'] === 'error' ||
-          msg['stopReason'] === 'aborted' ||
-          msg['errorMessage'] != null);
-      if (isFailure) {
+      if (CortexAgent.isTrimmableFailureMessage(msg)) {
         count += 1;
       } else {
         break;
       }
     }
     return count;
+  }
+
+  /**
+   * Whether a transcript message is a synthetic failure stub that trimming
+   * may remove: an assistant message pi appended for a failed or aborted
+   * run (stopReason 'error'/'aborted' or errorMessage set).
+   */
+  private static isTrimmableFailureMessage(msg: Record<string, unknown>): boolean {
+    return (
+      msg['role'] === 'assistant' &&
+      (msg['stopReason'] === 'error' ||
+        msg['stopReason'] === 'aborted' ||
+        msg['errorMessage'] != null)
+    );
   }
 
   /**
@@ -4997,15 +5006,24 @@ export class CortexAgent {
     if (firstAttemptTaskIds.length > 0) {
       this.fireBackgroundResultDeliveryHandlers(firstAttemptTaskIds);
     }
+    // pi pushes the delivery's user message into state.messages at run
+    // start, before any model call, so a failed delivery leaves that
+    // message (plus a synthetic failure stub) in the transcript. Captured
+    // here so the catch can unwind exactly what this attempt appended.
+    const preDeliveryCount = this.agent.state.messages.length;
     try {
       // fromDrain: deliver via a fresh loop even if a prior turn was
       // aborted; background completions are not cancelled by user abort.
       await this.runPromptOnce(message, undefined, true);
     } catch (err) {
-      // The delivery loop failed before completing: the results were spliced
-      // out but never reached the model, so put them back for another
-      // attempt (or dead-letter them) instead of dropping completed work.
-      this.requeueOrDeadLetter(batch, err);
+      // The delivery loop failed. Re-queue only when the delivery message
+      // could be unwound from the transcript (or never landed); if the run
+      // progressed past it, the body already lives in history where the
+      // next successful run will see it, and re-queueing would append the
+      // same completion a second time.
+      if (this.unwindFailedDelivery(preDeliveryCount)) {
+        this.requeueOrDeadLetter(batch, err);
+      }
       throw err;
     } finally {
       // Deliver anything that arrived during this delivery (including items
@@ -5014,6 +5032,52 @@ export class CortexAgent {
       // carries an attempt count and dead-letters at the cap.
       await this.drainPendingBackgroundResults();
     }
+  }
+
+  /**
+   * After a failed delivery attempt, restore the transcript to its
+   * pre-delivery state when possible. pi pushes the delivery's user message
+   * at run start (before any model call) and appends a synthetic assistant
+   * failure stub when the run fails; both must be removed before a
+   * re-attempt, or the re-queued delivery appends the same body again.
+   *
+   * Returns true when the delivery message is no longer in the transcript
+   * (unwound here, or it never landed), meaning the batch must be re-queued
+   * to survive. Returns false when the run progressed past the delivery
+   * message (a model response, tool results, or a steer landed after it):
+   * its content stays in history, so the completion counts as delivered and
+   * re-queueing would duplicate it.
+   */
+  private unwindFailedDelivery(preDeliveryCount: number): boolean {
+    const messages = this.agent.state.messages;
+    // Trim failure stubs appended during this run only; a stub predating
+    // the delivery belongs to an earlier turn and stays.
+    let end = messages.length;
+    while (end > preDeliveryCount) {
+      const msg = messages[end - 1] as unknown as Record<string, unknown>;
+      if (!CortexAgent.isTrimmableFailureMessage(msg)) break;
+      end -= 1;
+    }
+    if (end < messages.length) {
+      messages.splice(end, messages.length - end);
+    }
+    if (messages.length <= preDeliveryCount) {
+      // Nothing beyond the pre-delivery transcript survived (the failure
+      // hit before pi pushed the message, or only stubs landed): nothing
+      // to unwind, but the batch is not in history and must be re-queued.
+      // (`<` covers a mid-run compaction shrinking history; the recent
+      // tail survives compaction, so the delivery message is still there
+      // and this branch is not taken in that case.)
+      return messages.length === preDeliveryCount;
+    }
+    if (messages.length === preDeliveryCount + 1) {
+      const last = messages[messages.length - 1] as unknown as Record<string, unknown>;
+      if (last['role'] === 'user') {
+        messages.pop();
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
