@@ -71,6 +71,7 @@ import { DeferredToolRegistry } from './tools/tool-search/registry.js';
 import { createToolSearchTool, TOOL_SEARCH_TOOL_NAME } from './tools/tool-search/index.js';
 import { wrapModel, unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
+import { estimateTokens } from './token-estimator.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { PromptWatchdogDiagnostics } from './prompt-diagnostics.js';
@@ -222,6 +223,17 @@ const CHILD_SEED_CONTEXT_SLOT = '_seed_context';
  * line survives verbatim; the excess is cut, never summarized.
  */
 const RENDERED_REQUEST_MAX_CHARS = 500;
+
+/**
+ * Default hard token cap for the consumer-fed headline block. Injected
+ * user-role content is never trimmed by microcompaction, so an unbounded
+ * block would inflate utilization (triggering early source compaction)
+ * without itself shrinking; the cap is enforced here, not downstream.
+ */
+const DEFAULT_HEADLINE_MAX_TOKENS = 2_000;
+
+/** Marker appended when a headline block is cut at its token cap. */
+const HEADLINE_TRUNCATION_MARKER = '\n[headline block truncated]';
 
 const CORTEX_THINKING_LEVELS: readonly ThinkingLevel[] = [
   'off',
@@ -637,6 +649,12 @@ export class AgentLoop {
   // children's, so one query surfaces the whole subtree. Entries are removed
   // the moment an ask settles, however it settles.
   private readonly pendingAsks = new Map<string, PendingAsk>();
+
+  // Consumer-fed headline block: rebuilt from the provider on every LLM
+  // call, view-injected after the BP3 cache boundary (never in the cached
+  // prefix, never in the transcript), hard token-capped.
+  private headlineProvider: (() => string | null) | null = null;
+  private headlineMaxTokens = DEFAULT_HEADLINE_MAX_TOKENS;
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -1763,6 +1781,64 @@ export class AgentLoop {
     if (!ask) return false;
     ask.voiced = true;
     return true;
+  }
+
+  // -----------------------------------------------------------------------
+  // Headline feed
+  // -----------------------------------------------------------------------
+
+  /**
+   * Feed a consumer-built headline block (live task status, activity lines)
+   * into this loop's context. The provider is called on EVERY LLM call and
+   * its result is view-injected after the built-in background-task state,
+   * OUTSIDE the BP3 cache boundary: it churns per tick, so it must never
+   * extend the cached prefix, never enter the transcript, and is absent on
+   * compaction turns by design (like all view injections).
+   *
+   * The block is hard token-capped (default 2000 tokens; override via
+   * options.maxTokens): injected user-role content is never trimmed by
+   * microcompaction, so an unbounded block would inflate utilization and
+   * trigger early source compaction without itself shrinking.
+   *
+   * Pass null to stop injecting. A provider that throws or returns
+   * null/whitespace injects nothing for that call.
+   */
+  setHeadlineProvider(
+    provider: (() => string | null) | null,
+    options?: { maxTokens?: number },
+  ): void {
+    this.headlineProvider = provider;
+    if (options?.maxTokens !== undefined) {
+      if (!Number.isFinite(options.maxTokens) || options.maxTokens <= 0) {
+        throw new Error('setHeadlineProvider maxTokens must be a positive finite number');
+      }
+      this.headlineMaxTokens = options.maxTokens;
+    }
+  }
+
+  /**
+   * Build the capped headline injection for the current LLM call, or null
+   * when no provider is set or it produced nothing.
+   */
+  private buildHeadlineInjection(): string | null {
+    if (!this.headlineProvider) return null;
+    let content: string | null;
+    try {
+      content = this.headlineProvider();
+    } catch (err) {
+      this.logger.warn('headline provider threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+    if (!content || content.trim().length === 0) return null;
+    if (estimateTokens(content) <= this.headlineMaxTokens) return content;
+    // Hard cap: cut at the estimator's character budget, marker included.
+    const budgetChars = Math.max(
+      0,
+      this.headlineMaxTokens * 4 - HEADLINE_TRUNCATION_MARKER.length,
+    );
+    return content.slice(0, budgetChars) + HEADLINE_TRUNCATION_MARKER;
   }
 
   /** Track an ask for the lifetime of its resolver call. */
@@ -4033,6 +4109,15 @@ export class AgentLoop {
     const backgroundState = this.buildBackgroundTaskState();
     if (backgroundState) {
       injections.push({ role: 'user' as const, content: backgroundState, timestamp: Date.now() });
+    }
+
+    // Consumer-fed headline block (facade status lines). Like background
+    // task state it churns every tick, so it rides after the BP3 boundary
+    // (it is NOT counted in stableInjectionCount) while still being built
+    // here so token estimation and compaction utilization see it.
+    const headline = this.buildHeadlineInjection();
+    if (headline) {
+      injections.push({ role: 'user' as const, content: headline, timestamp: Date.now() });
     }
 
     if (injections.length > 0) {
