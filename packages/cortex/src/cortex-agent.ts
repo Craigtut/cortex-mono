@@ -1165,8 +1165,12 @@ export class CortexAgent {
         if (!willRetry) {
           // Signal "gave up" only when the retry budget was genuinely exhausted
           // (not when the transcript simply could not be resumed), and only if
-          // we had actually been retrying a transient failure.
+          // we had actually been retrying a transient failure. Never for a
+          // drain delivery: its ladder ending is not terminal (the batch is
+          // re-queued and the next attempt may succeed), so like onError the
+          // give-up signal is the chain root's to make (dead-letter).
           if (
+            !fromDrain &&
             retryIndex > 0 &&
             !aborted &&
             !policyAllowsRetry &&

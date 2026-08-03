@@ -2476,6 +2476,69 @@ You have 12 emotions.`;
       expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(1);
     });
 
+    it('does not fire onRetryExhausted when a drain attempt ladder ends but the re-queue recovers', async () => {
+      // A delivery attempt's in-run retry ladder ending is not terminal for
+      // a drain: the batch is re-queued and the next attempt may succeed.
+      // "Gave up after N attempts" must not reach the consumer for an
+      // attempt the chain recovered from, mirroring how onError is deferred
+      // to the chain root for drain deliveries.
+      config = createDefaultConfig({
+        retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 1 },
+      });
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const exhausted = vi.fn();
+      const errored = vi.fn();
+      agent.onRetryExhausted(exhausted);
+      agent.onError(errored);
+      seedCompletedTask(agent, 'task_n1', 'ladder-then-recovered output');
+
+      // First drain attempt: prompt fails, its one in-run retry (continue)
+      // fails too, exhausting the ladder. The re-queued second attempt
+      // delivers.
+      const originalPrompt = piAgent.prompt.bind(piAgent);
+      const promptCalls: string[] = [];
+      let failuresRemaining = 2;
+      const pushFailure = (): never => {
+        failuresRemaining -= 1;
+        piAgent.state.messages.push({
+          role: 'assistant',
+          content: [],
+          stopReason: 'error',
+          errorMessage: 'connect ECONNREFUSED',
+        } as never);
+        throw new Error('connect ECONNREFUSED');
+      };
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        promptCalls.push(input);
+        if (failuresRemaining > 0) {
+          piAgent.state.messages.push({ role: 'user', content: input } as never);
+          pushFailure();
+        }
+        return originalPrompt(input);
+      };
+      (piAgent as unknown as { continue: () => Promise<unknown> }).continue =
+        async (): Promise<unknown> => {
+          if (failuresRemaining > 0) pushFailure();
+          piAgent.state.messages.push({
+            role: 'assistant',
+            content: 'delivered',
+            stopReason: 'end_turn',
+          } as never);
+          return { content: 'delivered' };
+        };
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_n1' });
+
+      // The chain recovered: the completion was delivered and nothing
+      // surfaced to the consumer, exhaustion included.
+      expect(promptCalls).toHaveLength(2);
+      expect(historyOccurrences(agent, 'ladder-then-recovered output')).toBe(1);
+      expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(0);
+      expect(exhausted).not.toHaveBeenCalled();
+      expect(errored).not.toHaveBeenCalled();
+    });
+
     it('notifies onBackgroundResultDeadLettered when delivery gives up', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as InternalAgent;
