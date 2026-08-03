@@ -2476,6 +2476,82 @@ You have 12 emotions.`;
       expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(1);
     });
 
+    it('notifies onBackgroundResultDeadLettered when delivery gives up', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const deadLettered = vi.fn();
+      agent.onBackgroundResultDeadLettered(deadLettered);
+      seedCompletedTask(agent, 'task_s5a', 'undeliverable output');
+      installFailingPrompt(10);
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s5a' });
+
+      expect(deadLettered).toHaveBeenCalledTimes(1);
+      expect(deadLettered.mock.calls[0][0]).toMatchObject({
+        kind: 'bash',
+        taskId: 'task_s5a',
+        attempts: 3,
+      });
+      expect(deadLettered.mock.calls[0][0].message).toContain('undeliverable output');
+    });
+
+    it('dead-letters completions still queued when the agent is destroyed', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const deadLettered = vi.fn();
+      agent.onBackgroundResultDeadLettered(deadLettered);
+      // Queue directly without scheduling a drain, simulating a completion
+      // the shutdown raced.
+      (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
+        { kind: 'bash', taskId: 'task_s5b' },
+      );
+
+      await agent.destroy();
+
+      // Recorded and announced (handlers were still registered when the
+      // teardown dead-lettered it), not silently dropped.
+      expect(deadLettered).toHaveBeenCalledTimes(1);
+      expect(deadLettered.mock.calls[0][0]).toMatchObject({
+        kind: 'bash',
+        taskId: 'task_s5b',
+        lastError: 'agent shut down before delivery',
+      });
+      // The record survives destroy() for post-mortem inspection.
+      expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(1);
+    });
+
+    it('dead-letters a completion that arrives after shutdown begins', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      await agent.destroy();
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s5c' });
+
+      const dead = agent.getDeadLetteredBackgroundResults();
+      expect(dead).toHaveLength(1);
+      expect(dead[0]).toMatchObject({
+        taskId: 'task_s5c',
+        lastError: 'agent shut down before delivery',
+      });
+    });
+
+    it('evicts the oldest dead-letter entries once the cap is exceeded', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      await agent.destroy();
+
+      // Every arrival during shutdown dead-letters; push past the 50 cap.
+      for (let i = 0; i < 55; i++) {
+        await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: `task_cap_${i}` });
+      }
+
+      const dead = agent.getDeadLetteredBackgroundResults();
+      expect(dead).toHaveLength(50);
+      // Oldest five were evicted; the list keeps the newest 50 in order.
+      expect(dead[0].taskId).toBe('task_cap_5');
+      expect(dead[49].taskId).toBe('task_cap_54');
+    });
+
     it('fires onBackgroundResultDelivery once per completion, not per attempt', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as InternalAgent;

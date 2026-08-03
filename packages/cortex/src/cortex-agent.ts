@@ -508,6 +508,7 @@ export class CortexAgent {
   private subAgentCompletedHandlers: Array<(taskId: string, result: string, status: string, usage: unknown) => void> = [];
   private subAgentFailedHandlers: Array<(taskId: string, error: string) => void> = [];
   private backgroundResultDeliveryHandlers: Array<(taskIds: string[]) => void> = [];
+  private backgroundResultDeadLetterHandlers: Array<(result: DeadLetteredBackgroundResult) => void> = [];
   private pendingBackgroundResults: PendingBackgroundCompletion[] = [];
   private deadLetteredBackgroundResults: DeadLetteredBackgroundResult[] = [];
 
@@ -3051,6 +3052,19 @@ export class CortexAgent {
   }
 
   /**
+   * Register a handler that fires when a background completion is
+   * dead-lettered: delivery gave up (attempts exhausted, elapsed budget
+   * spent, or a fatal error) or the agent shut down before delivering it.
+   * The consumer can surface the result to the user or re-drive the work;
+   * Cortex will not retry it.
+   */
+  onBackgroundResultDeadLettered(
+    handler: (result: DeadLetteredBackgroundResult) => void,
+  ): void {
+    this.backgroundResultDeadLetterHandlers.push(handler);
+  }
+
+  /**
    * Get the EventBridge for direct event access.
    * Consumers that need raw event data (for logging) can subscribe directly.
    */
@@ -4329,6 +4343,15 @@ export class CortexAgent {
     // lifecycle is 'destroying'). Bounded by destroy()'s force-kill race.
     await this.loopGateTail;
 
+    // 1c. Dead-letter completions still awaiting delivery. The queued drain
+    // tasks above no-oped once teardown began, so anything still pending
+    // will never be delivered; record it (and notify handlers, which are
+    // still registered at this point) rather than letting completed work
+    // vanish with the shutdown.
+    for (const item of this.pendingBackgroundResults.splice(0)) {
+      this.deadLetterBackgroundResult(item, 'agent shut down before delivery');
+    }
+
     // 2. Cancel all sub-agents. Full child destroy(), not just a pi-level
     // abort: an abort alone left the child's MCP connections, event
     // subscriptions, and compaction timers alive until (and unless) its
@@ -4390,8 +4413,12 @@ export class CortexAgent {
     this.subAgentCompletedHandlers = [];
     this.subAgentFailedHandlers = [];
     this.backgroundResultDeliveryHandlers = [];
+    this.backgroundResultDeadLetterHandlers = [];
     this.pendingBackgroundResults = [];
-    this.deadLetteredBackgroundResults = [];
+    // deadLetteredBackgroundResults is deliberately NOT cleared: it is the
+    // consumer's bounded post-mortem record of undelivered completed work,
+    // and getDeadLetteredBackgroundResults() must still answer after
+    // destroy() (which itself dead-letters anything still pending).
   }
 
   /**
@@ -5021,13 +5048,20 @@ export class CortexAgent {
   private async deliverOrQueueBackgroundCompletion(
     item: PendingBackgroundCompletion,
   ): Promise<void> {
-    if (this.isShuttingDown()) return;
     // A cancelled sub-agent can settle after its cancel (its completion path
-    // survives the abort); its result must never wake the loop.
+    // survives the abort); its result must never wake the loop. Checked
+    // before the shutdown gate: work discarded on purpose is not
+    // dead-letter material, even when the discard happens mid-teardown.
     if (item.kind === 'subagent' && this.subAgentManager.isCancelled(item.taskId)) {
       this.logger.info('[CortexAgent] dropping result of cancelled subagent', {
         taskId: item.taskId,
       });
+      return;
+    }
+    // Completed work arriving during teardown will never be delivered:
+    // record it as dead-lettered instead of dropping it silently.
+    if (this.isShuttingDown()) {
+      this.deadLetterBackgroundResult(item, 'agent shut down before delivery');
       return;
     }
 
@@ -5250,28 +5284,54 @@ export class CortexAgent {
         requeue.push(item);
         continue;
       }
-      this.logger.error('[CortexAgent] background result dead-lettered', {
-        kind: item.kind,
-        taskId: item.taskId,
-        attempts,
-        lastError,
-      });
-      this.deadLetteredBackgroundResults.push({
-        kind: item.kind,
-        taskId: item.taskId,
-        attempts,
-        lastError,
-        deadLetteredAt: Date.now(),
-        message: item.formattedMessage ?? '',
-      });
-      if (this.deadLetteredBackgroundResults.length > MAX_DEAD_LETTERED_RESULTS) {
-        this.deadLetteredBackgroundResults.splice(
-          0,
-          this.deadLetteredBackgroundResults.length - MAX_DEAD_LETTERED_RESULTS,
-        );
-      }
+      this.deadLetterBackgroundResult(item, lastError);
     }
     this.pendingBackgroundResults.unshift(...requeue);
+  }
+
+  /**
+   * Record a completion the agent gives up on delivering: log it, append it
+   * to the bounded dead-letter list, and notify
+   * onBackgroundResultDeadLettered handlers. Cap evictions are logged,
+   * since an evicted entry is completed work vanishing for good.
+   */
+  private deadLetterBackgroundResult(
+    item: PendingBackgroundCompletion,
+    lastError: string,
+  ): void {
+    const attempts = item.deliveryAttempts ?? 0;
+    this.logger.error('[CortexAgent] background result dead-lettered', {
+      kind: item.kind,
+      taskId: item.taskId,
+      attempts,
+      lastError,
+    });
+    const entry: DeadLetteredBackgroundResult = {
+      kind: item.kind,
+      taskId: item.taskId,
+      attempts,
+      lastError,
+      deadLetteredAt: Date.now(),
+      message: item.formattedMessage ?? '',
+    };
+    this.deadLetteredBackgroundResults.push(entry);
+    const excess = this.deadLetteredBackgroundResults.length - MAX_DEAD_LETTERED_RESULTS;
+    if (excess > 0) {
+      const evicted = this.deadLetteredBackgroundResults.splice(0, excess);
+      this.logger.warn('[CortexAgent] dead-letter cap reached; evicting oldest entries', {
+        cap: MAX_DEAD_LETTERED_RESULTS,
+        evicted: evicted.map((e) => ({ kind: e.kind, taskId: e.taskId })),
+      });
+    }
+    for (const handler of this.backgroundResultDeadLetterHandlers) {
+      try {
+        handler(entry);
+      } catch (err) {
+        this.logger.error('[CortexAgent] onBackgroundResultDeadLettered handler threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   /**
