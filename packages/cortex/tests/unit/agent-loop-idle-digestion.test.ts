@@ -292,11 +292,10 @@ describe('digestIdle and deliver interleaving', () => {
     await waitUntil(() => complete.mock.calls.length === 1);
 
     // The gate is held by the digest, which never starts a pi run. Without
-    // the sweep, this steer parks in pi's queue with nothing to drain it
-    // and surfaces only in some unrelated later run (an unprompted
-    // response), while the caller was told 'steered'.
+    // the sweep, the parked content would wait for some unrelated later
+    // run (an unprompted response) instead of getting a run of its own.
     const result = loop.deliver('urgent while digesting');
-    expect(result.outcome).toBe('steered');
+    expect(result.outcome).toBe('parked');
 
     releaseObserver(OBSERVER_OUTPUT);
     await digestion;

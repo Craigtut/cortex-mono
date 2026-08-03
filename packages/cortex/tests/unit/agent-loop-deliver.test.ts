@@ -5,10 +5,11 @@
  * modes, queue clears).
  *
  * The load-bearing assertions here mirror docs/cortex/duplex/log-and-context.md:
- * silent (no-wake) content must NEVER touch pi's steering queue in any run
- * state, and a message delivered into a running turn extends that turn
- * (inheriting its budget window and consumer promise) rather than starting
- * a new one.
+ * NO deliver() content ever touches pi's steering queue (that queue belongs
+ * to the public steer() API alone), silent (no-wake) content waits for the
+ * next real prompt, and wake content parked while the gate is held opens
+ * the NEXT run exactly once: as leading batch messages of a prompt queued
+ * ahead of the sweep, or through the sweep's own run.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { AgentLoop } from '../../src/agent-loop.js';
@@ -20,7 +21,14 @@ import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 
 // ---------------------------------------------------------------------------
-// Mock PiAgent with steer/followUp queues and a controllable hanging run
+// Mock PiAgent with steering/follow-up queues and a run that can hold at
+// steering-poll boundaries. `holds` counts turn boundaries the next run
+// pauses at (each drains the steering queue when released, like pi does
+// after a tool batch); `finalHold` pauses once more AFTER the run's last
+// steering poll, modeling the tail of a real run (follow-up poll, agent_end
+// listeners, promise unwinding) where arriving content has no poll left to
+// drain it. That window is exactly where the old reconciliation-based
+// parking duplicated or destroyed content.
 // ---------------------------------------------------------------------------
 
 interface DeliverMockPiAgent extends PiAgent {
@@ -32,8 +40,14 @@ interface DeliverMockPiAgent extends PiAgent {
   clearFollowUpQueueCalls: number;
   /** Messages steered but not yet drained by a run (mirrors pi's queue). */
   steeringQueue: Array<{ role: string; content: string }>;
-  /** When true, the next run stays in flight until releaseRun() is called. */
-  hangNextRun: boolean;
+  /** Messages queued for a would-stop point (mirrors pi's follow-up queue). */
+  followUpQueue: Array<{ role: string; content: string }>;
+  /** Steering polls made so far (run start and each released hold). */
+  polls: number;
+  /** Number of turn-boundary holds the next run pauses at. */
+  holds: number;
+  /** When true, the next run pauses once more AFTER its last steering poll. */
+  finalHold: boolean;
   releaseRun: () => void;
 }
 
@@ -55,7 +69,10 @@ function createMockPiAgent(): DeliverMockPiAgent {
     clearSteeringQueueCalls: 0,
     clearFollowUpQueueCalls: 0,
     steeringQueue: [],
-    hangNextRun: false,
+    followUpQueue: [],
+    polls: 0,
+    holds: 0,
+    finalHold: false,
 
     subscribe(handler: (event: PiEvent) => void): () => void {
       eventHandler = handler;
@@ -80,19 +97,31 @@ function createMockPiAgent(): DeliverMockPiAgent {
           : [{ role: 'user', content: input, timestamp: Date.now() }];
         agent.state.messages.push(...messages);
         // Pi polls the steering queue at run start.
+        agent.polls += 1;
         agent.state.messages.push(
           ...(agent.steeringQueue.splice(0) as AgentMessage[]),
         );
 
-        if (agent.hangNextRun) {
-          agent.hangNextRun = false;
+        const holds = agent.holds;
+        agent.holds = 0;
+        for (let i = 0; i < holds; i += 1) {
           await new Promise<void>((resolve) => {
             releaseRun = resolve;
           });
           // ... and again at every turn boundary within the run.
+          agent.polls += 1;
           agent.state.messages.push(
             ...(agent.steeringQueue.splice(0) as AgentMessage[]),
           );
+        }
+
+        if (agent.finalHold) {
+          agent.finalHold = false;
+          // Past the run's last steering poll: whatever arrives now has no
+          // poll left inside this run.
+          await new Promise<void>((resolve) => {
+            releaseRun = resolve;
+          });
         }
 
         agent.emitEvent({ type: 'turn_end', text: 'ok' });
@@ -142,6 +171,7 @@ function createMockPiAgent(): DeliverMockPiAgent {
 
     followUp(message: { role: string; content: string }): void {
       agent.followUpCalls.push(message);
+      agent.followUpQueue.push(message);
     },
 
     clearSteeringQueue(): void {
@@ -150,11 +180,12 @@ function createMockPiAgent(): DeliverMockPiAgent {
     },
 
     hasQueuedMessages(): boolean {
-      return agent.steeringQueue.length > 0;
+      return agent.steeringQueue.length > 0 || agent.followUpQueue.length > 0;
     },
 
     clearFollowUpQueue(): void {
       agent.clearFollowUpQueueCalls += 1;
+      agent.followUpQueue = [];
     },
   };
 
@@ -186,6 +217,11 @@ function contentOf(message: AgentMessage): string {
   return typeof message.content === 'string' ? message.content : JSON.stringify(message.content);
 }
 
+/** Times `needle` appears across the transcript (duplication detector). */
+function occurrences(agent: DeliverMockPiAgent, needle: string): number {
+  return agent.state.messages.filter((m) => contentOf(m).includes(needle)).length;
+}
+
 /** Poll until `predicate` holds; fails the test after `timeoutMs`. */
 async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -209,46 +245,66 @@ describe('AgentLoop.deliver', () => {
     expect(piAgent.steerCalls).toEqual([]);
   });
 
-  it('delivery into a running turn steers, extending that turn instead of starting a new one', async () => {
+  it('delivery into a running turn parks and opens the next run, not the one in flight', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
     const resetSpy = vi.spyOn(loop.getBudgetGuard(), 'reset');
 
-    piAgent.hangNextRun = true;
+    piAgent.holds = 1;
     const turn = loop.prompt('long task');
-    // Let the gate task dequeue and the run start.
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await waitUntil(() => piAgent.promptCalls.length === 1);
 
     const result = loop.deliver('mid-run redirect');
 
-    expect(result.outcome).toBe('steered');
-    // No separate promise: the delivery rides the in-flight turn's promise.
+    expect(result.outcome).toBe('parked');
+    // No separate promise: the parked content has no turn until a run
+    // consumes it; that run's failures surface through onError.
     expect(result.turn).toBeUndefined();
-    expect(piAgent.steerCalls).toEqual([{ role: 'user', content: 'mid-run redirect' }]);
-    // No second prompt cycle: the message extends the running logical turn,
-    // so the budget window was reset exactly once (for the original prompt).
-    expect(piAgent.promptCalls).toHaveLength(1);
-    expect(resetSpy).toHaveBeenCalledTimes(1);
+    // Wake content never enters pi's steering queue (public steer() only).
+    expect(piAgent.steerCalls).toEqual([]);
+    expect(loop.pendingWakeDeliveryCount).toBe(1);
 
-    // The consumer promise of the ORIGINAL turn is the one that settles.
     piAgent.releaseRun();
-    await expect(turn).resolves.toBeDefined();
-    expect(resetSpy).toHaveBeenCalledTimes(1);
+    await turn;
+    // The in-flight run never carried the parked content (its prompt was
+    // the plain string, and nothing was steered into it): the accepted
+    // cost of exact parking is a bounded one-run delay.
+    expect(piAgent.promptCalls[0]).toBe('long task');
+
+    // The sweep then delivers it with a run of its own, exactly once.
+    await waitUntil(() => piAgent.promptCalls.length === 2);
+    expect(piAgent.promptCalls[1]).toBe('mid-run redirect');
+    await waitUntil(() => !loop.isLoopActive);
+    expect(occurrences(piAgent, 'mid-run redirect')).toBe(1);
+    // Two logical turns, each with its own budget window.
+    expect(resetSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('same-frame delivery after prompt() (gate held, pi idle) steers instead of throwing', async () => {
+  it('same-frame delivery after prompt() parks and rides that prompt as a leading batch message', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
 
     const turn = loop.prompt('first');
     // Same synchronous frame: the gate is held but pi has not started yet.
-    // This is the "gate held, pi idle" state (same shape as retry backoff
-    // and the drain window). prompt() would throw here; deliver() must not.
+    // prompt() would throw here; deliver() parks, and the already-queued
+    // prompt splices the parked content to the front of its batch.
     const result = loop.deliver('same frame delivery');
 
-    expect(result.outcome).toBe('steered');
-    expect(piAgent.steerCalls).toEqual([{ role: 'user', content: 'same frame delivery' }]);
+    expect(result.outcome).toBe('parked');
     await turn;
+    expect(piAgent.steerCalls).toEqual([]);
+    const batch = piAgent.promptCalls[0]!;
+    expect(Array.isArray(batch)).toBe(true);
+    expect((batch as AgentMessage[]).map((m) => contentOf(m))).toEqual([
+      'same frame delivery',
+      'first',
+    ]);
+
+    // The splice cleared the parked list at batch time, so the sweep finds
+    // nothing and starts no second run.
+    await waitUntil(() => !loop.isLoopActive);
+    expect(piAgent.promptCalls).toHaveLength(1);
+    expect(occurrences(piAgent, 'same frame delivery')).toBe(1);
   });
 
   it('silent delivery while idle queues on the loop, never on pi', () => {
@@ -269,9 +325,9 @@ describe('AgentLoop.deliver', () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
 
-    piAgent.hangNextRun = true;
+    piAgent.holds = 1;
     const turn = loop.prompt('long task');
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await waitUntil(() => piAgent.promptCalls.length === 1);
 
     const result = loop.deliver('silent while running', { wake: false });
 
@@ -376,49 +432,32 @@ describe('AgentLoop.deliver', () => {
 });
 
 describe('AgentLoop.deliver run guarantee (sweep)', () => {
-  it('a wake delivery steered while the gate is held by an empty drain still runs a turn', async () => {
+  it('a wake delivery parked while the gate is held by an empty drain still runs a turn', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
     await loop.prompt('warm up');
     piAgent.promptCalls = [];
 
     // Schedule a drain with nothing to deliver: it dequeues, finds the
-    // pending queue empty, and returns while still holding the gate. A
-    // steer landing in that window has no run to drain it.
+    // pending queue empty, and returns while still holding the gate. No
+    // run will start on its own for content parked in that window.
     const drain = (loop as unknown as {
       schedulePendingResultDelivery: () => Promise<void>;
     }).schedulePendingResultDelivery();
     const result = loop.deliver('urgent redirect');
-    expect(result.outcome).toBe('steered');
+    expect(result.outcome).toBe('parked');
 
     await drain;
-    // The sweep queued behind the drain converts the parked steer into a
-    // real run instead of leaving it for an unrelated later run.
+    // The sweep queued behind the drain delivers the parked content with a
+    // run of its own instead of leaving it for an unrelated later run.
     await waitUntil(() => piAgent.promptCalls.length === 1);
     expect(piAgent.promptCalls[0]).toBe('urgent redirect');
-    expect(piAgent.steeringQueue).toEqual([]);
+    expect(piAgent.steerCalls).toEqual([]);
     await waitUntil(() => !loop.isLoopActive);
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
   });
 
-  it('does not start a second run for a delivery steered into a live run', async () => {
-    const piAgent = createMockPiAgent();
-    const loop = createLoop(piAgent);
-    piAgent.hangNextRun = true;
-    const turn = loop.prompt('long task');
-    await waitUntil(() => piAgent.promptCalls.length === 1);
-
-    expect(loop.deliver('mid-run redirect').outcome).toBe('steered');
-    piAgent.releaseRun();
-    await turn;
-
-    // The boundary poll drained the steer into the live run; the sweep must
-    // conclude nothing is parked rather than re-delivering the content.
-    await waitUntil(() => !loop.isLoopActive);
-    expect(piAgent.promptCalls).toHaveLength(1);
-    expect(piAgent.state.messages.map(contentOf)).toContain('mid-run redirect');
-  });
-
-  it('clearing the steering queue also clears the sweep record', async () => {
+  it('clearAllQueues drops parked wake deliveries so the sweep finds nothing', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
     await loop.prompt('warm up');
@@ -428,12 +467,183 @@ describe('AgentLoop.deliver run guarantee (sweep)', () => {
       schedulePendingResultDelivery: () => Promise<void>;
     }).schedulePendingResultDelivery();
     loop.deliver('will be cleared');
-    loop.clearSteeringQueue();
+    const dropped = loop.clearAllQueues();
+    expect(dropped).toEqual(['will be cleared']);
 
     await drain;
     await waitUntil(() => !loop.isLoopActive);
-    // Content the caller explicitly cleared is not resurrected by the sweep.
+    // Content the caller explicitly dropped is not resurrected by the sweep.
     expect(piAgent.promptCalls).toHaveLength(0);
+  });
+});
+
+// The interleavings the duplex facade generates by design: a run drains one
+// message at a boundary poll while another lands after the run's last poll.
+// The old reconciliation-based parking (steer into pi's queue, inspect
+// hasQueuedMessages() afterwards) duplicated the drained content (BL1),
+// destroyed public steer() content with clearSteeringQueue() (BL2), and
+// re-delivered drained content whenever a follow-up sat queued (SF1).
+describe('AgentLoop.deliver exactness under partial-drain interleavings', () => {
+  it('a delivery mid-run plus one after the last poll are each delivered exactly once (BL1)', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+
+    piAgent.holds = 1;
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    // C1 lands mid-run, before the run's remaining boundary poll.
+    loop.deliver('C1-first');
+    piAgent.releaseRun();
+    await waitUntil(() => piAgent.polls === 2);
+
+    // C2 lands after the run's last poll.
+    loop.deliver('C2-second');
+    piAgent.releaseRun();
+    await turn;
+
+    await waitUntil(() => !loop.isLoopActive);
+    expect(occurrences(piAgent, 'C1-first')).toBe(1);
+    expect(occurrences(piAgent, 'C2-second')).toBe(1);
+  });
+
+  it('a public steer() parked after the last poll is not destroyed by the sweep (BL2)', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+
+    piAgent.holds = 1;
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    loop.deliver('D-delivery');
+    piAgent.releaseRun();
+    await waitUntil(() => piAgent.polls === 2);
+
+    // An unrelated public steer() lands after the run's last steering poll
+    // and parks in pi's queue.
+    loop.steer('S-plain-steer');
+    piAgent.releaseRun();
+    await turn;
+
+    await waitUntil(() => !loop.isLoopActive);
+    // The sweep never blanket-clears pi's queue: the parked steer drains
+    // into the next run start (here the sweep's own run), exactly once.
+    expect(piAgent.clearSteeringQueueCalls).toBe(0);
+    expect(occurrences(piAgent, 'S-plain-steer')).toBe(1);
+    expect(occurrences(piAgent, 'D-delivery')).toBe(1);
+  });
+
+  it('a queued follow-up does not trigger re-delivery of consumed content (SF1)', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+
+    piAgent.holds = 1;
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    loop.deliver('F-delivery');
+    piAgent.releaseRun();
+    await waitUntil(() => piAgent.polls === 2);
+
+    // A consumer queues a follow-up near the run's end. The old sweep read
+    // this as "something is still parked" and re-ran the whole record.
+    loop.followUp('later thought');
+    piAgent.releaseRun();
+    await turn;
+
+    await waitUntil(() => !loop.isLoopActive);
+    expect(occurrences(piAgent, 'F-delivery')).toBe(1);
+  });
+});
+
+describe('AgentLoop.deliver sweep failure recovery', () => {
+  it('unwinds a failed sweep run and re-delivers the parked content exactly once', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const errored = vi.fn();
+    loop.onError(errored);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    // The first sweep run fails after an assistant tool-call turn but
+    // before its tool results: the surviving tail carries an unpaired tool
+    // call, a hard provider error on the very next request if left there.
+    let failuresLeft = 1;
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      if (failuresLeft > 0) {
+        failuresLeft -= 1;
+        piAgent.state.messages.push({
+          role: 'assistant',
+          content: [{ type: 'toolCall', id: 'call_1', name: 'Bash', arguments: {} }],
+        } as never);
+        throw new Error('provider dropped mid-batch');
+      }
+      piAgent.state.messages.push({
+        role: 'assistant',
+        content: 'ok',
+        timestamp: Date.now(),
+      });
+      return { content: 'ok' };
+    };
+
+    const drain = (loop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    loop.deliver('parked content');
+    await drain;
+
+    // The failed run was unwound and the content re-parked; the follow-up
+    // sweep delivers it. Exactly one copy survives, no unpaired tool call
+    // lingers, and the recovered failure never surfaced through onError.
+    await waitUntil(() => occurrences(piAgent, 'parked content') === 1 && !loop.isLoopActive);
+    expect(piAgent.promptCalls).toHaveLength(2);
+    expect(piAgent.state.messages.some((m) => Array.isArray(m.content))).toBe(false);
+    expect(errored).not.toHaveBeenCalled();
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+  });
+
+  it('drops parked content after repeated failed sweep runs instead of looping', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const errored = vi.fn();
+    loop.onError(errored);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      piAgent.state.messages.push({
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'call_1', name: 'Bash', arguments: {} }],
+      } as never);
+      throw new Error('provider dropped mid-batch');
+    };
+
+    const drain = (loop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    loop.deliver('doomed content');
+    await drain;
+
+    await waitUntil(() => errored.mock.calls.length === 1 && !loop.isLoopActive);
+    // Exactly the capped number of attempts, then the content is dropped
+    // (surfacing through onError once) and the transcript is left clean.
+    expect(piAgent.promptCalls).toHaveLength(3);
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+    expect(occurrences(piAgent, 'doomed content')).toBe(0);
+    expect(piAgent.state.messages.some((m) => Array.isArray(m.content))).toBe(false);
   });
 });
 
@@ -466,7 +676,7 @@ describe('AgentLoop follow-up and queue surfaces', () => {
     expect(piAgent.followUpMode).toBe('one-at-a-time');
   });
 
-  it('clearAllQueues clears pi queues and returns dropped silent content', () => {
+  it('clearAllQueues clears pi queues and returns dropped silent and parked content', () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
 

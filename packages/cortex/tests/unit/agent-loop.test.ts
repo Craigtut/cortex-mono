@@ -2352,7 +2352,7 @@ You have 12 emotions.`;
       expect(dead[0].message).toContain('lost output');
     });
 
-    it('re-steers a wake delivery destroyed by the failed-delivery unwind', async () => {
+    it('recovers a public steer destroyed by the failed-delivery unwind via wake parking', async () => {
       const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
 
@@ -2361,11 +2361,6 @@ You have 12 emotions.`;
       piAgent.steer = (message: { role: string; content: string }): void => {
         steeringQueue.push(message);
       };
-      (piAgent as unknown as Record<string, unknown>)['clearSteeringQueue'] = (): void => {
-        steeringQueue.length = 0;
-      };
-      (piAgent as unknown as Record<string, unknown>)['hasQueuedMessages'] = (): boolean =>
-        steeringQueue.length > 0;
 
       let failuresLeft = 1;
       piAgent.prompt = async (input: string): Promise<unknown> => {
@@ -2401,11 +2396,18 @@ You have 12 emotions.`;
           usage: { turns: 1, cost: 0.01, durationMs: 100, contextTokens: 10 },
         },
       });
-      expect(agent.deliver('steered mid-drain').outcome).toBe('steered');
+      agent.steer('steered mid-drain');
       await delivery;
 
-      // The unwind re-steered the content instead of destroying it: it
-      // reaches history through the re-attempted delivery run, exactly once.
+      // The unwind recovered the spliced steer as a parked wake delivery
+      // (never guessing a pi queue for it); the sweep delivers it in a run
+      // of its own after the re-attempted delivery run. Exactly one copy
+      // of each content survives.
+      const deadline = Date.now() + 2000;
+      while (historyOccurrences(agent, 'steered mid-drain') !== 1 || agent.isLoopActive) {
+        if (Date.now() > deadline) throw new Error('sweep did not deliver the recovered steer');
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
       expect(historyOccurrences(agent, 'steered mid-drain')).toBe(1);
       expect(historyOccurrences(agent, 'research findings')).toBe(1);
     });

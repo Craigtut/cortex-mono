@@ -1587,11 +1587,11 @@ export interface SubAgentHandle {
   readonly isPrompting: boolean;
   /**
    * Deliver a message regardless of the child's run state. Mirrors
-   * AgentLoop.deliver: steered into a running turn, prompted when idle with
-   * wake wanted, queued when silent.
+   * AgentLoop.deliver: prompted when idle with wake wanted, parked for the
+   * child's next run when its gate is held, queued when silent.
    */
   deliver(content: string, options?: { wake?: boolean }): {
-    outcome: 'prompted' | 'steered' | 'queued';
+    outcome: 'prompted' | 'parked' | 'queued';
     turn?: Promise<unknown>;
   };
   /** Queue a steering message on the child's running loop (no-op when idle). */
