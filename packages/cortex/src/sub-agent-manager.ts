@@ -11,7 +11,7 @@
  *   - docs/cortex/plans/phase-4-sub-agents-and-skills.md
  */
 
-import type { SubAgentResult, TrackedSubAgent } from './types.js';
+import type { SubAgentHandle, SubAgentResult, TrackedSubAgent } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -159,7 +159,7 @@ export class SubAgentManager {
    * @param abortFn - Aborts and tears down the child agent (passed to avoid a circular dep)
    * @returns true when the task was active and is now cancelled
    */
-  async cancel(taskId: string, abortFn: (agent: unknown) => Promise<void>): Promise<boolean> {
+  async cancel(taskId: string, abortFn: (agent: SubAgentHandle) => Promise<void>): Promise<boolean> {
     const entry = this.agents.get(taskId);
     if (!entry) return false;
 
@@ -185,6 +185,30 @@ export class SubAgentManager {
     }
 
     return true;
+  }
+
+  /**
+   * Deliver a steering message to a running sub-agent by task ID, built on
+   * the child's deliver() primitive: a tracked child is normally mid-run,
+   * so the message is steered into its current logical turn and lands at
+   * the child's next turn boundary. In the rare window where a tracked
+   * child's gate is idle (its run just settled but completion has not
+   * untracked it yet), deliver() starts a turn instead, so the redirect is
+   * never silently dropped the way a bare steer() would be.
+   *
+   * @returns The deliver outcome, or null when the task is not active or
+   *   the child is already tearing down.
+   */
+  steer(taskId: string, message: string): 'prompted' | 'steered' | 'queued' | null {
+    const entry = this.agents.get(taskId);
+    if (!entry) return null;
+    try {
+      return entry.agent.deliver(message).outcome;
+    } catch {
+      // The child began destroy() between tracking and this call; the
+      // steer has nowhere to land.
+      return null;
+    }
   }
 
   /**
@@ -252,7 +276,7 @@ export class SubAgentManager {
    *
    * @param abortFn - Function to tear down an AgentLoop (passed to avoid circular dep)
    */
-  async cancelAll(abortFn: (agent: unknown) => Promise<void>): Promise<void> {
+  async cancelAll(abortFn: (agent: SubAgentHandle) => Promise<void>): Promise<void> {
     const entries = [...this.agents.values()];
     this.agents.clear();
     for (const entry of entries) {

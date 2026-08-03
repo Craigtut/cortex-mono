@@ -1418,13 +1418,55 @@ export interface DeadLetteredBackgroundResult {
 }
 
 /**
+ * Budget counters a child handle exposes. A structural subset of BudgetGuard
+ * so this file needs no import of the class.
+ */
+export interface SubAgentBudgetView {
+  getTurnCount(): number;
+  getTotalCost(): number;
+  getMaxTurns(): number;
+  getMaxCost(): number;
+}
+
+/**
+ * Typed handle to a spawned child loop. A structural subset of AgentLoop
+ * (which imports these types, so importing the class here would be
+ * circular); every AgentLoop satisfies it. This is the surface the
+ * sub-agent manager and status/steering paths rely on: delivery, teardown,
+ * and live usage reads.
+ */
+export interface SubAgentHandle {
+  /** The child's loop path identity ('parentPath/taskId'). */
+  readonly loopPath: string;
+  /** Post-hoc context token count from the child's most recent turn. */
+  readonly currentContextTokenCount: number;
+  /**
+   * Deliver a message regardless of the child's run state. Mirrors
+   * AgentLoop.deliver: steered into a running turn, prompted when idle with
+   * wake wanted, queued when silent.
+   */
+  deliver(content: string, options?: { wake?: boolean }): {
+    outcome: 'prompted' | 'steered' | 'queued';
+    turn?: Promise<unknown>;
+  };
+  /** Queue a steering message on the child's running loop (no-op when idle). */
+  steer(message: string): void;
+  /** Abort the child's current loop without destroying it. */
+  abort(): Promise<void>;
+  /** Tear the child down. */
+  destroy(timeoutMs?: number): Promise<void>;
+  /** Live budget counters for status surfaces. */
+  getBudgetGuard(): SubAgentBudgetView;
+}
+
+/**
  * Tracked sub-agent record managed by SubAgentManager.
  */
 export interface TrackedSubAgent {
   /** Unique task identifier. */
   taskId: string;
-  /** The sub-agent AgentLoop instance. */
-  agent: unknown; // AgentLoop (avoid circular import)
+  /** Typed handle to the sub-agent's AgentLoop instance. */
+  agent: SubAgentHandle;
   /** The instructions the sub-agent was spawned with. */
   instructions: string;
   /** Whether this is a background sub-agent. */

@@ -285,6 +285,40 @@ describe('SubAgentManager', () => {
     });
   });
 
+  describe('steer', () => {
+    it('delivers the message through the tracked child handle and returns the outcome', () => {
+      const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
+      manager.track(createTrackedEntry({ taskId: 'task-1', agent: { deliver } as never }));
+
+      const outcome = manager.steer('task-1', 'focus on Europe');
+
+      expect(outcome).toBe('steered');
+      expect(deliver).toHaveBeenCalledWith('focus on Europe');
+    });
+
+    it('returns null for an unknown task ID', () => {
+      expect(manager.steer('nope', 'message')).toBeNull();
+    });
+
+    it('returns null when the child is already tearing down (deliver throws)', () => {
+      const deliver = vi.fn(() => {
+        throw new Error('Agent is being destroyed');
+      });
+      manager.track(createTrackedEntry({ taskId: 'task-1', agent: { deliver } as never }));
+
+      expect(manager.steer('task-1', 'message')).toBeNull();
+    });
+
+    it('returns null after the task was cancelled', async () => {
+      const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
+      manager.track(createTrackedEntry({ taskId: 'task-1', agent: { deliver } as never }));
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+
+      expect(manager.steer('task-1', 'message')).toBeNull();
+      expect(deliver).not.toHaveBeenCalled();
+    });
+  });
+
   describe('cancelAll', () => {
     it('marks every task cancelled', async () => {
       manager.track(createTrackedEntry({ taskId: 'a' }));

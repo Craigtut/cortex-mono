@@ -4650,7 +4650,7 @@ export class AgentLoop {
     // destroy()'s own force-kill deadline.
     try {
       await this.subAgentManager.cancelAll(async (agent) => {
-        await (agent as AgentLoop).destroy();
+        await agent.destroy();
       });
     } catch {
       // Best-effort sub-agent cleanup
@@ -4861,7 +4861,7 @@ export class AgentLoop {
    */
   async cancelSubAgent(taskId: string): Promise<boolean> {
     const cancelled = await this.subAgentManager.cancel(taskId, async (agent) => {
-      await (agent as AgentLoop).destroy();
+      await agent.destroy();
     });
     if (cancelled) {
       // Purge a result that already completed and sits queued for delivery.
@@ -4876,6 +4876,20 @@ export class AgentLoop {
   }
 
   /**
+   * Deliver a steering message to a running sub-agent by task ID. The
+   * redirect rides the child's deliver() primitive, so it lands at the
+   * child's next turn boundary while it runs (and is never silently dropped
+   * in the settling window; see SubAgentManager.steer for the landing
+   * rules). Returns false when the task ID is not an active sub-agent.
+   */
+  steerSubAgent(taskId: string, message: string): boolean {
+    const outcome = this.subAgentManager.steer(taskId, message);
+    if (outcome === null) return false;
+    this.logger.info('subagent steered', { taskId, outcome });
+    return true;
+  }
+
+  /**
    * Snapshot of all currently running sub-agents, including live cost and
    * activity. Read-only; safe to call from anywhere (e.g. budget accounting
    * or status surfaces). Returns an empty array when none are running.
@@ -4885,7 +4899,7 @@ export class AgentLoop {
     for (const taskId of this.subAgentManager.getActiveTaskIds()) {
       const entry = this.subAgentManager.get(taskId);
       if (!entry) continue;
-      const childAgent = entry.agent as AgentLoop;
+      const childAgent = entry.agent;
       const budget = childAgent.getBudgetGuard();
       snapshots.push({
         taskId,
@@ -5058,7 +5072,7 @@ export class AgentLoop {
       if (!entry) continue;
 
       const durationSec = Math.round((now - entry.spawnedAt) / 1000);
-      const childAgent = entry.agent as AgentLoop;
+      const childAgent = entry.agent;
       const tokens = (childAgent.currentContextTokenCount / 1000).toFixed(1);
       const budget = childAgent.getBudgetGuard();
       const turnsUsed = budget.getTurnCount();
@@ -5186,7 +5200,7 @@ export class AgentLoop {
 
       // Forward child events to parent's EventBridge for real-time visibility
       const unsubForward = this.eventBridge.forwardFrom(
-        (childAgent as AgentLoop).getEventBridge(),
+        childAgent.getEventBridge(),
         taskId,
       );
 
@@ -5295,7 +5309,7 @@ export class AgentLoop {
     // forwarded child turn usage, so background child spend now lands in
     // getSessionUsage() just as foreground child spend always has.
     const unsubForward = this.eventBridge.forwardFrom(
-      (childAgent as AgentLoop).getEventBridge(),
+      childAgent.getEventBridge(),
       taskId,
     );
 

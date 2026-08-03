@@ -562,4 +562,38 @@ describe('AgentLoop spawn-path lifecycle', () => {
       }
     });
   });
+
+  describe('steerSubAgent', () => {
+    it('reaches a running child through its deliver() primitive', async () => {
+      const agent = createTestAgentLoop();
+      let releasePrompt!: () => void;
+      const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+      const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
+      const child = {
+        destroy: vi.fn().mockResolvedValue(undefined),
+        prompt: vi.fn().mockReturnValue(promptGate),
+        deliver,
+        getConversationHistory: () => [{ role: 'assistant', content: 'done' }],
+        getBudgetGuard: () => ({ getTurnCount: () => 1, getTotalCost: () => 0 }),
+        getEventBridge: () => new EventBridge(false),
+        currentContextTokenCount: 0,
+      };
+      (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
+
+      const { taskId } = await agent.spawnBackgroundSubAgent({ instructions: 'long scan' });
+
+      const steered = agent.steerSubAgent(taskId, 'focus on Europe');
+
+      expect(steered).toBe(true);
+      expect(deliver).toHaveBeenCalledWith('focus on Europe');
+
+      releasePrompt();
+      await agent.getSubAgentManager().get(taskId)?.completion;
+    });
+
+    it('returns false for an unknown task ID', () => {
+      const agent = createTestAgentLoop();
+      expect(agent.steerSubAgent('nope', 'message')).toBe(false);
+    });
+  });
 });
