@@ -124,6 +124,14 @@ function createMockPiAgent(): DeliverMockPiAgent {
           });
         }
 
+        // Pi drains the follow-up queue at a would-stop point: the run
+        // continues with the queued message instead of stopping. Without
+        // this, a queued follow-up would sit unconsumed and a test could
+        // only prove absence of re-delivery, not that the follow-up lands.
+        agent.state.messages.push(
+          ...(agent.followUpQueue.splice(0) as AgentMessage[]),
+        );
+
         agent.emitEvent({ type: 'turn_end', text: 'ok' });
         agent.state.messages.push({
           role: 'assistant',
@@ -556,6 +564,9 @@ describe('AgentLoop.deliver exactness under partial-drain interleavings', () => 
 
     await waitUntil(() => !loop.isLoopActive);
     expect(occurrences(piAgent, 'F-delivery')).toBe(1);
+    // The follow-up itself lands (the run drains it at its would-stop
+    // point), exactly once: the sweep neither re-delivers nor destroys it.
+    expect(occurrences(piAgent, 'later thought')).toBe(1);
   });
 });
 
