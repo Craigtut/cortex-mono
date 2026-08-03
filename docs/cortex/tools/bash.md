@@ -65,7 +65,7 @@ Each platform uses its native shell. No external dependencies required.
 3. PowerShell 7 is preferred because PS 5.1 lacks `&&` operator support
 4. Args: `["-NoProfile", "-NonInteractive", "-Command"]`
 
-**User override:** A `shellPath` setting allows users to specify a custom shell binary for edge cases (Git Bash, WSL, specific zsh version, etc.).
+**User override:** `CortexAgentConfig.bash.shellPath` lets a consumer specify a custom shell binary for edge cases (Git Bash, WSL, specific zsh version, etc.). When set, it takes precedence over the discovery chain above.
 
 ### Shell Trust Validation (Unix)
 
@@ -95,7 +95,7 @@ Long-running commands should not block the agent. Pi-agent-core executes tools s
 
 **Explicit background:** The model sets `background: true`. The command runs asynchronously. The tool returns immediately with a task ID.
 
-**Auto-yield:** If a command runs longer than a configurable threshold (default: 10 seconds), it auto-backgrounds. The agent receives the output accumulated so far plus a task ID. The threshold is configurable via the cortex agent config.
+**Auto-yield:** If a command runs longer than a configurable threshold (default: 10 seconds), it auto-backgrounds. The agent receives the output accumulated so far plus a task ID. The threshold is configurable via `CortexAgentConfig.bash.autoYieldThreshold` (milliseconds).
 
 **Polling backgrounded processes:** The agent uses the **TaskOutput** tool (a separate companion tool, automatically registered alongside Bash) to interact with backgrounded processes:
 - `poll`: Get the latest output and status (running/completed/failed)

@@ -93,11 +93,15 @@ Consumers may define their own command patterns for interacting with running sub
 
 ### Cancelling a Sub-Agent
 
-The parent can cancel a running background sub-agent. This calls `agent.abort()` on the sub-agent, kills any running tool processes (bash commands, etc.), and returns a `cancelled` status.
+`cancelSubAgent(taskId)` on the parent agent cancels a running sub-agent:
 
-Consumers may similarly define their own cancellation patterns (e.g., a decision type that triggers sub-agent cancellation).
+- The child agent is fully destroyed (loop aborted, tool processes killed, MCP connections closed).
+- The tracked completion promise resolves with `status: 'cancelled'`.
+- Any result already queued for delivery is purged, and a result arriving after the cancel is discarded, so cancelled work is never delivered to the loop.
+- A pending permission ask on the child is dismissed via the abort signal passed to the consumer resolver, and the child's `waiting-for-permission` status is cleared.
+- Returns `false` when the task ID is not an active sub-agent.
 
-Foreground sub-agents can be implicitly cancelled if the parent's own loop is aborted (e.g., tick timeout).
+A cancelled **foreground** child reports `status: 'cancelled'` (not `failed`) to the SubAgent tool. Foreground sub-agents can also be implicitly cancelled if the parent's own loop is aborted (e.g., tick timeout).
 
 ## Concurrency
 
@@ -129,8 +133,16 @@ Cortex emits events that the consumer can hook into for lifecycle management:
 - **`onSubAgentSpawned(taskId, instructions)`**: A sub-agent was created. The consumer can track it (e.g., insert a row in `agent_tasks` table).
 - **`onSubAgentCompleted(taskId, result, status, usage)`**: A sub-agent finished. The consumer can process results (e.g., deliver via heartbeat trigger, update task status).
 - **`onSubAgentFailed(taskId, error)`**: A sub-agent errored. The consumer can handle the failure.
+- **`onBackgroundResultDelivery(taskIds)`**: Queued background completions (sub-agent or Bash) are about to be delivered to the parent loop. Fires once per completion, not per re-attempt.
+- **`onBackgroundResultDeadLettered(result)`**: Cortex gave up delivering a background completion: attempts exhausted, total delivery time over budget, a fatal error (e.g., failed authentication), or the agent shut down before delivering it. The `result` carries the task ID, attempt count, last error, and the formatted message that never reached the loop.
 
 These hooks are how a consumer's orchestration layer integrates without cortex knowing about the orchestrator's existence.
+
+### Delivery Durability and Dead-Lettering
+
+A background completion delivered while the loop is busy is queued and drained when the loop goes idle. A failed delivery is unwound from history (so a re-attempt cannot duplicate the completion body) and re-queued, bounded by a capped attempt count and a total elapsed delivery budget. Completions that cannot be re-attempted productively are dead-lettered rather than dropped or retried forever.
+
+`getDeadLetteredBackgroundResults()` returns the bounded dead-letter list (newest last; oldest entries are evicted past the cap). The list survives `destroy()`, which itself dead-letters anything still queued, so an application can surface undelivered completed work to the user or re-drive it.
 
 ## Relationship to Consumer Orchestration
 

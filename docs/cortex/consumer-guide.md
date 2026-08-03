@@ -117,6 +117,9 @@ Common `CortexAgent.create()` fields:
 | `compaction` | Optional compaction strategy and thresholds |
 | `persistResult` | Optional callback for storing oversized tool results |
 | `deferredTools` | Optional schema deferral for large MCP tool sets |
+| `bash.autoYieldThreshold` | Milliseconds before a running Bash command auto-yields to a background task (default 10000) |
+| `bash.shellPath` | Custom shell binary for the Bash tool |
+| `webFetch.maxPerLoop` | WebFetch rate limit per agentic loop (default 20) |
 
 Built-in tools are registered automatically: `Bash`, `TaskOutput`, `Read`, `Write`, `Edit`, `UndoEdit`, `Glob`, `Grep`, `WebFetch`, and `SubAgent`. `ToolSearch` is registered automatically when `deferredTools.enabled` is true. The `load_skill` tool is registered automatically for parent agents.
 
@@ -183,14 +186,17 @@ Slots should usually be rebuilt from current application state instead of restor
 
 `resolvePermission` is the single public hook for tool permissions. Return `true` or `{ decision: 'allow' }` to proceed. Return `false`, `{ decision: 'block' }`, or `{ decision: 'ask' }` to block the tool call with a reason. Cortex does not run an in-band approval UI for `ask`; your application should collect approval and retry or steer the agent as appropriate.
 
+The resolver receives a third argument, a `ToolPermissionRequestContext` with an optional `signal`. The signal fires when the run that asked is aborted. Cortex races your resolver against that abort and proceeds with a block when the abort wins, so an unanswered approval prompt can never hang `abort()` or `destroy()`. A UI showing an approval prompt should listen on the signal and dismiss the now-moot prompt.
+
 ```typescript
 const agent = await CortexAgent.create({
   model,
   workingDirectory,
   initialBasePrompt,
-  resolvePermission: async (toolName, args) => {
+  resolvePermission: async (toolName, args, context) => {
     if (toolName === 'Bash') {
-      return { decision: 'ask', reason: 'Shell commands require approval.' };
+      // Collect approval; dismiss the prompt if the run is aborted meanwhile.
+      return await askForApproval(toolName, args, { dismissOn: context?.signal });
     }
     if (toolName === 'Write' || toolName === 'Edit') {
       return isAllowedPath(args) ? true : { decision: 'block', reason: 'Path is outside workspace.' };
@@ -200,7 +206,36 @@ const agent = await CortexAgent.create({
 });
 ```
 
-The `SubAgent` tool invocation itself is treated as internal orchestration. Tool calls made by child agents still go through the parent permission resolver.
+The `SubAgent` tool invocation itself is treated as internal orchestration. Tool calls made by child agents still go through the parent permission resolver; the `context.signal` for those asks is the child run's signal, so cancelling a child dismisses its pending ask.
+
+## Background Sub-Agents
+
+The `SubAgent` tool lets the model delegate work; the same machinery is exposed as a consumer API:
+
+```typescript
+const { taskId } = await agent.spawnBackgroundSubAgent({ instructions: 'Research topic X' });
+
+console.log(agent.getActiveSubAgents()); // live status, tool activity, cost
+
+await agent.cancelSubAgent(taskId);
+```
+
+`cancelSubAgent(taskId)` destroys the child, resolves its completion promise as `cancelled`, and discards any pending or late result so cancelled work is never delivered to the loop. It returns `false` for an unknown task ID. A cancelled foreground child reports `status: 'cancelled'` to the SubAgent tool.
+
+When a background child or backgrounded Bash command completes while the loop is busy, its result is queued and delivered once the loop goes idle. Delivery is durable: a failed delivery attempt is unwound from history and re-queued with a capped attempt count and a total elapsed budget. A delivery Cortex gives up on (attempts exhausted, budget spent, a fatal error such as failed authentication, or the agent shutting down first) is dead-lettered instead of silently dropped:
+
+```typescript
+agent.onBackgroundResultDelivery((taskIds) => showSpinner(taskIds));
+
+agent.onBackgroundResultDeadLettered((result) => {
+  notifyUser(`Background result for ${result.taskId} could not be delivered: ${result.lastError}`);
+});
+
+// Bounded list, newest last; still available after destroy().
+const undelivered = agent.getDeadLetteredBackgroundResults();
+```
+
+A delivery failure that a later re-queued attempt recovers from surfaces no `onError`; a terminal failure surfaces exactly one, and never rejects a consumer `prompt()` that already succeeded.
 
 ## MCP Tools
 
