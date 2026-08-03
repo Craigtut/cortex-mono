@@ -927,8 +927,15 @@ export class CortexAgent {
     } finally {
       // Deliver background results that arrived while prompting. This runs
       // before the consumer's await resolves, keeping its UI state
-      // consistent, and still under the same gate acquisition.
-      await this.drainPendingBackgroundResults();
+      // consistent, and still under the same gate acquisition. A terminal
+      // delivery failure is a background concern: it surfaces through
+      // onError (once, at this chain root), never by rejecting a consumer
+      // turn that already succeeded or replacing that turn's own error.
+      try {
+        await this.drainPendingBackgroundResults();
+      } catch (err) {
+        this.emitError(err instanceof Error ? err : new Error(String(err)));
+      }
     }
   }
 
@@ -1010,7 +1017,7 @@ export class CortexAgent {
 
     let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
     try {
-      return await this.runTurnWithRetry(input);
+      return await this.runTurnWithRetry(input, fromDrain);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       promptStatus = this.isAborted() ? 'cancelled' : 'rejected';
@@ -1063,8 +1070,15 @@ export class CortexAgent {
    * overflow, abort) or once retries are exhausted, it emits onError and throws
    * exactly as the non-retrying path did, so the consumer's existing handling
    * is unchanged for those cases.
+   *
+   * @param fromDrain - True for background-completion deliveries. The drain
+   *   chain re-queues a failed delivery and re-attempts it, so per-attempt
+   *   onError emission is deferred to the chain root: a later attempt that
+   *   succeeds surfaces no error at all, and a terminal failure surfaces
+   *   exactly once (mirroring how an in-run retry that recovers reports
+   *   onRetrySucceeded rather than onError).
    */
-  private async runTurnWithRetry(input: string): Promise<unknown> {
+  private async runTurnWithRetry(input: string, fromDrain = false): Promise<unknown> {
     let retryIndex = 0;
     let firstFailureAt: number | undefined;
 
@@ -1142,7 +1156,9 @@ export class CortexAgent {
           if (aborted) {
             this.trimTrailingFailureMessages();
           }
-          this.emitError(error, aborted);
+          if (!fromDrain) {
+            this.emitError(error, aborted);
+          }
           throw error;
         }
 
@@ -1176,7 +1192,9 @@ export class CortexAgent {
           // failure stub that was awaiting this retry is trimmed like any
           // other aborted turn.
           this.trimTrailingFailureMessages();
-          this.emitError(error, true);
+          if (!fromDrain) {
+            this.emitError(error, true);
+          }
           const abortErr = new Error('Prompt aborted during retry backoff');
           abortErr.name = 'AbortError';
           throw abortErr;
@@ -4995,8 +5013,8 @@ export class CortexAgent {
 
   /**
    * Enqueue a gated drain cycle. Delivery failures have no consumer-level
-   * caller to catch them, so they are routed to onError handlers and never
-   * rejected out of the returned promise.
+   * caller to catch them, so a terminal failure is routed to onError (once,
+   * at this chain root) and never rejected out of the returned promise.
    */
   private schedulePendingResultDelivery(): Promise<void> {
     return this.enqueueLoopTask(async () => {
@@ -5004,19 +5022,7 @@ export class CortexAgent {
       try {
         await this.drainPendingBackgroundResults();
       } catch (err) {
-        const classified = classifyError(
-          err instanceof Error ? err : new Error(String(err)),
-          { wasAborted: this.isAborted() },
-        );
-        for (const handler of this.errorHandlers) {
-          try {
-            handler(classified);
-          } catch (handlerErr) {
-            this.logger.error('[CortexAgent] onError handler threw', {
-              error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
-            });
-          }
-        }
+        this.emitError(err instanceof Error ? err : new Error(String(err)));
       }
     });
   }
@@ -5063,6 +5069,8 @@ export class CortexAgent {
     // message (plus a synthetic failure stub) in the transcript. Captured
     // here so the catch can unwind exactly what this attempt appended.
     const preDeliveryCount = this.agent.state.messages.length;
+    let attemptError: Error | null = null;
+    let requeuedForRetry = false;
     try {
       // fromDrain: deliver via a fresh loop even if a prior turn was
       // aborted; background completions are not cancelled by user abort.
@@ -5073,17 +5081,52 @@ export class CortexAgent {
       // progressed past it, the body already lives in history where the
       // next successful run will see it, and re-queueing would append the
       // same completion a second time.
+      attemptError = err instanceof Error ? err : new Error(String(err));
       if (this.unwindFailedDelivery(preDeliveryCount)) {
         this.requeueOrDeadLetter(batch, err);
+        requeuedForRetry = true;
       }
-      throw err;
-    } finally {
-      // Deliver anything that arrived during this delivery (including items
-      // the catch above re-queued), even when it failed, matching the
-      // pre-gate recursive prompt() behavior. Bounded: each re-queued item
-      // carries an attempt count and dead-letters at the cap.
-      await this.drainPendingBackgroundResults();
     }
+
+    // Deliver anything that arrived during this delivery (including items
+    // the catch above re-queued), even when the attempt failed, matching
+    // the pre-gate recursive prompt() behavior. Bounded: each re-queued
+    // item carries an attempt count and dead-letters at the cap. A failure
+    // here propagates in place of this attempt's own error (as the old
+    // finally-based flow did).
+    await this.drainPendingBackgroundResults();
+
+    if (attemptError !== null) {
+      // A later attempt in this same drain chain delivered the whole
+      // re-queued batch: the failure was recovered from, so it must not
+      // reach onError or reject a consumer turn (mirroring how an in-run
+      // retry that recovers reports onRetrySucceeded rather than onError).
+      if (requeuedForRetry && this.batchRecoveredAfterRequeue(batch)) {
+        this.logger.info('[CortexAgent] background delivery recovered after re-queue', {
+          taskIds: batch.map((item) => item.taskId),
+          error: attemptError.message,
+        });
+        return;
+      }
+      throw attemptError;
+    }
+  }
+
+  /**
+   * Whether every item of a failed-then-re-queued delivery batch has since
+   * left the system without being dead-lettered: no longer waiting in the
+   * pending queue and absent from the dead-letter list. True means the
+   * recursive drain that ran after the re-queue delivered the batch (or a
+   * cancel discarded it), so the failure that re-queued it was transient.
+   */
+  private batchRecoveredAfterRequeue(batch: PendingBackgroundCompletion[]): boolean {
+    return batch.every(
+      (item) =>
+        !this.pendingBackgroundResults.includes(item) &&
+        !this.deadLetteredBackgroundResults.some(
+          (dead) => dead.kind === item.kind && dead.taskId === item.taskId,
+        ),
+    );
   }
 
   /**

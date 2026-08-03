@@ -2311,6 +2311,81 @@ You have 12 emotions.`;
       expect(dead[0].message).toContain('lost output');
     });
 
+    it('does not fire onError when a re-queued delivery eventually succeeds', async () => {
+      // The failed first attempt is re-queued and the drain chain's next
+      // attempt delivers it. A recovered failure must not surface: no
+      // per-attempt emission, and the pending throw from the failed attempt
+      // is suppressed instead of reaching the scheduled-drain onError root.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const errored = vi.fn();
+      agent.onError(errored);
+      seedCompletedTask(agent, 'task_s3a', 'eventually delivered output');
+      installFailingPrompt(1);
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s3a' });
+
+      expect(historyOccurrences(agent, 'eventually delivered output')).toBe(1);
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(errored).not.toHaveBeenCalled();
+    });
+
+    it('fires onError exactly once when a delivery exhausts all attempts', async () => {
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const errored = vi.fn();
+      agent.onError(errored);
+      seedCompletedTask(agent, 'task_s3b', 'never delivered output');
+      installFailingPrompt(10);
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s3b' });
+
+      // Terminal failure: dead-lettered, and the chain root reports it once
+      // (not once per attempt, and not doubled by the propagated re-throw).
+      expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(1);
+      expect(errored).toHaveBeenCalledTimes(1);
+      expect(errored.mock.calls[0][0].originalMessage).toContain('delivery misconfigured');
+    });
+
+    it('does not reject a successful consumer prompt when its end-of-cycle delivery fails', async () => {
+      // A completion is already pending when the consumer prompts, so
+      // runPromptCycle's finally drains it after the consumer turn
+      // succeeds. The delivery fails terminally; that is a background
+      // concern surfaced through onError, never a rejection of the
+      // consumer's own successful turn.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      seedCompletedTask(agent, 'task_s3c', 'cycle-drain output');
+      (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
+        { kind: 'bash', taskId: 'task_s3c' },
+      );
+
+      const originalPrompt = piAgent.prompt.bind(piAgent);
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        if (input.includes('[Background command')) {
+          piAgent.state.messages.push({ role: 'user', content: input } as never);
+          piAgent.state.messages.push({
+            role: 'assistant',
+            content: [],
+            stopReason: 'error',
+            errorMessage: 'delivery down',
+          } as never);
+          throw new Error('delivery down');
+        }
+        return originalPrompt(input);
+      };
+
+      const errored = vi.fn();
+      agent.onError(errored);
+
+      // Must resolve even though every delivery attempt fails.
+      await agent.prompt('hello there');
+
+      expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(1);
+      expect(errored).toHaveBeenCalledTimes(1);
+      expect(errored.mock.calls[0][0].originalMessage).toContain('delivery down');
+    });
+
     it('fires onBackgroundResultDelivery once per completion, not per attempt', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as InternalAgent;
