@@ -293,10 +293,15 @@ export class SubAgentManager {
 
   /**
    * Clean up all state. Called during parent destroy().
+   *
+   * The cancelled-ID set deliberately survives: a cancelled child's
+   * completion continuation can settle after this runs (it awaits its own
+   * child destroy), and isCancelled() must still recognize that late result
+   * as a purposeful discard rather than letting it dead-letter as
+   * undelivered work. The set is capped, so keeping it is not a leak.
    */
   destroy(): void {
     this.agents.clear();
-    this.cancelledTaskIds.clear();
     this.hooks = {};
   }
 }

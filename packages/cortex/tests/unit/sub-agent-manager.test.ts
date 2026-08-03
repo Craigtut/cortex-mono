@@ -348,6 +348,21 @@ describe('SubAgentManager', () => {
       expect(manager.activeCount).toBe(0);
       expect(manager.getActiveTaskIds()).toHaveLength(0);
     });
+
+    it('keeps cancelled task IDs so late completions stay discardable after destroy', async () => {
+      // A cancelled child's completion continuation can settle after the
+      // parent's teardown reaches destroy() (it awaits its own child
+      // destroy). The cancelled-ID set must survive so that late result is
+      // still recognized as a purposeful discard, not dead-lettered as
+      // undelivered work. The set is capped at 200, so keeping it is not a
+      // leak.
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+
+      manager.destroy();
+
+      expect(manager.isCancelled('task-1')).toBe(true);
+    });
   });
 
   describe('defaults', () => {

@@ -2566,6 +2566,50 @@ You have 12 emotions.`;
       expect(dead[0].message).toContain('late findings');
     });
 
+    it('discards, not dead-letters, a cancelled sub-agent result settling after destroy', async () => {
+      // The user cancelled this sub-agent on purpose. Its completion
+      // continuation can settle after the parent's teardown (it awaits its
+      // own child destroy), so the cancelled-ID set must survive
+      // SubAgentManager.destroy() for the late result to stay a purposeful
+      // discard instead of dead-lettering as "shut down before delivery".
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent & {
+        subAgentManager: {
+          track: (entry: unknown) => boolean;
+          cancel: (taskId: string, abortFn: (a: unknown) => Promise<void>) => Promise<boolean>;
+        };
+      };
+      internal.subAgentManager.track({
+        taskId: 'sa_cancelled_late',
+        agent: { destroy: async () => {} },
+        instructions: 'work',
+        background: true,
+        spawnedAt: Date.now(),
+        completion: Promise.resolve({}),
+        resolve: () => {},
+        toolCount: 0,
+        lastToolName: null,
+        lastToolSummary: null,
+        lastToolStartedAt: null,
+        pendingPermission: null,
+      });
+      await agent.cancelSubAgent('sa_cancelled_late');
+
+      await agent.destroy();
+
+      await internal.deliverOrQueueBackgroundCompletion({
+        kind: 'subagent',
+        taskId: 'sa_cancelled_late',
+        result: {
+          output: 'finished right as it was cancelled',
+          status: 'completed',
+          usage: { turns: 1, cost: 0.01, durationMs: 100, contextTokens: 50 },
+        },
+      });
+
+      expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(0);
+    });
+
     it('dead-letters a completion that arrives after shutdown begins', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as InternalAgent;
