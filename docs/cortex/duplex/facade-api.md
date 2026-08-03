@@ -8,7 +8,7 @@ The facade is named `CortexAgent`. Consumers interact with one agent; the talker
 
 ```typescript
 const agent = await CortexAgent.create({
-  // everything CortexAgentConfig has today, applied per the routing table below
+  // everything AgentLoopConfig has today, applied per the routing table below
   mode: 'duplex',              // default; 'passthrough' opts out
   talker: {                    // optional overrides, all have defaults
     model,                     // default: fast tier resolved from the primary provider

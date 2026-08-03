@@ -50,7 +50,7 @@ Message shape constraints from the audit: user-role, non-whitespace string conte
 
 ### Churn: View Injection Outside BP3
 
-Task headlines and live activity (current tool, duration, token count, last output lines) change every tick and must never enter a transcript or the cached prefix. They use the existing `<background-tasks>` mechanism: view-injected in `transformContext` after the BP3 boundary (`cortex-agent.ts:3340-3350`), rebuilt every call, absent on compaction turns by design, never observed, never persisted.
+Task headlines and live activity (current tool, duration, token count, last output lines) change every tick and must never enter a transcript or the cached prefix. They use the existing `<background-tasks>` mechanism: view-injected in `transformContext` after the BP3 boundary (`agent-loop.ts:3340-3350`), rebuilt every call, absent on compaction turns by design, never observed, never persisted.
 
 Rules for the headline block, from the audit:
 
@@ -79,11 +79,11 @@ Every entry carries a monotonic sequence number (timestamps collide under burst)
 
 ## Cache Discipline Per Loop
 
-Each loop keeps its own transcript, its own stable session ID (`sessionId` per instance for prefix-cache routing; children already use taskId, `cortex-agent.ts:4917-4918`), and its own cache breakpoints. The composite adds no cross-loop cache coupling:
+Each loop keeps its own transcript, its own stable session ID (`sessionId` per instance for prefix-cache routing; children already use taskId, `agent-loop.ts:4917-4918`), and its own cache breakpoints. The composite adds no cross-loop cache coupling:
 
 - Talker prefix: system prompt + slots + compacted history. Deliveries append; headlines stay outside BP3. Target: near-total cache reads per utterance.
 - Reasoner prefix: unchanged from today.
-- The step-0 mirror rule holds everywhere: mid-loop writes to `agent.state.messages` (including `setSlot`) are clobbered by the next `transformContext` mirror (`cortex-agent.ts:3275`) and never reach pi's loop array. The facade therefore writes slots only between prompts, or uses the per-call re-patch pattern (`cortex-agent.ts:3319-3333`) if a mid-loop surface ever becomes necessary.
+- The step-0 mirror rule holds everywhere: mid-loop writes to `agent.state.messages` (including `setSlot`) are clobbered by the next `transformContext` mirror (`agent-loop.ts:3275`) and never reach pi's loop array. The facade therefore writes slots only between prompts, or uses the per-call re-patch pattern (`agent-loop.ts:3319-3333`) if a mid-loop surface ever becomes necessary.
 
 ## Compaction Interactions
 
