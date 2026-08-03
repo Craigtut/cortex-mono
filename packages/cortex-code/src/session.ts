@@ -22,6 +22,7 @@ import {
   type CortexModel,
   type CortexEvent,
   type CortexToolPermissionResult,
+  type ToolPermissionRequestContext,
   type AgentTextOutput,
   type ClassifiedError,
   type CompactionResult,
@@ -292,7 +293,8 @@ export class Session {
       workingDirectory: this.cwd,
       initialBasePrompt: this.mode.systemPrompt,
       slots: this.mode.contextSlots,
-      resolvePermission: (toolName, toolArgs) => this.resolvePermission(toolName, toolArgs),
+      resolvePermission: (toolName, toolArgs, context) =>
+        this.resolvePermission(toolName, toolArgs, context),
       // WebFetch's egress gate: the same decision function the sandbox egress
       // proxy consults for shell commands, so one grant covers both paths.
       resolveNetworkAccess: (req) => this.resolveNetworkAccess(req),
@@ -1608,7 +1610,9 @@ export class Session {
   private async resolvePermission(
     toolName: string,
     toolArgs: unknown,
+    context?: ToolPermissionRequestContext,
   ): Promise<boolean | CortexToolPermissionResult> {
+    const abortSignal = context?.signal;
     // Refuse-to-run (opt-in). When the consumer requires enforcement and the
     // rung is contained but the OS sandbox is not actually enforcing (backend
     // 'none': helper missing/blocked/quarantined), block shell commands rather
@@ -1681,6 +1685,13 @@ export class Session {
       await this.permissionLockPromise;
     }
 
+    // The asking run may have been aborted while this ask waited behind
+    // another prompt (or before it arrived). Cortex has already stopped
+    // waiting for this resolver, so never show a prompt for dead work.
+    if (abortSignal?.aborted) {
+      return { decision: 'block', reason: 'Run aborted before the permission prompt was shown' };
+    }
+
     // Re-check: a previous prompt may have added an "always allow"/deny rule.
     const preAfterWait = await preflightPermission(toolName, toolArgs, preflightDeps);
     if (preAfterWait.decision === 'allow') return true;
@@ -1695,7 +1706,11 @@ export class Session {
       this.permissionLockRelease = resolve;
     });
 
-    const permission = this.activity.recordPermissionRequested(toolName, toolArgs);
+    const permission = this.activity.recordPermissionRequested(
+      toolName,
+      toolArgs,
+      context?.askId !== undefined ? { askId: context.askId } : undefined,
+    );
     await permission.written;
     let permissionResolution: PermissionResolution = 'denied';
 
@@ -1705,13 +1720,40 @@ export class Session {
     // the controller stops the watcher once the prompt resolves, however it
     // resolved.
     const externalController = new AbortController();
-    const externalDecision = watchDecisionFile(
+    const fileDecision = watchDecisionFile(
       this.activity.decisionPath(permission.id),
       externalController.signal,
     );
 
+    // Dismiss the prompt when the asking run is aborted. Cortex races the
+    // resolver against the run's abort signal and proceeds with a block, so
+    // an unanswered prompt would sit on screen for dead work while holding
+    // permissionLockPromise, serializing the next live ask behind it. The
+    // abort settles the prompt through the same external-decision channel a
+    // companion app uses, which removes it from the TUI and releases the lock.
+    let abortDismissed = false;
+    let onAbort: (() => void) | undefined;
+    let externalDecision = fileDecision;
+    if (abortSignal) {
+      const abortDecision = new Promise<'deny'>((resolve) => {
+        onAbort = () => {
+          abortDismissed = true;
+          resolve('deny');
+        };
+        abortSignal.addEventListener('abort', onAbort, { once: true });
+      });
+      externalDecision = Promise.race([fileDecision, abortDecision]);
+    }
+
     try {
       const result = await this.app.showPermissionPrompt(toolName, toolArgs, externalDecision);
+      if (abortDismissed) {
+        permissionResolution = 'cancelled';
+        return {
+          decision: 'block',
+          reason: 'Run aborted before the permission prompt was answered',
+        };
+      }
       permissionResolution = result.decision === 'allow' ? 'allowed' : 'denied';
 
       if (result.scope === 'project-edits') {
@@ -1729,6 +1771,9 @@ export class Session {
       void this.activity.recordError(error instanceof Error ? error : String(error));
       throw error;
     } finally {
+      if (abortSignal && onAbort) {
+        abortSignal.removeEventListener('abort', onAbort);
+      }
       externalController.abort();
       await this.activity.recordPermissionResolved(permission.id, toolName, permissionResolution);
       const release = this.permissionLockRelease;
