@@ -450,6 +450,17 @@ interface QueuedSilentDelivery {
   timestamp: number;
 }
 
+/** Result of {@link AgentLoop.digestIdle}. */
+export interface IdleDigestionResult {
+  /** Whether an observer call ran to buffer unobserved history. */
+  observerRan: boolean;
+  /**
+   * Whether the threshold pass changed the durable history (observation
+   * activation trimmed it, or summarization rewrote it).
+   */
+  historyCompacted: boolean;
+}
+
 /**
  * A background task that finished while the agent was busy and must be
  * delivered to the loop once it goes idle. Either a sub-agent (carries its
@@ -655,6 +666,12 @@ export class AgentLoop {
   // prefix, never in the transcript), hard token-capped.
   private headlineProvider: (() => string | null) | null = null;
   private headlineMaxTokens = DEFAULT_HEADLINE_MAX_TOKENS;
+
+  // Set while digestIdle() runs the transform pipeline, so the compaction
+  // manager runs its blocking work (sync observer, summarization) even
+  // under the non-blocking posture: the idle window is exactly where that
+  // work is supposed to happen.
+  private _forceBlockingCompaction = false;
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -3836,6 +3853,58 @@ export class AgentLoop {
   }
 
   /**
+   * Run deferred digestion OUTSIDE a prompt: pending observation buffering
+   * plus the threshold pass (observation activation, reflection, and, for
+   * the classic strategy, summarization), with blocking work explicitly
+   * allowed even under the non-blocking posture. This is the primitive
+   * behind scheduling digestion in idle windows: without it, observation
+   * only triggers on turn_end and compaction only runs inside
+   * transformContext, so there is no way to do either between turns.
+   *
+   * Serialized through the loop gate, so it can never race a running
+   * turn's history mutations; called while a turn is active, it runs after
+   * that turn finishes. prompt() fails fast while digestion holds the gate
+   * (deliver() steers or queues as usual).
+   */
+  async digestIdle(): Promise<IdleDigestionResult> {
+    this.assertNotShuttingDown();
+    return this.enqueueLoopTask(async () => {
+      if (this.isShuttingDown()) {
+        return { observerRan: false, historyCompacted: false };
+      }
+
+      // 1. Buffer catch-up (observational only): make sure the expensive
+      // observer work over the unobserved tail is done and chunked, so the
+      // next activation is a cheap merge.
+      let observerRan = false;
+      if (this.compactionManager.strategy === 'observational') {
+        observerRan = await this.compactionManager.digestPendingObservationBuffers(
+          this.agent.state.messages,
+          this.contextManager.slotCount,
+        );
+      }
+
+      // 2. Threshold pass: run the same pipeline transformContext runs
+      // against the live source history. Source mutations (activation
+      // trims, summarization rewrites) persist; the returned view is
+      // discarded. _forceBlockingCompaction lets the manager run its
+      // synchronous paths regardless of the configured posture.
+      const lengthBefore = this.agent.state.messages.length;
+      const hook = this.getTransformContextHook();
+      this._forceBlockingCompaction = true;
+      try {
+        await hook(this.buildAgentContextSnapshot());
+      } finally {
+        this._forceBlockingCompaction = false;
+      }
+      const historyCompacted = this.agent.state.messages.length !== lengthBefore;
+
+      this.logger.debug('idle digestion complete', { observerRan, historyCompacted });
+      return { observerRan, historyCompacted };
+    });
+  }
+
+  /**
    * Run end-of-tick compaction check. Call after EXECUTE completes,
    * before the next tick starts. Returns the CompactionResult if
    * Layer 2 compaction ran, null otherwise.
@@ -4031,6 +4100,9 @@ export class AgentLoop {
             sourceMessages.length - currentTickCount,
           );
         },
+        // digestIdle() re-enables blocking work for its pass; otherwise the
+        // manager's configured posture decides.
+        this._forceBlockingCompaction ? { allowBlocking: true } : undefined,
       );
 
       // After compaction/observation runs, update the observation slot

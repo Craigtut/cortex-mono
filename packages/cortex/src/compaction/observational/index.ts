@@ -411,6 +411,59 @@ export class ObservationalMemoryEngine {
   }
 
   // -------------------------------------------------------------------------
+  // Idle digestion
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run pending observation buffering OUTSIDE a prompt: wait for any
+   * in-flight observer to land its chunk, then observe the still-unobserved
+   * tail (when it clears the buffering floor) and wait for that chunk too.
+   *
+   * Chunks stay buffered rather than activating here: activation trims raw
+   * history, which is a threshold decision, while this call only ensures the
+   * expensive observer work is DONE so the next activation (in-band or via
+   * an explicit digestion pass) is a cheap chunk merge. This is the
+   * primitive behind "digest during idle windows".
+   *
+   * @param messages - The full message array (slot messages included)
+   * @param slotCount - Number of slot messages to skip
+   * @returns true when an observer call ran during this digestion
+   */
+  async digestPendingBuffers(messages: AgentMessage[], slotCount: number): Promise<boolean> {
+    if (!this.completeFn) return false;
+
+    // Let an already-running observer finish and record its chunk, so the
+    // tail computed below starts at the settled watermark.
+    await this.buffering.waitForObserverSettled();
+
+    const history = messages.slice(slotCount);
+    const watermark = this.buffering.getWatermark();
+    const unobserved = history.slice(watermark);
+    if (unobserved.length === 0) return false;
+
+    const unobservedTokens = unobserved.reduce((sum, msg) => {
+      const content = typeof msg.content === 'string'
+        ? msg.content
+        : JSON.stringify(msg.content);
+      return sum + estimateTokens(content);
+    }, 0);
+    // Same floor onTurnEnd's buffering uses: observing a trivial tail
+    // thrashes the utility model for nothing.
+    if (unobservedTokens < this.config.bufferMinTokens) return false;
+
+    this.buffering.launchObserver(
+      this.completeFn,
+      [...unobserved],
+      watermark + unobserved.length,
+      this.observations || null,
+      this.buildObserverConfig(),
+      this.logger ?? undefined,
+    );
+    await this.buffering.waitForObserverSettled();
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
   // Slot content
   // -------------------------------------------------------------------------
 

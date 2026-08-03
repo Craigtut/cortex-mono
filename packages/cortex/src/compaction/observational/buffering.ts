@@ -396,6 +396,21 @@ export class BufferingCoordinator {
   }
 
   /**
+   * Resolve once the in-flight observer (if any) has settled. The internal
+   * completion handler was attached at launch, so by the time this resolves
+   * the chunk (or the failure cleanup) is already recorded. Resolves
+   * immediately when nothing is in flight; never rejects.
+   */
+  async waitForObserverSettled(): Promise<void> {
+    const inFlight = this.inFlightObserver;
+    if (!inFlight) return;
+    await inFlight.then(
+      () => {},
+      () => {},
+    );
+  }
+
+  /**
    * Whether a reflector call is currently in flight.
    */
   isReflectorInFlight(): boolean {

@@ -156,6 +156,7 @@ export type {
   DeliverOptions,
   DeliverOutcome,
   DeliverResult,
+  IdleDigestionResult,
   QueueDrainMode,
 } from './agent-loop.js';
 
