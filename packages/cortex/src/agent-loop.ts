@@ -222,9 +222,15 @@ const CHILD_SEED_CONTEXT_SLOT = '_seed_context';
 
 /**
  * Hard cap on a rendered permission request. Long enough that a real command
- * line survives verbatim; the excess is cut, never summarized.
+ * line survives verbatim. Over the cap, the HEAD and TAIL are kept with a
+ * loud elision marker between them, never a summary: the tail matters as
+ * much as the head, because a destructive suffix (`... && rm -rf ~`) must
+ * not be concealable behind padding (review-findings F14, D16: this is the
+ * string a human approves).
  */
 const RENDERED_REQUEST_MAX_CHARS = 500;
+const RENDERED_REQUEST_HEAD_CHARS = 300;
+const RENDERED_REQUEST_TAIL_CHARS = 150;
 
 /**
  * Default hard token cap for the consumer-fed headline block. Injected
@@ -2616,7 +2622,15 @@ export class AgentLoop {
 
     const rendered = detail.length > 0 ? `${permissionName}: ${detail}` : permissionName;
     if (rendered.length <= RENDERED_REQUEST_MAX_CHARS) return rendered;
-    return `${rendered.slice(0, RENDERED_REQUEST_MAX_CHARS)} [truncated]`;
+    // Head AND tail survive verbatim; only the middle is elided. A
+    // head-only cut would let a long benign prefix conceal a destructive
+    // suffix from the human approving this string.
+    const elided = rendered.length - RENDERED_REQUEST_HEAD_CHARS - RENDERED_REQUEST_TAIL_CHARS;
+    return (
+      rendered.slice(0, RENDERED_REQUEST_HEAD_CHARS) +
+      ` …[${elided} chars elided]… ` +
+      rendered.slice(-RENDERED_REQUEST_TAIL_CHARS)
+    );
   }
 
   /**

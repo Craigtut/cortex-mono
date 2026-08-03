@@ -129,7 +129,7 @@ describe('pending-ask registry', () => {
     expect(observedAskId).toMatch(/^ask-/);
   });
 
-  it('truncates a long rendered request without summarizing it', async () => {
+  it('elides the middle of a long rendered request, keeping head and tail verbatim', async () => {
     const longCommand = `echo ${'x'.repeat(700)}`;
     let rendered: string | undefined;
     const { hook } = buildLoopWithHook(async (_tool, _args, context) => {
@@ -139,12 +139,26 @@ describe('pending-ask registry', () => {
 
     await hook({ toolCall: { name: 'Bash' }, args: { command: longCommand } });
 
-    expect(rendered).toBeDefined();
-    expect(rendered!.endsWith(' [truncated]')).toBe(true);
-    // Verbatim prefix: exactly the leading characters of the real request.
-    const body = rendered!.slice(0, -' [truncated]'.length);
-    expect(`Bash: ${longCommand}`.startsWith(body)).toBe(true);
-    expect(body.length).toBe(500);
+    const full = `Bash: ${longCommand}`;
+    expect(rendered).toBe(
+      `${full.slice(0, 300)} …[${full.length - 450} chars elided]… ${full.slice(-150)}`,
+    );
+  });
+
+  it('keeps a destructive suffix visible through the elision', async () => {
+    // A 600-char benign prefix must not conceal what the command ends with:
+    // this rendering is the string a human approves by voice.
+    const longCommand = `echo ${'x'.repeat(600)} && rm -rf ~/work`;
+    let rendered: string | undefined;
+    const { hook } = buildLoopWithHook(async (_tool, _args, context) => {
+      rendered = context?.renderedRequest;
+      return true;
+    });
+
+    await hook({ toolCall: { name: 'Bash' }, args: { command: longCommand } });
+
+    expect(rendered!.endsWith('&& rm -rf ~/work')).toBe(true);
+    expect(rendered).toContain('chars elided');
   });
 
   it('settles the ask when the run aborts while it is pending', async () => {
