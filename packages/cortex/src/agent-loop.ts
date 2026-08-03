@@ -1314,6 +1314,15 @@ export class AgentLoop {
     // check above so a turn cancelled before it started leaves the queue
     // intact for the next prompt.
     const silentBatch = fromDrain ? [] : this.queuedSilentDeliveries.splice(0);
+    // Parked wake deliveries ride ahead of the prompt in the same batch,
+    // spliced in this same synchronous frame (before pi pushes the batch at
+    // run start) so a sweep task that fires later finds nothing and cannot
+    // re-deliver content this run consumed. If the run fails terminally
+    // without progressing past the batch, the catch below unwinds the wake
+    // portion and re-parks it: content the caller was told was 'parked'
+    // must end in a run that answers it, never silently demote to inert
+    // transcript context.
+    const wakeBatch = fromDrain ? [] : this.pendingWakeDeliveries.splice(0);
 
     // Long-lived mode keeps workspace state (cwd, read-before-edit registry,
     // undo history) across prompts; transient state resets regardless.
@@ -1335,6 +1344,9 @@ export class AgentLoop {
     // This enables cache breakpoint optimization: old history is stable
     // across ticks and can be cached, while new content changes each tick.
     this._prePromptMessageCount = this.agent.state.messages.length;
+    // Pre-delivery boundary for the wake-batch failure unwind, captured as
+    // a local because compaction may move _prePromptMessageCount mid-run.
+    const preDeliveryCount = this._prePromptMessageCount;
 
     this.logger.debug('loop start', {
       messageCount: this._prePromptMessageCount,
@@ -1357,10 +1369,20 @@ export class AgentLoop {
 
     let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
     try {
-      return await this.runTurnWithRetry(input, fromDrain, retryPolicyOverride, silentBatch);
+      return await this.runTurnWithRetry(
+        input, fromDrain, retryPolicyOverride, silentBatch, wakeBatch,
+      );
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       promptStatus = this.isAborted() ? 'cancelled' : 'rejected';
+      // A wake delivery spliced into a failed consumer prompt would
+      // otherwise sit in the transcript with no run ever answering it.
+      // Unwind and re-park it so a sweep re-delivers it with a run of its
+      // own. An aborted turn instead cancels its spliced deliveries, the
+      // same way abort() cancels parked ones.
+      if (promptStatus !== 'cancelled') {
+        this.reparkUndeliveredWakeBatch(wakeBatch, preDeliveryCount, silentBatch.length);
+      }
       // Classification, overflow handling, retry orchestration, and the onError
       // emission all happen inside runTurnWithRetry. Here we only record status
       // for diagnostics and re-throw to the consumer.
@@ -1423,6 +1445,7 @@ export class AgentLoop {
     fromDrain = false,
     retryPolicyOverride?: RetryPolicy,
     silentBatch: QueuedDelivery[] = [],
+    wakeBatch: QueuedDelivery[] = [],
   ): Promise<unknown> {
     const policy = retryPolicyOverride ?? this.retryPolicy;
     let retryIndex = 0;
@@ -1431,14 +1454,13 @@ export class AgentLoop {
     // Parked wake deliveries and queued silent deliveries ride ahead of the
     // prompt in one message batch; pi pushes every batch message into the
     // transcript at run start, so after the first attempt they are durable
-    // history and retries (continue()) see them without re-sending. The
-    // wake list is spliced (and cleared) here, immediately before the
-    // prompt call, so a sweep task that fires later finds nothing and
-    // cannot re-deliver content this run consumed. Drain-started runs
-    // splice neither queue: their failure unwind counts messages from the
+    // history and retries (continue()) see them without re-sending. Both
+    // queues are spliced by runPromptOnce in the same synchronous frame as
+    // this call, so a sweep task that fires later finds nothing and cannot
+    // re-deliver content this run consumed. Drain-started runs splice
+    // neither queue: their failure unwind counts messages from the
     // pre-delivery boundary, which flushed extras would corrupt, and the
     // sweep delivers parked wake content with a run of its own.
-    const wakeBatch = fromDrain ? [] : this.pendingWakeDeliveries.splice(0);
     const leadingBatch = [...wakeBatch, ...silentBatch];
     const promptInput: string | AgentMessage[] = leadingBatch.length > 0
       ? [
@@ -2012,6 +2034,84 @@ export class AgentLoop {
         return;
       }
       throw error;
+    }
+  }
+
+  /**
+   * After a terminal consumer-prompt failure, recover wake deliveries that
+   * were spliced into the failed run's leading batch. pi pushed them into
+   * the transcript at run start, but no run ever answered them: left
+   * there, content whose caller was told 'parked' silently demotes to
+   * inert context. Mirrors the sweep's failure recovery: when the run
+   * produced nothing beyond the batch (and failure stubs), the wake
+   * messages are spliced back out and re-parked for a sweep run of their
+   * own; when the run progressed past the batch, the content is durable
+   * history the next successful run sees, and re-parking would duplicate
+   * it. Consumer failure semantics for the prompt's own input and any
+   * flushed silent deliveries are unchanged: those stay in the transcript
+   * exactly as before.
+   */
+  private reparkUndeliveredWakeBatch(
+    wakeBatch: QueuedDelivery[],
+    preDeliveryCount: number,
+    trailingBatchCount: number,
+  ): void {
+    if (wakeBatch.length === 0) return;
+    const messages = this.agent.state.messages;
+
+    // How many spliced wake messages sit at the batch position, identity-
+    // checked by role and content so a mid-run history rewrite can never
+    // cause an unrelated message to be removed.
+    let landed = 0;
+    while (landed < wakeBatch.length) {
+      const idx = preDeliveryCount + landed;
+      if (idx >= messages.length) break;
+      const msg = messages[idx] as unknown as Record<string, unknown>;
+      if (msg['role'] !== 'user' || msg['content'] !== wakeBatch[landed]!.content) break;
+      landed += 1;
+    }
+
+    if (landed === wakeBatch.length) {
+      // Progression test, ignoring trailing failure stubs: any survivor
+      // beyond the pushed batch (wake, silent, and the prompt input) means
+      // the run progressed past the content.
+      let end = messages.length;
+      while (end > preDeliveryCount) {
+        const msg = messages[end - 1] as unknown as Record<string, unknown>;
+        if (!AgentLoop.isTrimmableFailureMessage(msg)) break;
+        end -= 1;
+      }
+      if (end > preDeliveryCount + wakeBatch.length + trailingBatchCount + 1) {
+        return; // Durable history; re-parking would duplicate it.
+      }
+      messages.splice(preDeliveryCount, landed);
+      this.notifySourceHistoryTailTrimmed();
+    } else if (landed > 0) {
+      // pi pushes the whole batch at run start, so a partial match means
+      // the transcript was rewritten under us. Leave it untouched and do
+      // not re-park: duplicating content is worse than leaving it as the
+      // context the surviving transcript already carries.
+      return;
+    }
+    // landed === 0: the failure hit before pi pushed the batch. Nothing to
+    // unwind, but the content is not in history and must be re-parked.
+
+    const requeue = wakeBatch.filter((item) => {
+      item.deliveryAttempts = (item.deliveryAttempts ?? 0) + 1;
+      item.firstDeliveryAttemptAt ??= Date.now();
+      if (item.deliveryAttempts >= MAX_WAKE_DELIVERY_ATTEMPTS) return false;
+      return Date.now() - item.firstDeliveryAttemptAt < MAX_WAKE_DELIVERY_ELAPSED_MS;
+    });
+    if (requeue.length < wakeBatch.length) {
+      this.logger.error('dropping wake deliveries after repeated failed carrying runs', {
+        dropped: wakeBatch.length - requeue.length,
+        attempts: MAX_WAKE_DELIVERY_ATTEMPTS,
+      });
+    }
+    if (requeue.length > 0) {
+      // Ahead of anything that parked meanwhile, preserving arrival order.
+      this.pendingWakeDeliveries.unshift(...requeue);
+      this.scheduleWakeSweep();
     }
   }
 

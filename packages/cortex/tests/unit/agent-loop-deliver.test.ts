@@ -702,6 +702,81 @@ describe('AgentLoop.deliver sweep failure recovery', () => {
   });
 });
 
+describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {
+  it('re-parks wake content spliced into a consumer prompt that fails before progressing', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+
+    // The consumer prompt fails after pi pushed its batch but before any
+    // model output; the sweep's later run succeeds.
+    let failuresLeft = 1;
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      if (failuresLeft > 0) {
+        failuresLeft -= 1;
+        throw new Error('provider exploded before any output');
+      }
+      piAgent.state.messages.push({ role: 'assistant', content: 'ok', timestamp: Date.now() });
+      return { content: 'ok' };
+    };
+
+    const turn = loop.prompt('real question');
+    // Same-frame park: the gate is held, so this splices into that prompt.
+    const result = loop.deliver('spliced wake content');
+    expect(result.outcome).toBe('parked');
+
+    await expect(turn).rejects.toThrow('provider exploded');
+
+    // The failed run never answered the spliced content: it is unwound and
+    // re-parked, and a sweep re-delivers it with a run of its own.
+    await waitUntil(() => piAgent.promptCalls.length === 2);
+    expect(piAgent.promptCalls[1]).toBe('spliced wake content');
+    await waitUntil(() => !loop.isLoopActive);
+    // Exactly once in the transcript (the failed copy was unwound), and
+    // the consumer prompt's own failure shape is unchanged.
+    expect(occurrences(piAgent, 'spliced wake content')).toBe(1);
+    expect(occurrences(piAgent, 'real question')).toBe(1);
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+  });
+
+  it('leaves spliced wake content in history when the failed run progressed past it', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+
+    // The run produces a partial assistant answer after the batch, then
+    // fails: the batch is durable history the next run sees, so re-parking
+    // it would deliver the same content twice.
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      piAgent.state.messages.push({
+        role: 'assistant',
+        content: 'partial answer covering the delivery',
+        timestamp: Date.now(),
+      });
+      throw new Error('provider dropped late in the run');
+    };
+
+    const turn = loop.prompt('real question');
+    const result = loop.deliver('progressed wake content');
+    expect(result.outcome).toBe('parked');
+
+    await expect(turn).rejects.toThrow('provider dropped late');
+    await waitUntil(() => !loop.isLoopActive);
+
+    expect(occurrences(piAgent, 'progressed wake content')).toBe(1);
+    expect(piAgent.promptCalls).toHaveLength(1);
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+  });
+});
+
 describe('AgentLoop.deliver and abort', () => {
   it('abort() drops parked wake deliveries instead of waiting on a swept run', async () => {
     const piAgent = createMockPiAgent();
