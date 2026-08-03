@@ -162,6 +162,20 @@ export type {
   QueueDrainMode,
 } from './agent-loop.js';
 
+// CortexAgent (the composite facade over AgentLoop; passthrough mode today,
+// duplex mode arrives with Phase 2b). AgentLoop remains the loop primitive
+// and the package's primary agent surface until the duplex default flips.
+export { CortexAgent, CONFIG_ROUTING, buildReasonerConfig } from './cortex-agent.js';
+export type {
+  CortexAgentMode,
+  CortexAgentConfig,
+  CortexAbortScope,
+  CortexDeliverOptions,
+  CortexSessionLogConfig,
+  TalkerConfig,
+  ConfigDestination,
+} from './cortex-agent.js';
+
 // Session Log (the CortexAgent composite's append-only session record)
 export { SessionLog } from './session-log.js';
 export type {
