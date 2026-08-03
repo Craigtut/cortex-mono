@@ -34,8 +34,11 @@ Wake class is the primary axis, loop state the secondary one. Silent never steer
 | Wake | Loop state | Action |
 |---|---|---|
 | wake | idle | prompt (starts a turn; the caller's promise is that turn) |
-| wake | running, or gate held with pi idle (retry backoff, drain window) | steer (lands at the next turn boundary) |
+| wake | gate held by a **run-bearing** task (running, queued, retry backoff, drain with work) | steer (lands at the next turn boundary) |
+| wake | gate held by a **non-run-bearing** task (`digestIdle`, an empty drain, a cycle that threw at dequeue) | steer, then enqueue a follow-up task that starts a run if pi's queue is still non-empty |
 | `silent` | any | loop-owned queue, flushed as leading messages of the next real prompt |
+
+**Not every gate holder drains pi's steering queue.** The obvious implementation steers whenever the gate is held, on the premise that some run will pick the message up. `digestIdle` breaks that premise: it holds the gate and calls the transform hook directly without starting a pi run, so a steer parked there waits for an unrelated later run, which may be a background drain. The caller is told the message was steered when there is no in-flight turn to carry it. Since the facade digests precisely during idle windows, and idle windows are when deliveries arrive, this is the common path rather than a corner. Gate-held is therefore two states, not one.
 
 **Silent must never reach pi's steering queue, including while a run is live.** After a terminated tool batch, `runLoop` still polls `getSteeringMessages()` and continues the inner loop if anything is queued. A silent delivery parked there during a talker turn would drain immediately after the control-tool batch and produce an unprompted spoken response to content that was supposed to surface only when relevant. Steering silent content into a running turn is the same mistake wearing a different hat: it lands at that run's next turn boundary and gets acted on, which is a wake by another name.
 
