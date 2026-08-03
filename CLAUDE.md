@@ -126,6 +126,10 @@ refactor(cortex): extract provider registry into separate module
 - Always use `git commit -m "..."` with a single-line message.
 - Do not use branches. Commit directly to the working branch; never create feature branches.
 
+**Git safety:**
+- Never run a bare `git stash pop` or `git stash drop`. The stash may hold unrelated work-in-progress that is not yours, and a bare pop takes whichever entry happens to be on top. To set your own changes aside temporarily, copy the file instead, or use `git stash push -- <paths>` and pop that specific entry by name.
+- To check whether a test genuinely fails against pre-change code, revert only the source file (keep the test) with `git show HEAD:<path> > <path>` and restore it afterwards. Do not stash.
+
 ## Documentation
 
 Detailed documentation lives in `/docs/cortex/`. Use `/doc-explorer <topic>` to explore.
