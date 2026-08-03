@@ -21,7 +21,7 @@
     "dev": "tsc --build --watch packages/cortex packages/cortex-code",
     "test": "vitest",
     "test:run": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "eslint packages/*/src packages/*/tests",
     "lint:fix": "eslint packages/*/src packages/*/tests --fix",
     "clean": "rm -rf packages/*/dist node_modules/.cache",

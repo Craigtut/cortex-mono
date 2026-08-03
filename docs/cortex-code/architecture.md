@@ -98,7 +98,7 @@ Three-layer separation. Each layer has a single concern:
 │  Cortex Framework                                      │
 │                                                        │
 │  ┌─────────────────────────────────────────────────┐  │
-│  │  AgentLoop                                    │  │
+│  │  AgentLoop                                      │  │
 │  │  (agentic loop, tools, compaction, skills)      │  │
 │  └─────────────────────────────────────────────────┘  │
 │  ┌─────────────────────────────────────────────────┐  │
