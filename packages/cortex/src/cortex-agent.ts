@@ -373,6 +373,12 @@ type PendingBackgroundCompletion = (
   /** Failed delivery attempts so far. Set by the drain's re-queue path. */
   deliveryAttempts?: number;
   /**
+   * When the first delivery attempt for this completion started. Bounds the
+   * TOTAL time spent delivering it (in-run retry backoff included), so
+   * re-queued attempts cannot re-enter the full retry ladder back-to-back.
+   */
+  firstDeliveryAttemptAt?: number;
+  /**
    * Message formatted on the first delivery attempt. Re-queued items reuse
    * it because formatting marks Bash tasks notified, so re-formatting would
    * return null and silently drop the completion.
@@ -389,6 +395,15 @@ const ABORTED_PERMISSION_REASON =
 
 /** Delivery attempts per background completion before dead-lettering. */
 const MAX_BACKGROUND_DELIVERY_ATTEMPTS = 3;
+
+/**
+ * Total time a background completion may spend in delivery attempts
+ * (in-run retry backoff included) before it dead-letters. The attempt cap
+ * alone would let each re-queued attempt re-enter the full retry ladder
+ * (~3h under the default policy) back-to-back while holding the loop gate,
+ * so the remaining budget also caps each attempt's ladder via maxElapsedMs.
+ */
+const MAX_BACKGROUND_DELIVERY_ELAPSED_MS = 4 * 60 * 60 * 1000;
 
 /** Dead-lettered completions retained for consumer inspection. */
 const MAX_DEAD_LETTERED_RESULTS = 50;
@@ -949,11 +964,15 @@ export class CortexAgent {
    *   which deliberately starts a fresh loop after an abort. The consumer
    *   path (false) instead cancels a turn whose controller was aborted
    *   before it dequeued (e.g. a same-frame prompt()+abort()).
+   * @param retryPolicyOverride - Per-run retry policy. The drain passes a
+   *   policy whose elapsed ceiling is its remaining delivery budget, so a
+   *   re-queued delivery cannot re-enter the full retry ladder.
    */
   private async runPromptOnce(
     input: string,
     options?: DirectCompletionOptions,
     fromDrain = false,
+    retryPolicyOverride?: RetryPolicy,
   ): Promise<unknown> {
     // Transition to ACTIVE on first loop
     if (this.lifecycleState === 'created') {
@@ -1017,7 +1036,7 @@ export class CortexAgent {
 
     let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
     try {
-      return await this.runTurnWithRetry(input, fromDrain);
+      return await this.runTurnWithRetry(input, fromDrain, retryPolicyOverride);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       promptStatus = this.isAborted() ? 'cancelled' : 'rejected';
@@ -1078,7 +1097,12 @@ export class CortexAgent {
    *   exactly once (mirroring how an in-run retry that recovers reports
    *   onRetrySucceeded rather than onError).
    */
-  private async runTurnWithRetry(input: string, fromDrain = false): Promise<unknown> {
+  private async runTurnWithRetry(
+    input: string,
+    fromDrain = false,
+    retryPolicyOverride?: RetryPolicy,
+  ): Promise<unknown> {
+    const policy = retryPolicyOverride ?? this.retryPolicy;
     let retryIndex = 0;
     let firstFailureAt: number | undefined;
 
@@ -1133,7 +1157,7 @@ export class CortexAgent {
         const policyAllowsRetry = shouldRetry(
           classified,
           { retryIndex, elapsedMs, aborted },
-          this.retryPolicy,
+          policy,
         );
         const willRetry = policyAllowsRetry && this.peekResumableAfterTrim();
 
@@ -1145,7 +1169,7 @@ export class CortexAgent {
             retryIndex > 0 &&
             !aborted &&
             !policyAllowsRetry &&
-            isRetryableCategory(classified.category, this.retryPolicy)
+            isRetryableCategory(classified.category, policy)
           ) {
             this.fireRetryExhausted({ attempts: retryIndex, category: classified.category });
           }
@@ -1162,12 +1186,12 @@ export class CortexAgent {
           throw error;
         }
 
-        const delayMs = backoffForAttempt(this.retryPolicy, retryIndex);
+        const delayMs = backoffForAttempt(policy, retryIndex);
         const attemptNumber = retryIndex + 1;
         const scheduled: RetryScheduledInfo = {
           category: classified.category,
           attempt: attemptNumber,
-          maxAttempts: this.retryPolicy.maxAttempts,
+          maxAttempts: policy.maxAttempts,
           delayMs,
           nextAttemptAt: Date.now() + delayMs,
           originalMessage: classified.originalMessage,
@@ -1179,7 +1203,7 @@ export class CortexAgent {
         this.logger.warn('[CortexAgent] scheduling background retry', {
           category: classified.category,
           attempt: attemptNumber,
-          maxAttempts: this.retryPolicy.maxAttempts,
+          maxAttempts: policy.maxAttempts,
           delayMs,
         });
 
@@ -5053,11 +5077,32 @@ export class CortexAgent {
       const message = item.formattedMessage ?? this.formatPendingCompletion(item);
       if (message === null) continue;
       item.formattedMessage = message;
+      item.firstDeliveryAttemptAt ??= Date.now();
       batch.push(item);
       parts.push(message);
       if (!item.deliveryAttempts) firstAttemptTaskIds.push(item.taskId);
     }
     if (batch.length === 0) return;
+
+    // Remaining delivery budget for the oldest item in this batch. Each
+    // attempt's in-run retry ladder is capped to it (via maxElapsedMs), so
+    // three re-queued attempts cannot hold the loop gate for three full
+    // ladders back-to-back during a sustained outage.
+    const oldestFirstAttemptAt = batch.reduce(
+      (oldest, item) => Math.min(oldest, item.firstDeliveryAttemptAt ?? oldest),
+      Date.now(),
+    );
+    const remainingBudgetMs = Math.max(
+      0,
+      MAX_BACKGROUND_DELIVERY_ELAPSED_MS - (Date.now() - oldestFirstAttemptAt),
+    );
+    const boundedRetryPolicy: RetryPolicy = {
+      ...this.retryPolicy,
+      maxElapsedMs: Math.min(
+        this.retryPolicy.maxElapsedMs ?? Number.POSITIVE_INFINITY,
+        remainingBudgetMs,
+      ),
+    };
 
     const message = parts.join('\n\n---\n\n');
     // Notify consumers once per completion (not again on re-attempts).
@@ -5074,7 +5119,7 @@ export class CortexAgent {
     try {
       // fromDrain: deliver via a fresh loop even if a prior turn was
       // aborted; background completions are not cancelled by user abort.
-      await this.runPromptOnce(message, undefined, true);
+      await this.runPromptOnce(message, undefined, true, boundedRetryPolicy);
     } catch (err) {
       // The delivery loop failed. Re-queue only when the delivery message
       // could be unwound from the transcript (or never landed); if the run
@@ -5180,16 +5225,28 @@ export class CortexAgent {
   /**
    * After a failed delivery, put the batch back at the front of the queue
    * (preserving order relative to completions that arrived meanwhile), or
-   * dead-letter items that exhausted their attempts so a deterministic
-   * delivery failure cannot redeliver forever.
+   * dead-letter items that cannot productively re-attempt: attempts
+   * exhausted, total delivery time over budget, or a fatal error category
+   * (an immediate identical re-attempt of an authentication failure is
+   * futile; the consumer must act first). Bounds both deterministic
+   * redelivery loops and gate-holding during a sustained outage.
    */
   private requeueOrDeadLetter(batch: PendingBackgroundCompletion[], err: unknown): void {
-    const lastError = err instanceof Error ? err.message : String(err);
+    const error = err instanceof Error ? err : new Error(String(err));
+    const lastError = error.message;
+    const fatal =
+      classifyError(error, { wasAborted: this.isAborted() }).severity === 'fatal';
+    const now = Date.now();
     const requeue: PendingBackgroundCompletion[] = [];
     for (const item of batch) {
       const attempts = (item.deliveryAttempts ?? 0) + 1;
       item.deliveryAttempts = attempts;
-      if (attempts < MAX_BACKGROUND_DELIVERY_ATTEMPTS) {
+      const elapsedMs = now - (item.firstDeliveryAttemptAt ?? now);
+      if (
+        !fatal &&
+        elapsedMs < MAX_BACKGROUND_DELIVERY_ELAPSED_MS &&
+        attempts < MAX_BACKGROUND_DELIVERY_ATTEMPTS
+      ) {
         requeue.push(item);
         continue;
       }

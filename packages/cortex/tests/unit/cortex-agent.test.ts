@@ -2386,6 +2386,96 @@ You have 12 emotions.`;
       expect(errored.mock.calls[0][0].originalMessage).toContain('delivery down');
     });
 
+    it('dead-letters immediately on a fatal authentication error instead of re-attempting', async () => {
+      // An identical immediate re-attempt of an auth failure is futile: the
+      // consumer must fix credentials first. Burning the attempt cap in
+      // milliseconds would only hide the real failure mode.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const errored = vi.fn();
+      agent.onError(errored);
+      seedCompletedTask(agent, 'task_s4a', 'auth-blocked output');
+
+      const promptCalls: string[] = [];
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        promptCalls.push(input);
+        piAgent.state.messages.push({ role: 'user', content: input } as never);
+        piAgent.state.messages.push({
+          role: 'assistant',
+          content: [],
+          stopReason: 'error',
+          errorMessage: 'Invalid API key provided',
+        } as never);
+        throw new Error('Invalid API key provided');
+      };
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s4a' });
+
+      expect(promptCalls).toHaveLength(1);
+      const dead = agent.getDeadLetteredBackgroundResults();
+      expect(dead).toHaveLength(1);
+      expect(dead[0].attempts).toBe(1);
+      expect(errored).toHaveBeenCalledTimes(1);
+    });
+
+    it('dead-letters a delivery whose total elapsed budget is exhausted, before the attempt cap', async () => {
+      // The item's first delivery attempt started five hours ago (earlier
+      // attempts burned the in-run retry ladder). Even though attempts
+      // remain, the elapsed budget bounds total delivery time; without it,
+      // this re-queue would succeed on the next immediate attempt and a
+      // real outage could hold the loop gate for three full ladders.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      seedCompletedTask(agent, 'task_s4b', 'over-budget output');
+      const promptCalls = installFailingPrompt(1);
+
+      await internal.deliverOrQueueBackgroundCompletion({
+        kind: 'bash',
+        taskId: 'task_s4b',
+        firstDeliveryAttemptAt: Date.now() - 5 * 60 * 60 * 1000,
+      });
+
+      expect(promptCalls).toHaveLength(1);
+      const dead = agent.getDeadLetteredBackgroundResults();
+      expect(dead).toHaveLength(1);
+      expect(dead[0].attempts).toBe(1);
+      expect(internal.pendingBackgroundResults).toHaveLength(0);
+    });
+
+    it('caps the in-run retry ladder by the remaining delivery budget', async () => {
+      // Retry enabled: a network failure would normally schedule an in-run
+      // retry. The delivery budget is exhausted, so the bounded policy the
+      // drain passes down must fail fast instead of re-entering the ladder.
+      config = createDefaultConfig({
+        retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 3 },
+      });
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const scheduled = vi.fn();
+      agent.onRetryScheduled(scheduled);
+      seedCompletedTask(agent, 'task_s4c', 'ladder-capped output');
+
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        piAgent.state.messages.push({ role: 'user', content: input } as never);
+        piAgent.state.messages.push({
+          role: 'assistant',
+          content: [],
+          stopReason: 'error',
+          errorMessage: 'connect ECONNREFUSED',
+        } as never);
+        throw new Error('connect ECONNREFUSED');
+      };
+
+      await internal.deliverOrQueueBackgroundCompletion({
+        kind: 'bash',
+        taskId: 'task_s4c',
+        firstDeliveryAttemptAt: Date.now() - 5 * 60 * 60 * 1000,
+      });
+
+      expect(scheduled).not.toHaveBeenCalled();
+      expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(1);
+    });
+
     it('fires onBackgroundResultDelivery once per completion, not per attempt', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as InternalAgent;
