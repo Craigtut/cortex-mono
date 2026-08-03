@@ -1,11 +1,11 @@
 # Cortex Built-in Tools
 
-Built-in tools that ship with `@animus-labs/cortex`. These are general-purpose tools any agent needs regardless of its application. They are **registered automatically** when `CortexAgent.create()` is called, using the `workingDirectory` from the agent config. No consumer-side tool creation is needed.
+Built-in tools that ship with `@animus-labs/cortex`. These are general-purpose tools any agent needs regardless of its application. They are **registered automatically** when `AgentLoop.create()` is called, using the `workingDirectory` from the agent config. No consumer-side tool creation is needed.
 
 To disable specific built-in tools, use the `disableTools` config option:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory: cwd,
   disableTools: ['WebFetch'], // Exclude specific tools

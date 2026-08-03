@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiModel } from '../../src/cortex-agent.js';
-import type { CortexAgentConfig, CortexToolPermissionResult } from '../../src/types.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiModel } from '../../src/agent-loop.js';
+import type { AgentLoopConfig, CortexToolPermissionResult } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 
 // ---------------------------------------------------------------------------
@@ -22,9 +22,9 @@ function makeModel(raw: PiModel) {
  * beforeToolCall permission hook, exactly as pi would call it.
  */
 function buildBeforeToolCallHook(
-  resolvePermission: CortexAgentConfig['resolvePermission'],
+  resolvePermission: AgentLoopConfig['resolvePermission'],
 ): BeforeToolCallHook {
-  const cortexConfig: CortexAgentConfig = {
+  const cortexConfig: AgentLoopConfig = {
     model: makeModel({
       provider: 'anthropic',
       name: 'claude-sonnet-4-20250514',
@@ -33,15 +33,15 @@ function buildBeforeToolCallHook(
     workingDirectory: '/tmp/test-workspace',
     ...(resolvePermission ? { resolvePermission } : {}),
   };
-  const statics = CortexAgent as unknown as {
+  const statics = AgentLoop as unknown as {
     buildPiAgentConfig: (params: {
-      cortexConfig: CortexAgentConfig;
-      cacheBreakpointState: { cortexAgent: CortexAgent | null };
+      cortexConfig: AgentLoopConfig;
+      cacheBreakpointState: { agentLoop: AgentLoop | null };
     }) => Record<string, unknown>;
   };
   const agentConfig = statics.buildPiAgentConfig({
     cortexConfig,
-    cacheBreakpointState: { cortexAgent: null },
+    cacheBreakpointState: { agentLoop: null },
   });
   return agentConfig['beforeToolCall'] as BeforeToolCallHook;
 }

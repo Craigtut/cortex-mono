@@ -172,7 +172,7 @@ export function computeAdaptiveThreshold(
  * CompactionManager orchestrates all three compaction layers.
  *
  * It is stateful: it tracks the current token count and the microcompaction
- * cache. The CortexAgent creates one instance and delegates all compaction
+ * cache. The AgentLoop creates one instance and delegates all compaction
  * decisions to it. Compaction is fully autonomous: all three layers run
  * inside applyInTransformContext(), which fires before every LLM call.
  */
@@ -226,7 +226,7 @@ export class CompactionManager {
   /** Consecutive Layer 2 failure count for circuit breaker. Reset on success. */
   private _consecutiveLayer2Failures = 0;
 
-  /** LLM completion function, set by CortexAgent. */
+  /** LLM completion function, set by AgentLoop. */
   private completeFn: CompleteFn | null = null;
 
   /** Logger for compaction diagnostics. */
@@ -329,7 +329,7 @@ export class CompactionManager {
   /**
    * Set the active provider and cache retention. Resolves the effective
    * cache TTL from PROVIDER_CACHE_CONFIG and stores it for L1's cache-aware
-   * gating. Called by CortexAgent at construction, on provider changes, and
+   * gating. Called by AgentLoop at construction, on provider changes, and
    * on cache retention changes.
    *
    * @param provider - The active provider name (e.g., "anthropic", "openai")
@@ -487,7 +487,7 @@ export class CompactionManager {
   }
 
   /**
-   * Register a handler that receives the CompactionResult (for CortexAgent event emission).
+   * Register a handler that receives the CompactionResult (for AgentLoop event emission).
    */
   onCompactionResult(handler: (result: CompactionResult) => void): void {
     this.compactionResultHandlers.push(handler);
@@ -763,7 +763,7 @@ export class CompactionManager {
   /**
    * Apply compaction layers to the context in transformContext.
    *
-   * This is the main entry point called from CortexAgent.getTransformContextHook().
+   * This is the main entry point called from AgentLoop.getTransformContextHook().
    * It is fully self-contained: all three compaction layers are integrated here,
    * triggered autonomously based on token thresholds. No external calls from
    * the backend are needed to trigger compaction.

@@ -70,7 +70,7 @@ export interface CortexEvent {
   /**
    * Extracted usage data from the LLM response, present on turn_end events.
    * Centralizes extraction from pi-ai's AssistantMessage.usage structure so
-   * subscribers (BudgetGuard, CortexAgent, consumers) read typed data instead
+   * subscribers (BudgetGuard, AgentLoop, consumers) read typed data instead
    * of parsing the opaque `data` field themselves.
    */
   usage?: CortexUsage;

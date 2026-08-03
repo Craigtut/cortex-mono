@@ -103,7 +103,7 @@ export function extractWorkingContent(text: string): string | null {
 /**
  * Parse text into structured AgentTextOutput with user-facing and working segments.
  *
- * This is the primary parsing function used by CortexAgent at turn completion.
+ * This is the primary parsing function used by AgentLoop at turn completion.
  * It combines stripWorkingTags and extractWorkingContent into a single result.
  *
  * @param text - Raw agent text potentially containing <working> tags

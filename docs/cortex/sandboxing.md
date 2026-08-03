@@ -134,10 +134,10 @@ type NetworkAccessScope = 'once' | 'session' | 'always';
 interface NetworkAccessDecision { decision: 'allow' | 'deny'; scope?: NetworkAccessScope; }
 type ResolveNetworkAccess = (req: NetworkAccessRequest) => Promise<NetworkAccessDecision>;
 
-// CortexAgentConfig.resolveNetworkAccess?: ResolveNetworkAccess
+// AgentLoopConfig.resolveNetworkAccess?: ResolveNetworkAccess
 //
 // The consumer implements ONE decision function (allowlist + grants + prompt)
-// and wires it twice: into CortexAgentConfig.resolveNetworkAccess (WebFetch
+// and wires it twice: into AgentLoopConfig.resolveNetworkAccess (WebFetch
 // consults it before every fetch) and into the provider's ask callback (the
 // egress proxy consults it for shell commands). A domain granted once then
 // covers both paths. WebFetch's SSRF/private-IP guard stays separate and

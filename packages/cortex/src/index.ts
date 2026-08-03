@@ -6,7 +6,7 @@
  * budget guards, compaction, skill system, and event logging.
  *
  * Phase 1A exports: types and pure utility modules.
- * Phase 1B exports: CortexAgent, ContextManager, EventBridge, BudgetGuard.
+ * Phase 1B exports: AgentLoop, ContextManager, EventBridge, BudgetGuard.
  * Phase 1C exports: Built-in tools (Read, Write, Edit, Glob, Grep, Bash, TaskOutput, WebFetch).
  * Phase 1D exports: ProviderManager, model wrapper, provider registry.
  */
@@ -20,7 +20,7 @@ export type {
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
   ToolPermissionRequestContext,
-  CortexAgentConfig,
+  AgentLoopConfig,
   CortexDiagnosticsConfig,
   ContextManagerConfig,
   ErrorCategory,
@@ -142,9 +142,9 @@ export type {
 // Budget Guard (Phase 1B)
 export { BudgetGuard } from './budget-guard.js';
 
-// CortexAgent (Phase 1B)
-export { CortexAgent, MINIMUM_CONTEXT_WINDOW, TOOL_RESULT_WORKING_TAGS_REMINDER } from './cortex-agent.js';
-export type { PiAgent, PiModel, DirectCompletionOptions } from './cortex-agent.js';
+// AgentLoop (Phase 1B)
+export { AgentLoop, MINIMUM_CONTEXT_WINDOW, TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop.js';
+export type { PiAgent, PiModel, DirectCompletionOptions } from './agent-loop.js';
 
 // Tool Contracts
 export { fromPiAgentTool, assertValidCortexTool } from './tool-contract.js';

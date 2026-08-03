@@ -144,7 +144,7 @@ export class SkillRegistry {
 
   /**
    * Callback fired when skills are added or removed.
-   * CortexAgent sets this to rebuild the load_skill tool description.
+   * AgentLoop sets this to rebuild the load_skill tool description.
    */
   onChange: (() => void) | null = null;
 

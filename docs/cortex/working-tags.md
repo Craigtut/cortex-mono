@@ -80,7 +80,7 @@ In this interaction:
 Working tags are enabled by default and can be disabled by the consumer.
 
 ```typescript
-interface CortexAgentConfig {
+interface AgentLoopConfig {
   // ... other config
   workingTags?: {
     enabled?: boolean;  // default: true

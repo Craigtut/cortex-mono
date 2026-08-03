@@ -15,22 +15,22 @@ ProviderManager wraps all of this into a single, typed interface that:
 - Keeps pi-ai as an internal implementation detail of Cortex
 - Provides an interface (`IProviderManager`) for testing and alternative implementations
 
-## Relationship to CortexAgent
+## Relationship to AgentLoop
 
-ProviderManager and CortexAgent are **fully independent**. Neither knows about the other. They exist as separate exports from `@animus-labs/cortex`.
+ProviderManager and AgentLoop are **fully independent**. Neither knows about the other. They exist as separate exports from `@animus-labs/cortex`.
 
 ```
 @animus-labs/cortex
 ├── ProviderManager    (discovery, auth, model resolution)
-├── CortexAgent        (agentic loop, tools, context, skills)
+├── AgentLoop        (agentic loop, tools, context, skills)
 └── pi-ai / pi-agent-core (internal, not exposed)
 ```
 
 **Why independent:**
 
-1. **Lifecycle mismatch.** ProviderManager is needed during onboarding (before any agent exists) for provider discovery and OAuth flows. CortexAgent is created later, after credentials are confirmed and persona is set up. They have different creation times.
+1. **Lifecycle mismatch.** ProviderManager is needed during onboarding (before any agent exists) for provider discovery and OAuth flows. AgentLoop is created later, after credentials are confirmed and persona is set up. They have different creation times.
 
-2. **The consumer wires them.** The consumer creates both, uses ProviderManager for auth/discovery, and provides a `getApiKey` callback to CortexAgent. The callback is the only connection, and the consumer owns it.
+2. **The consumer wires them.** The consumer creates both, uses ProviderManager for auth/discovery, and provides a `getApiKey` callback to AgentLoop. The callback is the only connection, and the consumer owns it.
 
 3. **Testability.** Each can be tested and mocked independently.
 
@@ -113,7 +113,7 @@ Model metadata is derived from pi-ai's model registry. Pi-ai auto-discovers mode
 ```typescript
 /**
  * Opaque model handle. The consumer receives this from ProviderManager
- * and passes it to CortexAgent. The consumer never inspects its internals.
+ * and passes it to AgentLoop. The consumer never inspects its internals.
  *
  * Internally, this wraps pi-ai's Model<T> type.
  */
@@ -129,7 +129,7 @@ type CortexModel = {
 };
 ```
 
-The consumer can read `provider`, `modelId`, and `contextWindow` for display and configuration purposes. The underlying pi-ai `Model` object is accessed internally by CortexAgent when constructing the pi-agent-core Agent.
+The consumer can read `provider`, `modelId`, and `contextWindow` for display and configuration purposes. The underlying pi-ai `Model` object is accessed internally by AgentLoop when constructing the pi-agent-core Agent.
 
 ### OAuth
 
@@ -684,16 +684,16 @@ The filtering pipeline in `listModels()` applies three steps in sequence:
 
 Providers not listed in `LEGACY_MODEL_PREFIXES` (e.g., Mistral, Groq) have no filtering applied; all their models pass through unchanged.
 
-## CortexAgent Integration
+## AgentLoop Integration
 
-CortexAgent receives a `CortexModel` and an optional `getApiKey` callback. The callback is the consumer's responsibility to implement; ProviderManager is not involved.
+AgentLoop receives a `CortexModel` and an optional `getApiKey` callback. The callback is the consumer's responsibility to implement; ProviderManager is not involved.
 
-`CortexModel` is the public model boundary for Cortex. Consumers obtain it from `ProviderManager`, store it, and pass it back into `CortexAgent`. Raw pi-ai model objects do not cross the public API boundary.
+`CortexModel` is the public model boundary for Cortex. Consumers obtain it from `ProviderManager`, store it, and pass it back into `AgentLoop`. Raw pi-ai model objects do not cross the public API boundary.
 
 ```typescript
-// packages/cortex/src/cortex-agent.ts
+// packages/cortex/src/agent-loop.ts
 
-interface CortexAgentConfig {
+interface AgentLoopConfig {
   /** Model handle from ProviderManager.resolveModel() */
   model: CortexModel;
 
@@ -708,10 +708,10 @@ interface CortexAgentConfig {
 }
 ```
 
-Internally, CortexAgent unwraps the `CortexModel` once at the Cortex boundary, uses the raw pi-ai model for runtime calls, and passes `getApiKey` through to pi-agent-core:
+Internally, AgentLoop unwraps the `CortexModel` once at the Cortex boundary, uses the raw pi-ai model for runtime calls, and passes `getApiKey` through to pi-agent-core:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   getApiKey: (provider) => credService.resolveApiKey(provider),
   initialBasePrompt: 'You are the application agent.',
@@ -734,7 +734,7 @@ packages/cortex/
                               # OAuth types, API key validation types, custom model config
     provider-registry.ts      # Static provider metadata (PROVIDER_REGISTRY), ProviderInfo, ModelInfo
     model-wrapper.ts          # CortexModel wrapping/unwrapping utilities
-    types.ts                  # CortexAgent config and shared agent/runtime types
+    types.ts                  # AgentLoop config and shared agent/runtime types
 ```
 
 ## Supported Providers

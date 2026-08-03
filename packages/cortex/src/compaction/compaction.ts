@@ -192,7 +192,7 @@ export function formatTurnsForSummarization(turns: AgentMessage[]): string {
 
 /**
  * Type for the LLM completion function.
- * Matches the signature of CortexAgent.directComplete().
+ * Matches the signature of AgentLoop.directComplete().
  */
 export type CompleteFn = (context: {
   systemPrompt: string;

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
-import type { CortexAgentConfig } from '../../src/types.js';
+import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 
 // ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ function makeModel(raw: PiModel) {
   return wrapModel(raw, raw.provider, raw.name, raw.contextWindow);
 }
 
-function createConfig(overrides?: Partial<CortexAgentConfig>): CortexAgentConfig {
+function createConfig(overrides?: Partial<AgentLoopConfig>): AgentLoopConfig {
   return {
     model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel),
     workingDirectory: '/tmp/test-workspace',
@@ -133,12 +133,12 @@ function createConfig(overrides?: Partial<CortexAgentConfig>): CortexAgentConfig
   };
 }
 
-type Ctor = new (agent: PiAgent, config: CortexAgentConfig) => CortexAgent;
-function build(agent: PiAgent, config: CortexAgentConfig): CortexAgent {
-  return new (CortexAgent as unknown as Ctor)(agent, config);
+type Ctor = new (agent: PiAgent, config: AgentLoopConfig) => AgentLoop;
+function build(agent: PiAgent, config: AgentLoopConfig): AgentLoop {
+  return new (AgentLoop as unknown as Ctor)(agent, config);
 }
 
-describe('CortexAgent background retry', () => {
+describe('AgentLoop background retry', () => {
   let mock: RetryMockAgent;
 
   afterEach(() => {
@@ -356,7 +356,7 @@ describe('CortexAgent background retry', () => {
   });
 });
 
-describe('CortexAgent abort-stub trim', () => {
+describe('AgentLoop abort-stub trim', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });

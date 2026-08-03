@@ -157,13 +157,13 @@ export class McpClientManager {
 
   /**
    * Callback invoked whenever the aggregate tool set changes.
-   * CortexAgent uses this to resync live tools after connect/disconnect/reconnect.
+   * AgentLoop uses this to resync live tools after connect/disconnect/reconnect.
    */
   onToolsChanged?: () => void;
 
   /**
    * Callback invoked when a subprocess is spawned (for PID tracking).
-   * The consumer (CortexAgent) uses this to track PIDs for exit cleanup.
+   * The consumer (AgentLoop) uses this to track PIDs for exit cleanup.
    */
   onSubprocessSpawned?: (pid: number) => void;
 
@@ -183,7 +183,7 @@ export class McpClientManager {
    * Optional OS-level sandbox. When present and it implements wrapExec, each
    * stdio MCP server subprocess is wrapped so it runs inside the same OS
    * boundary as shell commands, enforcing denyRead over secrets. Without it a
-   * stdio server spawns uncontained and bypasses the sandbox. Set by CortexAgent
+   * stdio server spawns uncontained and bypasses the sandbox. Set by AgentLoop
    * from its config. HTTP transports are unaffected (no subprocess to contain).
    */
   sandbox?: SandboxProvider;
@@ -201,7 +201,7 @@ export class McpClientManager {
    */
   onToolCallProgress?: (progress: McpToolCallProgress) => void;
 
-  /** Logger for MCP diagnostics. Set by CortexAgent after construction. */
+  /** Logger for MCP diagnostics. Set by AgentLoop after construction. */
   logger: CortexLogger = NOOP_LOGGER;
 
   /**
@@ -618,7 +618,7 @@ export class McpClientManager {
       name: namespacedName,
       description: mcpTool.description ?? '',
       parameters,
-      // Marks this tool as MCP-sourced so CortexAgent's deferred-tool
+      // Marks this tool as MCP-sourced so AgentLoop's deferred-tool
       // partitioning can identify it without rechecking by name prefix.
       isMcp: true,
       execute: async (args: unknown): Promise<unknown> => {

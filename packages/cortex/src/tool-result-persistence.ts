@@ -53,7 +53,7 @@ export const SKIP_RESULT_PERSISTENCE = new Set<string>([
  *   traces, build spam). A tighter cap reduces noise in context while still
  *   preserving full output via persistence.
  *
- * Consumers can extend or override this map via `CortexAgentConfig.toolResultThresholds`.
+ * Consumers can extend or override this map via `AgentLoopConfig.toolResultThresholds`.
  */
 export const DEFAULT_TOOL_THRESHOLDS: Record<string, number> = {
   Bash: 7_500,
@@ -154,7 +154,7 @@ export async function applyResultPersistence(
  * - Other part types (e.g., `image`) pass through unchanged
  * - Returns the same object reference if nothing changed (no allocation)
  *
- * Used by `CortexAgent.refreshTools()` at the tool execution boundary.
+ * Used by `AgentLoop.refreshTools()` at the tool execution boundary.
  * Exported so the wrapper logic is unit-testable.
  */
 export async function processToolResult(

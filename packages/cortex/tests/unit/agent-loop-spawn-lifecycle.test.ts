@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
-import type { CortexAgentConfig } from '../../src/types.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
+import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import { EventBridge } from '../../src/event-bridge.js';
 import type { CortexEvent, PiEvent } from '../../src/event-bridge.js';
@@ -10,12 +10,12 @@ import type { CortexEvent, PiEvent } from '../../src/event-bridge.js';
 // Helpers
 // ---------------------------------------------------------------------------
 
-type TestCortexAgentConstructor = new (
+type TestAgentLoopConstructor = new (
   agent: PiAgent,
-  config: CortexAgentConfig,
+  config: AgentLoopConfig,
   tools?: unknown[],
   options?: { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean },
-) => CortexAgent;
+) => AgentLoop;
 
 function makeModel(raw: PiModel) {
   return wrapModel(raw, raw.provider, raw.name, raw.contextWindow);
@@ -33,11 +33,11 @@ function createMockPiAgent(): PiAgent {
   } as unknown as PiAgent;
 }
 
-function createTestCortexAgent(
-  config?: Partial<CortexAgentConfig>,
+function createTestAgentLoop(
+  config?: Partial<AgentLoopConfig>,
   piAgent?: PiAgent,
-): CortexAgent {
-  const Ctor = CortexAgent as unknown as TestCortexAgentConstructor;
+): AgentLoop {
+  const Ctor = AgentLoop as unknown as TestAgentLoopConstructor;
   return new Ctor(
     piAgent ?? createMockPiAgent(),
     {
@@ -70,7 +70,7 @@ interface SpawnInternals {
  * Replace createChildAgent with a stub so spawn-path tests observe child
  * lifecycle without constructing a real child agent.
  */
-function stubChildAgent(agent: CortexAgent): {
+function stubChildAgent(agent: AgentLoop): {
   destroySpy: ReturnType<typeof vi.fn>;
   createSpy: ReturnType<typeof vi.fn>;
 } {
@@ -84,10 +84,10 @@ function stubChildAgent(agent: CortexAgent): {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('CortexAgent spawn-path lifecycle', () => {
+describe('AgentLoop spawn-path lifecycle', () => {
   describe('foreground spawn at the concurrency cap', () => {
     it('destroys the just-created child when track() fails', async () => {
-      const agent = createTestCortexAgent({ maxConcurrentSubAgents: 0 });
+      const agent = createTestAgentLoop({ maxConcurrentSubAgents: 0 });
       const { destroySpy } = stubChildAgent(agent);
       const internal = agent as unknown as SpawnInternals;
 
@@ -102,7 +102,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
 
   describe('background spawn at the concurrency cap', () => {
     it('destroys the just-created child when track() fails', async () => {
-      const agent = createTestCortexAgent({ maxConcurrentSubAgents: 0 });
+      const agent = createTestAgentLoop({ maxConcurrentSubAgents: 0 });
       const { destroySpy } = stubChildAgent(agent);
       const internal = agent as unknown as SpawnInternals;
 
@@ -115,7 +115,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
 
   describe('public spawnBackgroundSubAgent cap pre-check', () => {
     it('rejects before building a child agent when at the cap', async () => {
-      const agent = createTestCortexAgent({ maxConcurrentSubAgents: 0 });
+      const agent = createTestAgentLoop({ maxConcurrentSubAgents: 0 });
       const { createSpy } = stubChildAgent(agent);
 
       await expect(
@@ -125,7 +125,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     });
 
     it('spawns normally when under the cap', async () => {
-      const agent = createTestCortexAgent({ maxConcurrentSubAgents: 2 });
+      const agent = createTestAgentLoop({ maxConcurrentSubAgents: 2 });
       // The background runner prompts the stub child; hold the prompt open
       // so the tracked entry is observable before the child completes.
       let releasePrompt!: () => void;
@@ -179,7 +179,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     it('destroys the child, resolves the completion as cancelled, and drops the late result', async () => {
       const piAgent = createMockPiAgent();
       const promptSpy = vi.spyOn(piAgent, 'prompt');
-      const agent = createTestCortexAgent({}, piAgent);
+      const agent = createTestAgentLoop({}, piAgent);
       const child = createHangingChild();
       (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
 
@@ -201,7 +201,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     });
 
     it('returns false for an unknown task ID', async () => {
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       await expect(agent.cancelSubAgent('nope')).resolves.toBe(false);
     });
 
@@ -209,7 +209,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
       // The cancel destroys the child mid-run, which surfaces in
       // runSubAgent's catch as an abort-shaped failure; the SubAgent tool
       // must still see the cancel as a cancel.
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       const child = createHangingChild();
       const internal = agent as unknown as SpawnInternals;
       internal.createChildAgent = vi.fn().mockResolvedValue(child);
@@ -228,7 +228,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     });
 
     it('cancels cleanly while the child sits in a pending permission ask', async () => {
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       const child = createHangingChild();
       const internal = agent as unknown as SpawnInternals;
       internal.createChildAgent = vi.fn().mockResolvedValue(child);
@@ -253,7 +253,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
       // run's abort signal. When abort wins, the resolver is left pending
       // (the consumer may never answer the dismissed prompt), so the marker
       // must be cleared by the abort itself, not only by resolver settle.
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       const manager = agent.getSubAgentManager();
       manager.track({
         taskId: 'perm-task',
@@ -294,7 +294,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     });
 
     it('purges a queued pending result for the cancelled task', async () => {
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       const internal = agent as unknown as DeliveryInternals;
       const manager = agent.getSubAgentManager();
 
@@ -334,7 +334,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     it('drops a cancelled task result at drain time', async () => {
       const piAgent = createMockPiAgent();
       const promptSpy = vi.spyOn(piAgent, 'prompt');
-      const agent = createTestCortexAgent({}, piAgent);
+      const agent = createTestAgentLoop({}, piAgent);
       const internal = agent as unknown as DeliveryInternals;
       const manager = agent.getSubAgentManager();
 
@@ -411,7 +411,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     }
 
     it('forwards background child events to the parent bridge with childTaskId set', async () => {
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       const { child, emit, releasePrompt } = createForwardingChild();
       (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
 
@@ -443,7 +443,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     });
 
     it('accumulates background child usage into session usage', async () => {
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       const { child, emit, releasePrompt } = createForwardingChild();
       (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
 
@@ -474,7 +474,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
     });
 
     it('stops forwarding once the child completes (no listener leak per task)', async () => {
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       const { child, emit, releasePrompt } = createForwardingChild();
       (agent as unknown as SpawnInternals).createChildAgent = vi.fn().mockResolvedValue(child);
 
@@ -508,7 +508,7 @@ describe('CortexAgent spawn-path lifecycle', () => {
 
   describe('destroy cascading to children', () => {
     it('destroys tracked children via cancelAll', async () => {
-      const agent = createTestCortexAgent();
+      const agent = createTestAgentLoop();
       const manager = agent.getSubAgentManager();
       const childDestroy = vi.fn().mockResolvedValue(undefined);
 

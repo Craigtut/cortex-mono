@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
-import type { CortexAgentConfig } from '../../src/types.js';
+import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 import { DEFAULT_TOOL_THRESHOLDS, MAX_RESULT_TOKENS } from '../../src/tool-result-persistence.js';
@@ -131,27 +131,27 @@ function createMockPiAgent(options?: {
   return agent;
 }
 
-type TestCortexAgentConstructor = new (
+type TestAgentLoopConstructor = new (
   agent: PiAgent,
-  config: CortexAgentConfig,
+  config: AgentLoopConfig,
   tools?: CortexTool[],
   options?: {
     enableSubAgentTool?: boolean;
     enableLoadSkillTool?: boolean;
   },
-) => CortexAgent;
+) => AgentLoop;
 
-function createTestCortexAgent(
+function createTestAgentLoop(
   agent: PiAgent,
-  config: CortexAgentConfig,
+  config: AgentLoopConfig,
   tools?: CortexTool[],
   options?: {
     enableSubAgentTool?: boolean;
     enableLoadSkillTool?: boolean;
   },
-): CortexAgent {
-  const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
-  return new CortexAgentCtor(agent, config, tools, options);
+): AgentLoop {
+  const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+  return new AgentLoopCtor(agent, config, tools, options);
 }
 
 function makeModel(raw: PiModel): CortexModel {
@@ -173,11 +173,11 @@ function normalizeModel(model: PiModel | CortexModel): CortexModel {
 }
 
 function createDefaultConfig(
-  overrides?: Partial<CortexAgentConfig> & {
+  overrides?: Partial<AgentLoopConfig> & {
     model?: PiModel | CortexModel;
     utilityModel?: PiModel | CortexModel | 'default';
   },
-): CortexAgentConfig {
+): AgentLoopConfig {
   const { model, utilityModel, ...rest } = overrides ?? {};
   return {
     model: model
@@ -197,7 +197,7 @@ function createDefaultConfig(
   };
 }
 
-describe('CortexAgent', () => {
+describe('AgentLoop', () => {
   let piAgent: MockPiAgent;
   let config: ReturnType<typeof createDefaultConfig>;
 
@@ -216,12 +216,12 @@ describe('CortexAgent', () => {
 
   describe('construction', () => {
     it('creates with valid config', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       expect(agent.state).toBe('created');
     });
 
     it('exposes the context manager', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         slots: ['a', 'b'],
         compaction: { strategy: 'classic' },
@@ -232,14 +232,14 @@ describe('CortexAgent', () => {
     });
 
     it('infers utility model dynamically for anthropic', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const utilityModel = agent.getUtilityModel();
       expect(utilityModel.provider).toBe('anthropic');
       expect(utilityModel.modelId).toBe('claude-haiku-4-5-20251001');
     });
 
     it('infers utility model dynamically for openai', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         model: makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel),
       });
@@ -250,7 +250,7 @@ describe('CortexAgent', () => {
 
     it('uses primary model when no default mapping exists', () => {
       const customModel = makeModel({ provider: 'custom-provider', name: 'custom-model' } as PiModel);
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         model: customModel,
       });
@@ -260,7 +260,7 @@ describe('CortexAgent', () => {
 
     it('uses explicit utility model when provided', () => {
       const explicitUtility = makeModel({ provider: 'anthropic', name: 'claude-haiku-3' } as PiModel);
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         utilityModel: explicitUtility,
       });
@@ -270,7 +270,7 @@ describe('CortexAgent', () => {
 
     it('throws on same-provider constraint violation', () => {
       expect(() => {
-        createTestCortexAgent(piAgent, {
+        createTestAgentLoop(piAgent, {
           ...config,
           model: makeModel({ provider: 'anthropic', name: 'claude-sonnet' } as PiModel),
           utilityModel: makeModel({ provider: 'openai', name: 'gpt-4o-mini' } as PiModel),
@@ -279,7 +279,7 @@ describe('CortexAgent', () => {
     });
 
     it('allows utilityModel: "default" explicitly', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         utilityModel: 'default',
       });
@@ -294,7 +294,7 @@ describe('CortexAgent', () => {
 
   describe('getAutoResolvedUtilityModel', () => {
     it('returns the inferred utility model for an enumerable provider', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const auto = agent.getAutoResolvedUtilityModel();
       expect(auto.provider).toBe('anthropic');
       expect(auto.modelId).toBe('claude-haiku-4-5-20251001');
@@ -304,7 +304,7 @@ describe('CortexAgent', () => {
       // Ollama and custom OpenAI-compatible endpoints surface as a provider
       // with no pi-ai registry, so auto-resolution falls back to the primary.
       const customModel = makeModel({ provider: 'custom', name: 'llama3.3:70b' } as PiModel);
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         model: customModel,
       });
@@ -312,7 +312,7 @@ describe('CortexAgent', () => {
     });
 
     it('reflects auto-resolution even while a manual override is active, without clearing it', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const override = makeModel({ provider: 'anthropic', name: 'claude-haiku-3' } as PiModel);
       agent.setUtilityModel(override);
 
@@ -339,7 +339,7 @@ describe('CortexAgent', () => {
         DYLD_INSERT_LIBRARIES: '/app/dock.dylib',
         ANIMUS_DOCK_SUPPRESS_ADDON: '/app/addon.node',
       };
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         envOverrides: overrides,
       });
@@ -348,13 +348,13 @@ describe('CortexAgent', () => {
     });
 
     it('returns undefined when no envOverrides configured', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       expect(agent.getEnvOverrides()).toBeUndefined();
     });
 
     it('passes envOverrides to McpClientManager', () => {
       const overrides = { DYLD_INSERT_LIBRARIES: '/app/dock.dylib' };
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         envOverrides: overrides,
       });
@@ -364,7 +364,7 @@ describe('CortexAgent', () => {
     });
 
     it('does not set McpClientManager envOverrides when not configured', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       const mcpManager = agent.getMcpClientManager();
       expect(mcpManager.envOverrides).toBeUndefined();
@@ -378,14 +378,14 @@ describe('CortexAgent', () => {
   describe('prompt', () => {
     it('runs the agent and returns a result', async () => {
       piAgent.promptResult = { content: 'Hello world' };
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       const result = await agent.prompt('Say hello');
       expect(result).toEqual({ content: 'Hello world' });
     });
 
     it('transitions from CREATED to ACTIVE on first prompt', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       expect(agent.state).toBe('created');
 
       await agent.prompt('Hello');
@@ -393,7 +393,7 @@ describe('CortexAgent', () => {
     });
 
     it('remains ACTIVE on subsequent prompts', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       await agent.prompt('First');
       expect(agent.state).toBe('active');
@@ -403,7 +403,7 @@ describe('CortexAgent', () => {
     });
 
     it('throws when destroyed', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.destroy();
 
       await expect(agent.prompt('Hello')).rejects.toThrow('Agent has been destroyed');
@@ -411,7 +411,7 @@ describe('CortexAgent', () => {
 
     it('classifies and emits errors on failure', async () => {
       piAgent.promptError = new Error('invalid api key');
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       const errorHandler = vi.fn();
       agent.onError(errorHandler);
@@ -432,7 +432,7 @@ describe('CortexAgent', () => {
       piAgent.promptError = new Error('Rate limit exceeded');
       // Retry disabled: the mock leaves a resumable transcript, so a
       // retryable category would otherwise schedule a real backoff wait.
-      const agent = createTestCortexAgent(piAgent, { ...config, retryPolicy: { enabled: false } });
+      const agent = createTestAgentLoop(piAgent, { ...config, retryPolicy: { enabled: false } });
 
       const errorHandler = vi.fn();
       agent.onError(errorHandler);
@@ -444,7 +444,7 @@ describe('CortexAgent', () => {
 
     it('classifies network errors', async () => {
       piAgent.promptError = new Error('ECONNREFUSED');
-      const agent = createTestCortexAgent(piAgent, { ...config, retryPolicy: { enabled: false } });
+      const agent = createTestAgentLoop(piAgent, { ...config, retryPolicy: { enabled: false } });
 
       const errorHandler = vi.fn();
       agent.onError(errorHandler);
@@ -456,7 +456,7 @@ describe('CortexAgent', () => {
 
     it('swallows error handler exceptions', async () => {
       piAgent.promptError = new Error('Rate limit exceeded');
-      const agent = createTestCortexAgent(piAgent, { ...config, retryPolicy: { enabled: false } });
+      const agent = createTestAgentLoop(piAgent, { ...config, retryPolicy: { enabled: false } });
 
       agent.onError(() => {
         throw new Error('Handler blew up');
@@ -473,7 +473,7 @@ describe('CortexAgent', () => {
         warn: vi.fn(),
         error: vi.fn(),
       };
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         logger,
         diagnostics: {
@@ -508,7 +508,7 @@ describe('CortexAgent', () => {
         warn: vi.fn(),
         error: vi.fn(),
       };
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         logger,
         diagnostics: {
@@ -542,14 +542,14 @@ describe('CortexAgent', () => {
 
   describe('buildSystemPrompt', () => {
     it('puts consumer content first', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.buildSystemPrompt('You are a helpful assistant.');
 
       expect(prompt.startsWith('You are a helpful assistant.')).toBe(true);
     });
 
     it('includes Response Delivery when working tags enabled (default)', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.buildSystemPrompt('Consumer content');
 
       expect(prompt).toContain('# Response Delivery');
@@ -557,7 +557,7 @@ describe('CortexAgent', () => {
     });
 
     it('omits Response Delivery when working tags disabled', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         workingTags: { enabled: false },
       });
@@ -567,35 +567,35 @@ describe('CortexAgent', () => {
     });
 
     it('includes System Rules section', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.buildSystemPrompt('Consumer');
 
       expect(prompt).toContain('# System Rules');
     });
 
     it('includes Taking Action section', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.buildSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Taking Action');
     });
 
     it('includes Tool Usage section', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.buildSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Tool Usage');
     });
 
     it('includes Executing with Care section', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.buildSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Executing with Care');
     });
 
     it('includes Environment section with platform info', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.buildSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Environment');
@@ -605,7 +605,7 @@ describe('CortexAgent', () => {
     });
 
     it('preserves consumer content exactly', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const consumerContent = `You are Animus.
 Your personality is warm and curious.
 You have 12 emotions.`;
@@ -615,7 +615,7 @@ You have 12 emotions.`;
     });
 
     it('does not mutate the live system prompt', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.buildSystemPrompt('Consumer');
 
       expect(prompt).toContain('Consumer');
@@ -626,7 +626,7 @@ You have 12 emotions.`;
 
   describe('setBasePrompt', () => {
     it('updates the live system prompt and tracks the base prompt', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       const prompt = agent.setBasePrompt('Base prompt');
 
@@ -639,7 +639,7 @@ You have 12 emotions.`;
 
   describe('rebuildSystemPrompt', () => {
     it('updates the system prompt without losing conversation history', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       // Build initial prompt
       agent.setBasePrompt('Original persona');
@@ -671,7 +671,7 @@ You have 12 emotions.`;
 
   describe('conversation history', () => {
     it('getConversationHistory excludes slot region', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         slots: ['slot1', 'slot2'],
       });
@@ -694,7 +694,7 @@ You have 12 emotions.`;
     });
 
     it('getConversationHistory returns empty when only slots exist', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         slots: ['slot1'],
       });
@@ -707,7 +707,7 @@ You have 12 emotions.`;
     });
 
     it('restoreConversationHistory injects after slots', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         slots: ['slot1', 'slot2'],
         compaction: { strategy: 'classic' },
@@ -735,7 +735,7 @@ You have 12 emotions.`;
     });
 
     it('restoreConversationHistory replaces existing conversation', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         slots: ['slot1'],
       });
@@ -765,7 +765,7 @@ You have 12 emotions.`;
 
   describe('restoreObservationalMemoryState slot population', () => {
     it('leaves the observation slot empty when restored observations are empty', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         compaction: { strategy: 'observational' },
       });
@@ -786,7 +786,7 @@ You have 12 emotions.`;
     });
 
     it('populates the observation slot when restored observations are present', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         compaction: { strategy: 'observational' },
       });
@@ -811,31 +811,31 @@ You have 12 emotions.`;
 
   describe('lifecycle', () => {
     it('starts in CREATED state', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       expect(agent.state).toBe('created');
     });
 
     it('transitions to ACTIVE after first prompt', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.prompt('Hello');
       expect(agent.state).toBe('active');
     });
 
     it('transitions to DESTROYED after destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.destroy();
       expect(agent.state).toBe('destroyed');
     });
 
     it('destroy is idempotent', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.destroy();
       await agent.destroy(); // Should not throw
       expect(agent.state).toBe('destroyed');
     });
 
     it('abort calls agent.abort() and waitForIdle()', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.prompt('Hello');
 
       await agent.abort();
@@ -844,7 +844,7 @@ You have 12 emotions.`;
     });
 
     it('abort keeps the agent in ACTIVE state', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.prompt('Hello');
 
       await agent.abort();
@@ -853,7 +853,7 @@ You have 12 emotions.`;
     });
 
     it('prompt() issued right after abort() resolves does not fail fast on a stale gate', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       // Hold a turn open; release it when abort() reaches pi (as a real
       // abort would settle the in-flight run).
@@ -888,9 +888,9 @@ You have 12 emotions.`;
     it('does not add an exit listener per agent instance', async () => {
       const before = process.listenerCount('exit');
 
-      const first = createTestCortexAgent(createMockPiAgent(), config);
-      const second = createTestCortexAgent(createMockPiAgent(), config);
-      const third = createTestCortexAgent(createMockPiAgent(), config);
+      const first = createTestAgentLoop(createMockPiAgent(), config);
+      const second = createTestAgentLoop(createMockPiAgent(), config);
+      const third = createTestAgentLoop(createMockPiAgent(), config);
 
       const after = process.listenerCount('exit');
       expect(after - before).toBeLessThanOrEqual(1);
@@ -907,7 +907,7 @@ You have 12 emotions.`;
 
   describe('events', () => {
     it('onLoopComplete fires on loop_end (agent_end)', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const handler = vi.fn();
       agent.onLoopComplete(handler);
 
@@ -918,7 +918,7 @@ You have 12 emotions.`;
     });
 
     it('suppresses onLoopComplete for a run that ended in error (retry may follow)', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const handler = vi.fn();
       agent.onLoopComplete(handler);
 
@@ -939,7 +939,7 @@ You have 12 emotions.`;
 
     it('onTurnComplete fires with AgentTextOutput', async () => {
       piAgent.promptResult = 'Hello <working>internal</working> world';
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       const handler = vi.fn();
       agent.onTurnComplete(handler);
@@ -955,7 +955,7 @@ You have 12 emotions.`;
       piAgent.promptError = new Error('Rate limit exceeded');
       // Retry disabled: the mock leaves a resumable transcript, so a
       // retryable category would otherwise schedule a real backoff wait.
-      const agent = createTestCortexAgent(piAgent, { ...config, retryPolicy: { enabled: false } });
+      const agent = createTestAgentLoop(piAgent, { ...config, retryPolicy: { enabled: false } });
 
       const handler = vi.fn();
       agent.onError(handler);
@@ -967,7 +967,7 @@ You have 12 emotions.`;
     });
 
     it('multiple handlers can be registered for the same event', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const handler1 = vi.fn();
       const handler2 = vi.fn();
       agent.onLoopComplete(handler1);
@@ -980,7 +980,7 @@ You have 12 emotions.`;
     });
 
     it('auto-wires current-context token tracking from turn_end usage data', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
       });
@@ -998,7 +998,7 @@ You have 12 emotions.`;
     });
 
     it('auto-wires current-context token tracking from message.usage.input pattern', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
       });
@@ -1015,7 +1015,7 @@ You have 12 emotions.`;
     });
 
     it('does not update token count when turn_end has no usage data', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
       });
@@ -1034,7 +1034,7 @@ You have 12 emotions.`;
     });
 
     it('estimates current context tokens from the live agent snapshot', () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         slots: ['project-context'],
       });
@@ -1048,7 +1048,7 @@ You have 12 emotions.`;
     });
 
     it('uses the larger of the post-hoc count and heuristic estimate', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       agent.updateCurrentContextTokenCount(50_000);
 
       expect(agent.estimateCurrentContextTokens()).toBe(50_000);
@@ -1061,21 +1061,21 @@ You have 12 emotions.`;
 
   describe('destroy cleanup', () => {
     it('calls agent.abort() during destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.destroy();
 
       expect(piAgent.abortCalled).toBe(true);
     });
 
     it('calls agent.reset() during destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.destroy();
 
       expect(piAgent.resetCalled).toBe(true);
     });
 
     it('emits onLoopComplete during destroy for final checkpoint', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const handler = vi.fn();
       agent.onLoopComplete(handler);
 
@@ -1086,7 +1086,7 @@ You have 12 emotions.`;
     });
 
     it('clears handlers after destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const errorHandler = vi.fn();
       agent.onError(errorHandler);
 
@@ -1106,7 +1106,7 @@ You have 12 emotions.`;
         setTimeout(resolve, 60000); // Very slow
       });
 
-      const agent = createTestCortexAgent(slowAgent, config);
+      const agent = createTestAgentLoop(slowAgent, config);
 
       // Destroy with a short timeout
       const startTime = Date.now();
@@ -1119,7 +1119,7 @@ You have 12 emotions.`;
     });
 
     it('concurrent destroy() calls share one teardown', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const resetSpy = vi.spyOn(piAgent, 'reset');
 
       await Promise.all([agent.destroy(), agent.destroy()]);
@@ -1129,7 +1129,7 @@ You have 12 emotions.`;
     });
 
     it('rejects prompt() issued while destroy is in progress', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       const teardown = agent.destroy();
       expect(agent.state).toBe('destroying');
@@ -1149,7 +1149,7 @@ You have 12 emotions.`;
         }
       };
 
-      const agent = createTestCortexAgent(
+      const agent = createTestAgentLoop(
         piAgent,
         createDefaultConfig({ workingDirectory: process.cwd() }),
         [],
@@ -1191,7 +1191,7 @@ You have 12 emotions.`;
     }, 10000);
 
     it('does not start a new loop for a background completion pending at destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as {
         toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
         deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
@@ -1244,13 +1244,13 @@ You have 12 emotions.`;
 
   describe('transformContext', () => {
     it('returns a composable hook function', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const hook = agent.getTransformContextHook();
       expect(typeof hook).toBe('function');
     });
 
     it('the hook passes through context when no ephemeral content', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const hook = agent.getTransformContextHook();
 
       const context = {
@@ -1267,7 +1267,7 @@ You have 12 emotions.`;
     });
 
     it('the hook injects ephemeral content', async () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         slots: [],
       });
@@ -1291,7 +1291,7 @@ You have 12 emotions.`;
     });
 
     it('persists compaction source mutations into the active transform context', async () => {
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         slots: [],
         compaction: { strategy: 'classic' },
@@ -1340,7 +1340,7 @@ You have 12 emotions.`;
   describe('model access', () => {
     it('getModel returns the primary model', () => {
       const model = makeModel({ provider: 'anthropic', name: 'claude-sonnet-4' } as PiModel);
-      const agent = createTestCortexAgent(piAgent, {
+      const agent = createTestAgentLoop(piAgent, {
         ...config,
         model,
       });
@@ -1349,7 +1349,7 @@ You have 12 emotions.`;
     });
 
     it('getUtilityModel returns resolved utility model', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const utility = agent.getUtilityModel();
 
       expect(utility.provider).toBe('anthropic');
@@ -1357,7 +1357,7 @@ You have 12 emotions.`;
     });
 
     it('utilityComplete uses utility model for completion', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       // utilityComplete requires a real pi-ai complete() call which needs a valid model
       // Just verify the method exists and is callable
       expect(typeof agent.utilityComplete).toBe('function');
@@ -1370,7 +1370,7 @@ You have 12 emotions.`;
 
   describe('setModel', () => {
     it('updates the primary model', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const newModel = makeModel({ provider: 'openai', name: 'gpt-4o', contextWindow: 128_000 } as PiModel);
 
       agent.setModel(newModel);
@@ -1379,7 +1379,7 @@ You have 12 emotions.`;
     });
 
     it('updates agent.state.model', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const newModel = makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel);
 
       agent.setModel(newModel);
@@ -1390,7 +1390,7 @@ You have 12 emotions.`;
     });
 
     it('does not throw when agent lacks setModel', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const newModel = makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel);
 
       // Should not throw even though piAgent has no setModel
@@ -1400,14 +1400,14 @@ You have 12 emotions.`;
 
   describe('setThinkingLevel', () => {
     it('updates agent.state.thinkingLevel', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       agent.setThinkingLevel('high');
 
       expect(piAgent.state.thinkingLevel).toBe('high');
     });
 
     it('maps max to xhigh in agent state', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       agent.setThinkingLevel('max');
 
@@ -1417,7 +1417,7 @@ You have 12 emotions.`;
 
   describe('refreshTools', () => {
     it('updates agent.state.tools with registered + MCP tools', () => {
-      const agent = createTestCortexAgent(
+      const agent = createTestAgentLoop(
         piAgent,
         config,
         [], // No additional tools; built-in tools auto-register
@@ -1439,7 +1439,7 @@ You have 12 emotions.`;
     });
 
     it('adapts Bash using the canonical Cortex tool contract', async () => {
-      const agent = createTestCortexAgent(
+      const agent = createTestAgentLoop(
         piAgent,
         createDefaultConfig({ workingDirectory: process.cwd() }),
         [],
@@ -1465,7 +1465,7 @@ You have 12 emotions.`;
     it('persists oversized Bash output before it reaches conversation history', async () => {
       const persistResult = vi.fn().mockResolvedValue('/tmp/bash-oversized.txt');
 
-      const agent = createTestCortexAgent(
+      const agent = createTestAgentLoop(
         piAgent,
         createDefaultConfig({
           workingDirectory: process.cwd(),
@@ -1520,7 +1520,7 @@ You have 12 emotions.`;
     it('persists oversized WebFetch output before returning from the wrapped tool', async () => {
       const persistResult = vi.fn().mockResolvedValue('/tmp/webfetch-oversized.txt');
 
-      const agent = createTestCortexAgent(
+      const agent = createTestAgentLoop(
         piAgent,
         createDefaultConfig({
           workingDirectory: process.cwd(),
@@ -1582,7 +1582,7 @@ You have 12 emotions.`;
         })),
       });
 
-      const agent = createTestCortexAgent(
+      const agent = createTestAgentLoop(
         piAgent,
         config,
         [legacyTool],
@@ -1621,7 +1621,7 @@ You have 12 emotions.`;
         }),
       };
 
-      expect(() => createTestCortexAgent(
+      expect(() => createTestAgentLoop(
         piAgent,
         config,
         [legacyTool as unknown as CortexTool],
@@ -1630,7 +1630,7 @@ You have 12 emotions.`;
     });
 
     it('does not throw when agent lacks setTools', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       expect(() => agent.refreshTools()).not.toThrow();
     });
@@ -1642,13 +1642,13 @@ You have 12 emotions.`;
 
   describe('event bridge access', () => {
     it('exposes the event bridge', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const bridge = agent.getEventBridge();
       expect(bridge).toBeDefined();
     });
 
     it('exposes the budget guard', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const guard = agent.getBudgetGuard();
       expect(guard).toBeDefined();
     });
@@ -1665,7 +1665,7 @@ You have 12 emotions.`;
         steerCalls.push(msg);
       };
 
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       // Override run to hold open the prompting state so we can steer
       const originalPrompt = piAgent.prompt.bind(piAgent);
@@ -1688,7 +1688,7 @@ You have 12 emotions.`;
         steerCalls.push(msg);
       };
 
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       // Not prompting, should be a no-op
       agent.steer('This should be ignored');
@@ -1702,7 +1702,7 @@ You have 12 emotions.`;
         steerCalls.push(msg);
       };
 
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       await agent.prompt('Hello');
 
       // Prompt is done, should be a no-op
@@ -1717,7 +1717,7 @@ You have 12 emotions.`;
         steerCalls.push(msg);
       };
 
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
 
       // The turn is deferred one microtask (it dequeues from the loop gate),
       // so _isPrompting is still false here. steer() must treat the non-empty
@@ -1757,7 +1757,7 @@ You have 12 emotions.`;
     }
 
     it('a concurrent prompt() fails fast without touching the running loop', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as GateInternals;
       const { release, calls } = holdPromptOpen(piAgent);
 
@@ -1791,7 +1791,7 @@ You have 12 emotions.`;
     });
 
     it('a background completion arriving while idle does not race a consumer prompt()', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as GateInternals & {
         toolRuntime: { resetForLoop: () => void; backgroundTasks: { set: (t: unknown) => void } };
         deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
@@ -1820,7 +1820,7 @@ You have 12 emotions.`;
     });
 
     it('a same-frame prompt() + abort() cancels the queued turn without running pi', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const promptSpy = vi.spyOn(piAgent, 'prompt');
       const errored = vi.fn();
       agent.onError(errored);
@@ -1857,18 +1857,18 @@ You have 12 emotions.`;
 
   describe('directComplete', () => {
     it('directComplete method exists and is callable', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       expect(typeof agent.directComplete).toBe('function');
     });
   });
 
   // -----------------------------------------------------------------------
-  // CortexAgent.create() factory
+  // AgentLoop.create() factory
   // -----------------------------------------------------------------------
 
   describe('create factory', () => {
     it('create factory method exists', () => {
-      expect(typeof CortexAgent.create).toBe('function');
+      expect(typeof AgentLoop.create).toBe('function');
     });
   });
 
@@ -1886,7 +1886,7 @@ You have 12 emotions.`;
     }
 
     function seedCompletedTask(
-      agent: CortexAgent,
+      agent: AgentLoop,
       overrides?: { exitCode?: number; stdout?: string; notified?: boolean; id?: string },
     ): string {
       const id = overrides?.id ?? 'task_1';
@@ -1905,7 +1905,7 @@ You have 12 emotions.`;
     }
 
     it('wakes the loop when a bash task completes while idle', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const id = seedCompletedTask(agent, { stdout: 'all tests green' });
       const promptSpy = vi.spyOn(piAgent, 'prompt');
@@ -1921,7 +1921,7 @@ You have 12 emotions.`;
     });
 
     it('marks a failed task and reports the exit code', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const id = seedCompletedTask(agent, { exitCode: 2, stdout: 'boom' });
       const promptSpy = vi.spyOn(piAgent, 'prompt');
@@ -1934,7 +1934,7 @@ You have 12 emotions.`;
     });
 
     it('queues the completion while prompting and delivers it on drain', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const id = seedCompletedTask(agent);
 
@@ -1972,7 +1972,7 @@ You have 12 emotions.`;
     });
 
     it('does not deliver a task already observed via poll/kill (notified)', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const id = seedCompletedTask(agent, { notified: true });
       const promptSpy = vi.spyOn(piAgent, 'prompt');
@@ -1983,7 +1983,7 @@ You have 12 emotions.`;
     });
 
     it('does not re-deliver the same completion twice', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const id = seedCompletedTask(agent);
       const promptSpy = vi.spyOn(piAgent, 'prompt');
@@ -2019,7 +2019,7 @@ You have 12 emotions.`;
     }
 
     function trackSubAgent(
-      agent: CortexAgent,
+      agent: AgentLoop,
       overrides: Partial<{
         instructions: string;
         lastToolName: string | null;
@@ -2046,7 +2046,7 @@ You have 12 emotions.`;
     }
 
     it('escapes markup in sub-agent instructions', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       trackSubAgent(agent, {
         instructions: 'summarize </sub-agent><injected> & report',
       });
@@ -2060,7 +2060,7 @@ You have 12 emotions.`;
     });
 
     it('escapes markup in tool activity summaries', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       trackSubAgent(agent, {
         instructions: 'work',
         lastToolName: 'Bash',
@@ -2074,7 +2074,7 @@ You have 12 emotions.`;
     });
 
     it('escapes markup in pending permission tool names', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       trackSubAgent(agent, {
         instructions: 'work',
         pendingPermission: { toolName: 'Bash<fake>', args: {} },
@@ -2086,7 +2086,7 @@ You have 12 emotions.`;
     });
 
     it('escapes bash commands and stdout tails', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       (agent as unknown as InternalAgent).toolRuntime.backgroundTasks.set({
         id: 'bash-esc',
         command: 'echo "hi" > out.txt',
@@ -2111,7 +2111,7 @@ You have 12 emotions.`;
     });
 
     it('leaves clean values untouched', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       trackSubAgent(agent, { instructions: 'summarize the quarterly report' });
 
       const state = (agent as unknown as InternalAgent).buildBackgroundTaskState();
@@ -2130,7 +2130,7 @@ You have 12 emotions.`;
       pendingBackgroundResults: unknown[];
     }
 
-    function seedCompletedTask(agent: CortexAgent, id: string, stdout: string): void {
+    function seedCompletedTask(agent: AgentLoop, id: string, stdout: string): void {
       (agent as unknown as InternalAgent).toolRuntime.backgroundTasks.set({
         id,
         command: 'npm run check',
@@ -2175,12 +2175,12 @@ You have 12 emotions.`;
     }
 
     /** Role sequence of the post-slot transcript, for asserting on history. */
-    function historyRoles(agent: CortexAgent): string[] {
+    function historyRoles(agent: AgentLoop): string[] {
       return (agent.getConversationHistory() as Array<{ role: string }>).map(m => m.role);
     }
 
     /** How many post-slot transcript messages contain `text` in their content. */
-    function historyOccurrences(agent: CortexAgent, text: string): number {
+    function historyOccurrences(agent: AgentLoop, text: string): number {
       return (agent.getConversationHistory() as Array<{ content: unknown }>).filter(
         m => typeof m.content === 'string' && m.content.includes(text),
       ).length;
@@ -2193,7 +2193,7 @@ You have 12 emotions.`;
     });
 
     it('re-queues a failed bash delivery and delivers it on the next attempt', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       seedCompletedTask(agent, 'task_r1', 'durable output');
       const promptCalls = installFailingPrompt(1);
@@ -2217,7 +2217,7 @@ You have 12 emotions.`;
     });
 
     it('does not duplicate the completion message in history across re-queued attempts', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       seedCompletedTask(agent, 'task_dup', 'sixty-thousand-token payload');
       installFailingPrompt(2);
@@ -2240,7 +2240,7 @@ You have 12 emotions.`;
       // already count them. The unwind must notify the compaction manager
       // with the surviving post-slot length (here: back to the empty
       // pre-delivery transcript) so the watermark is clamped.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const spy = vi.spyOn(
         (agent as unknown as {
@@ -2261,7 +2261,7 @@ You have 12 emotions.`;
     });
 
     it('re-queues a failed sub-agent result delivery without losing the result', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const promptCalls = installFailingPrompt(1);
 
@@ -2285,7 +2285,7 @@ You have 12 emotions.`;
     });
 
     it('dead-letters a completion after repeated delivery failures', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       seedCompletedTask(agent, 'task_dead', 'lost output');
       const promptCalls = installFailingPrompt(Infinity);
@@ -2316,7 +2316,7 @@ You have 12 emotions.`;
       // attempt delivers it. A recovered failure must not surface: no
       // per-attempt emission, and the pending throw from the failed attempt
       // is suppressed instead of reaching the scheduled-drain onError root.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const errored = vi.fn();
       agent.onError(errored);
@@ -2331,7 +2331,7 @@ You have 12 emotions.`;
     });
 
     it('fires onError exactly once when a delivery exhausts all attempts', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const errored = vi.fn();
       agent.onError(errored);
@@ -2353,7 +2353,7 @@ You have 12 emotions.`;
       // succeeds. The delivery fails terminally; that is a background
       // concern surfaced through onError, never a rejection of the
       // consumer's own successful turn.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       seedCompletedTask(agent, 'task_s3c', 'cycle-drain output');
       (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
@@ -2390,7 +2390,7 @@ You have 12 emotions.`;
       // An identical immediate re-attempt of an auth failure is futile: the
       // consumer must fix credentials first. Burning the attempt cap in
       // milliseconds would only hide the real failure mode.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const errored = vi.fn();
       agent.onError(errored);
@@ -2424,7 +2424,7 @@ You have 12 emotions.`;
       // remain, the elapsed budget bounds total delivery time; without it,
       // this re-queue would succeed on the next immediate attempt and a
       // real outage could hold the loop gate for three full ladders.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       seedCompletedTask(agent, 'task_s4b', 'over-budget output');
       const promptCalls = installFailingPrompt(1);
@@ -2449,7 +2449,7 @@ You have 12 emotions.`;
       config = createDefaultConfig({
         retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 3 },
       });
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const scheduled = vi.fn();
       agent.onRetryScheduled(scheduled);
@@ -2485,7 +2485,7 @@ You have 12 emotions.`;
       config = createDefaultConfig({
         retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 1 },
       });
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const exhausted = vi.fn();
       const errored = vi.fn();
@@ -2540,7 +2540,7 @@ You have 12 emotions.`;
     });
 
     it('notifies onBackgroundResultDeadLettered when delivery gives up', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const deadLettered = vi.fn();
       agent.onBackgroundResultDeadLettered(deadLettered);
@@ -2559,7 +2559,7 @@ You have 12 emotions.`;
     });
 
     it('dead-letters completions still queued when the agent is destroyed', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       const deadLettered = vi.fn();
       agent.onBackgroundResultDeadLettered(deadLettered);
@@ -2589,7 +2589,7 @@ You have 12 emotions.`;
       // format it on the spot: teardown runs before the tool runtime is
       // destroyed, so the Bash output is still readable there, and an empty
       // message would make the output unrecoverable.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       seedCompletedTask(agent, 'task_sf1a', 'shutdown-orphaned output');
       (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
@@ -2609,7 +2609,7 @@ You have 12 emotions.`;
       // teardown began is dead-lettered directly without a drain, so its
       // message must be formatted at dead-letter time. Sub-agent items carry
       // their result, so this works even after full teardown.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       await agent.destroy();
 
@@ -2635,7 +2635,7 @@ You have 12 emotions.`;
       // own child destroy), so the cancelled-ID set must survive
       // SubAgentManager.destroy() for the late result to stay a purposeful
       // discard instead of dead-lettering as "shut down before delivery".
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent & {
         subAgentManager: {
           track: (entry: unknown) => boolean;
@@ -2674,7 +2674,7 @@ You have 12 emotions.`;
     });
 
     it('dead-letters a completion that arrives after shutdown begins', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       await agent.destroy();
 
@@ -2689,7 +2689,7 @@ You have 12 emotions.`;
     });
 
     it('evicts the oldest dead-letter entries once the cap is exceeded', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       await agent.destroy();
 
@@ -2706,7 +2706,7 @@ You have 12 emotions.`;
     });
 
     it('fires onBackgroundResultDelivery once per completion, not per attempt', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       seedCompletedTask(agent, 'task_h1', 'output');
       installFailingPrompt(1);
@@ -2720,7 +2720,7 @@ You have 12 emotions.`;
     });
 
     it('delivers completions that arrive during a failed delivery', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as InternalAgent;
       seedCompletedTask(agent, 'task_a', 'first output');
       seedCompletedTask(agent, 'task_b', 'second output');
@@ -2776,7 +2776,7 @@ You have 12 emotions.`;
       // An abort is the user stopping the agent, not the delivery failing on
       // its own terms. Charging it an attempt means a few quick aborts
       // permanently dead-letter completed work that never actually failed.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as RequeueInternals;
       vi.spyOn(internal, 'isAborted').mockReturnValue(true);
       const item = { kind: 'bash' as const, taskId: 'task_abort' };
@@ -2796,7 +2796,7 @@ You have 12 emotions.`;
       // lookup in the capped dead-letter list: an entry evicted by later
       // dead-letters would otherwise read as "recovered" and swallow the
       // consumer's onError for a delivery that never landed.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as RequeueInternals;
       const item = { kind: 'bash' as const, taskId: 'task_evicted', deliveryAttempts: 3 };
 
@@ -2819,7 +2819,7 @@ You have 12 emotions.`;
       // A failure between an assistant tool-call turn and its tool results
       // leaves a transcript the provider rejects outright. Treating that as
       // "delivered" would strand the completion AND wedge the next request.
-      const agent = createTestCortexAgent(piAgent, config);
+      const agent = createTestAgentLoop(piAgent, config);
       const internal = agent as unknown as RequeueInternals;
       const preDeliveryCount = piAgent.state.messages.length;
       piAgent.state.messages.push({ role: 'user', content: 'delivery body' } as never);

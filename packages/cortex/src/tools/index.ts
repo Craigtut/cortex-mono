@@ -1,7 +1,7 @@
 /**
  * Tool barrel export and factory registration.
  *
- * All built-in tools are registered here. The CortexAgent maps tool names
+ * All built-in tools are registered here. The AgentLoop maps tool names
  * to factory functions, creates each tool with the appropriate config,
  * and registers them on the pi-agent-core Agent.
  */

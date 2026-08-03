@@ -676,10 +676,10 @@ Observational memory is the default. No configuration change is needed to use it
 
 ```typescript
 // Default: observational memory (zero config)
-const agent = await CortexAgent.create(config);
+const agent = await AgentLoop.create(config);
 
 // With hooks (method-level, like onBeforeCompaction)
-const agent = await CortexAgent.create(config);
+const agent = await AgentLoop.create(config);
 agent.onObservation((event) => {
   // persist compacted messages if desired
 });
@@ -688,7 +688,7 @@ agent.onReflection((event) => {
 });
 
 // Opt into classic compaction
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   compaction: {
     strategy: 'classic',
   }
@@ -779,7 +779,7 @@ agent.onLoopComplete(() => {
 And restores after creation:
 
 ```typescript
-const agent = await CortexAgent.create(config);
+const agent = await AgentLoop.create(config);
 agent.restoreConversationHistory(saved.history);
 if (saved.omState) {
   agent.restoreObservationalMemoryState(saved.omState);
@@ -823,7 +823,7 @@ The consumer provides a `search` function. Cortex wraps it in a tool.
 
 ```typescript
 // Consumer configuration
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   compaction: {
     strategy: 'observational',
     observational: {
@@ -945,7 +945,7 @@ packages/cortex/src/compaction/
 - When observational memory is active, `emergencyTruncate()` must skip observation slot messages
 - Add `observationSlotIndex` parameter to identify which messages to protect
 
-#### `packages/cortex/src/cortex-agent.ts`
+#### `packages/cortex/src/agent-loop.ts`
 
 - In constructor: when `strategy === 'observational'`, append `'_observations'` to slot list
 - Wire `ObservationalMemoryEngine` with `utilityComplete` for observer/reflector calls
@@ -1005,7 +1005,7 @@ packages/cortex/src/compaction/
    - Wire `ObservationalMemoryEngine` with `CompleteFn` and event handlers
    - Expose state save/restore through to engine
 
-8. **CortexAgent integration** (`cortex-agent.ts`)
+8. **AgentLoop integration** (`agent-loop.ts`)
    - Slot registration for `_observations`
    - Event wiring (turn_end to engine, engine events to consumer hooks)
    - Public API surface (state, events, triggerObservation)

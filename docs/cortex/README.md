@@ -3,7 +3,7 @@
 Start here if you are integrating `@animus-labs/cortex` into an application:
 
 - [Using Cortex](./consumer-guide.md): install, create an agent, configure providers, slots, persistence, permissions, MCP, tools, skills, compaction, and shutdown.
-- [Built-in Tools](./tools/README.md): tools registered automatically by `CortexAgent.create()`.
+- [Built-in Tools](./tools/README.md): tools registered automatically by `AgentLoop.create()`.
 - [Provider Manager](./provider-manager.md): provider discovery, OAuth, API key validation, custom endpoints, and model resolution.
 
 Architecture and implementation references:

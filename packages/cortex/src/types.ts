@@ -1,7 +1,7 @@
 /**
  * Core types for the @animus-labs/cortex package.
  *
- * These types define the public API surface for CortexAgent configuration,
+ * These types define the public API surface for AgentLoop configuration,
  * context management, error classification, working tags, budget guards,
  * compaction, events, and model tiers.
  *
@@ -29,7 +29,7 @@ import type { SandboxProvider, ResolveNetworkAccess } from './sandbox/types.js';
  * Pluggable logger interface for Cortex diagnostics.
  *
  * Cortex never decides where logs go. The consumer provides an implementation
- * via CortexAgentConfig.logger. If omitted, all logging is silently discarded.
+ * via AgentLoopConfig.logger. If omitted, all logging is silently discarded.
  *
  * All methods share the same signature for uniformity. The optional `data`
  * parameter carries structured context (token counts, server names, error
@@ -107,7 +107,7 @@ export interface SessionUsage {
 // ---------------------------------------------------------------------------
 
 /**
- * The lifecycle state of a CortexAgent instance.
+ * The lifecycle state of an AgentLoop instance.
  *
  * CREATED -> ACTIVE -> DESTROYING -> DESTROYED
  *
@@ -131,7 +131,7 @@ export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'max
 
 /**
  * Describes a model's thinking/reasoning capabilities.
- * Returned by CortexAgent.getModelThinkingCapabilities().
+ * Returned by AgentLoop.getModelThinkingCapabilities().
  */
 export interface ModelThinkingCapabilities {
   /** Whether the model supports extended thinking at all. */
@@ -170,13 +170,13 @@ export interface ToolPermissionRequestContext {
 // ---------------------------------------------------------------------------
 
 /**
- * Configuration for creating a CortexAgent instance.
+ * Configuration for creating an AgentLoop instance.
  *
  * The `model` field uses CortexModel as the public boundary.
  * Consumers obtain these handles from ProviderManager and pass them back to
- * CortexAgent. Raw pi-ai model objects stay inside Cortex.
+ * AgentLoop. Raw pi-ai model objects stay inside Cortex.
  */
-export interface CortexAgentConfig {
+export interface AgentLoopConfig {
   /** Primary model for the agentic loop, THOUGHT, REFLECT, and all consumer-facing work. */
   model: CortexModel;
 
@@ -821,7 +821,7 @@ export interface MicrocompactionConfig {
    * includes a file path reference the agent can Read to recover full content.
    * Only fires for non-reproducible and computational tools.
    *
-   * Typically set at the top-level CortexAgentConfig.persistResult and
+   * Typically set at the top-level AgentLoopConfig.persistResult and
    * propagated here automatically.
    */
   persistResult?: PersistResultFn;
@@ -885,7 +885,7 @@ export interface AdaptiveThresholdConfig {
 }
 
 /**
- * Full compaction configuration for CortexAgent.
+ * Full compaction configuration for AgentLoop.
  *
  * Supports two strategies:
  * - `'observational'` (default): Observer/Reflector background compression
@@ -986,7 +986,7 @@ export interface CompactionExhaustedInfo {
 // ---------------------------------------------------------------------------
 
 /**
- * Event handlers emitted by CortexAgent during the agentic loop lifecycle.
+ * Event handlers emitted by AgentLoop during the agentic loop lifecycle.
  */
 export interface CortexEvents {
   /** Fired when the full agentic loop finishes (agent_end, not turn_end). */
@@ -1239,7 +1239,7 @@ export interface SubAgentSpawnConfig {
 
 /**
  * Describes a sub-agent about to be spawned. Passed to
- * CortexAgentConfig.onBeforeSubAgentSpawn so a consumer can record the spawn
+ * AgentLoopConfig.onBeforeSubAgentSpawn so a consumer can record the spawn
  * and decide what background context to seed.
  */
 export interface SubAgentSpawnRequest {
@@ -1339,8 +1339,8 @@ export interface DeadLetteredBackgroundResult {
 export interface TrackedSubAgent {
   /** Unique task identifier. */
   taskId: string;
-  /** The sub-agent CortexAgent instance. */
-  agent: unknown; // CortexAgent (avoid circular import)
+  /** The sub-agent AgentLoop instance. */
+  agent: unknown; // AgentLoop (avoid circular import)
   /** The instructions the sub-agent was spawned with. */
   instructions: string;
   /** Whether this is a background sub-agent. */

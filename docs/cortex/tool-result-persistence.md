@@ -1,7 +1,7 @@
 # Tool Result Persistence
 
 Cortex's proactive system for handling oversized tool results. Sits at the
-tool execution boundary in `CortexAgent.refreshTools()` and processes every
+tool execution boundary in `AgentLoop.refreshTools()` and processes every
 tool's output before it enters the conversation.
 
 ## Why
@@ -63,7 +63,7 @@ Read tool to access the full content on demand.
 ## Configuration
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model: ...,
   systemPrompt: ...,
   
@@ -195,14 +195,14 @@ dense matches and use the full 25K. Other tools default to 25K unless
 listed in `DEFAULT_TOOL_THRESHOLDS`.
 
 **Resolution order:**
-1. Consumer override on `CortexAgentConfig.toolResultThresholds`
+1. Consumer override on `AgentLoopConfig.toolResultThresholds`
 2. Built-in `DEFAULT_TOOL_THRESHOLDS`
 3. `MAX_RESULT_TOKENS` (25,000)
 
 Consumers can tune any tool (built-in, MCP, custom) without forking:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   // ...
   toolResultThresholds: {
     'mcp__playwright__browser_snapshot': 5_000,  // very chatty
@@ -226,10 +226,10 @@ const agent = await CortexAgent.create({
 ## File Locations
 
 - `packages/cortex/src/tool-result-persistence.ts` — the interceptor module
-- `packages/cortex/src/cortex-agent.ts` — wired into `refreshTools()` and
+- `packages/cortex/src/agent-loop.ts` — wired into `refreshTools()` and
   `applyToolResultPersistence()` private method
 - `packages/cortex/src/types.ts` — `PersistResultFn` type, `persistResult`
-  on `CortexAgentConfig`
+  on `AgentLoopConfig`
 - `packages/cortex/src/compaction/microcompaction.ts` — `applyBookend()`
   reused for preview formatting
 - `packages/cortex/src/compaction/index.ts` — `capIncomingToolResults()`

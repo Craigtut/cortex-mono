@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
-import type { CortexAgentConfig, TrackedSubAgent, SubAgentResult } from '../../src/types.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
+import type { AgentLoopConfig, TrackedSubAgent, SubAgentResult } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 
 type RegisteredTool = {
@@ -14,12 +14,12 @@ type RegisteredTool = {
   execute: (...args: any[]) => Promise<unknown>;
 };
 
-type TestCortexAgentConstructor = new (
+type TestAgentLoopConstructor = new (
   agent: PiAgent,
-  config: CortexAgentConfig,
+  config: AgentLoopConfig,
   tools?: RegisteredTool[],
   options?: { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean },
-) => CortexAgent;
+) => AgentLoop;
 
 function makeModel(raw: PiModel) {
   return wrapModel(raw, raw.provider, raw.name, raw.contextWindow);
@@ -37,15 +37,15 @@ function createMockPiAgent(): PiAgent {
   } as unknown as PiAgent;
 }
 
-function createTestCortexAgent(config: CortexAgentConfig): CortexAgent {
-  const Ctor = CortexAgent as unknown as TestCortexAgentConstructor;
+function createTestAgentLoop(config: AgentLoopConfig): AgentLoop {
+  const Ctor = AgentLoop as unknown as TestAgentLoopConstructor;
   return new Ctor(createMockPiAgent(), config, [], {
     enableSubAgentTool: false,
     enableLoadSkillTool: false,
   });
 }
 
-function createConfig(workingDirectory: string, extra?: Partial<CortexAgentConfig>): CortexAgentConfig {
+function createConfig(workingDirectory: string, extra?: Partial<AgentLoopConfig>): AgentLoopConfig {
   return {
     model: makeModel({
       provider: 'anthropic',
@@ -68,10 +68,10 @@ function withTmpDir<T>(fn: (dir: string) => T): T {
   }
 }
 
-describe('CortexAgent sessionId (prompt_cache_key plumbing)', () => {
+describe('AgentLoop sessionId (prompt_cache_key plumbing)', () => {
   it('initializes from config and supports get/set/clear', () => {
     withTmpDir((dir) => {
-      const agent = createTestCortexAgent(createConfig(dir, { sessionId: 'mind-session' }));
+      const agent = createTestAgentLoop(createConfig(dir, { sessionId: 'mind-session' }));
       expect(agent.getSessionId()).toBe('mind-session');
 
       agent.setSessionId('mind-session-2');
@@ -84,23 +84,23 @@ describe('CortexAgent sessionId (prompt_cache_key plumbing)', () => {
 
   it('defaults to null when no sessionId is configured', () => {
     withTmpDir((dir) => {
-      const agent = createTestCortexAgent(createConfig(dir));
+      const agent = createTestAgentLoop(createConfig(dir));
       expect(agent.getSessionId()).toBeNull();
     });
   });
 });
 
-describe('CortexAgent.getActiveSubAgents', () => {
+describe('AgentLoop.getActiveSubAgents', () => {
   it('returns an empty array when no sub-agents are running', () => {
     withTmpDir((dir) => {
-      const agent = createTestCortexAgent(createConfig(dir));
+      const agent = createTestAgentLoop(createConfig(dir));
       expect(agent.getActiveSubAgents()).toEqual([]);
     });
   });
 
   it('maps tracked sub-agents to snapshots including live cost and activity', () => {
     withTmpDir((dir) => {
-      const agent = createTestCortexAgent(createConfig(dir));
+      const agent = createTestAgentLoop(createConfig(dir));
       const manager = (agent as unknown as { subAgentManager: { track(e: TrackedSubAgent): boolean } }).subAgentManager;
 
       const fakeChild = {
@@ -141,7 +141,7 @@ describe('CortexAgent.getActiveSubAgents', () => {
 
   it('reports waiting-for-permission status when a sub-agent is blocked on approval', () => {
     withTmpDir((dir) => {
-      const agent = createTestCortexAgent(createConfig(dir));
+      const agent = createTestAgentLoop(createConfig(dir));
       const manager = (agent as unknown as { subAgentManager: { track(e: TrackedSubAgent): boolean } }).subAgentManager;
 
       const entry: TrackedSubAgent = {

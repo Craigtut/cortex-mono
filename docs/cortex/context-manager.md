@@ -6,7 +6,7 @@ The `ContextManager` is the core abstraction in `@animus-labs/cortex` for managi
 
 ## Message Array Layout
 
-In a managed `CortexAgent`, the effective message array has four regions. The ContextManager owns slot content and consumer ephemeral content. CortexAgent composes that with background task state, loaded skills, compaction, and cache breakpoint logic.
+In a managed `AgentLoop`, the effective message array has four regions. The ContextManager owns slot content and consumer ephemeral content. AgentLoop composes that with background task state, loaded skills, compaction, and cache breakpoint logic.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -52,7 +52,7 @@ Anthropic prompt caching is explicit: at least one content block must carry `cac
 
 Anthropic also performs automatic prefix checking around explicit breakpoints. When a breakpoint is present, Anthropic checks previous content-block boundaries near that breakpoint, currently documented as roughly 20 blocks back, and uses the longest matching cached prefix it finds. This is why Cortex's slot ordering matters: one explicit breakpoint at the end of the slot region can still reuse an earlier stable prefix when a later slot changes, as long as the earlier boundary is within Anthropic's lookback window.
 
-For a managed `CortexAgent` using Anthropic, pi-ai first places cache controls on the system prompt, the last tool definition, and the last user message. Cortex's `onPayload` hook then adjusts that payload into the intended four-breakpoint layout:
+For a managed `AgentLoop` using Anthropic, pi-ai first places cache controls on the system prompt, the last tool definition, and the last user message. Cortex's `onPayload` hook then adjusts that payload into the intended four-breakpoint layout:
 
 1. System prompt.
 2. End of the slot region.
@@ -93,7 +93,7 @@ class ContextManager {
 
   // Set ephemeral content for the next LLM call(s).
   // The standalone ContextManager hook appends it at the end of the
-  // message array. CortexAgent uses its composed hook to insert it at the
+  // message array. AgentLoop uses its composed hook to insert it at the
   // pre-prompt boundary for cache optimization.
   // Never written to agent.state.messages.
   // Pass null to clear.
@@ -103,8 +103,8 @@ class ContextManager {
   getEphemeral(): string | null;
 
   // Returns a standalone transformContext hook function that appends the
-  // ephemeral content. Consumers using CortexAgent normally do not register
-  // this manually; CortexAgent installs its composed hook internally.
+  // ephemeral content. Consumers using AgentLoop normally do not register
+  // this manually; AgentLoop installs its composed hook internally.
   getTransformContextHook(): (context: AgentContext) => AgentContext;
 }
 ```
@@ -120,7 +120,7 @@ The consumer defines slots at startup and populates them with content built from
 **Startup (once per process)**:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,
@@ -209,7 +209,7 @@ The ContextManager does not impose any formatting. The consumer provides the ful
 
 ## Ephemeral Context
 
-Ephemeral context is per-call content that the LLM should see but that should NOT persist in `agent.state.messages`. The standalone `ContextManager.getTransformContextHook()` appends it at the end of the message array. The managed `CortexAgent.getTransformContextHook()` reads the same ephemeral content and inserts it at the pre-prompt boundary, along with framework-managed background task state and loaded skill instructions.
+Ephemeral context is per-call content that the LLM should see but that should NOT persist in `agent.state.messages`. The standalone `ContextManager.getTransformContextHook()` appends it at the end of the message array. The managed `AgentLoop.getTransformContextHook()` reads the same ephemeral content and inserts it at the pre-prompt boundary, along with framework-managed background task state and loaded skill instructions.
 
 ### What Goes in Ephemeral Context
 
@@ -227,7 +227,7 @@ This block is omitted entirely when no background tasks are running.
 
 ### Composability
 
-Applications that use `CortexAgent.create()` do not need to wire `transformContext`; Cortex installs the composed hook internally. Consumers that instantiate `ContextManager` directly can compose its standalone hook with their own logic:
+Applications that use `AgentLoop.create()` do not need to wire `transformContext`; Cortex installs the composed hook internally. Consumers that instantiate `ContextManager` directly can compose its standalone hook with their own logic:
 
 ```typescript
 const cm = new ContextManager(agent, { slots: [...] });
@@ -248,5 +248,5 @@ const agent = new Agent({
 
 - **Manage conversation history**: The organic message accumulation from agent turns is entirely pi-agent-core's responsibility.
 - **Format content**: No XML wrapping, no tags. The consumer formats content however they want.
-- **Handle persistence**: Serializing `agent.state.messages` for crash recovery is the consumer's responsibility. Cortex provides `getConversationHistory()` and `restoreConversationHistory()` on the `CortexAgent`, not on the ContextManager.
+- **Handle persistence**: Serializing `agent.state.messages` for crash recovery is the consumer's responsibility. Cortex provides `getConversationHistory()` and `restoreConversationHistory()` on the `AgentLoop`, not on the ContextManager.
 - **Compact conversation history**: Compaction is a separate cortex capability that composes with the ContextManager via `transformContext`.

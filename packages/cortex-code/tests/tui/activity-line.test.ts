@@ -6,7 +6,7 @@ describe('ActivityLine', () => {
   it('clamps rendered lines to the available width', () => {
     const line = new ActivityLine();
     line.setContent(
-      'grep /spawnSubAgent|spawnBackground|SubAgent.*system|systemPrompt.*sub|sub.*systemPrompt/ in packages/cortex/src/cortex-agent.ts',
+      'grep /spawnSubAgent|spawnBackground|SubAgent.*system|systemPrompt.*sub|sub.*systemPrompt/ in packages/cortex/src/agent-loop.ts',
       [],
       '',
       'pending',

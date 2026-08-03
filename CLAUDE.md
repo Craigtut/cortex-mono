@@ -30,7 +30,7 @@ Production-grade agent infrastructure built on `pi-agent-core`. Cortex wraps `@e
 
 Two main exports, fully independent:
 
-- **`CortexAgent`**: The agentic loop, tools, context management, compaction, skills. Always-warm session, no cold/warm state machine.
+- **`AgentLoop`**: The agentic loop, tools, context management, compaction, skills. Always-warm session, no cold/warm state machine.
 - **`ProviderManager`**: Provider discovery, OAuth flows, API key validation, model resolution. Wraps pi-ai's multi-provider ecosystem.
 
 ### Key Design Patterns

@@ -1,5 +1,5 @@
 /**
- * CortexAgent: production-grade wrapper for pi-agent-core's Agent.
+ * AgentLoop: production-grade wrapper for pi-agent-core's Agent.
  *
  * Composes ContextManager, EventBridge, BudgetGuard, system prompt assembly,
  * and lifecycle management into a single orchestrator class.
@@ -78,7 +78,7 @@ import { assertValidCortexTool } from './tool-contract.js';
 import type { CortexTool } from './tool-contract.js';
 import type {
   CortexLogger,
-  CortexAgentConfig,
+  AgentLoopConfig,
   CortexLifecycleState,
   CortexUsage,
   SessionUsage,
@@ -333,7 +333,7 @@ It may represent in-progress work.`;
 
 type RegisteredTool = CortexTool;
 
-interface CortexAgentConstructorOptions {
+interface AgentLoopConstructorOptions {
   enableSubAgentTool?: boolean;
   enableLoadSkillTool?: boolean;
 }
@@ -432,10 +432,10 @@ function escapeBackgroundStateAttribute(value: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// CortexAgent
+// AgentLoop
 // ---------------------------------------------------------------------------
 
-export class CortexAgent {
+export class AgentLoop {
   private static readonly globalTrackedPids = new Set<number>();
   private static exitHandlerInstalled = false;
 
@@ -443,7 +443,7 @@ export class CortexAgent {
   private readonly contextManager: ContextManager;
   private readonly eventBridge: EventBridge;
   private readonly budgetGuard: BudgetGuard;
-  private readonly config: CortexAgentConfig;
+  private readonly config: AgentLoopConfig;
   private readonly retryPolicy: RetryPolicy;
   private readonly logger: CortexLogger;
   private readonly promptDiagnostics: PromptWatchdogDiagnostics;
@@ -463,7 +463,7 @@ export class CortexAgent {
   private _activePromptCacheRetention: CacheRetention | null = null;
 
   // Stable cache/session key forwarded to the provider as prompt_cache_key
-  // (see CortexAgentConfig.sessionId). null = not set (provider generates one).
+  // (see AgentLoopConfig.sessionId). null = not set (provider generates one).
   private _sessionId: string | null = null;
 
   // Public model handles and internal pi-ai model objects.
@@ -591,17 +591,17 @@ export class CortexAgent {
   };
 
   /**
-   * Create a CortexAgent. Prefer CortexAgent.create().
+   * Create an AgentLoop. Prefer AgentLoop.create().
    *
    * @param agent - A pi-agent-core Agent instance
-   * @param config - CortexAgent configuration
+   * @param config - AgentLoop configuration
    * @throws Error if the utility model violates the same-provider constraint
    */
   private constructor(
     agent: PiAgent,
-    config: CortexAgentConfig,
+    config: AgentLoopConfig,
     tools?: RegisteredTool[],
-    options?: CortexAgentConstructorOptions,
+    options?: AgentLoopConstructorOptions,
   ) {
     this.agent = agent;
     this.config = config;
@@ -622,7 +622,7 @@ export class CortexAgent {
 
     // Resolve models
     if (!config.model) {
-      throw new Error('CortexAgentConfig.model is required but was undefined. Pass a CortexModel.');
+      throw new Error('AgentLoopConfig.model is required but was undefined. Pass a CortexModel.');
     }
     const { primaryModel, primaryPiModel, utilityModel, utilityPiModel } = this.resolveModels(config);
     this.primaryModel = primaryModel;
@@ -655,7 +655,7 @@ export class CortexAgent {
     if (config.persistResult) {
       this.persistResult = config.persistResult;
       if (compactionConfig.microcompaction.persistResult && compactionConfig.microcompaction.persistResult !== config.persistResult) {
-        this.logger.debug('[CortexAgent] top-level persistResult overrides compaction.microcompaction.persistResult');
+        this.logger.debug('[AgentLoop] top-level persistResult overrides compaction.microcompaction.persistResult');
       }
       compactionConfig.microcompaction.persistResult = config.persistResult;
     } else if (compactionConfig.microcompaction.persistResult) {
@@ -744,7 +744,7 @@ export class CortexAgent {
     this.skillRegistry = new SkillRegistry();
     this.skillRegistry.onChange = () => this.rebuildLoadSkillDescription();
 
-    // Wire sub-agent manager hooks to CortexAgent event handlers
+    // Wire sub-agent manager hooks to AgentLoop event handlers
     // (must be after subAgentManager is initialized)
     this.wireSubAgentHooks();
 
@@ -871,7 +871,7 @@ export class CortexAgent {
     this.assertNotShuttingDown();
     if (!this.hasConfiguredSystemPrompt()) {
       throw new Error(
-        'CortexAgent prompt is not configured. Call setBasePrompt() before prompt(), ' +
+        'AgentLoop prompt is not configured. Call setBasePrompt() before prompt(), ' +
         'or provide initialBasePrompt during creation.',
       );
     }
@@ -1022,7 +1022,7 @@ export class CortexAgent {
     // across ticks and can be cached, while new content changes each tick.
     this._prePromptMessageCount = this.agent.state.messages.length;
 
-    this.logger.debug('[CortexAgent] loop start', {
+    this.logger.debug('[AgentLoop] loop start', {
       messageCount: this._prePromptMessageCount,
       inputLength: input.length,
     });
@@ -1055,7 +1055,7 @@ export class CortexAgent {
       this._activePromptCacheRetention = null;
       this._isPrompting = false;
 
-      this.logger.debug('[CortexAgent] loop complete', {
+      this.logger.debug('[AgentLoop] loop complete', {
         durationMs: Date.now() - loopStartMs,
         turns: this.budgetGuard.getTurnCount(),
         totalCost: this.budgetGuard.getTotalCost(),
@@ -1211,7 +1211,7 @@ export class CortexAgent {
           scheduled.causeDetail = classified.causeDetail;
         }
         this.fireRetryScheduled(scheduled);
-        this.logger.warn('[CortexAgent] scheduling background retry', {
+        this.logger.warn('[AgentLoop] scheduling background retry', {
           category: classified.category,
           attempt: attemptNumber,
           maxAttempts: policy.maxAttempts,
@@ -1254,7 +1254,7 @@ export class CortexAgent {
     let count = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i] as unknown as Record<string, unknown>;
-      if (CortexAgent.isTrimmableFailureMessage(msg)) {
+      if (AgentLoop.isTrimmableFailureMessage(msg)) {
         count += 1;
       } else {
         break;
@@ -1284,7 +1284,7 @@ export class CortexAgent {
       return true;
     }
     if (!isAborted) return false;
-    return !CortexAgent.messageHasText(msg) || CortexAgent.messageHasToolCalls(msg);
+    return !AgentLoop.messageHasText(msg) || AgentLoop.messageHasToolCalls(msg);
   }
 
   /** Whether an assistant message carries non-empty text content. */
@@ -1378,7 +1378,7 @@ export class CortexAgent {
       try {
         handler(info);
       } catch (err) {
-        this.logger.error('[CortexAgent] onRetryScheduled handler threw', {
+        this.logger.error('[AgentLoop] onRetryScheduled handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -1390,7 +1390,7 @@ export class CortexAgent {
       try {
         handler(info);
       } catch (err) {
-        this.logger.error('[CortexAgent] onRetrySucceeded handler threw', {
+        this.logger.error('[AgentLoop] onRetrySucceeded handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -1402,7 +1402,7 @@ export class CortexAgent {
       try {
         handler(info);
       } catch (err) {
-        this.logger.error('[CortexAgent] onRetryExhausted handler threw', {
+        this.logger.error('[AgentLoop] onRetryExhausted handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -1450,7 +1450,7 @@ export class CortexAgent {
       wasAborted: wasAborted ?? this.isAborted(),
     });
 
-    this.logger.warn('[CortexAgent] error', {
+    this.logger.warn('[AgentLoop] error', {
       category: classified.category,
       severity: classified.severity,
       message: classified.originalMessage,
@@ -1461,7 +1461,7 @@ export class CortexAgent {
       try {
         handler(classified);
       } catch (handlerErr) {
-        this.logger.error('[CortexAgent] onError handler threw', {
+        this.logger.error('[AgentLoop] onError handler threw', {
           error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
         });
       }
@@ -1606,7 +1606,7 @@ export class CortexAgent {
       // Capture usage from the AssistantMessage response
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-      this.logger.debug('[CortexAgent] directComplete', {
+      this.logger.debug('[AgentLoop] directComplete', {
         durationMs: Date.now() - directStartMs,
         usage: this._lastDirectUsage,
       });
@@ -1707,7 +1707,7 @@ export class CortexAgent {
       // Capture usage from the AssistantMessage response
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-      this.logger.debug('[CortexAgent] structuredComplete', {
+      this.logger.debug('[AgentLoop] structuredComplete', {
         toolName,
         durationMs: Date.now() - structStartMs,
         usage: this._lastDirectUsage,
@@ -1807,9 +1807,9 @@ export class CortexAgent {
   }
 
   private static buildPiAgentConfig(params: {
-    cortexConfig: CortexAgentConfig;
+    cortexConfig: AgentLoopConfig;
     initialSystemPrompt?: string;
-    cacheBreakpointState: { cortexAgent: CortexAgent | null };
+    cacheBreakpointState: { agentLoop: AgentLoop | null };
   }): Record<string, unknown> {
     const { cortexConfig, initialSystemPrompt = '', cacheBreakpointState } = params;
     const rawModel = unwrapModel(cortexConfig.model) as PiModel;
@@ -1830,10 +1830,10 @@ export class CortexAgent {
     agentConfig['streamFn'] = async (model: unknown, context: unknown, options?: Record<string, unknown>) => {
       // streamSimple lives on pi-ai 0.80's temporary /compat shim (Phase 2 migrates this).
       const { streamSimple } = await import('@earendil-works/pi-ai/compat');
-      const retention = cacheBreakpointState.cortexAgent?._activePromptCacheRetention
-        ?? cacheBreakpointState.cortexAgent?._cacheRetention
+      const retention = cacheBreakpointState.agentLoop?._activePromptCacheRetention
+        ?? cacheBreakpointState.agentLoop?._cacheRetention
         ?? null;
-      const sessionId = cacheBreakpointState.cortexAgent?._sessionId ?? null;
+      const sessionId = cacheBreakpointState.agentLoop?._sessionId ?? null;
       let streamOptions = options;
       if (retention || sessionId) {
         streamOptions = { ...options };
@@ -1869,20 +1869,20 @@ export class CortexAgent {
         // pending human approval would hang abort/destroy into the force-kill
         // path. The signal is also passed to the resolver so the consumer UI
         // can dismiss the moot prompt.
-        const resolution = await CortexAgent.raceResolutionAgainstAbort(
+        const resolution = await AgentLoop.raceResolutionAgainstAbort(
           resolver(permissionName, args, signal ? { signal } : {}),
           signal,
         );
         if (resolution === PERMISSION_RACE_ABORTED) {
           return { block: true, reason: ABORTED_PERMISSION_REASON };
         }
-        const decision = CortexAgent.normalizePermissionDecision(resolution);
+        const decision = AgentLoop.normalizePermissionDecision(resolution);
         if (decision.decision !== 'allow') {
           return {
             block: true,
             reason: decision.reason ?? (escalation
               ? 'Escalation outside the sandbox was denied for this command; it was not run. Re-run without escalateOutsideSandbox to execute inside the sandbox.'
-              : CortexAgent.buildPermissionReason(permissionName, decision.decision)),
+              : AgentLoop.buildPermissionReason(permissionName, decision.decision)),
           };
         }
         return undefined;
@@ -1890,7 +1890,7 @@ export class CortexAgent {
     }
 
     agentConfig['afterToolCall'] = async (ctx: unknown) => {
-      const agent = cacheBreakpointState.cortexAgent;
+      const agent = cacheBreakpointState.agentLoop;
       if (!agent) return undefined;
       agent.syncActiveLoopTools(ctx);
       if (!agent.isWorkingTagsEnabled) return undefined;
@@ -1915,7 +1915,7 @@ export class CortexAgent {
     };
 
     agentConfig['onPayload'] = async (payload: Record<string, unknown>, model: Record<string, unknown>) => {
-      const agent = cacheBreakpointState.cortexAgent;
+      const agent = cacheBreakpointState.agentLoop;
       if (!agent) return undefined;
 
       const provider = (model as Record<string, unknown>)['provider'];
@@ -2002,8 +2002,8 @@ export class CortexAgent {
     return `Tool "${toolName}" is blocked or disabled.`;
   }
 
-  private static wireManagedPiAgent(cortexAgent: CortexAgent, piAgent: PiAgent): void {
-    const hook = cortexAgent.getTransformContextHook();
+  private static wireManagedPiAgent(agentLoop: AgentLoop, piAgent: PiAgent): void {
+    const hook = agentLoop.getTransformContextHook();
     piAgent.transformContext = async (messages: unknown[]) => {
       const result = await hook({
         systemPrompt: piAgent.state.systemPrompt ?? '',
@@ -2019,13 +2019,13 @@ export class CortexAgent {
   }
 
   private static async createManagedAgent(params: {
-    cortexConfig: CortexAgentConfig;
+    cortexConfig: AgentLoopConfig;
     tools?: RegisteredTool[];
     initialBasePrompt?: string;
     initialSystemPrompt?: string;
-    constructorOptions?: CortexAgentConstructorOptions;
+    constructorOptions?: AgentLoopConstructorOptions;
     missingDependencyMessage: string;
-  }): Promise<CortexAgent> {
+  }): Promise<AgentLoop> {
     const {
       cortexConfig,
       tools = [],
@@ -2035,12 +2035,12 @@ export class CortexAgent {
       missingDependencyMessage,
     } = params;
 
-    const AgentClass = await CortexAgent.loadAgentClass(missingDependencyMessage);
-    const cacheBreakpointState = { cortexAgent: null as CortexAgent | null };
+    const AgentClass = await AgentLoop.loadAgentClass(missingDependencyMessage);
+    const cacheBreakpointState = { agentLoop: null as AgentLoop | null };
     const agentConfigParams: {
-      cortexConfig: CortexAgentConfig;
+      cortexConfig: AgentLoopConfig;
       initialSystemPrompt?: string;
-      cacheBreakpointState: { cortexAgent: CortexAgent | null };
+      cacheBreakpointState: { agentLoop: AgentLoop | null };
     } = {
       cortexConfig,
       cacheBreakpointState,
@@ -2048,61 +2048,61 @@ export class CortexAgent {
     if (initialSystemPrompt !== undefined) {
       agentConfigParams.initialSystemPrompt = initialSystemPrompt;
     }
-    const agentConfig = CortexAgent.buildPiAgentConfig(agentConfigParams);
+    const agentConfig = AgentLoop.buildPiAgentConfig(agentConfigParams);
 
     const piAgent = new AgentClass(agentConfig);
-    const cortexAgent = new CortexAgent(
+    const agentLoop = new AgentLoop(
       piAgent,
       cortexConfig,
       tools,
       constructorOptions,
     );
 
-    cacheBreakpointState.cortexAgent = cortexAgent;
-    CortexAgent.wireManagedPiAgent(cortexAgent, piAgent);
+    cacheBreakpointState.agentLoop = agentLoop;
+    AgentLoop.wireManagedPiAgent(agentLoop, piAgent);
 
     if (typeof initialBasePrompt === 'string') {
-      cortexAgent.setBasePrompt(initialBasePrompt);
+      agentLoop.setBasePrompt(initialBasePrompt);
     } else if (typeof initialSystemPrompt === 'string' && initialSystemPrompt.trim()) {
-      cortexAgent.applySystemPrompt(initialSystemPrompt);
+      agentLoop.applySystemPrompt(initialSystemPrompt);
     }
 
-    return cortexAgent;
+    return agentLoop;
   }
 
   /**
-   * Create a CortexAgent with a pi-agent-core Agent constructed internally.
+   * Create an AgentLoop with a pi-agent-core Agent constructed internally.
    *
    * This eliminates the consumer's need to import pi-agent-core directly.
    * The factory dynamically imports pi-agent-core and pi-ai, resolves the
    * model, creates the internal Agent, and returns a fully configured
-   * CortexAgent.
+   * AgentLoop.
    *
-   * @param config - CortexAgent configuration (model, tools, options)
-   * @returns A new CortexAgent wrapping an internally-created pi-agent-core Agent
+   * @param config - AgentLoop configuration (model, tools, options)
+   * @returns A new AgentLoop wrapping an internally-created pi-agent-core Agent
    * @throws Error if pi-agent-core or pi-ai is not installed
    */
-  static async create(config: CortexAgentConfig & {
+  static async create(config: AgentLoopConfig & {
     /**
      * Additional consumer-provided tools to register alongside the built-in tools.
      * Built-in tools (Read, Write, Edit, Glob, Grep, Bash, WebFetch, TaskOutput)
      * are registered automatically. Tools passed here must use Cortex's
      * execute(params, context?) contract. Wrap raw pi-agent-core tools with
-     * fromPiAgentTool() before passing them to CortexAgent.create().
+     * fromPiAgentTool() before passing them to AgentLoop.create().
      */
     tools?: CortexTool[];
     /** @deprecated Use initialBasePrompt instead. */
     systemPrompt?: string;
-  }): Promise<CortexAgent> {
+  }): Promise<AgentLoop> {
     const managedCreateParams: {
-      cortexConfig: CortexAgentConfig;
+      cortexConfig: AgentLoopConfig;
       tools?: RegisteredTool[];
       initialBasePrompt?: string;
       missingDependencyMessage: string;
     } = {
       cortexConfig: config,
       missingDependencyMessage:
-        'CortexAgent.create() requires @earendil-works/pi-agent-core to be installed. ' +
+        'AgentLoop.create() requires @earendil-works/pi-agent-core to be installed. ' +
         'Install it as a dependency or peer dependency.',
     };
     if (config.tools) {
@@ -2112,7 +2112,7 @@ export class CortexAgent {
     if (initialBasePrompt !== undefined) {
       managedCreateParams.initialBasePrompt = initialBasePrompt;
     }
-    return CortexAgent.createManagedAgent(managedCreateParams);
+    return AgentLoop.createManagedAgent(managedCreateParams);
   }
 
   // -----------------------------------------------------------------------
@@ -2600,7 +2600,7 @@ export class CortexAgent {
           this.logger.debug('[Tool] executed', {
             name: tool.name,
             durationMs: Date.now() - toolStartMs,
-            ...CortexAgent.summarizeToolArgs(tool.name, params),
+            ...AgentLoop.summarizeToolArgs(tool.name, params),
           });
           // Already correct format: must have content as a non-empty array
           if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
@@ -2772,7 +2772,7 @@ export class CortexAgent {
       // Capture usage from utility model calls
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-      this.logger.debug('[CortexAgent] utilityComplete', {
+      this.logger.debug('[AgentLoop] utilityComplete', {
         durationMs: Date.now() - utilStartMs,
         usage: this._lastDirectUsage,
       });
@@ -2799,7 +2799,7 @@ export class CortexAgent {
     const unwound = this.turnUnwound;
 
     this.promptDiagnostics.recordAbortRequested();
-    this.logger.info('[CortexAgent] abort requested', { isPrompting: this._isPrompting });
+    this.logger.info('[AgentLoop] abort requested', { isPrompting: this._isPrompting });
     controller.abort();
     this.agent.abort();
     this.promptDiagnostics.startAbortWait();
@@ -2834,7 +2834,7 @@ export class CortexAgent {
     if (!this.isShuttingDown() && this.abortController === controller) {
       this.abortController = new AbortController();
     }
-    this.logger.info('[CortexAgent] abort complete');
+    this.logger.info('[AgentLoop] abort complete');
   }
 
   /**
@@ -2862,7 +2862,7 @@ export class CortexAgent {
       return this.destroyPromise; // Teardown already in progress, share it
     }
 
-    this.logger.info('[CortexAgent] destroy start', {
+    this.logger.info('[AgentLoop] destroy start', {
       activeSubAgents: this.subAgentManager.activeCount,
       mcpConnections: this.mcpClientManager.connectionCount,
     });
@@ -2898,7 +2898,7 @@ export class CortexAgent {
         }
         this.promptDiagnostics.stop();
         this.lifecycleState = 'destroyed';
-        this.logger.info('[CortexAgent] destroy complete');
+        this.logger.info('[AgentLoop] destroy complete');
       }
     })();
     return this.destroyPromise;
@@ -3712,7 +3712,7 @@ export class CortexAgent {
         // name. That gate is what authorizes escalateOutsideSandbox; without a
         // resolver the tool refuses escalation (fail closed).
         permissionGated: this.config.resolvePermission !== undefined,
-        // Consumer tool tuning (CortexAgentConfig.bash).
+        // Consumer tool tuning (AgentLoopConfig.bash).
         shellPath: this.config.bash?.shellPath,
         autoYieldThreshold: this.config.bash?.autoYieldThreshold,
       }) as RegisteredTool);
@@ -3733,7 +3733,7 @@ export class CortexAgent {
         // The consumer's unified egress gate, shared with sandboxed shell
         // egress. Undefined = ungated, exactly as before.
         resolveNetworkAccess: this.config.resolveNetworkAccess,
-        // Consumer tool tuning (CortexAgentConfig.webFetch).
+        // Consumer tool tuning (AgentLoopConfig.webFetch).
         maxPerLoop: this.config.webFetch?.maxPerLoop,
       }) as RegisteredTool);
     }
@@ -3761,7 +3761,7 @@ export class CortexAgent {
     });
   }
 
-  private resolveModels(config: CortexAgentConfig): {
+  private resolveModels(config: AgentLoopConfig): {
     primaryModel: CortexModel;
     primaryPiModel: PiModel;
     utilityModel: CortexModel;
@@ -3937,10 +3937,10 @@ export class CortexAgent {
         // finally succeeds (errorMessage is cleared at the start of each run).
         const agentState = this.agent.state as Record<string, unknown>;
         if (agentState['errorMessage']) {
-          this.logger.info('[CortexAgent] loop_end suppressed (run ended in error; retry may follow)');
+          this.logger.info('[AgentLoop] loop_end suppressed (run ended in error; retry may follow)');
           return;
         }
-        this.logger.info('[CortexAgent] loop_end', {
+        this.logger.info('[AgentLoop] loop_end', {
           turns: this.budgetGuard.getTurnCount(),
           totalCost: this.budgetGuard.getTotalCost(),
           currentContextTokens: this.compactionManager.currentContextTokenCount,
@@ -3950,7 +3950,7 @@ export class CortexAgent {
           try {
             handler();
           } catch (err) {
-            this.logger.error('[CortexAgent] onLoopComplete handler threw', {
+            this.logger.error('[AgentLoop] onLoopComplete handler threw', {
               error: err instanceof Error ? err.message : String(err),
             });
           }
@@ -4010,7 +4010,7 @@ export class CortexAgent {
           this._sessionUsage.tokens.cacheRead += event.usage.cacheRead;
           this._sessionUsage.tokens.cacheWrite += event.usage.cacheWrite;
 
-          this.logger.debug('[CortexAgent] turn_end usage', {
+          this.logger.debug('[AgentLoop] turn_end usage', {
             input: event.usage.input,
             output: event.usage.output,
             cacheRead: event.usage.cacheRead,
@@ -4049,7 +4049,7 @@ export class CortexAgent {
               try {
                 handler(event.textOutput);
               } catch (err) {
-                this.logger.error('[CortexAgent] onTurnComplete handler threw', {
+                this.logger.error('[AgentLoop] onTurnComplete handler threw', {
                   error: err instanceof Error ? err.message : String(err),
                 });
               }
@@ -4064,7 +4064,7 @@ export class CortexAgent {
                 try {
                   handler(output);
                 } catch (err) {
-                  this.logger.error('[CortexAgent] onTurnComplete handler threw', {
+                  this.logger.error('[AgentLoop] onTurnComplete handler threw', {
                     error: err instanceof Error ? err.message : String(err),
                   });
                 }
@@ -4369,7 +4369,7 @@ export class CortexAgent {
     // destroy()'s own force-kill deadline.
     try {
       await this.subAgentManager.cancelAll(async (agent) => {
-        await (agent as CortexAgent).destroy();
+        await (agent as AgentLoop).destroy();
       });
     } catch {
       // Best-effort sub-agent cleanup
@@ -4442,7 +4442,7 @@ export class CortexAgent {
       } catch {
         // Process may have already exited
       }
-      CortexAgent.globalTrackedPids.delete(pid);
+      AgentLoop.globalTrackedPids.delete(pid);
     }
     this.trackedPids.clear();
   }
@@ -4451,31 +4451,31 @@ export class CortexAgent {
    * Set up process exit handler for orphaned subprocess cleanup (Level 3 safety net).
    */
   private setupExitHandler(): void {
-    if (!CortexAgent.exitHandlerInstalled) {
-      process.on('exit', CortexAgent.handleProcessExit);
-      CortexAgent.exitHandlerInstalled = true;
+    if (!AgentLoop.exitHandlerInstalled) {
+      process.on('exit', AgentLoop.handleProcessExit);
+      AgentLoop.exitHandlerInstalled = true;
     }
   }
 
   private static handleProcessExit(): void {
-    for (const pid of CortexAgent.globalTrackedPids) {
+    for (const pid of AgentLoop.globalTrackedPids) {
       try {
         process.kill(pid);
       } catch {
         // Process may have already exited
       }
     }
-    CortexAgent.globalTrackedPids.clear();
+    AgentLoop.globalTrackedPids.clear();
   }
 
   private trackPid(pid: number): void {
     this.trackedPids.add(pid);
-    CortexAgent.globalTrackedPids.add(pid);
+    AgentLoop.globalTrackedPids.add(pid);
   }
 
   private untrackPid(pid: number): void {
     this.trackedPids.delete(pid);
-    CortexAgent.globalTrackedPids.delete(pid);
+    AgentLoop.globalTrackedPids.delete(pid);
   }
 
   // -----------------------------------------------------------------------
@@ -4577,7 +4577,7 @@ export class CortexAgent {
    */
   async cancelSubAgent(taskId: string): Promise<boolean> {
     const cancelled = await this.subAgentManager.cancel(taskId, async (agent) => {
-      await (agent as CortexAgent).destroy();
+      await (agent as AgentLoop).destroy();
     });
     if (cancelled) {
       // Purge a result that already completed and sits queued for delivery.
@@ -4586,7 +4586,7 @@ export class CortexAgent {
       this.pendingBackgroundResults = this.pendingBackgroundResults.filter(
         item => !(item.kind === 'subagent' && item.taskId === taskId),
       );
-      this.logger.info('[CortexAgent] subagent cancelled', { taskId });
+      this.logger.info('[AgentLoop] subagent cancelled', { taskId });
     }
     return cancelled;
   }
@@ -4601,7 +4601,7 @@ export class CortexAgent {
     for (const taskId of this.subAgentManager.getActiveTaskIds()) {
       const entry = this.subAgentManager.get(taskId);
       if (!entry) continue;
-      const childAgent = entry.agent as CortexAgent;
+      const childAgent = entry.agent as AgentLoop;
       const budget = childAgent.getBudgetGuard();
       snapshots.push({
         taskId,
@@ -4662,7 +4662,7 @@ export class CortexAgent {
     } else {
       this.skillBuffer.push(skill);
     }
-    this.logger.info('[CortexAgent] skill loaded', {
+    this.logger.info('[AgentLoop] skill loaded', {
       name: skill.name,
       contentLength: skill.content.length,
       bufferSize: this.skillBuffer.length,
@@ -4684,7 +4684,7 @@ export class CortexAgent {
   // -----------------------------------------------------------------------
 
   /**
-   * Wire the sub-agent manager's lifecycle hooks to CortexAgent event handlers.
+   * Wire the sub-agent manager's lifecycle hooks to AgentLoop event handlers.
    */
   private wireSubAgentHooks(): void {
     this.subAgentManager.setHooks({
@@ -4693,7 +4693,7 @@ export class CortexAgent {
           try {
             handler(taskId, instructions, background);
           } catch (err) {
-            this.logger.error('[CortexAgent] onSubAgentSpawned handler threw', {
+            this.logger.error('[AgentLoop] onSubAgentSpawned handler threw', {
               taskId,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -4705,7 +4705,7 @@ export class CortexAgent {
           try {
             handler(taskId, result, status, usage);
           } catch (err) {
-            this.logger.error('[CortexAgent] onSubAgentCompleted handler threw', {
+            this.logger.error('[AgentLoop] onSubAgentCompleted handler threw', {
               taskId,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -4717,7 +4717,7 @@ export class CortexAgent {
           try {
             handler(taskId, error);
           } catch (err) {
-            this.logger.error('[CortexAgent] onSubAgentFailed handler threw', {
+            this.logger.error('[AgentLoop] onSubAgentFailed handler threw', {
               taskId,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -4770,7 +4770,7 @@ export class CortexAgent {
       if (!entry) continue;
 
       const durationSec = Math.round((now - entry.spawnedAt) / 1000);
-      const childAgent = entry.agent as CortexAgent;
+      const childAgent = entry.agent as AgentLoop;
       const tokens = (childAgent.currentContextTokenCount / 1000).toFixed(1);
       const budget = childAgent.getBudgetGuard();
       const turnsUsed = budget.getTurnCount();
@@ -4842,7 +4842,7 @@ export class CortexAgent {
     const taskId = this.generateTaskId();
     const startTime = Date.now();
 
-    this.logger.info('[CortexAgent] subagent spawned', {
+    this.logger.info('[AgentLoop] subagent spawned', {
       taskId,
       background: false,
       instructionsLength: params.instructions.length,
@@ -4876,7 +4876,7 @@ export class CortexAgent {
       };
 
       if (!this.subAgentManager.track(tracked)) {
-        this.logger.warn('[CortexAgent] subagent rejected', {
+        this.logger.warn('[AgentLoop] subagent rejected', {
           taskId,
           active: this.subAgentManager.activeCount,
           limit: this.subAgentManager.limit,
@@ -4898,7 +4898,7 @@ export class CortexAgent {
 
       // Forward child events to parent's EventBridge for real-time visibility
       const unsubForward = this.eventBridge.forwardFrom(
-        (childAgent as CortexAgent).getEventBridge(),
+        (childAgent as AgentLoop).getEventBridge(),
         taskId,
       );
 
@@ -4906,7 +4906,7 @@ export class CortexAgent {
         // Run the sub-agent (foreground: wait for result)
         const result = await this.runSubAgent(childAgent, params.instructions, taskId, startTime);
 
-        this.logger.info('[CortexAgent] subagent complete', {
+        this.logger.info('[AgentLoop] subagent complete', {
           taskId,
           status: result.status,
           turns: result.usage.turns,
@@ -4925,7 +4925,7 @@ export class CortexAgent {
         unsubForward();
       }
     } catch (err) {
-      this.logger.error('[CortexAgent] subagent failed', {
+      this.logger.error('[AgentLoop] subagent failed', {
         taskId,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -4952,7 +4952,7 @@ export class CortexAgent {
     const taskId = this.generateTaskId();
     const startTime = Date.now();
 
-    this.logger.info('[CortexAgent] subagent spawned', {
+    this.logger.info('[AgentLoop] subagent spawned', {
       taskId,
       background: true,
       instructionsLength: params.instructions.length,
@@ -4985,7 +4985,7 @@ export class CortexAgent {
     };
 
     if (!this.subAgentManager.track(tracked)) {
-      this.logger.warn('[CortexAgent] subagent rejected', {
+      this.logger.warn('[AgentLoop] subagent rejected', {
         taskId,
         active: this.subAgentManager.activeCount,
         limit: this.subAgentManager.limit,
@@ -5007,7 +5007,7 @@ export class CortexAgent {
     // forwarded child turn usage, so background child spend now lands in
     // getSessionUsage() just as foreground child spend always has.
     const unsubForward = this.eventBridge.forwardFrom(
-      (childAgent as CortexAgent).getEventBridge(),
+      (childAgent as AgentLoop).getEventBridge(),
       taskId,
     );
 
@@ -5018,7 +5018,7 @@ export class CortexAgent {
         // The child has settled (and been destroyed by runSubAgent); stop
         // forwarding before delivery so listeners never leak per task.
         unsubForward();
-        this.logger.info('[CortexAgent] subagent complete', {
+        this.logger.info('[AgentLoop] subagent complete', {
           taskId,
           background: true,
           status: result.status,
@@ -5030,7 +5030,7 @@ export class CortexAgent {
       })
       .catch((err) => {
         unsubForward();
-        this.logger.error('[CortexAgent] subagent failed', {
+        this.logger.error('[AgentLoop] subagent failed', {
           taskId,
           background: true,
           error: err instanceof Error ? err.message : String(err),
@@ -5063,7 +5063,7 @@ export class CortexAgent {
     // before the shutdown gate: work discarded on purpose is not
     // dead-letter material, even when the discard happens mid-teardown.
     if (item.kind === 'subagent' && this.subAgentManager.isCancelled(item.taskId)) {
-      this.logger.info('[CortexAgent] dropping result of cancelled subagent', {
+      this.logger.info('[AgentLoop] dropping result of cancelled subagent', {
         taskId: item.taskId,
       });
       return;
@@ -5191,7 +5191,7 @@ export class CortexAgent {
       // reach onError or reject a consumer turn (mirroring how an in-run
       // retry that recovers reports onRetrySucceeded rather than onError).
       if (requeuedForRetry && this.batchRecoveredAfterRequeue(batch)) {
-        this.logger.info('[CortexAgent] background delivery recovered after re-queue', {
+        this.logger.info('[AgentLoop] background delivery recovered after re-queue', {
           taskIds: batch.map((item) => item.taskId),
           error: attemptError.message,
         });
@@ -5235,7 +5235,7 @@ export class CortexAgent {
     let end = messages.length;
     while (end > preDeliveryCount) {
       const msg = messages[end - 1] as unknown as Record<string, unknown>;
-      if (!CortexAgent.isTrimmableFailureMessage(msg)) break;
+      if (!AgentLoop.isTrimmableFailureMessage(msg)) break;
       end -= 1;
     }
     if (end < messages.length) {
@@ -5321,7 +5321,7 @@ export class CortexAgent {
   ): void {
     const attempts = item.deliveryAttempts ?? 0;
     item.deadLettered = true;
-    this.logger.error('[CortexAgent] background result dead-lettered', {
+    this.logger.error('[AgentLoop] background result dead-lettered', {
       kind: item.kind,
       taskId: item.taskId,
       attempts,
@@ -5344,7 +5344,7 @@ export class CortexAgent {
     const excess = this.deadLetteredBackgroundResults.length - MAX_DEAD_LETTERED_RESULTS;
     if (excess > 0) {
       const evicted = this.deadLetteredBackgroundResults.splice(0, excess);
-      this.logger.warn('[CortexAgent] dead-letter cap reached; evicting oldest entries', {
+      this.logger.warn('[AgentLoop] dead-letter cap reached; evicting oldest entries', {
         cap: MAX_DEAD_LETTERED_RESULTS,
         evicted: evicted.map((e) => ({ kind: e.kind, taskId: e.taskId })),
       });
@@ -5353,7 +5353,7 @@ export class CortexAgent {
       try {
         handler(entry);
       } catch (err) {
-        this.logger.error('[CortexAgent] onBackgroundResultDeadLettered handler threw', {
+        this.logger.error('[AgentLoop] onBackgroundResultDeadLettered handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -5420,7 +5420,7 @@ export class CortexAgent {
       try {
         handler(taskIds);
       } catch (err) {
-        this.logger.error('[CortexAgent] onBackgroundResultDelivery handler threw', {
+        this.logger.error('[AgentLoop] onBackgroundResultDelivery handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -5435,7 +5435,7 @@ export class CortexAgent {
     maxTurns?: number;
     maxCost?: number;
     background?: boolean;
-  }): Promise<CortexAgent> {
+  }): Promise<AgentLoop> {
     // Pre-spawn hook: lets the consumer record the spawn and curate the
     // child's starting context (system prompt, tools, background seed) before
     // the child is built. Purely additive; errors are swallowed.
@@ -5450,7 +5450,7 @@ export class CortexAgent {
           ...(params.systemPrompt ? { requestedSystemPrompt: params.systemPrompt } : {}),
         });
       } catch (err) {
-        this.logger.error('[CortexAgent] onBeforeSubAgentSpawn handler threw', {
+        this.logger.error('[AgentLoop] onBeforeSubAgentSpawn handler threw', {
           taskId: params.taskId,
           error: err instanceof Error ? err.message : String(err),
         });
@@ -5463,7 +5463,7 @@ export class CortexAgent {
     const childConfig = this.buildChildAgentConfig(params);
     const promptSeed = this.resolveChildPromptSeed(effectiveSystemPrompt);
 
-    const childCortexConfig: CortexAgentConfig = {
+    const childCortexConfig: AgentLoopConfig = {
       model: this.primaryModel,
       workingDirectory: this.workingDirectory,
       workingTags: { enabled: this.workingTagsEnabled },
@@ -5506,11 +5506,11 @@ export class CortexAgent {
     }
 
     const childCreateParams: {
-      cortexConfig: CortexAgentConfig;
+      cortexConfig: AgentLoopConfig;
       tools: RegisteredTool[];
       initialBasePrompt?: string;
       initialSystemPrompt?: string;
-      constructorOptions: CortexAgentConstructorOptions;
+      constructorOptions: AgentLoopConstructorOptions;
       missingDependencyMessage: string;
     } = {
       cortexConfig: childCortexConfig,
@@ -5529,7 +5529,7 @@ export class CortexAgent {
       childCreateParams.initialSystemPrompt = promptSeed.initialSystemPrompt;
     }
 
-    const childAgent = await CortexAgent.createManagedAgent(childCreateParams);
+    const childAgent = await AgentLoop.createManagedAgent(childCreateParams);
 
     // Seed background context as the child's leading context slot. This is
     // reference material, not the child's objective (its task is its
@@ -5554,9 +5554,9 @@ export class CortexAgent {
    * surfaces and the headline block.
    */
   private wrapChildPermissionResolver(
-    parentResolver: NonNullable<CortexAgentConfig['resolvePermission']>,
+    parentResolver: NonNullable<AgentLoopConfig['resolvePermission']>,
     childTaskId: string,
-  ): NonNullable<CortexAgentConfig['resolvePermission']> {
+  ): NonNullable<AgentLoopConfig['resolvePermission']> {
     const subAgentMgr = this.subAgentManager;
     return async (toolName, toolArgs, context) => {
       const entry = subAgentMgr.get(childTaskId);
@@ -5595,7 +5595,7 @@ export class CortexAgent {
    * Run a sub-agent to completion. Handles result delivery to the manager.
    */
   private async runSubAgent(
-    childAgent: CortexAgent,
+    childAgent: AgentLoop,
     instructions: string,
     taskId: string,
     startTime: number,

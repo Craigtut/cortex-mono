@@ -12,7 +12,7 @@ It does NOT contain application-specific logic (thoughts, emotions, decisions, p
 packages/cortex/
   src/
     index.ts                    # Public API
-    cortex-agent.ts             # Wraps pi-agent-core Agent with production concerns
+    agent-loop.ts             # Wraps pi-agent-core Agent with production concerns
     context-manager.ts          # Slot-based context management
     provider-manager.ts         # Provider discovery, OAuth login/refresh, API key validation
     provider-registry.ts        # Static provider metadata and utility model defaults
@@ -66,7 +66,7 @@ These terms are intentionally not interchangeable. Session persistence is a cons
 There is no cold/warm/active state machine. A single `Agent` instance persists for the lifetime of the process. The system prompt is set once and rarely changes. Context is managed through two complementary mechanisms:
 
 1. **`ContextManager.setSlot()`**: Updates persistent context slots in `agent.state.messages`. Used for content that changes infrequently. Consumers define how many slots exist and what they contain.
-2. **`transformContext` hook**: Injects ephemeral per-call context that should NOT persist in `agent.state.messages`. In a managed `CortexAgent`, Cortex inserts consumer ephemeral content, background task state, and loaded skill instructions at the pre-prompt boundary. This keeps old history cacheable while keeping the current prompt as the final message.
+2. **`transformContext` hook**: Injects ephemeral per-call context that should NOT persist in `agent.state.messages`. In a managed `AgentLoop`, Cortex inserts consumer ephemeral content, background task state, and loaded skill instructions at the pre-prompt boundary. This keeps old history cacheable while keeping the current prompt as the final message.
 
 ### The ContextManager
 
@@ -120,10 +120,10 @@ Built-in tools are native Cortex tools defined directly in Cortex. These run in-
 
 Mutable built-in tool state is scoped per agent runtime. That includes cwd tracking, read tracking, WebFetch loop counters/cache ownership, and background task ownership. Parent and child agents get fresh built-in tool instances so they do not share mutable closures.
 
-Built-in tools are registered automatically when `CortexAgent.create()` is called, using the `workingDirectory` from the agent config. The consumer does not need to create or pass tool instances. To exclude specific built-in tools, use the `disableTools` config option:
+Built-in tools are registered automatically when `AgentLoop.create()` is called, using the `workingDirectory` from the agent config. The consumer does not need to create or pass tool instances. To exclude specific built-in tools, use the `disableTools` config option:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory: cwd,
   disableTools: ['WebFetch', 'Bash'], // Exclude specific tools
@@ -134,7 +134,7 @@ Permissions are enforced through the `beforeToolCall` hook used for both built-i
 
 #### Dynamic Consumer Tool Management
 
-Consumer-provided tools (passed via `tools` in `CortexAgent.create()`) can be added and removed at runtime without restarting the agent:
+Consumer-provided tools (passed via `tools` in `AgentLoop.create()`) can be added and removed at runtime without restarting the agent:
 
 ```typescript
 // Add a tool dynamically (e.g., after a permission change enables it)
@@ -150,7 +150,7 @@ This complements the existing MCP dynamic lifecycle (connect/disconnect servers)
 
 #### Tool Result Persistence
 
-Every tool's output flows through a result-size interceptor at the registration boundary in `refreshTools()`. Oversized results (>25K tokens) are bookended (head + tail preview) and, when a `persistResult` callback is configured on `CortexAgentConfig`, persisted to disk with a file reference the agent can Read for the full content. This applies uniformly to built-in tools, MCP tools, and consumer-provided tools, with a small skip set (Read, Edit, Write, Glob) for tools that produce inherently bounded output. See [tool-result-persistence.md](tool-result-persistence.md) for the full design.
+Every tool's output flows through a result-size interceptor at the registration boundary in `refreshTools()`. Oversized results (>25K tokens) are bookended (head + tail preview) and, when a `persistResult` callback is configured on `AgentLoopConfig`, persisted to disk with a file reference the agent can Read for the full content. This applies uniformly to built-in tools, MCP tools, and consumer-provided tools, with a small skip set (Read, Edit, Write, Glob) for tools that produce inherently bounded output. See [tool-result-persistence.md](tool-result-persistence.md) for the full design.
 
 ### Schema Conversion (Zod -> TypeBox)
 
@@ -217,7 +217,7 @@ See **`skill-system.md`** for the full design: SKILL.md format, SkillRegistry, l
 
 When an agent runs multi-turn agentic loops, it generates intermediate text (reasoning, analysis, planning) mixed with user-facing text (acknowledgments, progress updates, final answers). Working tags let the agent wrap internal content in `<working>` XML tags. Text outside these tags is direct communication for the user. Both stay in conversation history; the difference is only in delivery.
 
-This feature is enabled by default and configurable via `CortexAgentConfig.workingTags.enabled`. When enabled, Cortex appends a "Response Delivery" section to its operational rules in the system prompt.
+This feature is enabled by default and configurable via `AgentLoopConfig.workingTags.enabled`. When enabled, Cortex appends a "Response Delivery" section to its operational rules in the system prompt.
 
 At the streaming level, Cortex passes raw text through with zero buffering. At turn completion, Cortex parses the complete text into a structured `AgentTextOutput` object with `userFacing`, `working`, and `raw` properties. The consumer decides per-channel what to deliver (e.g., SMS sends `userFacing` only; the frontend renders everything with working content dimmed).
 
@@ -308,7 +308,7 @@ Pi-agent-core's `Agent` class has no `destroy()` or `dispose()` method. It provi
 
 Cortex wraps this with explicit lifecycle management.
 
-### `CortexAgent.destroy()`
+### `AgentLoop.destroy()`
 
 Ordered cleanup of all resources. Called by the consumer when the agent is no longer needed (e.g., during application shutdown or pipeline teardown).
 
@@ -353,7 +353,7 @@ async destroy(): Promise<void> {
 }
 ```
 
-### `CortexAgent.abort()`
+### `AgentLoop.abort()`
 
 Cancel the current agentic loop without destroying the agent. The agent remains usable for subsequent prompts.
 
@@ -398,7 +398,7 @@ CREATED → ACTIVE → DESTROYED
                 └── abort() returns to ACTIVE (agent still usable)
 ```
 
-- **CREATED**: After `await CortexAgent.create(config)`. Slots can be set, but no loops have run.
+- **CREATED**: After `await AgentLoop.create(config)`. Slots can be set, but no loops have run.
 - **ACTIVE**: After the first `prompt()` call. The agent is running or idle between prompts.
 - **DESTROYED**: After `destroy()`. All resources released. Any `prompt()` call throws.
 

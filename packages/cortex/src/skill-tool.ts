@@ -59,7 +59,7 @@ export interface LoadSkillToolConfig {
 /**
  * Create the load_skill tool.
  *
- * Returns a Cortex-native tool. CortexAgent adapts it to pi-agent-core's
+ * Returns a Cortex-native tool. AgentLoop adapts it to pi-agent-core's
  * execute signature when synchronizing the tool inventory.
  * The tool description includes the available skills summary, which
  * updates when skills are added or removed from the registry.

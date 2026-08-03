@@ -13,7 +13,7 @@ This is a unified approach: both consumer domain tools (e.g., memory, tasks, mes
 ## Architecture
 
 ```
-CortexAgent
+AgentLoop
 ├── Built-in Tools (Bash, Read, Write, Edit, Glob, Grep, WebFetch, SubAgent)
 │   └── Cortex-native tools, adapted to AgentTool at registration time
 │
@@ -26,7 +26,7 @@ CortexAgent
 │       └── HTTP transport (for HTTP-based plugins)
 │       └── tools/list -> AgentTool wrappers
 │
-└── beforeToolCall hook (wired by CortexAgent, not McpClientManager)
+└── beforeToolCall hook (wired by AgentLoop, not McpClientManager)
     └── Permission gate (resolvePermission) for all tools
 ```
 
@@ -198,7 +198,7 @@ agent.beforeToolCall = async ({ toolCall, args }) => {
 
 Key details:
 
-- `resolvePermission()` is a consumer callback supplied to `CortexAgent`
+- `resolvePermission()` is a consumer callback supplied to `AgentLoop`
 - Structured decisions are `allow`, `block`, and `ask`
 - Boolean results are still accepted for compatibility and are normalized to `allow` or `block`
 - `ask` currently blocks the tool call and returns an approval-needed reason to the model. Consumers that want an approval UX must handle it out-of-band and retry later.

@@ -1,7 +1,7 @@
 /**
  * Pure helpers for cortex's background retry loop.
  *
- * The loop itself lives in CortexAgent.prompt() (it drives agent.prompt /
+ * The loop itself lives in AgentLoop.prompt() (it drives agent.prompt /
  * agent.continue). Everything decidable without touching agent state lives
  * here so it can be unit-tested in isolation: default policy, policy merge,
  * the backoff schedule, and the retry gate.

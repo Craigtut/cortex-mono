@@ -125,7 +125,7 @@ export class ObservationalMemoryEngine {
   // -------------------------------------------------------------------------
 
   /**
-   * Set the LLM completion function (wired to utilityComplete on CortexAgent).
+   * Set the LLM completion function (wired to utilityComplete on AgentLoop).
    */
   setCompleteFn(fn: CompleteFn): void {
     this.completeFn = fn;
@@ -310,7 +310,7 @@ export class ObservationalMemoryEngine {
 
     // Step 6: Build slot content AFTER reflection so it contains post-reflection
     // observations. Previously this was captured before reflection, requiring
-    // an external patch in cortex-agent.ts to correct stale content.
+    // an external patch in agent-loop.ts to correct stale content.
     const slotContent = this.buildSlotContent();
 
     // Step 7: Rebuild context with updated observations and trimmed history

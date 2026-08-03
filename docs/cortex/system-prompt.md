@@ -2,7 +2,7 @@
 
 > **STATUS: IMPLEMENTED**
 
-The `CortexAgent` assembles a system prompt from two layers: a **consumer layer** (identity, persona, domain-specific instructions) followed by a **cortex operational layer** (rules, tool guidance, safety, environment). The consumer's content comes first to establish the strongest foundation for the agent's identity and behavior.
+The `AgentLoop` assembles a system prompt from two layers: a **consumer layer** (identity, persona, domain-specific instructions) followed by a **cortex operational layer** (rules, tool guidance, safety, environment). The consumer's content comes first to establish the strongest foundation for the agent's identity and behavior.
 
 ## Prompt Structure
 
@@ -25,7 +25,7 @@ The consumer's content is the agent's identity. The cortex operational rules are
 The consumer provides environment details when creating the agent:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory: '/path/to/workspace',
   initialBasePrompt: 'You are the application agent.',

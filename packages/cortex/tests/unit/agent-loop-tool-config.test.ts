@@ -2,21 +2,21 @@ import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
-import type { CortexAgentConfig } from '../../src/types.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
+import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-type TestCortexAgentConstructor = new (
+type TestAgentLoopConstructor = new (
   agent: PiAgent,
-  config: CortexAgentConfig,
+  config: AgentLoopConfig,
   tools?: unknown[],
   options?: { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean },
-) => CortexAgent;
+) => AgentLoop;
 
 interface ExecutableTool {
   name: string;
@@ -39,11 +39,11 @@ function createMockPiAgent(): PiAgent {
   } as unknown as PiAgent;
 }
 
-function createTestCortexAgent(
+function createTestAgentLoop(
   workingDirectory: string,
-  config?: Partial<CortexAgentConfig>,
-): CortexAgent {
-  const Ctor = CortexAgent as unknown as TestCortexAgentConstructor;
+  config?: Partial<AgentLoopConfig>,
+): AgentLoop {
+  const Ctor = AgentLoop as unknown as TestAgentLoopConstructor;
   return new Ctor(
     createMockPiAgent(),
     {
@@ -62,7 +62,7 @@ function createTestCortexAgent(
   );
 }
 
-function getRegisteredTool(agent: CortexAgent, name: string): ExecutableTool {
+function getRegisteredTool(agent: AgentLoop, name: string): ExecutableTool {
   const tools = (agent as unknown as { registeredTools: ExecutableTool[] }).registeredTools;
   const tool = tools.find(t => t.name === name);
   expect(tool, `built-in tool ${name} should be registered`).toBeDefined();
@@ -80,9 +80,9 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('CortexAgent tool config threading', () => {
+describe('AgentLoop tool config threading', () => {
   let tmpDir: string | null = null;
-  let agent: CortexAgent | null = null;
+  let agent: AgentLoop | null = null;
 
   afterEach(async () => {
     await agent?.destroy();
@@ -99,7 +99,7 @@ describe('CortexAgent tool config threading', () => {
   }
 
   it('threads webFetch.maxPerLoop to the WebFetch tool', async () => {
-    agent = createTestCortexAgent(makeTmpDir(), { webFetch: { maxPerLoop: 0 } });
+    agent = createTestAgentLoop(makeTmpDir(), { webFetch: { maxPerLoop: 0 } });
     const webFetch = getRegisteredTool(agent, 'WebFetch');
 
     // A zero budget rate-limits before any network I/O.
@@ -112,7 +112,7 @@ describe('CortexAgent tool config threading', () => {
   });
 
   it('threads bash.autoYieldThreshold to the Bash tool', async () => {
-    agent = createTestCortexAgent(makeTmpDir(), { bash: { autoYieldThreshold: 150 } });
+    agent = createTestAgentLoop(makeTmpDir(), { bash: { autoYieldThreshold: 150 } });
     const bash = getRegisteredTool(agent, 'Bash');
 
     const result = await bash.execute({ command: 'sleep 1' });
@@ -127,7 +127,7 @@ describe('CortexAgent tool config threading', () => {
     fs.writeFileSync(shellPath, '#!/bin/sh\necho MARKER_FROM_CUSTOM_SHELL\nexec /bin/sh "$@"\n');
     fs.chmodSync(shellPath, 0o755);
 
-    agent = createTestCortexAgent(dir, { bash: { shellPath } });
+    agent = createTestAgentLoop(dir, { bash: { shellPath } });
     const bash = getRegisteredTool(agent, 'Bash');
 
     const result = await bash.execute({ command: 'echo hello' });
@@ -138,7 +138,7 @@ describe('CortexAgent tool config threading', () => {
   });
 
   it('keeps default behavior when neither bash nor webFetch config is set', async () => {
-    agent = createTestCortexAgent(makeTmpDir());
+    agent = createTestAgentLoop(makeTmpDir());
     const bash = getRegisteredTool(agent, 'Bash');
 
     const result = await bash.execute({ command: 'echo fast' });
@@ -149,17 +149,17 @@ describe('CortexAgent tool config threading', () => {
   });
 
   it('inherits bash and webFetch tuning in the child agent config', async () => {
-    agent = createTestCortexAgent(makeTmpDir(), {
+    agent = createTestAgentLoop(makeTmpDir(), {
       bash: { autoYieldThreshold: 250, shellPath: '/bin/sh' },
       webFetch: { maxPerLoop: 3 },
     });
 
     // Capture the config createChildAgent hands to the child factory.
-    const statics = CortexAgent as unknown as {
-      createManagedAgent: (params: { cortexConfig: CortexAgentConfig }) => Promise<unknown>;
+    const statics = AgentLoop as unknown as {
+      createManagedAgent: (params: { cortexConfig: AgentLoopConfig }) => Promise<unknown>;
     };
     const original = statics.createManagedAgent;
-    let captured: CortexAgentConfig | null = null;
+    let captured: AgentLoopConfig | null = null;
     statics.createManagedAgent = async (params) => {
       captured = params.cortexConfig;
       return { setCacheRetention: () => {} };

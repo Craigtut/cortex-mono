@@ -136,7 +136,7 @@ When a pi-ai call fails:
 ```
 Pi-ai error (plain Error)
   → classifyError() produces ClassifiedError
-  → CortexAgent emits onError(ClassifiedError) event
+  → AgentLoop emits onError(ClassifiedError) event
   → Consumer (backend) receives and routes:
       → Log the error (always)
       → EventBus 'system:error' (for auth, rate_limit, server_error)
@@ -144,7 +144,7 @@ Pi-ai error (plain Error)
       → SystemErrorCard rendered in conversation view
 ```
 
-### CortexAgent Error Event
+### AgentLoop Error Event
 
 ```typescript
 cortexAgent.onError((error: ClassifiedError) => {
@@ -208,7 +208,7 @@ The `getApiKey` callback (e.g. a consumer's `CortexCredentialService.resolveApiK
 - The encrypted key cannot be decrypted (vault locked)
 - An OAuth access token is expired and its refresh token is revoked/expired (refresh fails)
 
-A resolution failure is remembered, not swallowed. The completion still attempts pi-ai's env-var fallback (so a consumer whose callback can't resolve but who has `ANTHROPIC_API_KEY` set still works). If the call then fails, the remembered resolution error is surfaced as the cause (it is more actionable than the downstream provider error) and classified as `authentication` / `fatal`. In the agentic loop, pi-agent-core invokes `getApiKey` and stores the failure on `agent.state.errorMessage`, which `CortexAgent` re-throws and classifies the same way.
+A resolution failure is remembered, not swallowed. The completion still attempts pi-ai's env-var fallback (so a consumer whose callback can't resolve but who has `ANTHROPIC_API_KEY` set still works). If the call then fails, the remembered resolution error is surfaced as the cause (it is more actionable than the downstream provider error) and classified as `authentication` / `fatal`. In the agentic loop, pi-agent-core invokes `getApiKey` and stores the failure on `agent.state.errorMessage`, which `AgentLoop` re-throws and classifies the same way.
 
 ### Post-Call (Provider Rejection)
 
@@ -220,7 +220,7 @@ Both detection points result in the same consumer event. The backend emits `syst
 
 ## Transient Error Handling
 
-Cortex classifies transient errors (`rate_limit`, `server_error`, `network`) but does not retry `CortexAgent.prompt()` internally. The `onError` event gives consumers the category and suggested action so each consumer can choose the right retry, backoff, or user notification behavior for its runtime.
+Cortex classifies transient errors (`rate_limit`, `server_error`, `network`) but does not retry `AgentLoop.prompt()` internally. The `onError` event gives consumers the category and suggested action so each consumer can choose the right retry, backoff, or user notification behavior for its runtime.
 
 ### Why Cortex Owns This
 
@@ -236,10 +236,10 @@ Cortex sits at the right layer for classification: above inconsistent provider b
 
 ### Mechanism
 
-CortexAgent surfaces pi-agent-core failures through `prompt()` and its `onError` handlers:
+AgentLoop surfaces pi-agent-core failures through `prompt()` and its `onError` handlers:
 
 ```typescript
-// Inside CortexAgent.prompt()
+// Inside AgentLoop.prompt()
 try {
   const result = await this.agent.prompt(input);
   const stateError = this.agent.state.errorMessage ?? this.agent.state.error;
@@ -256,7 +256,7 @@ try {
 
 ### Events
 
-CortexAgent exposes `onError(handler)`. The handler receives a `ClassifiedError` with `category`, `severity`, `originalMessage`, and an optional `suggestedAction`.
+AgentLoop exposes `onError(handler)`. The handler receives a `ClassifiedError` with `category`, `severity`, `originalMessage`, and an optional `suggestedAction`.
 
 ### Error Categories and Retry Behavior
 

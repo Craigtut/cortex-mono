@@ -2,8 +2,8 @@
  * SubAgentManager: tracks active sub-agents, enforces concurrency limits,
  * manages lifecycle, and delivers background completion notifications.
  *
- * Each sub-agent is an independent CortexAgent instance tracked by task ID.
- * The manager does not own the CortexAgent; it tracks references and
+ * Each sub-agent is an independent AgentLoop instance tracked by task ID.
+ * The manager does not own the AgentLoop; it tracks references and
  * coordinates lifecycle events for the consumer.
  *
  * References:
@@ -46,7 +46,7 @@ export class SubAgentManager {
   }
 
   /**
-   * Set lifecycle hooks. Called by CortexAgent to wire consumer event handlers.
+   * Set lifecycle hooks. Called by AgentLoop to wire consumer event handlers.
    */
   setHooks(hooks: SubAgentLifecycleHooks): void {
     this.hooks = hooks;
@@ -250,7 +250,7 @@ export class SubAgentManager {
    * Marks each as cancelled, tears it down via `abortFn`, and removes it
    * from tracking.
    *
-   * @param abortFn - Function to tear down a CortexAgent (passed to avoid circular dep)
+   * @param abortFn - Function to tear down an AgentLoop (passed to avoid circular dep)
    */
   async cancelAll(abortFn: (agent: unknown) => Promise<void>): Promise<void> {
     const entries = [...this.agents.values()];

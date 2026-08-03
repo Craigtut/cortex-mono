@@ -15,12 +15,12 @@ Cortex requires Node.js 24 or newer and uses ESM.
 ## Minimal Agent
 
 ```typescript
-import { CortexAgent, ProviderManager } from '@animus-labs/cortex';
+import { AgentLoop, ProviderManager } from '@animus-labs/cortex';
 
 const providers = new ProviderManager();
 const model = await providers.resolveModel('anthropic', 'claude-sonnet-4-20250514');
 
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory: process.cwd(),
   initialBasePrompt: 'You are a helpful assistant.',
@@ -83,7 +83,7 @@ await credentialStore.saveEncrypted(result.credentials);
 Store OAuth credentials as opaque encrypted strings. Later, resolve them inside your `getApiKey` callback:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,
@@ -101,7 +101,7 @@ const agent = await CortexAgent.create({
 
 ## Core Configuration
 
-Common `CortexAgent.create()` fields:
+Common `AgentLoop.create()` fields:
 
 | Field | Purpose |
 |-------|---------|
@@ -128,7 +128,7 @@ Built-in tools are registered automatically: `Bash`, `TaskOutput`, `Read`, `Writ
 Slots are persistent messages at the front of context. Use them for application state that should survive across loops and benefit from prefix caching.
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,
@@ -168,7 +168,7 @@ agent.onLoopComplete(() => {
 Restore after creating a new agent:
 
 ```typescript
-const agent = await CortexAgent.create(config);
+const agent = await AgentLoop.create(config);
 
 agent.restoreConversationHistory(saved.history);
 agent.restoreSessionUsage(saved.usage);
@@ -189,7 +189,7 @@ Slots should usually be rebuilt from current application state instead of restor
 The resolver receives a third argument, a `ToolPermissionRequestContext` with an optional `signal`. The signal fires when the run that asked is aborted. Cortex races your resolver against that abort and proceeds with a block when the abort wins, so an unanswered approval prompt can never hang `abort()` or `destroy()`. A UI showing an approval prompt should listen on the signal and dismiss the now-moot prompt.
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,
@@ -258,7 +258,7 @@ await agent.disconnectMcpServer('memory');
 For large MCP tool sets, enable deferred tools so schemas are loaded on demand:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,
@@ -276,7 +276,7 @@ You can pass in-process tools at creation or add them later. Tools use Cortex's 
 
 ```typescript
 import { z } from 'zod';
-import { CortexAgent, zodToTypebox, type CortexTool } from '@animus-labs/cortex';
+import { AgentLoop, zodToTypebox, type CortexTool } from '@animus-labs/cortex';
 
 const getProjectTool: CortexTool = {
   name: 'get_project',
@@ -292,7 +292,7 @@ const getProjectTool: CortexTool = {
   },
 };
 
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,
@@ -334,7 +334,7 @@ Skill content is cleared automatically when the loop ends. You can also call `cl
 The default compaction strategy is observational memory. It compresses older conversation history into an internal observation slot and keeps emergency truncation as a failsafe.
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,
@@ -347,7 +347,7 @@ const agent = await CortexAgent.create({
 Use classic compaction when you want traditional summarization:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,
@@ -360,7 +360,7 @@ const agent = await CortexAgent.create({
 For oversized tool results, provide `persistResult` so Cortex can replace context-heavy output with a bookend preview and a file reference:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   initialBasePrompt,

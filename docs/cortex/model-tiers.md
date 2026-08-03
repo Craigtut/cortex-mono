@@ -28,7 +28,7 @@ The user never sees utility model output directly. It powers behind-the-scenes o
 ## Configuration
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model: getModel('anthropic', 'claude-sonnet-4-6'),       // primary
   utilityModel: 'default',                                  // use provider default
   // or: utilityModel: getModel('anthropic', 'claude-haiku-4-5'),  // explicit
@@ -98,4 +98,4 @@ The consumer stores both model selections in its own settings store:
 - Primary model ID
 - Utility model ID, or `'default'` for provider mapping
 
-On startup, the consumer resolves `'default'` to the actual model ID using the provider mapping, then passes both models to the `CortexAgent` constructor.
+On startup, the consumer resolves `'default'` to the actual model ID using the provider mapping, then passes both models to the `AgentLoop` constructor.

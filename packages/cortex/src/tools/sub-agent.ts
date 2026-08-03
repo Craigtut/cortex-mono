@@ -2,7 +2,7 @@
  * SubAgent tool: spawn independent cortex-based sub-agents for delegated work.
  *
  * Supports foreground (blocking) and background (async) execution modes.
- * Each sub-agent is an independent CortexAgent with its own message array
+ * Each sub-agent is an independent AgentLoop with its own message array
  * and empty context slots.
  *
  * The SubAgent tool is ALWAYS excluded from child agents to prevent
@@ -63,12 +63,12 @@ export interface SubAgentDetails {
 
 /**
  * Configuration passed to the SubAgent tool factory.
- * The CortexAgent provides all of these at tool registration time.
+ * The AgentLoop provides all of these at tool registration time.
  */
 export interface SubAgentToolConfig {
   /**
    * Spawn a sub-agent and run it. Returns the result when complete.
-   * The factory function handles CortexAgent creation, budget guard
+   * The factory function handles AgentLoop creation, budget guard
    * inheritance, tool filtering, and lifecycle management.
    */
   spawnSubAgent: (params: SubAgentParamsType) => Promise<{
@@ -122,7 +122,7 @@ export const SUB_AGENT_TOOL_NAME = 'SubAgent';
 /**
  * Create the SubAgent tool.
  *
- * Returns a Cortex-native tool. CortexAgent adapts it to pi-agent-core's
+ * Returns a Cortex-native tool. AgentLoop adapts it to pi-agent-core's
  * execute signature when synchronizing the tool inventory.
  */
 export function createSubAgentTool(config: SubAgentToolConfig): {

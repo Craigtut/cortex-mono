@@ -68,7 +68,7 @@ Background sub-agents use pi-agent-core's `getFollowUpMessages()` mechanism to n
 
 ## Sub-Agent Architecture
 
-Each sub-agent is an independent `CortexAgent` instance with its own:
+Each sub-agent is an independent `AgentLoop` instance with its own:
 - **Message array**: No shared conversation history with the parent. The sub-agent starts fresh with only the `instructions` as its initial prompt.
 - **Tool set**: Can be restricted from the parent's tools. The sub-agent cannot access tools the parent doesn't have. **The `SubAgent` and `load_skill` tools are always excluded from child agents.** Sub-agents cannot spawn further sub-agents, and they do not recursively load skills. If the `tools` parameter explicitly includes either excluded tool, it is silently stripped.
 - **System prompt**: Defaults to the parent's system prompt. Can be overridden for specialized tasks (e.g., a research-focused prompt).
@@ -105,10 +105,10 @@ A cancelled **foreground** child reports `status: 'cancelled'` (not `failed`) to
 
 ## Concurrency
 
-Multiple background sub-agents can run simultaneously. The concurrency limit is configurable on the `CortexAgent`:
+Multiple background sub-agents can run simultaneously. The concurrency limit is configurable on the `AgentLoop`:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory,
   maxConcurrentSubAgents: 4,  // default

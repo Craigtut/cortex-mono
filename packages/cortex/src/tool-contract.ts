@@ -3,7 +3,7 @@ import type { ToolExecuteContext } from './types.js';
 /**
  * Cortex's canonical in-process tool contract.
  *
- * All tools registered with CortexAgent are normalized to this signature.
+ * All tools registered with AgentLoop are normalized to this signature.
  * Cortex adapts this shape to pi-agent-core's execute signature at the
  * registration boundary.
  */
@@ -105,7 +105,7 @@ export function assertValidCortexTool(tool: CortexTool): CortexTool {
   if (tool.execute.length > 2) {
     throw new Error(
       `Tool "${tool.name}" does not use Cortex's execute(params, context?) contract. ` +
-      'Wrap raw pi-agent-core tools with fromPiAgentTool() before passing them to CortexAgent.create().',
+      'Wrap raw pi-agent-core tools with fromPiAgentTool() before passing them to AgentLoop.create().',
     );
   }
 

@@ -2,7 +2,7 @@
  * Session Controller: the central orchestrator bridging TUI and Cortex.
  *
  * Responsibilities:
- * - Creates and configures the CortexAgent with the active mode's settings
+ * - Creates and configures the AgentLoop with the active mode's settings
  * - Provides getApiKey callback (env var > credential store > OAuth refresh)
  * - Provides resolvePermission callback (rules check > inline TUI prompt)
  * - Routes Cortex events to the TUI (streaming, tool calls, errors, compaction)
@@ -16,7 +16,7 @@ const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require('../package.json');
 
 import {
-  CortexAgent,
+  AgentLoop,
   ProviderManager,
   BASH_ESCALATION_PERMISSION_NAME,
   type CortexModel,
@@ -124,7 +124,7 @@ export interface SessionOptions {
 }
 
 export class Session {
-  private agent: CortexAgent | null = null;
+  private agent: AgentLoop | null = null;
   private sandboxProvider: SandboxProvider | undefined;
   private sandboxStatus: SandboxStatus | undefined;
   /**
@@ -286,7 +286,7 @@ export class Session {
     this.sandboxProvider = await this.initSandbox();
 
     // Create agent (built-in tools are auto-registered by Cortex)
-    this.agent = await CortexAgent.create({
+    this.agent = await AgentLoop.create({
       model: this.model,
       utilityModel: 'default',
       workingDirectory: this.cwd,
@@ -934,7 +934,7 @@ export class Session {
     }
   }
 
-  /** Wire all CortexAgent events to the TUI. */
+  /** Wire all AgentLoop events to the TUI. */
   private wireEvents(): void {
     if (!this.agent || !this.app) return;
     const bridge = this.agent.getEventBridge();
@@ -1249,7 +1249,7 @@ export class Session {
     });
   }
 
-  private wireActivityEvents(bridge: ReturnType<CortexAgent['getEventBridge']>): void {
+  private wireActivityEvents(bridge: ReturnType<AgentLoop['getEventBridge']>): void {
     bridge.on('turn_start', () => {
       this.activity.recordTurnStarted();
     });
@@ -2397,7 +2397,7 @@ export class Session {
   // Public accessors for command handlers
   // -------------------------------------------------------------------------
 
-  getAgent(): CortexAgent | null { return this.agent; }
+  getAgent(): AgentLoop | null { return this.agent; }
   getApp(): App | null { return this.app; }
   getYoloMode(): boolean { return this.yoloMode; }
   getCompactionStrategy(): 'observational' | 'classic' { return this.compactionStrategy; }

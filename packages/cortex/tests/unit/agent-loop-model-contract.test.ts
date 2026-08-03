@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { CortexAgent } from '../../src/cortex-agent.js';
+import { AgentLoop } from '../../src/agent-loop.js';
 import { ProviderManager } from '../../src/provider-manager.js';
 
 const mockGetModel = vi.fn();
@@ -53,7 +53,7 @@ vi.mock('@earendil-works/pi-ai', () => ({
 }));
 
 // pi-ai 0.80 moved catalog reads to providers/all and completion to /compat.
-// cortex-agent now imports from those entrypoints; mock them to the same fns.
+// agent-loop now imports from those entrypoints; mock them to the same fns.
 vi.mock('@earendil-works/pi-ai/providers/all', () => ({
   getBuiltinModel: (...args: unknown[]) => mockGetModel(...args),
   getBuiltinModels: vi.fn(),
@@ -85,7 +85,7 @@ function makeUsage() {
   };
 }
 
-describe('CortexAgent model contract', () => {
+describe('AgentLoop model contract', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     lastAgentConfig = null;
@@ -119,7 +119,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -166,7 +166,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -206,7 +206,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -255,7 +255,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -309,7 +309,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -335,7 +335,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -376,7 +376,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -401,7 +401,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -431,7 +431,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',
@@ -458,7 +458,7 @@ describe('CortexAgent model contract', () => {
 
     const providerManager = new ProviderManager();
     const model = await providerManager.resolveModel('anthropic', 'claude-sonnet-4-20250514');
-    const agent = await CortexAgent.create({
+    const agent = await AgentLoop.create({
       model,
       workingDirectory: '/tmp/cortex-model-contract',
       initialBasePrompt: 'Test prompt',

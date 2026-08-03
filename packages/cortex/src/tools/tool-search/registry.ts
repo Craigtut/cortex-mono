@@ -2,7 +2,7 @@
  * DeferredToolRegistry: tracks the deferred tool pool and which tools the
  * agent has discovered (loaded) during this session.
  *
- * Lives on the CortexAgent instance. `refreshTools()` populates the deferred
+ * Lives on the AgentLoop instance. `refreshTools()` populates the deferred
  * pool from the union of registered + MCP tools (filtered by deferral
  * criteria), and `ToolSearch` updates the discovered set when the agent
  * resolves a query.

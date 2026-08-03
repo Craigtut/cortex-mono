@@ -56,7 +56,7 @@ Cortex imposes no formatting on slot content. The consumer provides the full str
 
 ## Ephemeral Context: Volatile Without Cost
 
-Ephemeral context is content the model should see for a single call but that should not persist in conversation history. In a managed `CortexAgent`, it is injected via `transformContext` at the pre-prompt boundary, below stable slots and old history but before current-loop content.
+Ephemeral context is content the model should see for a single call but that should not persist in conversation history. In a managed `AgentLoop`, it is injected via `transformContext` at the pre-prompt boundary, below stable slots and old history but before current-loop content.
 
 This placement is intentional: because ephemeral content sits below the stable cached prefix, it can change every single call without invalidating the slots or old conversation history above it. The current prompt remains the final user message, preserving model attention on the active request.
 
