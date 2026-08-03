@@ -119,7 +119,7 @@ Common `CortexAgent.create()` fields:
 | `deferredTools` | Optional schema deferral for large MCP tool sets |
 | `bash.autoYieldThreshold` | Milliseconds before a running Bash command auto-yields to a background task (default 10000) |
 | `bash.shellPath` | Custom shell binary for the Bash tool |
-| `webFetch.maxPerLoop` | WebFetch rate limit per agentic loop (default 20) |
+| `webFetch.maxPerLoop` | WebFetch rate limit per agentic loop (default 300) |
 
 Built-in tools are registered automatically: `Bash`, `TaskOutput`, `Read`, `Write`, `Edit`, `UndoEdit`, `Glob`, `Grep`, `WebFetch`, and `SubAgent`. `ToolSearch` is registered automatically when `deferredTools.enabled` is true. The `load_skill` tool is registered automatically for parent agents.
 

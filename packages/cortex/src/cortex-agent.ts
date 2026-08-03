@@ -373,6 +373,12 @@ type PendingBackgroundCompletion = (
   /** Failed delivery attempts so far. Set by the drain's re-queue path. */
   deliveryAttempts?: number;
   /**
+   * Set when the item was given up on. Read by the drain to tell a recovered
+   * batch from a terminal one; an exact marker rather than a lookup in the
+   * capped dead-letter list, which can evict the entry being looked for.
+   */
+  deadLettered?: boolean;
+  /**
    * When the first delivery attempt for this completion started. Bounds the
    * TOTAL time spent delivering it (in-run retry backoff included), so
    * re-queued attempts cannot re-enter the full retry ladder back-to-back.
@@ -5198,17 +5204,13 @@ export class CortexAgent {
   /**
    * Whether every item of a failed-then-re-queued delivery batch has since
    * left the system without being dead-lettered: no longer waiting in the
-   * pending queue and absent from the dead-letter list. True means the
-   * recursive drain that ran after the re-queue delivered the batch (or a
-   * cancel discarded it), so the failure that re-queued it was transient.
+   * pending queue and not marked given-up. True means the recursive drain
+   * that ran after the re-queue delivered the batch (or a cancel discarded
+   * it), so the failure that re-queued it was transient.
    */
   private batchRecoveredAfterRequeue(batch: PendingBackgroundCompletion[]): boolean {
     return batch.every(
-      (item) =>
-        !this.pendingBackgroundResults.includes(item) &&
-        !this.deadLetteredBackgroundResults.some(
-          (dead) => dead.kind === item.kind && dead.taskId === item.taskId,
-        ),
+      (item) => !this.pendingBackgroundResults.includes(item) && !item.deadLettered,
     );
   }
 
@@ -5257,6 +5259,16 @@ export class CortexAgent {
         return true;
       }
     }
+    const survivingTail = messages[messages.length - 1] as unknown as Record<string, unknown>;
+    if (survivingTail['role'] === 'assistant') {
+      // The run failed after an assistant tool-call turn but before its tool
+      // results, so the surviving tail carries an unpaired tool call: a hard
+      // provider error on the very next request. Unwind the whole delivery
+      // and re-queue rather than leave the transcript unusable.
+      messages.splice(preDeliveryCount, messages.length - preDeliveryCount);
+      this.notifySourceHistoryTailTrimmed();
+      return true;
+    }
     return false;
   }
 
@@ -5272,12 +5284,16 @@ export class CortexAgent {
   private requeueOrDeadLetter(batch: PendingBackgroundCompletion[], err: unknown): void {
     const error = err instanceof Error ? err : new Error(String(err));
     const lastError = error.message;
-    const fatal =
-      classifyError(error, { wasAborted: this.isAborted() }).severity === 'fatal';
+    const classified = classifyError(error, { wasAborted: this.isAborted() });
+    const fatal = classified.severity === 'fatal';
+    // An abort is the user stopping the agent, not this delivery failing on
+    // its own terms, so it must not consume an attempt: a few quick aborts
+    // would otherwise dead-letter completed work that never truly failed.
+    const consumesAttempt = classified.category !== 'cancelled';
     const now = Date.now();
     const requeue: PendingBackgroundCompletion[] = [];
     for (const item of batch) {
-      const attempts = (item.deliveryAttempts ?? 0) + 1;
+      const attempts = (item.deliveryAttempts ?? 0) + (consumesAttempt ? 1 : 0);
       item.deliveryAttempts = attempts;
       const elapsedMs = now - (item.firstDeliveryAttemptAt ?? now);
       if (
@@ -5304,6 +5320,7 @@ export class CortexAgent {
     lastError: string,
   ): void {
     const attempts = item.deliveryAttempts ?? 0;
+    item.deadLettered = true;
     this.logger.error('[CortexAgent] background result dead-lettered', {
       kind: item.kind,
       taskId: item.taskId,

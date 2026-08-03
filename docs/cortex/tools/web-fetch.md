@@ -72,7 +72,7 @@ When a URL redirects to a different host, the tool returns the redirect URL and 
 ### Rate Limiting
 
 Cortex enforces a per-loop rate limit on WebFetch calls to prevent the agent from hammering sites:
-- Default: 20 fetches per agentic loop
+- Default: 300 fetches per agentic loop
 - Configurable via `CortexAgentConfig.webFetch.maxPerLoop`
 - Cached responses do not count against the limit
 

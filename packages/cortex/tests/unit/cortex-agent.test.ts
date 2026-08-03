@@ -2763,5 +2763,76 @@ You have 12 emotions.`;
       expect(historyOccurrences(agent, 'first output')).toBe(1);
       expect(historyOccurrences(agent, 'second output')).toBe(1);
     });
+
+    interface RequeueInternals {
+      requeueOrDeadLetter: (batch: unknown[], err: unknown) => void;
+      unwindFailedDelivery: (preDeliveryCount: number) => boolean;
+      batchRecoveredAfterRequeue: (batch: unknown[]) => boolean;
+      pendingBackgroundResults: unknown[];
+      isAborted: () => boolean;
+    }
+
+    it('does not spend a delivery attempt when the user aborts mid-delivery', async () => {
+      // An abort is the user stopping the agent, not the delivery failing on
+      // its own terms. Charging it an attempt means a few quick aborts
+      // permanently dead-letter completed work that never actually failed.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as RequeueInternals;
+      vi.spyOn(internal, 'isAborted').mockReturnValue(true);
+      const item = { kind: 'bash' as const, taskId: 'task_abort' };
+
+      for (let i = 0; i < 4; i++) {
+        internal.pendingBackgroundResults.length = 0;
+        internal.requeueOrDeadLetter([item], new Error('Operation aborted'));
+      }
+
+      expect((item as { deliveryAttempts?: number }).deliveryAttempts).toBe(0);
+      expect(internal.pendingBackgroundResults).toContain(item);
+      expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(0);
+    });
+
+    it('reports a dead-lettered batch as terminal even after cap eviction', async () => {
+      // The recovered/terminal decision reads a flag on the item, not a
+      // lookup in the capped dead-letter list: an entry evicted by later
+      // dead-letters would otherwise read as "recovered" and swallow the
+      // consumer's onError for a delivery that never landed.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as RequeueInternals;
+      const item = { kind: 'bash' as const, taskId: 'task_evicted', deliveryAttempts: 3 };
+
+      internal.requeueOrDeadLetter([item], new Error('delivery down'));
+      expect(internal.batchRecoveredAfterRequeue([item])).toBe(false);
+
+      // Push it out of the bounded dead-letter list.
+      for (let i = 0; i < 55; i++) {
+        internal.requeueOrDeadLetter(
+          [{ kind: 'bash' as const, taskId: `filler_${i}`, deliveryAttempts: 3 }],
+          new Error('delivery down'),
+        );
+      }
+      const dead = agent.getDeadLetteredBackgroundResults();
+      expect(dead.some(d => d.taskId === 'task_evicted')).toBe(false);
+      expect(internal.batchRecoveredAfterRequeue([item])).toBe(false);
+    });
+
+    it('unwinds a delivery whose run left an unpaired assistant tool call', async () => {
+      // A failure between an assistant tool-call turn and its tool results
+      // leaves a transcript the provider rejects outright. Treating that as
+      // "delivered" would strand the completion AND wedge the next request.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as RequeueInternals;
+      const preDeliveryCount = piAgent.state.messages.length;
+      piAgent.state.messages.push({ role: 'user', content: 'delivery body' } as never);
+      piAgent.state.messages.push({
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'tc_1', name: 'Read', arguments: {} }],
+        stopReason: 'toolUse',
+      } as never);
+
+      const requeue = internal.unwindFailedDelivery(preDeliveryCount);
+
+      expect(requeue).toBe(true);
+      expect(piAgent.state.messages).toHaveLength(preDeliveryCount);
+    });
   });
 });
