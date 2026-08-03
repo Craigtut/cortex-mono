@@ -2091,8 +2091,6 @@ export class AgentLoop {
      * fromPiAgentTool() before passing them to AgentLoop.create().
      */
     tools?: CortexTool[];
-    /** @deprecated Use initialBasePrompt instead. */
-    systemPrompt?: string;
   }): Promise<AgentLoop> {
     const managedCreateParams: {
       cortexConfig: AgentLoopConfig;
@@ -2108,9 +2106,8 @@ export class AgentLoop {
     if (config.tools) {
       managedCreateParams.tools = config.tools;
     }
-    const initialBasePrompt = config.initialBasePrompt ?? config.systemPrompt;
-    if (initialBasePrompt !== undefined) {
-      managedCreateParams.initialBasePrompt = initialBasePrompt;
+    if (config.initialBasePrompt !== undefined) {
+      managedCreateParams.initialBasePrompt = config.initialBasePrompt;
     }
     return AgentLoop.createManagedAgent(managedCreateParams);
   }
@@ -2168,14 +2165,6 @@ export class AgentLoop {
   }
 
   /**
-   * @deprecated Use composeSystemPrompt() for pure composition or
-   * setBasePrompt() to update the live agent state.
-   */
-  buildSystemPrompt(basePrompt: string): string {
-    return this.composeSystemPrompt(basePrompt);
-  }
-
-  /**
    * Set the application/base prompt and update the live agent state.
    *
    * Preserves conversation history. Non-destructive.
@@ -2184,13 +2173,6 @@ export class AgentLoop {
     this.currentBasePrompt = basePrompt;
     const nextPrompt = this.composeSystemPrompt(basePrompt);
     return this.applySystemPrompt(nextPrompt);
-  }
-
-  /**
-   * @deprecated Use setBasePrompt().
-   */
-  rebuildSystemPrompt(newBasePrompt: string): void {
-    this.setBasePrompt(newBasePrompt);
   }
 
   /**

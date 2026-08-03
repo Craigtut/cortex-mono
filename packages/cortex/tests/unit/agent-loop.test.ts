@@ -540,17 +540,17 @@ describe('AgentLoop', () => {
   // System prompt
   // -----------------------------------------------------------------------
 
-  describe('buildSystemPrompt', () => {
+  describe('composeSystemPrompt', () => {
     it('puts consumer content first', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const prompt = agent.buildSystemPrompt('You are a helpful assistant.');
+      const prompt = agent.composeSystemPrompt('You are a helpful assistant.');
 
       expect(prompt.startsWith('You are a helpful assistant.')).toBe(true);
     });
 
     it('includes Response Delivery when working tags enabled (default)', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer content');
+      const prompt = agent.composeSystemPrompt('Consumer content');
 
       expect(prompt).toContain('# Response Delivery');
       expect(prompt).toContain('<working>');
@@ -561,42 +561,42 @@ describe('AgentLoop', () => {
         ...config,
         workingTags: { enabled: false },
       });
-      const prompt = agent.buildSystemPrompt('Consumer content');
+      const prompt = agent.composeSystemPrompt('Consumer content');
 
       expect(prompt).not.toContain('# Response Delivery');
     });
 
     it('includes System Rules section', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
+      const prompt = agent.composeSystemPrompt('Consumer');
 
       expect(prompt).toContain('# System Rules');
     });
 
     it('includes Taking Action section', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
+      const prompt = agent.composeSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Taking Action');
     });
 
     it('includes Tool Usage section', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
+      const prompt = agent.composeSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Tool Usage');
     });
 
     it('includes Executing with Care section', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
+      const prompt = agent.composeSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Executing with Care');
     });
 
     it('includes Environment section with platform info', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
+      const prompt = agent.composeSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Environment');
       expect(prompt).toContain('Platform:');
@@ -609,14 +609,14 @@ describe('AgentLoop', () => {
       const consumerContent = `You are Animus.
 Your personality is warm and curious.
 You have 12 emotions.`;
-      const prompt = agent.buildSystemPrompt(consumerContent);
+      const prompt = agent.composeSystemPrompt(consumerContent);
 
       expect(prompt.startsWith(consumerContent)).toBe(true);
     });
 
     it('does not mutate the live system prompt', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
+      const prompt = agent.composeSystemPrompt('Consumer');
 
       expect(prompt).toContain('Consumer');
       expect(agent.getCurrentSystemPrompt()).toContain('Test base prompt');
@@ -637,7 +637,7 @@ You have 12 emotions.`;
     });
   });
 
-  describe('rebuildSystemPrompt', () => {
+  describe('setBasePrompt with existing history', () => {
     it('updates the system prompt without losing conversation history', async () => {
       const agent = createTestAgentLoop(piAgent, config);
 
@@ -651,7 +651,7 @@ You have 12 emotions.`;
       );
 
       // Rebuild with new content
-      agent.rebuildSystemPrompt('Updated persona');
+      agent.setBasePrompt('Updated persona');
 
       // Conversation should still be there
       const history = agent.getConversationHistory();
