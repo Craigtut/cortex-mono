@@ -162,6 +162,19 @@ export type {
   QueueDrainMode,
 } from './agent-loop.js';
 
+// Session Log (the CortexAgent composite's append-only session record)
+export { SessionLog } from './session-log.js';
+export type {
+  SessionLogEntry,
+  SessionLogEntryType,
+  SessionLogAppendInput,
+  SessionLogEvent,
+  SessionLogGap,
+  SessionLogSubscriber,
+  SessionLogOptions,
+  WakeClass,
+} from './session-log.js';
+
 // Tool Contracts
 export { fromPiAgentTool, assertValidCortexTool } from './tool-contract.js';
 export type { CortexTool, PiAgentTool } from './tool-contract.js';
