@@ -174,6 +174,10 @@ export type {
   CortexSessionLogConfig,
   TalkerConfig,
   ConfigDestination,
+  CortexAgentStateV1,
+  CortexAgentStateV2,
+  CortexAgentPersistedState,
+  CortexAgentUsageBreakdown,
 } from './cortex-agent.js';
 
 // Session Log (the CortexAgent composite's append-only session record)

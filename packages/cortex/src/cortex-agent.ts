@@ -46,6 +46,7 @@ import type {
   RetryScheduledInfo,
   RetrySucceededInfo,
   SessionUsage,
+  UtilityUsageBucket,
   SubAgentSnapshot,
   SubAgentSpawnConfig,
   ThinkingLevel,
@@ -255,6 +256,200 @@ export function buildReasonerConfig(
 }
 
 // ---------------------------------------------------------------------------
+// Persisted state (versioned composite artifact)
+// ---------------------------------------------------------------------------
+
+/** Usage in the v2 artifact: one aggregate plus per-loop attribution. */
+export interface CortexAgentUsageBreakdown {
+  /**
+   * Aggregate across every loop, sub-agent, and utility call. Children are
+   * counted exactly once: each loop's session usage already includes its
+   * forwarded child events (bridge-of-record), so the aggregate is the sum
+   * of per-loop totals with SubAgentResult.usage never re-added on top.
+   */
+  total: SessionUsage;
+  /**
+   * Per-loop breakdown, so attribution survives a restore (a single blob
+   * would erase it). `talker` is null for passthrough sessions.
+   */
+  perLoop: {
+    talker: SessionUsage | null;
+    reasoner: SessionUsage;
+  };
+}
+
+/**
+ * Version 2: the composite artifact (facade-api.md). The log, per-loop
+ * histories, per-loop observational states, and the usage breakdown.
+ * Sub-agent state is deliberately absent (tasks re-derive from the log's
+ * directive/lifecycle entries; resumable tasks are out of scope).
+ */
+export interface CortexAgentStateV2 {
+  version: 2;
+  log: SessionLogEntry[];
+  /** Post-slot talker history. Empty for passthrough sessions. */
+  talkerHistory: AgentMessage[];
+  /** Post-slot reasoner history. */
+  reasonerHistory: AgentMessage[];
+  /** Talker observational state, order-coupled to talkerHistory. */
+  talkerMemory: ObservationalMemoryState | null;
+  /** Reasoner observational state, order-coupled to reasonerHistory. */
+  reasonerMemory: ObservationalMemoryState | null;
+  usage: CortexAgentUsageBreakdown;
+}
+
+/**
+ * Version 1: today's single-loop persistence surface (a conversation
+ * history plus optionally observational state and session usage), given a
+ * version wrapper so existing sessions upgrade transparently. It restores
+ * into the reasoner with an empty talker and a log synthesized from
+ * nothing.
+ */
+export interface CortexAgentStateV1 {
+  version: 1;
+  history: AgentMessage[];
+  memory?: ObservationalMemoryState | null;
+  usage?: SessionUsage;
+}
+
+/**
+ * What restore() accepts: a versioned artifact, or a bare message array
+ * (today's rawest persistence shape, treated as v1 history).
+ */
+export type CortexAgentPersistedState =
+  | CortexAgentStateV2
+  | CortexAgentStateV1
+  | AgentMessage[];
+
+// ---------------------------------------------------------------------------
+// Usage arithmetic (baseline-plus-delta restore model)
+// ---------------------------------------------------------------------------
+
+function zeroUsage(): SessionUsage {
+  return {
+    totalCost: 0,
+    totalTurns: 0,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
+}
+
+function cloneUsage(usage: SessionUsage): SessionUsage {
+  const copy: SessionUsage = {
+    totalCost: usage.totalCost,
+    totalTurns: usage.totalTurns,
+    tokens: { ...usage.tokens },
+  };
+  if (usage.utility) {
+    copy.utility = Object.fromEntries(
+      Object.entries(usage.utility).map(([category, bucket]) => [
+        category,
+        { ...bucket, tokens: { ...bucket.tokens } },
+      ]),
+    );
+  }
+  return copy;
+}
+
+function addUsage(a: SessionUsage, b: SessionUsage): SessionUsage {
+  const sum = cloneUsage(a);
+  sum.totalCost += b.totalCost;
+  sum.totalTurns += b.totalTurns;
+  sum.tokens.input += b.tokens.input;
+  sum.tokens.output += b.tokens.output;
+  sum.tokens.cacheRead += b.tokens.cacheRead;
+  sum.tokens.cacheWrite += b.tokens.cacheWrite;
+  if (b.utility) {
+    sum.utility ??= {};
+    for (const [category, bucket] of Object.entries(b.utility)) {
+      const target: UtilityUsageBucket = sum.utility[category] ?? {
+        calls: 0,
+        cost: 0,
+        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      };
+      sum.utility[category] = {
+        calls: target.calls + bucket.calls,
+        cost: target.cost + bucket.cost,
+        tokens: {
+          input: target.tokens.input + bucket.tokens.input,
+          output: target.tokens.output + bucket.tokens.output,
+          cacheRead: target.tokens.cacheRead + bucket.tokens.cacheRead,
+          cacheWrite: target.tokens.cacheWrite + bucket.tokens.cacheWrite,
+        },
+      };
+    }
+  }
+  return sum;
+}
+
+/**
+ * live minus baseline, per counter. Both reads come from the same loop's
+ * monotonically growing counters (baseline taken at restore time), so
+ * every difference is non-negative by construction.
+ */
+function diffUsage(live: SessionUsage, baseline: SessionUsage): SessionUsage {
+  const delta: SessionUsage = {
+    totalCost: live.totalCost - baseline.totalCost,
+    totalTurns: live.totalTurns - baseline.totalTurns,
+    tokens: {
+      input: live.tokens.input - baseline.tokens.input,
+      output: live.tokens.output - baseline.tokens.output,
+      cacheRead: live.tokens.cacheRead - baseline.tokens.cacheRead,
+      cacheWrite: live.tokens.cacheWrite - baseline.tokens.cacheWrite,
+    },
+  };
+  if (live.utility) {
+    delta.utility = {};
+    for (const [category, bucket] of Object.entries(live.utility)) {
+      const base = baseline.utility?.[category];
+      delta.utility[category] = {
+        calls: bucket.calls - (base?.calls ?? 0),
+        cost: bucket.cost - (base?.cost ?? 0),
+        tokens: {
+          input: bucket.tokens.input - (base?.tokens.input ?? 0),
+          output: bucket.tokens.output - (base?.tokens.output ?? 0),
+          cacheRead: bucket.tokens.cacheRead - (base?.tokens.cacheRead ?? 0),
+          cacheWrite: bucket.tokens.cacheWrite - (base?.tokens.cacheWrite ?? 0),
+        },
+      };
+    }
+  }
+  return delta;
+}
+
+/** Normalize any accepted persisted shape to v2. */
+function normalizePersistedState(state: CortexAgentPersistedState): CortexAgentStateV2 {
+  if (Array.isArray(state)) {
+    return upgradeV1({ version: 1, history: state });
+  }
+  if (state.version === 1) {
+    return upgradeV1(state);
+  }
+  if (state.version === 2) {
+    return state;
+  }
+  throw new Error(
+    `Unsupported CortexAgent state version: ${String((state as { version: unknown }).version)}`,
+  );
+}
+
+/** A v1 artifact restores into the reasoner with an empty talker and log. */
+function upgradeV1(state: CortexAgentStateV1): CortexAgentStateV2 {
+  const usage = state.usage ? cloneUsage(state.usage) : zeroUsage();
+  return {
+    version: 2,
+    log: [],
+    talkerHistory: [],
+    reasonerHistory: state.history,
+    talkerMemory: null,
+    reasonerMemory: state.memory ?? null,
+    usage: {
+      total: cloneUsage(usage),
+      perLoop: { talker: null, reasoner: usage },
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Facade deliver options
 // ---------------------------------------------------------------------------
 
@@ -306,6 +501,27 @@ export class CortexAgent {
   /** Spawn lifecycle seq per live task, for completion causation. */
   private readonly spawnSeqByTaskId = new Map<string, number>();
 
+  // Baseline-plus-delta usage model: loops restart at zero after a
+  // restore, so the composite aggregate is restoredBaseline + live deltas
+  // rather than an additive merge into live counters (which would
+  // double-count on repeated restores).
+  private usageBaseline: { talker: SessionUsage | null; reasoner: SessionUsage } | null = null;
+  /** Reasoner live counters at the moment of the last restore. */
+  private usageAtRestore: SessionUsage | null = null;
+  /**
+   * Talker-side artifact content carried through a passthrough session
+   * opaquely: passthrough has no talker loop to hydrate, but a restored
+   * duplex artifact must round-trip getState() without losing that side.
+   */
+  private retainedTalkerHistory: AgentMessage[] = [];
+  private retainedTalkerMemory: ObservationalMemoryState | null = null;
+
+  private readonly stateChangedHandlers: Array<(state: CortexAgentStateV2) => void> = [];
+  private readonly stateDebounceMs: number;
+  private stateDirty = false;
+  private stateTimer: ReturnType<typeof setTimeout> | null = null;
+  private emittingState = false;
+
   private destroyPromise: Promise<void> | null = null;
   private destroyed = false;
 
@@ -337,7 +553,10 @@ export class CortexAgent {
       onEvict: (evicted) => this.spillEvictedEntries(evicted, config),
     });
 
+    this.stateDebounceMs = config.stateChangeDebounceMs ?? DEFAULT_STATE_DEBOUNCE_MS;
+
     this.wireLogProducers();
+    this.wireStateTriggers();
   }
 
   /**
@@ -461,6 +680,19 @@ export class CortexAgent {
   }
 
   /**
+   * History can change without a log entry (compaction rewrites,
+   * observation activation trims, a run completing); these mark the
+   * composite state dirty so onStateChanged fires for them too. Log
+   * appends mark it in appendEntry.
+   */
+  private wireStateTriggers(): void {
+    this.reasoner.onLoopComplete(() => this.markStateDirty());
+    this.reasoner.onPostCompaction(() => this.markStateDirty());
+    this.reasoner.onObservation(() => this.markStateDirty());
+    this.reasoner.onReflection(() => this.markStateDirty());
+  }
+
+  /**
    * Append a log entry, stamping causation from the live facade-initiated
    * run unless the caller supplies (or suppresses, with null) its own.
    */
@@ -474,13 +706,15 @@ export class CortexAgent {
     const causedBy = input.causedBy === null
       ? undefined
       : input.causedBy ?? this.activeCauseSeq ?? undefined;
-    return this.log.append({
+    const entry = this.log.append({
       type: input.type,
       loopPath: input.loopPath,
       content: input.content,
       ...(causedBy !== undefined ? { causedBy } : {}),
       ...(input.data !== undefined ? { data: input.data } : {}),
     });
+    this.markStateDirty();
+    return entry;
   }
 
   /** Spill retention-evicted entries through persistResult when configured. */
@@ -636,6 +870,10 @@ export class CortexAgent {
   async destroy(timeoutMs?: number): Promise<void> {
     if (this.destroyPromise) return this.destroyPromise;
     this.destroyed = true;
+    if (this.stateTimer !== null) {
+      clearTimeout(this.stateTimer);
+      this.stateTimer = null;
+    }
     this.destroyPromise = (async () => {
       try {
         await this.reasoner.destroy(timeoutMs);
@@ -672,6 +910,151 @@ export class CortexAgent {
    */
   subscribeLog(cb: SessionLogSubscriber, fromSeq?: number): () => void {
     return this.log.subscribeLog(cb, fromSeq);
+  }
+
+  // -------------------------------------------------------------------------
+  // Composite persistence (v2 artifact)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Capture the composite state at a consistent point: the log, histories,
+   * observational states, and usage are all read in one synchronous frame
+   * with the loop gate empty, never mid-run. Resolves once the current run
+   * (and any queued gate work) finishes; under continuous activity that is
+   * the next quiescence window.
+   */
+  async getState(): Promise<CortexAgentStateV2> {
+    for (;;) {
+      await this.reasoner.waitForLoopIdle();
+      if (!this.reasoner.isLoopActive) {
+        return this.captureStateInFrame();
+      }
+    }
+  }
+
+  /** Synchronous composite snapshot; caller guarantees gate quiescence. */
+  private captureStateInFrame(): CortexAgentStateV2 {
+    const reasonerUsage = this.reasonerUsageWithBaseline();
+    const talkerUsage = this.usageBaseline?.talker
+      ? cloneUsage(this.usageBaseline.talker)
+      : null;
+    return {
+      version: 2,
+      log: this.log.getLog(),
+      // Passthrough has no talker loop; a restored duplex artifact's talker
+      // side is carried through unchanged so nothing is lost on round trip.
+      talkerHistory: this.retainedTalkerHistory,
+      reasonerHistory: this.reasoner.getConversationHistory(),
+      talkerMemory: this.retainedTalkerMemory,
+      reasonerMemory: this.reasoner.getObservationalMemoryState(),
+      usage: {
+        total: talkerUsage ? addUsage(reasonerUsage, talkerUsage) : reasonerUsage,
+        perLoop: { talker: talkerUsage, reasoner: reasonerUsage },
+      },
+    };
+  }
+
+  /** Reasoner usage under the baseline-plus-delta model. */
+  private reasonerUsageWithBaseline(): SessionUsage {
+    const live = this.reasoner.getSessionUsage();
+    if (!this.usageBaseline) return live;
+    const delta = this.usageAtRestore ? diffUsage(live, this.usageAtRestore) : live;
+    return addUsage(this.usageBaseline.reasoner, delta);
+  }
+
+  /**
+   * Restore a persisted artifact: v2 composite, v1 single history, or a
+   * bare message array (upgraded transparently). Rejected while any loop
+   * is running: a restore under a live run would splice history out from
+   * under pi's message mirror and desync the observation watermark.
+   *
+   * Per-loop restore ordering holds internally: history first, then
+   * observational state (whose buffer watermark aligns to the post-slot
+   * history length). Usage becomes the restored baseline; live counters
+   * accumulate as deltas on top, so repeated restores are idempotent, not
+   * additive.
+   */
+  restore(state: CortexAgentPersistedState): void {
+    this.assertNotDestroyed();
+    if (
+      this.reasoner.isLoopActive ||
+      this.pendingFacadePrompts > 0 ||
+      this.reasoner.getSubAgentManager().activeCount > 0
+    ) {
+      throw new Error(
+        'CortexAgent.restore() rejected: a loop is running. Await workSettled before restoring.',
+      );
+    }
+    const v2 = normalizePersistedState(state);
+
+    // History before observational state (restore ordering).
+    this.reasoner.restoreConversationHistory(v2.reasonerHistory);
+    if (v2.reasonerMemory) {
+      this.reasoner.restoreObservationalMemoryState(v2.reasonerMemory);
+    }
+    this.retainedTalkerHistory = [...v2.talkerHistory];
+    this.retainedTalkerMemory = v2.talkerMemory;
+    this.log.restore(v2.log);
+
+    this.usageBaseline = {
+      talker: v2.usage.perLoop.talker ? cloneUsage(v2.usage.perLoop.talker) : null,
+      reasoner: cloneUsage(v2.usage.perLoop.reasoner),
+    };
+    this.usageAtRestore = this.reasoner.getSessionUsage();
+    this.spawnSeqByTaskId.clear();
+  }
+
+  /**
+   * Debounced composite persistence trigger: fires with a consistent
+   * getState() snapshot after state-changing activity (log appends, run
+   * completions, compaction, observation) settles for stateChangeDebounceMs.
+   * This replaces persisting on onLoopComplete, which is ambiguous once
+   * multiple loops exist.
+   */
+  onStateChanged(handler: (state: CortexAgentStateV2) => void): void {
+    this.stateChangedHandlers.push(handler);
+    if (this.stateDirty) {
+      this.scheduleStateEmit();
+    }
+  }
+
+  private markStateDirty(): void {
+    this.stateDirty = true;
+    this.scheduleStateEmit();
+  }
+
+  private scheduleStateEmit(): void {
+    if (this.destroyed || this.stateTimer !== null || this.emittingState) return;
+    if (this.stateChangedHandlers.length === 0) return;
+    this.stateTimer = setTimeout(() => {
+      this.stateTimer = null;
+      void this.emitStateChanged();
+    }, this.stateDebounceMs);
+  }
+
+  private async emitStateChanged(): Promise<void> {
+    if (this.destroyed || this.stateChangedHandlers.length === 0) return;
+    this.emittingState = true;
+    try {
+      this.stateDirty = false;
+      const state = await this.getState();
+      if (this.destroyed) return;
+      for (const handler of this.stateChangedHandlers) {
+        try {
+          handler(state);
+        } catch (err) {
+          this.logger.error('onStateChanged handler threw', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    } finally {
+      this.emittingState = false;
+      // Changes that landed while snapshotting get their own cycle.
+      if (this.stateDirty) {
+        this.scheduleStateEmit();
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -896,12 +1279,16 @@ export class CortexAgent {
   }
 
   /**
-   * Accumulated session usage. In passthrough this is the reasoner's
-   * counters verbatim; the composite persistence work layers the
-   * restored-baseline-plus-live-deltas model on top.
+   * Accumulated session usage: the composite aggregate. Without a restore
+   * this is the reasoner's live counters verbatim; after one it is the
+   * restored baseline plus live deltas (loops restart at zero), including
+   * any restored talker-side spend, so totals survive restores without
+   * double-counting.
    */
   getSessionUsage(): SessionUsage {
-    return this.reasoner.getSessionUsage();
+    const reasoner = this.reasonerUsageWithBaseline();
+    const talkerBaseline = this.usageBaseline?.talker;
+    return talkerBaseline ? addUsage(reasoner, talkerBaseline) : reasoner;
   }
 
   // Tools, MCP, skills ------------------------------------------------------
