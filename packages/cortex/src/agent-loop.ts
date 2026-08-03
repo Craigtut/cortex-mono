@@ -481,6 +481,13 @@ interface QueuedDelivery {
    * Bounds total time spent in failed attempts via the elapsed budget.
    */
   firstDeliveryAttemptAt?: number;
+  /**
+   * The loop's abort epoch when this item parked (wake parking only).
+   * abort() cancels parked deliveries; an item stamped before the most
+   * recent abort completed is dropped instead of delivered to a run that
+   * starts after the user stopped the agent.
+   */
+  abortEpoch?: number;
 }
 
 /** Options for {@link AgentLoop.digestIdle}. */
@@ -772,6 +779,17 @@ export class AgentLoop {
 
   // AbortController for the current agentic loop
   private abortController = new AbortController();
+
+  // Abort epoch for wake parking. abort() cancels parked wake deliveries,
+  // including ones that park during its own await windows; the live
+  // controller cannot express that (a drain that starts mid-abort replaces
+  // it, and abort() skips the gate wait when background deliveries are
+  // pending), so parked items are stamped with the epoch at park time and
+  // every take of the parked queue drops items stamped before the most
+  // recent abort completed. The in-progress counter covers the window
+  // before the epoch advances at abort()'s end.
+  private _abortEpoch = 0;
+  private _abortsInProgress = 0;
 
   // Whether a prompt() call is currently in progress
   private _isPrompting = false;
@@ -1315,14 +1333,15 @@ export class AgentLoop {
     // intact for the next prompt.
     const silentBatch = fromDrain ? [] : this.queuedSilentDeliveries.splice(0);
     // Parked wake deliveries ride ahead of the prompt in the same batch,
-    // spliced in this same synchronous frame (before pi pushes the batch at
+    // taken in this same synchronous frame (before pi pushes the batch at
     // run start) so a sweep task that fires later finds nothing and cannot
-    // re-deliver content this run consumed. If the run fails terminally
-    // without progressing past the batch, the catch below unwinds the wake
-    // portion and re-parks it: content the caller was told was 'parked'
-    // must end in a run that answers it, never silently demote to inert
-    // transcript context.
-    const wakeBatch = fromDrain ? [] : this.pendingWakeDeliveries.splice(0);
+    // re-deliver content this run consumed. Items an abort cancelled are
+    // dropped by the take, not spliced into a post-abort prompt. If the
+    // run fails terminally without progressing past the batch, the catch
+    // below unwinds the wake portion and re-parks it: content the caller
+    // was told was 'parked' must end in a run that answers it, never
+    // silently demote to inert transcript context.
+    const wakeBatch = fromDrain ? [] : this.takeDeliverableWakeDeliveries();
 
     // Long-lived mode keeps workspace state (cwd, read-before-edit registry,
     // undo history) across prompts; transient state resets regardless.
@@ -1833,7 +1852,10 @@ export class AgentLoop {
    * contract (see {@link clearAllQueues}) and are additionally dropped by
    * abort(): a parked delivery is cancelled like the turn it was waiting
    * behind, never delivered by a run that starts after the user stopped
-   * the agent.
+   * the agent. That includes a delivery that parks while an abort is
+   * completing (the parked queue is gated on an abort epoch, so neither a
+   * mid-abort drain replacing the controller nor the skipped gate wait
+   * lets it through to a post-abort run).
    *
    * @param content - Non-whitespace message content (user role)
    * @param options - Wake behavior; default wakes an idle loop
@@ -1875,7 +1897,11 @@ export class AgentLoop {
       // drain window, idle digestion, a cycle cancelled at dequeue). The
       // content is parked for the next run; the sweep task guarantees that
       // run happens even when every gate task ahead of it is a non-run task.
-      this.pendingWakeDeliveries.push({ content, timestamp: Date.now() });
+      this.pendingWakeDeliveries.push({
+        content,
+        timestamp: Date.now(),
+        abortEpoch: this._abortEpoch,
+      });
       this.scheduleWakeSweep();
       this.logger.debug('wake delivery parked for the next run', {
         parked: this.pendingWakeDeliveries.length,
@@ -1895,6 +1921,34 @@ export class AgentLoop {
       });
     });
     return { outcome: 'prompted', turn };
+  }
+
+  /**
+   * Dequeue the parked wake deliveries that are still deliverable. An
+   * abort cancels parked deliveries, so two classes are dropped here
+   * instead of riding a post-abort run: everything, while an abort is
+   * still completing (abort() drops the queue synchronously at entry, but
+   * a delivery can park during its await windows, and a drain that starts
+   * mid-abort replaces the aborted controller, so neither the entry drop
+   * nor the live controller covers that window); and items stamped with a
+   * previous abort epoch, which parked before the most recent abort()
+   * finished and were cancelled by it.
+   */
+  private takeDeliverableWakeDeliveries(): QueuedDelivery[] {
+    const taken = this.pendingWakeDeliveries.splice(0);
+    if (taken.length === 0) return taken;
+    const abortInFlight =
+      this._abortsInProgress > 0 || this.abortController.signal.aborted;
+    const deliverable = abortInFlight
+      ? []
+      : taken.filter((item) => (item.abortEpoch ?? this._abortEpoch) === this._abortEpoch);
+    const dropped = taken.length - deliverable.length;
+    if (dropped > 0) {
+      this.logger.info('dropped wake deliveries parked during abort', {
+        count: dropped,
+      });
+    }
+    return deliverable;
   }
 
   /**
@@ -1938,18 +1992,8 @@ export class AgentLoop {
    */
   private async sweepParkedWakeDeliveries(): Promise<void> {
     if (this.pendingWakeDeliveries.length === 0) return;
-    if (this.abortController.signal.aborted) {
-      // abort() drops parked deliveries; one that parked in the narrow
-      // window between that drop and the controller reset at abort()'s end
-      // is cancelled the same way rather than waking a loop the user just
-      // stopped.
-      const dropped = this.pendingWakeDeliveries.splice(0);
-      this.logger.info('dropped wake deliveries parked during abort', {
-        count: dropped.length,
-      });
-      return;
-    }
-    const pending = this.pendingWakeDeliveries.splice(0);
+    const pending = this.takeDeliverableWakeDeliveries();
+    if (pending.length === 0) return;
     const message = pending.map((item) => item.content).join('\n\n');
     this.logger.info('delivering parked wake deliveries with a run', {
       count: pending.length,
@@ -3740,42 +3784,55 @@ export class AgentLoop {
         count: droppedWake.length,
       });
     }
-    controller.abort();
-    this.agent.abort();
-    this.promptDiagnostics.startAbortWait();
+    // A delivery can also park DURING the await windows below; it is
+    // cancelled the same way. The live controller cannot express that (a
+    // drain that starts mid-abort replaces it, and the gate wait is
+    // skipped entirely when background deliveries are pending), so the
+    // parked queue is epoch-gated instead: while this abort is in flight
+    // every take of the queue drops its items, and the epoch advance in
+    // the finally below marks anything stamped earlier as cancelled.
+    this._abortsInProgress += 1;
     try {
-      await this.agent.waitForIdle();
-      // waitForIdle() only covers pi-agent-core's run promise (it resolves,
-      // never rejects). The Cortex-side unwind (retry classification, the
-      // prompt finally block) may not have observed the abort yet, so wait
-      // for it too. Resetting the controller before that classification ran
-      // used to reclassify a cancelled turn as a retryable failure and
-      // resurrect it as a background retry.
-      await unwound;
+      controller.abort();
+      this.agent.abort();
+      this.promptDiagnostics.startAbortWait();
+      try {
+        await this.agent.waitForIdle();
+        // waitForIdle() only covers pi-agent-core's run promise (it resolves,
+        // never rejects). The Cortex-side unwind (retry classification, the
+        // prompt finally block) may not have observed the abort yet, so wait
+        // for it too. Resetting the controller before that classification ran
+        // used to reclassify a cancelled turn as a retryable failure and
+        // resurrect it as a background retry.
+        await unwound;
+      } finally {
+        this.promptDiagnostics.finishAbortWait();
+      }
+
+      // When no background delivery is pending, also wait for the gate to
+      // release the aborted cycle so a follow-up prompt() cannot spuriously
+      // fail fast on a stale gate. This is bounded: a queued task is either
+      // the just-unwound running turn (its finally drain is an empty no-op
+      // before release), a same-frame prompt() that has not started yet
+      // (it sees the aborted controller at dequeue and cancels without ever
+      // reaching pi), or a wake sweep that finds the parked list dropped
+      // above (one parked during this window is dropped by the epoch gate
+      // on every take of the parked queue) and never starts a run. When
+      // deliveries ARE pending they start a fresh (non-aborted) loop, so
+      // return immediately rather than blocking on it.
+      if (this.pendingBackgroundResults.length === 0) {
+        await this.loopGateTail;
+      }
+
+      // Reset so the agent is reusable, unless teardown owns the controller
+      // now or a newer turn (e.g. a background delivery that started during
+      // the wait) already installed its own controller.
+      if (!this.isShuttingDown() && this.abortController === controller) {
+        this.abortController = new AbortController();
+      }
     } finally {
-      this.promptDiagnostics.finishAbortWait();
-    }
-
-    // When no background delivery is pending, also wait for the gate to
-    // release the aborted cycle so a follow-up prompt() cannot spuriously
-    // fail fast on a stale gate. This is bounded: a queued task is either
-    // the just-unwound running turn (its finally drain is an empty no-op
-    // before release), a same-frame prompt() that has not started yet
-    // (it sees the aborted controller at dequeue and cancels without ever
-    // reaching pi), or a wake sweep that finds the parked list dropped
-    // above (a delivery parked during this window is dropped by the
-    // sweep's own aborted-controller check) and never starts a run. When
-    // deliveries ARE pending they start a fresh (non-aborted) loop, so
-    // return immediately rather than blocking on it.
-    if (this.pendingBackgroundResults.length === 0) {
-      await this.loopGateTail;
-    }
-
-    // Reset so the agent is reusable, unless teardown owns the controller
-    // now or a newer turn (e.g. a background delivery that started during
-    // the wait) already installed its own controller.
-    if (!this.isShuttingDown() && this.abortController === controller) {
-      this.abortController = new AbortController();
+      this._abortsInProgress -= 1;
+      this._abortEpoch += 1;
     }
     this.logger.info('abort complete');
   }
@@ -6510,7 +6567,11 @@ export class AgentLoop {
       this.notifySourceHistoryTailTrimmed();
       if (injected.length > 0) {
         for (const content of injected) {
-          this.pendingWakeDeliveries.push({ content, timestamp: Date.now() });
+          this.pendingWakeDeliveries.push({
+            content,
+            timestamp: Date.now(),
+            abortEpoch: this._abortEpoch,
+          });
         }
         this.scheduleWakeSweep();
       }

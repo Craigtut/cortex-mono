@@ -801,6 +801,79 @@ describe('AgentLoop.deliver and abort', () => {
     expect(occurrences(piAgent, 'post-abort content')).toBe(0);
   });
 
+  it('drops a delivery parked during abort even when pending background results skip the gate wait', async () => {
+    // The SF-D window: with a background completion pending, abort() skips
+    // its gate-tail wait and resets (or a mid-abort drain replaces) the
+    // controller, so a delivery that parked during abort's await windows
+    // used to meet a fresh controller when the sweep dequeued and run
+    // AFTER the user stopped the agent.
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    // First call hangs until abort rejects it; later calls (the background
+    // drain, and the sweep run this test forbids) succeed.
+    let rejectRun: ((err: Error) => void) | null = null;
+    let firstCall = true;
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      if (firstCall) {
+        firstCall = false;
+        await new Promise<never>((_resolve, reject) => {
+          rejectRun = reject;
+        });
+      }
+      piAgent.state.messages.push({ role: 'assistant', content: 'ok', timestamp: Date.now() });
+      return { content: 'ok' };
+    };
+    piAgent.abort = (): void => {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      rejectRun?.(err);
+      rejectRun = null;
+    };
+
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    // A background completion is pending, so abort() skips the gate wait.
+    void (loop as unknown as {
+      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
+    }).deliverOrQueueBackgroundCompletion({
+      kind: 'subagent',
+      taskId: 'task-mid-abort',
+      result: {
+        output: 'done',
+        status: 'completed',
+        usage: { turns: 1, cost: 0, durationMs: 5, contextTokens: 10 },
+      },
+    });
+
+    const abortPromise = loop.abort();
+    // Parks during abort's await window: after the synchronous drop at
+    // abort() entry, before the epoch advances at its end.
+    const result = loop.deliver('parked mid-abort');
+    expect(result.outcome).toBe('parked');
+
+    await abortPromise;
+    await turn.catch(() => {});
+    // Background completions survive the abort and are delivered.
+    await waitUntil(() => piAgent.promptCalls.some(
+      (call) => typeof call === 'string' && call.includes('task-mid-abort'),
+    ));
+    await waitUntil(() => !loop.isLoopActive);
+
+    // The mid-abort delivery was cancelled with the turn, not delivered by
+    // a post-abort run (neither a sweep run nor a prompt splice).
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+    expect(occurrences(piAgent, 'parked mid-abort')).toBe(0);
+  });
+
   it('an abort during a swept run cancels the content instead of re-parking it', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
