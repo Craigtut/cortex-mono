@@ -2358,7 +2358,9 @@ You have 12 emotions.`;
 
       // Give the mock a real steering queue: pi drains it at run start.
       const steeringQueue: Array<{ role: string; content: string }> = [];
+      let steerCalls = 0;
       piAgent.steer = (message: { role: string; content: string }): void => {
+        steerCalls += 1;
         steeringQueue.push(message);
       };
 
@@ -2410,6 +2412,11 @@ You have 12 emotions.`;
       }
       expect(historyOccurrences(agent, 'steered mid-drain')).toBe(1);
       expect(historyOccurrences(agent, 'research findings')).toBe(1);
+      // Only the test's own public steer() touched pi's queue. The unwind
+      // must not re-inject recovered content with steering semantics: the
+      // spliced range can also hold follow-up-injected messages, and pi's
+      // transcript cannot tell the two apart.
+      expect(steerCalls).toBe(1);
     });
 
     it('does not fire onError when a re-queued delivery eventually succeeds', async () => {
