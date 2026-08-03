@@ -5420,9 +5420,11 @@ export class AgentLoop {
   /**
    * Deliver a steering message to a running sub-agent by task ID. The
    * redirect rides the child's deliver() primitive, so it lands at the
-   * child's next turn boundary while it runs (and is never silently dropped
-   * in the settling window; see SubAgentManager.steer for the landing
-   * rules). Returns false when the task ID is not an active sub-agent.
+   * child's next turn boundary while it runs. Returns false when the task
+   * ID is not an active sub-agent, the child is tearing down, or the child
+   * is in its settle window (run ended, completion not yet untracked): a
+   * turn started there would be destroyed moments later, so the redirect
+   * is reported undeliverable and the caller decides how to re-route it.
    */
   steerSubAgent(taskId: string, message: string): boolean {
     const outcome = this.subAgentManager.steer(taskId, message);

@@ -87,7 +87,7 @@ Sub-agents share the parent's:
 
 ### Steering a Running Sub-Agent
 
-`steerSubAgent(taskId, message)` on the parent agent redirects a running sub-agent by task ID. It rides the child's `deliver()` primitive: a mid-run child is steered into its current logical turn (the message lands at the child's next turn boundary), and in the brief window where a tracked child's gate is idle the delivery starts a turn instead, so a redirect is never silently dropped the way a bare `steer()` on an idle loop would be. Returns `false` when the task ID is not an active sub-agent or the child is already tearing down.
+`steerSubAgent(taskId, message)` on the parent agent redirects a running sub-agent by task ID. It rides the child's `deliver()` primitive: a mid-run child is steered into its current logical turn (the message lands at the child's next turn boundary). Returns `false` when the task ID is not an active sub-agent, the child is already tearing down, or the child's gate is idle: that last case is the settle window (the child's run ended but completion has not untracked it yet, or it has not started running), where a freshly started turn would be destroyed by the completion continuation moments later. A `false` return means the redirect was NOT delivered; the caller decides whether to re-route it (for example, into the next spawn or as parent context).
 
 Tracked entries also expose a typed handle (`TrackedSubAgent.agent: SubAgentHandle`) with the delivery, teardown, and live-usage surface, so orchestration layers no longer cast an `unknown`.
 
@@ -136,6 +136,8 @@ await agent.spawnBackgroundSubAgent({ instructions, pool: 'lookup' });
 ```
 
 A spawn that names a pool counts only against that pool's limit; spawns without a pool use `maxConcurrentSubAgents`. Pools are counted independently, so a saturated default pool (a long task fleet) cannot block a small dedicated pool (quick lookups) and vice versa. A named pool missing from `subAgentPools` falls back to the default limit while still being counted separately.
+
+Note the aggregate consequence: because every pool is independent and unlisted names fall back rather than being rejected, N distinct pool names permit N x `maxConcurrentSubAgents` concurrent children in total. There is no cross-pool cap. An orchestrator that lets a model choose pool names freely should either restrict them to the configured set or bound total spawn count itself (the facade-level aggregate budget guard is the backstop for cost).
 
 ## Per-Spawn Controls
 

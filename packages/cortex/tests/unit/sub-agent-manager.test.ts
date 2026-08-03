@@ -288,7 +288,10 @@ describe('SubAgentManager', () => {
   describe('steer', () => {
     it('delivers the message through the tracked child handle and returns the outcome', () => {
       const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
-      manager.track(createTrackedEntry({ taskId: 'task-1', agent: { deliver } as never }));
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { deliver, isLoopActive: true } as never,
+      }));
 
       const outcome = manager.steer('task-1', 'focus on Europe');
 
@@ -300,18 +303,38 @@ describe('SubAgentManager', () => {
       expect(manager.steer('nope', 'message')).toBeNull();
     });
 
+    it('returns null in the settle window instead of starting a doomed turn', () => {
+      // The child's run has settled but complete() has not untracked it
+      // yet: deliver() would start a fresh turn that runSubAgent destroys
+      // microtasks later, while the caller is told the redirect landed.
+      const deliver = vi.fn(() => ({ outcome: 'prompted' as const }));
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { deliver, isLoopActive: false } as never,
+      }));
+
+      expect(manager.steer('task-1', 'message')).toBeNull();
+      expect(deliver).not.toHaveBeenCalled();
+    });
+
     it('returns null when the child is already tearing down (deliver throws)', () => {
       const deliver = vi.fn(() => {
         throw new Error('Agent is being destroyed');
       });
-      manager.track(createTrackedEntry({ taskId: 'task-1', agent: { deliver } as never }));
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { deliver, isLoopActive: true } as never,
+      }));
 
       expect(manager.steer('task-1', 'message')).toBeNull();
     });
 
     it('returns null after the task was cancelled', async () => {
       const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
-      manager.track(createTrackedEntry({ taskId: 'task-1', agent: { deliver } as never }));
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { deliver, isLoopActive: true } as never,
+      }));
       await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
 
       expect(manager.steer('task-1', 'message')).toBeNull();

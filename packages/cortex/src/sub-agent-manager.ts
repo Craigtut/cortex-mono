@@ -216,19 +216,25 @@ export class SubAgentManager {
    * Deliver a steering message to a running sub-agent by task ID, built on
    * the child's deliver() primitive: a tracked child is normally mid-run,
    * so the message is steered into its current logical turn and lands at
-   * the child's next turn boundary. In the rare window where a tracked
-   * child's gate is idle (its run just settled but completion has not
-   * untracked it yet), deliver() starts a turn instead, so the redirect is
-   * never silently dropped the way a bare steer() would be.
+   * the child's next turn boundary. In the window where a tracked child's
+   * gate is idle (its run just settled but completion has not untracked it
+   * yet, or it has not started running), the redirect is reported
+   * undeliverable instead: a turn started there is destroyed by the
+   * completion continuation moments later, so 'delivered' would be a lie.
    *
-   * @returns The deliver outcome, or null when the task is not active or
-   *   the child is already tearing down.
+   * @returns 'steered' when the redirect landed in the child's current
+   *   logical turn; null when the task is not active, the child's gate is
+   *   idle (settle window), or the child is already tearing down.
    */
-  steer(taskId: string, message: string): 'prompted' | 'steered' | 'queued' | null {
+  steer(taskId: string, message: string): 'steered' | null {
     const entry = this.agents.get(taskId);
     if (!entry) return null;
     try {
-      return entry.agent.deliver(message).outcome;
+      if (!entry.agent.isLoopActive) return null;
+      const outcome = entry.agent.deliver(message).outcome;
+      // The gate check above makes deliver() steer; narrow the type rather
+      // than surface an outcome this path can no longer produce.
+      return outcome === 'steered' ? outcome : null;
     } catch {
       // The child began destroy() between tracking and this call; the
       // steer has nowhere to land.

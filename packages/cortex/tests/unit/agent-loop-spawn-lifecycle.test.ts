@@ -573,6 +573,8 @@ describe('AgentLoop spawn-path lifecycle', () => {
         destroy: vi.fn().mockResolvedValue(undefined),
         prompt: vi.fn().mockReturnValue(promptGate),
         deliver,
+        // The child is mid-run: its gate is held for the whole prompt.
+        isLoopActive: true,
         getConversationHistory: () => [{ role: 'assistant', content: 'done' }],
         getBudgetGuard: () => ({ getTurnCount: () => 1, getTotalCost: () => 0 }),
         getEventBridge: () => new EventBridge(false),

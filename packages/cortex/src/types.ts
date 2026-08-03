@@ -1572,6 +1572,13 @@ export interface SubAgentHandle {
   /** Post-hoc context token count from the child's most recent turn. */
   readonly currentContextTokenCount: number;
   /**
+   * True while any gate task is running or queued on the child. False for a
+   * tracked child means it is in the settle window (its run ended but
+   * completion has not untracked it) or has not started its run yet; a
+   * delivery there would start a turn that teardown destroys moments later.
+   */
+  readonly isLoopActive: boolean;
+  /**
    * Deliver a message regardless of the child's run state. Mirrors
    * AgentLoop.deliver: steered into a running turn, prompted when idle with
    * wake wanted, queued when silent.
