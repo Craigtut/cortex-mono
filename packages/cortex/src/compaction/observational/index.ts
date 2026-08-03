@@ -592,6 +592,21 @@ export class ObservationalMemoryEngine {
   }
 
   /**
+   * Reconcile buffer state after the tail of the post-slot source history
+   * was trimmed (aborted/failed run stubs, unwound background deliveries).
+   *
+   * pi emits turn_end for those messages before Cortex trims them, so an
+   * observer counting them may be in flight (or already completed) with an
+   * end index past the new source length. The watermark is clamped so the
+   * next activation cannot slice away messages that were never observed.
+   *
+   * @param postSlotLength - post-slot source history length after the trim
+   */
+  onSourceHistoryTailTrimmed(postSlotLength: number): void {
+    this.buffering.onSourceTailTrimmed(postSlotLength);
+  }
+
+  /**
    * Returns the current slot content string.
    */
   getSlotContent(): string {

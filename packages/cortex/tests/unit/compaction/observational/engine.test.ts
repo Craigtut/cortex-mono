@@ -600,4 +600,115 @@ describe('ObservationalMemoryEngine', () => {
       expect(() => assertNoOrphans(survivingSource)).toThrow();
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Tests: onSourceHistoryTailTrimmed (S2, abort/failure tail-trim
+  // reconciliation)
+  // -------------------------------------------------------------------------
+
+  describe('onSourceHistoryTailTrimmed', () => {
+    // The observer runs over [U0, U1, STUB] (watermark = 3), where STUB is
+    // the aborted assistant stub pi appended and emitted turn_end for.
+    // Cortex then trims the stub (surviving length 2), and the conversation
+    // continues with a tool group and a follow-up:
+    //   [U0, U1, callB, resultB, U2]
+    // A stale watermark of 3 would slice [U0, U1, callB], destroying the
+    // unobserved callB and leaving resultB orphaned at the head.
+    const U0 = makeUserMsg('x'.repeat(50_000)); // large: exceeds buffer interval
+    const U1 = makeUserMsg('second setup message');
+    const STUB: AgentMessage = {
+      role: 'assistant',
+      content: [],
+      timestamp: 0,
+    };
+    const callB = makeToolCallMsg([{ id: 'call_B', name: 'Bash', arguments: { command: 'ls' } }]);
+    // Large result keeps post-chunk utilization below the activation
+    // threshold so the Step 2 sync observer does not fire and the surviving
+    // unobserved source can be inspected directly.
+    const resultB = makeToolResultMsg('call_B', 'Bash', 'y'.repeat(80_000));
+    const U2 = makeUserMsg('unobserved follow-up request');
+
+    // Source at the next activation, after the stub trim and further turns.
+    const postTrimSource = [U0, U1, callB, resultB, U2];
+
+    async function buildEngineWatermark3(): Promise<ObservationalMemoryEngine> {
+      const engine = new ObservationalMemoryEngine({
+        activationThreshold: 0.9,
+        bufferMinTokens: 1_000,
+        bufferTargetCycles: 4,
+        bufferTokenCap: 30_000,
+      }, 0);
+      engine.setCompleteFn(vi.fn<CompleteFn>().mockResolvedValue(OBSERVER_OUTPUT));
+      engine.setContextWindow(100_000);
+      engine.setUtilityModelContextWindow(200_000);
+
+      // Observe through the stub; the async observer sets watermark = 3.
+      engine.onTurnEnd(50_000, 100_000, [U0, U1, STUB], 0);
+      await flushPromises();
+      expect(engine.getState().bufferWatermark).toBe(3);
+      return engine;
+    }
+
+    async function activate(
+      engine: ObservationalMemoryEngine,
+    ): Promise<AgentMessage[]> {
+      const slotCount = 1;
+      let source: AgentMessage[] = [...postTrimSource];
+      const context: AgentContext = {
+        systemPrompt: '',
+        model: {},
+        messages: [makeUserMsg('<observation-slot>')],
+        tools: [],
+        thinkingLevel: 'none',
+      };
+      const getHistory = (ctx: AgentContext) => ctx.messages.slice(slotCount);
+      const setHistory = (ctx: AgentContext, hist: AgentMessage[]): AgentContext => ({
+        ...ctx,
+        messages: [...ctx.messages.slice(0, slotCount), ...hist],
+      });
+      const getSourceHistory = () => source;
+      const setSourceHistory = (h: AgentMessage[]) => { source = h; };
+
+      await engine.applyInTransformContext(
+        context, 0.95, slotCount, getHistory, setHistory, getSourceHistory, setSourceHistory,
+      );
+      return source;
+    }
+
+    it('clamps the buffer watermark to the surviving source length', async () => {
+      const engine = await buildEngineWatermark3();
+      engine.onSourceHistoryTailTrimmed(2);
+      expect(engine.getState().bufferWatermark).toBe(2);
+    });
+
+    it('next activation neither destroys unobserved messages nor orphans a tool result', async () => {
+      const engine = await buildEngineWatermark3();
+
+      // Reconcile the buffer with the tail-trimmed source (the fix).
+      engine.onSourceHistoryTailTrimmed(2);
+
+      const survivingSource = await activate(engine);
+
+      // No orphaned tool call or tool result at the head (would be a hard 400).
+      assertNoOrphans(survivingSource);
+      expect(survivingSource[0]!.role).not.toBe('toolResult');
+
+      // The genuinely unobserved tail is preserved intact, not silently trimmed.
+      expect(survivingSource).toContain(callB);
+      expect(survivingSource).toContain(resultB);
+      expect(survivingSource).toContain(U2);
+    });
+
+    it('without reconciliation the stale watermark orphans a tool result (bug repro)', async () => {
+      const engine = await buildEngineWatermark3();
+
+      // Skip the reconciliation: the watermark still counts the trimmed stub.
+      const survivingSource = await activate(engine);
+
+      // The stale slice removed callB but kept resultB: an orphaned result at
+      // the head of the surviving source. This is exactly what the fix prevents.
+      expect(survivingSource[0]!.role).toBe('toolResult');
+      expect(() => assertNoOrphans(survivingSource)).toThrow();
+    });
+  });
 });

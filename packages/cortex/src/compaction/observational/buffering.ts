@@ -457,4 +457,33 @@ export class BufferingCoordinator {
     this.bufferWatermark = Math.max(0, this.bufferWatermark - droppedFrontCount);
     this.activationEpoch++;
   }
+
+  /**
+   * Reconcile buffer state after the source conversation history was
+   * trimmed from the tail (an aborted or failed run's stub, or a failed
+   * background delivery being unwound).
+   *
+   * pi emits turn_end for those messages before Cortex trims them, so an
+   * observer may have launched with an endIndex that counts them, or
+   * already completed and moved the watermark past the new source length.
+   * Without clamping, later messages land at indices the watermark already
+   * claims as observed, and the next activation slices away an unobserved
+   * message (or orphans a tool result at the surviving head).
+   *
+   * Clamping (rather than epoch-advancing) keeps the observation content:
+   * text describing a trimmed stub is harmless, while the clamped index
+   * stays aligned with the surviving source prefix.
+   *
+   * @param postSlotLength - length of the post-slot source history after
+   *   the tail trim
+   */
+  onSourceTailTrimmed(postSlotLength: number): void {
+    const length = Math.max(0, postSlotLength);
+    if (this.bufferWatermark > length) {
+      this.bufferWatermark = length;
+    }
+    if (this.inFlightObserverEndIndex !== null && this.inFlightObserverEndIndex > length) {
+      this.inFlightObserverEndIndex = length;
+    }
+  }
 }

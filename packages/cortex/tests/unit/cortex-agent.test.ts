@@ -2234,6 +2234,32 @@ You have 12 emotions.`;
       expect(historyOccurrences(agent, 'sixty-thousand-token payload')).toBe(1);
     });
 
+    it('tells the compaction manager the post-slot length after unwinding a failed delivery', async () => {
+      // pi emits turn_end for the delivery message and failure stub before
+      // the unwind removes them, so an observational buffer watermark may
+      // already count them. The unwind must notify the compaction manager
+      // with the surviving post-slot length (here: back to the empty
+      // pre-delivery transcript) so the watermark is clamped.
+      const agent = createTestCortexAgent(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+      const spy = vi.spyOn(
+        (agent as unknown as {
+          compactionManager: { onSourceHistoryTailTrimmed: (n: number) => void };
+        }).compactionManager,
+        'onSourceHistoryTailTrimmed',
+      );
+      seedCompletedTask(agent, 'task_wm', 'watermark payload');
+      installFailingPrompt(1);
+
+      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_wm' });
+
+      expect(spy).toHaveBeenCalled();
+      const lastCall = spy.mock.calls[spy.mock.calls.length - 1]!;
+      expect(lastCall[0]).toBe(0);
+      // The retry then delivered normally.
+      expect(historyRoles(agent)).toEqual(['user', 'assistant']);
+    });
+
     it('re-queues a failed sub-agent result delivery without losing the result', async () => {
       const agent = createTestCortexAgent(piAgent, config);
       const internal = agent as unknown as InternalAgent;

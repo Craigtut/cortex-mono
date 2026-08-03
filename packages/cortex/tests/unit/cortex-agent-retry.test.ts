@@ -541,4 +541,46 @@ describe('CortexAgent abort-stub trim', () => {
 
     expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'end_turn' });
   });
+
+  it('tells the compaction manager the post-slot length after trimming an aborted stub', async () => {
+    // pi emits turn_end for the stub before Cortex trims it, so an
+    // observational buffer watermark may already count it. The trim must
+    // notify the compaction manager with the surviving post-slot length so
+    // the watermark is clamped and the next activation cannot slice away a
+    // message that was never observed.
+    const mock = createCleanAbortMock([]);
+    const agent = build(mock, createConfig());
+    const internal = agent as unknown as {
+      compactionManager: { onSourceHistoryTailTrimmed: (n: number) => void };
+    };
+    const spy = vi.spyOn(internal.compactionManager, 'onSourceHistoryTailTrimmed');
+
+    const turn = agent.prompt('hi');
+    await new Promise((resolve) => setImmediate(resolve));
+    await agent.abort();
+    await turn;
+
+    // History ends on the committed user message: post-slot length 1.
+    expect(lastMessage(mock).role).toBe('user');
+    expect(spy).toHaveBeenCalledWith(1);
+  });
+
+  it('does not notify the compaction manager when nothing was trimmed', async () => {
+    // A clean abort that keeps the partial text trims nothing, so there is
+    // no tail-trim to reconcile.
+    const mock = createCleanAbortMock([{ type: 'text', text: 'partial answer' }]);
+    const agent = build(mock, createConfig());
+    const internal = agent as unknown as {
+      compactionManager: { onSourceHistoryTailTrimmed: (n: number) => void };
+    };
+    const spy = vi.spyOn(internal.compactionManager, 'onSourceHistoryTailTrimmed');
+
+    const turn = agent.prompt('hi');
+    await new Promise((resolve) => setImmediate(resolve));
+    await agent.abort();
+    await turn;
+
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'aborted' });
+    expect(spy).not.toHaveBeenCalled();
+  });
 });

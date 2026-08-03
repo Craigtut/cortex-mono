@@ -647,6 +647,86 @@ describe('BufferingCoordinator', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Tests: onSourceTailTrimmed (tail-trim reconciliation, S2)
+  // -------------------------------------------------------------------------
+
+  describe('onSourceTailTrimmed', () => {
+    it('clamps a watermark past the surviving source length', () => {
+      coordinator.setWatermark(5);
+      coordinator.onSourceTailTrimmed(3);
+      expect(coordinator.getWatermark()).toBe(3);
+    });
+
+    it('leaves a watermark at or below the surviving length untouched', () => {
+      coordinator.setWatermark(3);
+      coordinator.onSourceTailTrimmed(3);
+      expect(coordinator.getWatermark()).toBe(3);
+      coordinator.onSourceTailTrimmed(7);
+      expect(coordinator.getWatermark()).toBe(3);
+    });
+
+    it('treats a negative length as 0', () => {
+      coordinator.setWatermark(4);
+      coordinator.onSourceTailTrimmed(-1);
+      expect(coordinator.getWatermark()).toBe(0);
+    });
+
+    it('clamps the end index of an in-flight observer so its landing watermark stays aligned', async () => {
+      // The observer launches counting the aborted stub (endIndex 3), the
+      // stub is trimmed while the call is in flight (surviving length 2),
+      // then the observer completes. Its landing writes
+      // `bufferWatermark = inFlightObserverEndIndex`, so without the
+      // in-flight clamp the watermark would claim index 2 (a message that
+      // arrives AFTER the trim) as observed.
+      let resolvePromise: ((value: string) => void) | undefined;
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(
+        new Promise<string>((resolve) => { resolvePromise = resolve; }),
+      );
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('hello'), assistantMsg('working on it'), assistantMsg('(aborted stub)')],
+        3,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      coordinator.onSourceTailTrimmed(2);
+
+      resolvePromise!(VALID_OBSERVER_OUTPUT);
+      await flushPromises();
+
+      // The chunk lands (its text is still valid; describing a trimmed stub
+      // is harmless) but the watermark reflects the surviving source only.
+      expect(coordinator.hasCompletedChunks()).toBe(true);
+      expect(coordinator.getWatermark()).toBe(2);
+    });
+
+    it('keeps an in-flight end index at or below the surviving length untouched', async () => {
+      let resolvePromise: ((value: string) => void) | undefined;
+      const mockComplete = vi.fn<CompleteFn>().mockReturnValue(
+        new Promise<string>((resolve) => { resolvePromise = resolve; }),
+      );
+
+      coordinator.launchObserver(
+        mockComplete,
+        [userMsg('hello')],
+        1,
+        null,
+        { previousObserverTokens: 2000 },
+      );
+
+      // The trim happened past the observed prefix; nothing to reconcile.
+      coordinator.onSourceTailTrimmed(4);
+
+      resolvePromise!(VALID_OBSERVER_OUTPUT);
+      await flushPromises();
+
+      expect(coordinator.getWatermark()).toBe(1);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Tests: activation epoch (race condition guard)
   // -------------------------------------------------------------------------
 

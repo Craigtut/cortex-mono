@@ -519,6 +519,20 @@ export class CompactionManager {
   }
 
   /**
+   * Reconcile the observational buffer after the tail of the post-slot
+   * source history was trimmed (an aborted or failed run's stub, or a
+   * failed background delivery being unwound). Clamps the buffer watermark
+   * and any in-flight observer end index to the surviving source length so
+   * the next activation cannot slice away unobserved messages. No-op for
+   * the classic strategy.
+   *
+   * @param postSlotLength - post-slot source history length after the trim
+   */
+  onSourceHistoryTailTrimmed(postSlotLength: number): void {
+    this.observationalEngine?.onSourceHistoryTailTrimmed(postSlotLength);
+  }
+
+  /**
    * Register observation event handler.
    */
   onObservation(handler: (event: ObservationEvent) => void): void {

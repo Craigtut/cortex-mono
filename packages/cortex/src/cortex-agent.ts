@@ -1278,7 +1278,24 @@ export class CortexAgent {
     const trimCount = this.trailingFailureTrimCount();
     if (trimCount > 0) {
       messages.splice(messages.length - trimCount, trimCount);
+      this.notifySourceHistoryTailTrimmed();
     }
+  }
+
+  /**
+   * Tell the compaction manager the tail of the post-slot source history was
+   * trimmed, so the observational buffer watermark (and any in-flight
+   * observer end index) can be clamped to the surviving length. pi emits
+   * turn_end for trimmed messages before Cortex removes them, so without
+   * this the watermark can end up counting messages that no longer exist and
+   * the next activation would slice away unobserved ones.
+   */
+  private notifySourceHistoryTailTrimmed(): void {
+    const postSlotLength = Math.max(
+      0,
+      this.agent.state.messages.length - this.contextManager.slotCount,
+    );
+    this.compactionManager.onSourceHistoryTailTrimmed(postSlotLength);
   }
 
   /**
@@ -5095,6 +5112,7 @@ export class CortexAgent {
     }
     if (end < messages.length) {
       messages.splice(end, messages.length - end);
+      this.notifySourceHistoryTailTrimmed();
     }
     if (messages.length <= preDeliveryCount) {
       // Nothing beyond the pre-delivery transcript survived (the failure
@@ -5109,6 +5127,7 @@ export class CortexAgent {
       const last = messages[messages.length - 1] as unknown as Record<string, unknown>;
       if (last['role'] === 'user') {
         messages.pop();
+        this.notifySourceHistoryTailTrimmed();
         return true;
       }
     }
