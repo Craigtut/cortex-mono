@@ -36,7 +36,7 @@ The breaking-change phase. Wants clean CI before starting; lands as a small numb
 7. **Ask registry.** Facade-queryable pending-ask collection with per-ask nonces, a `voiced` state field, and a mandatory verbatim `renderedRequest` (today: one anonymous nullable slot per tracked child). **[R-F2, R-F14]**
 8. **Headline feed API.** A small `AgentLoop` surface letting the facade feed the headline block into a loop's `transformContext`; `buildBackgroundTaskState` and its injection point are private and loop-local today. **[R-plan]**
 9. **Non-blocking compaction posture.** A loop mode that disables the synchronous observer fallback, leaving emergency truncation as the only in-band path (for the talker). **[R-F7]**
-10. **Idle-digestion entry point.** An `AgentLoop` API to run pending observation buffers and threshold compaction outside a prompt. Observation currently triggers on `turn_end` and compaction runs inside `transformContext`; there is no way to do either between turns, so the committed claim that the facade digests during idle windows has no primitive behind it. **[R2-idle]**
+10. **Idle-digestion entry point.** An `AgentLoop` API to run pending observation buffers and threshold compaction outside a prompt. Correction found during implementation: `checkAndRunCompaction` already provided an outside-prompt L2 path, so the gap was observation specifically, not compaction. Also, in-band L3 is view-only, so digestion's durable work is activation plus L2. **[R2-idle]**
 11. **Usage accounting.** Accumulate direct/utility completion usage into per-loop session usage under a category tag and emit a usage event, so the P2 aggregate guard can see observer, reflector, and summarization spend instead of shipping blind. **[R2-B4]**
 
 ## Phase 2: The Facade

@@ -29,14 +29,17 @@ Deliverables, directives, conversation deltas, permission asks: anything a loop 
 
 `deliver()` is a state machine over (loop-gate depth, pi run state, abort state) with four outcomes, specified in P1 rather than P0 because the semantics are subtle:
 
-| State | Action | Note |
-|---|---|---|
-| idle, wake wanted | prompt | starts a turn |
-| idle, no wake (`silent`) | **facade-owned queue**, flushed into the next prompt's message array | see the warning below: pi's steering queue is the wrong mechanism |
-| running | steer | lands at the next turn boundary |
-| gate held, pi idle (retry backoff, drain window) | steer | the state the original three-way spec omitted |
+Wake class is the primary axis, loop state the secondary one. Silent never steers, in any state:
 
-**The silent queue must never be pi's steering queue while a run is live.** After a terminated tool batch, `runLoop` still polls `getSteeringMessages()` and continues the inner loop if anything is queued. A silent delivery parked there during a talker turn would therefore drain immediately after the control-tool batch and produce an unprompted spoken response to content that was supposed to surface only when relevant. The facade holds silent-class content itself and prepends it to the next real prompt.
+| Wake | Loop state | Action |
+|---|---|---|
+| wake | idle | prompt (starts a turn; the caller's promise is that turn) |
+| wake | running, or gate held with pi idle (retry backoff, drain window) | steer (lands at the next turn boundary) |
+| `silent` | any | loop-owned queue, flushed as leading messages of the next real prompt |
+
+**Silent must never reach pi's steering queue, including while a run is live.** After a terminated tool batch, `runLoop` still polls `getSteeringMessages()` and continues the inner loop if anything is queued. A silent delivery parked there during a talker turn would drain immediately after the control-tool batch and produce an unprompted spoken response to content that was supposed to surface only when relevant. Steering silent content into a running turn is the same mistake wearing a different hat: it lands at that run's next turn boundary and gets acted on, which is a wake by another name.
+
+The silent queue flushes into real prompts only, never into drain-started background-completion runs, because those runs depend on the pre-delivery message count for the unwind accounting added in Phase 0.
 
 A message delivered into a running turn extends that turn, so it inherits its budget window, retry window, and consumer promise. The implementation lives inside the loop gate; a check-then-call version has a time-of-check race against `prompt()`, which throws whenever the gate is held.
 
