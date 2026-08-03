@@ -205,6 +205,94 @@ describe('CortexAgent spawn-path lifecycle', () => {
       await expect(agent.cancelSubAgent('nope')).resolves.toBe(false);
     });
 
+    it('reports a cancelled foreground child as cancelled, not failed', async () => {
+      // The cancel destroys the child mid-run, which surfaces in
+      // runSubAgent's catch as an abort-shaped failure; the SubAgent tool
+      // must still see the cancel as a cancel.
+      const agent = createTestCortexAgent();
+      const child = createHangingChild();
+      const internal = agent as unknown as SpawnInternals;
+      internal.createChildAgent = vi.fn().mockResolvedValue(child);
+
+      const spawnPromise = internal.spawnForegroundSubAgentInternal({
+        instructions: 'long task',
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      const [taskId] = agent.getSubAgentManager().getActiveTaskIds();
+      expect(taskId).toBeTruthy();
+
+      await agent.cancelSubAgent(taskId!);
+
+      const result = await spawnPromise;
+      expect(result.status).toBe('cancelled');
+    });
+
+    it('cancels cleanly while the child sits in a pending permission ask', async () => {
+      const agent = createTestCortexAgent();
+      const child = createHangingChild();
+      const internal = agent as unknown as SpawnInternals;
+      internal.createChildAgent = vi.fn().mockResolvedValue(child);
+
+      const { taskId } = await agent.spawnBackgroundSubAgent({ instructions: 'guarded work' });
+      const entry = agent.getSubAgentManager().get(taskId)!;
+      // The child is mid-ask: a consumer permission prompt is outstanding.
+      entry.pendingPermission = { toolName: 'Bash', args: { command: 'rm -rf build' } };
+      expect(agent.getActiveSubAgents()[0]!.status).toBe('waiting-for-permission');
+
+      const cancelled = await agent.cancelSubAgent(taskId);
+
+      expect(cancelled).toBe(true);
+      expect(child.destroy).toHaveBeenCalled();
+      expect(agent.getSubAgentManager().get(taskId)).toBeUndefined();
+      expect(agent.getActiveSubAgents()).toHaveLength(0);
+      await expect(entry.completion).resolves.toMatchObject({ status: 'cancelled' });
+    });
+
+    it('clears the pending-permission marker when the child ask loses the abort race', async () => {
+      // The child's beforeToolCall races the consumer resolver against the
+      // run's abort signal. When abort wins, the resolver is left pending
+      // (the consumer may never answer the dismissed prompt), so the marker
+      // must be cleared by the abort itself, not only by resolver settle.
+      const agent = createTestCortexAgent();
+      const manager = agent.getSubAgentManager();
+      manager.track({
+        taskId: 'perm-task',
+        agent: {},
+        instructions: 'guarded work',
+        background: true,
+        spawnedAt: Date.now(),
+        completion: Promise.resolve({
+          output: '',
+          status: 'cancelled',
+          usage: { turns: 0, cost: 0, durationMs: 0, contextTokens: 0 },
+        }),
+        resolve: () => {},
+        toolCount: 0,
+        lastToolName: null,
+        lastToolSummary: null,
+        lastToolStartedAt: null,
+        pendingPermission: null,
+      });
+
+      const wrapped = (agent as unknown as {
+        wrapChildPermissionResolver: (
+          resolver: (toolName: string, toolArgs: unknown, context?: { signal?: AbortSignal }) => Promise<boolean>,
+          taskId: string,
+        ) => (toolName: string, toolArgs: unknown, context?: { signal?: AbortSignal }) => Promise<unknown>;
+      }).wrapChildPermissionResolver(
+        () => new Promise<boolean>(() => {}), // consumer never answers
+        'perm-task',
+      );
+
+      const controller = new AbortController();
+      void wrapped('Bash', { command: 'ls' }, { signal: controller.signal });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(manager.get('perm-task')!.pendingPermission).toMatchObject({ toolName: 'Bash' });
+
+      controller.abort();
+      expect(manager.get('perm-task')!.pendingPermission).toBeNull();
+    });
+
     it('purges a queued pending result for the cancelled task', async () => {
       const agent = createTestCortexAgent();
       const internal = agent as unknown as DeliveryInternals;

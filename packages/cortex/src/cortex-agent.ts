@@ -5473,21 +5473,10 @@ export class CortexAgent {
     if (this.persistResult) childCortexConfig.persistResult = this.persistResult;
     if (this.toolResultThresholds) childCortexConfig.toolResultThresholds = this.toolResultThresholds;
     if (this.config.resolvePermission) {
-      const parentResolver = this.config.resolvePermission;
-      const subAgentMgr = this.subAgentManager;
-      const childTaskId = params.taskId;
-      childCortexConfig.resolvePermission = async (toolName, toolArgs, context) => {
-        const entry = subAgentMgr.get(childTaskId);
-        if (entry) entry.pendingPermission = { toolName, args: toolArgs };
-        try {
-          // Forward the child run's abort signal so the consumer UI can
-          // dismiss a prompt made moot by the child being cancelled.
-          return await parentResolver(toolName, toolArgs, context);
-        } finally {
-          const e = subAgentMgr.get(childTaskId);
-          if (e) e.pendingPermission = null;
-        }
-      };
+      childCortexConfig.resolvePermission = this.wrapChildPermissionResolver(
+        this.config.resolvePermission,
+        params.taskId,
+      );
     }
 
     const childCreateParams: {
@@ -5524,6 +5513,43 @@ export class CortexAgent {
     }
     childAgent.setCacheRetention(this.getCacheRetention() ?? 'none');
     return childAgent;
+  }
+
+  /**
+   * Wrap the consumer's permission resolver for a child agent: mark the
+   * tracked entry as waiting for permission while the ask is pending, and
+   * clear the marker however the ask ends.
+   *
+   * When the child run aborts while the ask is pending, the race in the
+   * child's beforeToolCall proceeds with a block WITHOUT settling this
+   * resolver (the consumer may never answer the dismissed prompt), so the
+   * finally alone is not enough: the marker is also cleared on the abort
+   * signal, or the entry lingers as 'waiting-for-permission' in status
+   * surfaces and the headline block.
+   */
+  private wrapChildPermissionResolver(
+    parentResolver: NonNullable<CortexAgentConfig['resolvePermission']>,
+    childTaskId: string,
+  ): NonNullable<CortexAgentConfig['resolvePermission']> {
+    const subAgentMgr = this.subAgentManager;
+    return async (toolName, toolArgs, context) => {
+      const entry = subAgentMgr.get(childTaskId);
+      if (entry) entry.pendingPermission = { toolName, args: toolArgs };
+      const clearPending = (): void => {
+        const e = subAgentMgr.get(childTaskId);
+        if (e) e.pendingPermission = null;
+      };
+      const signal = context?.signal;
+      signal?.addEventListener('abort', clearPending, { once: true });
+      try {
+        // Forward the child run's abort signal so the consumer UI can
+        // dismiss a prompt made moot by the child being cancelled.
+        return await parentResolver(toolName, toolArgs, context);
+      } finally {
+        signal?.removeEventListener('abort', clearPending);
+        clearPending();
+      }
+    };
   }
 
   private resolveChildPromptSeed(systemPrompt?: string): {
@@ -5583,10 +5609,16 @@ export class CortexAgent {
       return result;
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
+      // A cancel destroys the child mid-run, which surfaces here as an
+      // abort-shaped prompt failure. The cancel already resolved the
+      // tracked completion as cancelled and fired its hooks; report the
+      // same status instead of overriding it with 'failed' (the foreground
+      // path returns this result directly to the SubAgent tool).
+      const cancelled = this.subAgentManager.isCancelled(taskId);
 
       const result: SubAgentResult = {
         output: '',
-        status: 'failed',
+        status: cancelled ? 'cancelled' : 'failed',
         usage: {
           turns: childAgent.getBudgetGuard().getTurnCount(),
           cost: childAgent.getBudgetGuard().getTotalCost(),
@@ -5595,7 +5627,9 @@ export class CortexAgent {
         },
       };
 
-      this.subAgentManager.fail(taskId, errorMsg);
+      if (!cancelled) {
+        this.subAgentManager.fail(taskId, errorMsg);
+      }
 
       // Clean up child agent
       try {
