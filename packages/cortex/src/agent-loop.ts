@@ -474,8 +474,13 @@ export interface DeliverResult {
 interface QueuedDelivery {
   content: string;
   timestamp: number;
-  /** Failed sweep-run attempts so far (wake parking only). */
+  /** Failed delivery-run attempts so far (wake parking only). */
   deliveryAttempts?: number;
+  /**
+   * When the first delivery run for this item started (wake parking only).
+   * Bounds total time spent in failed attempts via the elapsed budget.
+   */
+  firstDeliveryAttemptAt?: number;
 }
 
 /** Options for {@link AgentLoop.digestIdle}. */
@@ -571,11 +576,22 @@ const MAX_BACKGROUND_DELIVERY_ATTEMPTS = 3;
 
 /**
  * Sweep-run attempts per parked wake delivery before it is dropped. Each
- * attempt already runs the full in-run retry ladder for transient
- * failures, so a failure that escapes it is terminal-shaped; a small cap
- * bounds the redelivery loop without giving up on the first hiccup.
+ * attempt runs an in-run retry ladder for transient failures (bounded by
+ * the elapsed budget below), so a failure that escapes it is
+ * terminal-shaped; a small cap bounds the redelivery loop without giving
+ * up on the first hiccup.
  */
 const MAX_WAKE_DELIVERY_ATTEMPTS = 3;
+
+/**
+ * Total time a parked wake delivery may spend in failed sweep attempts
+ * before it is dropped. The attempt cap alone would let each sweep run
+ * re-enter the full in-run retry ladder (~3h under the default policy)
+ * back-to-back while holding the loop gate through a sustained outage, so
+ * the remaining budget also caps each attempt's ladder via maxElapsedMs,
+ * mirroring the background drain's delivery budget.
+ */
+const MAX_WAKE_DELIVERY_ELAPSED_MS = 4 * 60 * 60 * 1000;
 
 /**
  * Total time a background completion may spend in delivery attempts
@@ -1890,9 +1906,13 @@ export class AgentLoop {
    * unwound from the pre-delivery boundary (so a run that failed after an
    * assistant tool-call turn cannot leave an unpaired tool call), and
    * unwound content returns to the parked list for a bounded number of
-   * further sweep attempts rather than being dropped. Content the failed
-   * run progressed past stays in the transcript as durable history, where
-   * the next successful run sees it; re-parking it would duplicate it.
+   * further sweep attempts rather than being dropped. Both bounds the
+   * drain applies hold here too: an attempt cap, and an elapsed delivery
+   * budget that also caps each attempt's in-run retry ladder (via
+   * maxElapsedMs), so a sustained outage cannot hold the gate for full
+   * ladders back-to-back. Content the failed run progressed past stays in
+   * the transcript as durable history, where the next successful run sees
+   * it; re-parking it would duplicate it.
    */
   private async sweepParkedWakeDeliveries(): Promise<void> {
     if (this.pendingWakeDeliveries.length === 0) return;
@@ -1912,6 +1932,28 @@ export class AgentLoop {
     this.logger.info('delivering parked wake deliveries with a run', {
       count: pending.length,
     });
+    // Remaining delivery budget for the oldest item in this batch, exactly
+    // as the background drain computes it: each attempt's in-run retry
+    // ladder is capped to what is left (via maxElapsedMs), so re-parked
+    // attempts cannot hold the loop gate for full ladders back-to-back
+    // during a sustained outage.
+    const now = Date.now();
+    for (const item of pending) item.firstDeliveryAttemptAt ??= now;
+    const oldestFirstAttemptAt = pending.reduce(
+      (oldest, item) => Math.min(oldest, item.firstDeliveryAttemptAt ?? oldest),
+      now,
+    );
+    const remainingBudgetMs = Math.max(
+      0,
+      MAX_WAKE_DELIVERY_ELAPSED_MS - (now - oldestFirstAttemptAt),
+    );
+    const boundedRetryPolicy: RetryPolicy = {
+      ...this.retryPolicy,
+      maxElapsedMs: Math.min(
+        this.retryPolicy.maxElapsedMs ?? Number.POSITIVE_INFINITY,
+        remainingBudgetMs,
+      ),
+    };
     // Boundary for the failure unwind, captured like the drain captures it:
     // pi pushes the delivery message at run start, before any model call.
     const preDeliveryCount = this.agent.state.messages.length;
@@ -1921,7 +1963,7 @@ export class AgentLoop {
       // the silent queue (its contract is "next real prompt", and the
       // unwind below counts messages from the pre-delivery boundary, which
       // flushed extras would corrupt).
-      await this.runPromptOnce(message, undefined, true);
+      await this.runPromptOnce(message, undefined, true, boundedRetryPolicy);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       if (!this.unwindFailedDelivery(preDeliveryCount)) {
@@ -1939,11 +1981,14 @@ export class AgentLoop {
         });
         return;
       }
-      // Otherwise re-park for another sweep attempt, dropping items that
-      // keep failing so a terminal error cannot loop the gate forever.
+      // Otherwise re-park for another sweep attempt, dropping items whose
+      // attempt cap or total delivery budget is exhausted so a terminal
+      // error cannot loop the gate forever.
       const requeue = pending.filter((item) => {
         item.deliveryAttempts = (item.deliveryAttempts ?? 0) + 1;
-        return item.deliveryAttempts < MAX_WAKE_DELIVERY_ATTEMPTS;
+        if (item.deliveryAttempts >= MAX_WAKE_DELIVERY_ATTEMPTS) return false;
+        const elapsedMs = Date.now() - (item.firstDeliveryAttemptAt ?? Date.now());
+        return elapsedMs < MAX_WAKE_DELIVERY_ELAPSED_MS;
       });
       if (requeue.length < pending.length) {
         this.logger.error('dropping parked wake deliveries after repeated failed runs', {

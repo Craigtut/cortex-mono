@@ -610,6 +610,61 @@ describe('AgentLoop.deliver sweep failure recovery', () => {
     expect(loop.pendingWakeDeliveryCount).toBe(0);
   });
 
+  it('caps a sweep attempt in-run retry ladder by the remaining wake-delivery budget', async () => {
+    // Retry enabled: a network failure would normally schedule an in-run
+    // retry, and each re-parked sweep attempt would re-enter the full
+    // ladder (~3h under the default policy) while holding the loop gate.
+    // With the item's delivery budget exhausted, the bounded policy the
+    // sweep passes down must fail fast and drop the item instead.
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, {
+      retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 3 },
+    });
+    const scheduled = vi.fn();
+    const errored = vi.fn();
+    loop.onRetryScheduled(scheduled);
+    loop.onError(errored);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      piAgent.state.messages.push({
+        role: 'assistant',
+        content: [],
+        stopReason: 'error',
+        errorMessage: 'connect ECONNREFUSED',
+      } as never);
+      throw new Error('connect ECONNREFUSED');
+    };
+
+    // Park through the real API (an empty drain holds the gate), then age
+    // the item: its first delivery run started five hours ago, so earlier
+    // attempts already consumed the whole elapsed budget.
+    const drain = (loop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    loop.deliver('over-budget parked content');
+    const internal = loop as unknown as {
+      pendingWakeDeliveries: Array<{ deliveryAttempts?: number; firstDeliveryAttemptAt?: number }>;
+    };
+    internal.pendingWakeDeliveries[0]!.deliveryAttempts = 1;
+    internal.pendingWakeDeliveries[0]!.firstDeliveryAttemptAt =
+      Date.now() - 5 * 60 * 60 * 1000;
+    await drain;
+
+    await waitUntil(() => errored.mock.calls.length === 1 && !loop.isLoopActive);
+    // One attempt, no in-run retry ladder, then the drop surfaces once.
+    expect(scheduled).not.toHaveBeenCalled();
+    expect(piAgent.promptCalls).toHaveLength(1);
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+    expect(occurrences(piAgent, 'over-budget parked content')).toBe(0);
+  });
+
   it('drops parked content after repeated failed sweep runs instead of looping', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
