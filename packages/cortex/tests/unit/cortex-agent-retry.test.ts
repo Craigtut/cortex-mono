@@ -402,9 +402,12 @@ describe('CortexAgent abort-stub trim', () => {
     expect(lastMessage(mock).role).toBe('user');
   });
 
-  it('trims a cleanly-aborted stub when the run resolves without an error state', async () => {
-    // Abort mid-stream without a throw: pi records a stopReason 'aborted'
-    // message (no errorMessage) and prompt() resolves normally.
+  /**
+   * A mock whose single run parks until abort, then appends an aborted
+   * assistant message with the given content (mirroring pi returning the
+   * accumulated partial content with stopReason 'aborted', no error state).
+   */
+  function createCleanAbortMock(abortedContent: unknown): RetryMockAgent {
     const mock = createRetryMock([]);
     let releasePrompt: (() => void) | null = null;
     let idleResolve: (() => void) | null = null;
@@ -415,7 +418,7 @@ describe('CortexAgent abort-stub trim', () => {
       await new Promise<void>((resolve) => { releasePrompt = resolve; });
       mock.state.messages.push({
         role: 'assistant',
-        content: [{ type: 'text', text: 'partial answer' }],
+        content: abortedContent,
         stopReason: 'aborted',
       } as never);
       idleResolve?.();
@@ -430,13 +433,49 @@ describe('CortexAgent abort-stub trim', () => {
       releasePrompt?.();
       releasePrompt = null;
     };
+    return mock;
+  }
 
+  async function runCleanAbort(mock: RetryMockAgent): Promise<void> {
     const agent = build(mock, createConfig());
     const turn = agent.prompt('hi');
     await new Promise((resolve) => setImmediate(resolve));
-
     await agent.abort();
     await turn;
+  }
+
+  it('keeps partial assistant text the user already saw when a clean abort ends the run', async () => {
+    // Abort mid-stream without a throw: pi records the accumulated partial
+    // content with stopReason 'aborted' and prompt() resolves normally. The
+    // streamed text was already rendered by the consumer UI, so trimming it
+    // would make the model forget an answer the user read.
+    const mock = createCleanAbortMock([{ type: 'text', text: 'partial answer' }]);
+
+    await runCleanAbort(mock);
+
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'aborted' });
+    const content = lastMessage(mock) as { content?: Array<{ text?: string }> };
+    expect(content.content?.[0]?.text).toBe('partial answer');
+  });
+
+  it('trims a cleanly-aborted stub with no text content', async () => {
+    const mock = createCleanAbortMock([]);
+
+    await runCleanAbort(mock);
+
+    expect(lastMessage(mock).role).toBe('user');
+  });
+
+  it('trims an aborted message whose tool call would be left unpaired', async () => {
+    // Partial text plus a dispatched tool call whose result never ran: an
+    // unpaired tool call in history is a hard provider error on the next
+    // request, so the whole message goes even at the cost of the text.
+    const mock = createCleanAbortMock([
+      { type: 'text', text: 'let me check that file' },
+      { type: 'toolCall', toolCallId: 'tc_1', name: 'Read', args: {} },
+    ]);
+
+    await runCleanAbort(mock);
 
     expect(lastMessage(mock).role).toBe('user');
   });

@@ -1212,16 +1212,47 @@ export class CortexAgent {
 
   /**
    * Whether a transcript message is a synthetic failure stub that trimming
-   * may remove: an assistant message pi appended for a failed or aborted
-   * run (stopReason 'error'/'aborted' or errorMessage set).
+   * may remove. Error stubs (stopReason 'error' or errorMessage set) are
+   * always trimmable: pi appends them with empty content, and continue()
+   * rejects a trailing assistant turn.
+   *
+   * An aborted message (stopReason 'aborted') is different: pi returns the
+   * accumulated PARTIAL content with that stopReason, and a consumer UI has
+   * already shown any streamed text to the user. Trimming it would make the
+   * model forget an answer the user read. So an aborted message is only
+   * trimmable when it has no text to keep, or when it carries tool calls
+   * (trailing ones are unpaired by construction, and an unpaired tool call
+   * in history is a hard provider error on the next request).
    */
   private static isTrimmableFailureMessage(msg: Record<string, unknown>): boolean {
-    return (
-      msg['role'] === 'assistant' &&
-      (msg['stopReason'] === 'error' ||
-        msg['stopReason'] === 'aborted' ||
-        msg['errorMessage'] != null)
-    );
+    if (msg['role'] !== 'assistant') return false;
+    const isAborted = msg['stopReason'] === 'aborted';
+    if (msg['stopReason'] === 'error' || (msg['errorMessage'] != null && !isAborted)) {
+      return true;
+    }
+    if (!isAborted) return false;
+    return !CortexAgent.messageHasText(msg) || CortexAgent.messageHasToolCalls(msg);
+  }
+
+  /** Whether an assistant message carries non-empty text content. */
+  private static messageHasText(msg: Record<string, unknown>): boolean {
+    const content = msg['content'];
+    if (typeof content === 'string') return content.length > 0;
+    if (!Array.isArray(content)) return false;
+    return content.some((part) => {
+      const p = part as Record<string, unknown>;
+      return p['type'] === 'text' && typeof p['text'] === 'string' && p['text'].length > 0;
+    });
+  }
+
+  /** Whether an assistant message contains tool-call content parts. */
+  private static messageHasToolCalls(msg: Record<string, unknown>): boolean {
+    const content = msg['content'];
+    if (!Array.isArray(content)) return false;
+    return content.some((part) => {
+      const type = (part as Record<string, unknown>)['type'];
+      return type === 'toolCall' || type === 'tool_use';
+    });
   }
 
   /**
