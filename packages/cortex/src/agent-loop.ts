@@ -105,6 +105,8 @@ import type {
   TrackedSubAgent,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
+  ToolPermissionRequestContext,
+  LoopOriginContext,
   ThinkingLevel,
   ModelThinkingCapabilities,
   ToolExecuteContext,
@@ -399,6 +401,25 @@ const PERMISSION_RACE_ABORTED = Symbol('permission-race-aborted');
 const ABORTED_PERMISSION_REASON =
   'The run was aborted before this tool call was approved; it was not run.';
 
+/** Loop identity used when the consumer does not configure one. */
+const DEFAULT_LOOP_PATH = 'main';
+
+/**
+ * Wrap a logger so every message carries the loop's identity prefix. All
+ * components logging through the loop's logger (the loop itself, the prompt
+ * watchdog, the event bridge, budget guard, compaction, MCP) inherit it, so
+ * concurrent loops stay distinguishable in shared log output.
+ */
+function prefixLoggerWithLoopPath(logger: CortexLogger, loopPath: string): CortexLogger {
+  const prefix = `[AgentLoop:${loopPath}]`;
+  return {
+    debug: (message, data) => logger.debug(`${prefix} ${message}`, data),
+    info: (message, data) => logger.info(`${prefix} ${message}`, data),
+    warn: (message, data) => logger.warn(`${prefix} ${message}`, data),
+    error: (message, data) => logger.error(`${prefix} ${message}`, data),
+  };
+}
+
 /** Delivery attempts per background completion before dead-lettering. */
 const MAX_BACKGROUND_DELIVERY_ATTEMPTS = 3;
 
@@ -446,6 +467,12 @@ export class AgentLoop {
   private readonly config: AgentLoopConfig;
   private readonly retryPolicy: RetryPolicy;
   private readonly logger: CortexLogger;
+  /**
+   * Path identity of this loop (config `loopPath`, default 'main'). Threaded
+   * through permission asks, callback origin context, persistResult metadata,
+   * and log prefixes; sub-agents extend it with '/<taskId>'.
+   */
+  readonly loopPath: string;
   private readonly promptDiagnostics: PromptWatchdogDiagnostics;
   private workingTagsEnabled: boolean;
   private readonly workingDirectory: string;
@@ -489,7 +516,11 @@ export class AgentLoop {
 
   // Tool result persistence (proactive, at execution boundary).
   // Same callback flows to compaction (reactive) via MicrocompactionConfig.
+  // `persistResult` is the consumer callback wrapped to stamp this loop's
+  // identity into metadata; `persistResultRaw` is the unwrapped consumer
+  // callback, inherited by child loops so they stamp their own path.
   private readonly persistResult?: PersistResultFn;
+  private readonly persistResultRaw?: PersistResultFn;
   private readonly toolCategories?: Record<string, ToolCategory>;
   private readonly toolResultThresholds?: Record<string, number>;
 
@@ -501,7 +532,7 @@ export class AgentLoop {
 
   // Event handlers (consumer-registered callbacks)
   private loopCompleteHandlers: Array<() => void> = [];
-  private errorHandlers: Array<(error: ClassifiedError) => void> = [];
+  private errorHandlers: Array<(error: ClassifiedError, origin: LoopOriginContext) => void> = [];
   private retryScheduledHandlers: Array<(info: RetryScheduledInfo) => void> = [];
   private retrySucceededHandlers: Array<(info: RetrySucceededInfo) => void> = [];
   private retryExhaustedHandlers: Array<(info: RetryExhaustedInfo) => void> = [];
@@ -509,7 +540,7 @@ export class AgentLoop {
   private compactionErrorHandlers: Array<(error: Error) => void> = [];
   private compactionDegradedHandlers: Array<(info: CompactionDegradedInfo) => void> = [];
   private compactionExhaustedHandlers: Array<(info: CompactionExhaustedInfo) => void> = [];
-  private turnCompleteHandlers: Array<(output: AgentTextOutput) => void> = [];
+  private turnCompleteHandlers: Array<(output: AgentTextOutput, origin: LoopOriginContext) => void> = [];
   private subAgentSpawnedHandlers: Array<(taskId: string, instructions: string, background: boolean) => void> = [];
   private subAgentCompletedHandlers: Array<(taskId: string, result: string, status: string, usage: unknown) => void> = [];
   private subAgentFailedHandlers: Array<(taskId: string, error: string) => void> = [];
@@ -606,7 +637,8 @@ export class AgentLoop {
     this.agent = agent;
     this.config = config;
     this.retryPolicy = resolveRetryPolicy(config.retryPolicy);
-    this.logger = config.logger ?? NOOP_LOGGER;
+    this.loopPath = config.loopPath ?? DEFAULT_LOOP_PATH;
+    this.logger = prefixLoggerWithLoopPath(config.logger ?? NOOP_LOGGER, this.loopPath);
     this.promptDiagnostics = new PromptWatchdogDiagnostics(
       config.diagnostics?.promptWatchdog,
       this.logger,
@@ -614,6 +646,7 @@ export class AgentLoop {
         isPrompting: () => this._isPrompting,
         isAbortRequested: () => this.isAborted(),
       },
+      this.loopPath,
     );
     this.workingTagsEnabled = config.workingTags?.enabled ?? true;
     this.workingDirectory = config.workingDirectory;
@@ -652,16 +685,20 @@ export class AgentLoop {
     // Propagate it into MicrocompactionConfig so reactive paths (compaction
     // trim, aggregate budget enforcement) and the proactive interceptor share
     // the same callback.
-    if (config.persistResult) {
-      this.persistResult = config.persistResult;
-      if (compactionConfig.microcompaction.persistResult && compactionConfig.microcompaction.persistResult !== config.persistResult) {
-        this.logger.debug('[AgentLoop] top-level persistResult overrides compaction.microcompaction.persistResult');
-      }
-      compactionConfig.microcompaction.persistResult = config.persistResult;
-    } else if (compactionConfig.microcompaction.persistResult) {
-      // Backwards compatibility: consumer set it only on compaction config.
-      // Use it for the proactive interceptor as well.
-      this.persistResult = compactionConfig.microcompaction.persistResult;
+    if (config.persistResult && compactionConfig.microcompaction.persistResult
+      && compactionConfig.microcompaction.persistResult !== config.persistResult) {
+      this.logger.debug('top-level persistResult overrides compaction.microcompaction.persistResult');
+    }
+    // Backwards compatibility: a callback set only on the compaction config
+    // is used for the proactive interceptor as well.
+    const consumerPersistResult = config.persistResult ?? compactionConfig.microcompaction.persistResult;
+    if (consumerPersistResult) {
+      this.persistResultRaw = consumerPersistResult;
+      // Stamp this loop's identity into the metadata of every persistence
+      // call, proactive and reactive alike.
+      this.persistResult = (content, metadata) =>
+        consumerPersistResult(content, { ...metadata, loopPath: this.loopPath });
+      compactionConfig.microcompaction.persistResult = this.persistResult;
     }
     if (compactionConfig.microcompaction.toolCategories) {
       this.toolCategories = compactionConfig.microcompaction.toolCategories;
@@ -1022,7 +1059,7 @@ export class AgentLoop {
     // across ticks and can be cached, while new content changes each tick.
     this._prePromptMessageCount = this.agent.state.messages.length;
 
-    this.logger.debug('[AgentLoop] loop start', {
+    this.logger.debug('loop start', {
       messageCount: this._prePromptMessageCount,
       inputLength: input.length,
     });
@@ -1055,7 +1092,7 @@ export class AgentLoop {
       this._activePromptCacheRetention = null;
       this._isPrompting = false;
 
-      this.logger.debug('[AgentLoop] loop complete', {
+      this.logger.debug('loop complete', {
         durationMs: Date.now() - loopStartMs,
         turns: this.budgetGuard.getTurnCount(),
         totalCost: this.budgetGuard.getTotalCost(),
@@ -1211,7 +1248,7 @@ export class AgentLoop {
           scheduled.causeDetail = classified.causeDetail;
         }
         this.fireRetryScheduled(scheduled);
-        this.logger.warn('[AgentLoop] scheduling background retry', {
+        this.logger.warn('scheduling background retry', {
           category: classified.category,
           attempt: attemptNumber,
           maxAttempts: policy.maxAttempts,
@@ -1378,7 +1415,7 @@ export class AgentLoop {
       try {
         handler(info);
       } catch (err) {
-        this.logger.error('[AgentLoop] onRetryScheduled handler threw', {
+        this.logger.error('onRetryScheduled handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -1390,7 +1427,7 @@ export class AgentLoop {
       try {
         handler(info);
       } catch (err) {
-        this.logger.error('[AgentLoop] onRetrySucceeded handler threw', {
+        this.logger.error('onRetrySucceeded handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -1402,7 +1439,7 @@ export class AgentLoop {
       try {
         handler(info);
       } catch (err) {
-        this.logger.error('[AgentLoop] onRetryExhausted handler threw', {
+        this.logger.error('onRetryExhausted handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -1450,7 +1487,7 @@ export class AgentLoop {
       wasAborted: wasAborted ?? this.isAborted(),
     });
 
-    this.logger.warn('[AgentLoop] error', {
+    this.logger.warn('error', {
       category: classified.category,
       severity: classified.severity,
       message: classified.originalMessage,
@@ -1459,9 +1496,9 @@ export class AgentLoop {
 
     for (const handler of this.errorHandlers) {
       try {
-        handler(classified);
+        handler(classified, { loopPath: this.loopPath });
       } catch (handlerErr) {
-        this.logger.error('[AgentLoop] onError handler threw', {
+        this.logger.error('onError handler threw', {
           error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
         });
       }
@@ -1606,7 +1643,7 @@ export class AgentLoop {
       // Capture usage from the AssistantMessage response
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-      this.logger.debug('[AgentLoop] directComplete', {
+      this.logger.debug('directComplete', {
         durationMs: Date.now() - directStartMs,
         usage: this._lastDirectUsage,
       });
@@ -1707,7 +1744,7 @@ export class AgentLoop {
       // Capture usage from the AssistantMessage response
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-      this.logger.debug('[AgentLoop] structuredComplete', {
+      this.logger.debug('structuredComplete', {
         toolName,
         durationMs: Date.now() - structStartMs,
         usage: this._lastDirectUsage,
@@ -1846,6 +1883,7 @@ export class AgentLoop {
     if (cortexConfig.resolvePermission) {
       const resolver = cortexConfig.resolvePermission;
       const sandboxConfigured = cortexConfig.sandbox !== undefined;
+      const loopPath = cortexConfig.loopPath ?? DEFAULT_LOOP_PATH;
       agentConfig['beforeToolCall'] = async (ctx: unknown, signal?: AbortSignal) => {
         const { toolCall, args } = ctx as { toolCall: { name: string }; args: unknown };
         // Spawning a sub-agent is an internal orchestration decision, not a
@@ -1864,13 +1902,22 @@ export class AgentLoop {
         // sandbox is configured; without one the flag changes nothing.
         const escalation = sandboxConfigured && isBashEscalationRequest(toolCall.name, args);
         const permissionName = escalation ? BASH_ESCALATION_PERMISSION_NAME : toolCall.name;
+        // Each ask carries a fresh nonce plus the asking loop's identity, so
+        // a consumer fielding several concurrent loops can key prompt state
+        // per ask and attribute it. (The ask registry itself is a later
+        // phase; the id is generated here so the contract is stable now.)
+        const askContext: ToolPermissionRequestContext = {
+          askId: `ask-${crypto.randomUUID()}`,
+          loopPath,
+          ...(signal ? { signal } : {}),
+        };
         // Race the consumer's decision against the run's abort signal. pi
         // awaits this hook before checking the signal, so without the race a
         // pending human approval would hang abort/destroy into the force-kill
         // path. The signal is also passed to the resolver so the consumer UI
         // can dismiss the moot prompt.
         const resolution = await AgentLoop.raceResolutionAgainstAbort(
-          resolver(permissionName, args, signal ? { signal } : {}),
+          resolver(permissionName, args, askContext),
           signal,
         );
         if (resolution === PERMISSION_RACE_ABORTED) {
@@ -2754,7 +2801,7 @@ export class AgentLoop {
       // Capture usage from utility model calls
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
 
-      this.logger.debug('[AgentLoop] utilityComplete', {
+      this.logger.debug('utilityComplete', {
         durationMs: Date.now() - utilStartMs,
         usage: this._lastDirectUsage,
       });
@@ -2781,7 +2828,7 @@ export class AgentLoop {
     const unwound = this.turnUnwound;
 
     this.promptDiagnostics.recordAbortRequested();
-    this.logger.info('[AgentLoop] abort requested', { isPrompting: this._isPrompting });
+    this.logger.info('abort requested', { isPrompting: this._isPrompting });
     controller.abort();
     this.agent.abort();
     this.promptDiagnostics.startAbortWait();
@@ -2816,7 +2863,7 @@ export class AgentLoop {
     if (!this.isShuttingDown() && this.abortController === controller) {
       this.abortController = new AbortController();
     }
-    this.logger.info('[AgentLoop] abort complete');
+    this.logger.info('abort complete');
   }
 
   /**
@@ -2844,7 +2891,7 @@ export class AgentLoop {
       return this.destroyPromise; // Teardown already in progress, share it
     }
 
-    this.logger.info('[AgentLoop] destroy start', {
+    this.logger.info('destroy start', {
       activeSubAgents: this.subAgentManager.activeCount,
       mcpConnections: this.mcpClientManager.connectionCount,
     });
@@ -2880,7 +2927,7 @@ export class AgentLoop {
         }
         this.promptDiagnostics.stop();
         this.lifecycleState = 'destroyed';
-        this.logger.info('[AgentLoop] destroy complete');
+        this.logger.info('destroy complete');
       }
     })();
     return this.destroyPromise;
@@ -2926,8 +2973,9 @@ export class AgentLoop {
 
   /**
    * Register a handler for classified errors during the agentic loop.
+   * The origin context identifies which loop produced the error.
    */
-  onError(handler: (error: ClassifiedError) => void): void {
+  onError(handler: (error: ClassifiedError, origin: LoopOriginContext) => void): void {
     this.errorHandlers.push(handler);
   }
 
@@ -3008,8 +3056,9 @@ export class AgentLoop {
 
   /**
    * Register a handler for turn completion with parsed working tag output.
+   * The origin context identifies which loop completed the turn.
    */
-  onTurnComplete(handler: (output: AgentTextOutput) => void): void {
+  onTurnComplete(handler: (output: AgentTextOutput, origin: LoopOriginContext) => void): void {
     this.turnCompleteHandlers.push(handler);
   }
 
@@ -3919,10 +3968,10 @@ export class AgentLoop {
         // finally succeeds (errorMessage is cleared at the start of each run).
         const agentState = this.agent.state as Record<string, unknown>;
         if (agentState['errorMessage']) {
-          this.logger.info('[AgentLoop] loop_end suppressed (run ended in error; retry may follow)');
+          this.logger.info('loop_end suppressed (run ended in error; retry may follow)');
           return;
         }
-        this.logger.info('[AgentLoop] loop_end', {
+        this.logger.info('loop_end', {
           turns: this.budgetGuard.getTurnCount(),
           totalCost: this.budgetGuard.getTotalCost(),
           currentContextTokens: this.compactionManager.currentContextTokenCount,
@@ -3932,7 +3981,7 @@ export class AgentLoop {
           try {
             handler();
           } catch (err) {
-            this.logger.error('[AgentLoop] onLoopComplete handler threw', {
+            this.logger.error('onLoopComplete handler threw', {
               error: err instanceof Error ? err.message : String(err),
             });
           }
@@ -3992,7 +4041,7 @@ export class AgentLoop {
           this._sessionUsage.tokens.cacheRead += event.usage.cacheRead;
           this._sessionUsage.tokens.cacheWrite += event.usage.cacheWrite;
 
-          this.logger.debug('[AgentLoop] turn_end usage', {
+          this.logger.debug('turn_end usage', {
             input: event.usage.input,
             output: event.usage.output,
             cacheRead: event.usage.cacheRead,
@@ -4029,9 +4078,9 @@ export class AgentLoop {
           if (event.textOutput) {
             for (const handler of this.turnCompleteHandlers) {
               try {
-                handler(event.textOutput);
+                handler(event.textOutput, { loopPath: this.loopPath });
               } catch (err) {
-                this.logger.error('[AgentLoop] onTurnComplete handler threw', {
+                this.logger.error('onTurnComplete handler threw', {
                   error: err instanceof Error ? err.message : String(err),
                 });
               }
@@ -4044,9 +4093,9 @@ export class AgentLoop {
               const output = parseWorkingTags(text);
               for (const handler of this.turnCompleteHandlers) {
                 try {
-                  handler(output);
+                  handler(output, { loopPath: this.loopPath });
                 } catch (err) {
-                  this.logger.error('[AgentLoop] onTurnComplete handler threw', {
+                  this.logger.error('onTurnComplete handler threw', {
                     error: err instanceof Error ? err.message : String(err),
                   });
                 }
@@ -4568,7 +4617,7 @@ export class AgentLoop {
       this.pendingBackgroundResults = this.pendingBackgroundResults.filter(
         item => !(item.kind === 'subagent' && item.taskId === taskId),
       );
-      this.logger.info('[AgentLoop] subagent cancelled', { taskId });
+      this.logger.info('subagent cancelled', { taskId });
     }
     return cancelled;
   }
@@ -4644,7 +4693,7 @@ export class AgentLoop {
     } else {
       this.skillBuffer.push(skill);
     }
-    this.logger.info('[AgentLoop] skill loaded', {
+    this.logger.info('skill loaded', {
       name: skill.name,
       contentLength: skill.content.length,
       bufferSize: this.skillBuffer.length,
@@ -4675,7 +4724,7 @@ export class AgentLoop {
           try {
             handler(taskId, instructions, background);
           } catch (err) {
-            this.logger.error('[AgentLoop] onSubAgentSpawned handler threw', {
+            this.logger.error('onSubAgentSpawned handler threw', {
               taskId,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -4687,7 +4736,7 @@ export class AgentLoop {
           try {
             handler(taskId, result, status, usage);
           } catch (err) {
-            this.logger.error('[AgentLoop] onSubAgentCompleted handler threw', {
+            this.logger.error('onSubAgentCompleted handler threw', {
               taskId,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -4699,7 +4748,7 @@ export class AgentLoop {
           try {
             handler(taskId, error);
           } catch (err) {
-            this.logger.error('[AgentLoop] onSubAgentFailed handler threw', {
+            this.logger.error('onSubAgentFailed handler threw', {
               taskId,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -4716,7 +4765,11 @@ export class AgentLoop {
       const toolName = payload?.toolName ?? 'unknown';
       const args = payload?.args ?? {};
       const summary = this.summarizeToolArgs(toolName, args);
-      this.subAgentManager.updateToolActivity(event.childTaskId, toolName, summary);
+      // childTaskId is a path when the event was re-forwarded from a deeper
+      // descendant; attribute activity to this loop's direct child (the
+      // first segment), which is the task ID the manager tracks.
+      const directChildId = event.childTaskId.split('/')[0]!;
+      this.subAgentManager.updateToolActivity(directChildId, toolName, summary);
     });
   }
 
@@ -4824,7 +4877,7 @@ export class AgentLoop {
     const taskId = this.generateTaskId();
     const startTime = Date.now();
 
-    this.logger.info('[AgentLoop] subagent spawned', {
+    this.logger.info('subagent spawned', {
       taskId,
       background: false,
       instructionsLength: params.instructions.length,
@@ -4858,7 +4911,7 @@ export class AgentLoop {
       };
 
       if (!this.subAgentManager.track(tracked)) {
-        this.logger.warn('[AgentLoop] subagent rejected', {
+        this.logger.warn('subagent rejected', {
           taskId,
           active: this.subAgentManager.activeCount,
           limit: this.subAgentManager.limit,
@@ -4888,7 +4941,7 @@ export class AgentLoop {
         // Run the sub-agent (foreground: wait for result)
         const result = await this.runSubAgent(childAgent, params.instructions, taskId, startTime);
 
-        this.logger.info('[AgentLoop] subagent complete', {
+        this.logger.info('subagent complete', {
           taskId,
           status: result.status,
           turns: result.usage.turns,
@@ -4907,7 +4960,7 @@ export class AgentLoop {
         unsubForward();
       }
     } catch (err) {
-      this.logger.error('[AgentLoop] subagent failed', {
+      this.logger.error('subagent failed', {
         taskId,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -4934,7 +4987,7 @@ export class AgentLoop {
     const taskId = this.generateTaskId();
     const startTime = Date.now();
 
-    this.logger.info('[AgentLoop] subagent spawned', {
+    this.logger.info('subagent spawned', {
       taskId,
       background: true,
       instructionsLength: params.instructions.length,
@@ -4967,7 +5020,7 @@ export class AgentLoop {
     };
 
     if (!this.subAgentManager.track(tracked)) {
-      this.logger.warn('[AgentLoop] subagent rejected', {
+      this.logger.warn('subagent rejected', {
         taskId,
         active: this.subAgentManager.activeCount,
         limit: this.subAgentManager.limit,
@@ -5000,7 +5053,7 @@ export class AgentLoop {
         // The child has settled (and been destroyed by runSubAgent); stop
         // forwarding before delivery so listeners never leak per task.
         unsubForward();
-        this.logger.info('[AgentLoop] subagent complete', {
+        this.logger.info('subagent complete', {
           taskId,
           background: true,
           status: result.status,
@@ -5012,7 +5065,7 @@ export class AgentLoop {
       })
       .catch((err) => {
         unsubForward();
-        this.logger.error('[AgentLoop] subagent failed', {
+        this.logger.error('subagent failed', {
           taskId,
           background: true,
           error: err instanceof Error ? err.message : String(err),
@@ -5045,7 +5098,7 @@ export class AgentLoop {
     // before the shutdown gate: work discarded on purpose is not
     // dead-letter material, even when the discard happens mid-teardown.
     if (item.kind === 'subagent' && this.subAgentManager.isCancelled(item.taskId)) {
-      this.logger.info('[AgentLoop] dropping result of cancelled subagent', {
+      this.logger.info('dropping result of cancelled subagent', {
         taskId: item.taskId,
       });
       return;
@@ -5173,7 +5226,7 @@ export class AgentLoop {
       // reach onError or reject a consumer turn (mirroring how an in-run
       // retry that recovers reports onRetrySucceeded rather than onError).
       if (requeuedForRetry && this.batchRecoveredAfterRequeue(batch)) {
-        this.logger.info('[AgentLoop] background delivery recovered after re-queue', {
+        this.logger.info('background delivery recovered after re-queue', {
           taskIds: batch.map((item) => item.taskId),
           error: attemptError.message,
         });
@@ -5303,7 +5356,7 @@ export class AgentLoop {
   ): void {
     const attempts = item.deliveryAttempts ?? 0;
     item.deadLettered = true;
-    this.logger.error('[AgentLoop] background result dead-lettered', {
+    this.logger.error('background result dead-lettered', {
       kind: item.kind,
       taskId: item.taskId,
       attempts,
@@ -5326,7 +5379,7 @@ export class AgentLoop {
     const excess = this.deadLetteredBackgroundResults.length - MAX_DEAD_LETTERED_RESULTS;
     if (excess > 0) {
       const evicted = this.deadLetteredBackgroundResults.splice(0, excess);
-      this.logger.warn('[AgentLoop] dead-letter cap reached; evicting oldest entries', {
+      this.logger.warn('dead-letter cap reached; evicting oldest entries', {
         cap: MAX_DEAD_LETTERED_RESULTS,
         evicted: evicted.map((e) => ({ kind: e.kind, taskId: e.taskId })),
       });
@@ -5335,7 +5388,7 @@ export class AgentLoop {
       try {
         handler(entry);
       } catch (err) {
-        this.logger.error('[AgentLoop] onBackgroundResultDeadLettered handler threw', {
+        this.logger.error('onBackgroundResultDeadLettered handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -5402,7 +5455,7 @@ export class AgentLoop {
       try {
         handler(taskIds);
       } catch (err) {
-        this.logger.error('[AgentLoop] onBackgroundResultDelivery handler threw', {
+        this.logger.error('onBackgroundResultDelivery handler threw', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -5432,7 +5485,7 @@ export class AgentLoop {
           ...(params.systemPrompt ? { requestedSystemPrompt: params.systemPrompt } : {}),
         });
       } catch (err) {
-        this.logger.error('[AgentLoop] onBeforeSubAgentSpawn handler threw', {
+        this.logger.error('onBeforeSubAgentSpawn handler threw', {
           taskId: params.taskId,
           error: err instanceof Error ? err.message : String(err),
         });
@@ -5456,6 +5509,9 @@ export class AgentLoop {
       contextWindowLimit: this._contextWindowLimit,
       // Each sub-agent is its own logical session for prefix-cache routing.
       sessionId: params.taskId,
+      // The child's identity extends this loop's path, so its asks, errors,
+      // and log lines are attributable through the spawn chain.
+      loopPath: `${this.loopPath}/${params.taskId}`,
     };
     if (seedContext) {
       childCortexConfig.slots = [CHILD_SEED_CONTEXT_SLOT];
@@ -5478,7 +5534,8 @@ export class AgentLoop {
     if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
     // Inherit tool result persistence so child tool calls (Bash, Grep, WebFetch
     // inside a sub-agent doing research) get the same protection as the parent.
-    if (this.persistResult) childCortexConfig.persistResult = this.persistResult;
+    // The raw consumer callback, so the child stamps its own loopPath.
+    if (this.persistResultRaw) childCortexConfig.persistResult = this.persistResultRaw;
     if (this.toolResultThresholds) childCortexConfig.toolResultThresholds = this.toolResultThresholds;
     if (this.config.resolvePermission) {
       childCortexConfig.resolvePermission = this.wrapChildPermissionResolver(

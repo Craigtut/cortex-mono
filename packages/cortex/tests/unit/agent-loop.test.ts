@@ -425,6 +425,7 @@ describe('AgentLoop', () => {
           severity: 'fatal',
           originalMessage: 'invalid api key',
         }),
+        { loopPath: 'main' },
       );
     });
 
@@ -487,14 +488,15 @@ describe('AgentLoop', () => {
       await agent.prompt('Hello');
 
       expect(logger.info).toHaveBeenCalledWith(
-        '[Diagnostics] prompt_started',
+        '[AgentLoop:main] [Diagnostics] prompt_started',
         expect.objectContaining({
           inputLength: 5,
           provider: 'anthropic',
+          loopPath: 'main',
         }),
       );
       expect(logger.info).toHaveBeenCalledWith(
-        '[Diagnostics] prompt_finished',
+        '[AgentLoop:main] [Diagnostics] prompt_finished',
         expect.objectContaining({
           status: 'resolved',
         }),
@@ -522,13 +524,14 @@ describe('AgentLoop', () => {
       await agent.abort();
 
       expect(logger.info).toHaveBeenCalledWith(
-        '[Diagnostics] abort_requested',
+        '[AgentLoop:main] [Diagnostics] abort_requested',
         expect.objectContaining({
           isPrompting: false,
+          loopPath: 'main',
         }),
       );
       expect(logger.info).toHaveBeenCalledWith(
-        '[Diagnostics] abort_wait_finished',
+        '[AgentLoop:main] [Diagnostics] abort_wait_finished',
         expect.objectContaining({
           elapsedMs: expect.any(Number),
         }),
@@ -964,6 +967,43 @@ You have 12 emotions.`;
 
       expect(handler).toHaveBeenCalledTimes(1);
       expect(handler.mock.calls[0][0].category).toBe('rate_limit');
+    });
+
+    it('onTurnComplete and onError carry the loop origin context', async () => {
+      piAgent.promptResult = 'Hello world';
+      const agent = createTestAgentLoop(piAgent, { ...config, loopPath: 'reasoner' });
+
+      const turnHandler = vi.fn();
+      agent.onTurnComplete(turnHandler);
+      await agent.prompt('Hello');
+      expect(turnHandler).toHaveBeenCalled();
+      expect(turnHandler.mock.calls[0][1]).toEqual({ loopPath: 'reasoner' });
+
+      piAgent.promptError = new Error('invalid api key');
+      const errorHandler = vi.fn();
+      agent.onError(errorHandler);
+      await expect(agent.prompt('Again')).rejects.toThrow();
+      expect(errorHandler.mock.calls[0][1]).toEqual({ loopPath: 'reasoner' });
+    });
+
+    it('defaults the loop identity to main and honors a configured loopPath', () => {
+      const defaultAgent = createTestAgentLoop(piAgent, config);
+      expect(defaultAgent.loopPath).toBe('main');
+
+      const named = createTestAgentLoop(createMockPiAgent(), { ...config, loopPath: 'talker' });
+      expect(named.loopPath).toBe('talker');
+    });
+
+    it('prefixes log lines with the loop identity', async () => {
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const agent = createTestAgentLoop(piAgent, { ...config, logger, loopPath: 'reasoner' });
+
+      await agent.prompt('Hello');
+
+      expect(logger.debug).toHaveBeenCalledWith(
+        '[AgentLoop:reasoner] loop start',
+        expect.any(Object),
+      );
     });
 
     it('multiple handlers can be registered for the same event', async () => {
@@ -1498,6 +1538,7 @@ You have 12 emotions.`;
         expect.objectContaining({
           toolName: 'Bash',
           toolCallId: 'tc-bash-oversized',
+          loopPath: 'main',
         }),
       );
       expect(text).toContain('[Result persisted: /tmp/bash-oversized.txt');

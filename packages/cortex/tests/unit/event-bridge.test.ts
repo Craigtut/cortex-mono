@@ -684,5 +684,44 @@ describe('EventBridge', () => {
         expect(call[0].childTaskId).toBe('sub-2');
       }
     });
+
+    it('preserves a nested child origin as a path instead of overwriting it', () => {
+      // grandchild -> child -> this bridge. Before the path form, the second
+      // forward overwrote childTaskId and the inner origin was lost.
+      const childBridge = new EventBridge(false);
+      const grandchildBridge = new EventBridge(false);
+      const grandchildSource = createMockSource();
+      grandchildBridge.wire(grandchildSource);
+
+      childBridge.forwardFrom(grandchildBridge, 'task-42');
+      bridge.forwardFrom(childBridge, 'task-7');
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      grandchildSource.emit({
+        type: 'tool_execution_start',
+        toolCallId: 'gc-tc',
+        toolName: 'Read',
+        args: {},
+      });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0][0].childTaskId).toBe('task-7/task-42');
+    });
+
+    it('keeps a direct child origin as the bare task ID', () => {
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+      bridge.forwardFrom(childBridge, 'task-7');
+
+      childSource.emit({ type: 'tool_execution_start', toolCallId: 'c', toolName: 'A', args: {} });
+
+      expect(listener.mock.calls[0][0].childTaskId).toBe('task-7');
+    });
   });
 });

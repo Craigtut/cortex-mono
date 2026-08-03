@@ -57,6 +57,8 @@ export class PromptWatchdogDiagnostics {
   private readonly abortWaitWarningMs: number;
   private readonly callbacks: PromptDiagnosticsCallbacks;
   private readonly sessionId: string;
+  /** Identity of the loop this watchdog belongs to, stamped on every log payload. */
+  private readonly loopPath: string;
 
   private sequence = 0;
   private activePrompt: ActivePromptState | null = null;
@@ -68,6 +70,7 @@ export class PromptWatchdogDiagnostics {
     config: PromptWatchdogDiagnosticsConfig | undefined,
     logger: CortexLogger | undefined,
     callbacks: PromptDiagnosticsCallbacks,
+    loopPath = 'main',
   ) {
     this.logger = logger ?? NOOP_LOGGER;
     this.enabled = config?.enabled ?? false;
@@ -75,6 +78,7 @@ export class PromptWatchdogDiagnostics {
     this.abortWaitWarningMs = Math.max(250, config?.abortWaitWarningMs ?? DEFAULT_ABORT_WAIT_WARNING_MS);
     this.callbacks = callbacks;
     this.sessionId = Math.random().toString(36).slice(2, 8);
+    this.loopPath = loopPath;
   }
 
   startPrompt(meta: PromptStartMeta): void {
@@ -101,6 +105,7 @@ export class PromptWatchdogDiagnostics {
 
     this.logger.info('[Diagnostics] prompt_started', {
       diagnosticsSessionId: this.sessionId,
+      loopPath: this.loopPath,
       promptId: this.currentPromptId(),
       inputLength: meta.inputLength,
       messageCount: meta.messageCount,
@@ -129,6 +134,7 @@ export class PromptWatchdogDiagnostics {
       this.activePrompt.toolCallCount += 1;
       this.logger.debug('[Diagnostics] tool_call_start', {
         diagnosticsSessionId: this.sessionId,
+        loopPath: this.loopPath,
         promptId: this.currentPromptId(),
         toolName: event.payload?.toolName,
         childTaskId: event.childTaskId,
@@ -140,6 +146,7 @@ export class PromptWatchdogDiagnostics {
       const endPayload = event.payload as import('./types.js').ToolCallEndPayload | undefined;
       this.logger.debug('[Diagnostics] tool_call_end', {
         diagnosticsSessionId: this.sessionId,
+        loopPath: this.loopPath,
         promptId: this.currentPromptId(),
         toolName: endPayload?.toolName,
         childTaskId: event.childTaskId,
@@ -152,6 +159,7 @@ export class PromptWatchdogDiagnostics {
     if (event.type === 'response_start') {
       this.logger.debug('[Diagnostics] response_started', {
         diagnosticsSessionId: this.sessionId,
+        loopPath: this.loopPath,
         promptId: this.currentPromptId(),
         childTaskId: event.childTaskId,
       });
@@ -164,6 +172,7 @@ export class PromptWatchdogDiagnostics {
         this.activePrompt.sawFirstResponseChunk = true;
         this.logger.debug('[Diagnostics] first_response_chunk', {
           diagnosticsSessionId: this.sessionId,
+          loopPath: this.loopPath,
           promptId: this.currentPromptId(),
           childTaskId: event.childTaskId,
         });
@@ -174,6 +183,7 @@ export class PromptWatchdogDiagnostics {
     if (event.type === 'response_end' || event.type === 'turn_start' || event.type === 'turn_end' || event.type === 'loop_end') {
       this.logger.debug(`[Diagnostics] ${event.type}`, {
         diagnosticsSessionId: this.sessionId,
+        loopPath: this.loopPath,
         promptId: this.currentPromptId(),
         childTaskId: event.childTaskId,
       });
@@ -185,6 +195,7 @@ export class PromptWatchdogDiagnostics {
 
     this.logger.info('[Diagnostics] abort_requested', {
       diagnosticsSessionId: this.sessionId,
+      loopPath: this.loopPath,
       promptId: this.currentPromptId(),
       isPrompting: this.callbacks.isPrompting(),
       abortRequested: this.callbacks.isAbortRequested(),
@@ -198,12 +209,14 @@ export class PromptWatchdogDiagnostics {
     this.abortWaitStartedAt = Date.now();
     this.logger.debug('[Diagnostics] abort_wait_started', {
       diagnosticsSessionId: this.sessionId,
+      loopPath: this.loopPath,
       promptId: this.currentPromptId(),
     });
     this.abortWaitTimer = setInterval(() => {
       if (this.abortWaitStartedAt === null) return;
       this.logger.warn('[Diagnostics] abort_wait_still_pending', {
         diagnosticsSessionId: this.sessionId,
+        loopPath: this.loopPath,
         promptId: this.currentPromptId(),
         elapsedMs: Date.now() - this.abortWaitStartedAt,
         isPrompting: this.callbacks.isPrompting(),
@@ -220,6 +233,7 @@ export class PromptWatchdogDiagnostics {
     this.stopAbortWait();
     this.logger.info('[Diagnostics] abort_wait_finished', {
       diagnosticsSessionId: this.sessionId,
+      loopPath: this.loopPath,
       promptId: this.currentPromptId(),
       elapsedMs,
     });
@@ -232,6 +246,7 @@ export class PromptWatchdogDiagnostics {
     this.stopHeartbeat();
     this.logger.info('[Diagnostics] prompt_finished', {
       diagnosticsSessionId: this.sessionId,
+      loopPath: this.loopPath,
       promptId: this.currentPromptId(),
       status: meta.status,
       durationMs: meta.durationMs,
@@ -261,6 +276,7 @@ export class PromptWatchdogDiagnostics {
     const now = Date.now();
     this.logger.debug('[Diagnostics] prompt_heartbeat', {
       diagnosticsSessionId: this.sessionId,
+      loopPath: this.loopPath,
       promptId: this.currentPromptId(),
       elapsedMs: now - this.activePrompt.startedAt,
       sinceLastEventMs: now - this.activePrompt.lastEventAt,

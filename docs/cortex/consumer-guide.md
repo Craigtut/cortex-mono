@@ -188,6 +188,8 @@ Slots should usually be rebuilt from current application state instead of restor
 
 The resolver receives a third argument, a `ToolPermissionRequestContext` with an optional `signal`. The signal fires when the run that asked is aborted. Cortex races your resolver against that abort and proceeds with a block when the abort wins, so an unanswered approval prompt can never hang `abort()` or `destroy()`. A UI showing an approval prompt should listen on the signal and dismiss the now-moot prompt.
 
+The context also carries `askId`, a nonce unique to each ask (two asks never share one, even for identical tool calls), and `loopPath`, the identity of the loop that raised the ask (`'main'` by default, `'main/<taskId>'` for a sub-agent, configurable via `AgentLoopConfig.loopPath`). Key pending-prompt UI state on `askId` and use `loopPath` to attribute asks when several loops share one resolver. The same `loopPath` appears as the second argument to `onError` and `onTurnComplete` handlers, in `persistResult` metadata, and as the `[AgentLoop:<loopPath>]` prefix on log lines.
+
 ```typescript
 const agent = await AgentLoop.create({
   model,

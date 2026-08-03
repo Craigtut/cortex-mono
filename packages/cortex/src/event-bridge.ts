@@ -76,8 +76,11 @@ export interface CortexEvent {
   usage?: CortexUsage;
   /**
    * Present when this event originates from a child (sub-agent) event bridge.
-   * The value is the sub-agent's task ID, allowing consumers to route events
-   * to the correct UI component. Absent for parent agent events.
+   * For a direct child this is the sub-agent's task ID; for an event that was
+   * re-forwarded through intermediate bridges it is the path of IDs from this
+   * bridge down to the originating loop (e.g. 'task-7/task-42'), so nested
+   * origins are preserved instead of overwritten. Absent for parent agent
+   * events. Consumers routing per child should use the first path segment.
    */
   childTaskId?: string;
 }
@@ -217,8 +220,12 @@ export class EventBridge {
    * Forward all events from a child agent's event bridge onto this bridge.
    *
    * Each forwarded event gets `childTaskId` set so consumers can distinguish
-   * parent events from child events. Returns an unsubscribe function that
-   * stops forwarding (call when the child agent completes or is destroyed).
+   * parent events from child events. An event that already carries a
+   * `childTaskId` (the child forwarded it from its own descendant) keeps it,
+   * prefixed with this child's ID, so the origin arrives as a path
+   * ('task-7/task-42') instead of being overwritten. Returns an unsubscribe
+   * function that stops forwarding (call when the child agent completes or
+   * is destroyed).
    *
    * @param childBridge - The child agent's EventBridge
    * @param childTaskId - The sub-agent task ID to tag forwarded events with
@@ -228,7 +235,9 @@ export class EventBridge {
     return childBridge.onAll((event) => {
       this.emit({
         ...event,
-        childTaskId,
+        childTaskId: event.childTaskId
+          ? `${childTaskId}/${event.childTaskId}`
+          : childTaskId,
       });
     });
   }

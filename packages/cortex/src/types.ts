@@ -163,6 +163,32 @@ export interface ToolPermissionRequestContext {
    * prompt should listen and dismiss the now-moot prompt.
    */
   signal?: AbortSignal;
+  /**
+   * Unique nonce for this specific ask. Always set when Cortex invokes the
+   * resolver; two asks never share an id, even for identical tool calls.
+   * Consumers can key pending-prompt UI state on it.
+   */
+  askId?: string;
+  /**
+   * Path identity of the loop that raised the ask (e.g. 'main' for a
+   * standalone loop, 'main/<taskId>' for a sub-agent it spawned). Always set
+   * when Cortex invokes the resolver, so a consumer fielding asks from
+   * several concurrent loops can attribute each prompt.
+   */
+  loopPath?: string;
+}
+
+/**
+ * Origin identity passed as the second argument to loop-scoped callbacks
+ * (onError, onTurnComplete). Identifies which loop produced the signal when
+ * several AgentLoops share consumer-level handlers.
+ */
+export interface LoopOriginContext {
+  /**
+   * The loop's path identity: its configured `loopPath` (default 'main'),
+   * extended with '/<taskId>' segments for spawned sub-agents.
+   */
+  loopPath: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +429,15 @@ export interface AgentLoopConfig {
    * setSessionId(). Optional.
    */
   sessionId?: string;
+
+  /**
+   * Path identity for this loop, threaded through consumer-visible signals
+   * (permission asks, onError/onTurnComplete origin context, persistResult
+   * metadata, log prefixes) so several loops behind one owner stay
+   * distinguishable. Sub-agents spawned by this loop extend it with
+   * '/<taskId>'. Default: 'main'.
+   */
+  loopPath?: string;
 
   /**
    * Called before a sub-agent is spawned (foreground or background), giving
@@ -761,6 +796,12 @@ export type PersistResultFn = (
     toolCallId?: string;
     /** Present when called from compaction (reactive paths). */
     messageIndex?: number;
+    /**
+     * Path identity of the loop whose tool result is being persisted (e.g.
+     * 'main', or 'main/<taskId>' for a sub-agent). Always set when the
+     * callback is invoked through an AgentLoop.
+     */
+    loopPath?: string;
   },
 ) => Promise<string>;
 
@@ -1002,9 +1043,9 @@ export interface CortexEvents {
   /** Fired when all compaction layers have failed. Consumer should take recovery action. */
   onCompactionExhausted: (info: CompactionExhaustedInfo) => void;
   /** Fired when an error is classified during the agentic loop. */
-  onError: (error: ClassifiedError) => void;
+  onError: (error: ClassifiedError, origin: LoopOriginContext) => void;
   /** Fired at the end of each turn with parsed working tag output. */
-  onTurnComplete: (output: AgentTextOutput) => void;
+  onTurnComplete: (output: AgentTextOutput, origin: LoopOriginContext) => void;
   /** Fired when a sub-agent is spawned for delegated work. */
   onSubAgentSpawned: (taskId: string, instructions: string, background: boolean) => void;
   /** Fired when a sub-agent completes successfully. */

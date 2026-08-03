@@ -23,6 +23,7 @@ function makeModel(raw: PiModel) {
  */
 function buildBeforeToolCallHook(
   resolvePermission: AgentLoopConfig['resolvePermission'],
+  configOverrides?: Partial<AgentLoopConfig>,
 ): BeforeToolCallHook {
   const cortexConfig: AgentLoopConfig = {
     model: makeModel({
@@ -32,6 +33,7 @@ function buildBeforeToolCallHook(
     } as PiModel),
     workingDirectory: '/tmp/test-workspace',
     ...(resolvePermission ? { resolvePermission } : {}),
+    ...configOverrides,
   };
   const statics = AgentLoop as unknown as {
     buildPiAgentConfig: (params: {
@@ -147,5 +149,67 @@ describe('permission resolver abort race (beforeToolCall wrapper)', () => {
     // The consumer answering afterwards changes nothing and throws nothing.
     resolveLate(true);
     await new Promise((resolve) => setImmediate(resolve));
+  });
+});
+
+describe('permission ask identity (askId and loopPath)', () => {
+  type SeenContext = { signal?: AbortSignal; askId?: string; loopPath?: string };
+
+  it('passes a per-ask nonce and the default loop path to the resolver', async () => {
+    const seenContexts: SeenContext[] = [];
+    const resolver = vi.fn(async (_tool: string, _args: unknown, context?: SeenContext) => {
+      if (context) seenContexts.push(context);
+      return true;
+    });
+    const hook = buildBeforeToolCallHook(resolver);
+
+    await hook(bashCtx, new AbortController().signal);
+
+    expect(seenContexts).toHaveLength(1);
+    expect(seenContexts[0]!.askId).toMatch(/^ask-/);
+    expect(seenContexts[0]!.loopPath).toBe('main');
+  });
+
+  it('passes the configured loopPath to the resolver', async () => {
+    const seenContexts: SeenContext[] = [];
+    const resolver = vi.fn(async (_tool: string, _args: unknown, context?: SeenContext) => {
+      if (context) seenContexts.push(context);
+      return true;
+    });
+    const hook = buildBeforeToolCallHook(resolver, { loopPath: 'reasoner' });
+
+    await hook(bashCtx, new AbortController().signal);
+
+    expect(seenContexts[0]!.loopPath).toBe('reasoner');
+  });
+
+  it('never reuses an askId across asks, even for identical calls', async () => {
+    const askIds: string[] = [];
+    const resolver = vi.fn(async (_tool: string, _args: unknown, context?: SeenContext) => {
+      if (context?.askId) askIds.push(context.askId);
+      return true;
+    });
+    const hook = buildBeforeToolCallHook(resolver);
+
+    await hook(bashCtx, new AbortController().signal);
+    await hook(bashCtx, new AbortController().signal);
+
+    expect(askIds).toHaveLength(2);
+    expect(askIds[0]).not.toBe(askIds[1]);
+  });
+
+  it('carries identity even when pi passes no signal', async () => {
+    const seenContexts: SeenContext[] = [];
+    const resolver = vi.fn(async (_tool: string, _args: unknown, context?: SeenContext) => {
+      if (context) seenContexts.push(context);
+      return true;
+    });
+    const hook = buildBeforeToolCallHook(resolver);
+
+    await hook(bashCtx, undefined);
+
+    expect(seenContexts[0]!.askId).toMatch(/^ask-/);
+    expect(seenContexts[0]!.loopPath).toBe('main');
+    expect(seenContexts[0]!.signal).toBeUndefined();
   });
 });

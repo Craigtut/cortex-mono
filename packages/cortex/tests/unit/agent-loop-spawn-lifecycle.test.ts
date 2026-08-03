@@ -535,4 +535,31 @@ describe('AgentLoop spawn-path lifecycle', () => {
       expect(childDestroy).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe('child loop identity', () => {
+    it("extends the parent's loopPath with the child's task ID", async () => {
+      const agent = createTestAgentLoop({ loopPath: 'reasoner' });
+      const managedSpy = vi
+        .spyOn(AgentLoop as unknown as {
+          createManagedAgent: (params: unknown) => Promise<unknown>;
+        }, 'createManagedAgent')
+        .mockResolvedValue({
+          getContextManager: () => ({ setSlot: vi.fn() }),
+          setCacheRetention: vi.fn(),
+        });
+      try {
+        const internal = agent as unknown as {
+          createChildAgent: (params: unknown) => Promise<unknown>;
+        };
+        await internal.createChildAgent({ taskId: 'task-7', instructions: 'look up x' });
+
+        const createParams = managedSpy.mock.calls[0]![0] as {
+          cortexConfig: AgentLoopConfig;
+        };
+        expect(createParams.cortexConfig.loopPath).toBe('reasoner/task-7');
+      } finally {
+        managedSpy.mockRestore();
+      }
+    });
+  });
 });
