@@ -665,6 +665,17 @@ export class AgentLoop {
   // can start would drain immediately and be answered unprompted.
   private queuedSilentDeliveries: QueuedSilentDelivery[] = [];
 
+  // Wake deliveries steered into pi's queue while the loop gate was held,
+  // pending proof that a run will drain them. The gate can be held by a task
+  // that never starts a pi run (an idle digestion pass, a scheduled drain
+  // that finds nothing to deliver, a prompt cycle cancelled at its dequeue
+  // abort check); a steer landing in such a window would otherwise sit in
+  // pi's queue until some unrelated later run surfaces it unprompted.
+  // Cleared whenever a pi run starts (pi drains its steering queue at run
+  // start); entries that survive are converted into a run of their own by
+  // sweepUndrainedSteeredDeliveries.
+  private pendingSteeredDeliveries: QueuedSilentDelivery[] = [];
+
   // Permission asks currently blocked on a resolver decision, keyed by their
   // per-ask nonce. Covers this loop's own asks plus (mirrored) its
   // children's, so one query surfaces the whole subtree. Entries are removed
@@ -1127,6 +1138,16 @@ export class AgentLoop {
   }
 
   /**
+   * True while any gate task is running or queued: a prompt cycle, a
+   * background-completion drain, an idle digestion pass, or a delivery
+   * sweep. While true, prompt() fails fast and deliver() steers or queues
+   * instead of starting a turn.
+   */
+  get isLoopActive(): boolean {
+    return this.loopGateDepth > 0;
+  }
+
+  /**
    * One gate-owned loop cycle: run the logical turn, then deliver any
    * background completions that arrived while it ran. Lifecycle is
    * re-checked here (at dequeue time) so a destroy() that lands between
@@ -1338,6 +1359,10 @@ export class AgentLoop {
     // Resolves to the turn result, or throws after onError has been emitted.
     for (;;) {
       try {
+        // A run start (and a retry continuation) drains pi's steering queue,
+        // so recorded steered deliveries are consumed by this run: clear the
+        // sweep record before handing control to pi.
+        this.pendingSteeredDeliveries = [];
         const result =
           retryIndex === 0 ? await this.agent.prompt(promptInput) : await this.agent.continue();
 
@@ -1672,7 +1697,12 @@ export class AgentLoop {
    *   or in the end-of-cycle drain window): steer. Pi polls its steering
    *   queue at run start and at every turn boundary within a run, so the
    *   message lands inside the SAME logical turn and inherits that turn's
-   *   budget window, retry window, and consumer promise.
+   *   budget window, retry window, and consumer promise. When the gate is
+   *   held only by tasks that never start a pi run (an idle digestion pass,
+   *   a drain with nothing to deliver, a cycle cancelled at dequeue), a
+   *   sweep task queued behind the gate converts the undrained steer into a
+   *   run of its own, so a steered delivery always ends in a turn that
+   *   actually runs.
    * - Wake wanted, idle: start a turn with this content as the prompt; the
    *   returned `turn` promise settles with it.
    *
@@ -1695,6 +1725,17 @@ export class AgentLoop {
       // which would turn a "delivered" message into nothing. Fail loudly.
       throw new Error('deliver() requires non-whitespace string content');
     }
+    if (!this.hasConfiguredSystemPrompt()) {
+      // prompt() rejects for the same reason, but only asynchronously and
+      // without emitting onError, so a fire-and-forget deliver() would
+      // report an outcome for a turn that can never run (and steered or
+      // queued content would wait on a prompt that must fail). Fail at the
+      // point of misuse instead.
+      throw new Error(
+        'AgentLoop prompt is not configured. Call setBasePrompt() before deliver(), ' +
+        'or provide initialBasePrompt during creation.',
+      );
+    }
     const wake = options?.wake ?? true;
 
     if (!wake) {
@@ -1711,21 +1752,90 @@ export class AgentLoop {
 
     if (this.loopGateDepth > 0) {
       // Covers both "pi running" and "gate held but pi idle" (retry backoff,
-      // drain window): in every gate-held state the steering queue is
-      // drained by the current logical turn or the queued cycle about to
-      // start, so the message extends that turn rather than starting one.
-      this.agent.steer({ role: 'user', content });
+      // drain window): a run-bearing gate task drains the steering queue, so
+      // the message extends that turn rather than starting one. The gate can
+      // also be held by a task that never starts a run (idle digestion, an
+      // empty drain, a cycle cancelled at dequeue); the run guarantee covers
+      // that hole by sweeping undrained steers into a run of their own.
+      this.steerWithRunGuarantee(content);
       return { outcome: 'steered' };
     }
 
     // Idle + wake: the gate is empty in this same synchronous frame, so
-    // prompt() cannot fail fast on a held gate. Attach a no-op rejection
-    // handler so a fire-and-forget caller never produces an unhandled
-    // rejection; callers that await result.turn still observe the rejection,
-    // and failures surface through onError regardless.
+    // prompt() cannot fail fast on a held gate. Attach a rejection handler so
+    // a fire-and-forget caller never produces an unhandled rejection and the
+    // failure is at least logged; callers that await result.turn still
+    // observe the rejection, and run failures surface through onError.
     const turn = this.prompt(content);
-    turn.catch(() => {});
+    turn.catch((err) => {
+      this.logger.warn('deliver-started turn failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
     return { outcome: 'prompted', turn };
+  }
+
+  /**
+   * Steer a wake delivery into pi's queue AND guarantee some run drains it.
+   * The content is recorded and a sweep task is queued behind every gate
+   * task present now; any pi run start clears the record (pi drains its
+   * steering queue at run start), and a sweep that finds the record intact
+   * converts it into a run of its own. Without the sweep, a steer landing
+   * while the gate is held by a non-run task (idle digestion, a drain that
+   * finds nothing to deliver, a prompt cycle cancelled at its dequeue abort
+   * check) parks in pi's queue and surfaces only in whatever unrelated run
+   * starts later: an unprompted response, and a 'steered' outcome with no
+   * turn behind it.
+   */
+  private steerWithRunGuarantee(content: string): void {
+    this.agent.steer({ role: 'user', content });
+    this.pendingSteeredDeliveries.push({ content, timestamp: Date.now() });
+    void this.enqueueLoopTask(async () => {
+      if (this.isShuttingDown()) return;
+      try {
+        await this.sweepUndrainedSteeredDeliveries();
+      } catch (err) {
+        // Sweep runs have no consumer-level caller; route terminal failures
+        // to onError like the scheduled background drain does.
+        this.emitError(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  /**
+   * Convert steered deliveries that no run has drained into a run of their
+   * own. Runs under the gate AFTER every task queued when the steer landed.
+   * A non-empty record means no pi run has STARTED since the steer; pi's
+   * hasQueuedMessages() then distinguishes the live-run case (the steer was
+   * drained at a turn boundary of an already-running turn: nothing parked,
+   * nothing to do) from the parked case. When parked, the queue copies are
+   * cleared and the content is delivered through a drain-style run, so
+   * 'steered' always ends in a turn that actually runs.
+   *
+   * Known narrow edge: hasQueuedMessages() also covers pi's follow-up
+   * queue, so a run that failed after draining the steer but before its
+   * would-stop point (where follow-ups drain) makes a swept re-delivery of
+   * content that already reached the failed run's transcript. That is a
+   * duplicate after a failed run, preferred over the silent swallow.
+   */
+  private async sweepUndrainedSteeredDeliveries(): Promise<void> {
+    if (this.pendingSteeredDeliveries.length === 0) return;
+    if (!(this.agent.hasQueuedMessages?.() ?? false)) {
+      this.pendingSteeredDeliveries = [];
+      return;
+    }
+    const pending = this.pendingSteeredDeliveries.splice(0);
+    // Remove the parked queue copies so the run below cannot receive the
+    // same content twice (once as its prompt, once as a drained steer).
+    this.agent.clearSteeringQueue?.();
+    const message = pending.map((item) => item.content).join('\n\n');
+    this.logger.info('sweeping undrained steered deliveries into a run', {
+      count: pending.length,
+    });
+    // Drain semantics: replace an aborted controller (deliveries survive a
+    // user abort, like background completions) and never flush the silent
+    // queue (its contract is "next real prompt").
+    await this.runPromptOnce(message, undefined, true);
   }
 
   /**
@@ -1756,6 +1866,9 @@ export class AgentLoop {
   /** Remove all queued steering messages from pi's steering queue. */
   clearSteeringQueue(): void {
     this.agent.clearSteeringQueue?.();
+    // Steered deliveries the caller just cleared must not be resurrected by
+    // a queued sweep task.
+    this.pendingSteeredDeliveries = [];
   }
 
   /** Remove all queued follow-up messages from pi's follow-up queue. */
@@ -5097,6 +5210,9 @@ export class AgentLoop {
     // Queued silent deliveries are dropped on destroy by contract; a facade
     // that needs them durable drains them first via clearQueuedDeliveries().
     this.queuedSilentDeliveries = [];
+    // Undrained steered deliveries share that contract: the sweep task
+    // no-ops during teardown, so drop its record too.
+    this.pendingSteeredDeliveries = [];
     // Any ask still pending at teardown settles as a block via the abort
     // race; the registry entries just have not been reaped yet.
     this.pendingAsks.clear();

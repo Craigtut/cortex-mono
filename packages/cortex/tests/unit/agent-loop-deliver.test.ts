@@ -30,6 +30,8 @@ interface DeliverMockPiAgent extends PiAgent {
   followUpCalls: Array<{ role: string; content: string }>;
   clearSteeringQueueCalls: number;
   clearFollowUpQueueCalls: number;
+  /** Messages steered but not yet drained by a run (mirrors pi's queue). */
+  steeringQueue: Array<{ role: string; content: string }>;
   /** When true, the next run stays in flight until releaseRun() is called. */
   hangNextRun: boolean;
   releaseRun: () => void;
@@ -52,6 +54,7 @@ function createMockPiAgent(): DeliverMockPiAgent {
     followUpCalls: [],
     clearSteeringQueueCalls: 0,
     clearFollowUpQueueCalls: 0,
+    steeringQueue: [],
     hangNextRun: false,
 
     subscribe(handler: (event: PiEvent) => void): () => void {
@@ -76,12 +79,20 @@ function createMockPiAgent(): DeliverMockPiAgent {
           ? input
           : [{ role: 'user', content: input, timestamp: Date.now() }];
         agent.state.messages.push(...messages);
+        // Pi polls the steering queue at run start.
+        agent.state.messages.push(
+          ...(agent.steeringQueue.splice(0) as AgentMessage[]),
+        );
 
         if (agent.hangNextRun) {
           agent.hangNextRun = false;
           await new Promise<void>((resolve) => {
             releaseRun = resolve;
           });
+          // ... and again at every turn boundary within the run.
+          agent.state.messages.push(
+            ...(agent.steeringQueue.splice(0) as AgentMessage[]),
+          );
         }
 
         agent.emitEvent({ type: 'turn_end', text: 'ok' });
@@ -126,6 +137,7 @@ function createMockPiAgent(): DeliverMockPiAgent {
 
     steer(message: { role: string; content: string }): void {
       agent.steerCalls.push(message);
+      agent.steeringQueue.push(message);
     },
 
     followUp(message: { role: string; content: string }): void {
@@ -134,6 +146,11 @@ function createMockPiAgent(): DeliverMockPiAgent {
 
     clearSteeringQueue(): void {
       agent.clearSteeringQueueCalls += 1;
+      agent.steeringQueue = [];
+    },
+
+    hasQueuedMessages(): boolean {
+      return agent.steeringQueue.length > 0;
     },
 
     clearFollowUpQueue(): void {
@@ -167,6 +184,15 @@ function createLoop(agent: PiAgent, overrides?: Partial<AgentLoopConfig>): Agent
 
 function contentOf(message: AgentMessage): string {
   return typeof message.content === 'string' ? message.content : JSON.stringify(message.content);
+}
+
+/** Poll until `predicate` holds; fails the test after `timeoutMs`. */
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('waitUntil timed out');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 describe('AgentLoop.deliver', () => {
@@ -318,6 +344,18 @@ describe('AgentLoop.deliver', () => {
     expect(() => loop.deliver('   ', { wake: false })).toThrow('non-whitespace');
   });
 
+  it('throws synchronously when no base prompt is configured', () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, { initialBasePrompt: undefined as never });
+
+    // Without the synchronous check, the idle+wake branch would return
+    // { outcome: 'prompted' } carrying a turn that rejects pre-flight
+    // without emitting onError: a reported outcome for a turn that never
+    // ran, invisible to a fire-and-forget caller.
+    expect(() => loop.deliver('content')).toThrow('not configured');
+    expect(piAgent.promptCalls).toEqual([]);
+  });
+
   it('throws once the loop is shutting down', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
@@ -334,6 +372,68 @@ describe('AgentLoop.deliver', () => {
     expect(loop.queuedDeliveryCount).toBe(1);
     await loop.destroy();
     expect(loop.queuedDeliveryCount).toBe(0);
+  });
+});
+
+describe('AgentLoop.deliver run guarantee (sweep)', () => {
+  it('a wake delivery steered while the gate is held by an empty drain still runs a turn', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    // Schedule a drain with nothing to deliver: it dequeues, finds the
+    // pending queue empty, and returns while still holding the gate. A
+    // steer landing in that window has no run to drain it.
+    const drain = (loop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    const result = loop.deliver('urgent redirect');
+    expect(result.outcome).toBe('steered');
+
+    await drain;
+    // The sweep queued behind the drain converts the parked steer into a
+    // real run instead of leaving it for an unrelated later run.
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    expect(piAgent.promptCalls[0]).toBe('urgent redirect');
+    expect(piAgent.steeringQueue).toEqual([]);
+    await waitUntil(() => !loop.isLoopActive);
+  });
+
+  it('does not start a second run for a delivery steered into a live run', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    piAgent.hangNextRun = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    expect(loop.deliver('mid-run redirect').outcome).toBe('steered');
+    piAgent.releaseRun();
+    await turn;
+
+    // The boundary poll drained the steer into the live run; the sweep must
+    // conclude nothing is parked rather than re-delivering the content.
+    await waitUntil(() => !loop.isLoopActive);
+    expect(piAgent.promptCalls).toHaveLength(1);
+    expect(piAgent.state.messages.map(contentOf)).toContain('mid-run redirect');
+  });
+
+  it('clearing the steering queue also clears the sweep record', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    const drain = (loop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    loop.deliver('will be cleared');
+    loop.clearSteeringQueue();
+
+    await drain;
+    await waitUntil(() => !loop.isLoopActive);
+    // Content the caller explicitly cleared is not resurrected by the sweep.
+    expect(piAgent.promptCalls).toHaveLength(0);
   });
 });
 

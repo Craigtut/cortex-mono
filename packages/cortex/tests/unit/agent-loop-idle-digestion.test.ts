@@ -28,6 +28,8 @@ function makeModel(raw: PiModel) {
 interface DigestMockPiAgent extends PiAgent {
   hangNextRun: boolean;
   releaseRun: () => void;
+  promptCalls: Array<string | AgentMessage[]>;
+  steeringQueue: Array<{ role: string; content: string }>;
 }
 
 function createMockPiAgent(): DigestMockPiAgent {
@@ -35,12 +37,17 @@ function createMockPiAgent(): DigestMockPiAgent {
   const agent: DigestMockPiAgent = {
     state: { messages: [], systemPrompt: '', tools: [] },
     hangNextRun: false,
+    promptCalls: [],
+    steeringQueue: [],
     subscribe() { return () => {}; },
     async prompt(input: string | AgentMessage[]) {
+      agent.promptCalls.push(input);
       const messages: AgentMessage[] = Array.isArray(input)
         ? input
         : [{ role: 'user', content: input, timestamp: Date.now() }];
       agent.state.messages.push(...messages);
+      // Pi polls the steering queue at run start.
+      agent.state.messages.push(...(agent.steeringQueue.splice(0) as AgentMessage[]));
       if (agent.hangNextRun) {
         agent.hangNextRun = false;
         await new Promise<void>((resolve) => { release = resolve; });
@@ -56,9 +63,26 @@ function createMockPiAgent(): DigestMockPiAgent {
     abort() {},
     async waitForIdle() {},
     reset() { agent.state.messages = []; },
-    steer() {},
+    steer(message: { role: string; content: string }) {
+      agent.steeringQueue.push(message);
+    },
+    clearSteeringQueue() {
+      agent.steeringQueue = [];
+    },
+    hasQueuedMessages() {
+      return agent.steeringQueue.length > 0;
+    },
   };
   return agent;
+}
+
+/** Poll until `predicate` holds; fails the test after `timeoutMs`. */
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('waitUntil timed out');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 function createLoop(
@@ -226,5 +250,38 @@ describe('digestIdle gate serialization', () => {
     await loop.destroy();
 
     await expect(loop.digestIdle()).rejects.toThrow('destroyed');
+  });
+});
+
+describe('digestIdle and deliver interleaving', () => {
+  it('a wake delivery during idle digestion still runs a turn once the digest completes', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    let releaseObserver!: (value: string) => void;
+    const complete = vi.fn(
+      () => new Promise<string>((resolve) => { releaseObserver = resolve; }),
+    );
+    loop.getCompactionManager().setObservationalCompleteFn(complete as unknown as CompleteFn);
+    seedHistory(piAgent);
+
+    const digestion = loop.digestIdle();
+    await waitUntil(() => complete.mock.calls.length === 1);
+
+    // The gate is held by the digest, which never starts a pi run. Without
+    // the sweep, this steer parks in pi's queue with nothing to drain it
+    // and surfaces only in some unrelated later run (an unprompted
+    // response), while the caller was told 'steered'.
+    const result = loop.deliver('urgent while digesting');
+    expect(result.outcome).toBe('steered');
+
+    releaseObserver(OBSERVER_OUTPUT);
+    await digestion;
+
+    // A turn actually runs with the delivered content.
+    await waitUntil(() => piAgent.promptCalls.some(
+      (call) => typeof call === 'string' && call.includes('urgent while digesting'),
+    ));
+    expect(piAgent.steeringQueue).toEqual([]);
+    await waitUntil(() => !loop.isLoopActive);
   });
 });
