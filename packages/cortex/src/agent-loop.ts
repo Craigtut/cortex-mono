@@ -6099,8 +6099,34 @@ export class AgentLoop {
       // results, so the surviving tail carries an unpaired tool call: a hard
       // provider error on the very next request. Unwind the whole delivery
       // and re-queue rather than leave the transcript unusable.
+      //
+      // A steer that landed inside this run (pi injects steered user
+      // messages after the delivery message) is in the spliced range, and
+      // its caller was told 'steered': collect it before the splice and
+      // re-steer it so it lands in the re-attempted delivery run, or in a
+      // swept run of its own if the batch dead-letters instead.
+      const steered: string[] = [];
+      for (const raw of messages.slice(preDeliveryCount + 1)) {
+        const msg = raw as unknown as Record<string, unknown>;
+        if (msg['role'] !== 'user') continue;
+        const content = msg['content'];
+        const text = typeof content === 'string'
+          ? content
+          : Array.isArray(content)
+            ? content
+                .map((part) => {
+                  const p = part as Record<string, unknown>;
+                  return typeof p['text'] === 'string' ? p['text'] : '';
+                })
+                .join('')
+            : '';
+        if (text.trim().length > 0) steered.push(text);
+      }
       messages.splice(preDeliveryCount, messages.length - preDeliveryCount);
       this.notifySourceHistoryTailTrimmed();
+      for (const content of steered) {
+        this.steerWithRunGuarantee(content);
+      }
       return true;
     }
     return false;

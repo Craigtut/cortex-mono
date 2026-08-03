@@ -2352,6 +2352,64 @@ You have 12 emotions.`;
       expect(dead[0].message).toContain('lost output');
     });
 
+    it('re-steers a wake delivery destroyed by the failed-delivery unwind', async () => {
+      const agent = createTestAgentLoop(piAgent, config);
+      const internal = agent as unknown as InternalAgent;
+
+      // Give the mock a real steering queue: pi drains it at run start.
+      const steeringQueue: Array<{ role: string; content: string }> = [];
+      piAgent.steer = (message: { role: string; content: string }): void => {
+        steeringQueue.push(message);
+      };
+      (piAgent as unknown as Record<string, unknown>)['clearSteeringQueue'] = (): void => {
+        steeringQueue.length = 0;
+      };
+      (piAgent as unknown as Record<string, unknown>)['hasQueuedMessages'] = (): boolean =>
+        steeringQueue.length > 0;
+
+      let failuresLeft = 1;
+      piAgent.prompt = async (input: string): Promise<unknown> => {
+        piAgent.state.messages.push({ role: 'user', content: input } as never);
+        piAgent.state.messages.push(...(steeringQueue.splice(0) as never[]));
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
+          // The run fails after an assistant tool-call turn but before its
+          // tool results: the surviving tail carries an unpaired tool call,
+          // so the unwind splices the whole delivery range.
+          piAgent.state.messages.push({
+            role: 'assistant',
+            content: [{ type: 'toolCall', id: 'call_1', name: 'Bash', arguments: {} }],
+          } as never);
+          throw new Error('provider dropped mid-batch');
+        }
+        piAgent.state.messages.push({
+          role: 'assistant',
+          content: 'delivered',
+          stopReason: 'end_turn',
+        } as never);
+        return { content: 'delivered' };
+      };
+
+      // The steer lands while the drain holds the gate, so pi injects it
+      // right after the delivery message inside the doomed run.
+      const delivery = internal.deliverOrQueueBackgroundCompletion({
+        kind: 'subagent',
+        taskId: 'sa_steer',
+        result: {
+          output: 'research findings',
+          status: 'completed',
+          usage: { turns: 1, cost: 0.01, durationMs: 100, contextTokens: 10 },
+        },
+      });
+      expect(agent.deliver('steered mid-drain').outcome).toBe('steered');
+      await delivery;
+
+      // The unwind re-steered the content instead of destroying it: it
+      // reaches history through the re-attempted delivery run, exactly once.
+      expect(historyOccurrences(agent, 'steered mid-drain')).toBe(1);
+      expect(historyOccurrences(agent, 'research findings')).toBe(1);
+    });
+
     it('does not fire onError when a re-queued delivery eventually succeeds', async () => {
       // The failed first attempt is re-queued and the drain chain's next
       // attempt delivers it. A recovered failure must not surface: no
