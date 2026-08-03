@@ -66,7 +66,19 @@ These terms are intentionally not interchangeable. Session persistence is a cons
 There is no cold/warm/active state machine. A single `Agent` instance persists for the lifetime of the process. The system prompt is set once and rarely changes. Context is managed through two complementary mechanisms:
 
 1. **`ContextManager.setSlot()`**: Updates persistent context slots in `agent.state.messages`. Used for content that changes infrequently. Consumers define how many slots exist and what they contain.
-2. **`transformContext` hook**: Injects ephemeral per-call context that should NOT persist in `agent.state.messages`. In a managed `AgentLoop`, Cortex inserts consumer ephemeral content, background task state, and loaded skill instructions at the pre-prompt boundary. This keeps old history cacheable while keeping the current prompt as the final message.
+2. **`transformContext` hook**: Injects ephemeral per-call context that should NOT persist in `agent.state.messages`. In a managed `AgentLoop`, Cortex inserts consumer ephemeral content, background task state, loaded skill instructions, and an optional consumer-fed headline block at the pre-prompt boundary. This keeps old history cacheable while keeping the current prompt as the final message.
+
+By default, per-loop tool runtime state (working directory, read-before-edit registry, undo history) resets at every prompt. A long-lived loop that is woken repeatedly by deliveries can opt into `persistentRuntime: true` to keep that workspace state across prompts; transient per-loop state (the file mutation lock and the WebFetch rate-limit counter) still resets every prompt.
+
+### Delivery and Steering
+
+`prompt()` throws while a turn is running or queued, and `steer()` silently no-ops while the loop is idle. `deliver(content, { wake? })` closes that gap: it is a small state machine over the loop's run state that accepts a message in every state.
+
+- **Wake wanted (default), loop busy** (running, queued, in retry backoff, or in the end-of-cycle drain window): the message is steered into the current logical turn. It lands at the next turn boundary and **extends that turn**: it inherits the turn's budget window, its retry window, and the consumer promise held by whoever started the turn. No separate promise exists for the delivery.
+- **Wake wanted, loop idle**: a turn starts with the content as its prompt; `DeliverResult.turn` carries that turn's promise.
+- **`wake: false` (silent), any state**: the content is queued on the `AgentLoop` itself and flushed as leading user messages into the next real prompt's message batch. It never touches pi's steering queue (which drains into whatever run starts next, surfacing "silent" content as an unprompted response) and never flushes into a background-completion delivery run. Inspect and clear the queue via `queuedDeliveryCount` / `clearQueuedDeliveries()`; queued content is dropped at `destroy()`.
+
+Alongside `deliver()`, the loop surfaces pi's queue controls directly: `followUp(message)` (queued until a would-stop point: after the model produces what would otherwise be the run's final answer), `setSteeringQueueMode` / `setFollowUpQueueMode` (`'all' | 'one-at-a-time'`), and `clearSteeringQueue` / `clearFollowUpQueue` / `clearAllQueues` (the last also drains the silent delivery queue and returns its content).
 
 ### The ContextManager
 
@@ -177,6 +189,10 @@ Pi-agent-core has no permission system. Cortex implements permissions via the `b
 
 The consumer provides the resolver; cortex provides the hook integration.
 
+Every resolver invocation receives a `ToolPermissionRequestContext` carrying the run's abort `signal` (dismiss the prompt when it fires; the answer is no longer consulted), a per-ask `askId` nonce (crypto-random, never reused), the asking loop's `loopPath`, and a verbatim `renderedRequest`: the permission name plus the actual command, path, pattern, or URL, truncated at a fixed cap but never summarized. Surfaces presenting the ask to a human should show this text so what the human approves is what the tool will actually do.
+
+While a resolver call is pending, the ask is queryable: `getPendingAsks()` snapshots every ask currently blocked on a decision, for the loop and (mirrored) its spawned children, and `markAskVoiced(askId)` records that an ask was actually presented to the human. Entries disappear the moment an ask settles, however it settles (answered, blocked, or aborted). A consent broker should treat ask ids as security-relevant: bind an approval to the exact `askId` it was voiced for.
+
 ### Budget Guards
 
 Pi-agent-core has no limits on turns or cost.
@@ -185,6 +201,8 @@ Cortex provides optional, configurable guards. All default to unlimited (no enfo
 
 - **Max turns**: Count LLM turns via `turn_end` events. Default: `Infinity`. On breach, force-stop the loop.
 - **Max cost**: Track via `AssistantMessage.usage.cost.total`. Default: `Infinity`. On breach, force-stop the loop.
+- **Scope** (`budgetGuard.scope`): `'prompt'` (default) resets the counters at each prompt, so limits bound one logical turn. `'lifetime'` never resets them, so limits bound the loop's whole life; once breached, a lifetime guard aborts every further turn, including turns of later prompts. The mode for a resident loop prompted many times per session, where a per-prompt `maxCost` would never trip.
+- **Child usage** (`budgetGuard.includeChildUsage`): by default a loop's guard counts only its own turns; forwarded sub-agent events are skipped (each child has its own guard). Setting it true counts forwarded child turn usage too, which is the plumbing an aggregate guard needs to bound a loop plus everything it spawns.
 
 These are safety rails for runaway loops, not user-facing budget enforcement. Application-level budgeting (weekly/monthly spend limits, user-configurable caps) is the consumer's responsibility.
 
@@ -198,6 +216,11 @@ Cortex implements compaction in `transformContext` with two selectable strategie
 - **Classic** (`strategy: 'classic'`): Three-layer system with microcompaction (tool result trimming), LLM-based conversation summarization, and emergency truncation. See [compaction-strategy.md](./compaction-strategy.md).
 
 Both strategies preserve context slots untouched and use Layer 3 emergency truncation as a safety valve. The consumer selects the strategy via `compaction.strategy` in the agent config.
+
+Two controls exist for latency-sensitive loops:
+
+- **Non-blocking posture** (`compaction.nonBlocking: true`): no synchronous LLM call may run inside `transformContext`. Observational activation still consumes already-buffered chunks (instant), but the forced synchronous observer, the pre-truncation catch-up observation, and inline reflection are skipped (reflection swaps in a buffered result or launches asynchronously); under the classic strategy, in-band L2 summarization is skipped. Emergency truncation remains the only blocking in-band path.
+- **Idle digestion** (`digestIdle()`): runs pending observation buffering plus the threshold pass (activation, reflection, and classic summarization) OUTSIDE a prompt, with blocking work explicitly allowed even under the non-blocking posture. Serialized through the loop gate, so it can never race a running turn; an owner schedules it during idle windows so the multi-second calls happen while nobody is waiting.
 
 ### Skill System
 
@@ -277,6 +300,7 @@ Pi-agent-core emits 10 events across 4 scopes. Cortex normalizes these into a co
 
 **Additional notes:**
 
+- Cortex additionally emits one synthetic event of its own: `utility_usage`, fired once per direct/utility completion with the typed usage and a category tag (see Token Tracking below). It propagates through `forwardFrom` with `childTaskId` set, exactly like pi events.
 - Each pipeline phase (THOUGHT, AGENTIC LOOP, REFLECT) creates its own event session/scope for traceability. This allows log consumers to correlate events to a specific phase of the tick.
 - `thinking_start`/`thinking_end` are dropped. These were Claude SDK-specific events not present in pi-agent-core.
 - `turn_start` is available as a new event type (mapped from pi-agent-core's `turn_start` event).
@@ -301,6 +325,8 @@ Cortex tracks tokens through two complementary mechanisms:
 - **Heuristic estimation**: A built-in `estimateCurrentContextTokens()` API uses `estimateTokens(text)` internally to estimate context size before the first LLM call and between calls. This is critical for compaction and consumer UIs: if the heuristic estimate of the current message array is approaching `model.contextWindow`, Cortex can trigger compaction proactively and consumers can show current context pressure without waiting for the next post-hoc usage report.
 
 The heuristic is a duplicate of the same utility in `@animus-labs/shared` (4 lines), kept inline to avoid a dependency.
+
+**Utility usage accounting.** Direct and utility completions (observer, reflector, L2 summarization, WebFetch summarization, Bash safety classification, and consumer `directComplete` / `structuredComplete` / `utilityComplete` calls) are accounted per loop, not just stashed for `getLastDirectUsage()`. Each completion is recorded under a category tag: Cortex tags its internal calls (`observer`, `reflector`, `summarization`, `webfetch`, `bash_utility`); consumer calls default to their entry point (`direct`, `structured`, `utility`) or pass `usageCategory` explicitly. The spend rolls into `getSessionUsage()` (top-level totals plus a per-category `utility` breakdown, persisted and restored with the rest of session usage) and each completion emits a `utility_usage` event on the event bridge, carrying the typed usage and its category. Forwarded child events roll into the parent's totals exactly like child turn usage, so an aggregate consumer sees a subtree's whole spend.
 
 ## Lifecycle
 

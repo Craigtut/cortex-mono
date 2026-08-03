@@ -213,7 +213,7 @@ Ephemeral context is per-call content that the LLM should see but that should NO
 
 ### What Goes in Ephemeral Context
 
-There are two sources of ephemeral content, injected as separate user-role messages at the boundary position. Injection order follows stability: consumer ephemeral first, then loaded skill instructions, then background task state last, so the churning background block stays outside the BP3 cache breakpoint.
+There are three sources of ephemeral content, injected as separate user-role messages at the boundary position. Injection order follows stability: consumer ephemeral first, then loaded skill instructions, then background task state, then the consumer-fed headline block last, so the churning blocks stay outside the BP3 cache breakpoint.
 
 **1. Consumer ephemeral content** (via `setEphemeral()`): Anything the consumer wants the LLM to see per-call. Examples: environment info (cwd, git branch, model), runtime state, active contact context, emotional state, retrieved memories.
 
@@ -224,6 +224,8 @@ The background task block includes:
 - **Running bash processes**: task ID, command, duration, last few lines of stdout
 
 This block is omitted entirely when no background tasks are running.
+
+**3. Consumer-fed headline block** (via `AgentLoop.setHeadlineProvider(provider, { maxTokens? })`): An owner-built live status block, rebuilt from the provider on every LLM call and injected after the background task state. Like background state it churns per tick, so it never extends the cached prefix, never enters the transcript, and is absent on compaction turns like all view injections. The block is hard token-capped (default 2000 tokens): injected user-role content is never trimmed by microcompaction, so an unbounded block would inflate utilization without ever shrinking. Pass `null` to stop injecting; a provider that throws or returns nothing injects nothing for that call.
 
 ### Composability
 

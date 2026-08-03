@@ -87,7 +87,9 @@ Sub-agents share the parent's:
 
 ### Steering a Running Sub-Agent
 
-The parent can send new context to a running background sub-agent via pi-agent-core's `agent.steer()` mechanism. This interrupts the sub-agent's current tool execution, injects the new context, and triggers a new LLM turn.
+`steerSubAgent(taskId, message)` on the parent agent redirects a running sub-agent by task ID. It rides the child's `deliver()` primitive: a mid-run child is steered into its current logical turn (the message lands at the child's next turn boundary), and in the brief window where a tracked child's gate is idle the delivery starts a turn instead, so a redirect is never silently dropped the way a bare `steer()` on an idle loop would be. Returns `false` when the task ID is not an active sub-agent or the child is already tearing down.
+
+Tracked entries also expose a typed handle (`TrackedSubAgent.agent: SubAgentHandle`) with the delivery, teardown, and live-usage surface, so orchestration layers no longer cast an `unknown`.
 
 Consumers may define their own command patterns for interacting with running sub-agents (e.g., decision types that trigger steering with new context).
 
@@ -117,6 +119,32 @@ const agent = await AgentLoop.create({
 ```
 
 Attempting to spawn beyond the limit returns an error in `content` telling the parent agent that the sub-agent budget is exhausted. The parent can wait for a running sub-agent to complete or cancel one to free a slot.
+
+### Concurrency Pools
+
+Spawns can name an independent concurrency pool so one class of work never starves another:
+
+```typescript
+const agent = await AgentLoop.create({
+  model,
+  workingDirectory,
+  maxConcurrentSubAgents: 4,          // the default (unnamed) pool
+  subAgentPools: { lookup: 2 },       // independent named pools
+});
+
+await agent.spawnBackgroundSubAgent({ instructions, pool: 'lookup' });
+```
+
+A spawn that names a pool counts only against that pool's limit; spawns without a pool use `maxConcurrentSubAgents`. Pools are counted independently, so a saturated default pool (a long task fleet) cannot block a small dedicated pool (quick lookups) and vice versa. A named pool missing from `subAgentPools` falls back to the default limit while still being counted separately.
+
+## Per-Spawn Controls
+
+Spawn configuration (both the programmatic `spawnBackgroundSubAgent` API and internal spawn paths) supports per-spawn overrides beyond tools and budget:
+
+- **`timeoutMs`**: Wall-clock cap for the whole spawn. On expiry the child is aborted and its result reports `status: 'timed_out'`, with whatever partial output its transcript holds; background timeouts deliver that result to the parent loop like any completion. Default: no cap.
+- **`model`**: Model for this spawn (default: the parent's primary model). The child's utility model re-resolves from the override's provider, so a fast-model spawn stays fast end to end.
+- **`thinkingLevel`**: Thinking level for this spawn.
+- **`compaction`**: Compaction configuration for this spawn (e.g. a classic strategy or non-blocking posture for a short-lived child).
 
 ## Event Bridge
 

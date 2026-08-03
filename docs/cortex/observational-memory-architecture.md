@@ -106,6 +106,9 @@ interface CortexCompactionConfig {
   // Strategy selection
   strategy?: 'observational' | 'classic';  // default: 'observational'
 
+  // Non-blocking posture: no synchronous LLM call in transformContext
+  nonBlocking?: boolean;  // default: false
+
   // Classic-specific (used when strategy === 'classic')
   microcompaction?: Partial<MicrocompactionConfig>;
   compaction?: Partial<CompactionConfig>;
@@ -120,6 +123,13 @@ interface CortexCompactionConfig {
 ```
 
 When `strategy` is `'observational'` (or omitted), observational memory handles compression. L1 threshold trimming and L2 summarization are disabled. When `'classic'`, the existing L1 + L2 + L3 system operates unchanged.
+
+### Non-Blocking Posture and Idle Digestion
+
+For loops whose turns must never stall on a multi-second in-band LLM call (a presence loop mid-conversation), two controls exist:
+
+- **`nonBlocking: true`** disables every synchronous LLM call inside `transformContext`. Activation still consumes already-buffered chunks (a cheap merge), but the forced synchronous observer on the unobserved tail, the pre-truncation catch-up observation, and inline reflection are skipped; reflection at threshold swaps in a buffered result or launches asynchronously instead. Emergency truncation remains the only blocking in-band path, at the accepted cost of dropping unobserved content if the failsafe fires before digestion catches up.
+- **`AgentLoop.digestIdle()`** runs the deferred work OUTSIDE a prompt: it waits for any in-flight observer chunk to land, observes the still-unobserved tail (buffering the result as a chunk), then runs the threshold pass (activation, reflection, classic summarization) with blocking work explicitly allowed even under the non-blocking posture. It is serialized through the loop gate, so it can never race a running turn's history mutations; an owner schedules it during idle windows so the expensive calls happen while nobody is waiting. Returns `{ observerRan, historyCompacted }`.
 
 ### ObservationalMemoryConfig
 
