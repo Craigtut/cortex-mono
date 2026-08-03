@@ -487,7 +487,9 @@ export interface IdleDigestionOptions {
    * digestion holds the loop gate, so a hung utility request in either
    * phase must time the digestion out (the hung call left in flight)
    * rather than wedge the gate: while the gate is wedged, prompt() fails
-   * fast and parked wake deliveries wait on the sweep behind it.
+   * fast and parked wake deliveries wait on the sweep behind it. The
+   * timed-out pass is invalidated: if the hung call settles later, its
+   * history mutations are discarded rather than applied over live state.
    */
   observerTimeoutMs?: number;
 }
@@ -739,6 +741,15 @@ export class AgentLoop {
   // under the non-blocking posture: the idle window is exactly where that
   // work is supposed to happen.
   private _forceBlockingCompaction = false;
+
+  // Generation token for transform/digestion passes (mirrors the buffering
+  // engine's activationEpoch). A timed-out digestIdle() threshold pass is
+  // abandoned, not cancelled: its hung utility call can settle minutes
+  // later, after the gate released and a real prompt appended messages.
+  // Advancing the generation at abandonment makes that late continuation
+  // discard itself: it must neither rewrite history from its stale
+  // snapshot nor lower _forceBlockingCompaction under a later pass.
+  private _digestionGeneration = 0;
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -4206,7 +4217,10 @@ export class AgentLoop {
    * time out inside the compaction manager, and the blocking threshold
    * pass is raced against the same deadline here, so a hung utility
    * request (observer, reflector, or summarizer) times the digestion out
-   * instead of wedging the gate.
+   * instead of wedging the gate. A timed-out pass is invalidated, not just
+   * abandoned: when its hung call eventually settles, its history rewrite
+   * is discarded instead of being applied over messages a later prompt has
+   * appended in the meantime.
    */
   async digestIdle(options?: IdleDigestionOptions): Promise<IdleDigestionResult> {
     this.assertNotShuttingDown();
@@ -4237,12 +4251,19 @@ export class AgentLoop {
       // gate indefinitely behind a hung request.
       const lengthBefore = this.agent.state.messages.length;
       const hook = this.getTransformContextHook();
+      const passGeneration = this._digestionGeneration;
       this._forceBlockingCompaction = true;
       const thresholdPass = (async () => {
         try {
           await hook(this.buildAgentContextSnapshot());
         } finally {
-          this._forceBlockingCompaction = false;
+          // Only the pass that still owns the current generation may lower
+          // the flag: an abandoned pass settling here while a LATER pass is
+          // mid-flight would otherwise silently degrade that pass to the
+          // non-blocking posture.
+          if (passGeneration === this._digestionGeneration) {
+            this._forceBlockingCompaction = false;
+          }
         }
       })();
       const timeoutMs = options?.observerTimeoutMs ?? DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS;
@@ -4255,10 +4276,14 @@ export class AgentLoop {
           }),
         ]);
         if (timedOut) {
-          // Abandoned, not cancelled: the hung call settles into the void.
-          // Lower the blocking flag now so a later prompt's transform does
-          // not inherit the blocking posture from the abandoned pass, and
-          // swallow its eventual settlement.
+          // Abandoned, not cancelled: nothing can cancel the hung utility
+          // call, so it can still settle minutes from now, after the gate
+          // released and a real prompt appended live messages. Advance the
+          // generation so that late continuation discards itself instead of
+          // replacing live history from its stale snapshot, lower the flag
+          // for the pass (its own finally is now stale), and swallow the
+          // eventual settlement.
+          this._digestionGeneration += 1;
           this._forceBlockingCompaction = false;
           thresholdPass.catch(() => {});
           this.logger.warn('idle digestion threshold pass timed out', { timeoutMs });
@@ -4416,6 +4441,12 @@ export class AgentLoop {
 
     return async (context: AgentContext): Promise<AgentContext> => {
       const sourceMessages = context.messages;
+      // Generation this pass runs under. digestIdle() advances it when it
+      // abandons a timed-out pass; from then on this pass's continuation is
+      // stale and must not touch live state (its hung call can settle after
+      // a later prompt appended messages to the same live history).
+      const passGeneration = this._digestionGeneration;
+      const passIsStale = (): boolean => passGeneration !== this._digestionGeneration;
 
       // Step 0: Apply Tier 1 insertion-time cap to the source messages.
       // Mutate the active transformContext source array, not only
@@ -4427,6 +4458,7 @@ export class AgentLoop {
         sourceMessages,
         slotCount,
       );
+      if (passIsStale()) return context;
       this.agent.state.messages = [...sourceMessages];
 
       // Step 1: Insert ephemeral and skill buffer at the boundary position
@@ -4458,7 +4490,16 @@ export class AgentLoop {
         () => sourceMessages.slice(slotCount),
         // setSourceHistory: replace original transcript after compaction in
         // both the active loop context and the persisted agent state.
+        // Covers the observational activation trim and sync-observer paths
+        // and the classic summarizer rewrite: all of them land here.
         (history) => {
+          if (passIsStale()) {
+            // An abandoned digestIdle() pass settling late: its snapshot
+            // predates messages a real prompt has since appended, so this
+            // rewrite would silently destroy them. Discard it.
+            this.logger.warn('discarding history rewrite from an abandoned digestion pass');
+            return;
+          }
           // Adjust boundary after compaction
           const currentTickCount = sourceMessages.length - this._prePromptMessageCount;
           sourceMessages.splice(slotCount, sourceMessages.length - slotCount, ...history);
@@ -4473,6 +4514,10 @@ export class AgentLoop {
         // manager's configured posture decides.
         this._forceBlockingCompaction ? { allowBlocking: true } : undefined,
       );
+      // A pass abandoned while the manager call hung must not mutate the
+      // live observation slot or breakpoint state either; its return value
+      // goes nowhere.
+      if (passIsStale()) return result;
 
       // After compaction/observation runs, update the observation slot
       if (this.compactionManager.strategy === 'observational') {

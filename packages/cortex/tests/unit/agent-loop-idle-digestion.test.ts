@@ -259,6 +259,142 @@ describe('digestIdle observer wait bound', () => {
   });
 });
 
+describe('digestIdle abandoned pass invalidation', () => {
+  // The dangerous shape is hang-then-SETTLE, not hang-forever: nothing can
+  // cancel the hung utility call, so after the timeout lowers the gate and
+  // a real prompt appends live messages, the abandoned pass's continuation
+  // eventually runs. Pre-fix it replaced the whole post-slot history from
+  // its stale snapshot; it must discard itself instead.
+
+  function messageTexts(piAgent: PiAgent): string[] {
+    return piAgent.state.messages.map((m) =>
+      typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+    );
+  }
+
+  /**
+   * Drain the abandoned pass's continuation chain. Once its hung promise
+   * is resolved the rest of the chain is microtasks only, so one macrotask
+   * hop is a hard barrier, not a timing-dependent sleep. Two for margin.
+   */
+  async function drainSettledContinuations(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it('a timed-out observational pass that later settles does not wipe messages a real prompt appended', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const releases: Array<(value: string) => void> = [];
+    const complete = vi.fn(
+      () => new Promise<string>((resolve) => { releases.push(resolve); }),
+    );
+    loop.getCompactionManager().setObservationalCompleteFn(complete as unknown as CompleteFn);
+    seedHistory(piAgent);
+    // Over the activation threshold so the pass reaches the sync observer.
+    loop.getCompactionManager().updateCurrentContextTokenCount(19_500);
+
+    // Both the buffering catch-up and the threshold pass's sync observer
+    // hang past the deadline; the digestion times out and abandons them.
+    const result = await loop.digestIdle({ observerTimeoutMs: 30 });
+    expect(result.historyCompacted).toBe(false);
+
+    // The gate is free: a real prompt runs and appends live messages.
+    await loop.prompt('after timeout question');
+    const lengthAfterPrompt = piAgent.state.messages.length;
+    expect(messageTexts(piAgent).some((t) => t.includes('after timeout question'))).toBe(true);
+
+    // Now the hung observer calls SETTLE. The abandoned pass's continuation
+    // must discard its stale rewrite instead of destroying live history.
+    for (const release of releases.splice(0)) release(OBSERVER_OUTPUT);
+    await drainSettledContinuations();
+
+    expect(piAgent.state.messages.length).toBe(lengthAfterPrompt);
+    expect(messageTexts(piAgent).some((t) => t.includes('after timeout question'))).toBe(true);
+  });
+
+  it('a timed-out classic summarization that later settles does not rewrite live history', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, { compaction: { strategy: 'classic' } });
+    let releaseSummarizer!: (value: string) => void;
+    const complete = vi.fn(
+      () => new Promise<string>((resolve) => { releaseSummarizer = resolve; }),
+    );
+    loop.getCompactionManager().setCompleteFn(complete as unknown as CompleteFn);
+    for (let i = 0; i < 10; i++) seedHistory(piAgent, 2_000);
+    loop.getCompactionManager().updateCurrentContextTokenCount(15_000);
+
+    const result = await loop.digestIdle({ observerTimeoutMs: 30 });
+    expect(result.historyCompacted).toBe(false);
+
+    await loop.prompt('after classic timeout');
+    const lengthAfterPrompt = piAgent.state.messages.length;
+
+    releaseSummarizer('Summary of the work so far');
+    await drainSettledContinuations();
+
+    expect(piAgent.state.messages.length).toBe(lengthAfterPrompt);
+    expect(messageTexts(piAgent).some((t) => t.includes('after classic timeout'))).toBe(true);
+  });
+
+  it('an abandoned pass settling mid-flight does not strip the blocking posture from a later pass', async () => {
+    const piAgent = createMockPiAgent();
+    // nonBlocking: the posture under which the clobber is destructive. A
+    // later pass degraded to it skips every blocking path and does nothing.
+    const loop = createLoop(piAgent, {
+      compaction: { strategy: 'classic', nonBlocking: true },
+    });
+    let releaseFirst: ((value: string) => void) | null = null;
+    const complete = vi.fn((): Promise<string> => {
+      if (releaseFirst === null) {
+        return new Promise<string>((resolve) => { releaseFirst = resolve; });
+      }
+      return Promise.resolve('Summary of the work so far');
+    });
+    loop.getCompactionManager().setCompleteFn(complete as unknown as CompleteFn);
+    for (let i = 0; i < 10; i++) seedHistory(piAgent, 2_000);
+    loop.getCompactionManager().updateCurrentContextTokenCount(15_000);
+
+    // Pass 1: the summarizer hangs, the pass times out and is abandoned
+    // while still awaiting its hung call.
+    await loop.digestIdle({ observerTimeoutMs: 20 });
+    expect(complete).toHaveBeenCalledTimes(1);
+
+    // Pass 2: intercept the pipeline INSIDE its window between raising the
+    // blocking flag and reading it, and settle pass 1 there. Its abandoned
+    // finally must not lower the flag out from under pass 2.
+    const mgr = loop.getCompactionManager();
+    const managerAny = mgr as unknown as {
+      applyInsertionCap: (...args: unknown[]) => Promise<unknown>;
+      applyInTransformContext: (...args: unknown[]) => Promise<unknown>;
+    };
+    const originalCap = managerAny.applyInsertionCap.bind(mgr);
+    let settledPassOne = false;
+    managerAny.applyInsertionCap = async (...args: unknown[]) => {
+      if (!settledPassOne) {
+        settledPassOne = true;
+        releaseFirst!('Summary of the work so far');
+        // Macrotask barrier: pass 1's remaining chain is microtasks only,
+        // so it has fully settled (including its finally) after this hop.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      return originalCap(...args);
+    };
+    const optionsSeen: unknown[] = [];
+    const originalApply = managerAny.applyInTransformContext.bind(mgr);
+    managerAny.applyInTransformContext = async (...args: unknown[]) => {
+      optionsSeen.push(args[5]);
+      return originalApply(...args);
+    };
+
+    await loop.digestIdle({ observerTimeoutMs: 5_000 });
+
+    // Pass 2 still ran under the blocking posture its own digestIdle set.
+    expect(settledPassOne).toBe(true);
+    expect(optionsSeen).toEqual([{ allowBlocking: true }]);
+  });
+});
+
 describe('digestIdle gate serialization', () => {
   it('waits for a running turn instead of racing its history mutations', async () => {
     const piAgent = createMockPiAgent();
