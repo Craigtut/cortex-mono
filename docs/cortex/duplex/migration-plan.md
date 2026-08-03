@@ -43,6 +43,16 @@ Three review passes were needed on 1b, and the pattern is worth carrying into Ph
 
 ## Phase 2: The Facade
 
+Split into 2a (skeleton, passthrough-only, the parity checkpoint) and 2b (duplex behaviors), so the plumbing is verified against today's behavior before any duplex behavior exists to confuse the comparison.
+
+### 2a (complete)
+
+Landed the facade class with a compile-checked config routing table, `SessionLog` (monotonic seq, causation stamps, bounded replayable subscriptions, ring-buffer retention with spill), v2 composite persistence (baseline-plus-delta usage with a per-loop breakdown, restore-while-running rejection, v1 and bare-array upgrade paths, debounced `onStateChanged` snapshotting only at gate quiescence), settlement predicates over gate depth, and a side-by-side parity suite driving `AgentLoop` and the facade over identical mock loops. `mode: 'duplex'` throws rather than silently degrading. Suite 2954 to 3035.
+
+Two mechanism deviations are recorded as footnotes in facade-api.md; both resolve in 2b. Causation stamps bind exactly for facade-initiated runs and are deliberately absent (rather than guessed) for runs the facade did not start, since the router owns those in 2b and D16 binds consent to causation.
+
+### 2b (outstanding)
+
 The new `CortexAgent`. Built against the hardened primitive; passthrough mode first, duplex assembled behind it.
 
 1. Facade class: talker + persistent reasoner, mode routing, the completed config routing table (facade-api.md), per-loop session IDs, staggered compaction thresholds, talker constructed with no `resolvePermission` and a facade-set hard `maxTurns`, **and the aggregate budget guard active from the first assembly** (moved up from P3: duplex must never run with per-prompt budgets as its only bound). **[R-F1, R-F3]**

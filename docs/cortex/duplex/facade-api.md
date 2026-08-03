@@ -73,6 +73,11 @@ Abort semantics, per scope:
 
 Concurrency contract: concurrent `prompt()` calls are serialized by the facade rather than throwing; `restore()` is rejected while any loop is running; the consumer idle signal is advisory, with the facade enforcing its own minimum inter-delivery spacing so an always-idle or never-idle signal cannot break the wake policy.
 
+**Two passthrough footnotes**, from building 2a. Both keep the contracts above while differing in mechanism, and both resolve in 2b.
+
+- `prompt()` is specified as always routing through `deliver()`. In passthrough it instead serializes on a facade chain and calls the reasoner's `prompt()` directly, because `deliver()` carries no `DirectCompletionOptions` (dropping them would be a silent parity break) and a parked delivery has no turn promise, so "resolves against the turn that carries the input" is unimplementable through it. The `deliver()` route is a talker and barge-in mechanism; it belongs to 2b, where the talker needs non-throwing input under an interrupt-woken turn.
+- The abort table's "completed-but-undelivered results are retained in the log, not delivered" holds in duplex, where the router owns delivery. In passthrough those completions are logged as lifecycle entries *and* still delivered by the existing background drain, because suppressing delivery requires the router. Parity with today's single-loop behavior wins here.
+
 ## Events
 
 One merged stream via `getEventBridge()`, every event labeled with a loop path (`talker`, `reasoner`, `reasoner/task-7`, `lookup/lk-2`). The existing single-level `childTaskId` becomes this path (P1).

@@ -28,10 +28,11 @@ Production-grade agent infrastructure built on `pi-agent-core`. Cortex wraps `@e
 
 ## The Cortex Package (`@animus-labs/cortex`)
 
-Two main exports, fully independent:
+Three main exports:
 
-- **`AgentLoop`**: The agentic loop, tools, context management, compaction, skills. Always-warm session, no cold/warm state machine.
-- **`ProviderManager`**: Provider discovery, OAuth flows, API key validation, model resolution. Wraps pi-ai's multi-provider ecosystem.
+- **`CortexAgent`**: The composite agent consumers interact with. Owns the session log, persistence, and settlement, and routes to one or more `AgentLoop` instances. Currently passthrough-only (routes straight to a single reasoner loop); the talker/reasoner duplex mode lands in the restructure's Phase 2b. See `docs/cortex/duplex/`.
+- **`AgentLoop`**: The loop primitive. The agentic loop, tools, context management, compaction, skills. Always-warm session, no cold/warm state machine. Role-neutral by design: the same class runs as talker, reasoner, and sub-agent.
+- **`ProviderManager`**: Provider discovery, OAuth flows, API key validation, model resolution. Wraps pi-ai's multi-provider ecosystem. Independent of the other two.
 
 ### Key Design Patterns
 
