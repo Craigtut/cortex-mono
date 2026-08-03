@@ -77,6 +77,9 @@ Concurrency contract: concurrent `prompt()` calls are serialized by the facade r
 
 - `prompt()` is specified as always routing through `deliver()`. In passthrough it instead serializes on a facade chain and calls the reasoner's `prompt()` directly, because `deliver()` carries no `DirectCompletionOptions` (dropping them would be a silent parity break) and a parked delivery has no turn promise, so "resolves against the turn that carries the input" is unimplementable through it. The `deliver()` route is a talker and barge-in mechanism; it belongs to 2b, where the talker needs non-throwing input under an interrupt-woken turn.
 - The abort table's "completed-but-undelivered results are retained in the log, not delivered" holds in duplex, where the router owns delivery. In passthrough those completions are logged as lifecycle entries *and* still delivered by the existing background drain, because suppressing delivery requires the router. Parity with today's single-loop behavior wins here.
+- Facade `abort()` clears the loop's queues (both pi queues plus silent and parked-wake content) where direct `AgentLoop.abort()` does not. This follows the abort table above, so it is intended rather than accidental, but it is a genuine behavioral difference for a consumer migrating: content parked by `steer()` survives a direct loop abort and does not survive a facade abort. A consumer that relied on the former needs to re-issue after aborting.
+
+The facade is not yet a drop-in replacement for `AgentLoop`. See the delegation table in `docs/cortex/cortex-agent.md` for what is forwarded, what is subsumed, and what is deliberately withheld; that table is the migration checklist Phase 3 plans against, and it is kept accurate by a structural test rather than by review.
 
 ## Events
 
