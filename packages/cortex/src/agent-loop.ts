@@ -2748,12 +2748,18 @@ export class AgentLoop {
     if (rendered.length <= RENDERED_REQUEST_MAX_CHARS) return rendered;
     // Head AND tail survive verbatim; only the middle is elided. A
     // head-only cut would let a long benign prefix conceal a destructive
-    // suffix from the human approving this string.
-    const elided = rendered.length - RENDERED_REQUEST_HEAD_CHARS - RENDERED_REQUEST_TAIL_CHARS;
+    // suffix from the human approving this string. The middle is still
+    // concealed, though: an over-cap rendering is not a full transcript of
+    // what will run, and a surface that needs certainty must read the tool
+    // call's own args. Sliced by code points so the cut cannot split a
+    // surrogate pair and corrupt the characters at the seam.
+    const chars = [...rendered];
+    if (chars.length <= RENDERED_REQUEST_MAX_CHARS) return rendered;
+    const elided = chars.length - RENDERED_REQUEST_HEAD_CHARS - RENDERED_REQUEST_TAIL_CHARS;
     return (
-      rendered.slice(0, RENDERED_REQUEST_HEAD_CHARS) +
+      chars.slice(0, RENDERED_REQUEST_HEAD_CHARS).join('') +
       ` …[${elided} chars elided]… ` +
-      rendered.slice(-RENDERED_REQUEST_TAIL_CHARS)
+      chars.slice(-RENDERED_REQUEST_TAIL_CHARS).join('')
     );
   }
 

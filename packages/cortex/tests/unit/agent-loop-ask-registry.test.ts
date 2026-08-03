@@ -161,6 +161,26 @@ describe('pending-ask registry', () => {
     expect(rendered).toContain('chars elided');
   });
 
+  it('never splits a surrogate pair at the elision seams', async () => {
+    // Astral characters (2 UTF-16 units each) placed so both the head cut
+    // and the tail cut land mid-pair under unit-based slicing: 'x' shifts
+    // the head boundary onto the second unit of an emoji, 'y' does the
+    // same for the tail. A lone surrogate corrupts the string a human is
+    // asked to approve.
+    const longCommand = `x${'\u{1F600}'.repeat(600)}y`;
+    let rendered: string | undefined;
+    const { hook } = buildLoopWithHook(async (_tool, _args, context) => {
+      rendered = context?.renderedRequest;
+      return true;
+    });
+
+    await hook({ toolCall: { name: 'Bash' }, args: { command: longCommand } });
+
+    expect(rendered).toContain('chars elided');
+    expect(rendered!.isWellFormed()).toBe(true);
+    expect(rendered!.endsWith(`${'\u{1F600}'.repeat(3)}y`)).toBe(true);
+  });
+
   it('settles the ask when the run aborts while it is pending', async () => {
     const resolver = vi.fn(() => new Promise<boolean>(() => {}));
     const { loop, hook } = buildLoopWithHook(resolver);
