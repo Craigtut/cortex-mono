@@ -116,6 +116,8 @@ import type {
   ToolExecuteContext,
   PersistResultFn,
   ToolCategory,
+  UtilityUsageBucket,
+  UtilityUsagePayload,
 } from './types.js';
 import { processToolResult } from './tool-result-persistence.js';
 
@@ -409,6 +411,14 @@ export interface DirectCompletionOptions {
    * and `utilityComplete`.
    */
   signal?: AbortSignal;
+  /**
+   * Category tag this completion's spend is recorded under in the loop's
+   * session usage (see SessionUsage.utility) and on the emitted
+   * utility_usage event. Cortex tags its internal calls ('observer',
+   * 'reflector', 'summarization', 'webfetch', 'bash_utility'); consumer
+   * calls default to 'direct', 'structured', or 'utility' by entry point.
+   */
+  usageCategory?: string;
 }
 
 /** Options for {@link AgentLoop.deliver}. */
@@ -987,17 +997,23 @@ export class AgentLoop {
       this.setBasePrompt(config.initialBasePrompt);
     }
 
-    // Wire compaction completion function (uses directComplete)
+    // Wire compaction completion function (uses directComplete). Tagged so
+    // L2 summarization spend lands in session usage under its own bucket.
     this.compactionManager.setCompleteFn(async (context) => {
-      return this.directComplete(context);
+      return this.directComplete(context, { usageCategory: 'summarization' });
     });
 
-    // Wire utility model completion for observer/reflector
-    this.compactionManager.setObservationalCompleteFn(async (context) => {
-      return this.utilityComplete({
-        systemPrompt: context.systemPrompt,
-        messages: context.messages as Array<{ role: string; content: string }>,
-      });
+    // Wire utility model completion for observer/reflector. The purpose the
+    // engine passes per call becomes the usage category, so observer and
+    // reflector spend are separable in accounting.
+    this.compactionManager.setObservationalCompleteFn(async (context, options) => {
+      return this.utilityComplete(
+        {
+          systemPrompt: context.systemPrompt,
+          messages: context.messages as Array<{ role: string; content: string }>,
+        },
+        { usageCategory: options?.purpose ?? 'observation' },
+      );
     });
 
     // Wire compaction result -> onPostCompaction handlers on the manager.
@@ -2040,6 +2056,7 @@ export class AgentLoop {
 
       // Capture usage from the AssistantMessage response
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      this.recordUtilityUsage(options?.usageCategory ?? 'direct', this._lastDirectUsage);
 
       this.logger.debug('directComplete', {
         durationMs: Date.now() - directStartMs,
@@ -2141,6 +2158,7 @@ export class AgentLoop {
 
       // Capture usage from the AssistantMessage response
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      this.recordUtilityUsage(options?.usageCategory ?? 'structured', this._lastDirectUsage);
 
       this.logger.debug('structuredComplete', {
         toolName,
@@ -3270,6 +3288,7 @@ export class AgentLoop {
 
       // Capture usage from utility model calls
       this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      this.recordUtilityUsage(options?.usageCategory ?? 'utility', this._lastDirectUsage);
 
       this.logger.debug('utilityComplete', {
         durationMs: Date.now() - utilStartMs,
@@ -3611,7 +3630,19 @@ export class AgentLoop {
    * and restore it via restoreSessionUsage() after loading a saved session.
    */
   getSessionUsage(): SessionUsage {
-    return { ...this._sessionUsage, tokens: { ...this._sessionUsage.tokens } };
+    const snapshot: SessionUsage = {
+      ...this._sessionUsage,
+      tokens: { ...this._sessionUsage.tokens },
+    };
+    if (this._sessionUsage.utility) {
+      snapshot.utility = Object.fromEntries(
+        Object.entries(this._sessionUsage.utility).map(([category, bucket]) => [
+          category,
+          { ...bucket, tokens: { ...bucket.tokens } },
+        ]),
+      );
+    }
+    return snapshot;
   }
 
   /**
@@ -3628,6 +3659,43 @@ export class AgentLoop {
     this._sessionUsage.tokens.output += usage.tokens.output;
     this._sessionUsage.tokens.cacheRead += usage.tokens.cacheRead;
     this._sessionUsage.tokens.cacheWrite += usage.tokens.cacheWrite;
+    if (usage.utility) {
+      for (const [category, bucket] of Object.entries(usage.utility)) {
+        const target = this.utilityUsageBucket(category);
+        target.calls += bucket.calls;
+        target.cost += bucket.cost;
+        target.tokens.input += bucket.tokens.input;
+        target.tokens.output += bucket.tokens.output;
+        target.tokens.cacheRead += bucket.tokens.cacheRead;
+        target.tokens.cacheWrite += bucket.tokens.cacheWrite;
+      }
+    }
+  }
+
+  /**
+   * Emit a utility_usage event for a completed direct/utility call. The
+   * session-usage accumulation happens in the event listener (see
+   * wireInternalEvents), one code path for this loop's own completions and
+   * forwarded child ones alike.
+   */
+  private recordUtilityUsage(category: string, usage: CortexUsage | null): void {
+    if (!usage) return;
+    this.eventBridge.emitUtilityUsage(category, usage);
+  }
+
+  /** Get (or create) the session-usage bucket for a utility category. */
+  private utilityUsageBucket(category: string): UtilityUsageBucket {
+    this._sessionUsage.utility ??= {};
+    let bucket = this._sessionUsage.utility[category];
+    if (!bucket) {
+      bucket = {
+        calls: 0,
+        cost: 0,
+        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      };
+      this._sessionUsage.utility[category] = bucket;
+    }
+    return bucket;
   }
 
   // -----------------------------------------------------------------------
@@ -4257,7 +4325,7 @@ export class AgentLoop {
         utilityComplete: (context) => this.utilityComplete(context as {
           systemPrompt: string;
           messages: Array<{ role: string; content: string }>;
-        }),
+        }, { usageCategory: 'bash_utility' }),
         isAutoApprove: () => this.config.isAutoApprove?.() ?? false,
         // Track spawned shell PIDs so destroy()'s force-kill deadline and
         // the process-exit safety net cover background/auto-yielded
@@ -4294,7 +4362,7 @@ export class AgentLoop {
         utilityComplete: (context) => this.utilityComplete(context as {
           systemPrompt: string;
           messages: Array<{ role: string; content: string }>;
-        }),
+        }, { usageCategory: 'webfetch' }),
         // The consumer's unified egress gate, shared with sandboxed shell
         // egress. Undefined = ungated, exactly as before.
         resolveNetworkAccess: this.config.resolveNetworkAccess,
@@ -4482,6 +4550,42 @@ export class AgentLoop {
     this.eventUnsubscribers.push(
       this.eventBridge.onAll((event) => {
         this.promptDiagnostics.recordEvent(event);
+      }),
+    );
+
+    // Accumulate direct/utility completion spend into session usage. One
+    // listener covers this loop's own completions (emitted by
+    // recordUtilityUsage) and forwarded child completions (childTaskId set),
+    // mirroring how child turn_end usage rolls into the parent totals.
+    this.eventUnsubscribers.push(
+      this.eventBridge.on('utility_usage', (event) => {
+        const usage = event.usage;
+        if (!usage) return;
+        const category =
+          (event.payload as UtilityUsagePayload | undefined)?.category ?? 'utility';
+
+        this._sessionUsage.totalCost += usage.cost.total;
+        this._sessionUsage.tokens.input += usage.input;
+        this._sessionUsage.tokens.output += usage.output;
+        this._sessionUsage.tokens.cacheRead += usage.cacheRead;
+        this._sessionUsage.tokens.cacheWrite += usage.cacheWrite;
+
+        const bucket = this.utilityUsageBucket(category);
+        bucket.calls += 1;
+        bucket.cost += usage.cost.total;
+        bucket.tokens.input += usage.input;
+        bucket.tokens.output += usage.output;
+        bucket.tokens.cacheRead += usage.cacheRead;
+        bucket.tokens.cacheWrite += usage.cacheWrite;
+
+        this.logger.debug('utility usage', {
+          category,
+          cost: usage.cost.total,
+          input: usage.input,
+          output: usage.output,
+          childTaskId: event.childTaskId,
+          sessionTotalCost: this._sessionUsage.totalCost,
+        });
       }),
     );
 

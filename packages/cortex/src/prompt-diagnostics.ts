@@ -132,11 +132,12 @@ export class PromptWatchdogDiagnostics {
 
     if (event.type === 'tool_call_start') {
       this.activePrompt.toolCallCount += 1;
+      const startPayload = event.payload as import('./types.js').ToolCallStartPayload | undefined;
       this.logger.debug('[Diagnostics] tool_call_start', {
         diagnosticsSessionId: this.sessionId,
         loopPath: this.loopPath,
         promptId: this.currentPromptId(),
-        toolName: event.payload?.toolName,
+        toolName: startPayload?.toolName,
         childTaskId: event.childTaskId,
       });
       return;

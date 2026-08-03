@@ -504,12 +504,12 @@ export async function runObserver(
     config.previousObserverTokens,
   );
 
-  const raw = await complete({ systemPrompt, messages: observerMessages });
+  const raw = await complete({ systemPrompt, messages: observerMessages }, { purpose: 'observer' });
   const output = parseObserverOutput(raw);
 
   // Detect degenerate repetition and retry once
   if (detectDegenerateRepetition(output.observations)) {
-    const retryRaw = await complete({ systemPrompt, messages: observerMessages });
+    const retryRaw = await complete({ systemPrompt, messages: observerMessages }, { purpose: 'observer' });
     return parseObserverOutput(retryRaw);
   }
 

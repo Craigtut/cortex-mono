@@ -89,11 +89,39 @@ export interface CortexUsage {
  * Cortex tracks this in memory; consumers persist and restore as needed.
  */
 export interface SessionUsage {
-  /** Total cost in USD across all turns. */
+  /**
+   * Total cost in USD across all recorded spend: loop turns (this loop's
+   * and forwarded children's) plus direct/utility completions.
+   */
   totalCost: number;
   /** Total number of LLM turns across all loops. */
   totalTurns: number;
-  /** Accumulated token counts across all turns. */
+  /** Accumulated token counts across all recorded spend. */
+  tokens: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+  /**
+   * Direct/utility completion spend broken down by category tag (e.g.
+   * 'observer', 'reflector', 'summarization', 'webfetch', 'bash_utility',
+   * or a consumer-supplied tag). Absent until the first tagged completion
+   * is recorded. Bucket contents are also included in the top-level totals.
+   */
+  utility?: Record<string, UtilityUsageBucket>;
+}
+
+/**
+ * Accumulated spend of one direct/utility completion category within
+ * {@link SessionUsage}.
+ */
+export interface UtilityUsageBucket {
+  /** Number of completions recorded under this category. */
+  calls: number;
+  /** Accumulated cost in USD. */
+  cost: number;
+  /** Accumulated token counts. */
   tokens: {
     input: number;
     output: number;
@@ -821,6 +849,17 @@ export interface ToolCallEndPayload {
   durationMs: number;
   isError: boolean;
   error?: string;
+}
+
+/**
+ * Typed payload for utility_usage events, emitted once per direct/utility
+ * completion (observer, reflector, summarization, WebFetch summarization,
+ * Bash utility calls, consumer-tagged calls). The usage itself rides the
+ * event's `usage` field.
+ */
+export interface UtilityUsagePayload {
+  /** The category tag the spend was recorded under. */
+  category: string;
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ import type {
   ToolCallUpdatePayload,
   ToolCallEndPayload,
   ToolContentDetails,
+  UtilityUsagePayload,
 } from './types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { parseWorkingTags } from './working-tags.js';
@@ -51,7 +52,8 @@ export type CortexEventType =
   | 'response_end'
   | 'tool_call_start'
   | 'tool_call_update'
-  | 'tool_call_end';
+  | 'tool_call_end'
+  | 'utility_usage';
 
 /**
  * Normalized event data emitted by the event bridge.
@@ -63,13 +65,15 @@ export interface CortexEvent {
   /** Parsed text output, present only for turn_end events. */
   textOutput?: AgentTextOutput;
   /**
-   * Typed payload for tool events (tool_call_start, tool_call_update, tool_call_end).
-   * Provides typed access to tool event data without casting `data`.
+   * Typed payload for tool events (tool_call_start, tool_call_update,
+   * tool_call_end) and utility_usage events. Provides typed access without
+   * casting `data`.
    */
-  payload?: ToolCallStartPayload | ToolCallUpdatePayload | ToolCallEndPayload;
+  payload?: ToolCallStartPayload | ToolCallUpdatePayload | ToolCallEndPayload | UtilityUsagePayload;
   /**
-   * Extracted usage data from the LLM response, present on turn_end events.
-   * Centralizes extraction from pi-ai's AssistantMessage.usage structure so
+   * Extracted usage data from the LLM response, present on turn_end events
+   * (from pi-ai's AssistantMessage.usage) and on utility_usage events (from
+   * the direct/utility completion that was just recorded). Centralized so
    * subscribers (BudgetGuard, AgentLoop, consumers) read typed data instead
    * of parsing the opaque `data` field themselves.
    */
@@ -239,6 +243,20 @@ export class EventBridge {
           ? `${childTaskId}/${event.childTaskId}`
           : childTaskId,
       });
+    });
+  }
+
+  /**
+   * Emit a utility_usage event for one direct/utility completion. Cortex
+   * calls this once per recorded completion; it also propagates to parent
+   * bridges through forwardFrom (with childTaskId set), exactly like pi
+   * events, so an aggregate consumer sees a subtree's utility spend.
+   */
+  emitUtilityUsage(category: string, usage: CortexUsage): void {
+    this.emit({
+      type: 'utility_usage',
+      usage,
+      payload: { category } satisfies UtilityUsagePayload,
     });
   }
 
