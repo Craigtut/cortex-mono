@@ -18,8 +18,14 @@ import type { SubAgentHandle, SubAgentResult, TrackedSubAgent } from './types.js
 // ---------------------------------------------------------------------------
 
 export interface SubAgentManagerConfig {
-  /** Maximum concurrent sub-agents. Default: 4. */
+  /** Maximum concurrent sub-agents in the default (unnamed) pool. Default: 4. */
   maxConcurrent: number;
+  /**
+   * Independent named concurrency pools. A spawn that names a pool counts
+   * only against that pool's limit; a named pool missing from this map
+   * falls back to maxConcurrent while still being counted separately.
+   */
+  pools?: Record<string, number>;
 }
 
 export interface SubAgentLifecycleHooks {
@@ -38,11 +44,13 @@ const MAX_CANCELLED_TASK_IDS = 200;
 export class SubAgentManager {
   private readonly agents = new Map<string, TrackedSubAgent>();
   private readonly maxConcurrent: number;
+  private readonly pools: Record<string, number>;
   private hooks: SubAgentLifecycleHooks = {};
   private readonly cancelledTaskIds = new Set<string>();
 
   constructor(config?: Partial<SubAgentManagerConfig>) {
     this.maxConcurrent = config?.maxConcurrent ?? 4;
+    this.pools = config?.pools ?? {};
   }
 
   /**
@@ -53,32 +61,49 @@ export class SubAgentManager {
   }
 
   /**
-   * Check if another sub-agent can be spawned within the concurrency limit.
+   * Check if another sub-agent can be spawned within the concurrency limit
+   * of the given pool (the default pool when omitted). Pools are counted
+   * independently, so a saturated default pool never blocks a named pool.
    */
-  canSpawn(): boolean {
-    return this.agents.size < this.maxConcurrent;
+  canSpawn(pool?: string): boolean {
+    return this.activeCountInPool(pool) < this.poolLimit(pool);
   }
 
   /**
-   * Get the number of currently active sub-agents.
+   * Get the number of currently active sub-agents across all pools.
    */
   get activeCount(): number {
     return this.agents.size;
   }
 
   /**
-   * Get the concurrency limit.
+   * Get the concurrency limit of the default pool.
    */
   get limit(): number {
     return this.maxConcurrent;
   }
 
+  /** Number of active sub-agents in the given pool (default pool when omitted). */
+  activeCountInPool(pool?: string): number {
+    let count = 0;
+    for (const entry of this.agents.values()) {
+      if (entry.pool === pool) count += 1;
+    }
+    return count;
+  }
+
+  /** The configured limit of a pool (default pool when omitted). */
+  poolLimit(pool?: string): number {
+    if (pool === undefined) return this.maxConcurrent;
+    return this.pools[pool] ?? this.maxConcurrent;
+  }
+
   /**
    * Register a newly spawned sub-agent.
-   * Returns false if the concurrency limit would be exceeded.
+   * Returns false if its pool's concurrency limit would be exceeded.
    */
   track(entry: TrackedSubAgent): boolean {
-    if (this.agents.size >= this.maxConcurrent) {
+    if (this.activeCountInPool(entry.pool) >= this.poolLimit(entry.pool)) {
       return false;
     }
 

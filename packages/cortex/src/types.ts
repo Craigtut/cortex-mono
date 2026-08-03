@@ -285,6 +285,16 @@ export interface AgentLoopConfig {
   maxConcurrentSubAgents?: number;
 
   /**
+   * Named, independent sub-agent concurrency pools. A spawn that names a
+   * pool counts only against that pool's limit, so a saturated default pool
+   * (long task fleet) can never starve a small dedicated pool (quick
+   * lookups) and vice versa. A named pool missing from this map falls back
+   * to the maxConcurrentSubAgents limit while still being counted
+   * separately. Spawns without a pool use maxConcurrentSubAgents.
+   */
+  subAgentPools?: Record<string, number>;
+
+  /**
    * Tool execution strategy for assistant messages with multiple tool calls.
    * Defaults to sequential for deterministic permission, logging, and UI order.
    */
@@ -1319,6 +1329,29 @@ export interface SubAgentSpawnConfig {
   maxCost?: number;
   /** Run asynchronously. Default: false (blocks until complete). */
   background?: boolean;
+  /**
+   * Wall-clock cap in milliseconds for the whole spawn. On expiry the child
+   * is aborted and its result reports status 'timed_out' (with whatever
+   * partial output its transcript holds). Default: no cap.
+   */
+  timeoutMs?: number;
+  /**
+   * Model for this spawn. Default: the parent's primary model. The child's
+   * utility model re-resolves from this model's provider, so a fast-model
+   * spawn stays fast end to end.
+   */
+  model?: CortexModel;
+  /** Thinking level for this spawn. Default: pi-agent-core's default. */
+  thinkingLevel?: ThinkingLevel;
+  /** Compaction configuration for this spawn. Default: Cortex defaults. */
+  compaction?: Partial<CortexCompactionConfig>;
+  /**
+   * Named concurrency pool this spawn counts against (see
+   * AgentLoopConfig.subAgentPools). Spawns without a pool count against
+   * maxConcurrentSubAgents. Pools are independent: work in one pool never
+   * blocks capacity in another.
+   */
+  pool?: string;
 }
 
 /**
@@ -1471,6 +1504,8 @@ export interface TrackedSubAgent {
   instructions: string;
   /** Whether this is a background sub-agent. */
   background: boolean;
+  /** Named concurrency pool this spawn counts against (default pool when absent). */
+  pool?: string;
   /** Spawn timestamp. */
   spawnedAt: number;
   /** Promise that resolves when the sub-agent completes. */
