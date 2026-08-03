@@ -102,6 +102,20 @@ async function settledWithin<T>(promise: Promise<T>, ms: number): Promise<{ sett
   return { settled: true, value: winner as T };
 }
 
+/**
+ * Wait until `predicate` holds, polling on the microtask/timer queue. A fixed
+ * sleep races the async chain from resolvePermission to the prompt spy: on a
+ * loaded machine 20ms is not always enough, which showed up as roughly a
+ * one-in-six suite flake.
+ */
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('waitUntil timed out');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe('Session.resolvePermission ask context', () => {
   it('dismisses a pending prompt when the asking run aborts, settling with a block and releasing the lock', async () => {
     const { internals } = makeSession();
@@ -134,7 +148,7 @@ describe('Session.resolvePermission ask context', () => {
   });
 
   it('carries the askId into the permission activity record', async () => {
-    const { internals } = makeSession();
+    const { internals, showPermissionPrompt } = makeSession();
     const controller = new AbortController();
     const requested = vi.spyOn(internals.activity, 'recordPermissionRequested');
 
@@ -143,8 +157,9 @@ describe('Session.resolvePermission ask context', () => {
       { command: 'git push origin main' },
       { signal: controller.signal, askId: 'ask-test-2', loopPath: 'main' },
     );
-    // Let the prompt reach the activity record, then dismiss it.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Wait for the prompt itself, not for the activity record: the record is
+    // written as the ask settles, so waiting on it here would deadlock.
+    await waitUntil(() => showPermissionPrompt.mock.calls.length > 0);
     controller.abort();
     await resultPromise;
 
@@ -165,7 +180,7 @@ describe('Session.resolvePermission ask context', () => {
       { command: 'git push origin main' },
       { signal: firstController.signal, askId: 'ask-first' },
     );
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitUntil(() => showPermissionPrompt.mock.calls.length > 0);
     expect(showPermissionPrompt).toHaveBeenCalledTimes(1);
 
     // Second ask queues behind the lock; its run aborts while it waits.
