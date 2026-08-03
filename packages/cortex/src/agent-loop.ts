@@ -1253,6 +1253,28 @@ export class AgentLoop {
   }
 
   /**
+   * Resolve once the loop gate is empty: no gate task running or queued.
+   * This is the awaitable form of {@link isLoopActive}, and the primitive
+   * settlement predicates build on. It deliberately keys on gate depth
+   * rather than {@link isPrompting}, which reads idle while gate tasks
+   * (queued drains, delivery sweeps, idle digestion) are still pending.
+   *
+   * Event-driven, not polled: each pass awaits the current gate tail and
+   * re-checks, so tasks enqueued by tasks (a run scheduling a drain, a
+   * parked delivery scheduling a sweep) extend the wait. The depth is zero
+   * in the frame this resolves in, but the caller's continuation runs a
+   * microtask later, and an unrelated continuation can enqueue a gate task
+   * in between; a caller that needs check-then-act atomicity must therefore
+   * re-check {@link isLoopActive} synchronously before acting, and wait
+   * again if the gate refilled.
+   */
+  async waitForLoopIdle(): Promise<void> {
+    while (this.loopGateDepth > 0) {
+      await this.loopGateTail;
+    }
+  }
+
+  /**
    * One gate-owned loop cycle: run the logical turn, then deliver any
    * background completions that arrived while it ran. Lifecycle is
    * re-checked here (at dequeue time) so a destroy() that lands between
