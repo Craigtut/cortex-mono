@@ -1,6 +1,6 @@
 # Migration Plan
 
-> **STATUS: IN PROGRESS.** Phase 0 complete. Phase 1 items 1 and 3 complete (rename, loop identity). Remaining Phase 1 items, Phase 2, and Phase 3 outstanding.
+> **STATUS: IN PROGRESS.** Phases 0 and 1 complete and reviewed. Phase 2 is next, split into 2a (facade skeleton, passthrough-only, the parity checkpoint) and 2b (duplex behaviors). Phase 3 outstanding.
 
 Four phases, developed on the `duplex-restructure` branch (an exception to the usual commit-to-main rule, given the size of the overhaul). Each phase lands in small conventional commits, keeps the test suite green, and is independently valuable. File:line references are as of 2026-08 and will drift; they identify the sites, not eternal truths.
 
@@ -23,21 +23,23 @@ Landed across 8 implementation commits plus two rounds of review fixes. Two Opus
 
 `deliver()` was originally P0.3 and has moved to P1; the reviews showed it is a state machine, not a small fix. **[R16]**
 
-## Phase 1: Rename and Loop Hardening
+## Phase 1: Rename and Loop Hardening (complete)
 
-The breaking-change phase. Wants clean CI before starting; lands as a small number of focused commits.
+The breaking-change phase. Split in practice into 1a (rename plus loop identity, mechanical and high-blast-radius) and 1b (the concurrency primitives), each separately reviewed, because a 635-site rename mixed with concurrency changes would bury the interesting parts of the diff.
+
+Three review passes were needed on 1b, and the pattern is worth carrying into Phase 2. Every round found real defects, none of which the suite could reach: they required hand-traced interleavings and purpose-built probes. Two of them were *introduced by the previous round's fix*, both of the same shape, a bound-the-hang change trading a loud failure for a quiet one. The lesson for the facade: when a fix adds a coordination mechanism, review the mechanism, not just the bug it closed.
 
 1. **Rename (done).** `CortexAgent` (class) became `AgentLoop`, and `src/cortex-agent.ts` became `src/agent-loop.ts`. The `CortexAgent` name is now free for the facade (Phase 2). Deprecated aliases (`buildSystemPrompt`, `rebuildSystemPrompt`, `systemPrompt` config) were removed rather than renamed. Actual blast radius: 635 occurrences across 71 files (43 code, 26 docs, 12 in this folder left untouched), and 42 `[CortexAgent]` log prefixes, not the ~90 measured. cortex-code and cortex-sandbox flipped in the same commit. No compat alias was left, so this is an npm major. **[R19]**
 2. **`deliver()` primitive (done).** Three outcomes (`prompted`, `parked`, `queued`), decided synchronously inside the loop gate to avoid a time-of-check race against `prompt()`. Wake and silent content both live in loop-owned queues spliced into the next run's batch; pi's steering queue is reserved for the public `steer()` API. Two review passes were needed here: the first mechanism steered into pi's queue and reconciled afterwards, which duplicated already-drained content and destroyed unrelated parked content, because pi's queue cannot be inspected or selectively drained. Also surfaces `followUp()`, queue modes, and queue clears. **[R16, R-F5]**
 3. **Loop identity (done).** `AgentLoopConfig.loopPath` (default `'main'`), children derive `${parent.loopPath}/${taskId}`. Threaded through `resolvePermission` (the Phase 0 `ToolPermissionRequestContext` gained `askId` and `loopPath` rather than a fourth parameter), `onError` and `onTurnComplete` (new optional second arg, so 1-arg handlers keep working), `persistResult` metadata, and the watchdog's structured payloads. The logger is wrapped once at construction, so every component logging through it inherits the prefix and the 42 hand-written literals were dropped. `forwardFrom` now prefixes rather than overwrites `childTaskId`, so nested origins survive as paths while direct children keep bare IDs (preserving cortex-code's UI routing).
-4. **Long-lived mode.** Opt-in `persistentRuntime` (skip `toolRuntime.resetForLoop()` per prompt, `agent-loop.ts:936`); lifetime budget mode (no per-prompt `budgetGuard.reset()`, `940`) plus the plumbing for a facade-level aggregate guard (parent guards currently skip child events, `budget-guard.ts:87-89`).
-5. **Steer addressability.** Typed child handles (replace `agent: unknown`, `types.ts:1300`); `steerSubAgent(taskId, message)` on the sub-agent manager, built on `deliver()`.
-6. **Timeouts, caps, per-spawn overrides.** Wall-clock timeout per spawn producing the existing-but-unused `timed_out` status (`types.ts:1281`), treated as a launch blocker; separate concurrency pools for reasoner sub-agents and quick lookups (`sub-agent-manager.ts:41`); per-spawn model/compaction/thinking overrides (`createChildAgent` hardcodes the parent's primary model at `4909`). **[R-F19]**
-7. **Ask registry.** Facade-queryable pending-ask collection with per-ask nonces, a `voiced` state field, and a mandatory verbatim `renderedRequest` (today: one anonymous nullable slot per tracked child). **[R-F2, R-F14]**
-8. **Headline feed API.** A small `AgentLoop` surface letting the facade feed the headline block into a loop's `transformContext`; `buildBackgroundTaskState` and its injection point are private and loop-local today. **[R-plan]**
-9. **Non-blocking compaction posture.** A loop mode that disables the synchronous observer fallback, leaving emergency truncation as the only in-band path (for the talker). **[R-F7]**
-10. **Idle-digestion entry point.** An `AgentLoop` API to run pending observation buffers and threshold compaction outside a prompt. Correction found during implementation: `checkAndRunCompaction` already provided an outside-prompt L2 path, so the gap was observation specifically, not compaction. Also, in-band L3 is view-only, so digestion's durable work is activation plus L2. **[R2-idle]**
-11. **Usage accounting.** Accumulate direct/utility completion usage into per-loop session usage under a category tag and emit a usage event, so the P2 aggregate guard can see observer, reflector, and summarization spend instead of shipping blind. **[R2-B4]**
+4. **Long-lived mode (done).** Opt-in `persistentRuntime` (skip `toolRuntime.resetForLoop()` per prompt, `agent-loop.ts:936`); lifetime budget mode (no per-prompt `budgetGuard.reset()`, `940`) plus the plumbing for a facade-level aggregate guard (parent guards currently skip child events, `budget-guard.ts:87-89`).
+5. **Steer addressability (done).** Typed child handles (replace `agent: unknown`, `types.ts:1300`); `steerSubAgent(taskId, message)` on the sub-agent manager, built on `deliver()`.
+6. **Timeouts, caps, per-spawn overrides (done).** Wall-clock timeout per spawn producing the existing-but-unused `timed_out` status (`types.ts:1281`), treated as a launch blocker; separate concurrency pools for reasoner sub-agents and quick lookups (`sub-agent-manager.ts:41`); per-spawn model/compaction/thinking overrides (`createChildAgent` hardcodes the parent's primary model at `4909`). **[R-F19]**
+7. **Ask registry (done).** Facade-queryable pending-ask collection with per-ask nonces, a `voiced` state field, and a mandatory verbatim `renderedRequest` (today: one anonymous nullable slot per tracked child). **[R-F2, R-F14]**
+8. **Headline feed API (done).** A small `AgentLoop` surface letting the facade feed the headline block into a loop's `transformContext`; `buildBackgroundTaskState` and its injection point are private and loop-local today. **[R-plan]**
+9. **Non-blocking compaction posture (done).** A loop mode that disables the synchronous observer fallback, leaving emergency truncation as the only in-band path (for the talker). **[R-F7]**
+10. **Idle-digestion entry point (done).** An `AgentLoop` API to run pending observation buffers and threshold compaction outside a prompt. Correction found during implementation: `checkAndRunCompaction` already provided an outside-prompt L2 path, so the gap was observation specifically, not compaction. Also, in-band L3 is view-only, so digestion's durable work is activation plus L2. **[R2-idle]**
+11. **Usage accounting (done).** Accumulate direct/utility completion usage into per-loop session usage under a category tag and emit a usage event, so the P2 aggregate guard can see observer, reflector, and summarization spend instead of shipping blind. **[R2-B4]**
 
 ## Phase 2: The Facade
 
