@@ -83,7 +83,9 @@ The facade is not yet a drop-in replacement for `AgentLoop`. See the delegation 
 
 ## Events
 
-One merged stream via `getEventBridge()`, every event labeled with a loop path (`talker`, `reasoner`, `reasoner/task-7`, `lookup/lk-2`). The existing single-level `childTaskId` becomes this path (P1).
+One merged stream via `getEventBridge()`, every event labeled with a loop path (`talker`, `reasoner`, `reasoner/task-7`, `lookup/lk-2`) in its **own `loopPath` field**.
+
+The label does not reuse `childTaskId`, which keeps meaning "this event came from a sub-agent". An earlier 2b-i draft did reuse it, which silently killed the long-established `if (event.childTaskId) return;` idiom: a main-loop `turn_end` arrived labeled `childTaskId: 'reasoner'`, so three filters in cortex-code and any consumer-side budget guard went completely dead against a duplex facade. The tell was that the facade's own aggregate guard needed `includeChildUsage: true` just to observe main-loop events, which meant the encoding was wrong rather than the guard.
 
 **Voice consumers must use the sanitized delta stream, not raw `response_chunk`.** Working tags are stripped only at `turn_end` today, so raw deltas carry `<working>` content that TTS would speak aloud. The facade emits a separate sanitized talker-delta event with holdback buffering across chunk boundaries (text after a `<` is held until the tag is disambiguated). Consumers cannot do this themselves because tags split across chunks.
 

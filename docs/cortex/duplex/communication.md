@@ -54,6 +54,8 @@ Adopted vocabulary from Gemini Live's result scheduling (decisions.md D10). Ever
 
 The producer proposes a class and the router may demote it (D19). The idle signal is advisory: the facade enforces its own minimum inter-delivery spacing regardless, so an always-idle signal cannot collapse the dampening properties.
 
+**Permission asks need their own lane.** They are `interrupt` class, so under the shipped backpressure defaults a chatty reasoner that burns the interrupt token bucket can push an ask up to the degrade delay behind, while the loop that raised it blocks the whole time. Backpressure exists to stop a reasoner monopolizing the conversation, not to delay the one message that has a human waiting on the other side of it. Asks get a reserved token or a class exempt from the bucket, decided when the broker lands.
+
 Defaults per entry type: milestones `silent`, final results `when_idle`, permission asks `interrupt`, conversation deltas to the reasoner `silent` (D18). Without a consumer idle signal, `when_idle` degrades to `interrupt` after a configurable delay; the same delay bounds the case where a signal exists but never reports a lull.
 
 Stale results are never dropped (the Nova 2 Sonic position): a delivery that arrives after the user changed direction still enters the log and the talker's context; the talker reconciles conversationally. Explicit `cancel_task` is the only discard path.
