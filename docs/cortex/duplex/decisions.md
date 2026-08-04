@@ -37,6 +37,8 @@ Rejected: a per-slot policy (talker-only / reasoner-only / both) on the facade A
 
 Consumer slots apply to both loops. The consumer should not know the talker/reasoner split exists; that dynamic is Cortex's internal concern. If a large slot ever becomes a talker latency problem, Cortex may optimize placement internally without any API change.
 
+This covers **mid-session writes**, not only construction. 2b-i wired initial slots to both loops but left `getContextManager()` returning the reasoner's manager, so a consumer updating a persona slot mid-session would silently diverge the two loops. The facade's `getContextManager()` therefore returns a fan-out view: writes reach both loops, reads come from the reasoner. A per-slot routing knob remains forbidden.
+
 ## D7: The Log Is a Bus, Not a Context Projection
 
 Rejected: injecting log-derived synthetic messages into each loop's prompt view via `transformContext`.
@@ -121,7 +123,9 @@ Every control-tool outcome, including schema-validation failure, unknown task id
 
 ## D18: Conversation Is Context, Not Instruction
 
-Conversation deltas (both user utterances and talker replies) are delivered to the reasoner queued rather than prompted, wrapped as explicitly context-only. Only a control-tool dispatch starts a reasoner turn. Without this, every "thanks, that's great" runs a full primary-model turn over the whole session context, and any utterance can drive an agent that acts (F3). Talker replies are included because the reasoner cannot interpret "yes, do that" without its antecedent (F4).
+Conversation deltas (both user utterances and talker replies) reach the reasoner queued rather than prompted, wrapped as explicitly context-only. Only a control-tool dispatch starts a reasoner turn.
+
+**Mechanism, settled during 2b-i.** The deltas ride *inside* the next dispatch message as a `<conversation-context>` block, rather than going through the reasoner's loop-owned silent queue. The silent queue flushes only into real prompts, and sweep runs deliberately never flush it (the unwind accounting from Phase 0), so a dispatch parked behind a busy reasoner would have arrived without the conversation it points at. That breaks pointer-not-paraphrase in exactly the busy case this decision exists for. Carrying the block in the dispatch makes the pairing exact in every loop state. The contract this decision asserts (queued not prompted; only dispatches start turns) is unchanged. Without this, every "thanks, that's great" runs a full primary-model turn over the whole session context, and any utterance can drive an agent that acts (F3). Talker replies are included because the reasoner cannot interpret "yes, do that" without its antecedent (F4).
 
 ## D19: The Router Applies Backpressure
 

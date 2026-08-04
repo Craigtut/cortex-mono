@@ -51,11 +51,19 @@ Landed the facade class with a compile-checked config routing table, `SessionLog
 
 Two mechanism deviations are recorded as footnotes in facade-api.md; both resolve in 2b. Causation stamps bind exactly for facade-initiated runs and are deliberately absent (rather than guessed) for runs the facade did not start, since the router owns those in 2b and D16 binds consent to causation.
 
-### 2b (outstanding)
+### 2b-i (complete)
 
-Duplex behavior, assembled behind the 2a skeleton.
+Duplex assembly: the talker loop (no permission resolver, no network resolver, all built-ins disabled, spawn-incapable, hard `maxTurns` consumer config cannot raise, fail-fast retries, forced non-blocking compaction staggered under the reasoner, its own session id and `loopPath`), the aggregate budget guard on the merged bridge from first duplex assembly, the router (wake policy, backpressure, delegation registry with friendly aliases, delta buffer, liveness watchdog), the control toolset with structurally-enforced D17 terminate guards, the `Deliver` and `SteerSubAgent` reasoner tools, conversation deltas, and both role prompts. Suite 3057 to 3139.
 
-**Two items deferred into 2b from earlier review rounds, deliberately, because 2b's design supersedes the obvious standalone fix.**
+Settled during implementation: the duplex reasoner defaults to `persistentRuntime: true` (an explicit consumer `false` still wins), since the reasoner is session-lifetime by design; the aggregate guard aggregates `maxCost` only, because turn counts across two loops plus children have no comparable composite meaning and a lifetime turn aggregate would silently cap session length; and with no consumer idle signal the lull defaults to talker-gate-idle rather than waiting out the degrade delay, which would otherwise add that delay to every final result in the default config.
+
+### 2b-ii (outstanding)
+
+The remaining duplex behavior.
+
+**Three items 2b-ii owns.** The first is a D6 gap found in 2b-i; the other two were deferred from earlier review rounds because 2b's design supersedes the obvious standalone fix.
+
+- **Slot writes must fan out.** 2b-i wires initial slots to both loops but `getContextManager()` returns the reasoner's manager, so a mid-session slot write silently diverges them. The facade returns a fan-out view: writes to both, reads from the reasoner. No per-slot routing knob (D6).
 
 - **Where destroyed wake content is recorded.** Three sites destroy parked wake deliveries with only a log line: epoch-gated abort-window drops, sweep attempt-cap and elapsed-budget drops, and repark-cap drops. The standalone fix is a loop-level dead-letter surface mirroring `getDeadLetteredBackgroundResults`, which is new public `AgentLoop` API plus delegation routing plus facade forwarding. In duplex the router owns delivery and the session log is the durable record of undelivered content, which is exactly the abort-table row "retained in the log, not delivered", so 2b must make the log cover all three sites. If it does not, the fallback shape is a bounded record of `{content, timestamp, attempts, reason}` at each site, surfaced as `getDeadLetteredWakeDeliveries` plus an `onWakeDeliveryDeadLettered` handler and a `delivery_dead_lettered` lifecycle entry. Pre-existing rather than a regression, per the mechanism review.
 - **Discarded compaction passes still fire consumer events.** A pass abandoned by the digestion timeout still emits compaction and observation events from inside `CompactionManager`, before the loop knows the pass went stale, so a consumer sees a compaction reported for a rewrite that never landed. Suppressing it means threading staleness into the manager's and the observational engine's dispatch, and 2b's facade-level callback fan-in with origin context touches those same dispatch points. Bounded harm meanwhile: the reported state genuinely did not change, so a persistence trigger firing on it still saves a correct snapshot.
