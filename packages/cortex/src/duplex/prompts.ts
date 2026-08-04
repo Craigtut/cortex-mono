@@ -265,11 +265,22 @@ export interface AskVoicingInput {
  * The message that voices a permission ask through the talker. The request
  * text is untrusted (a command or URL authored by the model, possibly under
  * injected influence), so it sits between fence lines stamped with the
- * ask's nonce: the nonce is minted after the request text exists, so
- * hostile request content cannot forge a matching close fence and break out
- * of the quoted region. The instruction lines are a voicing aid only; the
- * consent rules themselves are enforced router-side and hold no matter what
- * the talker does with this text.
+ * ask's nonce.
+ *
+ * What makes the fence hold is that the nonce is CSPRNG-random and never
+ * reaches whoever authored the content inside it: ask ids are minted by the
+ * loop's resolver call and never returned to the reasoner, the broker's own
+ * deny reasons never carry them, and a re-voice reuses the same id rather
+ * than minting a guessable successor. It is NOT mint ordering. The id is in
+ * fact minted before the rendering exists on both paths (beforeToolCall and
+ * the network resolver), and ordering is the kind of rationale that
+ * survives a refactor while the property it claimed to describe quietly
+ * does not: a future switch to a derived or sequential id would read as
+ * fine against an ordering argument and break the fence outright.
+ *
+ * The instruction lines are a voicing aid only; the consent rules
+ * themselves are enforced router-side and hold no matter what the talker
+ * does with this text.
  */
 export function buildAskVoicing(input: AskVoicingInput): string {
   const open = `<permission-request ask="${input.askId}">`;
