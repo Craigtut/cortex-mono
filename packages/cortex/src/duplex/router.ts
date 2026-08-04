@@ -36,6 +36,7 @@ import {
   wrapDeliveryForTalker,
 } from './prompts.js';
 import type { ConversationDelta } from './prompts.js';
+import type { CauseTag } from './cause-tags.js';
 import type { ControlDispatchTarget } from './control-tools.js';
 import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
 
@@ -71,9 +72,24 @@ export interface DuplexRouterPorts {
   dispatchToReasoner(message: string, causeSeq: number | null): void;
   /** Append a session log entry; returns its seq. */
   appendLog(input: RouterLogInput): number;
-  /** Seq of the utterance driving the talker's live run, or null. */
+  /**
+   * Latest cause seq on the talker's live run, or null. This is the
+   * LOG-STAMPING collapse; anything deciding behavior from causation (the
+   * exchange rollover here, the D16 consent check in the broker) must read
+   * the full set via {@link currentTalkerCauseTags} instead.
+   */
   currentTalkerCauseSeq(): number | null;
-  /** Seq of the directive driving the reasoner's live run, or null. */
+  /**
+   * The FULL discriminated cause set of the talker's live run (empty when
+   * no run is live or its content carried no tags). The set carries NO
+   * ordering guarantee: readers must scan it, never assume ascending seq
+   * order or read only the last element. This is the surface the D16
+   * consent check reads (does the chain include a user utterance newer than
+   * the voiced ask), where the collapsing helper above would misread a
+   * mixed-kind set in both directions.
+   */
+  currentTalkerCauseTags(): readonly CauseTag[];
+  /** Latest cause seq on the reasoner's live run, or null (log stamping). */
   currentReasonerCauseSeq(): number | null;
   /** Consumer idle signal (advisory, facade-api.md). */
   idleSignal?: (() => boolean) | undefined;

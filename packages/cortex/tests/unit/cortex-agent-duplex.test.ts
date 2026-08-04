@@ -530,6 +530,35 @@ describe('duplex prompt routing', () => {
     expect(directive.data).toMatchObject({ tool: 'spawn_task', alias: 'task-1' });
   });
 
+  it('stamps discriminated cause tags (kind + seq), never bare seqs (SF-2)', async () => {
+    // 2b-ii tags headline deliveries on the same talker port, making the
+    // run's cause set mixed-kind; a bare-number tag cannot say which causes
+    // are user utterances, and D16's consent check then misreads the set in
+    // both directions. The tag must be self-describing.
+    const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+    talkerPi.hold = true;
+    const turn = facade.prompt('hello tags');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+    const utterance = facade.getLog().find((entry) => entry.type === 'utterance')!;
+    expect(talkerLoop.activeRunCauseTags).toEqual([{ kind: 'utterance', seq: utterance.seq }]);
+    talkerPi.releaseRun();
+    await turn;
+    expect(talkerLoop.activeRunCauseTags).toEqual([]);
+  });
+
+  it('stamps a dispatch with a directive-kind cause tag on the reasoner run (SF-2)', async () => {
+    const { facade, talkerPi, reasonerLoop, reasonerPi } = createDuplexFacade();
+    reasonerPi.hold = true;
+    await facade.prompt('go build it');
+    const spawn = getPiTool(talkerPi, 'spawn_task');
+    await spawn.execute('call-1', { instructions: 'build it' });
+    await waitUntil(() => reasonerPi.promptCalls.length === 1);
+    const directive = facade.getLog().find((entry) => entry.type === 'directive')!;
+    expect(reasonerLoop.activeRunCauseTags).toEqual([{ kind: 'directive', seq: directive.seq }]);
+    reasonerPi.releaseRun();
+    await waitUntil(() => !facade.isRunning);
+  });
+
   it('a barge-in utterance keeps its causation stamp through the sweep run (B1)', async () => {
     const { facade, talkerPi } = createDuplexFacade();
     talkerPi.hold = true;

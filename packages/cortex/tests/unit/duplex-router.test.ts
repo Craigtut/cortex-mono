@@ -13,6 +13,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { DuplexRouter, DUPLEX_ROUTER_DEFAULTS } from '../../src/duplex/router.js';
 import type { DuplexRouterPorts, RouterLogInput } from '../../src/duplex/router.js';
+import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
 import {
   CONVERSATION_CONTEXT_OPEN,
@@ -30,12 +31,15 @@ interface Harness {
   setDispatchError: (error: Error | null) => void;
   /** Change the live reasoner-run cause seq (the causing directive). */
   setReasonerCauseSeq: (seq: number | null) => void;
+  /** Change the talker's live-run discriminated cause set. */
+  setTalkerCauseTags: (tags: readonly CauseTag[]) => void;
   advance: (ms: number) => void;
   now: () => number;
 }
 
 function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] & {
   talkerCauseSeq?: number | null;
+  talkerCauseTags?: readonly CauseTag[];
   reasonerCauseSeq?: number | null;
 }): Harness {
   let clock = 1_000_000;
@@ -43,6 +47,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   let idleSignal: (() => boolean) | undefined;
   let dispatchError: Error | null = null;
   let reasonerCauseSeq: number | null = options?.reasonerCauseSeq ?? null;
+  let talkerCauseTags: readonly CauseTag[] = options?.talkerCauseTags ?? [];
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const reasonerDispatches: Array<{ message: string; causeSeq: number | null }> = [];
@@ -61,6 +66,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
       return seq;
     },
     currentTalkerCauseSeq: () => options?.talkerCauseSeq ?? null,
+    currentTalkerCauseTags: () => talkerCauseTags,
     currentReasonerCauseSeq: () => reasonerCauseSeq,
     get idleSignal() {
       return idleSignal;
@@ -85,6 +91,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     setIdleSignal: (signal) => { idleSignal = signal; },
     setDispatchError: (error) => { dispatchError = error; },
     setReasonerCauseSeq: (seq) => { reasonerCauseSeq = seq; },
+    setTalkerCauseTags: (tags) => { talkerCauseTags = tags; },
     advance: (ms) => { clock += ms; },
     now: () => clock,
   };

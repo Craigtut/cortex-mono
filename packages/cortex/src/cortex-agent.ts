@@ -83,6 +83,8 @@ import { stripWorkingTags } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter } from './duplex/router.js';
 import type { DuplexRouterOptions, DuplexRouterPorts } from './duplex/router.js';
+import { collectCauseTags, latestCauseSeq } from './duplex/cause-tags.js';
+import type { CauseTag } from './duplex/cause-tags.js';
 import { buildControlTools, isControlToolName } from './duplex/control-tools.js';
 import { buildDeliverTool, buildSteerSubAgentTool } from './duplex/reasoner-tools.js';
 import {
@@ -928,23 +930,6 @@ function extractSpokenText(assistantMessage: unknown): string {
   return stripWorkingTags(raw).trim();
 }
 
-/**
- * Latest (highest) numeric cause tag on a loop's live run, or null. The
- * facade tags every conversation-surface delivery with its utterance's log
- * seq and every dispatch with its directive's seq; seqs are monotonic, so
- * the highest tag is the most recent cause when several ride one run
- * (e.g. two barge-ins delivered by a single sweep).
- */
-function latestCauseSeq(tags: readonly unknown[]): number | null {
-  let latest: number | null = null;
-  for (const tag of tags) {
-    if (typeof tag === 'number' && (latest === null || tag > latest)) {
-      latest = tag;
-    }
-  }
-  return latest;
-}
-
 /** Append the D17 speak-now appendix to a control-tool receipt. */
 function appendSpeakNudge(content: unknown): unknown {
   const nudge = `\n\n${SPEAK_NOW_APPENDIX}`;
@@ -1137,6 +1122,7 @@ export class CortexAgent {
       // the tags travel with the content, so a barge-in parked behind a
       // live run keeps its utterance seq through the sweep run (B1).
       currentTalkerCauseSeq: () => latestCauseSeq(talker.activeRunCauseTags),
+      currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
       currentReasonerCauseSeq: () => latestCauseSeq(this.reasoner.activeRunCauseTags),
       idleSignal: config.idleSignal,
       logger: this.logger,
@@ -1238,14 +1224,18 @@ export class CortexAgent {
 
   /**
    * Wake-deliver a dispatch to the reasoner. The directive seq rides the
-   * delivery as its cause tag, so the run that consumes it (the turn it
-   * starts, or the sweep run when the reasoner is busy) carries the
-   * causation regardless of which path delivers it.
+   * delivery as its cause tag (stamped kind 'directive': the router only
+   * ever dispatches on behalf of a directive entry it just appended), so
+   * the run that consumes it (the turn it starts, or the sweep run when the
+   * reasoner is busy) carries the causation regardless of which path
+   * delivers it.
    */
   private dispatchToReasoner(message: string, causeSeq: number | null): void {
     this.reasoner.deliver(
       message,
-      causeSeq !== null ? { causeTag: causeSeq } : undefined,
+      causeSeq !== null
+        ? { causeTag: { kind: 'directive', seq: causeSeq } satisfies CauseTag }
+        : undefined,
     );
   }
 
@@ -1723,13 +1713,15 @@ export class CortexAgent {
       // (D18); a fresh utterance also opens a new exchange for the
       // delegation caps and dispatch dedup.
       this.router!.noteUserUtterance(input);
-      // The utterance seq travels with the content as its cause tag: the
-      // run that consumes the input (the turn started here, or the sweep
-      // run after a barge-in parks) exposes it through activeRunCauseTags,
-      // which is where the router reads directive causation (B1/D16).
+      // The utterance travels with the content as a discriminated cause tag
+      // (kind + seq): the run that consumes the input (the turn started
+      // here, or the sweep run after a barge-in parks) exposes it through
+      // activeRunCauseTags, which is where the router reads directive
+      // causation and where D16's consent check will look for a qualifying
+      // user utterance among mixed-kind causes (B1/D16).
       const result = talker.deliver(input, {
         wake: true,
-        causeTag: entry.seq,
+        causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag,
         ...(options ? { promptOptions: options } : {}),
       });
       if (result.outcome === 'prompted' && result.turn) {
@@ -1823,11 +1815,13 @@ export class CortexAgent {
         router.noteWorkContext(content);
         return { outcome: 'queued' };
       }
-      // The utterance seq rides the dispatch as its cause tag (parked
+      // The utterance rides the dispatch as its cause tag (parked
       // dispatches keep it through the sweep, exactly like router
       // dispatches).
       const message = router.composeWorkDispatch(content);
-      return this.reasoner.deliver(message, { causeTag: entry.seq });
+      return this.reasoner.deliver(message, {
+        causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag,
+      });
     }
 
     const talker = this.talker!;
@@ -1845,11 +1839,13 @@ export class CortexAgent {
     } else {
       router.noteUserUtterance(content);
     }
-    // Wake deliveries carry the utterance seq as their cause tag (a no-wake
+    // Wake deliveries carry the utterance as their cause tag (a no-wake
     // delivery is silent context and carries no causation).
     return talker.deliver(content, {
       ...(options?.wake !== undefined ? { wake: options.wake } : {}),
-      ...(options?.wake !== false ? { causeTag: entry.seq } : {}),
+      ...(options?.wake !== false
+        ? { causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag }
+        : {}),
     });
   }
 
