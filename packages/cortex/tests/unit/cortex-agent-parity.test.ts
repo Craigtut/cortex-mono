@@ -200,7 +200,10 @@ function createMockPiAgent(): ParityMockPiAgent {
 interface Harness {
   label: 'direct' | 'facade';
   piAgent: ParityMockPiAgent;
-  events: string[];
+  /** Full normalized events (type, payload shape, origin), not just types. */
+  events: unknown[];
+  /** What AgentLoop.prompt() received on this side (input plus options). */
+  loopPromptCalls: Array<{ input: string; options: unknown }>;
   turnOutputs: Array<{ userFacing: string; loopPath: string }>;
   loopCompletes: number;
   errors: Array<{ category: string; severity: string; loopPath: string }>;
@@ -211,6 +214,7 @@ interface Harness {
   abort: () => Promise<void>;
   getConversationHistory: () => AgentMessage[];
   getSessionUsage: () => SessionUsage;
+  queuedDeliveryCount: () => number;
   waitForIdle: () => Promise<void>;
 }
 
@@ -235,8 +239,41 @@ function baseConfig(overrides?: Partial<AgentLoopConfig>): AgentLoopConfig {
   };
 }
 
+/**
+ * Deep-normalize a value for cross-side comparison: volatile wall-clock
+ * values (timestamps, durations, *At fields) are replaced with a marker so
+ * everything else in the payload shape still must match. A projection to
+ * event.type alone would miss exactly the payload-shaped changes 2b makes
+ * (loop paths stamped on every event).
+ */
+const VOLATILE_KEY = /^(timestamp|durationMs|delayMs)$|At$/;
+
+function scrubVolatile(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(scrubVolatile);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = VOLATILE_KEY.test(key) ? '<volatile>' : scrubVolatile(entry);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Record every AgentLoop.prompt() invocation (input plus options). */
+function recordLoopPrompts(
+  loop: AgentLoop,
+  calls: Array<{ input: string; options: unknown }>,
+): void {
+  const original = loop.prompt.bind(loop);
+  (loop as { prompt: AgentLoop['prompt'] }).prompt = (input, options) => {
+    calls.push({ input, options });
+    return original(input, options);
+  };
+}
+
 function collect(
-  harness: Omit<Harness, 'prompt' | 'deliver' | 'steer' | 'abort' | 'getConversationHistory' | 'getSessionUsage' | 'waitForIdle'>,
+  harness: Omit<Harness, 'prompt' | 'deliver' | 'steer' | 'abort' | 'getConversationHistory' | 'getSessionUsage' | 'queuedDeliveryCount' | 'waitForIdle'>,
   surface: {
     getEventBridge: AgentLoop['getEventBridge'];
     onTurnComplete: (handler: (output: AgentTextOutput, origin: LoopOriginContext) => void) => void;
@@ -246,7 +283,7 @@ function collect(
   },
 ): void {
   surface.getEventBridge().onAll((event) => {
-    harness.events.push(event.type);
+    harness.events.push(scrubVolatile(event));
   });
   surface.onTurnComplete((output, origin) => {
     harness.turnOutputs.push({ userFacing: output.userFacing, loopPath: origin.loopPath });
@@ -273,6 +310,7 @@ function createDirectHarness(overrides?: Partial<AgentLoopConfig>): Harness {
     label: 'direct',
     piAgent,
     events: [],
+    loopPromptCalls: [],
     turnOutputs: [],
     loopCompletes: 0,
     errors: [],
@@ -283,8 +321,10 @@ function createDirectHarness(overrides?: Partial<AgentLoopConfig>): Harness {
     abort: () => loop.abort(),
     getConversationHistory: () => loop.getConversationHistory(),
     getSessionUsage: () => loop.getSessionUsage(),
+    queuedDeliveryCount: () => loop.queuedDeliveryCount,
     waitForIdle: () => loop.waitForLoopIdle(),
   };
+  recordLoopPrompts(loop, harness.loopPromptCalls);
   collect(harness, loop);
   return harness;
 }
@@ -300,6 +340,7 @@ function createFacadeHarness(overrides?: Partial<AgentLoopConfig>): Harness {
     label: 'facade',
     piAgent,
     events: [],
+    loopPromptCalls: [],
     turnOutputs: [],
     loopCompletes: 0,
     errors: [],
@@ -310,8 +351,10 @@ function createFacadeHarness(overrides?: Partial<AgentLoopConfig>): Harness {
     abort: () => facade.abort(),
     getConversationHistory: () => facade.getConversationHistory(),
     getSessionUsage: () => facade.getSessionUsage(),
+    queuedDeliveryCount: () => facade.queuedDeliveryCount,
     waitForIdle: () => facade.waitForConversationIdle(),
   };
+  recordLoopPrompts(loop, harness.loopPromptCalls);
   collect(harness, facade);
   return harness;
 }
@@ -320,12 +363,14 @@ function harnessPair(overrides?: Partial<AgentLoopConfig>): [Harness, Harness] {
   return [createDirectHarness(overrides), createFacadeHarness(overrides)];
 }
 
-/** Project history to what a consumer compares: roles and contents. */
-function historyShape(history: AgentMessage[]): Array<[string, string]> {
-  return history.map((message) => [
-    message.role,
-    typeof message.content === 'string' ? message.content : JSON.stringify(message.content),
-  ]);
+/**
+ * Project history for cross-side comparison: the full message shape with
+ * only wall-clock values scrubbed, so a payload-shaped divergence (an extra
+ * field, a changed role, structured content) fails parity instead of being
+ * projected away.
+ */
+function historyShape(history: AgentMessage[]): unknown[] {
+  return history.map(scrubVolatile);
 }
 
 /** Project pi prompt calls: strings stay strings, batches become contents. */
@@ -344,6 +389,7 @@ function expectParity(direct: Harness, facade: Harness): void {
   expect(promptCallShape(facade.piAgent.promptCalls)).toEqual(
     promptCallShape(direct.piAgent.promptCalls),
   );
+  expect(facade.loopPromptCalls).toEqual(direct.loopPromptCalls);
   expect(historyShape(facade.getConversationHistory())).toEqual(
     historyShape(direct.getConversationHistory()),
   );
@@ -446,7 +492,7 @@ describe('CortexAgent passthrough parity', () => {
 
     expectParity(direct, facade);
     // The steer landed inside the run's transcript on both sides.
-    expect(historyShape(direct.getConversationHistory()).map(([, content]) => content)).toContain(
+    expect(direct.getConversationHistory().map((message) => message.content)).toContain(
       'course correction',
     );
   });
@@ -500,11 +546,61 @@ describe('CortexAgent passthrough parity', () => {
     expect(promptCallShape(facade.piAgent.promptCalls)).toEqual(['long task', 'after abort']);
   });
 
+  it('abort with queued steer and silent content: the facade clears every queue, the direct loop retains them', async () => {
+    // This pins the documented passthrough divergence (facade-api.md,
+    // third footnote): facade abort() applies the abort-table scope
+    // semantics and clears pi's steering queue plus the silent queue,
+    // where direct AgentLoop.abort() leaves both intact. Without queued
+    // content at abort time the divergence is invisible to the suite.
+    const [direct, facade] = harnessPair();
+
+    for (const side of [direct, facade]) {
+      side.piAgent.hold = true;
+      const turn = side.prompt('long task');
+      await waitUntil(() => side.piAgent.promptCalls.length === 1);
+      side.steer('queued steer');
+      expect(side.deliver('background note', { wake: false }).outcome).toBe('queued');
+      await side.abort();
+      await expect(turn).rejects.toThrow();
+    }
+
+    // Direct: both queues survive the abort.
+    expect(direct.piAgent.steeringQueue.map((m) => m.content)).toEqual(['queued steer']);
+    expect(direct.queuedDeliveryCount()).toBe(1);
+    // Facade: both queues are cleared per the abort table.
+    expect(facade.piAgent.steeringQueue).toEqual([]);
+    expect(facade.queuedDeliveryCount()).toBe(0);
+
+    // The retained content reaches the direct loop's next run and never
+    // reaches the facade's: a consumer that relied on steer() content
+    // surviving an abort must re-issue it after a facade abort.
+    for (const side of [direct, facade]) {
+      await side.prompt('after abort');
+      await side.waitForIdle();
+    }
+    expect(promptCallShape(direct.piAgent.promptCalls)).toEqual([
+      'long task',
+      ['background note', 'after abort'],
+    ]);
+    expect(promptCallShape(facade.piAgent.promptCalls)).toEqual(['long task', 'after abort']);
+    const directContents = direct.getConversationHistory().map((m) => m.content);
+    const facadeContents = facade.getConversationHistory().map((m) => m.content);
+    expect(directContents).toContain('queued steer');
+    expect(facadeContents).not.toContain('queued steer');
+  });
+
   it('prompt options thread identically', async () => {
     const [direct, facade] = harnessPair();
     await direct.prompt('hello', { sessionId: 'affinity-1' });
     await facade.prompt('hello', { sessionId: 'affinity-1' });
     expectParity(direct, facade);
+    // The loop received the options verbatim on BOTH sides. A facade that
+    // dropped options entirely would previously still pass, because the
+    // mock never recorded what it was given.
+    expect(direct.loopPromptCalls).toEqual([
+      { input: 'hello', options: { sessionId: 'affinity-1' } },
+    ]);
+    expect(facade.loopPromptCalls).toEqual(direct.loopPromptCalls);
   });
 
   it('usage parity includes cache token and cost breakdowns', async () => {
