@@ -52,11 +52,21 @@ export function isCauseTag(value: unknown): value is CauseTag {
 }
 
 /**
+ * Bound on nested-array depth in the flatten below. Producers today nest
+ * exactly one array inside a slot (the truncation-repair delivery carries
+ * the flat output of collectCauseTags), so the cap leaves headroom while
+ * keeping the no-unbounded-recursion invariant local: a cyclic or
+ * absurdly nested value degrades to dropped tags (the safe direction for
+ * consent) instead of a stack overflow inside a dispatch path.
+ */
+const MAX_FLATTEN_DEPTH = 4;
+
+/**
  * Collect the discriminated tags out of a loop's raw cause-tag set,
- * ignoring anything the facade did not stamp. Nested arrays are flattened:
- * a delivery carries ONE causeTag slot, so a delivery that itself carries a
- * whole run's causation (the truncation repair turn) rides as an array of
- * tags inside that slot.
+ * ignoring anything the facade did not stamp. Nested arrays are flattened
+ * to {@link MAX_FLATTEN_DEPTH}: a delivery carries ONE causeTag slot, so a
+ * delivery that itself carries a whole run's causation (the truncation
+ * repair turn) rides as an array of tags inside that slot.
  *
  * The returned set carries NO ordering guarantee. A reader deciding
  * anything from it (the D16 consent check above all) must scan the whole
@@ -64,14 +74,15 @@ export function isCauseTag(value: unknown): value is CauseTag {
  */
 export function collectCauseTags(tags: readonly unknown[]): CauseTag[] {
   const collected: CauseTag[] = [];
-  const visit = (value: unknown): void => {
+  const visit = (value: unknown, depth: number): void => {
     if (Array.isArray(value)) {
-      for (const item of value) visit(item);
+      if (depth >= MAX_FLATTEN_DEPTH) return;
+      for (const item of value) visit(item, depth + 1);
       return;
     }
     if (isCauseTag(value)) collected.push(value);
   };
-  for (const tag of tags) visit(tag);
+  for (const tag of tags) visit(tag, 0);
   return collected;
 }
 

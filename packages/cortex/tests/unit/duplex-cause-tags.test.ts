@@ -75,4 +75,24 @@ describe('collectCauseTags', () => {
       { kind: 'directive', seq: 9 },
     ]);
   });
+
+  it('survives a cyclic array instead of overflowing the stack', () => {
+    // Nothing produces a cycle today, but the flatten runs inside dispatch
+    // paths; the invariant must hold locally, not by arguing from producers.
+    const cyclic: unknown[] = [];
+    cyclic.push(cyclic);
+    expect(collectCauseTags(cyclic)).toEqual([]);
+
+    const cyclicWithTag: unknown[] = [{ kind: 'utterance', seq: 3 }];
+    cyclicWithTag.push(cyclicWithTag);
+    expect(collectCauseTags([cyclicWithTag])).toContainEqual({ kind: 'utterance', seq: 3 });
+  });
+
+  it('drops tags nested past the depth cap, keeps those within it', () => {
+    const withinCap = [[[{ kind: 'utterance', seq: 2 }]]];
+    expect(collectCauseTags(withinCap)).toEqual([{ kind: 'utterance', seq: 2 }]);
+
+    const pastCap = [[[[[[{ kind: 'utterance', seq: 2 }]]]]]];
+    expect(collectCauseTags(pastCap)).toEqual([]);
+  });
 });
