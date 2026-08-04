@@ -569,7 +569,10 @@ describe('scenario: passthrough parity over a whole session', () => {
     return {
       prompts: promptTexts(pi),
       results,
-      history: JSON.stringify(pi.state.messages),
+      // Timestamps are wall-clock and differ between two sessions run
+      // back to back whenever a millisecond boundary falls between them;
+      // comparing them compares the clock, not the behavior.
+      history: JSON.stringify(pi.state.messages).replace(/"timestamp":\d+/g, '"timestamp":0'),
       turns: pi.modelCalls,
     };
   }
