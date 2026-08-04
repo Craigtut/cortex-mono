@@ -84,6 +84,7 @@ import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter } from './duplex/router.js';
 import type { DuplexRouterOptions, DuplexRouterPorts } from './duplex/router.js';
 import { collectCauseTags, latestCauseSeq } from './duplex/cause-tags.js';
+import { FanOutContextManager } from './duplex/fanout-context-manager.js';
 import type { CauseTag } from './duplex/cause-tags.js';
 import { buildControlTools, isControlToolName } from './duplex/control-tools.js';
 import { buildDeliverTool, buildSteerSubAgentTool } from './duplex/reasoner-tools.js';
@@ -978,6 +979,8 @@ export class CortexAgent {
   private talkerRepairPending = false;
   /** The consumer's base prompt without the appended role prompts. */
   private consumerBasePrompt: string | null = null;
+  /** Lazily-built D6 fan-out view over both loops' context managers. */
+  private fanOutContextManager: FanOutContextManager | null = null;
   private digestionTimer: ReturnType<typeof setTimeout> | null = null;
   private idleDigestionDelayMs = 10_000;
 
@@ -2385,7 +2388,20 @@ export class CortexAgent {
     return this.mergedBridge ?? this.reasoner.getEventBridge();
   }
 
+  /**
+   * The context manager. Passthrough returns the reasoner's manager
+   * verbatim. Duplex returns a fan-out view (D6: mid-session slot writes
+   * reach both loops so they never diverge; reads come from the reasoner;
+   * no per-slot routing knob exists).
+   */
   getContextManager(): ContextManager {
+    if (this.talker) {
+      this.fanOutContextManager ??= new FanOutContextManager(
+        this.reasoner.getContextManager(),
+        this.talker.getContextManager(),
+      );
+      return this.fanOutContextManager;
+    }
     return this.reasoner.getContextManager();
   }
 

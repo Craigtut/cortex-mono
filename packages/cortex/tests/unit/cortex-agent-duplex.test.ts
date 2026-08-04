@@ -211,18 +211,19 @@ function createDuplexFacade(overrides?: Partial<CortexAgentConfig>): DuplexHarne
   const talkerPi = createMockPiAgent();
   const reasonerPi = createMockPiAgent();
   const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+  const loopSlots = overrides?.slots ?? [];
   const reasonerLoop = new AgentLoopCtor(reasonerPi, {
     model: testModel(),
     workingDirectory: '/tmp/test-workspace',
     initialBasePrompt: 'Test base prompt',
-    slots: [],
+    slots: loopSlots,
     loopPath: 'reasoner',
   });
   const talkerLoop = new AgentLoopCtor(talkerPi, {
     model: testModel(),
     workingDirectory: '/tmp/test-workspace',
     initialBasePrompt: 'Test base prompt',
-    slots: [],
+    slots: loopSlots,
     loopPath: 'talker',
     disableTools: Object.values(TOOL_NAMES),
   }, [], { enableSubAgentTool: false, enableLoadSkillTool: false });
@@ -1305,5 +1306,49 @@ describe('duplex settlement', () => {
     expect(settled).toBe(false);
     await facade.abort('conversation'); // drops the held delivery
     await waitUntil(() => settled);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Slot fan-out (D6)
+// ---------------------------------------------------------------------------
+
+describe('duplex slot fan-out (D6)', () => {
+  it('mid-session slot writes through getContextManager() reach both loops', () => {
+    const { facade, talkerLoop, reasonerLoop } = createDuplexFacade({ slots: ['project'] });
+    facade.getContextManager().setSlot('project', 'the project brief');
+    expect(reasonerLoop.getContextManager().getSlot('project')).toBe('the project brief');
+    expect(talkerLoop.getContextManager().getSlot('project')).toBe('the project brief');
+  });
+
+  it('reads come from the reasoner', () => {
+    const { facade, talkerLoop, reasonerLoop } = createDuplexFacade({ slots: ['project'] });
+    reasonerLoop.getContextManager().setSlot('project', 'reasoner view');
+    talkerLoop.getContextManager().setSlot('project', 'talker view');
+    expect(facade.getContextManager().getSlot('project')).toBe('reasoner view');
+    expect(facade.getContextManager().slots).toContain('project');
+  });
+
+  it('internal slots are not mirrored to the talker', () => {
+    const { facade, talkerLoop, reasonerLoop } = createDuplexFacade({ slots: ['project'] });
+    // Default compaction is observational, so both loops carry _observations.
+    facade.getContextManager().setSlot('_observations', 'reasoner memory');
+    expect(reasonerLoop.getContextManager().getSlot('_observations')).toBe('reasoner memory');
+    expect(talkerLoop.getContextManager().getSlot('_observations')).not.toBe('reasoner memory');
+  });
+
+  it('an unknown slot name throws before either loop is written', () => {
+    const { facade, talkerLoop, reasonerLoop } = createDuplexFacade({ slots: ['project'] });
+    expect(() => facade.getContextManager().setSlot('nope', 'x')).toThrow(/Unknown slot/);
+    expect(reasonerLoop.getContextManager().getSlot('project')).toBe('');
+    expect(talkerLoop.getContextManager().getSlot('project')).toBe('');
+  });
+
+  it('ephemeral content fans out to both loops', () => {
+    const { facade, talkerLoop, reasonerLoop } = createDuplexFacade({ slots: [] });
+    facade.getContextManager().setEphemeral('for this call only');
+    expect(reasonerLoop.getContextManager().getEphemeral()).toBe('for this call only');
+    expect(talkerLoop.getContextManager().getEphemeral()).toBe('for this call only');
+    expect(facade.getContextManager().getEphemeral()).toBe('for this call only');
   });
 });
