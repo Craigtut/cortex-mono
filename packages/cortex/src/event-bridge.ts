@@ -85,8 +85,19 @@ export interface CortexEvent {
    * bridge down to the originating loop (e.g. 'task-7/task-42'), so nested
    * origins are preserved instead of overwritten. Absent for parent agent
    * events. Consumers routing per child should use the first path segment.
+   *
+   * This means "came from a sub-agent" and nothing else: a composite
+   * facade's merged stream labels resident-loop origin in `loopPath`, never
+   * here, so the long-standing `if (event.childTaskId) return;` consumer
+   * idiom keeps working against a duplex facade.
    */
   childTaskId?: string;
+  /**
+   * Loop-path label on a composite facade's merged stream ('talker',
+   * 'reasoner', 'reasoner/task-7' for a sub-agent of the reasoner). Absent
+   * on a loop's own bridge; set by {@link forwardLoopFrom}.
+   */
+  loopPath?: string;
 }
 
 /**
@@ -242,6 +253,31 @@ export class EventBridge {
         childTaskId: event.childTaskId
           ? `${childTaskId}/${event.childTaskId}`
           : childTaskId,
+      });
+    });
+  }
+
+  /**
+   * Forward all events from a resident loop's bridge onto this (merged
+   * facade) bridge, labeled with the loop's path in the event's own
+   * `loopPath` field. `childTaskId` is passed through untouched: it keeps
+   * meaning "this event came from a sub-agent", so a main-loop event
+   * arrives with `loopPath: 'reasoner'` and no childTaskId, while a
+   * sub-agent's arrives with `loopPath: 'reasoner/task-7'` and
+   * `childTaskId: 'task-7'`. Reusing the child slot for loop labels would
+   * silently kill the `if (event.childTaskId) return;` consumer idiom.
+   *
+   * @param loopBridge - The resident loop's EventBridge
+   * @param loopPath - The loop's path label ('talker', 'reasoner')
+   * @returns An unsubscribe function
+   */
+  forwardLoopFrom(loopBridge: EventBridge, loopPath: string): () => void {
+    return loopBridge.onAll((event) => {
+      this.emit({
+        ...event,
+        loopPath: event.childTaskId
+          ? `${loopPath}/${event.childTaskId}`
+          : loopPath,
       });
     });
   }

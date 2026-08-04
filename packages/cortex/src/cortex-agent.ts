@@ -1177,10 +1177,13 @@ export class CortexAgent {
       this.scheduleIdleDigestion();
     });
 
-    // One merged event stream, every event labeled with its loop path.
+    // One merged event stream, every event labeled with its loop path in
+    // its own loopPath field. Never forwardFrom: that would stamp
+    // childTaskId, and main-loop events arriving as pseudo-children go
+    // dark against every `if (event.childTaskId) return;` consumer filter.
     this.mergedBridge = new EventBridge(false, this.logger);
-    this.mergedBridge.forwardFrom(talkerBridge, talker.loopPath);
-    this.mergedBridge.forwardFrom(reasonerBridge, this.reasoner.loopPath);
+    this.mergedBridge.forwardLoopFrom(talkerBridge, talker.loopPath);
+    this.mergedBridge.forwardLoopFrom(reasonerBridge, this.reasoner.loopPath);
 
     // The aggregate budget guard, active from the first duplex assembly
     // (D19): lifetime scope over both loops, every sub-agent, and utility
@@ -2270,8 +2273,9 @@ export class CortexAgent {
    * The merged event stream. In passthrough this is the reasoner's bridge
    * verbatim, so event identity and ordering match direct AgentLoop use
    * exactly. In duplex it is the facade's merged bridge: every event
-   * carries its loop path as childTaskId ('talker', 'reasoner',
-   * 'reasoner/task-7').
+   * carries its loop path in its own loopPath field ('talker', 'reasoner',
+   * 'reasoner/task-7'), while childTaskId keeps meaning "this came from a
+   * sub-agent" exactly as on a loop's own bridge.
    */
   getEventBridge(): EventBridge {
     return this.mergedBridge ?? this.reasoner.getEventBridge();

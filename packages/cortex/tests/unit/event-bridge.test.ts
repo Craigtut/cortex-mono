@@ -724,4 +724,44 @@ describe('EventBridge', () => {
       expect(listener.mock.calls[0][0].childTaskId).toBe('task-7');
     });
   });
+
+  describe('forwardLoopFrom', () => {
+    it('labels a main-loop event with loopPath and leaves childTaskId unset', () => {
+      const loopBridge = new EventBridge(false);
+      const loopSource = createMockSource();
+      loopBridge.wire(loopSource);
+
+      const listener = vi.fn();
+      bridge.on('turn_start', listener);
+      bridge.forwardLoopFrom(loopBridge, 'talker');
+
+      loopSource.emit({ type: 'turn_start' });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.loopPath).toBe('talker');
+      // The child slot keeps meaning "came from a sub-agent"; a main-loop
+      // event must survive the `if (event.childTaskId) return;` idiom.
+      expect(event.childTaskId).toBeUndefined();
+    });
+
+    it('prefixes a child origin into loopPath while childTaskId keeps the bare id', () => {
+      const loopBridge = new EventBridge(false);
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+
+      loopBridge.forwardFrom(childBridge, 'task-7');
+      bridge.forwardLoopFrom(loopBridge, 'reasoner');
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      childSource.emit({ type: 'tool_execution_start', toolCallId: 'c', toolName: 'A', args: {} });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.loopPath).toBe('reasoner/task-7');
+      expect(event.childTaskId).toBe('task-7');
+    });
+  });
 });

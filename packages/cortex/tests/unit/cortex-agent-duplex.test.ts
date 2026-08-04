@@ -12,6 +12,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { AgentLoop, TOOL_RESULT_WORKING_TAGS_REMINDER } from '../../src/agent-loop.js';
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
+import { EventBridge } from '../../src/event-bridge.js';
 import type { PiEvent } from '../../src/event-bridge.js';
 import type { AgentLoopConfig } from '../../src/types.js';
 import type { AgentMessage } from '../../src/context-manager.js';
@@ -384,12 +385,35 @@ describe('duplex assembly', () => {
     expect(talkerTools).not.toContain('Deliver');
   });
 
-  it('labels the merged event stream with loop paths', async () => {
+  it('labels the merged event stream with loop paths in loopPath, never childTaskId', async () => {
     const { facade } = createDuplexFacade();
-    const labels: Array<string | undefined> = [];
-    facade.getEventBridge().on('turn_end', (event) => labels.push(event.childTaskId));
+    const events: Array<{ loopPath?: string; childTaskId?: string }> = [];
+    facade.getEventBridge().on('turn_end', (event) =>
+      events.push({ loopPath: event.loopPath, childTaskId: event.childTaskId }));
     await facade.prompt('hello');
-    expect(labels).toContain('talker');
+    const talkerEvents = events.filter((event) => event.loopPath === 'talker');
+    expect(talkerEvents.length).toBeGreaterThan(0);
+    // A main-loop event must not arrive as a pseudo-child: the consumer
+    // idiom `if (event.childTaskId) return;` has to keep seeing it.
+    for (const event of talkerEvents) {
+      expect(event.childTaskId).toBeUndefined();
+    }
+  });
+
+  it('prefixes child origins into loopPath while childTaskId keeps the bare child id', () => {
+    const { facade, reasonerLoop } = createDuplexFacade();
+    const seen: Array<{ loopPath?: string; childTaskId?: string }> = [];
+    facade.getEventBridge().on('utility_usage', (event) =>
+      seen.push({ loopPath: event.loopPath, childTaskId: event.childTaskId }));
+    // A sub-agent's bridge forwards into its parent loop's bridge with
+    // childTaskId set; the merged stream adds the loop-path prefix on top.
+    const childBridge = new EventBridge(false);
+    reasonerLoop.getEventBridge().forwardFrom(childBridge, 'task-7');
+    childBridge.emitUtilityUsage('observer', {
+      input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+    });
+    expect(seen).toEqual([{ loopPath: 'reasoner/task-7', childTaskId: 'task-7' }]);
   });
 });
 
@@ -833,6 +857,20 @@ describe('duplex aggregate budget guard', () => {
     const breaches = facade.getLog().filter((entry) =>
       (entry.data as { event?: string } | undefined)?.event === 'budget_breached');
     expect(breaches).toHaveLength(1);
+  });
+
+  it('counts a forwarded child event exactly once after the loopPath split', () => {
+    const { facade, reasonerLoop } = createDuplexFacade();
+    const guard = facade.getBudgetGuard();
+    // One child utility completion, forwarded child bridge -> reasoner
+    // bridge -> merged bridge. The aggregate must count its cost once.
+    const childBridge = new EventBridge(false);
+    reasonerLoop.getEventBridge().forwardFrom(childBridge, 'task-1');
+    childBridge.emitUtilityUsage('observer', {
+      input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.2 },
+    });
+    expect(guard.getTotalCost()).toBeCloseTo(0.2);
   });
 
   it('is wired even when the consumer sets no budget (mechanism active from assembly)', () => {
