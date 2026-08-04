@@ -934,20 +934,40 @@ export class CortexAgent {
   // -------------------------------------------------------------------------
 
   /**
+   * Mirror AgentLoop.prompt()'s synchronous validation (teardown state and
+   * a configured system prompt) before anything is logged or queued, so the
+   * log never records an utterance for input the loop rejects. The loop
+   * performs the same checks itself; hoisting them keeps phantom entries
+   * out of the log, exactly as deliver() validates at the point of misuse.
+   */
+  private assertPromptable(action: 'prompt' | 'deliver'): void {
+    this.assertNotDestroyed();
+    const loopState = this.reasoner.state;
+    if (loopState === 'destroying') {
+      throw new Error('Agent is being destroyed');
+    }
+    if (loopState === 'destroyed') {
+      throw new Error('Agent has been destroyed');
+    }
+    if (this.reasoner.getCurrentSystemPrompt().trim().length === 0) {
+      throw new Error(
+        `CortexAgent prompt is not configured. Call setBasePrompt() before ${action}(), ` +
+        'or provide initialBasePrompt during creation.',
+      );
+    }
+  }
+
+  /**
    * Prompt the agent. Routes to the reasoner (passthrough) or the talker
    * (duplex, 2b). Never throws on a busy loop: concurrent calls are
    * serialized by the facade, each resolving against the turn that carries
-   * its input. The utterance is appended to the log before its run starts
-   * (append-then-emit).
+   * its input. The utterance is appended to the log when its run starts
+   * (append-then-emit still holds: the entry lands before any event of the
+   * run), so log order always matches execution order even when a deliver()
+   * issued in the same tick starts its run ahead of a queued prompt().
    */
   async prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
-    this.assertNotDestroyed();
-    const entry = this.appendEntry({
-      type: 'utterance',
-      loopPath: this.reasoner.loopPath,
-      content: input,
-      causedBy: null,
-    });
+    this.assertPromptable('prompt');
 
     this.pendingFacadePrompts += 1;
     const run = this.promptChain.then(async () => {
@@ -959,6 +979,18 @@ export class CortexAgent {
       for (;;) {
         await this.reasoner.waitForLoopIdle();
         if (this.reasoner.isLoopActive) continue;
+        // Re-validate at run start: a teardown that landed while this call
+        // was queued must reject it before the utterance is logged.
+        this.assertPromptable('prompt');
+        // Logged here rather than at call time: the log is the ordering
+        // authority, and content that reached the loop first (a same-tick
+        // deliver()) must hold the lower seq.
+        const entry = this.appendEntry({
+          type: 'utterance',
+          loopPath: this.reasoner.loopPath,
+          content: input,
+          causedBy: null,
+        });
         this.activeCauseSeq = entry.seq;
         try {
           return await this.reasoner.prompt(input, options);
@@ -983,17 +1015,11 @@ export class CortexAgent {
    * or waits silently for the next real prompt ('queued').
    */
   deliver(content: string, options?: CortexDeliverOptions): DeliverResult {
-    this.assertNotDestroyed();
     // Mirror AgentLoop.deliver's synchronous validation before appending,
     // so the log never records an utterance the loop rejected.
+    this.assertPromptable('deliver');
     if (typeof content !== 'string' || content.trim().length === 0) {
       throw new Error('deliver() requires non-whitespace string content');
-    }
-    if (this.reasoner.getCurrentSystemPrompt().trim().length === 0) {
-      throw new Error(
-        'CortexAgent prompt is not configured. Call setBasePrompt() before deliver(), ' +
-        'or provide initialBasePrompt during creation.',
-      );
     }
     const entry = this.appendEntry({
       type: 'utterance',

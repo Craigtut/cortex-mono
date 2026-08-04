@@ -437,6 +437,33 @@ describe('CortexAgent.prompt', () => {
     await facade.destroy();
     await expect(facade.prompt('late')).rejects.toThrow('CortexAgent has been destroyed');
   });
+
+  it('rejects unconfigured input without logging a phantom utterance', async () => {
+    const piAgent = createMockPiAgent();
+    const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+    const loop = new AgentLoopCtor(piAgent, {
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      slots: [],
+    });
+    const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
+    const facade = new CortexAgentCtor(loop, {
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+    });
+
+    await expect(facade.prompt('never ran')).rejects.toThrow(/not configured/);
+    expect(() => facade.deliver('never ran either')).toThrow(/not configured/);
+    expect(facade.getLog()).toEqual([]);
+    expect(piAgent.promptCalls).toEqual([]);
+  });
+
+  it('rejects on a directly destroyed loop without logging a phantom utterance', async () => {
+    const { facade, loop } = createFacade();
+    await loop.destroy();
+    await expect(facade.prompt('too late')).rejects.toThrow(/destroyed/);
+    expect(facade.getLog().filter((e) => e.type === 'utterance')).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -595,6 +622,32 @@ describe('CortexAgent session log', () => {
     const { facade } = createFacade();
     expect(() => facade.deliver('   ')).toThrow('non-whitespace');
     expect(facade.getLog()).toEqual([]);
+  });
+
+  it('log order matches execution order when a same-tick deliver() runs first', async () => {
+    const { facade, piAgent } = createFacade();
+
+    // The prompt is accepted first but its run is chained; the deliver sees
+    // an empty gate in the same tick and starts its run immediately. The
+    // log (the ordering authority) must record them in execution order.
+    const turn = facade.prompt('queued input');
+    const result = facade.deliver('barged-in input');
+    expect(result.outcome).toBe('prompted');
+    await Promise.all([turn, result.turn]);
+
+    expect(piAgent.promptCalls).toEqual(['barged-in input', 'queued input']);
+    const utterances = facade
+      .getLog()
+      .filter((e) => e.type === 'utterance')
+      .map((e) => e.content);
+    expect(utterances).toEqual(['barged-in input', 'queued input']);
+
+    // Causation still binds each reply to its own utterance.
+    const entries = facade.getLog();
+    for (const reply of entries.filter((e) => e.type === 'reply')) {
+      const cause = entries.find((e) => e.seq === reply.causedBy);
+      expect(cause?.type).toBe('utterance');
+    }
   });
 });
 
