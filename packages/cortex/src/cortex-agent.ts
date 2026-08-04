@@ -1138,9 +1138,12 @@ export class CortexAgent {
       log: this.log.getLog(),
       // Passthrough has no talker loop; a restored duplex artifact's talker
       // side is carried through unchanged so nothing is lost on round trip.
-      talkerHistory: this.retainedTalkerHistory,
+      // Copied like getLog(): a persistence layer that normalizes the
+      // snapshot in place must never mutate live facade state (and becomes
+      // load-bearing when talkerHistory is a live loop's history in 2b).
+      talkerHistory: structuredClone(this.retainedTalkerHistory),
       reasonerHistory: this.reasoner.getConversationHistory(),
-      talkerMemory: this.retainedTalkerMemory,
+      talkerMemory: structuredClone(this.retainedTalkerMemory),
       reasonerMemory: this.reasoner.getObservationalMemoryState(),
       usage: {
         total: talkerUsage ? addUsage(reasonerUsage, talkerUsage) : reasonerUsage,
@@ -1187,8 +1190,10 @@ export class CortexAgent {
     if (v2.reasonerMemory) {
       this.reasoner.restoreObservationalMemoryState(v2.reasonerMemory);
     }
-    this.retainedTalkerHistory = [...v2.talkerHistory];
-    this.retainedTalkerMemory = v2.talkerMemory;
+    // Deep copies: the caller's artifact stays the caller's (a later
+    // in-place mutation of it must never reach live facade state).
+    this.retainedTalkerHistory = structuredClone(v2.talkerHistory);
+    this.retainedTalkerMemory = structuredClone(v2.talkerMemory);
     this.log.restore(v2.log);
 
     this.usageBaseline = {

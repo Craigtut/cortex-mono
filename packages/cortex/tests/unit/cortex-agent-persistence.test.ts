@@ -432,6 +432,37 @@ describe('CortexAgent.restore', () => {
     ).toThrow(/Unsupported CortexAgent state version: 3/);
   });
 
+  it('never shares live talker references with the caller (copy on both sides)', async () => {
+    const { facade } = createFacade();
+    const zero = { totalCost: 0, totalTurns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const artifact: CortexAgentStateV2 = {
+      version: 2,
+      log: [],
+      talkerHistory: [{ role: 'user', content: 'voice input', timestamp: 1 } as AgentMessage],
+      reasonerHistory: [],
+      talkerMemory: fakeMemory(),
+      reasonerMemory: null,
+      usage: { total: zero, perLoop: { talker: null, reasoner: zero } },
+    };
+    facade.restore(artifact);
+
+    // A persistence layer normalizing its own artifact in place must not
+    // mutate live facade state.
+    artifact.talkerHistory[0]!.content = 'mutated after restore';
+    artifact.talkerMemory!.observations = 'mutated after restore';
+    const state = await facade.getState();
+    expect(state.talkerHistory[0]!.content).toBe('voice input');
+    expect(state.talkerMemory!.observations).toBe('observed things');
+
+    // And the returned snapshot is a copy, like getLog(): mutating it must
+    // not reach the next snapshot.
+    state.talkerHistory[0]!.content = 'normalized in place';
+    state.talkerMemory!.observations = 'normalized in place';
+    const second = await facade.getState();
+    expect(second.talkerHistory[0]!.content).toBe('voice input');
+    expect(second.talkerMemory!.observations).toBe('observed things');
+  });
+
   it('carries a restored talker side through a passthrough round trip', async () => {
     const { facade } = createFacade();
     const talkerHistory = [
