@@ -592,6 +592,29 @@ describe('CortexAgent session log', () => {
     expect(completed.data).toMatchObject({ taskId: 'task-1', status: 'completed' });
   });
 
+  it('logs a cancelled sub-agent as a cancellation milestone, not a failure', async () => {
+    const { facade, loop } = createFacade();
+    trackFakeSubAgent(loop, 'task-cancel');
+    const spawn = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_spawned')!;
+
+    await facade.abort('work');
+
+    const entries = facade.getLog();
+    const cancelled = entries.find((e) => e.data?.['event'] === 'sub_agent_cancelled')!;
+    expect(cancelled).toBeDefined();
+    expect(cancelled.type).toBe('lifecycle');
+    expect(cancelled.content).toBe('Sub-agent task-cancel cancelled');
+    expect(cancelled.causedBy).toBe(spawn.seq);
+    expect(entries.find((e) => e.data?.['event'] === 'sub_agent_failed')).toBeUndefined();
+
+    // A genuine failure still logs as one.
+    trackFakeSubAgent(loop, 'task-fail');
+    loop.getSubAgentManager().fail('task-fail', 'child exploded');
+    const failed = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_failed')!;
+    expect(failed.content).toBe('Sub-agent task-fail failed: child exploded');
+    expect(failed.data).toMatchObject({ taskId: 'task-fail', error: 'child exploded' });
+  });
+
   it('entries produced outside any facade-initiated run carry no causation stamp', () => {
     const { facade, loop } = createFacade();
     trackFakeSubAgent(loop, 'task-idle');

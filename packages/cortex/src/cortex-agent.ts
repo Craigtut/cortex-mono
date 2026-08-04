@@ -850,6 +850,22 @@ export class CortexAgent {
     this.reasoner.onSubAgentFailed((taskId, error) => {
       const spawnSeq = this.spawnSeqByTaskId.get(taskId);
       this.spawnSeqByTaskId.delete(taskId);
+      // SubAgentManager.cancel fires the loop's onSubAgentFailed hook with
+      // 'Cancelled' (the consumer callback contract keeps that shape), but
+      // the log is the durable record the duplex router reads, and
+      // log-and-context.md lists cancellations as their own milestone, not
+      // failures. The manager marks the ID cancelled before any hook fires,
+      // so this discriminator is reliable, unlike matching the error text.
+      if (this.reasoner.getSubAgentManager().isCancelled(taskId)) {
+        this.appendEntry({
+          type: 'lifecycle',
+          loopPath: this.reasoner.loopPath,
+          content: `Sub-agent ${taskId} cancelled`,
+          data: { event: 'sub_agent_cancelled', taskId },
+          ...(spawnSeq !== undefined ? { causedBy: spawnSeq } : {}),
+        });
+        return;
+      }
       this.appendEntry({
         type: 'lifecycle',
         loopPath: this.reasoner.loopPath,
