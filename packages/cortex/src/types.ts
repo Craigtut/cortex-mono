@@ -425,6 +425,18 @@ export interface AgentLoopConfig {
   disableTools?: string[];
 
   /**
+   * Restrict the read-surface built-in tools (Read, Glob, Grep) to paths
+   * under these roots, enforced in-tool with symlink resolution and a
+   * visible refusal. For read-restricted loops (duplex quick lookups spawn
+   * with `[workingDirectory]`): their answers become conversation, so an
+   * unrestricted read is an exfiltration path. Gates only the read tools;
+   * combine with `disableTools` (write/exec tools) and the sandbox for a
+   * fully restricted loop. Inherited by spawned sub-agents. Undefined or
+   * empty = unrestricted, exactly as before.
+   */
+  readPathAllowlist?: string[];
+
+  /**
    * Structured permission result for a tool call.
    * - `allow`: proceed immediately
    * - `block`: deny the call

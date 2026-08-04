@@ -18,6 +18,8 @@ import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
 import { estimateTokens } from '../token-estimator.js';
 import { extractPdfText } from './shared/pdf-extractor.js';
+import { createPathAllowlist } from './shared/path-allowlist.js';
+import type { PathAllowlist } from './shared/path-allowlist.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -123,6 +125,14 @@ export interface ReadDetails {
 export interface ReadToolConfig {
   runtime?: CortexToolRuntime | undefined;
   readRegistry?: ReadRegistry | undefined;
+  /**
+   * Restrict reads to paths under these roots. Enforced in-tool with
+   * symlink resolution (a link inside a root pointing outside is refused).
+   * Undefined or empty = unrestricted, exactly as before. Used by
+   * restricted loops (duplex quick lookups) where a read outside the
+   * working directory is an exfiltration path.
+   */
+  allowedRoots?: readonly string[] | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +261,10 @@ export function createReadTool(config: ReadToolConfig): {
   if (!readRegistry) {
     throw new Error('createReadTool requires either runtime or readRegistry');
   }
+  const allowlist: PathAllowlist | null =
+    config.allowedRoots && config.allowedRoots.length > 0
+      ? createPathAllowlist(config.allowedRoots)
+      : null;
 
   const tool = {
     name: 'Read',
@@ -272,6 +286,15 @@ export function createReadTool(config: ReadToolConfig): {
       const filePath = path.resolve(params.file_path);
       const offset = params.offset ?? 1;
       const limit = params.limit ?? DEFAULT_LIMIT;
+
+      // Allowlist gate (symlink-resolved) before any disk I/O on the target.
+      // The refusal is a visible tool result, never a silent empty read.
+      if (allowlist) {
+        const verdict = await allowlist.check(filePath);
+        if (!verdict.allowed) {
+          return makeRejection(filePath, 0, verdict.refusal!);
+        }
+      }
 
       // Block device paths that would hang (infinite output or blocking input)
       if (isBlockedDevicePath(filePath)) {

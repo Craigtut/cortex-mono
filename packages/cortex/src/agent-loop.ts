@@ -5175,9 +5175,14 @@ export class AgentLoop {
     const tools: RegisteredTool[] = [];
     const cwd = this.workingDirectory;
     const runtime = this.toolRuntime;
+    // In-tool path allowlist for the read-surface tools (Read, Glob, Grep).
+    // Enforced in the tools themselves, never by prompt: restricted loops
+    // (duplex quick lookups) speak their answers, so an out-of-scope read is
+    // an exfiltration path regardless of what the model was told.
+    const allowedRoots = this.config.readPathAllowlist;
 
     if (!disabled.has(TOOL_NAMES.Read)) {
-      tools.push(createReadTool({ runtime }) as RegisteredTool);
+      tools.push(createReadTool({ runtime, allowedRoots }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.Write)) {
       tools.push(createWriteTool({ runtime }) as RegisteredTool);
@@ -5189,13 +5194,17 @@ export class AgentLoop {
       tools.push(createUndoEditTool({ runtime }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.Glob)) {
-      tools.push(createGlobTool({ defaultCwd: cwd }) as RegisteredTool);
+      tools.push(createGlobTool({ defaultCwd: cwd, allowedRoots }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.Grep)) {
       // Thread the sandbox so ripgrep content search runs inside the same OS
       // boundary as shell commands (enforces denyRead over secrets). No-op when
       // no provider is configured.
-      tools.push(createGrepTool({ defaultCwd: cwd, sandbox: this.config.sandbox }) as RegisteredTool);
+      tools.push(createGrepTool({
+        defaultCwd: cwd,
+        sandbox: this.config.sandbox,
+        allowedRoots,
+      }) as RegisteredTool);
     }
     if (!disabled.has(TOOL_NAMES.Bash)) {
       tools.push(createBashTool({
@@ -7185,6 +7194,10 @@ export class AgentLoop {
     // contained by the same OS boundary. Sharing the instance (not cloning) is
     // correct: the underlying SandboxManager is a process-global singleton.
     if (this.config.sandbox) childCortexConfig.sandbox = this.config.sandbox;
+    // A read-restricted parent must not spawn read-unrestricted children.
+    if (this.config.readPathAllowlist) {
+      childCortexConfig.readPathAllowlist = this.config.readPathAllowlist;
+    }
     // Share the egress gate so a sub-agent's WebFetch answers to the same
     // network policy and grant set as the parent's.
     if (this.config.resolveNetworkAccess) {

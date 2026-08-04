@@ -95,7 +95,10 @@ import {
 import type { PermissionBroker } from './duplex/permission-broker.js';
 import type { ResolveNetworkAccess } from './sandbox/types.js';
 import { buildDeliverTool, buildSteerSubAgentTool } from './duplex/reasoner-tools.js';
+import { QuickLookupManager } from './duplex/quick-lookups.js';
+import type { QuickLookupOutcome } from './duplex/quick-lookups.js';
 import {
+  buildQuickLookupPrompt,
   REASONER_ROLE_PROMPT,
   SPEAK_NOW_APPENDIX,
   TALKER_ROLE_PROMPT,
@@ -140,6 +143,16 @@ export interface DuplexTuningConfig extends Omit<DuplexRouterOptions, 'now'> {
    * Default: 10000.
    */
   idleDigestionDelayMs?: number;
+  /**
+   * Concurrent quick-lookup cap: the separate small pool (D13), so a busy
+   * task fleet can never starve lookups and vice versa. Default: 2.
+   */
+  maxConcurrentLookups?: number;
+  /**
+   * Wall-clock timeout per quick lookup in ms; on expiry the lookup aborts
+   * and reports timed_out (visibly, never silently). Default: 30000.
+   */
+  lookupTimeoutMs?: number;
   /**
    * Aggregate lifetime cost cap in USD across both resident loops, every
    * sub-agent, and utility spend (observer/reflector/summarization).
@@ -253,6 +266,9 @@ export const CONFIG_ROUTING: { [K in keyof Required<CortexAgentConfig>]: ConfigD
   // Reasoner and sub-agents.
   toolExecution: 'reasoner',
   disableTools: 'reasoner',
+  // Reasoner and sub-agents (the talker has no read tools). The facade's
+  // quick-lookup loops get their own facade-set allowlist regardless.
+  readPathAllowlist: 'reasoner',
   deferredTools: 'reasoner',
   toolResultThresholds: 'reasoner',
   webFetch: 'reasoner',
@@ -545,6 +561,67 @@ export function buildTalkerConfig(
 }
 
 /**
+ * The lookup loop's hard turn cap. Small by design: a lookup is a few read
+ * tool calls plus an answer; anything longer belongs on the reasoner.
+ */
+export const LOOKUP_MAX_TURNS = 6;
+
+/** Read-surface toolset a quick lookup keeps (everything else disabled). */
+const LOOKUP_TOOL_NAMES: ReadonlySet<string> = new Set([
+  TOOL_NAMES.Read,
+  TOOL_NAMES.Grep,
+  TOOL_NAMES.Glob,
+]);
+
+/**
+ * Config for one ephemeral quick-lookup loop (decisions.md D13, F12): fast
+ * model, Read/Grep/Glob only, an in-tool path allowlist rooted at the
+ * working directory, the shared sandbox, broker-gated permissions (the
+ * config's resolvePermission is already the brokered wrapper in duplex),
+ * fail-fast retries, and a hard turn cap. No conversation context by
+ * design. Exported for tests.
+ */
+export function buildQuickLookupConfig(
+  config: CortexAgentConfig,
+  model: CortexModel,
+  alias: string,
+): AgentLoopConfig & { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean } {
+  const lookup: AgentLoopConfig & {
+    enableSubAgentTool?: boolean;
+    enableLoadSkillTool?: boolean;
+  } = {
+    model,
+    workingDirectory: config.workingDirectory,
+    loopPath: `lookup/${alias}`,
+    thinkingLevel: 'off',
+    budgetGuard: { maxTurns: LOOKUP_MAX_TURNS, scope: 'prompt' },
+    retryPolicy: TALKER_RETRY_POLICY,
+    initialBasePrompt: buildQuickLookupPrompt(config.workingDirectory),
+    // Read-only toolset (D13): no write, exec, network, or spawn surface.
+    disableTools: Object.values(TOOL_NAMES).filter((name) => !LOOKUP_TOOL_NAMES.has(name)),
+    // The security half (F12), enforced in-tool rather than by prompt:
+    // lookup answers become spoken conversation, so a read outside the
+    // working directory is a direct exfiltration path.
+    readPathAllowlist: [config.workingDirectory],
+    enableSubAgentTool: false,
+    enableLoadSkillTool: false,
+  };
+  if (config.getApiKey) lookup.getApiKey = config.getApiKey;
+  if (config.sandbox) lookup.sandbox = config.sandbox;
+  if (config.envOverrides) lookup.envOverrides = config.envOverrides;
+  if (config.logger) lookup.logger = config.logger;
+  if (config.diagnostics) lookup.diagnostics = config.diagnostics;
+  if (config.persistResult) lookup.persistResult = config.persistResult;
+  if (config.toolResultThresholds) lookup.toolResultThresholds = config.toolResultThresholds;
+  // Broker-gated like any other loop: in duplex create() this is the
+  // brokered wrapper, so an `ask` is voiced through the talker rather than
+  // blocking the lookup invisibly (the lookup's timeout still bounds it).
+  if (config.resolvePermission) lookup.resolvePermission = config.resolvePermission;
+  if (config.isAutoApprove) lookup.isAutoApprove = config.isAutoApprove;
+  return lookup;
+}
+
+/**
  * Route the blocking permission surfaces through the duplex broker
  * (communication.md "Full coverage"): the consumer's resolvePermission and
  * resolveNetworkAccess are wrapped so an `ask` becomes a voiced
@@ -800,6 +877,11 @@ export interface CortexAgentUsageBreakdown {
   perLoop: {
     talker: SessionUsage | null;
     reasoner: SessionUsage;
+    /**
+     * Accumulated quick-lookup spend (settled lookup loops, duplex only).
+     * Absent when no lookup has ever run; carried through restores.
+     */
+    lookups?: SessionUsage;
   };
 }
 
@@ -856,6 +938,18 @@ function zeroUsage(): SessionUsage {
     totalTurns: 0,
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   };
+}
+
+function isZeroUsage(usage: SessionUsage): boolean {
+  return (
+    usage.totalCost === 0 &&
+    usage.totalTurns === 0 &&
+    usage.tokens.input === 0 &&
+    usage.tokens.output === 0 &&
+    usage.tokens.cacheRead === 0 &&
+    usage.tokens.cacheWrite === 0 &&
+    (usage.utility === undefined || Object.keys(usage.utility).length === 0)
+  );
 }
 
 function cloneUsage(usage: SessionUsage): SessionUsage {
@@ -1046,6 +1140,8 @@ export class CortexAgent {
   private headlines: DuplexHeadlines | null = null;
   private mergedBridge: EventBridge | null = null;
   private aggregateGuard: BudgetGuard | null = null;
+  /** Facade-owned quick-lookup fleet (D13); null in passthrough. */
+  private lookups: QuickLookupManager | null = null;
   private aggregateBreachLogged = false;
   /** Whether the current reasoner run called Deliver (implicit-delivery guard). */
   private reasonerDeliverCalledThisRun = false;
@@ -1093,11 +1189,17 @@ export class CortexAgent {
   // restore, so the composite aggregate is restoredBaseline + live deltas
   // rather than an additive merge into live counters (which would
   // double-count on repeated restores).
-  private usageBaseline: { talker: SessionUsage | null; reasoner: SessionUsage } | null = null;
+  private usageBaseline: {
+    talker: SessionUsage | null;
+    reasoner: SessionUsage;
+    lookups: SessionUsage | null;
+  } | null = null;
   /** Reasoner live counters at the moment of the last restore. */
   private usageAtRestore: SessionUsage | null = null;
   /** Talker live counters at the moment of the last restore (duplex). */
   private talkerUsageAtRestore: SessionUsage | null = null;
+  /** Lookup accumulator reading at the moment of the last restore (duplex). */
+  private lookupUsageAtRestore: SessionUsage | null = null;
   /**
    * Talker-side artifact content carried through a passthrough session
    * opaquely: passthrough has no talker loop to hydrate, but a restored
@@ -1220,11 +1322,44 @@ export class CortexAgent {
       }
     }
 
+    // The facade-owned quick-lookup fleet (D13): ephemeral read-only loops
+    // on the talker's fast model, spawned on the talker's behalf, with their
+    // own small pool. Created before the router so its ports can dispatch
+    // into it synchronously.
+    const lookups = new QuickLookupManager(
+      {
+        createLoop: async (alias) => {
+          const loop = await AgentLoop.create(
+            buildQuickLookupConfig(config, talker.getModel(), alias),
+          );
+          // Label lookup events on the merged stream ('lookup/lk-1'), which
+          // also feeds the aggregate budget guard, so lookup spend is
+          // bounded like everything else.
+          const cleanup = this.mergedBridge
+            ? this.mergedBridge.forwardLoopFrom(loop.getEventBridge(), loop.loopPath)
+            : undefined;
+          return { loop, ...(cleanup ? { cleanup } : {}) };
+        },
+        onOutcome: (outcome) => this.handleLookupOutcome(outcome),
+        logger: this.logger,
+      },
+      {
+        ...(config.duplex?.maxConcurrentLookups !== undefined
+          ? { maxConcurrent: config.duplex.maxConcurrentLookups }
+          : {}),
+        ...(config.duplex?.lookupTimeoutMs !== undefined
+          ? { timeoutMs: config.duplex.lookupTimeoutMs }
+          : {}),
+      },
+    );
+    this.lookups = lookups;
+
     const ports: DuplexRouterPorts = {
       deliverToTalker: (content, wake) => {
         talker.deliver(content, { wake });
       },
       talkerIdle: () => !talker.isLoopActive,
+      spawnLookup: (question, causeSeq) => lookups.request(question, causeSeq),
       dispatchToReasoner: (message, causeSeq) => this.dispatchToReasoner(message, causeSeq),
       appendLog: (input) => this.appendEntry({
         type: input.type,
@@ -1512,6 +1647,33 @@ export class CortexAgent {
   }
 
   /**
+   * A quick lookup settled. Non-cancelled outcomes (including timeouts and
+   * failures, which must be visible) route through the router: durable
+   * lookup_result entry, talker wake, reasoner delta. Cancelled lookups
+   * were stopped on purpose (abort, restore, teardown): logged, never
+   * delivered.
+   */
+  private handleLookupOutcome(outcome: QuickLookupOutcome): void {
+    if (outcome.status === 'cancelled') {
+      if (this.destroyed) return;
+      this.appendEntry({
+        type: 'lifecycle',
+        loopPath: `lookup/${outcome.alias}`,
+        content: `Quick lookup ${outcome.alias} cancelled`,
+        data: {
+          event: 'lookup_cancelled',
+          alias: outcome.alias,
+          question: outcome.question,
+        },
+        causedBy: outcome.causeSeq,
+      });
+      return;
+    }
+    this.router?.deliverLookupResult(outcome);
+    this.markStateDirty();
+  }
+
+  /**
    * Aggregate budget breach: log once, then stop both loops and every
    * child. The lifetime guard keeps stopping anything that starts after
    * the breach, so later dispatches cannot leak spend.
@@ -1542,6 +1704,7 @@ export class CortexAgent {
     for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
       void this.reasoner.cancelSubAgent(taskId).catch(swallow);
     }
+    if (this.lookups) void this.lookups.cancelAll().catch(swallow);
   }
 
   /**
@@ -2125,6 +2288,9 @@ export class CortexAgent {
         this.router!.dropPendingDeliveries();
         this.recordDroppedQueueContent(this.talker!, 'abort', this.talker!.clearAllQueues());
         work.push(this.talker!.abort());
+        // Quick lookups belong to the conversation surface (abort table):
+        // cancelled here, untouched by a 'work' abort.
+        if (this.lookups) work.push(this.lookups.cancelAll());
       }
       if (scope === 'work' || scope === 'all') {
         this.router!.dropWorkContext();
@@ -2184,6 +2350,7 @@ export class CortexAgent {
       try {
         const teardowns: Array<Promise<void>> = [this.reasoner.destroy(timeoutMs)];
         if (this.talker) teardowns.push(this.talker.destroy(timeoutMs));
+        if (this.lookups) teardowns.push(this.lookups.destroy());
         await Promise.all(teardowns);
       } finally {
         this.mergedBridge?.destroy();
@@ -2249,6 +2416,10 @@ export class CortexAgent {
   private captureStateInFrame(): CortexAgentStateV2 {
     const reasonerUsage = this.reasonerUsageWithBaseline();
     const talkerUsage = this.talkerUsageWithBaseline();
+    const lookupUsage = this.lookupUsageWithBaseline();
+    let total = reasonerUsage;
+    if (talkerUsage) total = addUsage(total, talkerUsage);
+    if (lookupUsage) total = addUsage(total, lookupUsage);
     return {
       version: 2,
       log: this.log.getLog(),
@@ -2266,8 +2437,12 @@ export class CortexAgent {
         : structuredClone(this.retainedTalkerMemory),
       reasonerMemory: this.reasoner.getObservationalMemoryState(),
       usage: {
-        total: talkerUsage ? addUsage(reasonerUsage, talkerUsage) : reasonerUsage,
-        perLoop: { talker: talkerUsage, reasoner: reasonerUsage },
+        total,
+        perLoop: {
+          talker: talkerUsage,
+          reasoner: reasonerUsage,
+          ...(lookupUsage ? { lookups: lookupUsage } : {}),
+        },
       },
     };
   }
@@ -2296,6 +2471,24 @@ export class CortexAgent {
   }
 
   /**
+   * Quick-lookup spend under the same model. Null when nothing was ever
+   * spent (the artifact omits an all-zero bucket rather than growing every
+   * duplex snapshot).
+   */
+  private lookupUsageWithBaseline(): SessionUsage | null {
+    const baseline = this.usageBaseline?.lookups ?? null;
+    if (!this.lookups) {
+      // Passthrough: carry a restored duplex artifact's lookup spend
+      // through unchanged, like the retained talker side.
+      return baseline ? cloneUsage(baseline) : null;
+    }
+    const live = this.lookups.getSettledUsage();
+    const delta = this.lookupUsageAtRestore ? diffUsage(live, this.lookupUsageAtRestore) : live;
+    const combined = baseline ? addUsage(baseline, delta) : delta;
+    return isZeroUsage(combined) ? null : combined;
+  }
+
+  /**
    * Restore a persisted artifact: v2 composite, v1 single history, or a
    * bare message array (upgraded transparently). Rejected while any loop
    * is running: a restore under a live run would splice history out from
@@ -2313,7 +2506,8 @@ export class CortexAgent {
       this.reasoner.isLoopActive ||
       (this.talker?.isLoopActive ?? false) ||
       this.pendingFacadePrompts > 0 ||
-      this.reasoner.getSubAgentManager().activeCount > 0
+      this.reasoner.getSubAgentManager().activeCount > 0 ||
+      (this.lookups?.activeCount ?? 0) > 0
     ) {
       throw new Error(
         'CortexAgent.restore() rejected: a loop is running. Await workSettled before restoring.',
@@ -2352,9 +2546,11 @@ export class CortexAgent {
     this.usageBaseline = {
       talker: v2.usage.perLoop.talker ? cloneUsage(v2.usage.perLoop.talker) : null,
       reasoner: cloneUsage(v2.usage.perLoop.reasoner),
+      lookups: v2.usage.perLoop.lookups ? cloneUsage(v2.usage.perLoop.lookups) : null,
     };
     this.usageAtRestore = this.reasoner.getSessionUsage();
     this.talkerUsageAtRestore = this.talker ? this.talker.getSessionUsage() : null;
+    this.lookupUsageAtRestore = this.lookups ? this.lookups.getSettledUsage() : null;
     this.spawnSeqByTaskId.clear();
     this.activeCauseSeq = null;
     // Pre-restore queued content belongs to the replaced session: left in
@@ -2468,16 +2664,17 @@ export class CortexAgent {
 
   /**
    * Whether all work has settled: conversation idle, reasoner gate empty,
-   * no active sub-agents, no parked wake deliveries on either loop, no
-   * router-held deliveries, no pending permission asks. Queued silent
-   * deliveries do not count: silent content deliberately waits for the
-   * next prompt.
+   * no active sub-agents or quick lookups, no parked wake deliveries on
+   * either loop, no router-held deliveries, no pending permission asks.
+   * Queued silent deliveries do not count: silent content deliberately
+   * waits for the next prompt.
    */
   get workSettled(): boolean {
     return (
       this.conversationIdle &&
       !this.reasoner.isLoopActive &&
       this.reasoner.getSubAgentManager().activeCount === 0 &&
+      (this.lookups?.activeCount ?? 0) === 0 &&
       this.reasoner.pendingWakeDeliveryCount === 0 &&
       (this.talker?.pendingWakeDeliveryCount ?? 0) === 0 &&
       (this.router?.pendingDeliveryCount ?? 0) === 0 &&
@@ -2528,6 +2725,14 @@ export class CortexAgent {
           .map((taskId) => manager.get(taskId)?.completion)
           .filter((completion) => completion !== undefined);
         await Promise.all(completions);
+        await yieldMacrotask();
+        continue;
+      }
+
+      // Active quick lookups: their settlement enqueues router deliveries
+      // and talker wakes, so loop back for a full re-check afterwards.
+      if (this.lookups && this.lookups.activeCount > 0) {
+        await this.lookups.waitForIdle();
         await yieldMacrotask();
         continue;
       }
@@ -2782,14 +2987,17 @@ export class CortexAgent {
 
   /**
    * Accumulated session usage: the composite aggregate across both loops
-   * (children counted once via each loop's own accounting), under the
-   * baseline-plus-delta restore model, so totals survive restores without
-   * double-counting.
+   * and settled quick lookups (children counted once via each loop's own
+   * accounting), under the baseline-plus-delta restore model, so totals
+   * survive restores without double-counting.
    */
   getSessionUsage(): SessionUsage {
-    const reasoner = this.reasonerUsageWithBaseline();
+    let total = this.reasonerUsageWithBaseline();
     const talker = this.talkerUsageWithBaseline();
-    return talker ? addUsage(reasoner, talker) : reasoner;
+    if (talker) total = addUsage(total, talker);
+    const lookups = this.lookupUsageWithBaseline();
+    if (lookups) total = addUsage(total, lookups);
+    return total;
   }
 
   // Tools, MCP, skills ------------------------------------------------------

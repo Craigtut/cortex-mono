@@ -9,7 +9,7 @@
  * utility spend, duplex abort scopes, composite persistence over two live
  * loops, and settlement.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { AgentLoop, TOOL_RESULT_WORKING_TAGS_REMINDER } from '../../src/agent-loop.js';
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import { EventBridge } from '../../src/event-bridge.js';
@@ -20,8 +20,10 @@ import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 import {
   CortexAgent,
+  LOOKUP_MAX_TURNS,
   TALKER_MAX_TURNS,
   buildDuplexReasonerConfig,
+  buildQuickLookupConfig,
   buildTalkerConfig,
   withBrokeredPermissions,
 } from '../../src/cortex-agent.js';
@@ -428,6 +430,176 @@ describe('duplex config builders', () => {
     const reasoner = buildDuplexReasonerConfig(baseConfig);
     expect(reasoner.tools?.[0]?.name).toBe('consumer_tool');
     expect(reasoner.budgetGuard).toEqual({ maxTurns: 500, maxCost: 42 });
+  });
+
+  it('builds quick-lookup loops read-only, allowlisted, spawn-incapable, and capped (D13/F12)', () => {
+    const lookup = buildQuickLookupConfig(baseConfig, testModel(), 'lk-1');
+    // The security half, in-tool: reads confined to the working directory.
+    expect(lookup.readPathAllowlist).toEqual(['/tmp/test-workspace']);
+    // Read-only toolset: exactly Read/Grep/Glob survive.
+    const disabled = new Set(lookup.disableTools);
+    expect(disabled.has(TOOL_NAMES.Read)).toBe(false);
+    expect(disabled.has(TOOL_NAMES.Grep)).toBe(false);
+    expect(disabled.has(TOOL_NAMES.Glob)).toBe(false);
+    for (const name of Object.values(TOOL_NAMES)) {
+      if (![TOOL_NAMES.Read, TOOL_NAMES.Grep, TOOL_NAMES.Glob].includes(name)) {
+        expect(disabled.has(name), `${name} must be disabled`).toBe(true);
+      }
+    }
+    expect(lookup.enableSubAgentTool).toBe(false);
+    expect(lookup.enableLoadSkillTool).toBe(false);
+    // Bounded and fast: hard turn cap, fail-fast retries, no API thinking.
+    expect(lookup.budgetGuard).toEqual({ maxTurns: LOOKUP_MAX_TURNS, scope: 'prompt' });
+    expect(lookup.retryPolicy?.maxAttempts).toBe(2);
+    expect(lookup.thinkingLevel).toBe('off');
+    expect(lookup.loopPath).toBe('lookup/lk-1');
+    // No conversation context by design: a facade-owned prompt, never the
+    // consumer's identity prompt.
+    expect(lookup.initialBasePrompt).not.toContain('Consumer identity prompt');
+    expect(lookup.initialBasePrompt).toContain('read-only lookup assistant');
+    // Broker-gated like any other loop: the (brokered) resolver threads in.
+    expect(lookup.resolvePermission).toBe(baseConfig.resolvePermission);
+    // Consumer tools and slots never reach a lookup.
+    expect((lookup as Record<string, unknown>)['tools']).toBeUndefined();
+    expect((lookup as Record<string, unknown>)['slots']).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Quick lookups end to end (D13)
+// ---------------------------------------------------------------------------
+
+describe('duplex quick lookups', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Stub AgentLoop.create to build lookup loops over mock pi agents. Setup
+   * runs on each pi BEFORE the lookup's prompt, because the mock answers in
+   * microtasks: configuring after a waitUntil would race the whole run.
+   */
+  function stubLookupLoops(setup?: (pi: DuplexMockPiAgent) => void): {
+    pis: DuplexMockPiAgent[];
+    configs: AgentLoopConfig[];
+  } {
+    const pis: DuplexMockPiAgent[] = [];
+    const configs: AgentLoopConfig[] = [];
+    const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+    vi.spyOn(AgentLoop, 'create').mockImplementation(async (config) => {
+      const pi = createMockPiAgent();
+      setup?.(pi);
+      pis.push(pi);
+      configs.push(config);
+      return new AgentLoopCtor(pi, config, [], {
+        enableSubAgentTool: false,
+        enableLoadSkillTool: false,
+      });
+    });
+    return { pis, configs };
+  }
+
+  it('quick_lookup runs an ephemeral loop; the result wakes the talker and reaches the reasoner deltas', async () => {
+    const h = createDuplexFacade();
+    const stub = stubLookupLoops((pi) => {
+      pi.nextTurnText = 'Port 8080, set in config/server.ts.';
+    });
+
+    const tool = getPiTool(h.talkerPi, 'quick_lookup');
+    const receipt = await tool.execute('call-1', { question: 'what port does the server use?' }) as {
+      content: Array<{ text: string }>;
+      terminate: boolean;
+    };
+    expect(receipt.terminate).toBe(true);
+    expect(receipt.content[0]!.text).toMatch(/Looking into that/);
+
+    // The lookup loop was created with the restricted config.
+    await waitUntil(() => stub.pis.length === 1);
+    expect(stub.configs[0]!.loopPath).toBe('lookup/lk-1');
+    expect(stub.configs[0]!.readPathAllowlist).toEqual(['/tmp/test-workspace']);
+
+    // Result: durable log entry caused by the directive, talker woken with
+    // the wrapped update.
+    await waitUntil(() => h.talkerPi.promptCalls.length === 1);
+    const woken = String(h.talkerPi.promptCalls[0]);
+    expect(woken).toContain('<background-update>');
+    expect(woken).toContain('Port 8080');
+
+    const log = h.facade.getLog();
+    const directive = log.find((entry) => entry.type === 'directive')!;
+    const result = log.find((entry) => entry.type === 'lookup_result')!;
+    expect(result.loopPath).toBe('lookup/lk-1');
+    expect(result.causedBy).toBe(directive.seq);
+
+    // Shared context (D13): the reasoner sees the lookup with its next
+    // dispatch; context never forks.
+    const spawn = getPiTool(h.talkerPi, 'spawn_task');
+    await spawn.execute('call-2', { instructions: 'unrelated work' });
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1);
+    expect(String(h.reasonerPi.promptCalls[0])).toContain('Quick lookup');
+    expect(String(h.reasonerPi.promptCalls[0])).toContain('Port 8080');
+
+    // The reasoner itself ran nothing for the lookup.
+    expect(h.reasonerPi.promptCalls).toHaveLength(1);
+    await h.facade.waitForWorkSettled();
+  });
+
+  it('a lookup refused at the cap is a visible receipt, not a silent drop', async () => {
+    const h = createDuplexFacade({ duplex: { maxConcurrentLookups: 0 } });
+    const tool = getPiTool(h.talkerPi, 'quick_lookup');
+    const receipt = await tool.execute('call-1', { question: 'q' }) as {
+      content: Array<{ text: string }>;
+      terminate: boolean;
+    };
+    expect(receipt.terminate).toBe(true);
+    expect(receipt.content[0]!.text).toMatch(/Could not start that lookup \(lookup limit reached/);
+    const refusal = h.facade.getLog().find(
+      (entry) => entry.type === 'lifecycle' &&
+        (entry.data as { event?: string }).event === 'dispatch_refused',
+    );
+    expect(refusal).toBeDefined();
+  });
+
+  it("abort('conversation') cancels an in-flight lookup; nothing is delivered", async () => {
+    const h = createDuplexFacade();
+    // Hold every lookup run open so the abort finds it live.
+    const stub = stubLookupLoops((pi) => {
+      pi.hold = true;
+    });
+
+    const tool = getPiTool(h.talkerPi, 'quick_lookup');
+    await tool.execute('call-1', { question: 'slow question' });
+    await waitUntil(() => stub.pis.length === 1);
+
+    await h.facade.abort('conversation');
+    await h.facade.waitForWorkSettled();
+
+    const log = h.facade.getLog();
+    expect(log.find((entry) => entry.type === 'lookup_result')).toBeUndefined();
+    const cancelled = log.find(
+      (entry) => entry.type === 'lifecycle' &&
+        (entry.data as { event?: string }).event === 'lookup_cancelled',
+    );
+    expect(cancelled).toBeDefined();
+    expect(cancelled!.loopPath).toBe('lookup/lk-1');
+    expect(h.talkerPi.promptCalls).toHaveLength(0);
+  });
+
+  it("abort('work') leaves a running lookup untouched (abort table)", async () => {
+    const h = createDuplexFacade();
+    const stub = stubLookupLoops((pi) => {
+      pi.hold = true;
+      pi.nextTurnText = 'the answer';
+    });
+
+    const tool = getPiTool(h.talkerPi, 'quick_lookup');
+    await tool.execute('call-1', { question: 'q' });
+    await waitUntil(() => stub.pis.length === 1);
+
+    await h.facade.abort('work');
+    // Still live after the work abort; releasing it completes normally.
+    stub.pis[0]!.releaseRun();
+    await waitUntil(() => h.facade.getLog().some((entry) => entry.type === 'lookup_result'));
   });
 });
 

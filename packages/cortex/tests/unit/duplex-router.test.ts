@@ -26,6 +26,9 @@ interface Harness {
   talkerDeliveries: Array<{ content: string; wake: boolean }>;
   askVoicings: Array<{ content: string; causeTag: CauseTag }>;
   reasonerDispatches: Array<{ message: string; causeSeq: number | null }>;
+  lookupSpawns: Array<{ question: string; causeSeq: number | null }>;
+  /** Force the next spawnLookup verdicts to a refusal (null = accept). */
+  setLookupRefusal: (reason: string | null) => void;
   setTalkerIdle: (idle: boolean) => void;
   setIdleSignal: (signal: (() => boolean) | undefined) => void;
   /** Make dispatchToReasoner throw until cleared with null. */
@@ -53,12 +56,20 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const askVoicings: Array<{ content: string; causeTag: CauseTag }> = [];
   const reasonerDispatches: Array<{ message: string; causeSeq: number | null }> = [];
+  const lookupSpawns: Array<{ question: string; causeSeq: number | null }> = [];
+  let lookupRefusal: string | null = null;
+  let nextLookupAlias = 1;
   let nextSeq = 1;
 
   const ports: DuplexRouterPorts = {
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
     voiceAskToTalker: (content, causeTag) => askVoicings.push({ content, causeTag }),
     talkerIdle: () => talkerIdle,
+    spawnLookup: (question, causeSeq) => {
+      if (lookupRefusal !== null) return { accepted: false, reason: lookupRefusal };
+      lookupSpawns.push({ question, causeSeq });
+      return { accepted: true, alias: `lk-${nextLookupAlias++}` };
+    },
     dispatchToReasoner: (message, causeSeq) => {
       if (dispatchError) throw dispatchError;
       reasonerDispatches.push({ message, causeSeq });
@@ -91,6 +102,8 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     talkerDeliveries,
     askVoicings,
     reasonerDispatches,
+    lookupSpawns,
+    setLookupRefusal: (reason) => { lookupRefusal = reason; },
     setTalkerIdle: (idle) => { talkerIdle = idle; },
     setIdleSignal: (signal) => { idleSignal = signal; },
     setDispatchError: (error) => { dispatchError = error; },
@@ -636,11 +649,107 @@ describe('control-tool dispatch', () => {
     expect(h.reasonerDispatches[0]!.message).toContain('Redirect for the work in progress: focus on Europe');
   });
 
-  it('quick_lookup routes the question to the reasoner (2b-i interim)', async () => {
+  it('quick_lookup spawns a facade lookup and never dispatches to the reasoner (D13)', async () => {
     const h = createHarness();
     const result = await callTool(h, 'quick_lookup', { question: 'what does resolveModel do?' });
     expect(result.terminate).toBe(true);
-    expect(h.reasonerDispatches[0]!.message).toContain('what does resolveModel do?');
+    expect(result.content[0]!.text).toMatch(/Looking into that/);
+    expect(h.reasonerDispatches).toHaveLength(0);
+    expect(h.lookupSpawns).toHaveLength(1);
+    expect(h.lookupSpawns[0]!.question).toBe('what does resolveModel do?');
+    // The spawn carries the directive seq for causation binding.
+    const directive = h.log.find((entry) => entry.type === 'directive')!;
+    expect(h.lookupSpawns[0]!.causeSeq).toBe(directive.seq);
+  });
+
+  it('a refused lookup spawn is a visible receipt and a logged refusal, never memoized', async () => {
+    const h = createHarness();
+    h.setLookupRefusal('lookup limit reached (2/2 running)');
+    const refused = await callTool(h, 'quick_lookup', { question: 'q' });
+    expect(refused.terminate).toBe(true);
+    expect(refused.content[0]!.text).toMatch(/Could not start that lookup \(lookup limit reached/);
+    const refusal = h.log.find(
+      (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'dispatch_refused',
+    );
+    expect(refusal).toBeDefined();
+    expect(refusal!.data).toMatchObject({ tool: 'quick_lookup' });
+
+    // The pool drained: an identical retry in the same turn spawns instead
+    // of replaying the refusal.
+    h.setLookupRefusal(null);
+    const retry = await callTool(h, 'quick_lookup', { question: 'q' });
+    expect(retry.content[0]!.text).toMatch(/Looking into that/);
+    expect(h.lookupSpawns).toHaveLength(1);
+  });
+
+  it('deliverLookupResult logs a lookup_result, wakes the talker, and joins the reasoner deltas', async () => {
+    const h = createHarness();
+    h.setTalkerIdle(true);
+    await callTool(h, 'quick_lookup', { question: 'what port does the server use?' });
+    const directive = h.log.find((entry) => entry.type === 'directive')!;
+
+    h.router.deliverLookupResult({
+      alias: 'lk-1',
+      question: 'what port does the server use?',
+      status: 'completed',
+      answer: 'Port 8080, set in config/server.ts.',
+      causeSeq: directive.seq,
+      durationMs: 1200,
+    });
+
+    const entry = h.log.find((item) => item.type === 'lookup_result')!;
+    expect(entry.loopPath).toBe('lookup/lk-1');
+    expect(entry.content).toContain('Port 8080');
+    expect(entry.causedBy).toBe(directive.seq);
+    expect(entry.wake).toBe('interrupt');
+
+    await waitUntil(() => h.talkerDeliveries.length === 1);
+    expect(h.talkerDeliveries[0]!.wake).toBe(true);
+    expect(h.talkerDeliveries[0]!.content).toContain('<background-update>');
+    expect(h.talkerDeliveries[0]!.content).toContain('Port 8080');
+
+    // Shared context (D13): the reasoner sees the result with its next
+    // dispatch.
+    await callTool(h, 'spawn_task', { instructions: 'unrelated work' });
+    const dispatch = h.reasonerDispatches[0]!.message;
+    expect(dispatch).toContain('Quick lookup');
+    expect(dispatch).toContain('Port 8080');
+  });
+
+  it('a timed-out lookup is delivered visibly, not dropped', async () => {
+    const h = createHarness();
+    h.setTalkerIdle(true);
+    h.router.deliverLookupResult({
+      alias: 'lk-1',
+      question: 'q',
+      status: 'timed_out',
+      answer: '',
+      causeSeq: null,
+      durationMs: 30_000,
+    });
+    const entry = h.log.find((item) => item.type === 'lookup_result')!;
+    expect(entry.content).toMatch(/did not complete: it timed out/);
+    await waitUntil(() => h.talkerDeliveries.length === 1);
+    expect(h.talkerDeliveries[0]!.content).toMatch(/did not complete/);
+  });
+
+  it('lookup interrupts draw from the token bucket and demote when it is empty', async () => {
+    const h = createHarness({ interruptBucketCapacity: 1, interruptRefillMs: 1_000_000 });
+    h.setTalkerIdle(false);
+    const outcome = (alias: string) => ({
+      alias,
+      question: 'q',
+      status: 'completed' as const,
+      answer: `answer from ${alias}`,
+      causeSeq: null,
+      durationMs: 10,
+    });
+    h.router.deliverLookupResult(outcome('lk-1'));
+    h.router.deliverLookupResult(outcome('lk-2'));
+    const entries = h.log.filter((item) => item.type === 'lookup_result');
+    expect(entries[0]!.wake).toBe('interrupt');
+    expect(entries[1]!.wake).toBe('when_idle');
+    expect(entries[1]!.data).toMatchObject({ demoted: true });
   });
 
   it('overflowing the delta buffer trims oldest lines behind a marker', async () => {

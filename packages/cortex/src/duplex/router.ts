@@ -27,7 +27,7 @@ import { NOOP_LOGGER } from '../noop-logger.js';
 import {
   buildCancelDirective,
   buildConversationBlock,
-  buildLookupDirective,
+  buildLookupResultText,
   buildSpawnDirective,
   buildSteerDirective,
   buildWorkInputDirective,
@@ -40,6 +40,7 @@ import type { CauseTag } from './cause-tags.js';
 import type { ControlDispatchTarget } from './control-tools.js';
 import { PermissionBroker } from './permission-broker.js';
 import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
+import type { QuickLookupOutcome, QuickLookupRequestResult } from './quick-lookups.js';
 
 // ---------------------------------------------------------------------------
 // Ports and options
@@ -47,7 +48,7 @@ import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
 
 /** Log entry input the router produces (a subset of the facade's schema). */
 export interface RouterLogInput {
-  type: 'directive' | 'delivery' | 'lifecycle' | 'ask' | 'ask_answer';
+  type: 'directive' | 'delivery' | 'lifecycle' | 'ask' | 'ask_answer' | 'lookup_result';
   loopPath: string;
   content: string;
   wake?: WakeClass;
@@ -102,6 +103,14 @@ export interface DuplexRouterPorts {
   voiceAskToTalker(content: string, causeTag: CauseTag): void;
   /** Mark a loop-registry pending ask as voiced (broker voicing sync). */
   markAskVoiced?(askId: string): void;
+  /**
+   * Start a facade-spawned quick lookup (D13): an ephemeral read-only
+   * sub-agent, never a reasoner directive. causeSeq is the log seq of the
+   * quick_lookup directive; the outcome carries it back for causation. The
+   * verdict is synchronous so a cap refusal reaches the talker's receipt in
+   * the same dispatch.
+   */
+  spawnLookup(question: string, causeSeq: number | null): QuickLookupRequestResult;
   /** Consumer idle signal (advisory, facade-api.md). */
   idleSignal?: (() => boolean) | undefined;
   logger?: CortexLogger;
@@ -564,11 +573,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     const capRefusal = this.applyDispatchCaps('quick_lookup');
     if (capRefusal) return capRefusal;
 
-    // 2b-i interim: the question routes to the reasoner as a directive, so
-    // the capability exists end to end. 2b-ii replaces this dispatch with a
-    // facade-spawned read-only ephemeral sub-agent (D13) so the answer does
-    // not wait on the reasoner's turn boundary, with the F12 read
-    // restrictions built in-tool.
+    // Facade-spawned ephemeral read-only sub-agent (D13), never a reasoner
+    // directive: the answer must not wait on the reasoner's turn boundary,
+    // and the F12 read restrictions are built into the lookup loop's tools.
     const seq = this.ports.appendLog({
       type: 'directive',
       loopPath: this.talkerLoopPath,
@@ -576,12 +583,83 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       data: { tool: 'quick_lookup', question },
       ...this.talkerCause(),
     });
-    if (!this.dispatch(buildLookupDirective(question), seq)) {
-      return 'Could not start that lookup. Tell the user and try again.';
+    let spawn: QuickLookupRequestResult;
+    try {
+      spawn = this.ports.spawnLookup(question, seq);
+    } catch (err) {
+      this.logger.error('quick lookup spawn threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      spawn = { accepted: false, reason: 'spawn failed' };
+    }
+    if (!spawn.accepted) {
+      // Visible, logged refusal; never memoized, so a retry after the pool
+      // drains can succeed.
+      return this.refuseDispatch('quick_lookup', spawn.reason,
+        `Could not start that lookup (${spawn.reason}). Tell the user; they can ask again shortly or hand it to the background agent.`);
     }
     const receipt = 'Looking into that in the background.';
     this.dispatchDedup.set(dedupKey, receipt);
     return receipt;
+  }
+
+  /**
+   * A quick lookup settled: append the durable lookup_result entry, join
+   * the outcome into the reasoner's conversation deltas (shared context,
+   * D13: the reasoner sees everything the talker learned, at its next
+   * dispatch), and wake the talker. Cancelled lookups are logged by the
+   * facade and never reach here.
+   */
+  deliverLookupResult(outcome: QuickLookupOutcome): void {
+    if (this.destroyed || outcome.status === 'cancelled') return;
+    const loopPath = `lookup/${outcome.alias}`;
+    const text = buildLookupResultText(
+      outcome.alias,
+      outcome.question,
+      outcome.status,
+      outcome.answer,
+    );
+
+    // Proposed interrupt (D13: results wake the talker), bounded by the
+    // same token bucket as reasoner interrupts (D19): a demoted result
+    // arrives at the next lull instead.
+    const now = this.now();
+    let wake: WakeClass = 'interrupt';
+    let demoted = false;
+    this.refillInterruptTokens(now);
+    if (this.interruptTokens > 0) {
+      this.interruptTokens -= 1;
+    } else {
+      wake = 'when_idle';
+      demoted = true;
+      this.logger.info('lookup result demoted to when_idle (token bucket empty)');
+    }
+
+    this.ports.appendLog({
+      type: 'lookup_result',
+      loopPath,
+      content: text,
+      wake,
+      data: {
+        alias: outcome.alias,
+        question: outcome.question,
+        status: outcome.status,
+        durationMs: outcome.durationMs,
+        ...(demoted ? { demoted: true } : {}),
+        ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+      },
+      ...(outcome.causeSeq !== null ? { causedBy: outcome.causeSeq } : {}),
+    });
+
+    this.pushDelta({ speaker: 'lookup', text });
+
+    const pending: PendingDelivery = { content: text, enqueuedAt: now };
+    if (wake === 'interrupt') {
+      this.interruptQueue.push(pending);
+    } else {
+      this.whenIdleQueue.push(pending);
+    }
+    this.pump();
   }
 
   dispatchAnswerAsk(askIdRaw: unknown, decisionRaw: unknown, reasonRaw: unknown): string {

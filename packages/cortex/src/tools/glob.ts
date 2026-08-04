@@ -16,6 +16,8 @@ import {
   DEFAULT_IGNORE_PATTERNS,
 } from './shared/gitignore.js';
 import { compileGlob, type GlobMatcher } from './shared/glob-matcher.js';
+import { createPathAllowlist } from './shared/path-allowlist.js';
+import type { PathAllowlist } from './shared/path-allowlist.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -56,6 +58,12 @@ export interface GlobToolConfig {
   defaultCwd: string;
   /** Whether to respect .gitignore. Default: true. */
   respectGitignore?: boolean | undefined;
+  /**
+   * Restrict searches to paths under these roots. Enforced in-tool with
+   * symlink resolution; a search path outside the roots is refused with a
+   * visible message. Undefined or empty = unrestricted, exactly as before.
+   */
+  allowedRoots?: readonly string[] | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +161,10 @@ export function createGlobTool(config: GlobToolConfig): {
   execute: (params: GlobParamsType) => Promise<ToolContentDetails<GlobDetails>>;
 } {
   const respectGitignore = config.respectGitignore ?? true;
+  const allowlist: PathAllowlist | null =
+    config.allowedRoots && config.allowedRoots.length > 0
+      ? createPathAllowlist(config.allowedRoots)
+      : null;
 
   return {
     name: 'Glob',
@@ -162,6 +174,22 @@ export function createGlobTool(config: GlobToolConfig): {
     async execute(params: GlobParamsType): Promise<ToolContentDetails<GlobDetails>> {
       const searchPath = params.path ? path.resolve(params.path) : path.resolve(config.defaultCwd);
       const startTime = Date.now();
+
+      // Allowlist gate (symlink-resolved) before touching the search path.
+      if (allowlist) {
+        const verdict = await allowlist.check(searchPath);
+        if (!verdict.allowed) {
+          return {
+            content: [{ type: 'text', text: verdict.refusal! }],
+            details: {
+              totalCount: 0,
+              truncated: false,
+              durationMs: Date.now() - startTime,
+              searchPath,
+            },
+          };
+        }
+      }
 
       // Verify search path exists
       try {

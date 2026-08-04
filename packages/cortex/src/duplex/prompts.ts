@@ -115,8 +115,8 @@ export const CONVERSATION_CONTEXT_CLOSE = '</conversation-context>';
 
 /** One buffered conversation delta awaiting a dispatch flush. */
 export interface ConversationDelta {
-  /** Who produced the line. */
-  speaker: 'user' | 'assistant' | 'consumer';
+  /** Who produced the line ('lookup': a quick-lookup result, D13). */
+  speaker: 'user' | 'assistant' | 'consumer' | 'lookup';
   text: string;
 }
 
@@ -135,7 +135,9 @@ export function buildConversationBlock(deltas: readonly ConversationDelta[]): st
       ? 'User'
       : delta.speaker === 'assistant'
         ? 'Assistant (conversation surface)'
-        : 'Consumer note';
+        : delta.speaker === 'lookup'
+          ? 'Quick lookup'
+          : 'Consumer note';
     return `${label}: ${delta.text}`;
   });
   return [
@@ -181,13 +183,36 @@ export function buildCancelDirective(alias: string, instructions: string): strin
 }
 
 /**
- * Directive line for a quick lookup. 2b-i interim: lookups route to the
- * reasoner as a question directive; 2b-ii replaces this with facade-spawned
- * read-only lookup sub-agents (decisions.md D13) so the answer does not wait
- * on the reasoner's turn boundary.
+ * Base prompt for a facade-spawned quick-lookup loop (decisions.md D13):
+ * ephemeral, read-only, no conversation context. The path restriction named
+ * here is descriptive only; the tools enforce it regardless (F12).
  */
-export function buildLookupDirective(question: string): string {
-  return `[Directive] Answer this question and Deliver the answer promptly (wake when_idle), ahead of other work: ${question}`;
+export function buildQuickLookupPrompt(workingDirectory: string): string {
+  return `You are a fast read-only lookup assistant. Answer the single question you are given, directly and concisely.
+
+Rules:
+- You may use Read, Grep, and Glob against files under ${workingDirectory}. You cannot write, run commands, or read anything outside that directory; the tools refuse such requests. If a needed path is refused, say so briefly instead of retrying.
+- You have no conversation context. Answer only from the question and what you find.
+- Be fast: a few tool calls at most. If the answer is not quickly findable, say what you checked and stop.
+- Reply with the answer itself, no preamble.`;
+}
+
+/**
+ * The talker-facing text of a quick-lookup outcome. Wrapped in the standard
+ * background-update envelope at delivery time; the alias and question ride
+ * along so the talker can connect the result to what the user asked.
+ */
+export function buildLookupResultText(
+  alias: string,
+  question: string,
+  status: 'completed' | 'timed_out' | 'failed',
+  answer: string,
+): string {
+  if (status === 'completed') {
+    return `Quick lookup ${alias} ("${question}") answered:\n${answer}`;
+  }
+  const why = status === 'timed_out' ? 'it timed out' : 'it failed';
+  return `Quick lookup ${alias} ("${question}") did not complete: ${why}. Offer to hand the question to the background agent instead.`;
 }
 
 /** Directive line for consumer input targeted at the work surface. */
