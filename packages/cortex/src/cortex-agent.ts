@@ -22,7 +22,10 @@ import type {
   DirectCompletionOptions,
   IdleDigestionOptions,
   IdleDigestionResult,
+  QueueDrainMode,
 } from './agent-loop.js';
+import type { McpClientManager } from './mcp-client.js';
+import type { CompactionManager } from './compaction/index.js';
 import type { DirectCompletionContext } from './cache-breakpoints.js';
 import type {
   AgentLoopConfig,
@@ -36,6 +39,7 @@ import type {
   CortexLogger,
   CortexUsage,
   DeadLetteredBackgroundResult,
+  LoadedSkill,
   LoopOriginContext,
   McpConnectionState,
   McpToolCallProgress,
@@ -254,6 +258,197 @@ export function buildReasonerConfig(
   }
   return routed as unknown as AgentLoopConfig & { tools?: CortexTool[] };
 }
+
+// ---------------------------------------------------------------------------
+// Delegation surface
+// ---------------------------------------------------------------------------
+
+/**
+ * How a public AgentLoop member maps onto the facade.
+ *
+ * - `forwarded`: same-name member on CortexAgent, delegating to the loop
+ *   (pure delegation in passthrough; duplex routing notes live at each
+ *   delegation site).
+ * - `subsumed`: no same-name member; the capability exists on the facade
+ *   under a composite-aware surface (named in the table comment).
+ * - `withheld`: deliberately not exposed (reason in the table comment).
+ */
+export type AgentLoopMemberDisposition = 'forwarded' | 'subsumed' | 'withheld';
+
+/**
+ * The complete delegation table over AgentLoop's public surface. Like
+ * CONFIG_ROUTING, this mapped object is the contract: adding a public
+ * member to AgentLoop without routing it here is a compile error, and the
+ * structural test in tests/unit/cortex-agent.test.ts asserts the runtime
+ * facade matches every disposition, so a delegation gap cannot silently
+ * reappear. The rule is: forward everything that is pure delegation;
+ * subsume or withhold only with a stated reason.
+ */
+export const AGENT_LOOP_DELEGATION = {
+  // Interaction surface (facade semantics documented on each method).
+  prompt: 'forwarded',
+  deliver: 'forwarded',
+  steer: 'forwarded',
+  abort: 'forwarded',
+  destroy: 'forwarded',
+  followUp: 'forwarded',
+  isPrompting: 'forwarded',
+  // Subsumed: the settlement predicates (conversationIdle / workSettled and
+  // their awaitable forms) are the composite-aware forms of the loop-gate
+  // reads; in duplex a single loop's gate is not "the agent is idle".
+  isLoopActive: 'subsumed',
+  waitForLoopIdle: 'subsumed',
+  // Queues.
+  setSteeringQueueMode: 'forwarded',
+  setFollowUpQueueMode: 'forwarded',
+  clearSteeringQueue: 'forwarded',
+  clearFollowUpQueue: 'forwarded',
+  clearQueuedDeliveries: 'forwarded',
+  queuedDeliveryCount: 'forwarded',
+  pendingWakeDeliveryCount: 'forwarded',
+  // Subsumed: facade abort() clears every queue per the abort-table scope
+  // semantics (facade-api.md); a bare clear-everything without an abort has
+  // no composite meaning once queues span loops.
+  clearAllQueues: 'subsumed',
+  // Asks and headlines.
+  getPendingAsks: 'forwarded',
+  markAskVoiced: 'forwarded',
+  setHeadlineProvider: 'forwarded',
+  // Prompt and model surface.
+  setBasePrompt: 'forwarded',
+  getBasePrompt: 'forwarded',
+  getCurrentSystemPrompt: 'forwarded',
+  composeSystemPrompt: 'forwarded',
+  getSystemPromptSections: 'forwarded',
+  getModel: 'forwarded',
+  setModel: 'forwarded',
+  getUtilityModel: 'forwarded',
+  setUtilityModel: 'forwarded',
+  resetUtilityModel: 'forwarded',
+  getAutoResolvedUtilityModel: 'forwarded',
+  isUtilityModelOverridden: 'forwarded',
+  getThinkingLevel: 'forwarded',
+  setThinkingLevel: 'forwarded',
+  getModelThinkingCapabilities: 'forwarded',
+  clampThinkingLevel: 'forwarded',
+  setCacheRetention: 'forwarded',
+  getCacheRetention: 'forwarded',
+  setSessionId: 'forwarded',
+  getSessionId: 'forwarded',
+  // Context window and token accounting.
+  setContextWindow: 'forwarded',
+  setContextWindowLimit: 'forwarded',
+  contextWindowLimit: 'forwarded',
+  effectiveContextWindow: 'forwarded',
+  modelContextWindow: 'forwarded',
+  currentContextTokenCount: 'forwarded',
+  updateCurrentContextTokenCount: 'forwarded',
+  estimateCurrentContextTokens: 'forwarded',
+  capToolResult: 'forwarded',
+  // Direct completions and usage.
+  directComplete: 'forwarded',
+  structuredComplete: 'forwarded',
+  utilityComplete: 'forwarded',
+  getLastDirectUsage: 'forwarded',
+  getSessionUsage: 'forwarded',
+  // Subsumed: restore() takes the versioned composite artifact and applies
+  // per-loop ordering internally; piecemeal per-loop restores would bypass
+  // the guard and the baseline-plus-delta usage model.
+  restoreConversationHistory: 'subsumed',
+  restoreObservationalMemoryState: 'subsumed',
+  restoreSessionUsage: 'subsumed',
+  // History, memory, digestion, compaction.
+  getConversationHistory: 'forwarded',
+  getObservationalMemoryState: 'forwarded',
+  digestIdle: 'forwarded',
+  checkAndRunCompaction: 'forwarded',
+  triggerObservation: 'forwarded',
+  getCompactionManager: 'forwarded',
+  // Tools, MCP, skills.
+  addConsumerTool: 'forwarded',
+  removeConsumerTool: 'forwarded',
+  refreshTools: 'forwarded',
+  connectMcpServer: 'forwarded',
+  disconnectMcpServer: 'forwarded',
+  getMcpServerStates: 'forwarded',
+  mcpConfigMatches: 'forwarded',
+  setMcpToolCallProgressHandler: 'forwarded',
+  getMcpClientManager: 'forwarded',
+  getMcpTools: 'forwarded',
+  getSkillRegistry: 'forwarded',
+  loadSkill: 'forwarded',
+  clearSkillBuffer: 'forwarded',
+  getSkillBuffer: 'forwarded',
+  setPreprocessorVariables: 'forwarded',
+  setScriptContext: 'forwarded',
+  // Sub-agents.
+  spawnBackgroundSubAgent: 'forwarded',
+  cancelSubAgent: 'forwarded',
+  steerSubAgent: 'forwarded',
+  getActiveSubAgents: 'forwarded',
+  getDeadLetteredBackgroundResults: 'forwarded',
+  // Withheld: raw manager internals. Consumers have getActiveSubAgents,
+  // spawnBackgroundSubAgent, cancelSubAgent, and steerSubAgent; handing out
+  // the manager would let a consumer mutate tracking state the facade's
+  // lifecycle log depends on.
+  getSubAgentManager: 'withheld',
+  // State reads and misc.
+  isRunning: 'forwarded',
+  state: 'forwarded',
+  isWorkingTagsEnabled: 'forwarded',
+  setWorkingTagsEnabled: 'forwarded',
+  setLastInteractionTime: 'forwarded',
+  getEnvOverrides: 'forwarded',
+  getEventBridge: 'forwarded',
+  getBudgetGuard: 'forwarded',
+  getContextManager: 'forwarded',
+  // Withheld: no single composite value exists in duplex (each loop has its
+  // own path); origin reaches consumers via LoopOriginContext on callbacks.
+  loopPath: 'withheld',
+  // Withheld: cache-breakpoint internal (the boundary between cacheable
+  // history and tick content); meaningless as a composite value.
+  prePromptMessageCount: 'withheld',
+  // Withheld: context-composition internals; the hook is wiring between the
+  // loop and pi, not a consumer surface.
+  getTransformContextHook: 'withheld',
+  // Callback registration.
+  onLoopComplete: 'forwarded',
+  onError: 'forwarded',
+  onTurnComplete: 'forwarded',
+  onRetryScheduled: 'forwarded',
+  onRetrySucceeded: 'forwarded',
+  onRetryExhausted: 'forwarded',
+  onBeforeCompaction: 'forwarded',
+  onPostCompaction: 'forwarded',
+  onCompactionError: 'forwarded',
+  onCompactionDegraded: 'forwarded',
+  onCompactionExhausted: 'forwarded',
+  onSubAgentSpawned: 'forwarded',
+  onSubAgentCompleted: 'forwarded',
+  onSubAgentFailed: 'forwarded',
+  onBackgroundResultDelivery: 'forwarded',
+  onBackgroundResultDeadLettered: 'forwarded',
+  onObservation: 'forwarded',
+  onReflection: 'forwarded',
+} as const satisfies Record<keyof AgentLoop, AgentLoopMemberDisposition>;
+
+type DelegationTable = typeof AGENT_LOOP_DELEGATION;
+
+/** The keys the table marks 'forwarded'. */
+type ForwardedLoopMember = {
+  [K in keyof DelegationTable]: DelegationTable[K] extends 'forwarded' ? K : never;
+}[keyof DelegationTable];
+
+type AssertExtends<A extends B, B> = A;
+
+/**
+ * Compile-time check: every forwarded member exists on CortexAgent. Fails
+ * to typecheck when a member marked 'forwarded' has no facade counterpart.
+ */
+export type _ForwardedMembersExistOnFacade = AssertExtends<
+  ForwardedLoopMember,
+  keyof CortexAgent
+>;
 
 // ---------------------------------------------------------------------------
 // Persisted state (versioned composite artifact)
@@ -1176,6 +1371,19 @@ export class CortexAgent {
     return this.reasoner.getCurrentSystemPrompt();
   }
 
+  /**
+   * Compose the full system prompt from a base prompt. Reasoner composition
+   * in both modes; in duplex (2b) the talker appends its role prompt to the
+   * same base (CONFIG_ROUTING initialBasePrompt: both loops in full).
+   */
+  composeSystemPrompt(basePrompt: string): string {
+    return this.reasoner.composeSystemPrompt(basePrompt);
+  }
+
+  getSystemPromptSections(): Array<{ name: string; content: string }> {
+    return this.reasoner.getSystemPromptSections();
+  }
+
   getModel(): CortexModel {
     return this.reasoner.getModel();
   }
@@ -1194,6 +1402,17 @@ export class CortexAgent {
 
   resetUtilityModel(): void {
     this.reasoner.resetUtilityModel();
+  }
+
+  // Utility-model reads are per loop in duplex (CONFIG_ROUTING utilityModel:
+  // per-loop); until 2b decides the composite read, these report the
+  // reasoner's dial, matching the setters above.
+  getAutoResolvedUtilityModel(): CortexModel {
+    return this.reasoner.getAutoResolvedUtilityModel();
+  }
+
+  isUtilityModelOverridden(): boolean {
+    return this.reasoner.isUtilityModelOverridden();
   }
 
   getThinkingLevel(): ThinkingLevel {
@@ -1240,12 +1459,31 @@ export class CortexAgent {
     return this.reasoner.effectiveContextWindow;
   }
 
+  // Context-window values are per loop in duplex (CONFIG_ROUTING
+  // contextWindowLimit: per-loop, derived from each loop's model); 2b
+  // decides the composite read. Passthrough reports the reasoner's.
+  get modelContextWindow(): number {
+    return this.reasoner.modelContextWindow;
+  }
+
+  setContextWindow(contextWindow: number): void {
+    this.reasoner.setContextWindow(contextWindow);
+  }
+
   get currentContextTokenCount(): number {
     return this.reasoner.currentContextTokenCount;
   }
 
+  updateCurrentContextTokenCount(inputTokens: number): void {
+    this.reasoner.updateCurrentContextTokenCount(inputTokens);
+  }
+
   estimateCurrentContextTokens(): number {
     return this.reasoner.estimateCurrentContextTokens();
+  }
+
+  capToolResult(content: string): string {
+    return this.reasoner.capToolResult(content);
   }
 
   // Direct completions ------------------------------------------------------
@@ -1329,8 +1567,32 @@ export class CortexAgent {
     this.reasoner.setMcpToolCallProgressHandler(handler);
   }
 
+  /**
+   * The MCP client manager. A facade service in duplex (2b: one connection
+   * multiplexed to the loops that need it, per facade-api.md); the
+   * reasoner's manager in passthrough.
+   */
+  getMcpClientManager(): McpClientManager {
+    return this.reasoner.getMcpClientManager();
+  }
+
+  getMcpTools(): CortexTool[] {
+    return this.reasoner.getMcpTools();
+  }
+
   async loadSkill(name: string, args?: string): Promise<void> {
     return this.reasoner.loadSkill(name, args);
+  }
+
+  // Skills are facade services projected to the reasoner and sub-agents in
+  // duplex (never the talker, facade-api.md); the reasoner's buffer in
+  // passthrough.
+  clearSkillBuffer(): void {
+    this.reasoner.clearSkillBuffer();
+  }
+
+  getSkillBuffer(): LoadedSkill[] {
+    return this.reasoner.getSkillBuffer();
   }
 
   setPreprocessorVariables(variables: Record<string, string>): void {
@@ -1371,6 +1633,31 @@ export class CortexAgent {
     return this.reasoner.markAskVoiced(askId);
   }
 
+  // The pi queue surface targets the single reasoner in passthrough; 2b
+  // decides which loop each of these addresses in duplex (the conversation
+  // surface holds the talker's queues, directives ride the router).
+
+  /** Queue a follow-up that drains at the run's would-stop point. */
+  followUp(message: string): void {
+    this.reasoner.followUp(message);
+  }
+
+  setSteeringQueueMode(mode: QueueDrainMode): void {
+    this.reasoner.setSteeringQueueMode(mode);
+  }
+
+  setFollowUpQueueMode(mode: QueueDrainMode): void {
+    this.reasoner.setFollowUpQueueMode(mode);
+  }
+
+  clearSteeringQueue(): void {
+    this.reasoner.clearSteeringQueue();
+  }
+
+  clearFollowUpQueue(): void {
+    this.reasoner.clearFollowUpQueue();
+  }
+
   get queuedDeliveryCount(): number {
     return this.reasoner.queuedDeliveryCount;
   }
@@ -1379,8 +1666,26 @@ export class CortexAgent {
     return this.reasoner.pendingWakeDeliveryCount;
   }
 
+  clearQueuedDeliveries(): string[] {
+    return this.reasoner.clearQueuedDeliveries();
+  }
+
   getDeadLetteredBackgroundResults(): DeadLetteredBackgroundResult[] {
     return this.reasoner.getDeadLetteredBackgroundResults();
+  }
+
+  /**
+   * Feed a consumer-built headline block into the loop's context (view
+   * injection outside the cache boundary). The facade takes headline
+   * ownership only in duplex (2b builds the live-status block from
+   * event-bridge activity, log-and-context.md); forwarding keeps the
+   * consumer capability intact in passthrough.
+   */
+  setHeadlineProvider(
+    provider: (() => string | null) | null,
+    options?: { maxTokens?: number },
+  ): void {
+    this.reasoner.setHeadlineProvider(provider, options);
   }
 
   // History, memory, digestion ---------------------------------------------
@@ -1405,14 +1710,36 @@ export class CortexAgent {
     return this.reasoner.triggerObservation();
   }
 
+  /**
+   * The compaction manager. Each loop runs its own manager in duplex
+   * (CONFIG_ROUTING compaction: both-loops); 2b decides how the composite
+   * exposes the pair. Passthrough returns the reasoner's.
+   */
+  getCompactionManager(): CompactionManager {
+    return this.reasoner.getCompactionManager();
+  }
+
   // State reads -------------------------------------------------------------
 
   get isRunning(): boolean {
     return this.reasoner.isRunning;
   }
 
+  /**
+   * True while a logical turn is in flight on the loop. Narrower than the
+   * settlement predicates: it reads idle while gate tasks are still queued,
+   * so prefer conversationIdle / workSettled for settlement decisions.
+   */
+  get isPrompting(): boolean {
+    return this.reasoner.isPrompting;
+  }
+
   get state(): CortexLifecycleState {
     return this.reasoner.state;
+  }
+
+  getEnvOverrides(): Record<string, string> | undefined {
+    return this.reasoner.getEnvOverrides();
   }
 
   get isWorkingTagsEnabled(): boolean {

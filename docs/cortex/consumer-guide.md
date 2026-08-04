@@ -46,6 +46,12 @@ await agent.destroy();
 
 If `getApiKey` is omitted, pi-ai falls back to provider environment variables such as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
 
+## The CortexAgent Facade
+
+`CortexAgent` is a composite facade over `AgentLoop`. It accepts the same configuration (via `CortexAgent.create()`), forwards the loop's public surface (including everything documented in this guide: `getMcpClientManager()`, `clearSkillBuffer()`, `getCompactionManager()`, models, queues, callbacks), and adds a session log, settlement predicates (`conversationIdle`, `workSettled`), versioned composite persistence (`getState()` / `restore()`), and an `onStateChanged` persistence trigger. In its default `passthrough` mode it behaves identically to a direct `AgentLoop`, with two intentional differences: `prompt()` never throws on a busy loop (concurrent calls serialize), and `abort()` clears every queue per its scope semantics.
+
+A small set of loop members is deliberately not exposed (internals like `getSubAgentManager()` and `getTransformContextHook()`), and the piecemeal restore methods are replaced by the composite `restore()`. See `docs/cortex/cortex-agent.md` for the full delegation table.
+
 ## Provider Setup
 
 Use `ProviderManager` during onboarding and settings screens:

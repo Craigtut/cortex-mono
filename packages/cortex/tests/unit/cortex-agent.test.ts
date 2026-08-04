@@ -16,6 +16,7 @@ import type { CortexModel } from '../../src/model-wrapper.js';
 import {
   CortexAgent,
   CONFIG_ROUTING,
+  AGENT_LOOP_DELEGATION,
   buildReasonerConfig,
 } from '../../src/cortex-agent.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
@@ -738,6 +739,25 @@ describe('CortexAgent settlement', () => {
 // ---------------------------------------------------------------------------
 
 describe('CortexAgent delegation', () => {
+  it('structurally exposes every non-withheld public AgentLoop member', () => {
+    // The delegation table in src/cortex-agent.ts is compile-time exhaustive
+    // over AgentLoop's public surface (a new member is a type error until
+    // routed). This asserts the runtime facade matches every disposition,
+    // so a forwarding gap (or an accidental exposure of a withheld member)
+    // cannot silently reappear.
+    const { facade } = createFacade();
+    for (const [member, disposition] of Object.entries(AGENT_LOOP_DELEGATION)) {
+      if (disposition === 'forwarded') {
+        expect(member in facade, `AgentLoop.${member} is marked forwarded but missing on CortexAgent`).toBe(true);
+      } else {
+        expect(
+          member in facade,
+          `AgentLoop.${member} is marked ${disposition} but exposed on CortexAgent; update the table if intended`,
+        ).toBe(false);
+      }
+    }
+  });
+
   it('exposes the reasoner event bridge, context manager, and usage verbatim', async () => {
     const { facade, loop } = createFacade();
     expect(facade.getEventBridge()).toBe(loop.getEventBridge());
