@@ -522,10 +522,12 @@ export class PermissionBroker {
   // -------------------------------------------------------------------------
 
   /**
-   * Re-deliver the voicing of the currently voiced ask (refusal recovery,
-   * and after a conversation abort destroys the parked voicing). Re-voicing
-   * re-anchors consent at the new voicing seq, which only tightens the
-   * check. Damped to one re-delivery per interval unless forced.
+   * Re-read the currently voiced ask to the user (refusal recovery). The
+   * consent anchor does NOT move: the user already heard this request, and
+   * a re-read must not invalidate an answer they have already given. Damped
+   * to one re-delivery per interval unless forced. Use
+   * {@link noteVoicingLost} instead when the previous voicing never
+   * reached the user, which is the case that does need a fresh anchor.
    */
   revoiceCurrent(force = false): void {
     if (this.destroyed || this.voicedAskId === null) return;
@@ -687,8 +689,17 @@ export class PermissionBroker {
    * only that voicing was attempted, and every consent rule downstream
    * reads it as "the user could have heard the request", so a throw
    * withdraws it. Returns whether the talker took the voicing.
+   *
+   * An ask that is ALREADY anchored keeps its anchor across a re-read. The
+   * anchor means "after the user could have heard this request", and a
+   * re-read does not un-hear it, so moving it would silently discard
+   * consent already given: the user says yes, the talker fumbles the
+   * decision field, the refusal re-reads the request, and the yes is now
+   * permanently stale. Only an unheard voicing (never delivered, or
+   * destroyed, both of which null the anchor) takes a fresh one.
    */
   private deliverVoicing(ask: BrokeredAsk, revoiced: boolean): boolean {
+    const anchoring = ask.voicedAtSeq === null;
     const anchorSeq = this.ports.appendLog({
       type: 'lifecycle',
       loopPath: ask.request.loopPath,
@@ -698,6 +709,7 @@ export class PermissionBroker {
         event: 'ask_voiced',
         askId: ask.request.askId,
         ...(revoiced ? { revoiced: true } : {}),
+        ...(anchoring ? {} : { anchorUnchanged: true }),
       },
     });
     ask.lastVoicedAtMs = this.now();
@@ -723,7 +735,7 @@ export class PermissionBroker {
       });
       return false;
     }
-    ask.voicedAtSeq = anchorSeq;
+    if (anchoring) ask.voicedAtSeq = anchorSeq;
     ask.lastVoicingText = text;
     return true;
   }

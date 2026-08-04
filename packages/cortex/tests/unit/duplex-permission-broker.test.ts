@@ -435,7 +435,7 @@ describe('D16 consent binding', () => {
     expect(h.router.permissionBroker.pendingAskCount).toBe(1);
   });
 
-  it('re-voices the pending ask after a refused allow (damped, re-anchoring consent)', async () => {
+  it('re-voices the pending ask after a refused allow, damped', async () => {
     const h = createHarness();
     requestAsk(h);
     const firstVoicedSeq = h.lastVoicedSeq();
@@ -445,12 +445,41 @@ describe('D16 consent binding', () => {
     await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
     expect(h.askVoicings).toHaveLength(1);
 
-    // Past the window it re-voices with a fresh anchor.
-    h.advance(2_001);
+    // Past the window it re-reads the request.
+    h.advance(3_001);
     await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
     expect(h.askVoicings).toHaveLength(2);
     expect(h.askVoicings[1]!.content).toContain('still waiting on the user');
     expect(h.lastVoicedSeq()).toBeGreaterThan(firstVoicedSeq);
+  });
+
+  it('a refusal re-read does not make consent the user already gave stale', async () => {
+    // The anchor answers "could the user have heard this yet", and a
+    // re-read does not un-hear it. Moving it on every refusal costs the
+    // user a repeat of an answer they already gave, which a fumble-prone
+    // fast-tier talker makes routine.
+    const h = createHarness();
+    const { decisions } = requestAsk(h);
+    const anchor = h.lastVoicedSeq();
+    const yesSeq = anchor + 1;
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: yesSeq }]);
+
+    // The talker fumbles the decision field; the refusal re-reads the ask.
+    h.advance(3_001);
+    const refused = await callAnswerAsk(h, { askId: 'ask-1', decision: 'yes please' });
+    expect(refused.content[0]!.text).toContain('allow or deny');
+    expect(h.askVoicings).toHaveLength(2);
+
+    // The same yes still binds on the retry.
+    const allowed = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    expect(allowed.content[0]!.text).toBe('Approval passed along.');
+    await waitUntil(() => decisions.length === 1);
+    const answer = h.log.find((entry) => entry.type === 'ask_answer')!;
+    expect(answer.causedBy).toBe(yesSeq);
+
+    // The re-read is logged, and says the anchor did not move.
+    const revoiced = h.log.filter((entry) => entry.data?.['event'] === 'ask_voiced');
+    expect(revoiced[1]!.data).toMatchObject({ revoiced: true, anchorUnchanged: true });
   });
 
   it('binds a bare allow to the most recently voiced ask only, and refuses one naming an unvoiced ask', async () => {
