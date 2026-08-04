@@ -154,6 +154,12 @@ export interface DuplexRouterOptions {
    * asking run indefinitely (PERMISSION_BROKER_DEFAULTS). Null disables it.
    */
   escalationAskTimeoutMs?: number | null;
+  /**
+   * Coalescing window before a settled ask lets the next queued one be
+   * voiced, so one talker turn settling several asks still produces exactly
+   * one voicing (PERMISSION_BROKER_DEFAULTS).
+   */
+  settleVoiceDelayMs?: number;
   /** Clock override for tests. */
   now?: () => number;
 }
@@ -172,6 +178,7 @@ export const DUPLEX_ROUTER_DEFAULTS = {
   deltaBufferMaxChars: 16_000,
   askTimeoutMs: PERMISSION_BROKER_DEFAULTS.askTimeoutMs,
   escalationAskTimeoutMs: PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs,
+  settleVoiceDelayMs: PERMISSION_BROKER_DEFAULTS.settleVoiceDelayMs,
 } as const;
 
 type ResolvedOptions = typeof DUPLEX_ROUTER_DEFAULTS;
@@ -323,6 +330,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       {
         askTimeoutMs: this.options.askTimeoutMs,
         escalationAskTimeoutMs: this.options.escalationAskTimeoutMs,
+        settleVoiceDelayMs: this.options.settleVoiceDelayMs,
         now: this.now,
       },
     );

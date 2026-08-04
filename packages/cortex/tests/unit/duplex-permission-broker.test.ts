@@ -178,8 +178,36 @@ describe('ask intake and voicing', () => {
     expect(outcome).toBe('Denial passed along.');
     await waitUntil(() => first.decisions.length === 1);
     expect(first.decisions).toEqual([{ decision: 'deny' }]);
-    expect(h.askVoicings).toHaveLength(2);
+    // The successor voices after the settlement coalescing window, never
+    // inline with the settlement (see the batch-settlement test below).
+    await waitUntil(() => h.askVoicings.length === 2);
     expect(h.askVoicings[1]!.content).toContain('Write: /tmp/other');
+  });
+
+  it('settling several asks in one turn still leaves exactly one voicing in flight', async () => {
+    // Deny is unrestricted and takes an id, so one assistant message can
+    // settle a voiced ask and an unvoiced one. Voicing each successor
+    // inline would put two requests in the talker's next batch, one of them
+    // already denied, and a bare "yes" meant for the first would bind to
+    // whichever ended up voiced.
+    const h = createHarness();
+    const a = requestAsk(h, { askId: 'ask-a', renderedRequest: 'Bash: a' });
+    const b = requestAsk(h, { askId: 'ask-b', renderedRequest: 'Bash: b' });
+    requestAsk(h, { askId: 'ask-c', renderedRequest: 'Bash: c' });
+    expect(h.askVoicings).toHaveLength(1);
+
+    await callAnswerAsk(h, { askId: 'ask-a', decision: 'deny' });
+    await callAnswerAsk(h, { askId: 'ask-b', decision: 'deny' });
+    await waitUntil(() => a.decisions.length === 1 && b.decisions.length === 1);
+
+    await waitUntil(() => h.askVoicings.length >= 2);
+    expect(h.askVoicings).toHaveLength(2);
+    // B settled before it was ever read out; C is the one voiced ask.
+    expect(h.askVoicings.some((voicing) => voicing.content.includes('Bash: b'))).toBe(false);
+    expect(h.askVoicings[1]!.content).toContain('Bash: c');
+    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+      { askId: 'ask-c', voiced: true },
+    ]);
   });
 
   it('the ask lane is exempt from the interrupt token bucket (asks are never delayed)', async () => {
@@ -574,7 +602,7 @@ describe('ask timeouts and settlement', () => {
     // No ask_answer entry for an abort: nobody answered.
     expect(h.log.filter((entry) => entry.type === 'ask_answer')).toHaveLength(0);
     expect(second.decisions).toHaveLength(0);
-    expect(h.askVoicings).toHaveLength(2);
+    await waitUntil(() => h.askVoicings.length === 2);
   });
 
   it('an ask raised on an already-aborted signal denies immediately without voicing', async () => {

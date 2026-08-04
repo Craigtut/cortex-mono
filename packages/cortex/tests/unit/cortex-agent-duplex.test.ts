@@ -2015,7 +2015,9 @@ describe('duplex permission broker', () => {
     await waitUntil(() => first.decisions.length === 1);
     expect(first.decisions).toEqual([{ decision: 'allow' }]);
     expect(second.decisions).toHaveLength(0);
-    // The second ask is untouched, now voiced for its own answer.
+    // The second ask is untouched, and voiced for its own answer once the
+    // settlement coalescing window passes.
+    await waitUntil(() => getBroker(facade).getPendingAsks()[0]?.voiced === true);
     expect(getBroker(facade).getPendingAsks()).toMatchObject([
       { askId: 'ask-b', voiced: true },
     ]);

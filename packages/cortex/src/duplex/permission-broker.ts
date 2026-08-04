@@ -153,6 +153,11 @@ export interface PermissionBrokerOptions {
    * {@link PERMISSION_BROKER_DEFAULTS}). Null disables it.
    */
   escalationAskTimeoutMs?: number | null;
+  /**
+   * Coalescing window before a settlement voices the next queued ask (see
+   * {@link PERMISSION_BROKER_DEFAULTS}).
+   */
+  settleVoiceDelayMs?: number;
   /** Clock override for tests (stamps and revoice damping, not timers). */
   now?: () => number;
 }
@@ -170,6 +175,18 @@ export const PERMISSION_BROKER_DEFAULTS = {
    * request produces.
    */
   escalationAskTimeoutMs: 900_000 as number | null,
+  /**
+   * A settlement does not voice the next ask synchronously; it coalesces
+   * over this window and voices whatever is at the head afterwards. One
+   * assistant message can settle several asks (deny is unrestricted and
+   * takes an id, so unvoiced asks settle too), and voicing each successor
+   * as its predecessor settles puts several voicings in the same next
+   * talker batch: the user hears two requests read out, one of which is
+   * already denied, and a bare "yes" meant for the first binds to whichever
+   * one ended up voiced. The window only has to outlast a tool batch, which
+   * is a few dispatches of well under a millisecond each.
+   */
+  settleVoiceDelayMs: 250,
 } as const;
 
 /**
@@ -267,10 +284,13 @@ export class PermissionBroker {
   private readonly now: () => number;
   private readonly askTimeoutMs: number | null;
   private readonly escalationAskTimeoutMs: number | null;
+  private readonly settleVoiceDelayMs: number;
 
   private readonly asks = new Map<string, BrokeredAsk>();
   /** Ask ids awaiting their first voicing, FIFO. */
   private voiceQueue: string[] = [];
+  /** Pending coalesced voice-the-next-ask timer (see {@link settle}). */
+  private settleVoiceTimer: ReturnType<typeof setTimeout> | null = null;
   /** The most recently voiced, still-pending ask (exactly one at a time). */
   private voicedAskId: string | null = null;
   /** True while settleAll drains, so settlement never voices a doomed ask. */
@@ -289,6 +309,8 @@ export class PermissionBroker {
     this.escalationAskTimeoutMs = options?.escalationAskTimeoutMs !== undefined
       ? options.escalationAskTimeoutMs
       : PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs;
+    this.settleVoiceDelayMs = options?.settleVoiceDelayMs
+      ?? PERMISSION_BROKER_DEFAULTS.settleVoiceDelayMs;
   }
 
   // -------------------------------------------------------------------------
@@ -561,6 +583,7 @@ export class PermissionBroker {
    * is guarded. Never leaves a resolver hanging.
    */
   settleAll(cause: 'abort' | 'restore' | 'destroy'): void {
+    this.clearSettleVoiceTimer();
     this.draining = true;
     try {
       for (const ask of [...this.asks.values()]) {
@@ -589,6 +612,7 @@ export class PermissionBroker {
     if (this.destroyed) return;
     this.settleAll('destroy');
     this.destroyed = true;
+    this.clearSettleVoiceTimer();
   }
 
   /**
@@ -755,7 +779,34 @@ export class PermissionBroker {
       this.voicedAskId = null;
     }
     ask.resolve(decision);
-    this.voiceNext();
+    this.scheduleVoiceNext();
+  }
+
+  /**
+   * Voice the next queued ask after a coalescing window rather than inline
+   * with this settlement. See {@link PERMISSION_BROKER_DEFAULTS}
+   * settleVoiceDelayMs: settling several asks in one talker turn must leave
+   * exactly one voicing in flight, not one per settlement.
+   */
+  private scheduleVoiceNext(): void {
+    if (this.destroyed || this.draining) return;
+    if (this.settleVoiceTimer !== null) return;
+    if (this.settleVoiceDelayMs <= 0) {
+      this.voiceNext();
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.settleVoiceTimer = null;
+      this.voiceNext();
+    }, this.settleVoiceDelayMs);
+    timer.unref?.();
+    this.settleVoiceTimer = timer;
+  }
+
+  private clearSettleVoiceTimer(): void {
+    if (this.settleVoiceTimer === null) return;
+    clearTimeout(this.settleVoiceTimer);
+    this.settleVoiceTimer = null;
   }
 }
 

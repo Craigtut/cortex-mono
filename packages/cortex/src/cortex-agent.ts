@@ -1362,7 +1362,7 @@ export class CortexAgent {
         'deliveryDedupWindowMs', 'deliveryDedupMaxEntries',
         'maxDispatchesPerTurn', 'maxDispatchesPerExchange',
         'watchdogIntervalMs', 'deltaBufferMaxChars',
-        'askTimeoutMs', 'escalationAskTimeoutMs',
+        'askTimeoutMs', 'escalationAskTimeoutMs', 'settleVoiceDelayMs',
       ] as const) {
         if (tuning[key] !== undefined) {
           (routerOptions as Record<string, unknown>)[key] = tuning[key];
