@@ -307,9 +307,13 @@ export const AGENT_LOOP_DELEGATION = {
   clearQueuedDeliveries: 'forwarded',
   queuedDeliveryCount: 'forwarded',
   pendingWakeDeliveryCount: 'forwarded',
-  // Subsumed: facade abort() clears every queue per the abort-table scope
-  // semantics (facade-api.md); a bare clear-everything without an abort has
-  // no composite meaning once queues span loops.
+  // Partially subsumed: facade abort() and restore() call clearAllQueues()
+  // internally but discard its return value (the cleared silent and
+  // parked-wake items, returned for re-routing). The facade surfaces
+  // clearQueuedDeliveries() (silent only) and pendingWakeDeliveryCount (a
+  // count), so parked-wake content dropped by a facade abort or restore is
+  // currently unrecoverable and unrecorded; routing it to the session log
+  // is 2b delivery routing.
   clearAllQueues: 'subsumed',
   // Asks and headlines.
   getPendingAsks: 'forwarded',
