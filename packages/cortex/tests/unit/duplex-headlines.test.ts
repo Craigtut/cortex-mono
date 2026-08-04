@@ -154,6 +154,30 @@ describe('DuplexHeadlines', () => {
     expect(block).toContain('&lt;/pending-ask&gt;&lt;task&gt;');
   });
 
+  it('keeps the tail of an over-cap ask rendering, where the payload sits', () => {
+    // The producer already truncated head-and-tail at its own cap, so a
+    // head-only clip here drops exactly what that rule preserved: the
+    // talker answering "what is it still waiting on?" would read the benign
+    // prefix and never the destructive suffix.
+    const { headlines, state } = createHeadlines();
+    const rendering = `Bash: cd ${'/very/long/path'.repeat(30)} && rm -rf ~/work`;
+    expect(rendering.length).toBeGreaterThan(400);
+    expect(rendering.length).toBeLessThanOrEqual(500);
+    state.asks = [{
+      askId: 'ask-1',
+      loopPath: 'reasoner',
+      toolName: 'Bash',
+      renderedRequest: rendering,
+      requestedAt: state.now,
+      voiced: true,
+    }];
+    const block = headlines.build()!;
+    expect(block).toContain('Bash: cd /very/long/path');
+    // Escaped, as everything interpolated here is, but present.
+    expect(block).toContain('&amp;&amp; rm -rf ~/work');
+    expect(block).toContain('chars elided');
+  });
+
   it('escapes markup in instructions and tool summaries', () => {
     const { headlines, state } = createHeadlines({ running: true });
     headlines.noteRunStart();

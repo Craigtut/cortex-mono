@@ -44,6 +44,8 @@ const MAX_TOOL_SUMMARY_CHARS = 120;
 const MAX_OUTPUT_LINES = 3;
 const MAX_OUTPUT_LINE_CHARS = 200;
 const MAX_ASK_CHARS = 400;
+const ASK_HEAD_CHARS = 250;
+const ASK_TAIL_CHARS = 120;
 
 // ---------------------------------------------------------------------------
 // Escaping
@@ -64,6 +66,32 @@ function escapeAttribute(value: string): string {
 
 function clip(value: string, maxChars: number): string {
   return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value;
+}
+
+/**
+ * Head-and-tail clip, for content the producer already truncated
+ * head-and-tail (permission renderings). A head-only cut here undoes
+ * exactly what that rule exists to preserve: a long command's payload sits
+ * at the end (`… && rm -rf ~/work`), so a talker answering "what is it
+ * still waiting on?" from this block would read a wall of benign leading
+ * path with the payload gone, while the voicing and the log carry it.
+ * Sliced by code points so the cut cannot split a surrogate pair.
+ */
+function clipHeadTail(
+  value: string,
+  maxChars: number,
+  headChars: number,
+  tailChars: number,
+): string {
+  if (value.length <= maxChars) return value;
+  const chars = [...value];
+  if (chars.length <= maxChars) return value;
+  const elided = chars.length - headChars - tailChars;
+  return (
+    chars.slice(0, headChars).join('') +
+    ` …[${elided} chars elided]… ` +
+    chars.slice(-tailChars).join('')
+  );
 }
 
 function ageSeconds(now: number, timestamp: number): number {
@@ -193,11 +221,13 @@ export class DuplexHeadlines {
     for (const ask of asks) {
       // The verbatim rendering, escaped: the talker's answer to "what is
       // it waiting on" must carry the actual command or path (F14), and a
-      // hostile rendering must not fabricate block structure.
+      // hostile rendering must not fabricate block structure. Over-cap
+      // renderings keep their tail, matching the producer's rule.
       sections.push(
         `<pending-ask voiced="${ask.voiced}" ` +
         `age="${ageSeconds(now, ask.requestedAt)}s">` +
-        `${escapeText(clip(ask.renderedRequest, MAX_ASK_CHARS))}</pending-ask>`,
+        `${escapeText(clipHeadTail(ask.renderedRequest, MAX_ASK_CHARS, ASK_HEAD_CHARS, ASK_TAIL_CHARS))}` +
+        '</pending-ask>',
       );
     }
 
