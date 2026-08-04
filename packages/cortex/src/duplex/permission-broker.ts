@@ -559,15 +559,16 @@ export class PermissionBroker {
    * Re-read the currently voiced ask to the user (refusal recovery). The
    * consent anchor does NOT move: the user already heard this request, and
    * a re-read must not invalidate an answer they have already given. Damped
-   * to one re-delivery per interval unless forced. Use
-   * {@link noteVoicingLost} instead when the previous voicing never
-   * reached the user, which is the case that does need a fresh anchor.
+   * to one re-delivery per interval, so a turn spraying refused answers
+   * cannot flood the voice channel. Use {@link noteVoicingLost} instead
+   * when the previous voicing never reached the user: that case is not
+   * damped and does take a fresh anchor.
    */
-  revoiceCurrent(force = false): void {
+  revoiceCurrent(): void {
     if (this.destroyed || this.voicedAskId === null) return;
     const ask = this.asks.get(this.voicedAskId);
     if (!ask) return;
-    if (!force && this.now() - ask.lastVoicedAtMs < REVOICE_MIN_INTERVAL_MS) return;
+    if (this.now() - ask.lastVoicedAtMs < REVOICE_MIN_INTERVAL_MS) return;
     this.voiceAsk(ask);
   }
 
