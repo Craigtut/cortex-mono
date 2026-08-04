@@ -83,6 +83,15 @@ The remaining duplex behavior.
 
 ## Phase 3: Validation and Default Flip
 
+**What the test suite structurally cannot see**, established while building the scenario suites. This list is the honest boundary of "green" and should be read before the default flip:
+
+- **Model compliance, everywhere.** The suites prove the system hands the talker nothing to hallucinate from and that the rules are present in the role prompt. Whether a fast-tier model obeys grounding under user pressure, speaks before calling a control tool (the reason D17's guards exist), or truncates mid-tool-call in practice, are all unmeasurable without a live provider.
+- **Compaction and observational quality.** Retention and transcript shape across a compaction boundary are testable; whether the distilled understanding is any good is a model question.
+- **Real tool execution inside children.** Sub-agents and lookups run scripted, so F12's path allowlist is covered at the config and tool layers rather than by a child actually attempting an escape.
+- **Latency.** Live-provider work by nature.
+
+A green suite therefore means the mechanisms are right and the wiring is right. It does not mean the conversation is good, and the default flip should rest on a real session as well as on the suite.
+
 **Consumer migration checklist**, from the 2a verification pass. The facade is not a drop-in replacement for `AgentLoop`; `AGENT_LOOP_DELEGATION` in `src/cortex-agent.ts` is the authoritative disposition source, and these are the three places a real migration breaks:
 
 - `packages/cortex-code/src/session.ts:1948-1963` calls all three subsumed `restore*` methods on a bare `AgentLoop`. This is a call-site rewrite into a single `restore()`, not a rename, because `restore()` is all-or-nothing and rejects while running.
