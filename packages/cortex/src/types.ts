@@ -892,6 +892,14 @@ export interface BudgetGuardConfig {
    * guard needs to bound a loop plus everything it spawns.
    */
   includeChildUsage?: boolean;
+  /**
+   * Count direct/utility completion spend (observer, reflector,
+   * summarization, WebFetch, Bash utility calls) against maxCost, via the
+   * utility_usage event. Default false. Without it an aggregate guard is
+   * blind to exactly the spend class duplex doubles (two resident loops
+   * observing overlapping content), so the facade's aggregate guard sets it.
+   */
+  includeUtilityUsage?: boolean;
 }
 
 // ---------------------------------------------------------------------------

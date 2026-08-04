@@ -443,7 +443,54 @@ export interface DeliverOptions {
    * drain into whatever run starts next and produce an unprompted response).
    */
   wake?: boolean;
+  /**
+   * Options for the turn this delivery starts when it lands on an idle loop
+   * (the 'prompted' outcome only). Parked and queued content rides a later
+   * run whose options belong to that run's initiator, so these are dropped
+   * on those paths by design.
+   */
+  promptOptions?: DirectCompletionOptions;
 }
+
+/**
+ * What the owner-installed tool-result interceptor receives per finalized
+ * tool call (see {@link AgentLoop.setToolResultInterceptor}).
+ */
+export interface ToolResultInterceptorInfo {
+  toolName: string;
+  /** Validated tool arguments as pi passed them to execute. */
+  args: unknown;
+  /**
+   * The assistant message that carried this tool call (pi's message shape,
+   * opaque). Lets an interceptor inspect the spoken text alongside the call.
+   */
+  assistantMessage: unknown;
+  /** The finalized result (content in pi's block shape). */
+  result: { content: unknown };
+  isError: boolean;
+}
+
+/**
+ * Overrides returned by a tool-result interceptor. Absent fields leave the
+ * result untouched.
+ */
+export interface ToolResultInterceptorResult {
+  /** Replacement result content (pi block shape or plain string). */
+  content?: unknown;
+  /**
+   * Explicit override of the result's terminate flag. `false` suppresses a
+   * tool-set `terminate: true`, forcing a follow-up turn; `true` ends the
+   * batch after this call.
+   */
+  terminate?: boolean;
+  /** Skip the working-tags reminder appendix for this result. */
+  suppressWorkingTagsReminder?: boolean;
+}
+
+/** Owner-installed hook over finalized tool results. */
+export type ToolResultInterceptor = (
+  info: ToolResultInterceptorInfo,
+) => ToolResultInterceptorResult | undefined | null;
 
 /** Which branch of the deliver() state machine handled a delivery. */
 export type DeliverOutcome = 'prompted' | 'parked' | 'queued';
@@ -759,6 +806,8 @@ export class AgentLoop {
   // call, view-injected after the BP3 cache boundary (never in the cached
   // prefix, never in the transcript), hard token-capped.
   private headlineProvider: (() => string | null) | null = null;
+  /** Owner-installed tool-result hook (see setToolResultInterceptor). */
+  private toolResultInterceptor: ToolResultInterceptor | null = null;
   private headlineMaxTokens = DEFAULT_HEADLINE_MAX_TOKENS;
 
   // Set while digestIdle() runs the transform pipeline, so the compaction
@@ -1938,7 +1987,7 @@ export class AgentLoop {
     // a fire-and-forget caller never produces an unhandled rejection and the
     // failure is at least logged; callers that await result.turn still
     // observe the rejection, and run failures surface through onError.
-    const turn = this.prompt(content);
+    const turn = this.prompt(content, options?.promptOptions);
     turn.catch((err) => {
       this.logger.warn('deliver-started turn failed', {
         error: err instanceof Error ? err.message : String(err),
@@ -2352,6 +2401,21 @@ export class AgentLoop {
       }
       this.headlineMaxTokens = options.maxTokens;
     }
+  }
+
+  /**
+   * Install a hook over finalized tool results. Runs inside pi's
+   * afterToolCall for every executed call (errors included); the return
+   * value can replace the result content, override the terminate flag, or
+   * suppress the working-tags reminder appendix. One interceptor at a time;
+   * pass null to remove. General-purpose by design; the duplex facade uses
+   * it for the control-tool terminate guards (empty-spoken-text suppression
+   * and bare receipts, docs/cortex/duplex/decisions.md D17). An interceptor
+   * that throws is logged and ignored so it can never fail the tool result
+   * path, which for control tools would reopen the very loop D17 closes.
+   */
+  setToolResultInterceptor(interceptor: ToolResultInterceptor | null): void {
+    this.toolResultInterceptor = interceptor;
   }
 
   /**
@@ -2882,25 +2946,60 @@ export class AgentLoop {
       const agent = cacheBreakpointState.agentLoop;
       if (!agent) return undefined;
       agent.syncActiveLoopTools(ctx);
-      if (!agent.isWorkingTagsEnabled) return undefined;
 
-      const { result, isError } = ctx as {
+      const { toolCall, assistantMessage, args, result, isError } = ctx as {
         toolCall: { name: string };
+        assistantMessage?: unknown;
+        args?: unknown;
         result: { content: unknown };
         isError: boolean;
         context: unknown;
       };
-      if (isError) return undefined;
 
-      const reminder = '\n\n' + TOOL_RESULT_WORKING_TAGS_REMINDER;
-      const content = result.content;
-      if (typeof content === 'string') {
-        return { content: content + reminder };
+      // Owner-installed interception runs first so it can suppress the
+      // reminder appendix below (control tools carry bare receipts, D17). A
+      // throwing interceptor is swallowed: pi wraps afterToolCall failures
+      // into error results WITHOUT terminate, which would reopen the loop
+      // the interceptor exists to bound.
+      let intercept: ToolResultInterceptorResult | undefined;
+      if (agent.toolResultInterceptor) {
+        try {
+          intercept = agent.toolResultInterceptor({
+            toolName: toolCall.name,
+            args,
+            assistantMessage,
+            result,
+            isError,
+          }) ?? undefined;
+        } catch (err) {
+          agent.logger.error('tool result interceptor threw; ignoring', {
+            toolName: toolCall.name,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
-      if (Array.isArray(content)) {
-        return { content: [...content, { type: 'text', text: reminder }] };
+
+      const override: { content?: unknown; terminate?: boolean } = {};
+      if (intercept?.content !== undefined) override.content = intercept.content;
+      if (intercept?.terminate !== undefined) override.terminate = intercept.terminate;
+
+      if (
+        agent.isWorkingTagsEnabled &&
+        !isError &&
+        intercept?.suppressWorkingTagsReminder !== true
+      ) {
+        const reminder = '\n\n' + TOOL_RESULT_WORKING_TAGS_REMINDER;
+        const content = override.content ?? result.content;
+        if (typeof content === 'string') {
+          override.content = content + reminder;
+        } else if (Array.isArray(content)) {
+          override.content = [...content, { type: 'text', text: reminder }];
+        }
       }
-      return undefined;
+
+      return override.content !== undefined || override.terminate !== undefined
+        ? override
+        : undefined;
     };
 
     agentConfig['onPayload'] = async (payload: Record<string, unknown>, model: Record<string, unknown>) => {
@@ -3146,11 +3245,21 @@ export class AgentLoop {
      * fromPiAgentTool() before passing them to AgentLoop.create().
      */
     tools?: CortexTool[];
+    /**
+     * Whether to auto-register the SubAgent tool. Default true. An owner
+     * assembling a role loop that must not spawn (the duplex talker, a
+     * tier-capped child) sets false; combined with disableTools this yields
+     * a loop with no built-in toolset at all.
+     */
+    enableSubAgentTool?: boolean;
+    /** Whether to auto-register the load_skill tool. Default true. */
+    enableLoadSkillTool?: boolean;
   }): Promise<AgentLoop> {
     const managedCreateParams: {
       cortexConfig: AgentLoopConfig;
       tools?: RegisteredTool[];
       initialBasePrompt?: string;
+      constructorOptions?: AgentLoopConstructorOptions;
       missingDependencyMessage: string;
     } = {
       cortexConfig: config,
@@ -3163,6 +3272,16 @@ export class AgentLoop {
     }
     if (config.initialBasePrompt !== undefined) {
       managedCreateParams.initialBasePrompt = config.initialBasePrompt;
+    }
+    if (config.enableSubAgentTool !== undefined || config.enableLoadSkillTool !== undefined) {
+      managedCreateParams.constructorOptions = {
+        ...(config.enableSubAgentTool !== undefined
+          ? { enableSubAgentTool: config.enableSubAgentTool }
+          : {}),
+        ...(config.enableLoadSkillTool !== undefined
+          ? { enableLoadSkillTool: config.enableLoadSkillTool }
+          : {}),
+      };
     }
     return AgentLoop.createManagedAgent(managedCreateParams);
   }

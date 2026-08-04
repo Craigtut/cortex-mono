@@ -253,6 +253,19 @@ describe('AgentLoop.deliver', () => {
     expect(piAgent.steerCalls).toEqual([]);
   });
 
+  it('passes promptOptions through to the prompted turn (and only that path)', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const promptSpy = vi.spyOn(loop, 'prompt');
+
+    const options = { sessionId: 'affinity-1', usageCategory: 'direct' } as const;
+    const result = loop.deliver('with options', { promptOptions: options });
+
+    expect(result.outcome).toBe('prompted');
+    expect(promptSpy).toHaveBeenCalledWith('with options', options);
+    await result.turn;
+  });
+
   it('delivery into a running turn parks and opens the next run, not the one in flight', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);

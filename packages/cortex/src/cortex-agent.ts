@@ -319,6 +319,10 @@ export const AGENT_LOOP_DELEGATION = {
   getPendingAsks: 'forwarded',
   markAskVoiced: 'forwarded',
   setHeadlineProvider: 'forwarded',
+  // Withheld: the facade owns this hook in duplex (the control-tool
+  // terminate guards install through it, D17); exposing it would let a
+  // consumer displace those guards. Direct AgentLoop users keep it.
+  setToolResultInterceptor: 'withheld',
   // Prompt and model surface.
   setBasePrompt: 'forwarded',
   getBasePrompt: 'forwarded',

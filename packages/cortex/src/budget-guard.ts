@@ -47,6 +47,7 @@ export class BudgetGuard {
   private readonly maxCost: number;
   private readonly scope: BudgetScope;
   private readonly includeChildUsage: boolean;
+  private readonly includeUtilityUsage: boolean;
   private readonly abortFn: () => void;
   private readonly logger: CortexLogger;
 
@@ -68,6 +69,7 @@ export class BudgetGuard {
     this.maxCost = config.maxCost ?? Infinity;
     this.scope = config.scope ?? 'prompt';
     this.includeChildUsage = config.includeChildUsage ?? false;
+    this.includeUtilityUsage = config.includeUtilityUsage ?? false;
     this.abortFn = abortFn;
     this.logger = logger ?? NOOP_LOGGER;
   }
@@ -110,6 +112,23 @@ export class BudgetGuard {
         this.checkLimits();
       }),
     );
+
+    // Utility spend (observer, reflector, summarization, WebFetch, Bash
+    // utility calls) counts toward maxCost when opted in. Never toward
+    // maxTurns: these are internal completions, not loop turns. The same
+    // child gate applies: forwarded child utility events carry childTaskId.
+    if (this.includeUtilityUsage) {
+      this.unsubscribers.push(
+        bridge.on('utility_usage', (event) => {
+          if (event.childTaskId && !this.includeChildUsage) return;
+          const cost = event.usage?.cost?.total ?? 0;
+          if (cost > 0) {
+            this.totalCost += cost;
+            this.checkLimits();
+          }
+        }),
+      );
+    }
   }
 
   /**
