@@ -424,6 +424,47 @@ describe('control-tool dispatch', () => {
     expect(h.router.getDelegations()).toHaveLength(1);
   });
 
+  it('a deliberate repeat in a later turn re-dispatches: turnIndex is part of the dedup key (N2)', async () => {
+    const h = createHarness();
+    h.router.noteUserUtterance('push it along');
+    const first = await callTool(h, 'steer_task', { message: 'hurry up' });
+    expect(first.content[0]!.text).toBe('Redirect sent.');
+    // Same turn: a retry-induced double is absorbed.
+    const sameTurn = await callTool(h, 'steer_task', { message: 'hurry up' });
+    expect(sameTurn.content[0]!.text).toBe('Redirect sent.');
+    expect(h.reasonerDispatches).toHaveLength(1);
+
+    // A later turn in the same exchange: the user watched the reasoner
+    // ignore the first steer and the talker deliberately re-sends it. That
+    // must dispatch again, not replay a receipt with nothing behind it.
+    h.router.noteTalkerTurnEnd();
+    const repeat = await callTool(h, 'steer_task', { message: 'hurry up' });
+    expect(repeat.content[0]!.text).toBe('Redirect sent.');
+    expect(h.reasonerDispatches).toHaveLength(2);
+  });
+
+  it('bounds dispatch_refused lifecycle entries per turn (N4)', async () => {
+    const h = createHarness();
+    h.router.noteUserUtterance('do things');
+    for (let i = 0; i < 5; i++) {
+      const refused = await callTool(h, 'spawn_task', {});
+      // The receipt still comes back for every call.
+      expect(refused.terminate).toBe(true);
+    }
+    const refusals = h.log.filter(
+      (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'dispatch_refused',
+    );
+    expect(refusals).toHaveLength(3);
+    expect(refusals[2]!.data).toMatchObject({ furtherRefusalsSuppressed: true });
+
+    // The bound is per turn, not per session.
+    h.router.noteTalkerTurnEnd();
+    await callTool(h, 'spawn_task', {});
+    expect(h.log.filter(
+      (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'dispatch_refused',
+    )).toHaveLength(4);
+  });
+
   it('a new utterance opens a fresh exchange: dedup and caps reset', async () => {
     const h = createHarness();
     h.router.noteUserUtterance('scan please');

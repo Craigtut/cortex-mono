@@ -127,6 +127,13 @@ export const DUPLEX_ROUTER_DEFAULTS = {
 
 type ResolvedOptions = typeof DUPLEX_ROUTER_DEFAULTS;
 
+/**
+ * Bound on dispatch_refused lifecycle entries per talker turn (N4). The
+ * talker's hard maxTurns bounds turns, but one assistant message can carry
+ * arbitrarily many malformed calls; without this each writes an entry.
+ */
+const MAX_REFUSAL_ENTRIES_PER_TURN = 3;
+
 /** One tracked delegation (a spawn_task dispatch), keyed by alias. */
 export interface DelegationSnapshot {
   alias: string;
@@ -184,8 +191,17 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   // Dispatch backpressure (D19).
   private dispatchesThisTurn = 0;
   private dispatchesThisExchange = 0;
+  /**
+   * Talker turn index within the current exchange. Part of the dispatch
+   * dedup key (D19): dedup absorbs retry-induced doubles within a turn,
+   * while a deliberate repeat in a later turn (re-sending the same steer
+   * after the reasoner visibly ignored it) dispatches again.
+   */
+  private dispatchTurnIndex = 0;
   /** dedup key -> receipt of the original dispatch (retries replay it). */
   private dispatchDedup = new Map<string, string>();
+  /** Refusal lifecycle entries written this turn (bounded, N4). */
+  private refusalEntriesThisTurn = 0;
 
   // Delivery backpressure (D19).
   private interruptTokens: number;
@@ -229,11 +245,21 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   // Conversation flow bookkeeping
   // -------------------------------------------------------------------------
 
-  /** A new user utterance: buffer the delta and open a fresh exchange. */
+  /**
+   * A new user utterance: buffer the delta and open a fresh exchange.
+   *
+   * Open question (review N1): the per-exchange cap clears ONLY here, so a
+   * long autonomous stretch (deliveries waking the talker with no new user
+   * input) runs against one fixed delegation budget until the user next
+   * speaks. Whether autonomous turns should ever refresh the cap is a
+   * policy call deferred until real usage data exists.
+   */
   noteUserUtterance(text: string): void {
     this.pushDelta({ speaker: 'user', text });
     this.dispatchesThisExchange = 0;
     this.dispatchesThisTurn = 0;
+    this.dispatchTurnIndex = 0;
+    this.refusalEntriesThisTurn = 0;
     this.dispatchDedup.clear();
   }
 
@@ -268,6 +294,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   /** A talker turn boundary: resets the per-turn dispatch cap. */
   noteTalkerTurnEnd(): void {
     this.dispatchesThisTurn = 0;
+    this.dispatchTurnIndex += 1;
+    this.refusalEntriesThisTurn = 0;
   }
 
   /** Reasoner run lifecycle, for the liveness watchdog. */
@@ -292,7 +320,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       return this.refuseDispatch('spawn_task', 'missing instructions',
         'Could not start the task: no instructions given.');
     }
-    const dedupKey = `spawn_task:${fnv1a(instructions)}`;
+    const dedupKey = `${this.dispatchTurnIndex}:spawn_task:${fnv1a(instructions)}`;
     const replay = this.dispatchDedup.get(dedupKey);
     if (replay !== undefined) return replay;
     const capRefusal = this.applyDispatchCaps('spawn_task');
@@ -344,7 +372,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       }
       alias = delegation.alias;
     }
-    const dedupKey = `steer_task:${alias ?? ''}:${fnv1a(message)}`;
+    const dedupKey = `${this.dispatchTurnIndex}:steer_task:${alias ?? ''}:${fnv1a(message)}`;
     const replay = this.dispatchDedup.get(dedupKey);
     if (replay !== undefined) return replay;
     const capRefusal = this.applyDispatchCaps('steer_task');
@@ -399,7 +427,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       return this.refuseDispatch('quick_lookup', 'missing question',
         'Could not look that up: the question was empty.');
     }
-    const dedupKey = `quick_lookup:${fnv1a(question)}`;
+    const dedupKey = `${this.dispatchTurnIndex}:quick_lookup:${fnv1a(question)}`;
     const replay = this.dispatchDedup.get(dedupKey);
     if (replay !== undefined) return replay;
     const capRefusal = this.applyDispatchCaps('quick_lookup');
@@ -433,15 +461,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // D16 consent rules (most-recently-voiced binding, allow-once,
     // utterance-after-voicing causation).
     return 'There are no pending permission requests to answer.';
-  }
-
-  /**
-   * Consumer input addressed to the work surface (facade deliver target
-   * 'work'). Bypasses the delegation caps (it is consumer input, not model
-   * delegation) but still flushes the conversation block.
-   */
-  dispatchWorkInput(content: string, causeSeq: number | null): void {
-    this.dispatch(buildWorkInputDirective(content), causeSeq);
   }
 
   // -------------------------------------------------------------------------
@@ -751,6 +770,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.recentDeliveryHashes = [];
     this.dispatchesThisTurn = 0;
     this.dispatchesThisExchange = 0;
+    this.dispatchTurnIndex = 0;
+    this.refusalEntriesThisTurn = 0;
     this.reasonerRunning = false;
     this.lastDeliveryAt = 0;
     this.interruptTokens = this.options.interruptBucketCapacity;
@@ -826,17 +847,30 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   }
 
   /**
-   * Record a refused or failed dispatch as a lifecycle entry (a user
-   * instruction must never vanish silently, F11) and return the receipt.
+   * Record a refused dispatch as a lifecycle entry (a user instruction
+   * must never vanish silently, F11) and return the receipt. Entries are
+   * bounded per turn (N4): refusals run before any cap counting, so one
+   * assistant message spraying N malformed calls must not write N entries;
+   * past the bound the receipt still goes back but the log stays quiet,
+   * with the last written entry marking the suppression.
    */
   private refuseDispatch(tool: string, reason: string, receipt: string): string {
-    this.ports.appendLog({
-      type: 'lifecycle',
-      loopPath: this.talkerLoopPath,
-      content: `Dispatch refused: ${tool} (${reason})`,
-      data: { event: 'dispatch_refused', tool, reason },
-      ...this.talkerCause(),
-    });
+    if (this.refusalEntriesThisTurn < MAX_REFUSAL_ENTRIES_PER_TURN) {
+      this.refusalEntriesThisTurn += 1;
+      const atBound = this.refusalEntriesThisTurn === MAX_REFUSAL_ENTRIES_PER_TURN;
+      this.ports.appendLog({
+        type: 'lifecycle',
+        loopPath: this.talkerLoopPath,
+        content: `Dispatch refused: ${tool} (${reason})`,
+        data: {
+          event: 'dispatch_refused',
+          tool,
+          reason,
+          ...(atBound ? { furtherRefusalsSuppressed: true } : {}),
+        },
+        ...this.talkerCause(),
+      });
+    }
     return receipt;
   }
 
