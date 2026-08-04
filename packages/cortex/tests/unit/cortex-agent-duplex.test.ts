@@ -474,6 +474,92 @@ describe('duplex prompt routing', () => {
     expect(directive.data).toMatchObject({ tool: 'spawn_task', alias: 'task-1' });
   });
 
+  it('a barge-in utterance keeps its causation stamp through the sweep run (B1)', async () => {
+    const { facade, talkerPi } = createDuplexFacade();
+    talkerPi.hold = true;
+    const first = facade.prompt('first question');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+    // Barge-in: parks behind the live run and rides the sweep run.
+    const second = facade.prompt('yes, go ahead');
+    // Hold the sweep run so the control tool below executes while the run
+    // carrying the barge-in is live (the normal voice interleaving: the
+    // talker answers a parked "yes" and calls a control tool from it).
+    talkerPi.hold = true;
+    talkerPi.releaseRun();
+    await waitUntil(() => talkerPi.promptCalls.length === 2);
+    expect(String(talkerPi.promptCalls[1])).toContain('yes, go ahead');
+
+    const spawn = getPiTool(talkerPi, 'spawn_task');
+    await spawn.execute('call-1', { instructions: 'proceed with the plan' });
+    talkerPi.releaseRun();
+    await Promise.all([first, second]);
+
+    const log = facade.getLog();
+    const bargeIn = log.find(
+      (entry) => entry.type === 'utterance' && entry.content === 'yes, go ahead',
+    )!;
+    const directive = log.find((entry) => entry.type === 'directive')!;
+    // The stamp travels with the parked content: the sweep-run dispatch is
+    // caused by the barge-in utterance, not unstamped and not the first
+    // utterance's.
+    expect(directive.causedBy).toBe(bargeIn.seq);
+  });
+
+  it('a delivery-woken talker run inherits no stamp from the previous run', async () => {
+    const { facade, talkerPi, reasonerPi } = createDuplexFacade();
+    talkerPi.hold = true;
+    const turn = facade.prompt('kick something off');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+    // An interrupt delivery parks behind the live (utterance-tagged) run.
+    const deliver = getPiTool(reasonerPi, 'Deliver');
+    await deliver.execute('c1', { content: 'urgent finding', wake: 'interrupt' });
+    // Hold the sweep run, which carries only the untagged background update.
+    talkerPi.hold = true;
+    talkerPi.releaseRun();
+    await turn;
+    await waitUntil(() => talkerPi.promptCalls.length === 2);
+    expect(String(talkerPi.promptCalls[1])).toContain('urgent finding');
+
+    const spawn = getPiTool(talkerPi, 'spawn_task');
+    await spawn.execute('call-2', { instructions: 'follow up on the finding' });
+    talkerPi.releaseRun();
+    await waitUntil(() => !facade.isRunning);
+
+    // A run with no user utterance behind it must carry no causation stamp:
+    // an unstamped chain is exactly what D16 refuses consent from.
+    const directive = facade.getLog().find((entry) => entry.type === 'directive')!;
+    expect(directive.causedBy).toBeUndefined();
+  });
+
+  it('a dispatch parked behind a busy reasoner carries its directive causation into the sweep run', async () => {
+    const { facade, talkerPi, reasonerPi } = createDuplexFacade();
+    reasonerPi.hold = true;
+    reasonerPi.nextTurnText = 'first analysis done';
+    const busy = facade.deliver('long analysis', { target: 'work' });
+    expect(busy.outcome).toBe('prompted');
+    await waitUntil(() => reasonerPi.promptCalls.length === 1);
+
+    await facade.prompt('also check the tests');
+    const spawn = getPiTool(talkerPi, 'spawn_task');
+    await spawn.execute('call-1', { instructions: 'check the tests' });
+    const directive = facade.getLog().find((entry) => entry.type === 'directive')!;
+
+    // Hold the sweep run so its final text can differ from run 1's.
+    reasonerPi.hold = true;
+    reasonerPi.releaseRun();
+    await waitUntil(() => reasonerPi.promptCalls.length === 2);
+    reasonerPi.nextTurnText = 'tests checked: all green';
+    reasonerPi.releaseRun();
+    await waitUntil(() => facade.getLog().some(
+      (entry) => entry.type === 'delivery' && entry.content === 'tests checked: all green'));
+
+    const delivery = facade.getLog().find(
+      (entry) => entry.type === 'delivery' && entry.content === 'tests checked: all green',
+    )!;
+    // The sweep-delivered dispatch still binds the run to its directive.
+    expect(delivery.causedBy).toBe(directive.seq);
+  });
+
   it('a dispatch parked behind a busy reasoner still carries its conversation block', async () => {
     const { facade, talkerPi, reasonerPi } = createDuplexFacade();
     // Occupy the reasoner.

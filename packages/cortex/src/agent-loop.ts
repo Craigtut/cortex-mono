@@ -450,6 +450,18 @@ export interface DeliverOptions {
    * on those paths by design.
    */
   promptOptions?: DirectCompletionOptions;
+  /**
+   * Opaque causation tag that travels WITH the content: exposed through
+   * {@link AgentLoop.activeRunCauseTags} for exactly the run that consumes
+   * this delivery (the turn it starts, the prompt whose leading batch it
+   * rides, or the sweep run that delivers it after parking). The facade
+   * stamps log-entry causation from it; binding the tag to the content
+   * rather than to a caller-side field means a parked delivery keeps its
+   * causation across the sweep, and a later run can never inherit a
+   * previous run's tag. Wake deliveries only; silent content is
+   * context-only and carries no causation.
+   */
+  causeTag?: unknown;
 }
 
 /**
@@ -535,6 +547,8 @@ interface QueuedDelivery {
    * starts after the user stopped the agent.
    */
   abortEpoch?: number;
+  /** Causation tag riding with the content (see DeliverOptions.causeTag). */
+  causeTag?: unknown;
 }
 
 /** Options for {@link AgentLoop.digestIdle}. */
@@ -844,6 +858,16 @@ export class AgentLoop {
 
   // Whether a prompt() call is currently in progress
   private _isPrompting = false;
+
+  // Cause tags of the run currently holding the gate (see
+  // DeliverOptions.causeTag): set in the same synchronous frame that takes
+  // the delivery batches at run start, cleared in the run's own finally, so
+  // a reader can never observe a previous run's tags from a later run.
+  private _activeRunCauseTags: readonly unknown[] = [];
+  // Tag handoff for the deliver() prompted branch: deliver() sets it
+  // immediately before calling prompt() with the gate empty, so the very
+  // next run task (that prompt's own) is the one that consumes it.
+  private pendingPromptCauseTag: unknown = undefined;
 
   // Loop gate: every agentic loop start (consumer prompt() calls and
   // background-completion deliveries) is serialized through this promise
@@ -1304,6 +1328,21 @@ export class AgentLoop {
   }
 
   /**
+   * Cause tags of the run currently holding the gate: the tags of every
+   * wake delivery this run consumed (its own prompt input, spliced parked
+   * content, or a sweep batch). Empty while no run is live and for runs
+   * that carry no tagged content (background drains, untagged prompts).
+   * Set at run start in the same frame the delivery batches are taken and
+   * cleared in the run's own finally, so the value is always exactly the
+   * live run's; a later run can never inherit a previous run's tags. The
+   * duplex facade reads this to stamp log-entry causation (D16 binds
+   * consent to those stamps, docs/cortex/duplex/log-and-context.md).
+   */
+  get activeRunCauseTags(): readonly unknown[] {
+    return this._activeRunCauseTags;
+  }
+
+  /**
    * Resolve once the loop gate is empty: no gate task running or queued.
    * This is the awaitable form of {@link isLoopActive}, and the primitive
    * settlement predicates build on. It deliberately keys on gate depth
@@ -1363,16 +1402,29 @@ export class AgentLoop {
    * @param retryPolicyOverride - Per-run retry policy. The drain passes a
    *   policy whose elapsed ceiling is its remaining delivery budget, so a
    *   re-queued delivery cannot re-enter the full retry ladder.
+   * @param causeTags - Cause tags for content a drain-started run carries
+   *   itself (the sweep passes its batch's tags; the non-drain path derives
+   *   tags from the spliced wake batch and the pending prompt tag instead).
    */
   private async runPromptOnce(
     input: string,
     options?: DirectCompletionOptions,
     fromDrain = false,
     retryPolicyOverride?: RetryPolicy,
+    causeTags?: unknown[],
   ): Promise<unknown> {
     // Transition to ACTIVE on first loop
     if (this.lifecycleState === 'created') {
       this.lifecycleState = 'active';
+    }
+
+    // Consume the deliver()-prompted cause tag first thing, even on paths
+    // that cancel before the run starts: the tag belongs to THIS cycle, and
+    // leaving it pending would mislabel a later, unrelated run.
+    let directCauseTag: unknown;
+    if (!fromDrain) {
+      directCauseTag = this.pendingPromptCauseTag;
+      this.pendingPromptCauseTag = undefined;
     }
 
     // Abort visibility at dequeue. prompt() installs a fresh (non-aborted)
@@ -1415,6 +1467,17 @@ export class AgentLoop {
     // was told was 'parked' must end in a run that answers it, never
     // silently demote to inert transcript context.
     const wakeBatch = fromDrain ? [] : this.takeDeliverableWakeDeliveries();
+
+    // Bind this run's cause tags in the same synchronous frame the batches
+    // were taken: caller-supplied tags (sweep runs), tags riding the spliced
+    // wake batch, and the deliver()-prompted input's own tag. Cleared in the
+    // finally below, under the same gate acquisition, so the tags can never
+    // outlive the run or leak into the next one.
+    this._activeRunCauseTags = [
+      ...(causeTags ?? []),
+      ...wakeBatch.map((item) => item.causeTag).filter((tag) => tag !== undefined),
+      ...(directCauseTag !== undefined ? [directCauseTag] : []),
+    ];
 
     // Long-lived mode keeps workspace state (cwd, read-before-edit registry,
     // undo history) across prompts; transient state resets regardless.
@@ -1482,6 +1545,7 @@ export class AgentLoop {
     } finally {
       this._activePromptCacheRetention = null;
       this._isPrompting = false;
+      this._activeRunCauseTags = [];
 
       this.logger.debug('loop complete', {
         durationMs: Date.now() - loopStartMs,
@@ -1974,6 +2038,7 @@ export class AgentLoop {
         content,
         timestamp: Date.now(),
         abortEpoch: this._abortEpoch,
+        ...(options?.causeTag !== undefined ? { causeTag: options.causeTag } : {}),
       });
       this.scheduleWakeSweep();
       this.logger.debug('wake delivery parked for the next run', {
@@ -1987,6 +2052,10 @@ export class AgentLoop {
     // a fire-and-forget caller never produces an unhandled rejection and the
     // failure is at least logged; callers that await result.turn still
     // observe the rejection, and run failures surface through onError.
+    // The cause tag is handed to the run through pendingPromptCauseTag: the
+    // gate is empty here, so the cycle prompt() enqueues is the next run
+    // task and no other run can dequeue between this frame and it.
+    this.pendingPromptCauseTag = options?.causeTag;
     const turn = this.prompt(content, options?.promptOptions);
     turn.catch((err) => {
       this.logger.warn('deliver-started turn failed', {
@@ -2104,8 +2173,15 @@ export class AgentLoop {
       // survive a prior abort, like background completions) and never flush
       // the silent queue (its contract is "next real prompt", and the
       // unwind below counts messages from the pre-delivery boundary, which
-      // flushed extras would corrupt).
-      await this.runPromptOnce(message, undefined, true, boundedRetryPolicy);
+      // flushed extras would corrupt). The batch's cause tags ride along so
+      // the sweep run carries the same causation the parked content did.
+      await this.runPromptOnce(
+        message,
+        undefined,
+        true,
+        boundedRetryPolicy,
+        pending.map((item) => item.causeTag).filter((tag) => tag !== undefined),
+      );
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       if (!this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch)) {

@@ -609,6 +609,9 @@ export const AGENT_LOOP_DELEGATION = {
   // Withheld: no single composite value exists in duplex (each loop has its
   // own path); origin reaches consumers via LoopOriginContext on callbacks.
   loopPath: 'withheld',
+  // Withheld: internal causation plumbing (the facade stamps log-entry
+  // causedBy from it); the log's causedBy field is the consumer surface.
+  activeRunCauseTags: 'withheld',
   // Withheld: cache-breakpoint internal (the boundary between cacheable
   // history and tick content); meaningless as a composite value.
   prePromptMessageCount: 'withheld',
@@ -899,6 +902,23 @@ function extractSpokenText(assistantMessage: unknown): string {
   return stripWorkingTags(raw).trim();
 }
 
+/**
+ * Latest (highest) numeric cause tag on a loop's live run, or null. The
+ * facade tags every conversation-surface delivery with its utterance's log
+ * seq and every dispatch with its directive's seq; seqs are monotonic, so
+ * the highest tag is the most recent cause when several ride one run
+ * (e.g. two barge-ins delivered by a single sweep).
+ */
+function latestCauseSeq(tags: readonly unknown[]): number | null {
+  let latest: number | null = null;
+  for (const tag of tags) {
+    if (typeof tag === 'number' && (latest === null || tag > latest)) {
+      latest = tag;
+    }
+  }
+  return latest;
+}
+
 /** Append the D17 speak-now appendix to a control-tool receipt. */
 function appendSpeakNudge(content: unknown): unknown {
   const nudge = `\n\n${SPEAK_NOW_APPENDIX}`;
@@ -937,20 +957,19 @@ export class CortexAgent {
   private promptSettlers: Array<() => void> = [];
 
   /**
-   * Seq of the utterance whose facade-initiated conversation run is
-   * currently live (the reasoner in passthrough, the talker in duplex).
-   * Entries produced by that run (replies, errors, spawn lifecycle) carry
-   * it as their causation stamp. Null while no facade-initiated run is
-   * live; entries produced then (e.g. by a background delivery run) carry
-   * no stamp rather than a guessed one.
+   * Passthrough only: seq of the utterance whose facade-initiated reasoner
+   * run is currently live. Entries produced by that run (replies, errors,
+   * spawn lifecycle) carry it as their causation stamp; entries produced
+   * while no facade-initiated run is live (e.g. by a background delivery
+   * run) carry no stamp rather than a guessed one.
+   *
+   * Duplex does not use this field: causation there is bound to the run
+   * inside the loop (deliver() causeTags read back via activeRunCauseTags),
+   * so a parked barge-in keeps its stamp through the sweep and a sweep run
+   * can never inherit a previous run's stamp from a facade field raced
+   * against the loop gate.
    */
   private activeCauseSeq: number | null = null;
-  /**
-   * Seq of the directive whose reasoner run is currently live (duplex).
-   * Entries the work surface produces during that run (deliveries, errors,
-   * spawn lifecycle) default to it.
-   */
-  private activeReasonerCauseSeq: number | null = null;
   /** Spawn lifecycle seq per live task, for completion causation. */
   private readonly spawnSeqByTaskId = new Map<string, number>();
 
@@ -1088,8 +1107,11 @@ export class CortexAgent {
         ...(input.wake !== undefined ? { wake: input.wake } : {}),
         ...(input.data !== undefined ? { data: input.data } : {}),
       }).seq,
-      currentTalkerCauseSeq: () => this.activeCauseSeq,
-      currentReasonerCauseSeq: () => this.activeReasonerCauseSeq,
+      // Read from the loops' live-run cause tags, never from facade fields:
+      // the tags travel with the content, so a barge-in parked behind a
+      // live run keeps its utterance seq through the sweep run (B1).
+      currentTalkerCauseSeq: () => latestCauseSeq(talker.activeRunCauseTags),
+      currentReasonerCauseSeq: () => latestCauseSeq(this.reasoner.activeRunCauseTags),
       idleSignal: config.idleSignal,
       logger: this.logger,
       talkerLoopPath: talker.loopPath,
@@ -1182,20 +1204,17 @@ export class CortexAgent {
     this.aggregateGuard.wire(this.mergedBridge);
   }
 
-  /** Wake-deliver a dispatch to the reasoner, binding run causation. */
+  /**
+   * Wake-deliver a dispatch to the reasoner. The directive seq rides the
+   * delivery as its cause tag, so the run that consumes it (the turn it
+   * starts, or the sweep run when the reasoner is busy) carries the
+   * causation regardless of which path delivers it.
+   */
   private dispatchToReasoner(message: string, causeSeq: number | null): void {
-    const result = this.reasoner.deliver(message);
-    if (result.outcome === 'prompted' && result.turn && causeSeq !== null) {
-      this.activeReasonerCauseSeq = causeSeq;
-      const clear = (): void => {
-        if (this.activeReasonerCauseSeq === causeSeq) {
-          this.activeReasonerCauseSeq = null;
-        }
-      };
-      void result.turn.then(clear, clear);
-    }
-    // Parked dispatches ride the sweep's run, which has no bindable
-    // causation (same rule as parked facade deliveries).
+    this.reasoner.deliver(
+      message,
+      causeSeq !== null ? { causeTag: causeSeq } : undefined,
+    );
   }
 
   /**
@@ -1531,10 +1550,18 @@ export class CortexAgent {
     return entry;
   }
 
-  /** Which live-run causation track a producer's entries default to. */
+  /**
+   * Which live-run causation track a producer's entries default to. Duplex
+   * reads the producing loop's live-run cause tags (bound to the run inside
+   * the loop, so parked content keeps its stamp through the sweep);
+   * passthrough keeps the facade-field stamp around its serialized prompt.
+   */
   private defaultCauseSeqFor(loopPath: string): number | null {
-    if (this.talker && loopPath !== this.talker.loopPath) {
-      return this.activeReasonerCauseSeq;
+    if (this.talker) {
+      if (loopPath !== this.talker.loopPath) {
+        return latestCauseSeq(this.reasoner.activeRunCauseTags);
+      }
+      return latestCauseSeq(this.talker.activeRunCauseTags);
     }
     return this.activeCauseSeq;
   }
@@ -1658,19 +1685,17 @@ export class CortexAgent {
       // (D18); a fresh utterance also opens a new exchange for the
       // delegation caps and dispatch dedup.
       this.router!.noteUserUtterance(input);
-      const result = talker.deliver(
-        input,
-        options ? { wake: true, promptOptions: options } : { wake: true },
-      );
+      // The utterance seq travels with the content as its cause tag: the
+      // run that consumes the input (the turn started here, or the sweep
+      // run after a barge-in parks) exposes it through activeRunCauseTags,
+      // which is where the router reads directive causation (B1/D16).
+      const result = talker.deliver(input, {
+        wake: true,
+        causeTag: entry.seq,
+        ...(options ? { promptOptions: options } : {}),
+      });
       if (result.outcome === 'prompted' && result.turn) {
-        this.activeCauseSeq = entry.seq;
-        try {
-          return await result.turn;
-        } finally {
-          if (this.activeCauseSeq === entry.seq) {
-            this.activeCauseSeq = null;
-          }
-        }
+        return await result.turn;
       }
       // Parked (barge-in): the input rides the talker's next run. Resolve
       // at the next gate quiescence, which is after that run.
@@ -1760,18 +1785,11 @@ export class CortexAgent {
         router.noteWorkContext(content);
         return { outcome: 'queued' };
       }
+      // The utterance seq rides the dispatch as its cause tag (parked
+      // dispatches keep it through the sweep, exactly like router
+      // dispatches).
       const message = router.composeWorkDispatch(content);
-      const result = this.reasoner.deliver(message);
-      if (result.outcome === 'prompted' && result.turn) {
-        this.activeReasonerCauseSeq = entry.seq;
-        const clear = (): void => {
-          if (this.activeReasonerCauseSeq === entry.seq) {
-            this.activeReasonerCauseSeq = null;
-          }
-        };
-        void result.turn.then(clear, clear);
-      }
-      return result;
+      return this.reasoner.deliver(message, { causeTag: entry.seq });
     }
 
     const talker = this.talker!;
@@ -1789,20 +1807,12 @@ export class CortexAgent {
     } else {
       router.noteUserUtterance(content);
     }
-    const result = talker.deliver(
-      content,
-      options?.wake !== undefined ? { wake: options.wake } : undefined,
-    );
-    if (result.outcome === 'prompted' && result.turn) {
-      this.activeCauseSeq = entry.seq;
-      const clear = (): void => {
-        if (this.activeCauseSeq === entry.seq) {
-          this.activeCauseSeq = null;
-        }
-      };
-      void result.turn.then(clear, clear);
-    }
-    return result;
+    // Wake deliveries carry the utterance seq as their cause tag (a no-wake
+    // delivery is silent context and carries no causation).
+    return talker.deliver(content, {
+      ...(options?.wake !== undefined ? { wake: options.wake } : {}),
+      ...(options?.wake !== false ? { causeTag: entry.seq } : {}),
+    });
   }
 
   /**
@@ -2064,7 +2074,6 @@ export class CortexAgent {
     this.talkerUsageAtRestore = this.talker ? this.talker.getSessionUsage() : null;
     this.spawnSeqByTaskId.clear();
     this.activeCauseSeq = null;
-    this.activeReasonerCauseSeq = null;
     // Pre-restore queued content belongs to the replaced session: left in
     // place, queued silent deliveries would flush into the first
     // post-restore prompt (and stale steer/follow-up content into its run).
