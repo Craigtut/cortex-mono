@@ -14,12 +14,15 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { Type } from 'typebox';
+import type { AgentMessage } from '../../src/context-manager.js';
+import type { CompleteFn } from '../../src/compaction/compaction.js';
 import type { CortexTool } from '../../src/tool-contract.js';
 import type { ToolPermissionRequestContext } from '../../src/types.js';
 import { buildBrokeredPermissionResolver } from '../../src/duplex/permission-broker.js';
 import {
   createDuplexScenario,
   createPassthroughScenario,
+  createRealDuplexScenario,
   destroyLiveFacades,
   entriesOfType,
   getBroker,
@@ -355,6 +358,211 @@ describe('scenario: iterative design against the persistent reasoner', () => {
     expect(historyText).toContain('summarize the design we landed on');
     expect(h.reasonerLoop.getSessionUsage().totalTurns)
       .toBeGreaterThanOrEqual(EXCHANGES.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scenario 3b: the same reasoner, across a real compaction
+// ---------------------------------------------------------------------------
+
+/**
+ * Scenario 3 proves the reasoner loop is not thrown away between exchanges.
+ * That is only half the persistent-reasoner argument: architecture.md answers
+ * context rot with "compaction is controlled forgetting", so the other half
+ * is that a session which actually crosses a threshold keeps its accumulated
+ * understanding. Six short exchanges never come close to a threshold, so
+ * nothing tested that until here.
+ *
+ * The threshold is lowered rather than the content inflated, and the session
+ * is driven through the real create() so the staggered thresholds and the
+ * facade's idle-digestion scheduling are the ones under test.
+ *
+ * Observer and reflector are model calls. They are stubbed, so this asserts
+ * STRUCTURE and RETENTION (what the observer was shown, what survives in
+ * context afterwards, what shape both transcripts are left in) and never
+ * summary quality. Whether a real observer writes a good observation is a
+ * model question no unit test answers.
+ */
+describe('scenario: the persistent reasoner across a compaction', () => {
+  const EARLY_FACT = 'cache key is tenant id plus route';
+  const LATE_FACT = 'eviction metric is a counter per tenant';
+
+  /** Bulk that makes an exchange cost real context, as long work does. */
+  function bulk(label: string): string {
+    return `${label} ${'detail '.repeat(700)}`;
+  }
+
+  /**
+   * Stub observer/reflector for one loop. It reports back what it was
+   * actually shown, so "the early fact survived" means the pipeline carried
+   * it, not that the test wrote it into the slot itself.
+   */
+  function stubObserver(loop: {
+    getCompactionManager: () => { setObservationalCompleteFn: (fn: CompleteFn) => void };
+  }, seen: string[]): void {
+    loop.getCompactionManager().setObservationalCompleteFn(async (context) => {
+      const text = JSON.stringify(context.messages);
+      seen.push(text);
+      const carried = text.includes(EARLY_FACT)
+        ? `Design decision: ${EARLY_FACT}`
+        : 'Design decision: (the early exchange was already gone)';
+      return [
+        '<observations>',
+        'Date: Apr 10, 2026',
+        '',
+        `* \u{1F7E1} (10:00) ${carried}`,
+        '</observations>',
+        '',
+        '<current-task>',
+        'Designing the caching layer.',
+        '</current-task>',
+        '',
+        '<suggested-response>',
+        'Continue.',
+        '</suggested-response>',
+      ].join('\n');
+    });
+  }
+
+  /** Tool calls and their results must pair up, in order, on every loop. */
+  function assertTranscriptShape(messages: AgentMessage[]): void {
+    const open = new Set<string>();
+    for (const message of messages) {
+      const record = message as unknown as {
+        role: string;
+        content?: unknown;
+        toolCallId?: string;
+      };
+      if (record.role === 'assistant' && Array.isArray(record.content)) {
+        for (const block of record.content as Array<{ type?: string; id?: string }>) {
+          if (block.type === 'toolCall' && block.id) open.add(block.id);
+        }
+      }
+      if (record.role === 'toolResult') {
+        expect(open.has(String(record.toolCallId))).toBe(true);
+        open.delete(String(record.toolCallId));
+      }
+    }
+    // Nothing left hanging: every call this transcript makes was answered.
+    expect([...open]).toEqual([]);
+  }
+
+  it('keeps one reasoner, and the early design, across a compaction it really crosses', async () => {
+    const observerSaw: string[] = [];
+    const talkerObserverSaw: string[] = [];
+    const h = await createRealDuplexScenario({
+      // Small window plus a low activation threshold: the session crosses a
+      // real threshold instead of being handed a pre-compacted history.
+      contextWindowLimit: 12_000,
+      compaction: {
+        strategy: 'observational',
+        observational: { activationThreshold: 0.35 },
+      },
+      duplex: { idleDigestionDelayMs: 5 },
+    });
+    stubObserver(h.reasonerLoop, observerSaw);
+    stubObserver(h.talkerLoop, talkerObserverSaw);
+    const reasonerBefore = h.reasonerLoop;
+
+    // Exchange 1 establishes the fact everything later depends on.
+    h.talkerPi.script = [{
+      text: 'Starting the design.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'design the caching layer' } }],
+    }];
+    h.reasonerPi.script = [{ text: bulk(`Noted: the ${EARLY_FACT}.`) }];
+    await h.facade.prompt(`lets design the caching layer, the ${EARLY_FACT}`);
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'first dispatch');
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner idle');
+
+    // Several more exchanges pile context on top of it. Each reasoner run
+    // makes a real tool call, so its transcript carries tool-call groups
+    // that a badly placed compaction boundary could split.
+    for (const [index, utterance] of [
+      'use an LRU rather than a TTL',
+      'what about the cold start case?',
+      'add a write-through path too',
+      `and make the eviction metric observable: the ${LATE_FACT}`,
+    ].entries()) {
+      h.talkerPi.script = [{
+        text: `Passing that along (${index + 2}).`,
+        calls: [{ name: 'steer_task', args: { taskAlias: 'task-1', message: utterance } }],
+      }];
+      h.reasonerPi.script = [
+        {
+          text: bulk(`Working on step ${index + 2}.`),
+          calls: [{
+            name: 'Deliver',
+            args: { content: `Step ${index + 2} noted.`, wake: 'silent' },
+          }],
+        },
+        { text: `Step ${index + 2} done.` },
+      ];
+      await h.facade.prompt(utterance);
+      await waitUntil(
+        () => h.reasonerPi.promptCalls.length === index + 2,
+        2000, `dispatch ${index + 2}`,
+      );
+      await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, `reasoner idle ${index + 2}`);
+    }
+    // The transcripts really do carry tool-call groups going in.
+    expect(
+      h.reasonerLoop.getConversationHistory().filter((m) => String(m.role) === 'toolResult').length,
+    ).toBeGreaterThan(0);
+
+    const historyBefore = h.reasonerLoop.getConversationHistory().length;
+
+    // The facade's idle digestion is where the blocking pass runs in duplex
+    // (architecture.md: it fires while nobody is waiting).
+    await waitUntil(() => observerSaw.length > 0, 3000, 'observer ran');
+    await waitUntil(
+      () => h.reasonerLoop.getObservationalMemoryState().observations.length > 0,
+      3000, 'observations landed in context',
+    );
+
+    // Compaction really fired: the raw transcript shed messages.
+    await waitUntil(
+      () => h.reasonerLoop.getConversationHistory().length < historyBefore,
+      3000, 'source history compacted',
+    );
+
+    // The observer was shown the early exchange, and what it wrote is what
+    // the loop now carries in context.
+    expect(observerSaw.some((seen) => seen.includes(EARLY_FACT))).toBe(true);
+    const observations = h.reasonerLoop.getObservationalMemoryState().observations;
+    expect(observations).toContain(EARLY_FACT);
+    expect(observations).not.toContain('the early exchange was already gone');
+
+    // Same loop object, same session, one reasoner. Forgetting happened
+    // inside it rather than by replacing it.
+    expect(h.reasonerLoop).toBe(reasonerBefore);
+    expect(h.reasonerLoop.state).toBe('active');
+
+    // The conversation carries on, and the next dispatch still lands.
+    h.talkerPi.script = [{
+      text: 'Summarizing now.',
+      calls: [{ name: 'steer_task', args: { taskAlias: 'task-1', message: 'summarize it' } }],
+    }];
+    h.reasonerPi.script = [{ text: 'Here is the design we landed on.' }];
+    const dispatchesBefore = h.reasonerPi.promptCalls.length;
+    await h.facade.prompt('summarize the design we landed on');
+    await waitUntil(
+      () => h.reasonerPi.promptCalls.length === dispatchesBefore + 1,
+      2000, 'post-compaction dispatch',
+    );
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner idle after summary');
+
+    // Neither transcript was left with an orphaned tool call.
+    assertTranscriptShape(h.reasonerLoop.getConversationHistory());
+    assertTranscriptShape(h.talkerLoop.getConversationHistory());
+
+    // And on the wire the early fact is genuinely reachable: the message
+    // array pi would send opens with the observations slot carrying it,
+    // even though the raw exchange that stated it is gone from the
+    // transcript. That is the whole "controlled forgetting" claim.
+    const wire = h.reasonerPi.state.messages;
+    expect(String(wire[0]?.role)).toBe('user');
+    expect(JSON.stringify(wire[0]?.content)).toContain(EARLY_FACT);
+    expect(JSON.stringify(h.reasonerLoop.getConversationHistory())).not.toContain(EARLY_FACT);
   });
 });
 
