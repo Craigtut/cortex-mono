@@ -2056,6 +2056,34 @@ describe('duplex permission broker', () => {
       .filter((call) => promptText(call).includes('ask-rv')).length >= 2);
   });
 
+  it('a voicing destroyed on the talker un-anchors and is read out again', async () => {
+    // The loop destroys parked wake deliveries in several places (a stale
+    // abort epoch at the gate, a sweep past the re-park cap, abort itself);
+    // all of them report through the dead-letter surface, which is what the
+    // facade subscribes the broker to. Without that, the ask stays anchored
+    // and allow-eligible while nothing ever reached the user.
+    const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+    talkerPi.hold = true;
+    const turn = facade.prompt('hold the floor');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+
+    const { decisions } = startToolAsk(facade, 'ask-dl', 'Bash: rm -rf /tmp/y');
+    const voicedEntries = (): number => facade.getLog()
+      .filter((entry) => entry.data?.['event'] === 'ask_voiced').length;
+    await waitUntil(() => voicedEntries() === 1);
+
+    // The voicing parked behind the live run and is destroyed with it.
+    await talkerLoop.abort();
+    await turn.catch(() => {});
+    await waitUntil(() => facade.getLog()
+      .some((entry) => entry.data?.['event'] === 'delivery_dead_lettered'));
+
+    // The ask survives (the work side was untouched) and is re-voiced.
+    await waitUntil(() => voicedEntries() >= 2);
+    expect(getBroker(facade).pendingAskCount).toBe(1);
+    expect(decisions).toHaveLength(0);
+  });
+
   it('withBrokeredPermissions wraps exactly the configured surfaces', async () => {
     const bare: CortexAgentConfig = {
       model: testModel(),

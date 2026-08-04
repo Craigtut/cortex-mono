@@ -1979,6 +1979,13 @@ export class CortexAgent {
           ...(result.kind === 'wake_delivery' ? { message: result.message } : {}),
         },
       });
+      // A destroyed wake delivery on the conversation surface may be a
+      // permission voicing, in which case the user never heard the request
+      // the broker still counts as read out. The broker withdraws its
+      // consent anchor and reads it again (D16 anchor rules).
+      if (result.kind === 'wake_delivery' && loop === this.talker) {
+        this.router?.permissionBroker.noteDeliveryDestroyed(result.message);
+      }
     });
   }
 
@@ -2400,9 +2407,11 @@ export class CortexAgent {
       await Promise.all(work);
       if (scope === 'conversation') {
         // The work loops kept running, so a voiced ask is still pending,
-        // but its voicing delivery may have been destroyed with the
-        // talker's queues; read it out again.
-        this.router!.permissionBroker.revoiceCurrent(true);
+        // but its voicing delivery was destroyed with the talker's queues
+        // (clearAllQueues takes it before the loop's own dead-letter path
+        // can report it). Treat it as unheard: withdraw the anchor and read
+        // it out again.
+        this.router!.permissionBroker.noteVoicingLost();
       }
       return;
     }
