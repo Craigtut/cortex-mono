@@ -14,6 +14,7 @@
 import { describe, it, expect } from 'vitest';
 import { DUPLEX_ROUTER_DEFAULTS, DuplexRouter } from '../../src/duplex/router.js';
 import type { DuplexRouterOptions, DuplexRouterPorts, RouterLogInput } from '../../src/duplex/router.js';
+import { collectCauseTags } from '../../src/duplex/cause-tags.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
 import type { BrokeredAskDecision, BrokeredAskRequest } from '../../src/duplex/permission-broker.js';
@@ -30,6 +31,11 @@ interface Harness {
   askVoicings: Array<{ content: string; causeTag: CauseTag }>;
   voicedRegistryIds: string[];
   setTalkerCauseTags: (tags: readonly CauseTag[]) => void;
+  /**
+   * Feed the talker's raw (unvalidated) cause-tag slot, exactly as the loop
+   * exposes it. The port runs collectCauseTags over it, like the facade.
+   */
+  setRawTalkerCauseTags: (tags: readonly unknown[]) => void;
   /** Make the ask lane throw (a talker mid-teardown refuses deliveries). */
   failVoicing: (fail: boolean) => void;
   advance: (ms: number) => void;
@@ -41,7 +47,7 @@ interface Harness {
 
 function createHarness(options?: DuplexRouterOptions): Harness {
   let clock = 1_000_000;
-  let talkerCauseTags: readonly CauseTag[] = [];
+  let rawTalkerCauseTags: readonly unknown[] = [];
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const askVoicings: Array<{ content: string; causeTag: CauseTag }> = [];
@@ -64,7 +70,9 @@ function createHarness(options?: DuplexRouterOptions): Harness {
       return seq;
     },
     currentTalkerCauseSeq: () => null,
-    currentTalkerCauseTags: () => talkerCauseTags,
+    // The facade's own wiring: the loop's tag slot is `unknown`, so
+    // collectCauseTags is the only validator ahead of the consent decision.
+    currentTalkerCauseTags: () => collectCauseTags(rawTalkerCauseTags),
     currentReasonerCauseSeq: () => null,
   };
 
@@ -82,7 +90,8 @@ function createHarness(options?: DuplexRouterOptions): Harness {
     talkerDeliveries,
     askVoicings,
     voicedRegistryIds,
-    setTalkerCauseTags: (tags) => { talkerCauseTags = tags; },
+    setTalkerCauseTags: (tags) => { rawTalkerCauseTags = tags; },
+    setRawTalkerCauseTags: (tags) => { rawTalkerCauseTags = tags; },
     failVoicing: (fail) => { voicingFails = fail; },
     advance: (ms) => { clock += ms; },
     lastVoicedSeq: () => {
@@ -501,6 +510,39 @@ describe('D16 consent binding', () => {
     expect(first.decisions).toEqual([{ decision: 'allow' }]);
     expect(second.decisions).toHaveLength(0);
     expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+  });
+
+  it('only tags the facade actually stamped can qualify as consent', async () => {
+    // The loop's cause-tag slot is `unknown`, so collectCauseTags is the
+    // only validator between arbitrary content and this decision. Each
+    // near-miss below would satisfy a looser check.
+    const h = createHarness();
+    const { decisions } = requestAsk(h);
+    const newer = h.lastVoicedSeq() + 1;
+
+    const nearMisses: Array<[string, readonly unknown[]]> = [
+      ['wrong-case kind', [{ kind: 'Utterance', seq: newer }]],
+      ['string seq', [{ kind: 'utterance', seq: String(newer) }]],
+      ['no kind, NaN seq', [{ seq: NaN }]],
+      ['kind only', [{ kind: 'utterance' }]],
+      ['not an object', ['utterance', newer, null]],
+      ['array-shaped tag', [[['kind', 'utterance'], ['seq', newer]]]],
+      ['nested past the flatten cap', [[[[[[{ kind: 'utterance', seq: newer }]]]]]]],
+    ];
+    for (const [label, tags] of nearMisses) {
+      h.setRawTalkerCauseTags(tags);
+      h.advance(3_001);
+      const refused = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+      expect(refused.content[0]!.text, label).toContain('Not accepted');
+      expect(decisions, label).toHaveLength(0);
+    }
+
+    // A real tag nested one level (the truncation-repair delivery shape)
+    // still binds, so the strictness is the validator's and not the port's.
+    h.setRawTalkerCauseTags([[{ kind: 'utterance', seq: newer }]]);
+    const allowed = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    expect(allowed.content[0]!.text).toBe('Approval passed along.');
+    await waitUntil(() => decisions.length === 1);
   });
 
   it('deny is unrestricted: it settles an unvoiced ask by id with no causation at all', async () => {

@@ -2058,6 +2058,50 @@ describe('duplex permission broker', () => {
       .filter((call) => promptText(call).includes('ask-rv')).length >= 2);
   });
 
+  it('a real barge-in yes riding the same run as the voicing still cannot grant it', async () => {
+    // Both the ask voicing and a user utterance park behind a live turn and
+    // are consumed by one sweep run, so the run genuinely carries a
+    // qualifying utterance tag AND this ask's voicing tag. The yes was
+    // spoken before the request could have been read out, so the second
+    // anchor rule (not the seq comparison) is what refuses it. The broker
+    // harness wires cause tags by hand and cannot show this.
+    const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+    talkerPi.hold = true;
+    const held = facade.prompt('start something');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+
+    const { decisions } = startToolAsk(facade, 'ask-race', 'Bash: rm -rf /tmp/z');
+    await waitUntil(() => getBroker(facade).pendingAskCount === 1);
+    const bargeIn = facade.prompt('yes, go ahead');
+
+    // The sweep run picks up both; hold it so answer_ask runs inside it.
+    talkerPi.hold = true;
+    talkerPi.releaseRun();
+    await waitUntil(() => talkerPi.promptCalls.length === 2);
+    const sweep = promptText(talkerPi.promptCalls[1]!);
+    expect(sweep).toContain('yes, go ahead');
+    expect(sweep).toContain('ask-race');
+    // Both causes really are on the run.
+    expect(talkerLoop.activeRunCauseTags).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'utterance' }),
+        expect.objectContaining({ kind: 'ask' }),
+      ]),
+    );
+
+    const answerAsk = getPiTool(talkerPi, 'answer_ask');
+    const refused = await answerAsk.execute('c1', {
+      askId: 'ask-race',
+      decision: 'allow',
+    }) as { content: Array<{ text: string }> };
+    expect(refused.content[0]!.text).toContain('Not accepted');
+    expect(decisions).toHaveLength(0);
+    expect(getBroker(facade).pendingAskCount).toBe(1);
+
+    talkerPi.releaseRun();
+    await Promise.all([held, bargeIn]);
+  });
+
   it('a voicing destroyed on the talker un-anchors and is read out again', async () => {
     // The loop destroys parked wake deliveries in several places (a stale
     // abort epoch at the gate, a sweep past the re-park cap, abort itself);
