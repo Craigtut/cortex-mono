@@ -1,6 +1,6 @@
 # Migration Plan
 
-> **STATUS: IN PROGRESS.** Phases 0, 1, and 2a complete. 2b (duplex behaviors) and Phase 3 outstanding.
+> **STATUS: IN PROGRESS.** Phases 0, 1, 2a, and 2b-i complete. 2b-ii and Phase 3 outstanding.
 
 Four phases, developed on the `duplex-restructure` branch (an exception to the usual commit-to-main rule, given the size of the overhaul). Each phase lands in small conventional commits, keeps the test suite green, and is independently valuable. File:line references are as of 2026-08 and will drift; they identify the sites, not eternal truths.
 
