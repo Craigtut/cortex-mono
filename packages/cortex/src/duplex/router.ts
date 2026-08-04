@@ -38,7 +38,7 @@ import {
 import type { ConversationDelta } from './prompts.js';
 import type { CauseTag } from './cause-tags.js';
 import type { ControlDispatchTarget } from './control-tools.js';
-import { PermissionBroker } from './permission-broker.js';
+import { PERMISSION_BROKER_DEFAULTS, PermissionBroker } from './permission-broker.js';
 import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
 import type { QuickLookupOutcome, QuickLookupRequestResult } from './quick-lookups.js';
 
@@ -149,9 +149,9 @@ export interface DuplexRouterOptions {
    */
   askTimeoutMs?: number | null;
   /**
-   * Timeout for sandbox escalation asks. Default null (none): auto-denying
-   * an escalation leaves the command running contained and failing, which
-   * invites a retry loop (communication.md).
+   * Timeout for sandbox escalation asks: long rather than absent, since no
+   * bound at all lets a talker that never relays the request block the
+   * asking run indefinitely (PERMISSION_BROKER_DEFAULTS). Null disables it.
    */
   escalationAskTimeoutMs?: number | null;
   /** Clock override for tests. */
@@ -170,8 +170,8 @@ export const DUPLEX_ROUTER_DEFAULTS = {
   maxDispatchesPerExchange: 8,
   watchdogIntervalMs: 90_000,
   deltaBufferMaxChars: 16_000,
-  askTimeoutMs: 120_000 as number | null,
-  escalationAskTimeoutMs: null as number | null,
+  askTimeoutMs: PERMISSION_BROKER_DEFAULTS.askTimeoutMs,
+  escalationAskTimeoutMs: PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs,
 } as const;
 
 type ResolvedOptions = typeof DUPLEX_ROUTER_DEFAULTS;

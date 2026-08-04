@@ -149,9 +149,8 @@ export interface PermissionBrokerOptions {
    */
   askTimeoutMs?: number | null;
   /**
-   * Timeout for sandbox escalation asks. Default null (no timeout): an
-   * auto-denied escalation leaves the command running contained and
-   * failing, which invites a retry loop (communication.md).
+   * Timeout for sandbox escalation asks. Long rather than absent (see
+   * {@link PERMISSION_BROKER_DEFAULTS}). Null disables it.
    */
   escalationAskTimeoutMs?: number | null;
   /** Clock override for tests (stamps and revoice damping, not timers). */
@@ -160,7 +159,17 @@ export interface PermissionBrokerOptions {
 
 export const PERMISSION_BROKER_DEFAULTS = {
   askTimeoutMs: 120_000 as number | null,
-  escalationAskTimeoutMs: null as number | null,
+  /**
+   * Escalations get a long bound, not none. The reason for the leniency
+   * holds (auto-denying an escalation leaves the command running contained
+   * and failing, which invites a retry loop, communication.md), and a long
+   * bound satisfies it just as well as no bound does. No bound has a
+   * failure mode of its own: with no answer, no abort and no destroy, the
+   * asking run blocks forever while the watchdog truthfully reports it as
+   * still working, which is exactly what a talker that never relays the
+   * request produces.
+   */
+  escalationAskTimeoutMs: 900_000 as number | null,
 } as const;
 
 /**
@@ -194,6 +203,15 @@ const UNBOUND_RECEIPT =
 const TIMEOUT_DENY_REASON =
   'No answer from the user before the permission request timed out; denied by default. ' +
   'Ask again if the work still needs it.';
+/**
+ * Escalations time out on a much longer bound, so the reason says what
+ * actually happened: nobody ever came back with a decision. The asking run
+ * is unblocked either way, and the distinct wording keeps a silent relay
+ * failure from reading like an ordinary short-timeout deny.
+ */
+const ESCALATION_TIMEOUT_DENY_REASON =
+  'Nobody answered the request to run outside the sandbox before it timed out; ' +
+  'denied by default. Continue contained if that is possible, or ask again.';
 const ABORT_DENY_REASON = 'The run that raised this permission request was aborted.';
 
 const DROP_REASONS: Record<'abort' | 'restore' | 'destroy', string> = {
@@ -696,7 +714,12 @@ export class PermissionBroker {
       causedBy: ask.entrySeq,
       data: { askId, decision: 'deny', timedOut: true },
     });
-    this.settle(ask, { decision: 'deny', reason: TIMEOUT_DENY_REASON });
+    this.settle(ask, {
+      decision: 'deny',
+      reason: ask.request.kind === 'escalation'
+        ? ESCALATION_TIMEOUT_DENY_REASON
+        : TIMEOUT_DENY_REASON,
+    });
   }
 
   private handleAbort(askId: string): void {

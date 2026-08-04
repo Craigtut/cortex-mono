@@ -12,12 +12,13 @@
  * tested as one mechanism.
  */
 import { describe, it, expect } from 'vitest';
-import { DuplexRouter } from '../../src/duplex/router.js';
+import { DUPLEX_ROUTER_DEFAULTS, DuplexRouter } from '../../src/duplex/router.js';
 import type { DuplexRouterOptions, DuplexRouterPorts, RouterLogInput } from '../../src/duplex/router.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
 import type { BrokeredAskDecision, BrokeredAskRequest } from '../../src/duplex/permission-broker.js';
 import {
+  PERMISSION_BROKER_DEFAULTS,
   buildBrokeredNetworkResolver,
   buildBrokeredPermissionResolver,
 } from '../../src/duplex/permission-broker.js';
@@ -508,7 +509,7 @@ describe('D16 consent binding', () => {
 // ---------------------------------------------------------------------------
 
 describe('ask timeouts and settlement', () => {
-  it('a tool ask times out to deny with a reason; escalation asks have no default timeout', async () => {
+  it('a tool ask times out to deny with a reason; escalations wait far longer', async () => {
     const h = createHarness({ askTimeoutMs: 40 });
     const tool = requestAsk(h, { askId: 'ask-tool' });
     const escalation = requestAsk(h, {
@@ -527,9 +528,36 @@ describe('ask timeouts and settlement', () => {
     // auto-denied escalation leaves the command running contained and
     // failing, which invites a retry loop (communication.md).
     expect(escalation.decisions).toHaveLength(0);
+    await waitUntil(() => h.askVoicings.length === 2);
     expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
       { askId: 'ask-esc', voiced: true },
     ]);
+  });
+
+  it('an escalation nobody answers is bounded, and says so distinctly', async () => {
+    const h = createHarness({ escalationAskTimeoutMs: 40 });
+    const escalation = requestAsk(h, {
+      askId: 'ask-esc',
+      toolName: 'Bash(escalate)',
+      kind: 'escalation',
+    });
+    await waitUntil(() => escalation.decisions.length === 1);
+    expect(escalation.decisions[0]!.decision).toBe('deny');
+    // Distinct from the ordinary timeout wording: nobody ever answered.
+    expect(escalation.decisions[0]!.reason).toContain('Nobody answered');
+    expect(escalation.decisions[0]!.reason).toContain('outside the sandbox');
+
+    // No bound at all wedges the asking run forever when the talker never
+    // relays the request: the only other exits are an abort or destroy, and
+    // the watchdog meanwhile reports the run as still working.
+    expect(PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs).toBeGreaterThanOrEqual(600_000);
+    expect(PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs).toBeLessThanOrEqual(900_000);
+    expect(DUPLEX_ROUTER_DEFAULTS.escalationAskTimeoutMs)
+      .toBe(PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs);
+    // Long, not lenient: an escalation still waits orders of magnitude
+    // longer than an ordinary tool ask.
+    expect(PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs!)
+      .toBeGreaterThan(PERMISSION_BROKER_DEFAULTS.askTimeoutMs! * 4);
   });
 
   it('an aborted run settles its ask as deny and the next queued ask voices', async () => {
