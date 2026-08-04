@@ -3052,10 +3052,18 @@ export class AgentLoop {
             isError,
           }) ?? undefined;
         } catch (err) {
-          agent.logger.error('tool result interceptor threw; ignoring', {
-            toolName: toolCall.name,
-            error: err instanceof Error ? err.message : String(err),
-          });
+          // The consumer's logger is itself untrusted here: if it throws,
+          // the error propagates out of afterToolCall and pi wraps it into
+          // an error result WITHOUT terminate, exactly the D17 shape this
+          // catch exists to prevent.
+          try {
+            agent.logger.error('tool result interceptor threw; ignoring', {
+              toolName: toolCall.name,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          } catch {
+            // Nothing safe left to report to.
+          }
         }
       }
 

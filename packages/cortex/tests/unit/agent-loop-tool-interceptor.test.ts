@@ -225,6 +225,34 @@ describe('setToolResultInterceptor', () => {
     expect(blocks[1]!.text).toBe(REMINDER);
   });
 
+  it('swallows a throwing consumer logger inside the interceptor catch (N5)', async () => {
+    // The catch for a throwing interceptor reports through the consumer's
+    // logger; if that logger also throws, the error must not escape
+    // afterToolCall (pi would wrap it into an error result without
+    // terminate, the exact D17 shape the catch exists to prevent).
+    const { loop, hook } = buildLoopWithHook({
+      logger: {
+        debug: () => {},
+        info: () => {},
+        warn: () => {},
+        error: () => {
+          throw new Error('logger bug');
+        },
+      },
+    });
+    loop.setToolResultInterceptor(() => {
+      throw new Error('interceptor bug');
+    });
+    const out = await hook({
+      toolCall: { name: 'Bash' },
+      result: textResult('output'),
+      isError: false,
+    });
+    // Both throws swallowed; the normal reminder path proceeds.
+    const blocks = out!.content as Array<{ type: string; text: string }>;
+    expect(blocks[1]!.text).toBe(REMINDER);
+  });
+
   it('is removable with null', async () => {
     const { loop, hook } = buildLoopWithHook();
     const interceptor = vi.fn<ToolResultInterceptor>(() => ({
