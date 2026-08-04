@@ -22,6 +22,7 @@
  * primitive); this module is the facade-side discipline over it.
  */
 
+import { SESSION_LOG_ENTRY_TYPES } from '../session-log.js';
 import type { SessionLogEntryType } from '../session-log.js';
 
 /**
@@ -34,11 +35,20 @@ export interface CauseTag {
   readonly seq: number;
 }
 
-/** Structural check for a facade-stamped cause tag. */
+const ENTRY_TYPE_SET: ReadonlySet<string> = new Set(SESSION_LOG_ENTRY_TYPES);
+
+/**
+ * Structural check for a facade-stamped cause tag. The loop's tag slot is
+ * `unknown`, so this is the only validator between arbitrary input and the
+ * D16 consent decision: `kind` must be a real log entry type (the broker
+ * branches on it) and `seq` a positive integer (log seqs start at 1; a NaN
+ * here would poison latestCauseSeq and the causedBy stamp).
+ */
 export function isCauseTag(value: unknown): value is CauseTag {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const tag = value as { kind?: unknown; seq?: unknown };
-  return typeof tag.kind === 'string' && typeof tag.seq === 'number';
+  return typeof tag.kind === 'string' && ENTRY_TYPE_SET.has(tag.kind)
+    && typeof tag.seq === 'number' && Number.isInteger(tag.seq) && tag.seq > 0;
 }
 
 /**

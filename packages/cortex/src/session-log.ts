@@ -34,18 +34,24 @@ import { NOOP_LOGGER } from './noop-logger.js';
  * - `ask` / `ask_answer`: permission asks brokered through conversation
  *   (produced in duplex mode; the types are part of the artifact contract).
  * - `lookup_result`: a quick-lookup sub-agent's result (duplex).
+ *
+ * The runtime array is the source of truth; the union derives from it so a
+ * validator over the vocabulary (isCauseTag) can never drift from the type.
  */
-export type SessionLogEntryType =
-  | 'utterance'
-  | 'reply'
-  | 'directive'
-  | 'delivery'
-  | 'error'
-  | 'retrying'
-  | 'lifecycle'
-  | 'ask'
-  | 'ask_answer'
-  | 'lookup_result';
+export const SESSION_LOG_ENTRY_TYPES = [
+  'utterance',
+  'reply',
+  'directive',
+  'delivery',
+  'error',
+  'retrying',
+  'lifecycle',
+  'ask',
+  'ask_answer',
+  'lookup_result',
+] as const;
+
+export type SessionLogEntryType = (typeof SESSION_LOG_ENTRY_TYPES)[number];
 
 /**
  * Wake policy vocabulary (decisions.md D10), stamped on entries destined for
