@@ -768,6 +768,36 @@ describe('ask timeouts and settlement', () => {
     expect(h.askVoicings).toHaveLength(1);
   });
 
+  it('re-voice damping keeps a real margin over the delivery spacing window', async () => {
+    // Every voicing stamps the router's spacing clock, so a damping window
+    // equal to that spacing gives no margin at all: the re-voice becomes
+    // eligible on the same tick the held ordinary deliveries do.
+    const h = createHarness();
+    requestAsk(h);
+    h.setTalkerCauseTags([]);
+
+    h.advance(DUPLEX_ROUTER_DEFAULTS.minDeliverySpacingMs);
+    await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    expect(h.askVoicings).toHaveLength(1);
+
+    h.advance(1);
+    await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    expect(h.askVoicings).toHaveLength(1);
+  });
+
+  it('settleAll is inert after destroy, like every other lifecycle method', async () => {
+    const h = createHarness();
+    const { decisions } = requestAsk(h);
+    h.router.destroy();
+    await waitUntil(() => decisions.length === 1);
+    const entries = h.log.length;
+
+    h.router.permissionBroker.settleAll('abort');
+    h.router.permissionBroker.reset();
+    expect(h.log).toHaveLength(entries);
+    expect(decisions).toHaveLength(1);
+  });
+
   it('resetForRestore settles pending asks as deny (they belong to the replaced session)', async () => {
     const h = createHarness();
     const { decisions } = requestAsk(h);

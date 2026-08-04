@@ -202,8 +202,14 @@ export const PERMISSION_BROKER_DEFAULTS = {
  * carry many refused answer_ask calls (the N4 shape); without damping each
  * refusal would re-deliver the voicing and the ask would talk over itself.
  * The ask stays answerable the whole time; only the re-delivery is damped.
+ *
+ * Deliberately larger than the router's default inter-delivery spacing
+ * (2s): every voicing stamps that spacing clock, so at equal values the
+ * re-voice becomes eligible exactly as the queued ordinary deliveries do,
+ * and the margin the damping is supposed to provide is zero by
+ * construction.
  */
-const REVOICE_MIN_INTERVAL_MS = 2_000;
+const REVOICE_MIN_INTERVAL_MS = 3_000;
 
 /** Cap on {@link PermissionBroker.settledAskIds}. */
 const MAX_SETTLED_ASK_IDS = 64;
@@ -613,6 +619,10 @@ export class PermissionBroker {
    * is guarded. Never leaves a resolver hanging.
    */
   settleAll(cause: 'abort' | 'restore' | 'destroy'): void {
+    // Guarded like every other lifecycle method: after destroy there are no
+    // asks to settle, and a late abort or restore must not re-enter the
+    // drain.
+    if (this.destroyed) return;
     this.clearSettleVoiceTimer();
     this.draining = true;
     try {
