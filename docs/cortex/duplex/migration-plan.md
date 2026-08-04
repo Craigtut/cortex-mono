@@ -75,6 +75,12 @@ Duplex behavior, assembled behind the 2a skeleton.
 
 ## Phase 3: Validation and Default Flip
 
+**Consumer migration checklist**, from the 2a verification pass. The facade is not a drop-in replacement for `AgentLoop`; `AGENT_LOOP_DELEGATION` in `src/cortex-agent.ts` is the authoritative disposition source, and these are the three places a real migration breaks:
+
+- `packages/cortex-code/src/session.ts:1948-1963` calls all three subsumed `restore*` methods on a bare `AgentLoop`. This is a call-site rewrite into a single `restore()`, not a rename, because `restore()` is all-or-nothing and rejects while running.
+- There is no facade route to parked-wake content dropped by `abort()` or `restore()`. `clearAllQueues()` returns that content for re-routing and both facade call sites discard it. Either forward it or surface the dropped content on the abort log entry (this overlaps the wake dead-letter item in 2b's scope).
+- Facade `abort()` clears queues that a direct `AgentLoop.abort()` retains. Intended per the abort table, documented in facade-api.md, and pinned by a parity test that asserts the divergence rather than papering over it. A consumer relying on `steer()` content surviving an abort must re-issue after migrating.
+
 1. Scenario integration tests, each run in both modes:
    - coding session with mid-work questions and a quick lookup
    - deep research with a mid-flight redirect (parent-to-child steer)
