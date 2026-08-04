@@ -49,7 +49,7 @@ Split into 2a (skeleton, passthrough-only, the parity checkpoint) and 2b (duplex
 
 Landed the facade class with a compile-checked config routing table, `SessionLog` (monotonic seq, causation stamps, bounded replayable subscriptions, ring-buffer retention with spill), v2 composite persistence (baseline-plus-delta usage with a per-loop breakdown, restore-while-running rejection, v1 and bare-array upgrade paths, debounced `onStateChanged` snapshotting only at gate quiescence), settlement predicates over gate depth, and a side-by-side parity suite driving `AgentLoop` and the facade over identical mock loops. `mode: 'duplex'` throws rather than silently degrading. Suite 2954 to 3035.
 
-Two mechanism deviations are recorded as footnotes in facade-api.md; both resolve in 2b. Causation stamps bind exactly for facade-initiated runs and are deliberately absent (rather than guessed) for runs the facade did not start, since the router owns those in 2b and D16 binds consent to causation.
+Two mechanism deviations are recorded as footnotes in facade-api.md; both resolve in 2b. Causation stamps bound exactly for facade-initiated runs and were deliberately absent (rather than guessed) for runs the facade did not start. 2b-i replaced that scheme: the cause now travels with the delivered content, which closed a blocker where a barge-in utterance produced a turn with no chain at all, and extended binding to runs the facade does not start. See log-and-context.md.
 
 ### 2b-i (complete)
 

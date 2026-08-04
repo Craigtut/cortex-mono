@@ -86,6 +86,8 @@ Rules for the headline block, from the audit:
 
 Every entry carries a monotonic sequence number (timestamps collide under burst), and entries produced by a router-initiated run carry the sequence number of the entry that caused it. Causation is not only for observability: D16 uses it to bind consent.
 
+**The cause travels with the content, not in a facade field.** A delivery carries its cause tag from the moment it is parked; the loop surfaces the tags of whatever content the current run actually consumed, set in the same synchronous frame the run takes its batch and cleared in that run's own `finally`. This matters because the obvious implementation, a facade field set when a run is started, silently fails for the most common voice interaction there is: a user answering while the talker is still speaking parks behind the live run, so the field is never set and the resulting turn has an empty chain. It also races, since the field's clear is not synchronized with the loop gate, so a swept run can begin while the previous utterance's stamp still stands. Binding the cause to the content makes both impossible by construction, and as a side effect gives a dispatch parked behind a busy reasoner the directive causation an earlier draft of this document called unbindable.
+
 ## Cache Discipline Per Loop
 
 Each loop keeps its own transcript, its own stable session ID (`sessionId` per instance for prefix-cache routing; children already use taskId, `agent-loop.ts:4917-4918`), and its own cache breakpoints. The composite adds no cross-loop cache coupling:
