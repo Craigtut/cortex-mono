@@ -1267,6 +1267,12 @@ export class CortexAgent {
     }
     const spoken = extractSpokenText(info.assistantMessage);
     if (spoken.length === 0) {
+      // Open question (review N3): a model that keeps answering the nudge
+      // with another silent tool call oscillates here until the talker's
+      // hard maxTurns aborts the exchange. Whether to cap the forced
+      // follow-ups separately (and say what instead: give up silently, or
+      // synthesize a spoken fallback) is a policy call deferred until real
+      // usage shows how often fast-tier models actually oscillate.
       return {
         terminate: false,
         suppressWorkingTagsReminder: true,
