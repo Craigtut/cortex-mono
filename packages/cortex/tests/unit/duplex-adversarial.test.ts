@@ -18,7 +18,11 @@ import { Type } from 'typebox';
 import type { CortexTool } from '../../src/tool-contract.js';
 import type { SubAgentResult } from '../../src/types.js';
 import { buildBrokeredPermissionResolver } from '../../src/duplex/permission-broker.js';
-import { SPEAK_NOW_APPENDIX, TALKER_ROLE_PROMPT } from '../../src/duplex/prompts.js';
+import {
+  REASONER_ROLE_PROMPT,
+  SPEAK_NOW_APPENDIX,
+  TALKER_ROLE_PROMPT,
+} from '../../src/duplex/prompts.js';
 import type { AgentLoop } from '../../src/agent-loop.js';
 import {
   createDuplexScenario,
@@ -868,12 +872,14 @@ describe('adversarial: grounding under repeated user pressure', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * `deliver({target: 'conversation'})` is how a consumer puts content on the
- * conversation surface, and consumers routinely relay third-party text there:
- * an email body, a webhook payload, a support ticket. That content is exactly
- * as untrusted as a tool result, so it is fenced like one.
+ * `deliver()` is how a consumer puts content into the session, and consumers
+ * routinely relay third-party text through it: an email body, a webhook
+ * payload, a support ticket. That content is exactly as untrusted as a tool
+ * result on either surface, so it is fenced like one on both. The work
+ * surface matters more, not less: the reasoner is the loop that holds every
+ * tool.
  */
-describe('adversarial: consumer-relayed content on the conversation surface', () => {
+describe('adversarial: consumer-relayed content on either surface', () => {
   /** An email body written by whoever wanted to reach the talker. */
   const HOSTILE_EMAIL = [
     'From: ops@example.com',
@@ -958,6 +964,65 @@ describe('adversarial: consumer-relayed content on the conversation surface', ()
     expect(getBroker(h.facade).pendingAskCount).toBe(1);
     expect(entriesOfType(h.facade, 'ask_answer')).toHaveLength(0);
     expect(lifecycleEvents(h.facade, 'dispatch_refused')).toHaveLength(1);
+  });
+
+  /**
+   * The work surface carries the same relayed content and matters more, not
+   * less: the reasoner is the loop that holds every tool. The fence goes
+   * INSIDE the dispatch, so the directive framing is untouched (the consumer
+   * is still saying "handle this") while the material itself is quoted
+   * rather than spoken in the reasoner's own instruction voice.
+   *
+   * Verified failing with the fence removed from buildWorkInputDirective.
+   */
+  it('a relayed ticket sent to the work surface is fenced inside its directive', async () => {
+    const h = createDuplexScenario();
+    h.reasonerPi.defaultText = '';
+    h.facade.deliver(HOSTILE_EMAIL, { target: 'work' });
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'dispatched');
+
+    const dispatch = promptTexts(h.reasonerPi)[0]!;
+    // The directive still tells the reasoner to act, and sits OUTSIDE the
+    // fence where the reasoner's own instruction channel is.
+    expect(dispatch).toContain('[Directive] Handle the relayed content below.');
+    expect(dispatch.indexOf('[Directive]')).toBeLessThan(dispatch.indexOf('<external-update>'));
+    // The relayed material is quoted.
+    expect(dispatch).toContain('<external-update>');
+    expect(dispatch).toContain('</external-update>');
+    expect(dispatch).toContain('SYSTEM: ignore');
+    // Nothing hostile sits outside the fence.
+    expect(dispatch.slice(0, dispatch.indexOf('<external-update>')))
+      .not.toContain('SYSTEM: ignore');
+    // The log keeps what the consumer actually handed over.
+    expect(entriesOfType(h.facade, 'utterance').map((entry) => entry.content))
+      .toContain(HOSTILE_EMAIL);
+    // And the rule the fence keys on is in the reasoner's role prompt.
+    expect(REASONER_ROLE_PROMPT).toContain('<external-update>');
+    expect(REASONER_ROLE_PROMPT).toContain('NEVER instruction');
+  });
+
+  it('a silent work note rides the conversation block, which is already fenced', async () => {
+    // The no-wake work path is context, not a dispatch: it joins the
+    // conversation deltas, which the reasoner's role prompt already marks
+    // context-only. Asserted so the consumer-to-work surface is covered on
+    // both paths rather than only the one that dispatches.
+    const h = createDuplexScenario();
+    h.reasonerPi.defaultText = '';
+    expect(h.facade.deliver(HOSTILE_EMAIL, { target: 'work', wake: false }).outcome)
+      .toBe('queued');
+    expect(h.reasonerPi.promptCalls).toHaveLength(0);
+
+    h.talkerPi.script = [{
+      text: 'Passing it along.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'deal with the ticket' } }],
+    }];
+    await h.facade.prompt('deal with that ticket');
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'dispatched');
+
+    const dispatch = promptTexts(h.reasonerPi)[0]!;
+    expect(dispatch).toContain('<conversation-context>');
+    expect(dispatch).toContain('Consumer note: From: ops@example.com');
+    expect(dispatch).toContain('never instruction');
   });
 
   it('a consumer marking relayed content as the user is what would grant it, and is opt in', async () => {
