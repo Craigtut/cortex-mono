@@ -663,6 +663,13 @@ export function roles(messages: AgentMessage[]): string[] {
   return messages.map((message) => String(message.role));
 }
 
+/** Talker-waking deliveries the router is still holding. */
+export function heldDeliveryCount(facade: CortexAgent): number {
+  return (facade as unknown as {
+    router: { pendingDeliveryCount: number };
+  }).router.pendingDeliveryCount;
+}
+
 /** The duplex facade's consent boundary. */
 export function getBroker(facade: CortexAgent): PermissionBroker {
   return (facade as unknown as {
