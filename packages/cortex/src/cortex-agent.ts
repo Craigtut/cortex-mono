@@ -74,6 +74,8 @@ import type {
   ObservationalMemoryState,
   ReflectionEvent,
 } from './compaction/index.js';
+import { COMPACTION_DEFAULTS } from './compaction/compaction.js';
+import { OBSERVATIONAL_MEMORY_DEFAULTS } from './compaction/observational/constants.js';
 import { SessionLog } from './session-log.js';
 import type { SessionLogEntry, SessionLogSubscriber, WakeClass } from './session-log.js';
 import { NOOP_LOGGER } from './noop-logger.js';
@@ -339,8 +341,19 @@ const TALKER_RETRY_POLICY: Partial<RetryPolicy> = {
  */
 const COMPACTION_THRESHOLD_STAGGER = 0.05;
 
-/** Floor below which staggering stops making thresholds more aggressive. */
-const COMPACTION_THRESHOLD_FLOOR = 0.5;
+/**
+ * Stagger a talker threshold below the reasoner's effective value. The
+ * pair is clamped together rather than one side against a fixed floor: the
+ * talker gets the full stagger whenever the reasoner's threshold leaves
+ * room for it, and a pathologically low reasoner threshold shrinks the
+ * stagger to half the reasoner's value instead of letting the pair
+ * collapse to equality or invert. Strictly below the reasoner for every
+ * positive input, which is the property the stagger exists for.
+ */
+function staggerBelow(reasonerThreshold: number): number {
+  const stagger = Math.min(COMPACTION_THRESHOLD_STAGGER, reasonerThreshold / 2);
+  return reasonerThreshold - stagger;
+}
 
 /** Suffix appended to the consumer session id for the talker's cache key. */
 const TALKER_SESSION_ID_SUFFIX = ':talker';
@@ -386,23 +399,26 @@ export function buildDuplexReasonerConfig(
 function buildTalkerCompactionConfig(
   consumer: Partial<CortexCompactionConfig> | undefined,
 ): Partial<CortexCompactionConfig> {
-  const staggered = (threshold: number): number =>
-    Math.max(COMPACTION_THRESHOLD_FLOOR, threshold - COMPACTION_THRESHOLD_STAGGER);
-  const talker: Partial<CortexCompactionConfig> = {
+  // Stagger relative to the reasoner's EFFECTIVE thresholds: the consumer's
+  // value when set, the strategy default otherwise. Defaults stagger too;
+  // an unset classic threshold still lands 0.70 on the reasoner, and the
+  // talker must sit below whatever the reasoner actually runs.
+  const reasonerActivation = consumer?.observational?.activationThreshold
+    ?? OBSERVATIONAL_MEMORY_DEFAULTS.activationThreshold;
+  const reasonerClassic = consumer?.compaction?.threshold ?? COMPACTION_DEFAULTS.threshold;
+  return {
     ...(consumer ?? {}),
     nonBlocking: true,
     observational: {
       ...(consumer?.observational ?? {}),
-      activationThreshold: staggered(consumer?.observational?.activationThreshold ?? 0.9),
+      activationThreshold: staggerBelow(reasonerActivation),
+    },
+    compaction: {
+      ...COMPACTION_DEFAULTS,
+      ...(consumer?.compaction ?? {}),
+      threshold: staggerBelow(reasonerClassic),
     },
   };
-  if (consumer?.compaction?.threshold !== undefined) {
-    talker.compaction = {
-      ...consumer.compaction,
-      threshold: staggered(consumer.compaction.threshold),
-    };
-  }
-  return talker;
 }
 
 /**

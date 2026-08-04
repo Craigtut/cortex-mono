@@ -333,6 +333,36 @@ describe('duplex config builders', () => {
     expect(talker.compaction?.observational?.activationThreshold).toBeCloseTo(0.75);
   });
 
+  it('keeps the stagger strict at and below the old 0.55 boundary (never equal, never inverted)', () => {
+    // At 0.5 the old floor collapsed the stagger to equality; below it the
+    // talker landed ABOVE the reasoner. Both are exactly the coinciding
+    // blocking work the stagger exists to prevent.
+    for (const reasonerThreshold of [0.55, 0.5, 0.4, 0.2]) {
+      const talker = buildTalkerConfig(
+        { ...baseConfig, compaction: { observational: { activationThreshold: reasonerThreshold } } },
+        testModel(),
+      );
+      const talkerThreshold = talker.compaction!.observational!.activationThreshold!;
+      expect(talkerThreshold).toBeLessThan(reasonerThreshold);
+      expect(talkerThreshold).toBeGreaterThan(0);
+    }
+  });
+
+  it('staggers the classic threshold on defaults, not only when the consumer set it', () => {
+    const talker = buildTalkerConfig(baseConfig, testModel());
+    // Reasoner default is COMPACTION_DEFAULTS.threshold (0.70); the talker
+    // sits the full stagger below it without the consumer configuring
+    // anything.
+    expect(talker.compaction?.compaction?.threshold).toBeCloseTo(0.65);
+    // A consumer-set classic threshold staggers relative to that value.
+    const configured = buildTalkerConfig(
+      { ...baseConfig, compaction: { compaction: { threshold: 0.8, preserveRecentTurns: 6 } } },
+      testModel(),
+    );
+    expect(configured.compaction?.compaction?.threshold).toBeCloseTo(0.75);
+    expect(configured.compaction?.compaction?.preserveRecentTurns).toBe(6);
+  });
+
   it('derives distinct stable per-loop identity: loopPath and session id', () => {
     const talker = buildTalkerConfig(baseConfig, testModel());
     const reasoner = buildDuplexReasonerConfig(baseConfig);
