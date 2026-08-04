@@ -227,6 +227,7 @@ function createDuplexFacade(overrides?: Partial<CortexAgentConfig>): DuplexHarne
     disableTools: Object.values(TOOL_NAMES),
   }, [], { enableSubAgentTool: false, enableLoadSkillTool: false });
   const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
+  const { duplex: duplexOverrides, ...restOverrides } = overrides ?? {};
   const facade = new CortexAgentCtor(reasonerLoop, {
     model: testModel(),
     workingDirectory: '/tmp/test-workspace',
@@ -239,8 +240,9 @@ function createDuplexFacade(overrides?: Partial<CortexAgentConfig>): DuplexHarne
       // Kept out of the way: these tests drive the router directly.
       watchdogIntervalMs: 3_600_000,
       idleDigestionDelayMs: 3_600_000,
+      ...duplexOverrides,
     },
-    ...overrides,
+    ...restOverrides,
   }, talkerLoop);
   liveFacades.push(facade);
   return { facade, talkerLoop, reasonerLoop, talkerPi, reasonerPi };
@@ -824,7 +826,7 @@ describe('duplex stop-reason audit', () => {
 describe('duplex aggregate budget guard', () => {
   it('counts talker and reasoner turns plus utility spend in one lifetime aggregate', async () => {
     const { facade, reasonerLoop } = createDuplexFacade({
-      budgetGuard: { maxCost: 10 },
+      duplex: { maxTotalCost: 10 },
     });
     const guard = facade.getBudgetGuard();
     await facade.prompt('hello'); // one talker turn, cost 0.003
@@ -840,7 +842,7 @@ describe('duplex aggregate budget guard', () => {
 
   it('a breach on utility spend alone stops the loops and logs once', async () => {
     const { facade, reasonerLoop } = createDuplexFacade({
-      budgetGuard: { maxCost: 0.4 },
+      duplex: { maxTotalCost: 0.4 },
     });
     const usage = {
       input: 500, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 600,
@@ -857,6 +859,57 @@ describe('duplex aggregate budget guard', () => {
     const breaches = facade.getLog().filter((entry) =>
       (entry.data as { event?: string } | undefined)?.event === 'budget_breached');
     expect(breaches).toHaveLength(1);
+  });
+
+  it("never reinterprets the consumer's per-prompt maxCost as the session aggregate cap", () => {
+    const { facade } = createDuplexFacade({
+      budgetGuard: { maxTurns: 500, maxCost: 42 },
+      duplex: { maxTotalCost: 5 },
+    });
+    // budgetGuard.maxCost keeps its per-prompt meaning on the reasoner;
+    // the aggregate's cap is its own key.
+    expect(facade.getBudgetGuard().getMaxCost()).toBe(5);
+  });
+
+  it('leaves the aggregate uncapped when only budgetGuard.maxCost is set', () => {
+    const { facade } = createDuplexFacade({
+      budgetGuard: { maxCost: 42 },
+    });
+    expect(facade.getBudgetGuard().getMaxCost()).toBe(Infinity);
+  });
+
+  it('restore() resets the aggregate guard so a restored session is not wedged by a pre-restore breach', async () => {
+    const { facade, reasonerLoop } = createDuplexFacade({
+      duplex: { maxTotalCost: 0.4 },
+    });
+    const usage = {
+      input: 500, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 600,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 },
+    };
+    reasonerLoop.getEventBridge().emitUtilityUsage('observer', usage);
+    expect(facade.getBudgetGuard().isBreached()).toBe(true);
+
+    facade.restore({
+      version: 2,
+      log: [],
+      talkerHistory: [],
+      reasonerHistory: [],
+      talkerMemory: null,
+      reasonerMemory: null,
+      usage: {
+        total: { totalCost: 0, totalTurns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+        perLoop: {
+          talker: null,
+          reasoner: { totalCost: 0, totalTurns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+        },
+      },
+    });
+    // Counters and the breach flag describe the replaced session.
+    expect(facade.getBudgetGuard().isBreached()).toBe(false);
+    expect(facade.getBudgetGuard().getTotalCost()).toBe(0);
+    // The restored session still enforces the cap on fresh spend.
+    reasonerLoop.getEventBridge().emitUtilityUsage('observer', usage);
+    expect(facade.getBudgetGuard().isBreached()).toBe(true);
   });
 
   it('counts a forwarded child event exactly once after the loopPath split', () => {

@@ -128,6 +128,16 @@ export interface DuplexTuningConfig extends Omit<DuplexRouterOptions, 'now'> {
    * Default: 10000.
    */
   idleDigestionDelayMs?: number;
+  /**
+   * Aggregate lifetime cost cap in USD across both resident loops, every
+   * sub-agent, and utility spend (observer/reflector/summarization).
+   * Deliberately its own key: `budgetGuard.maxCost` keeps its per-prompt
+   * meaning on the reasoner, and silently reinterpreting that number as a
+   * whole-session cap would make the same config mean two different
+   * things. Default: Infinity (the aggregate accumulates but never
+   * aborts).
+   */
+  maxTotalCost?: number;
 }
 
 /** Session log tuning (retention and subscriber buffering). */
@@ -1188,16 +1198,19 @@ export class CortexAgent {
     // The aggregate budget guard, active from the first duplex assembly
     // (D19): lifetime scope over both loops, every sub-agent, and utility
     // spend (observer/reflector/summarization), which per-prompt loop
-    // guards never see. Only maxCost aggregates: the consumer's maxTurns
-    // keeps its per-prompt meaning on the reasoner, and turn counts across
-    // two loops plus children have no comparable composite meaning.
+    // guards never see. Its cap is duplex.maxTotalCost, never the
+    // consumer's budgetGuard.maxCost: that number keeps its per-prompt
+    // meaning on the reasoner, and borrowing it here would silently turn
+    // "$10 per prompt" into "$10 for the whole session". Turn counts are
+    // not aggregated: turns across two loops plus children have no
+    // comparable composite meaning.
     const aggregateConfig: Partial<BudgetGuardConfig> = {
       scope: 'lifetime',
       includeChildUsage: true,
       includeUtilityUsage: true,
     };
-    if (config.budgetGuard?.maxCost !== undefined) {
-      aggregateConfig.maxCost = config.budgetGuard.maxCost;
+    if (config.duplex?.maxTotalCost !== undefined) {
+      aggregateConfig.maxCost = config.duplex.maxTotalCost;
     }
     this.aggregateGuard = new BudgetGuard(
       aggregateConfig,
@@ -2085,6 +2098,10 @@ export class CortexAgent {
     // Router state (delegations, deltas, held deliveries, dedup) describes
     // the replaced session too.
     this.router?.resetForRestore();
+    // The aggregate guard's counters describe the replaced session's spend;
+    // without a reset a lifetime breach would keep aborting the restored
+    // session forever and re-log a breach against a pre-restore total.
+    this.aggregateGuard?.reset();
     this.aggregateBreachLogged = false;
     this.talkerRepairPending = false;
   }
