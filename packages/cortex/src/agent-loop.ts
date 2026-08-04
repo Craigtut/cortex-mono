@@ -773,6 +773,9 @@ export class AgentLoop {
 
   // User-configured context window limit (null = no limit, use model's full window)
   private _contextWindowLimit: number | null = null;
+  // Last "configured:effective" pair warned about, so the override notice
+  // fires once per distinct outcome rather than on every recompute.
+  private _warnedContextWindowOverride: string | null = null;
 
   // Event handlers (consumer-registered callbacks)
   private loopCompleteHandlers: Array<() => void> = [];
@@ -4620,8 +4623,17 @@ export class AgentLoop {
     if (!modelWindow || !Number.isFinite(modelWindow)) {
       // Model does not advertise a context window. Set a safe floor
       // rather than leaving a stale value from a previous model.
+      //
+      // Defensive rather than routine: wrapModel() falls back to 200k, so a
+      // CortexModel always carries a finite window and this branch is only
+      // reachable from a hand-built model object.
       this.compactionManager.setContextWindow(MINIMUM_CONTEXT_WINDOW);
       this.compactionManager.setModelContextWindow(MINIMUM_CONTEXT_WINDOW);
+      this.warnContextWindowOverride(
+        this._contextWindowLimit,
+        MINIMUM_CONTEXT_WINDOW,
+        'the model advertises no context window, so the safe floor applies instead',
+      );
       return;
     }
 
@@ -4635,13 +4647,46 @@ export class AgentLoop {
     // - null (default): use the model's full context window
     const limit = this._contextWindowLimit ?? modelWindow;
     const clamped = Math.min(limit, modelWindow);
-    this.compactionManager.setContextWindow(Math.max(MINIMUM_CONTEXT_WINDOW, clamped));
+    const effective = Math.max(MINIMUM_CONTEXT_WINDOW, clamped);
+    this.compactionManager.setContextWindow(effective);
+    this.warnContextWindowOverride(
+      this._contextWindowLimit,
+      effective,
+      clamped < MINIMUM_CONTEXT_WINDOW
+        ? 'it is below the safe floor'
+        : "it exceeds the model's own context window",
+    );
 
     // Set utility model context window for observational memory clamps
     const utilityModel = this.getUtilityModel();
     if (utilityModel) {
       this.compactionManager.setUtilityModelContextWindow(utilityModel.contextWindow);
     }
+  }
+
+  /**
+   * Say so when a consumer's contextWindowLimit is not the number actually
+   * in force. Silence here is a genuine DX trap: the limit is a compaction
+   * budget, so a consumer who set 12000 and is quietly running on 16384
+   * sees compaction fire later than they asked for and has nothing to read
+   * that explains it. Warn rather than debug, since it means a configured
+   * value is not being honored, and once per distinct outcome, since this
+   * recomputes on every model or limit change.
+   */
+  private warnContextWindowOverride(
+    configured: number | null,
+    effective: number,
+    reason: string,
+  ): void {
+    if (configured === null || configured === effective) return;
+    const key = `${configured}:${effective}`;
+    if (this._warnedContextWindowOverride === key) return;
+    this._warnedContextWindowOverride = key;
+    this.logger.warn('configured contextWindowLimit is not the value in force', {
+      configured,
+      effective,
+      reason,
+    });
   }
 
   /**

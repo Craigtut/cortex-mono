@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { AgentLoop } from '../../src/agent-loop.js';
+import { AgentLoop, MINIMUM_CONTEXT_WINDOW } from '../../src/agent-loop.js';
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
 import type { AgentLoopConfig } from '../../src/types.js';
@@ -1401,6 +1401,101 @@ You have 12 emotions.`;
       // utilityComplete requires a real pi-ai complete() call which needs a valid model
       // Just verify the method exists and is callable
       expect(typeof agent.utilityComplete).toBe('function');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Effective context window
+  // -----------------------------------------------------------------------
+
+  describe('effective context window', () => {
+    function loggerStub() {
+      return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    }
+
+    /** The warn call about an unhonored limit, if one was made. */
+    function overrideWarning(logger: ReturnType<typeof loggerStub>) {
+      return logger.warn.mock.calls.find(
+        (call) => String(call[0]).includes('contextWindowLimit is not the value in force'),
+      );
+    }
+
+    it('honors a limit the model has room for, and says nothing', () => {
+      const logger = loggerStub();
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        logger,
+        model: makeModel({
+          provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000,
+        } as PiModel),
+        contextWindowLimit: 50_000,
+      });
+
+      expect(agent.effectiveContextWindow).toBe(50_000);
+      expect(overrideWarning(logger)).toBeUndefined();
+    });
+
+    it('warns when a limit below the safe floor is silently raised to it', () => {
+      // The DX trap, and the reachable one: contextWindowLimit is a
+      // compaction budget, so a consumer running on 16384 instead of the
+      // 12000 they set sees compaction fire at a different time with
+      // nothing anywhere explaining why.
+      const logger = loggerStub();
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        logger,
+        model: makeModel({
+          provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000,
+        } as PiModel),
+        contextWindowLimit: 12_000,
+      });
+
+      expect(agent.effectiveContextWindow).toBe(MINIMUM_CONTEXT_WINDOW);
+      const warning = overrideWarning(logger)!;
+      expect(warning).toBeDefined();
+      expect(warning[1]).toMatchObject({
+        configured: 12_000,
+        effective: MINIMUM_CONTEXT_WINDOW,
+      });
+      expect(String((warning[1] as { reason: string }).reason))
+        .toContain('below the safe floor');
+    });
+
+    it('warns when a limit above the model window is clamped down to it', () => {
+      const logger = loggerStub();
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        logger,
+        model: makeModel({
+          provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000,
+        } as PiModel),
+        contextWindowLimit: 400_000,
+      });
+
+      expect(agent.effectiveContextWindow).toBe(200_000);
+      expect(String((overrideWarning(logger)![1] as { reason: string }).reason))
+        .toContain("exceeds the model's own context window");
+    });
+
+    it('warns once per distinct outcome, not on every recompute', () => {
+      const logger = loggerStub();
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        logger,
+        model: makeModel({
+          provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000,
+        } as PiModel),
+        contextWindowLimit: 12_000,
+      });
+      const afterConstruction = logger.warn.mock.calls.length;
+
+      agent.setContextWindowLimit(12_000);
+      agent.setContextWindowLimit(12_000);
+      expect(logger.warn.mock.calls.length).toBe(afterConstruction);
+
+      // A different outcome is a different fact, and is reported.
+      agent.setContextWindowLimit(9_000);
+      expect(logger.warn.mock.calls.length).toBe(afterConstruction + 1);
     });
   });
 
