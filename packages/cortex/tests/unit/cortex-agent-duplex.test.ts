@@ -423,6 +423,19 @@ describe('duplex config builders', () => {
     expect(reasoner.initialBasePrompt).toBe(`Consumer identity prompt\n\n${REASONER_ROLE_PROMPT}`);
   });
 
+  it('gives every cross-loop wrapper the talker or reasoner sees a standing rule', () => {
+    // Enforcement never depends on these (the broker and the router hold
+    // the D16 rules), but a wrapper with no rule beside it is a gap a
+    // future one gets added into.
+    for (const wrapper of ['<background-update>', '<permission-request']) {
+      expect(TALKER_ROLE_PROMPT).toContain(wrapper);
+    }
+    expect(REASONER_ROLE_PROMPT).toContain('<conversation-context>');
+    // The talker-authored deny reason reaches the reasoner as tool error
+    // text: a talker-to-reasoner channel, and it needs the same rule.
+    expect(REASONER_ROLE_PROMPT).toContain('Blocked tools');
+  });
+
   it('defaults the duplex reasoner to a persistent tool runtime (explicit consumer value wins)', () => {
     expect(buildDuplexReasonerConfig(baseConfig).persistentRuntime).toBe(true);
     expect(
