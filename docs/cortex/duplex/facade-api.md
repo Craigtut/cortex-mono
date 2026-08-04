@@ -1,6 +1,6 @@
 # Facade API: The Consumer Surface
 
-> **STATUS: DESIGN, NOT IMPLEMENTED**
+> **STATUS: IMPLEMENTED.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is not yet the default mode; see migration-plan.md for what remains and for the honest boundary of what the test suite can see.
 
 The facade is named `CortexAgent`. Consumers interact with one agent; the talker/reasoner split is never exposed in the API. This document defines what the consumer sees and how existing surfaces map onto the composite.
 
@@ -9,7 +9,7 @@ The facade is named `CortexAgent`. Consumers interact with one agent; the talker
 ```typescript
 const agent = await CortexAgent.create({
   // everything AgentLoopConfig has today, applied per the routing table below
-  mode: 'duplex',              // default; 'passthrough' opts out
+  mode: 'duplex',              // 'passthrough' is still the default; D14 flips it
   talker: {                    // optional overrides, all have defaults
     model,                     // default: fast tier resolved from the primary provider
     // toolset is the fixed control tools only (decisions.md D5/D8);

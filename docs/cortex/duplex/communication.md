@@ -1,6 +1,6 @@
 # Communication: Control Tools, Headlines, Wake Policy, Permission Brokering
 
-> **STATUS: DESIGN, NOT IMPLEMENTED**
+> **STATUS: IMPLEMENTED.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is not yet the default mode; see migration-plan.md for what remains and for the honest boundary of what the test suite can see.
 
 The down-channel is a fixed set of fire-and-forget control tools on the talker; the up-channel is log routing. Neither direction ever blocks a loop on another loop.
 

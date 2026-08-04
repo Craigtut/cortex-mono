@@ -1,6 +1,6 @@
 # Review Findings
 
-> **STATUS: DESIGN, NOT IMPLEMENTED**
+> **STATUS: IMPLEMENTED.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is not yet the default mode; see migration-plan.md for what remains and for the honest boundary of what the test suite can see.
 
 Two independent reviews were run against the design before implementation began: a plan review (design-versus-code consistency, implementation landmines, latency claims, observability) and a red-team (adversarial attack on the design's mechanics). Both verified their claims against source rather than against the docs.
 

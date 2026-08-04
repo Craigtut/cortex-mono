@@ -1,6 +1,6 @@
 # Sub-Agents: Tiers, Steering, Quick Lookups, Lifecycle
 
-> **STATUS: DESIGN, NOT IMPLEMENTED**
+> **STATUS: IMPLEMENTED.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is not yet the default mode; see migration-plan.md for what remains and for the honest boundary of what the test suite can see.
 
 ## Tier Rules
 
