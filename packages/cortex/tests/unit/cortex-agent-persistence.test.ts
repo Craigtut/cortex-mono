@@ -425,6 +425,23 @@ describe('CortexAgent.restore', () => {
     expect(facade.getSessionUsage().totalCost).toBe(0);
   });
 
+  it('drops pre-restore queued silent deliveries instead of flushing them post-restore', async () => {
+    const first = createFacade();
+    await first.facade.prompt('one');
+    const artifact = await first.facade.getState();
+
+    const { facade, piAgent } = createFacade();
+    facade.deliver('stale silent note', { wake: false });
+    expect(facade.queuedDeliveryCount).toBe(1);
+
+    facade.restore(artifact);
+    expect(facade.queuedDeliveryCount).toBe(0);
+
+    // The restored session's first prompt carries no pre-restore content.
+    await facade.prompt('fresh start');
+    expect(piAgent.promptCalls.at(-1)).toBe('fresh start');
+  });
+
   it('rejects an unsupported version', () => {
     const { facade } = createFacade();
     expect(() =>

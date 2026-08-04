@@ -1070,6 +1070,7 @@ export class CortexAgent {
    * turn boundary). No-op while idle, exactly like AgentLoop.steer().
    */
   steer(message: string): void {
+    this.assertNotDestroyed();
     this.reasoner.steer(message);
   }
 
@@ -1084,6 +1085,7 @@ export class CortexAgent {
    * is duplex delivery routing (2b).
    */
   async abort(scope: CortexAbortScope = 'all'): Promise<void> {
+    this.assertNotDestroyed();
     this.appendEntry({
       type: 'lifecycle',
       loopPath: this.reasoner.loopPath,
@@ -1137,6 +1139,7 @@ export class CortexAgent {
    * seq >= fromSeq (all retained entries when omitted).
    */
   getLog(fromSeq?: number): SessionLogEntry[] {
+    this.assertNotDestroyed();
     return this.log.getLog(fromSeq);
   }
 
@@ -1147,6 +1150,7 @@ export class CortexAgent {
    * applying backpressure to the loops. Returns an idempotent unsubscribe.
    */
   subscribeLog(cb: SessionLogSubscriber, fromSeq?: number): () => void {
+    this.assertNotDestroyed();
     return this.log.subscribeLog(cb, fromSeq);
   }
 
@@ -1162,6 +1166,7 @@ export class CortexAgent {
    * the next quiescence window.
    */
   async getState(): Promise<CortexAgentStateV2> {
+    this.assertNotDestroyed();
     for (;;) {
       await this.reasoner.waitForLoopIdle();
       if (!this.reasoner.isLoopActive) {
@@ -1245,6 +1250,11 @@ export class CortexAgent {
     };
     this.usageAtRestore = this.reasoner.getSessionUsage();
     this.spawnSeqByTaskId.clear();
+    this.activeCauseSeq = null;
+    // Pre-restore queued content belongs to the replaced session: left in
+    // place, queued silent deliveries would flush into the first
+    // post-restore prompt (and stale steer/follow-up content into its run).
+    this.reasoner.clearAllQueues();
   }
 
   /**
@@ -1269,14 +1279,27 @@ export class CortexAgent {
   private scheduleStateEmit(): void {
     if (this.destroyed || this.stateTimer !== null || this.emittingState) return;
     if (this.stateChangedHandlers.length === 0) return;
+    if (this.isReasonerShuttingDown()) return;
     this.stateTimer = setTimeout(() => {
       this.stateTimer = null;
       void this.emitStateChanged();
     }, this.stateDebounceMs);
   }
 
+  /**
+   * Whether the loop is tearing down without the facade knowing (a direct
+   * AgentLoop.destroy()). Its final onLoopComplete checkpoint would
+   * otherwise schedule a debounce timer that holds its handle for the full
+   * window and then snapshots a torn-down loop.
+   */
+  private isReasonerShuttingDown(): boolean {
+    const loopState = this.reasoner.state;
+    return loopState === 'destroying' || loopState === 'destroyed';
+  }
+
   private async emitStateChanged(): Promise<void> {
     if (this.destroyed || this.stateChangedHandlers.length === 0) return;
+    if (this.isReasonerShuttingDown()) return;
     this.emittingState = true;
     try {
       this.stateDirty = false;

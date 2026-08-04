@@ -22,7 +22,7 @@ import {
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
 
 // ---------------------------------------------------------------------------
-// Mock PiAgent (holdable runs, steering/follow-up queues) — the shared shape
+// Mock PiAgent (holdable runs, steering/follow-up queues), the shared shape
 // used across agent-loop unit tests.
 // ---------------------------------------------------------------------------
 
@@ -892,5 +892,29 @@ describe('CortexAgent delegation', () => {
     await facade.destroy();
     await facade.destroy();
     expect(loop.state).toBe('destroyed');
+  });
+
+  it('every interaction and read surface rejects after destroy', async () => {
+    const { facade } = createFacade();
+    await facade.prompt('before destroy');
+    await facade.destroy();
+
+    expect(() => facade.steer('late')).toThrow('CortexAgent has been destroyed');
+    await expect(facade.abort()).rejects.toThrow('CortexAgent has been destroyed');
+    await expect(facade.getState()).rejects.toThrow('CortexAgent has been destroyed');
+    expect(() => facade.getLog()).toThrow('CortexAgent has been destroyed');
+    expect(() => facade.subscribeLog(() => {})).toThrow('CortexAgent has been destroyed');
+    expect(() => facade.restore([])).toThrow('CortexAgent has been destroyed');
+  });
+
+  it('a directly destroyed loop never schedules a state emission timer', async () => {
+    const { facade, loop } = createFacade({ stateChangeDebounceMs: 60_000 });
+    facade.onStateChanged(() => {});
+
+    // Direct AgentLoop.destroy(): the facade is not told, but its final
+    // onLoopComplete checkpoint must not schedule a debounce timer that
+    // holds its handle for the window and then snapshots a dead loop.
+    await loop.destroy();
+    expect((facade as unknown as { stateTimer: unknown }).stateTimer).toBeNull();
   });
 });
