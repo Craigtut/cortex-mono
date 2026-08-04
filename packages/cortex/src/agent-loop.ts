@@ -5036,8 +5036,15 @@ export class AgentLoop {
           );
         },
         // digestIdle() re-enables blocking work for its pass; otherwise the
-        // manager's configured posture decides.
-        this._forceBlockingCompaction ? { allowBlocking: true } : undefined,
+        // manager's configured posture decides. Staleness is threaded so an
+        // abandoned pass suppresses its compaction/observation/reflection
+        // event dispatch: its rewrite is discarded (setSourceHistory
+        // above), and a consumer must never see a compaction reported for
+        // a rewrite that never landed.
+        {
+          ...(this._forceBlockingCompaction ? { allowBlocking: true } : {}),
+          isStale: passIsStale,
+        },
       );
       // A pass abandoned while the manager call hung must not mutate the
       // live observation slot or breakpoint state either; its return value

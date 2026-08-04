@@ -391,7 +391,8 @@ describe('digestIdle abandoned pass invalidation', () => {
 
     // Pass 2 still ran under the blocking posture its own digestIdle set.
     expect(settledPassOne).toBe(true);
-    expect(optionsSeen).toEqual([{ allowBlocking: true }]);
+    expect(optionsSeen).toHaveLength(1);
+    expect(optionsSeen[0]).toMatchObject({ allowBlocking: true });
   });
 });
 
@@ -462,5 +463,92 @@ describe('digestIdle and deliver interleaving', () => {
     ));
     expect(piAgent.steeringQueue).toEqual([]);
     await waitUntil(() => !loop.isLoopActive);
+  });
+});
+
+describe('digestIdle abandoned pass event suppression', () => {
+  // A pass abandoned by the timeout has its history rewrite discarded, but
+  // the manager's and the observational engine's handler dispatch used to
+  // fire anyway when the hung call finally settled: a consumer saw a
+  // compaction or observation reported for a rewrite that never landed.
+
+  async function drainSettledContinuations(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it('a timed-out observational pass that later settles fires no observation event', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const releases: Array<(value: string) => void> = [];
+    const complete = vi.fn(
+      () => new Promise<string>((resolve) => { releases.push(resolve); }),
+    );
+    loop.getCompactionManager().setObservationalCompleteFn(complete as unknown as CompleteFn);
+    const observed = vi.fn();
+    loop.onObservation(observed);
+    seedHistory(piAgent);
+    loop.getCompactionManager().updateCurrentContextTokenCount(19_500);
+
+    const result = await loop.digestIdle({ observerTimeoutMs: 30 });
+    expect(result.historyCompacted).toBe(false);
+
+    for (const release of releases.splice(0)) release(OBSERVER_OUTPUT);
+    await drainSettledContinuations();
+
+    // The rewrite was discarded, so no observation may be reported either.
+    expect(observed).not.toHaveBeenCalled();
+  });
+
+  it('a live observational pass still fires its observation event', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const complete = vi.fn().mockResolvedValue(OBSERVER_OUTPUT);
+    loop.getCompactionManager().setObservationalCompleteFn(complete as unknown as CompleteFn);
+    const observed = vi.fn();
+    loop.onObservation(observed);
+    seedHistory(piAgent);
+    loop.getCompactionManager().updateCurrentContextTokenCount(19_500);
+
+    const result = await loop.digestIdle({ observerTimeoutMs: 5_000 });
+    expect(result.historyCompacted).toBe(true);
+    expect(observed).toHaveBeenCalled();
+  });
+
+  it('a timed-out classic summarization that later settles fires no compaction events', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, { compaction: { strategy: 'classic' } });
+    let releaseSummarizer!: (value: string) => void;
+    const complete = vi.fn(
+      () => new Promise<string>((resolve) => { releaseSummarizer = resolve; }),
+    );
+    loop.getCompactionManager().setCompleteFn(complete as unknown as CompleteFn);
+    const postCompaction = vi.fn();
+    loop.onPostCompaction(postCompaction);
+    for (let i = 0; i < 10; i++) seedHistory(piAgent, 2_000);
+    loop.getCompactionManager().updateCurrentContextTokenCount(15_000);
+
+    const result = await loop.digestIdle({ observerTimeoutMs: 30 });
+    expect(result.historyCompacted).toBe(false);
+
+    releaseSummarizer('Summary of the work so far');
+    await drainSettledContinuations();
+
+    expect(postCompaction).not.toHaveBeenCalled();
+  });
+
+  it('a live classic summarization still fires onPostCompaction', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, { compaction: { strategy: 'classic' } });
+    const complete = vi.fn().mockResolvedValue('Summary of the work so far');
+    loop.getCompactionManager().setCompleteFn(complete as unknown as CompleteFn);
+    const postCompaction = vi.fn();
+    loop.onPostCompaction(postCompaction);
+    for (let i = 0; i < 10; i++) seedHistory(piAgent, 2_000);
+    loop.getCompactionManager().updateCurrentContextTokenCount(15_000);
+
+    const result = await loop.digestIdle({ observerTimeoutMs: 5_000 });
+    expect(result.historyCompacted).toBe(true);
+    expect(postCompaction).toHaveBeenCalled();
   });
 });

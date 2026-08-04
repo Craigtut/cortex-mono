@@ -822,6 +822,11 @@ export class CompactionManager {
    * @param options - allowBlocking overrides the configured nonBlocking
    *   posture for this call (an idle-digestion entry point runs the
    *   synchronous work deliberately). Omitted: the config decides.
+   *   isStale reports whether the pass has been abandoned (a timed-out
+   *   digestIdle advanced the generation): a stale pass's history rewrite
+   *   is discarded by the owner's setSourceHistory guard, and this hook
+   *   suppresses the matching event dispatch, so a consumer never sees a
+   *   compaction or observation reported for a rewrite that never landed.
    * @returns Modified context with compacted history
    */
   async applyInTransformContext(
@@ -830,7 +835,7 @@ export class CompactionManager {
     setHistory: (ctx: AgentContext, history: AgentMessage[]) => AgentContext,
     getSourceHistory?: () => AgentMessage[],
     setSourceHistory?: (history: AgentMessage[]) => void,
-    options?: { allowBlocking?: boolean },
+    options?: { allowBlocking?: boolean; isStale?: () => boolean },
   ): Promise<AgentContext> {
     if (this._contextWindow <= 0) {
       // contextWindow not set, skip compaction
@@ -841,6 +846,7 @@ export class CompactionManager {
     // mechanical work (chunk activation, L1 trimming, L3 truncation) is
     // allowed unless the caller explicitly re-enables blocking work.
     const allowBlocking = options?.allowBlocking ?? !(this.config.nonBlocking ?? false);
+    const isStale = options?.isStale;
 
     let history = getHistory(context);
     if (history.length === 0) {
@@ -879,7 +885,7 @@ export class CompactionManager {
       // before they hit the LLM.
       context = await this.observationalEngine.applyInTransformContext(
         context, utilization, this.slotCount, getHistory, setHistory, getSourceHistory, setSourceHistory,
-        { allowSync: allowBlocking },
+        { allowSync: allowBlocking, ...(isStale ? { isStale } : {}) },
       );
       history = getHistory(context);
 
@@ -945,11 +951,26 @@ export class CompactionManager {
               this.completeFn,
               {
                 onBeforeCompaction: this.beforeCompactionHandlers,
-                onPostCompaction: this.postCompactionHandlers,
-                onCompactionError: this.compactionErrorHandlers,
+                // Post and error handlers are stale-guarded AT DISPATCH
+                // TIME: runCompaction fires them internally after its LLM
+                // call settles, which for an abandoned pass can be minutes
+                // after the owner discarded the rewrite, and a consumer
+                // must never see a compaction reported for a rewrite that
+                // never landed. onBeforeCompaction stays unguarded: it
+                // fires before the summarizer call, when the pass still
+                // owns the generation.
+                onPostCompaction: staleGuardHandlers(this.postCompactionHandlers, isStale),
+                onCompactionError: staleGuardHandlers(this.compactionErrorHandlers, isStale),
               },
               currentTokens, // pass actual full-context token count for accurate reporting
             );
+
+            // An abandoned pass settling late: its rewrite would be
+            // discarded by the owner's setSourceHistory guard anyway, so
+            // none of the success-path state (failure counters, the token
+            // count, the microcompaction cache, the result events) may be
+            // updated as if it landed.
+            if (isStale?.()) return context;
 
             // Success: update state and reset failure counter
             setSourceHistory(compactedSource);
@@ -986,6 +1007,10 @@ export class CompactionManager {
             succeeded = true;
             break;
           } catch (err) {
+            // A stale pass's failure is not the live loop's failure: it
+            // must not advance the failure ladder, trigger the L3 fallback
+            // events below, or burn retry waits inside an abandoned pass.
+            if (isStale?.()) return context;
             this._consecutiveLayer2Failures++;
             lastLayer2Error = err instanceof Error ? err : new Error(String(err));
             this.logger.warn('[Compaction] Layer2 retry failed', {
@@ -1270,4 +1295,22 @@ export class CompactionManager {
     }
     return total;
   }
+}
+
+/**
+ * Wrap handler arrays so each handler checks pass staleness at DISPATCH
+ * time. runCompaction fires its handlers internally, after an LLM call that
+ * an abandoned digestion pass cannot cancel, so the guard must live inside
+ * the handler rather than around the call. Identity is preserved when no
+ * staleness source exists.
+ */
+function staleGuardHandlers<Args extends unknown[], R>(
+  handlers: Array<(...args: Args) => R>,
+  isStale: (() => boolean) | undefined,
+): Array<(...args: Args) => R | undefined> {
+  if (!isStale) return handlers;
+  return handlers.map((handler) => (...args: Args): R | undefined => {
+    if (isStale()) return undefined;
+    return handler(...args);
+  });
 }

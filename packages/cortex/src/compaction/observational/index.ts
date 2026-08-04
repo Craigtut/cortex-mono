@@ -200,6 +200,11 @@ export class ObservationalMemoryEngine {
    *   calls may run inline. When false (the non-blocking posture),
    *   activation only consumes already-buffered chunks, the Step 2 forced
    *   observer is skipped, and reflection never runs inline.
+   *   isStale reports whether the pass has been abandoned (a timed-out
+   *   idle digestion); a stale pass's observation and reflection events
+   *   are suppressed, since its history rewrite is discarded by the
+   *   owner's setSourceHistory guard and reporting it would tell a
+   *   consumer about work that never landed.
    * @returns Modified context with updated observations and trimmed history
    */
   async applyInTransformContext(
@@ -210,12 +215,13 @@ export class ObservationalMemoryEngine {
     setHistory: (ctx: AgentContext, history: AgentMessage[]) => AgentContext,
     getSourceHistory: () => AgentMessage[],
     setSourceHistory: (history: AgentMessage[]) => void,
-    options?: { allowSync?: boolean },
+    options?: { allowSync?: boolean; isStale?: () => boolean },
   ): Promise<AgentContext> {
     if (utilization < this.config.activationThreshold) {
       return context;
     }
     const allowSync = options?.allowSync ?? true;
+    const isStale = options?.isStale;
 
     // --- Activation ---
     const sourceHistory = getSourceHistory();
@@ -308,8 +314,12 @@ export class ObservationalMemoryEngine {
       this.observationTokenCount = estimateTokens(this.observations);
     }
 
-    // Step 4: Fire observation event
-    if (compactedMessages.length > 0) {
+    // Step 4: Fire observation event. Checked at dispatch time: an
+    // abandoned digestion pass settling here (the Step 2 observer call can
+    // outlive the digestion timeout by minutes) had its history trim
+    // discarded, so reporting the observation would describe a rewrite
+    // that never landed.
+    if (compactedMessages.length > 0 && !isStale?.()) {
       this.fireObservationEvent({
         compactedMessages,
         observations: this.observations,
@@ -320,7 +330,7 @@ export class ObservationalMemoryEngine {
     }
 
     // Step 5: Handle reflection (may replace this.observations with condensed version)
-    await this.handleReflection(allowSync);
+    await this.handleReflection(allowSync, isStale);
 
     // Step 6: Build slot content AFTER reflection so it contains post-reflection
     // observations. Previously this was captured before reflection, requiring
@@ -776,7 +786,10 @@ export class ObservationalMemoryEngine {
    *   consumes a buffered reflection if one is ready (instant) but never
    *   runs the reflector inline; it launches one asynchronously instead.
    */
-  private async handleReflection(allowSync = true): Promise<void> {
+  private async handleReflection(
+    allowSync = true,
+    isStale?: () => boolean,
+  ): Promise<void> {
     if (!this.completeFn) return;
 
     const effectiveThreshold = computeEffectiveReflectionThreshold(
@@ -804,13 +817,18 @@ export class ObservationalMemoryEngine {
           this.observationTokenCount = estimateTokens(this.observations);
           this.generationCount++;
 
-          this.fireReflectionEvent({
-            previousObservations,
-            newObservations: this.observations,
-            generationCount: this.generationCount,
-            compressionLevel: buffered.compressionLevel,
-            timestamp: new Date(),
-          });
+          // Suppressed for an abandoned pass (see applyInTransformContext
+          // Step 4): the swap-in above keeps the engine coherent, but the
+          // event must not report it as landed work.
+          if (!isStale?.()) {
+            this.fireReflectionEvent({
+              previousObservations,
+              newObservations: this.observations,
+              generationCount: this.generationCount,
+              compressionLevel: buffered.compressionLevel,
+              timestamp: new Date(),
+            });
+          }
           return;
         }
       }
@@ -841,13 +859,15 @@ export class ObservationalMemoryEngine {
       this.observationTokenCount = estimateTokens(this.observations);
       this.generationCount++;
 
-      this.fireReflectionEvent({
-        previousObservations,
-        newObservations: this.observations,
-        generationCount: this.generationCount,
-        compressionLevel: output.compressionLevel,
-        timestamp: new Date(),
-      });
+      if (!isStale?.()) {
+        this.fireReflectionEvent({
+          previousObservations,
+          newObservations: this.observations,
+          generationCount: this.generationCount,
+          compressionLevel: output.compressionLevel,
+          timestamp: new Date(),
+        });
+      }
       return;
     }
 
