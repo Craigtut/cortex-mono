@@ -1868,11 +1868,19 @@ describe('duplex permission broker', () => {
       .join('\n');
   }
 
-  /** Start a brokered tool ask and capture its resolution. */
+  /**
+   * Start a brokered tool ask and capture its resolution.
+   *
+   * `loopPath` defaults to a distinct loop per concurrently pending ask.
+   * Sequential tool execution means one loop blocks its whole batch on its
+   * first ask and cannot raise a second, so two pending asks are always a
+   * reasoner plus one of its sub-agents.
+   */
   function startToolAsk(
     facade: CortexAgent,
     askId: string,
     renderedRequest: string,
+    loopPath?: string,
   ): { decisions: BrokeredAskDecision[] } {
     const broker = getBroker(facade);
     const resolver = buildBrokeredPermissionResolver(
@@ -1880,10 +1888,12 @@ describe('duplex permission broker', () => {
       undefined,
       () => broker,
     );
+    const alreadyPending = broker.pendingAskCount;
     const decisions: BrokeredAskDecision[] = [];
     void resolver('Bash', { command: renderedRequest }, {
       askId,
-      loopPath: 'reasoner',
+      loopPath: loopPath
+        ?? (alreadyPending === 0 ? 'reasoner' : `reasoner/task-${alreadyPending}`),
       renderedRequest,
     }).then((decision) => {
       decisions.push(decision as BrokeredAskDecision);
@@ -2007,6 +2017,8 @@ describe('duplex permission broker', () => {
 
   it('a bare yes with two pending asks binds only the most recently voiced one', async () => {
     const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+    // Two at once means two loops: the reasoner blocked on the first, a
+    // sub-agent of its own blocked on the second.
     const first = startToolAsk(facade, 'ask-a', 'Bash: npm install');
     const second = startToolAsk(facade, 'ask-b', 'Write: /etc/hosts');
     await waitUntil(() => talkerPi.promptCalls.length === 1);

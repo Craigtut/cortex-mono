@@ -11,6 +11,13 @@
  * when the talker relays the user's answer through answer_ask, when it times
  * out, or when the asking run aborts.
  *
+ * Several asks pending at once is inherently a MULTI-LOOP situation. Tool
+ * execution is sequential, so a loop that reaches an ask-gated call blocks
+ * its whole batch on that one decision and cannot raise a second: a queue
+ * behind the voiced ask means the reasoner and one of its sub-agents, or two
+ * sub-agents, each blocked on its own. That is why the queue exists at all,
+ * and why every ask carries loopPath.
+ *
  * D16 is enforced HERE, router-side, never prompt-side: the talker's
  * judgment is precisely what an injected-content attacker targets, so no
  * consent rule may depend on the talker behaving. The rules:

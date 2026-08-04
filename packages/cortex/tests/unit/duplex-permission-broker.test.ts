@@ -112,15 +112,26 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<vo
   }
 }
 
-/** Start an ask and capture its resolution without awaiting it. */
+/**
+ * Start an ask and capture its resolution without awaiting it.
+ *
+ * Each concurrently pending ask is attributed to a DIFFERENT loop, because
+ * that is the only way two can be pending at once: tool execution is
+ * sequential, so a loop that hits an ask-gated call blocks its whole batch
+ * on that one decision and cannot raise a second. Two pending asks means a
+ * reasoner and one of its sub-agents, which is the shape D16 names ("with N
+ * loops the consumer cannot attribute or correlate"). An override still
+ * wins, for the tests that pin attribution itself.
+ */
 function requestAsk(
   h: Harness,
   overrides?: Partial<BrokeredAskRequest>,
 ): { decisions: BrokeredAskDecision[] } {
   const decisions: BrokeredAskDecision[] = [];
+  const alreadyPending = h.router.permissionBroker.pendingAskCount;
   const request: BrokeredAskRequest = {
     askId: 'ask-1',
-    loopPath: 'reasoner',
+    loopPath: alreadyPending === 0 ? 'reasoner' : `reasoner/task-${alreadyPending}`,
     toolName: 'Bash',
     renderedRequest: 'Bash: rm -rf /tmp/scratch && echo done',
     kind: 'tool',
