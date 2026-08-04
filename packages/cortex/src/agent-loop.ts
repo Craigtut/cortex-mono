@@ -4769,7 +4769,11 @@ export class AgentLoop {
             this.logger.warn('discarding history rewrite from an abandoned digestion pass');
             return;
           }
-          // Adjust boundary after compaction
+          // Adjust boundary after compaction. This recalculation is exact
+          // only while every rewrite keeps the current tick's messages as a
+          // contiguous suffix of `history`; all setSourceHistory callers
+          // hold that today, and a strategy that breaks it skews the tick
+          // boundary silently.
           const currentTickCount = sourceMessages.length - this._prePromptMessageCount;
           sourceMessages.splice(slotCount, sourceMessages.length - slotCount, ...history);
           this.agent.state.messages = [...sourceMessages];
