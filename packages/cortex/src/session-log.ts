@@ -269,6 +269,12 @@ export class SessionLog {
    * reaches below retention), then live appends in order. Returns an
    * idempotent unsubscribe function. Subscriber exceptions are logged and
    * swallowed; a throwing subscriber never breaks the log or its peers.
+   *
+   * Without fromSeq the subscription is live from here, and "here" excludes
+   * an append currently emitting: the emit snapshots the subscriber set
+   * before callbacks run, so a subscription made by a sync subscriber
+   * callback starts at the NEXT append. Pass fromSeq to include the
+   * in-flight entry (replay covers it exactly once).
    */
   subscribeLog(cb: SessionLogSubscriber, fromSeq?: number): () => void {
     const sub: SubscriberState = {

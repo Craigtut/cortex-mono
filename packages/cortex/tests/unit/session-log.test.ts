@@ -272,6 +272,29 @@ describe('SessionLog: subscriptions', () => {
     expect(received).toEqual([1, 2, 3]);
   });
 
+  it('a subscriber added by a sync callback during an append, without fromSeq, starts after the in-flight entry', () => {
+    const log = new SessionLog();
+    const received: number[] = [];
+    let added = false;
+    log.subscribeLog(() => {
+      if (added) return;
+      added = true;
+      // No replay position means live from here, and "here" excludes the
+      // in-flight entry: the emit snapshots the subscriber set before
+      // callbacks run. A subscriber that wants the in-flight entry passes
+      // fromSeq (previous test).
+      log.subscribeLog((event) => {
+        if (event.kind === 'entry') received.push(event.entry.seq);
+      });
+    });
+
+    appendUtterance(log, 'in flight');
+    expect(received).toEqual([]);
+
+    appendUtterance(log, 'after');
+    expect(received).toEqual([2]);
+  });
+
   it('slowness in one subscriber never delays a fast peer', () => {
     const log = new SessionLog();
     const fastSeen: number[] = [];
