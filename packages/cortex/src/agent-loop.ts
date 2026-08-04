@@ -6181,6 +6181,16 @@ export class AgentLoop {
       // Purge a result that already completed and sits queued for delivery.
       // Results arriving after this point are dropped by the drain's
       // isCancelled() check.
+      //
+      // DELIBERATELY REDUNDANT, and not deletable as dead code. With the
+      // drain check in place this purge has no observable effect (the drain
+      // filters the same item and returns without starting a run), so no
+      // test can distinguish its removal, and it will read as dead on every
+      // future audit. It stays because it makes cancellation prompt rather
+      // than deferred, and because it leaves the drain check one edit away
+      // from being the only thing between discarded work and the loop's
+      // context. Redundancy in a cancellation path is cheap; finding out it
+      // was load-bearing is not.
       this.pendingBackgroundResults = this.pendingBackgroundResults.filter(
         item => !(item.kind === 'subagent' && item.taskId === taskId),
       );
