@@ -40,7 +40,20 @@ Config is routed per the table in `src/cortex-agent.ts` (`CONFIG_ROUTING`). The 
 - **`abort(scope?)`**: `'conversation'`, `'work'`, or `'all'` (default). Every scope aborts the in-flight turn, drops queued deliveries, and clears pi's steering and follow-up queues; `'work'` and `'all'` additionally cancel running sub-agents. Pending permission asks resolve as deny through the abort race.
 - **`destroy(timeoutMs?)`**: tears down the facade and its loops. Idempotent.
 
-Everything else a consumer uses on `AgentLoop` (slots, models, thinking levels, MCP, skills, sub-agents, direct completions, compaction hooks, callback registration) is exposed on the facade and delegates to the reasoner in passthrough. Callback signatures are unchanged, including the origin context (`loopPath`) added in the loop identity work.
+## Delegation
+
+Callback signatures are unchanged from `AgentLoop`, including the origin context (`loopPath`) added in the loop identity work.
+
+The rule is: **forward everything that is pure delegation, and withhold only what has no single composite meaning.** An earlier draft of this document claimed everything a consumer uses was already exposed, which was wrong in both directions and left four members with live call sites in this repo unreachable. The table below is the migration checklist, and a structural test asserts the facade exposes every non-withheld public member of `AgentLoop`, so a gap cannot reappear silently.
+
+| Category | Members | Notes |
+|---|---|---|
+| **Forwarded** | slots and `getContextManager`, models and thinking levels, `getCompactionManager`, `isUtilityModelOverridden`, `getAutoResolvedUtilityModel`, `modelContextWindow`, `setContextWindow`, `getMcpClientManager`, `getMcpTools`, `getSkillBuffer`, `clearSkillBuffer`, `composeSystemPrompt`, `getSystemPromptSections`, `capToolResult`, `getEnvOverrides`, `updateCurrentContextTokenCount`, `isPrompting`, `setHeadlineProvider`, the queue-control family (`followUp`, `setSteeringQueueMode`, `setFollowUpQueueMode`, `clearSteeringQueue`, `clearFollowUpQueue`, `clearQueuedDeliveries`), direct completions, sub-agent spawn/cancel/steer, callback registration | Delegate to the reasoner in passthrough. Where duplex will need to route a member per loop rather than to the reasoner, the call site carries a comment naming that decision. |
+| **Subsumed** | `restoreConversationHistory`, `restoreObservationalMemoryState`, `restoreSessionUsage` → `restore()`; `isLoopActive` → `conversationIdle`; `waitForLoopIdle` → `waitForConversationIdle` | Not a rename. `restore()` is all-or-nothing and rejects while running, where the three loop methods are independently callable at any time, so a consumer calling them separately rewrites the call site rather than renaming it. |
+| **Partially subsumed** | `clearAllQueues` → folded into `abort()` | `abort()` also aborts the turn and cancels children, and discards the dropped content that `clearAllQueues()` returns for re-routing. There is currently no facade way to drop queued content without aborting. |
+| **Withheld** | `getTransformContextHook`, `prePromptMessageCount`, `getSubAgentManager`, `loopPath` | Composition internals, a cache-breakpoint internal, a raw internals handle (consumers have `getActiveSubAgents` plus spawn/cancel/steer), and a value with no single composite meaning in duplex (origin reaches consumers through `LoopOriginContext`). |
+
+`waitForIdle`, `continue`, and `reset` are members of the wrapped `PiAgent` contract rather than `AgentLoop`, and are not part of this surface.
 
 ## The session log
 
