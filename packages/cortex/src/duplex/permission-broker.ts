@@ -75,6 +75,14 @@ export interface BrokeredAskRequest {
   askId: string;
   /** Path identity of the asking loop. */
   loopPath: string;
+  /**
+   * Set when {@link loopPath} is a best guess rather than the asking loop's
+   * own identity (network asks: NetworkAccessRequest carries no loop
+   * identity, so a sub-agent's egress ask is filed under the reasoner).
+   * Recorded on the log entry so an audit reads the attribution as
+   * approximate instead of trusting a path the broker cannot know.
+   */
+  loopPathApproximate?: boolean;
   /** Permission name (tool name, Bash(escalate), or NetworkAccess). */
   toolName: string;
   /**
@@ -346,6 +354,7 @@ export class PermissionBroker {
           askId: request.askId,
           toolName: request.toolName,
           kind: request.kind,
+          ...(request.loopPathApproximate ? { loopPathApproximate: true } : {}),
         },
       });
       const ask: BrokeredAsk = {
@@ -915,8 +924,9 @@ export function buildBrokeredPermissionResolver(
  * fail closed, matching how ungated surfaces treat a non-allow.
  *
  * Attribution limitation, accepted: NetworkAccessRequest carries no loop
- * identity, so a network ask raised by a sub-agent is logged under the
- * reasoner's path.
+ * identity, so a network ask raised by a sub-agent is filed under the
+ * reasoner's path. The ask entry marks the attribution approximate rather
+ * than asserting a path the broker cannot actually know.
  */
 export function buildBrokeredNetworkResolver(
   consumer: ResolveNetworkAccess,
@@ -930,6 +940,7 @@ export function buildBrokeredNetworkResolver(
     const answer = await broker.requestDecision({
       askId: `ask-${crypto.randomUUID()}`,
       loopPath: 'reasoner',
+      loopPathApproximate: true,
       toolName: NETWORK_ACCESS_PERMISSION_NAME,
       renderedRequest: renderNetworkAccessRequest(req),
       kind: 'network',

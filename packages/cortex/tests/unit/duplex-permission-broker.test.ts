@@ -748,6 +748,8 @@ describe('brokered resolvers', () => {
     const askEntry = h.log.find((entry) => entry.type === 'ask')!;
     expect(askEntry.loopPath).toBe('reasoner/task-3');
     expect(askEntry.content).toBe('Bash: rm -rf /');
+    // A tool ask knows its asking loop exactly; nothing marks it as a guess.
+    expect(askEntry.data?.['loopPathApproximate']).toBeUndefined();
 
     h.setTalkerCauseTags([{ kind: 'utterance', seq: h.lastVoicedSeq() + 1 }]);
     h.router.dispatchAnswerAsk('ask-r1', 'allow', undefined);
@@ -824,7 +826,14 @@ describe('brokered resolvers', () => {
     const askEntry = h.log.find((entry) => entry.type === 'ask')!;
     expect(askEntry.content).toContain('evil.example:443');
     expect(askEntry.content).toContain('https://evil.example/exfil?q=secret');
-    expect(askEntry.data).toMatchObject({ kind: 'network', toolName: 'NetworkAccess' });
+    // The egress request carries no loop identity, so the reasoner path is
+    // a guess and the entry says so rather than asserting it.
+    expect(askEntry.data).toMatchObject({
+      kind: 'network',
+      toolName: 'NetworkAccess',
+      loopPathApproximate: true,
+    });
+    expect(askEntry.loopPath).toBe('reasoner');
 
     h.router.dispatchAnswerAsk(String(askEntry.data!['askId']), 'deny', undefined);
     expect(await pending).toEqual({ decision: 'deny' });
