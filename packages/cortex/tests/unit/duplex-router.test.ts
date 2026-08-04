@@ -24,6 +24,7 @@ interface Harness {
   router: DuplexRouter;
   log: Array<RouterLogInput & { seq: number }>;
   talkerDeliveries: Array<{ content: string; wake: boolean }>;
+  askVoicings: Array<{ content: string; causeTag: CauseTag }>;
   reasonerDispatches: Array<{ message: string; causeSeq: number | null }>;
   setTalkerIdle: (idle: boolean) => void;
   setIdleSignal: (signal: (() => boolean) | undefined) => void;
@@ -50,11 +51,13 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   let talkerCauseTags: readonly CauseTag[] = options?.talkerCauseTags ?? [];
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
+  const askVoicings: Array<{ content: string; causeTag: CauseTag }> = [];
   const reasonerDispatches: Array<{ message: string; causeSeq: number | null }> = [];
   let nextSeq = 1;
 
   const ports: DuplexRouterPorts = {
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
+    voiceAskToTalker: (content, causeTag) => askVoicings.push({ content, causeTag }),
     talkerIdle: () => talkerIdle,
     dispatchToReasoner: (message, causeSeq) => {
       if (dispatchError) throw dispatchError;
@@ -86,6 +89,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     router,
     log,
     talkerDeliveries,
+    askVoicings,
     reasonerDispatches,
     setTalkerIdle: (idle) => { talkerIdle = idle; },
     setIdleSignal: (signal) => { idleSignal = signal; },

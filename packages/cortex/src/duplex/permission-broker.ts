@@ -1,0 +1,773 @@
+/**
+ * PermissionBroker: the duplex facade's consent boundary (decisions.md D16,
+ * communication.md "Permission Brokering").
+ *
+ * Every blocking permission ask in duplex mode flows through here: tool asks
+ * from the reasoner and its sub-agents (via the brokered resolvePermission),
+ * sandbox escalation asks (same path, under the synthetic Bash(escalate)
+ * name), and network egress asks from WebFetch and the sandbox ask callback
+ * (via the brokered resolveNetworkAccess). An ask becomes a log entry, is
+ * voiced to the user through the talker (exactly one at a time), and settles
+ * when the talker relays the user's answer through answer_ask, when it times
+ * out, or when the asking run aborts.
+ *
+ * D16 is enforced HERE, router-side, never prompt-side: the talker's
+ * judgment is precisely what an injected-content attacker targets, so no
+ * consent rule may depend on the talker behaving. The rules:
+ *
+ * - exactly one ask is voiced at a time;
+ * - `allow` binds only to the most recently voiced ask, takes effect at most
+ *   once, and is accepted only from a talker turn whose cause set contains a
+ *   user utterance newer than the voicing (details on {@link answer});
+ * - `deny` is unrestricted;
+ * - anything else returns a voiceable refusal and re-voices the pending ask.
+ *
+ * The consent check reads the FULL discriminated cause set
+ * (currentTalkerCauseTags) and filters by kind before aggregating. It must
+ * never use the collapsing latest-seq helper: collapse-then-filter denies a
+ * real "yes" whenever a later non-utterance rode the same run, and
+ * collapse-without-filter grants consent off a delivery the user never
+ * spoke (decisions.md D16 worked examples).
+ *
+ * The tag set is NOT a complete record of what the user said: steer()
+ * bypasses causation entirely, so a user steering "yes, go ahead" reaches
+ * neither the log nor this check. That failure direction is safe by design:
+ * an unheard yes leaves the ask pending and it gets re-voiced. There is
+ * deliberately NO recovery path that tries to infer such consent; any
+ * recovery heuristic would itself be an attack surface.
+ */
+
+import type {
+  AgentLoopConfig,
+  CortexLogger,
+  CortexToolPermissionResult,
+  PendingAsk,
+  ToolPermissionRequestContext,
+} from '../types.js';
+import type { NetworkAccessRequest, ResolveNetworkAccess } from '../sandbox/types.js';
+import type { WakeClass } from '../session-log.js';
+import { NOOP_LOGGER } from '../noop-logger.js';
+import { BASH_ESCALATION_PERMISSION_NAME } from '../tools/bash/index.js';
+import type { CauseTag } from './cause-tags.js';
+import { buildAskVoicing } from './prompts.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Ask classes the broker distinguishes. `escalation` is a Bash call asking
+ * to run outside the sandbox (it reaches the resolver under the synthetic
+ * Bash(escalate) name, never plain Bash); `network` is an egress ask from
+ * WebFetch or the sandbox ask callback. The class picks the voicing
+ * template and the timeout policy.
+ */
+export type BrokeredAskKind = 'tool' | 'escalation' | 'network';
+
+/** One ask handed to the broker for a user decision. */
+export interface BrokeredAskRequest {
+  /**
+   * Per-ask nonce. For tool asks this is the id the loop minted for the
+   * resolver call (so the broker, the loop's pending-ask registry, and the
+   * consumer all correlate on one id); network asks mint their own.
+   * Security-relevant: consent binding keys on it.
+   */
+  askId: string;
+  /** Path identity of the asking loop. */
+  loopPath: string;
+  /** Permission name (tool name, Bash(escalate), or NetworkAccess). */
+  toolName: string;
+  /**
+   * Verbatim head-and-tail rendering of what is being asked. Carried
+   * through to the log and the voicing UNCHANGED; the broker never
+   * summarizes it (review-findings F14).
+   */
+  renderedRequest: string;
+  kind: BrokeredAskKind;
+  /**
+   * The asking run's abort signal, when the caller has one (tool asks do;
+   * network asks do not). An abort settles the ask as deny so the broker's
+   * registry can never outlive the run it blocks.
+   */
+  signal?: AbortSignal | undefined;
+}
+
+/** The user's decision as the asking resolver receives it. */
+export interface BrokeredAskDecision {
+  decision: 'allow' | 'deny';
+  reason?: string;
+}
+
+/** Outcome of {@link PermissionBroker.answer}, consumed by the router. */
+export interface AskAnswerOutcome {
+  /** Voiceable receipt for the answer_ask control-tool result (D17). */
+  receipt: string;
+  /**
+   * Set when the answer was refused (consent rules, unreadable decision).
+   * The router records it as a bounded dispatch_refused lifecycle entry so
+   * the anomaly stays in the log without letting one spraying turn grow the
+   * log unboundedly.
+   */
+  refusal?: string;
+}
+
+/** Log entry input the broker produces (a subset of the router's schema). */
+export interface BrokerLogInput {
+  type: 'ask' | 'ask_answer' | 'lifecycle';
+  loopPath: string;
+  content: string;
+  wake?: WakeClass;
+  causedBy?: number;
+  data?: Record<string, unknown>;
+}
+
+/** What the broker needs from the router/facade. */
+export interface PermissionBrokerPorts {
+  /** Append a session log entry; returns its seq. */
+  appendLog(input: BrokerLogInput): number;
+  /**
+   * Wake-deliver an ask voicing to the talker, carrying its ask-kind cause
+   * tag. This is the reserved ask lane (communication.md): it must bypass
+   * the delivery token bucket, dedup, and queues, because the loop that
+   * raised the ask blocks for as long as the voicing is delayed.
+   */
+  voiceToTalker(content: string, causeTag: CauseTag): void;
+  /**
+   * The FULL discriminated cause set of the talker's live run. The set
+   * carries no ordering guarantee; the consent check scans all of it.
+   */
+  currentTalkerCauseTags(): readonly CauseTag[];
+  /** Mark the loop-registry pending ask as voiced (tool asks only). */
+  markAskVoiced?(askId: string): void;
+  logger?: CortexLogger;
+}
+
+export interface PermissionBrokerOptions {
+  /**
+   * Timeout for tool and network asks, after which the ask settles as deny
+   * with a reason. Null disables the timeout.
+   */
+  askTimeoutMs?: number | null;
+  /**
+   * Timeout for sandbox escalation asks. Default null (no timeout): an
+   * auto-denied escalation leaves the command running contained and
+   * failing, which invites a retry loop (communication.md).
+   */
+  escalationAskTimeoutMs?: number | null;
+  /** Clock override for tests (stamps and revoice damping, not timers). */
+  now?: () => number;
+}
+
+export const PERMISSION_BROKER_DEFAULTS = {
+  askTimeoutMs: 120_000 as number | null,
+  escalationAskTimeoutMs: null as number | null,
+} as const;
+
+/**
+ * Minimum ms between re-voicings of the same ask. One assistant message can
+ * carry many refused answer_ask calls (the N4 shape); without damping each
+ * refusal would re-deliver the voicing and the ask would talk over itself.
+ * The ask stays answerable the whole time; only the re-delivery is damped.
+ */
+const REVOICE_MIN_INTERVAL_MS = 2_000;
+
+// ---------------------------------------------------------------------------
+// Receipts and reasons (bare and uniform, D16/D17: as little imitable
+// decision text in the talker's transcript as possible)
+// ---------------------------------------------------------------------------
+
+const NO_PENDING_RECEIPT = 'There are no pending permission requests to answer.';
+const NOT_PENDING_RECEIPT = 'That permission request is no longer pending; nothing was changed.';
+const ALLOW_RECEIPT = 'Approval passed along.';
+const DENY_RECEIPT = 'Denial passed along.';
+const CONSENT_REFUSED_RECEIPT =
+  'Not accepted: approval needs the user\'s own answer, given after hearing the request. ' +
+  'It will be read to the user again.';
+const NOT_VOICED_RECEIPT =
+  'Not accepted: only the request most recently read to the user can be approved. ' +
+  'It will be read again.';
+const INVALID_DECISION_RECEIPT =
+  'Could not read that decision. Ask the user to allow or deny, then call answer_ask again.';
+const UNBOUND_RECEIPT =
+  'Could not tell which pending request that answers; it will be read to the user again.';
+
+const TIMEOUT_DENY_REASON =
+  'No answer from the user before the permission request timed out; denied by default. ' +
+  'Ask again if the work still needs it.';
+const ABORT_DENY_REASON = 'The run that raised this permission request was aborted.';
+
+const DROP_REASONS: Record<'abort' | 'restore' | 'destroy', string> = {
+  abort: 'Aborted before the user answered the permission request.',
+  restore: 'The session was restored before the user answered the permission request.',
+  destroy: 'The agent was shut down before the user answered the permission request.',
+};
+
+/** Cap on the relayed reason so a runaway argument cannot bloat the log. */
+const MAX_REASON_CHARS = 400;
+
+function asTrimmedString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+// ---------------------------------------------------------------------------
+// Broker
+// ---------------------------------------------------------------------------
+
+interface BrokeredAsk {
+  request: BrokeredAskRequest;
+  /** Seq of the 'ask' log entry; also the seq the voicing cause tag carries. */
+  entrySeq: number;
+  requestedAt: number;
+  voiced: boolean;
+  /**
+   * Seq anchor for consent: the ask_voiced lifecycle entry appended at the
+   * moment of (re-)voicing. A qualifying utterance must be strictly newer.
+   * Null until first voiced, so an unvoiced ask can never be allowed.
+   */
+  voicedAtSeq: number | null;
+  /** Clock stamp of the last voicing delivery, for revoice damping. */
+  lastVoicedAtMs: number;
+  settled: boolean;
+  resolve: (decision: BrokeredAskDecision) => void;
+  timer: ReturnType<typeof setTimeout> | null;
+  abortListener: (() => void) | null;
+}
+
+export class PermissionBroker {
+  private readonly ports: PermissionBrokerPorts;
+  private readonly logger: CortexLogger;
+  private readonly now: () => number;
+  private readonly askTimeoutMs: number | null;
+  private readonly escalationAskTimeoutMs: number | null;
+
+  private readonly asks = new Map<string, BrokeredAsk>();
+  /** Ask ids awaiting their first voicing, FIFO. */
+  private voiceQueue: string[] = [];
+  /** The most recently voiced, still-pending ask (exactly one at a time). */
+  private voicedAskId: string | null = null;
+  /** True while settleAll drains, so settlement never voices a doomed ask. */
+  private draining = false;
+  private destroyed = false;
+
+  constructor(ports: PermissionBrokerPorts, options?: PermissionBrokerOptions) {
+    this.ports = ports;
+    this.logger = ports.logger ?? NOOP_LOGGER;
+    this.now = options?.now ?? Date.now;
+    this.askTimeoutMs = options?.askTimeoutMs !== undefined
+      ? options.askTimeoutMs
+      : PERMISSION_BROKER_DEFAULTS.askTimeoutMs;
+    this.escalationAskTimeoutMs = options?.escalationAskTimeoutMs !== undefined
+      ? options.escalationAskTimeoutMs
+      : PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs;
+  }
+
+  // -------------------------------------------------------------------------
+  // Intake
+  // -------------------------------------------------------------------------
+
+  /**
+   * Route one ask through the conversation. Appends the 'ask' log entry,
+   * queues the voicing (one at a time), arms the timeout for its kind, and
+   * resolves with the user's decision, the timeout deny, or the abort deny.
+   * Never rejects: the asking resolver maps the decision to allow/block.
+   */
+  requestDecision(request: BrokeredAskRequest): Promise<BrokeredAskDecision> {
+    if (this.destroyed) {
+      return Promise.resolve({ decision: 'deny', reason: DROP_REASONS.destroy });
+    }
+    if (this.asks.has(request.askId)) {
+      // Nonce reuse is a caller bug; refuse rather than corrupt the
+      // registry an allow-once guarantee depends on.
+      return Promise.resolve({ decision: 'deny', reason: 'Duplicate ask id.' });
+    }
+    if (request.signal?.aborted) {
+      return Promise.resolve({ decision: 'deny', reason: ABORT_DENY_REASON });
+    }
+    return new Promise<BrokeredAskDecision>((resolve) => {
+      const entrySeq = this.ports.appendLog({
+        type: 'ask',
+        loopPath: request.loopPath,
+        // The verbatim rendering IS the durable payload; never a summary.
+        content: request.renderedRequest,
+        wake: 'interrupt',
+        data: {
+          askId: request.askId,
+          toolName: request.toolName,
+          kind: request.kind,
+        },
+      });
+      const ask: BrokeredAsk = {
+        request,
+        entrySeq,
+        requestedAt: this.now(),
+        voiced: false,
+        voicedAtSeq: null,
+        lastVoicedAtMs: 0,
+        settled: false,
+        resolve,
+        timer: null,
+        abortListener: null,
+      };
+      this.asks.set(request.askId, ask);
+      this.voiceQueue.push(request.askId);
+
+      const timeoutMs = request.kind === 'escalation'
+        ? this.escalationAskTimeoutMs
+        : this.askTimeoutMs;
+      if (timeoutMs !== null && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        const timer = setTimeout(() => this.handleTimeout(request.askId), timeoutMs);
+        timer.unref?.();
+        ask.timer = timer;
+      }
+      if (request.signal) {
+        ask.abortListener = () => this.handleAbort(request.askId);
+        request.signal.addEventListener('abort', ask.abortListener, { once: true });
+      }
+      this.voiceNext();
+    });
+  }
+
+  /**
+   * Record an ask the consumer's isAutoApprove bypassed: it never blocks and
+   * is never voiced, but the audit trail must still show it was granted
+   * without the user hearing it.
+   */
+  noteAutoApproved(toolName: string, context?: ToolPermissionRequestContext): void {
+    if (this.destroyed) return;
+    this.ports.appendLog({
+      type: 'lifecycle',
+      loopPath: context?.loopPath ?? 'reasoner',
+      content: `Permission auto-approved: ${context?.renderedRequest ?? toolName}`,
+      data: {
+        event: 'ask_auto_approved',
+        toolName,
+        ...(context?.askId !== undefined ? { askId: context.askId } : {}),
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Answering (the D16 rules)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Settle an ask from the talker's answer_ask dispatch. Enforced here, not
+   * in any prompt:
+   *
+   * - `deny` is unrestricted: any pending ask (named by id, or the voiced
+   *   one when no id is given) settles as deny with no causation check.
+   * - `allow` binds only to the most recently voiced ask, at most once, and
+   *   only when the talker's live cause set contains an utterance-kind tag
+   *   with seq strictly greater than the ask's voicing anchor. The set is
+   *   scanned whole and filtered by kind first (never collapsed, D16).
+   *   Additionally, a run whose cause set carries THIS ask's voicing tag
+   *   cannot grant it: content consumed alongside the voicing was authored
+   *   before the user could have heard the request, so a stale "yes" that
+   *   parked with the voicing must not bind to it.
+   * - anything else returns a voiceable refusal and re-voices the pending
+   *   ask (damped, so a spraying turn cannot flood the voice channel).
+   */
+  answer(askIdRaw: unknown, decisionRaw: unknown, reasonRaw: unknown): AskAnswerOutcome {
+    if (this.asks.size === 0) {
+      return { receipt: NO_PENDING_RECEIPT };
+    }
+    const askId = asTrimmedString(askIdRaw);
+    const decisionText = asTrimmedString(decisionRaw)?.toLowerCase() ?? null;
+    const rawReason = asTrimmedString(reasonRaw);
+    const reason = rawReason !== null && rawReason.length > MAX_REASON_CHARS
+      ? rawReason.slice(0, MAX_REASON_CHARS)
+      : rawReason;
+
+    if (decisionText !== 'allow' && decisionText !== 'deny') {
+      this.revoiceCurrent();
+      return { receipt: INVALID_DECISION_RECEIPT, refusal: 'unreadable decision' };
+    }
+
+    let ask: BrokeredAsk | undefined;
+    if (askId !== null) {
+      ask = this.asks.get(askId);
+      if (!ask) {
+        // Unknown id, or an already-settled ask: the replay path. A second
+        // allow for the same ask finds nothing here, which is what makes
+        // allow take effect exactly once.
+        return { receipt: NOT_PENDING_RECEIPT };
+      }
+    } else if (this.voicedAskId !== null) {
+      // A bare answer binds to the one voiced ask; with exactly one voiced
+      // at a time there is nothing else it could honestly mean.
+      ask = this.asks.get(this.voicedAskId);
+    }
+    if (!ask) {
+      this.revoiceCurrent();
+      return { receipt: UNBOUND_RECEIPT, refusal: 'no ask bindable without an id' };
+    }
+
+    if (decisionText === 'deny') {
+      this.ports.appendLog({
+        type: 'ask_answer',
+        loopPath: ask.request.loopPath,
+        content: `deny: ${ask.request.renderedRequest}`,
+        causedBy: ask.entrySeq,
+        data: {
+          askId: ask.request.askId,
+          decision: 'deny',
+          ...(reason !== null ? { reason } : {}),
+        },
+      });
+      this.settle(ask, { decision: 'deny', ...(reason !== null ? { reason } : {}) });
+      return { receipt: DENY_RECEIPT };
+    }
+
+    // allow
+    if (ask.request.askId !== this.voicedAskId || ask.voicedAtSeq === null) {
+      this.revoiceCurrent();
+      return {
+        receipt: NOT_VOICED_RECEIPT,
+        refusal: 'allow for an ask that is not the most recently voiced',
+      };
+    }
+    let qualifyingSeq: number | null = null;
+    let voicingInThisRun = false;
+    for (const tag of this.ports.currentTalkerCauseTags()) {
+      if (tag.kind === 'utterance' && tag.seq > ask.voicedAtSeq) {
+        if (qualifyingSeq === null || tag.seq > qualifyingSeq) qualifyingSeq = tag.seq;
+      }
+      if (tag.kind === 'ask' && tag.seq === ask.entrySeq) {
+        voicingInThisRun = true;
+      }
+    }
+    if (qualifyingSeq === null || voicingInThisRun) {
+      this.revoiceCurrent();
+      return {
+        receipt: CONSENT_REFUSED_RECEIPT,
+        refusal: voicingInThisRun
+          ? 'allow from the run that carried the voicing'
+          : 'no user utterance after the ask was voiced',
+      };
+    }
+
+    this.ports.appendLog({
+      type: 'ask_answer',
+      loopPath: ask.request.loopPath,
+      content: `allow: ${ask.request.renderedRequest}`,
+      // The consent-carrying cause: the qualifying utterance, so an audit
+      // can trace every allow to the user words that granted it.
+      causedBy: qualifyingSeq,
+      data: {
+        askId: ask.request.askId,
+        decision: 'allow',
+        qualifyingUtteranceSeq: qualifyingSeq,
+        ...(reason !== null ? { reason } : {}),
+      },
+    });
+    this.settle(ask, { decision: 'allow', ...(reason !== null ? { reason } : {}) });
+    return { receipt: ALLOW_RECEIPT };
+  }
+
+  // -------------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------------
+
+  /**
+   * Re-deliver the voicing of the currently voiced ask (refusal recovery,
+   * and after a conversation abort destroys the parked voicing). Re-voicing
+   * re-anchors consent at the new voicing seq, which only tightens the
+   * check. Damped to one re-delivery per interval unless forced.
+   */
+  revoiceCurrent(force = false): void {
+    if (this.destroyed || this.voicedAskId === null) return;
+    const ask = this.asks.get(this.voicedAskId);
+    if (!ask) return;
+    if (!force && this.now() - ask.lastVoicedAtMs < REVOICE_MIN_INTERVAL_MS) return;
+    this.deliverVoicing(ask, true);
+  }
+
+  /**
+   * Settle every pending ask as deny (facade abort, restore, or teardown).
+   * Tool asks also settle through their own abort signals; double settlement
+   * is guarded. Never leaves a resolver hanging.
+   */
+  settleAll(cause: 'abort' | 'restore' | 'destroy'): void {
+    this.draining = true;
+    try {
+      for (const ask of [...this.asks.values()]) {
+        this.ports.appendLog({
+          type: 'lifecycle',
+          loopPath: ask.request.loopPath,
+          content: `Permission request dropped (${cause})`,
+          causedBy: ask.entrySeq,
+          data: { event: 'ask_dropped', askId: ask.request.askId, cause },
+        });
+        this.settle(ask, { decision: 'deny', reason: DROP_REASONS[cause] });
+      }
+    } finally {
+      this.draining = false;
+    }
+    this.voiceQueue = [];
+    this.voicedAskId = null;
+  }
+
+  /** Facade restore(): the pending asks belong to the replaced session. */
+  reset(): void {
+    this.settleAll('restore');
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.settleAll('destroy');
+    this.destroyed = true;
+  }
+
+  /**
+   * Snapshot of asks the broker is holding, in the loop registry's shape
+   * plus the broker's kind. Tool and escalation asks also appear in the
+   * asking loop's own registry (same askId); network asks exist only here.
+   */
+  getPendingAsks(): Array<PendingAsk & { kind: BrokeredAskKind }> {
+    return [...this.asks.values()].map((ask) => ({
+      askId: ask.request.askId,
+      loopPath: ask.request.loopPath,
+      toolName: ask.request.toolName,
+      renderedRequest: ask.request.renderedRequest,
+      requestedAt: ask.requestedAt,
+      voiced: ask.voiced,
+      kind: ask.request.kind,
+    }));
+  }
+
+  /** Number of asks awaiting a decision. */
+  get pendingAskCount(): number {
+    return this.asks.size;
+  }
+
+  // -------------------------------------------------------------------------
+  // Internals
+  // -------------------------------------------------------------------------
+
+  private voiceNext(): void {
+    if (this.destroyed || this.draining || this.voicedAskId !== null) return;
+    for (;;) {
+      const nextId = this.voiceQueue.shift();
+      if (nextId === undefined) return;
+      const ask = this.asks.get(nextId);
+      if (!ask || ask.settled) continue;
+      this.voicedAskId = nextId;
+      ask.voiced = true;
+      this.deliverVoicing(ask, false);
+      try {
+        this.ports.markAskVoiced?.(nextId);
+      } catch (err) {
+        this.logger.warn('markAskVoiced port threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return;
+    }
+  }
+
+  /**
+   * Append the ask_voiced anchor entry and hand the voicing to the talker.
+   * The anchor is appended BEFORE the delivery, so any utterance that
+   * qualifies is provably newer than the moment voicing began; the voicing
+   * delivery carries the ask-kind cause tag that lets the consent check
+   * refuse answers from the very run that introduced the request.
+   */
+  private deliverVoicing(ask: BrokeredAsk, revoiced: boolean): void {
+    const anchorSeq = this.ports.appendLog({
+      type: 'lifecycle',
+      loopPath: ask.request.loopPath,
+      content: revoiced ? 'Permission request re-voiced' : 'Permission request voiced',
+      causedBy: ask.entrySeq,
+      data: {
+        event: 'ask_voiced',
+        askId: ask.request.askId,
+        ...(revoiced ? { revoiced: true } : {}),
+      },
+    });
+    ask.voicedAtSeq = anchorSeq;
+    ask.lastVoicedAtMs = this.now();
+    const text = buildAskVoicing({
+      askId: ask.request.askId,
+      renderedRequest: ask.request.renderedRequest,
+      kind: ask.request.kind,
+      revoiced,
+    });
+    try {
+      this.ports.voiceToTalker(text, { kind: 'ask', seq: ask.entrySeq });
+    } catch (err) {
+      // The ask stays pending and answerable; the talker-side failure is
+      // teardown or a bug, and timeout/abort still bound the wait.
+      this.logger.error('ask voicing delivery failed', {
+        askId: ask.request.askId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private handleTimeout(askId: string): void {
+    const ask = this.asks.get(askId);
+    if (!ask || ask.settled) return;
+    this.ports.appendLog({
+      type: 'ask_answer',
+      loopPath: ask.request.loopPath,
+      content: `deny (timeout): ${ask.request.renderedRequest}`,
+      causedBy: ask.entrySeq,
+      data: { askId, decision: 'deny', timedOut: true },
+    });
+    this.settle(ask, { decision: 'deny', reason: TIMEOUT_DENY_REASON });
+  }
+
+  private handleAbort(askId: string): void {
+    const ask = this.asks.get(askId);
+    if (!ask || ask.settled) return;
+    // No ask_answer entry: nobody answered. The lifecycle entry records why
+    // the ask vanished; the loop's own abort race already unblocked the run.
+    this.ports.appendLog({
+      type: 'lifecycle',
+      loopPath: ask.request.loopPath,
+      content: 'Permission request aborted with its run',
+      causedBy: ask.entrySeq,
+      data: { event: 'ask_aborted', askId },
+    });
+    this.settle(ask, { decision: 'deny', reason: ABORT_DENY_REASON });
+  }
+
+  /** Settle exactly once: remove first, then resolve, then voice the next. */
+  private settle(ask: BrokeredAsk, decision: BrokeredAskDecision): void {
+    if (ask.settled) return;
+    ask.settled = true;
+    if (ask.timer !== null) {
+      clearTimeout(ask.timer);
+      ask.timer = null;
+    }
+    if (ask.abortListener !== null && ask.request.signal) {
+      ask.request.signal.removeEventListener('abort', ask.abortListener);
+      ask.abortListener = null;
+    }
+    this.asks.delete(ask.request.askId);
+    this.voiceQueue = this.voiceQueue.filter((id) => id !== ask.request.askId);
+    if (this.voicedAskId === ask.request.askId) {
+      this.voicedAskId = null;
+    }
+    ask.resolve(decision);
+    this.voiceNext();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Brokered resolvers (installed by the facade in duplex mode)
+// ---------------------------------------------------------------------------
+
+/** Synthetic permission name for network egress asks. */
+export const NETWORK_ACCESS_PERMISSION_NAME = 'NetworkAccess';
+
+/**
+ * Head-and-tail truncation for broker-minted renderings, mirroring the
+ * loop's rendered-request rule: the tail survives because a hostile or
+ * verbose payload usually sits at the end, and a head-only cut would let it
+ * hide behind a long benign prefix. Sliced by code points so the cut cannot
+ * split a surrogate pair.
+ */
+const RENDERED_MAX_CHARS = 500;
+const RENDERED_HEAD_CHARS = 300;
+const RENDERED_TAIL_CHARS = 150;
+
+function truncateHeadTail(rendered: string): string {
+  if (rendered.length <= RENDERED_MAX_CHARS) return rendered;
+  const chars = [...rendered];
+  if (chars.length <= RENDERED_MAX_CHARS) return rendered;
+  const elided = chars.length - RENDERED_HEAD_CHARS - RENDERED_TAIL_CHARS;
+  return (
+    chars.slice(0, RENDERED_HEAD_CHARS).join('') +
+    ` …[${elided} chars elided]… ` +
+    chars.slice(-RENDERED_TAIL_CHARS).join('')
+  );
+}
+
+/** Verbatim rendering of a network egress ask (host, port, path, URL). */
+export function renderNetworkAccessRequest(req: NetworkAccessRequest): string {
+  const target = req.port !== undefined ? `${req.host}:${req.port}` : req.host;
+  const detail = req.via === 'webfetch' && req.url ? `${target} (${req.url})` : target;
+  return truncateHeadTail(`${NETWORK_ACCESS_PERMISSION_NAME} (${req.via}): ${detail}`);
+}
+
+type PermissionResolver = NonNullable<AgentLoopConfig['resolvePermission']>;
+
+/**
+ * Wrap the consumer's resolvePermission for duplex: allow and block pass
+ * through untouched (an allowlist auto-allow must not become a voiced ask),
+ * and `ask` routes through the conversation broker instead of blocking the
+ * loop invisibly. isAutoApprove bypasses voicing entirely (with an audit
+ * entry). The broker reference is late-bound because the loops capture this
+ * closure before the facade exists; the facade binds it synchronously during
+ * assembly, so an unbound broker is unreachable in normal operation, and the
+ * fallback (return the consumer's `ask`, which the loop treats as block)
+ * fails closed.
+ */
+export function buildBrokeredPermissionResolver(
+  consumer: PermissionResolver,
+  isAutoApprove: (() => boolean) | undefined,
+  getBroker: () => PermissionBroker | null,
+): PermissionResolver {
+  return async (toolName, toolArgs, context) => {
+    const raw = await consumer(toolName, toolArgs, context);
+    const normalized: CortexToolPermissionResult = typeof raw === 'boolean'
+      ? { decision: raw ? 'allow' : 'block' }
+      : raw;
+    if (normalized.decision !== 'ask') return normalized;
+    const broker = getBroker();
+    if (!broker) return normalized;
+    if (isAutoApprove?.() === true) {
+      broker.noteAutoApproved(toolName, context);
+      return { decision: 'allow' };
+    }
+    const answer = await broker.requestDecision({
+      askId: context?.askId ?? `ask-${crypto.randomUUID()}`,
+      loopPath: context?.loopPath ?? 'reasoner',
+      toolName,
+      renderedRequest: context?.renderedRequest ?? toolName,
+      kind: toolName === BASH_ESCALATION_PERMISSION_NAME ? 'escalation' : 'tool',
+      ...(context?.signal ? { signal: context.signal } : {}),
+    });
+    if (answer.decision === 'allow') return { decision: 'allow' };
+    return {
+      decision: 'block',
+      ...(answer.reason !== undefined ? { reason: answer.reason } : {}),
+    };
+  };
+}
+
+/**
+ * Wrap the consumer's resolveNetworkAccess the same way: allow and deny pass
+ * through, `ask` brokers through the conversation. This one function covers
+ * both egress paths: WebFetch calls it in-process, and the consumer wires
+ * the SAME wrapped function (via CortexAgent.getNetworkAccessResolver())
+ * into its SandboxProvider's ask callback so shell egress asks flow through
+ * the identical pipeline. With no broker bound the `ask` becomes a deny:
+ * fail closed, matching how ungated surfaces treat a non-allow.
+ *
+ * Attribution limitation, accepted: NetworkAccessRequest carries no loop
+ * identity, so a network ask raised by a sub-agent is logged under the
+ * reasoner's path.
+ */
+export function buildBrokeredNetworkResolver(
+  consumer: ResolveNetworkAccess,
+  getBroker: () => PermissionBroker | null,
+): ResolveNetworkAccess {
+  return async (req) => {
+    const upstream = await consumer(req);
+    if (upstream.decision !== 'ask') return upstream;
+    const broker = getBroker();
+    if (!broker) return { decision: 'deny' };
+    const answer = await broker.requestDecision({
+      askId: `ask-${crypto.randomUUID()}`,
+      loopPath: 'reasoner',
+      toolName: NETWORK_ACCESS_PERMISSION_NAME,
+      renderedRequest: renderNetworkAccessRequest(req),
+      kind: 'network',
+    });
+    return { decision: answer.decision === 'allow' ? 'allow' : 'deny' };
+  };
+}

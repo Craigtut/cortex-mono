@@ -149,7 +149,14 @@ export interface NetworkAccessRequest {
 export type NetworkAccessScope = 'once' | 'session' | 'always';
 
 export interface NetworkAccessDecision {
-  decision: 'allow' | 'deny';
+  /**
+   * `allow` and `deny` are final. `ask` defers the decision to the human:
+   * in a duplex CortexAgent the facade's permission broker voices the
+   * request through the conversation and settles it from the user's spoken
+   * answer; anywhere no broker exists (passthrough, direct AgentLoop use)
+   * an `ask` is treated as deny, so the unanswered case fails closed.
+   */
+  decision: 'allow' | 'deny' | 'ask';
   /** Scope of an allow, when the consumer wants to report it (informational to core). */
   scope?: NetworkAccessScope | undefined;
 }

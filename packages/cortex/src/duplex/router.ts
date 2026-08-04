@@ -38,6 +38,7 @@ import {
 import type { ConversationDelta } from './prompts.js';
 import type { CauseTag } from './cause-tags.js';
 import type { ControlDispatchTarget } from './control-tools.js';
+import { PermissionBroker } from './permission-broker.js';
 import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
 
 // ---------------------------------------------------------------------------
@@ -46,7 +47,7 @@ import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
 
 /** Log entry input the router produces (a subset of the facade's schema). */
 export interface RouterLogInput {
-  type: 'directive' | 'delivery' | 'lifecycle';
+  type: 'directive' | 'delivery' | 'lifecycle' | 'ask' | 'ask_answer';
   loopPath: string;
   content: string;
   wake?: WakeClass;
@@ -91,6 +92,16 @@ export interface DuplexRouterPorts {
   currentTalkerCauseTags(): readonly CauseTag[];
   /** Latest cause seq on the reasoner's live run, or null (log stamping). */
   currentReasonerCauseSeq(): number | null;
+  /**
+   * Wake-deliver a permission-ask voicing to the talker, carrying its
+   * ask-kind cause tag. The reserved ask lane (communication.md): calls
+   * arrive from the broker directly and must reach the talker without the
+   * delivery token bucket, dedup, spacing hold, or queues, because the loop
+   * that raised the ask blocks for as long as the voicing is delayed.
+   */
+  voiceAskToTalker(content: string, causeTag: CauseTag): void;
+  /** Mark a loop-registry pending ask as voiced (broker voicing sync). */
+  markAskVoiced?(askId: string): void;
   /** Consumer idle signal (advisory, facade-api.md). */
   idleSignal?: (() => boolean) | undefined;
   logger?: CortexLogger;
@@ -123,6 +134,17 @@ export interface DuplexRouterOptions {
   watchdogIntervalMs?: number;
   /** Char bound on the buffered conversation deltas. */
   deltaBufferMaxChars?: number;
+  /**
+   * Timeout for tool and network permission asks; on expiry the ask
+   * settles as deny with a reason. Null disables the timeout.
+   */
+  askTimeoutMs?: number | null;
+  /**
+   * Timeout for sandbox escalation asks. Default null (none): auto-denying
+   * an escalation leaves the command running contained and failing, which
+   * invites a retry loop (communication.md).
+   */
+  escalationAskTimeoutMs?: number | null;
   /** Clock override for tests. */
   now?: () => number;
 }
@@ -139,6 +161,8 @@ export const DUPLEX_ROUTER_DEFAULTS = {
   maxDispatchesPerExchange: 8,
   watchdogIntervalMs: 90_000,
   deltaBufferMaxChars: 16_000,
+  askTimeoutMs: 120_000 as number | null,
+  escalationAskTimeoutMs: null as number | null,
 } as const;
 
 type ResolvedOptions = typeof DUPLEX_ROUTER_DEFAULTS;
@@ -255,6 +279,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   private lastReasonerOutputAt = 0;
   private readonly watchdogTimer: ReturnType<typeof setInterval>;
 
+  // Permission broker (D16): the consent boundary for every ask in duplex.
+  private readonly broker: PermissionBroker;
+
   private destroyed = false;
 
   constructor(ports: DuplexRouterPorts, options?: DuplexRouterOptions) {
@@ -266,6 +293,30 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.reasonerLoopPath = ports.reasonerLoopPath ?? 'reasoner';
     this.interruptTokens = this.options.interruptBucketCapacity;
     this.lastTokenRefillAt = this.now();
+
+    this.broker = new PermissionBroker(
+      {
+        appendLog: (input) => this.ports.appendLog(input),
+        voiceToTalker: (content, causeTag) => {
+          // The reserved ask lane: no token bucket, no dedup, no queues.
+          // Voicing stamps the spacing clock so queued normal deliveries
+          // hold off for one spacing window behind a fresh ask instead of
+          // talking over it.
+          this.lastDeliveryAt = this.now();
+          this.ports.voiceAskToTalker(content, causeTag);
+        },
+        currentTalkerCauseTags: () => this.ports.currentTalkerCauseTags(),
+        ...(ports.markAskVoiced
+          ? { markAskVoiced: (askId: string) => this.ports.markAskVoiced!(askId) }
+          : {}),
+        ...(ports.logger ? { logger: ports.logger } : {}),
+      },
+      {
+        askTimeoutMs: this.options.askTimeoutMs,
+        escalationAskTimeoutMs: this.options.escalationAskTimeoutMs,
+        now: this.now,
+      },
+    );
 
     // The watchdog checks well inside its interval so a hung run is noticed
     // at most ~1.25 intervals after its last output.
@@ -533,14 +584,18 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     return receipt;
   }
 
-  dispatchAnswerAsk(_askIdRaw: unknown, _decisionRaw: unknown, _reasonRaw: unknown): string {
-    // The permission broker is 2b-ii. Until it lands, no ask is ever routed
-    // to the talker, so the only truthful receipt is that nothing is
-    // pending; the tool exists now so the talker's toolset and prompts are
-    // stable across the sub-phases. The broker replaces this body with the
-    // D16 consent rules (most-recently-voiced binding, allow-once,
-    // utterance-after-voicing causation).
-    return 'There are no pending permission requests to answer.';
+  dispatchAnswerAsk(askIdRaw: unknown, decisionRaw: unknown, reasonRaw: unknown): string {
+    this.maybeRolloverExchange();
+    // The D16 consent rules live in the broker; a refused answer is logged
+    // through the bounded dispatch_refused path so the anomaly stays in the
+    // log (D16) without one spraying turn growing it unboundedly (N4). No
+    // delegation caps here: refusing a user's permission answer on a rate
+    // cap would be the worse failure, same rule as cancel_task.
+    const outcome = this.broker.answer(askIdRaw, decisionRaw, reasonRaw);
+    if (outcome.refusal !== undefined) {
+      return this.refuseDispatch('answer_ask', outcome.refusal, outcome.receipt);
+    }
+    return outcome.receipt;
   }
 
   // -------------------------------------------------------------------------
@@ -807,6 +862,11 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     return [...this.delegations.values()].map((delegation) => ({ ...delegation }));
   }
 
+  /** The consent boundary for every permission ask in duplex (D16). */
+  get permissionBroker(): PermissionBroker {
+    return this.broker;
+  }
+
   private activeAliases(): string[] {
     return [...this.delegations.values()]
       .filter((delegation) => !delegation.cancelled)
@@ -851,6 +911,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   /** Reset the router wholesale (facade restore()). */
   resetForRestore(): void {
+    // Pending asks belong to the replaced session; every resolver settles
+    // as deny so no loop stays blocked on an ask nobody can answer anymore.
+    this.broker.reset();
     this.dropPendingDeliveries();
     this.dropWorkContext();
     this.delegations.clear();
@@ -871,6 +934,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    // Settle every pending ask first so no resolver promise outlives the
+    // router: a hanging ask would block its loop into the force-kill path.
+    this.broker.destroy();
     clearInterval(this.watchdogTimer);
     if (this.pumpTimer !== null) {
       clearTimeout(this.pumpTimer);

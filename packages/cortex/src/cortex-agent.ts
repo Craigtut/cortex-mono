@@ -88,6 +88,12 @@ import { FanOutContextManager } from './duplex/fanout-context-manager.js';
 import { DuplexHeadlines } from './duplex/headlines.js';
 import type { CauseTag } from './duplex/cause-tags.js';
 import { buildControlTools, isControlToolName } from './duplex/control-tools.js';
+import {
+  buildBrokeredNetworkResolver,
+  buildBrokeredPermissionResolver,
+} from './duplex/permission-broker.js';
+import type { PermissionBroker } from './duplex/permission-broker.js';
+import type { ResolveNetworkAccess } from './sandbox/types.js';
 import { buildDeliverTool, buildSteerSubAgentTool } from './duplex/reasoner-tools.js';
 import {
   REASONER_ROLE_PROMPT,
@@ -536,6 +542,39 @@ export function buildTalkerConfig(
   if (config.sessionId) talker.sessionId = `${config.sessionId}${TALKER_SESSION_ID_SUFFIX}`;
 
   return talker;
+}
+
+/**
+ * Route the blocking permission surfaces through the duplex broker
+ * (communication.md "Full coverage"): the consumer's resolvePermission and
+ * resolveNetworkAccess are wrapped so an `ask` becomes a voiced
+ * conversation ask instead of blocking a loop invisibly, while allow and
+ * block/deny decisions pass through untouched. The wrapped functions flow
+ * to the reasoner and, by inheritance, its sub-agents; the talker receives
+ * neither (buildTalkerConfig omits them: wiring the broker as the talker's
+ * resolver would deadlock answer_ask against the ask it is answering).
+ * Exported for tests.
+ */
+export function withBrokeredPermissions(
+  config: CortexAgentConfig,
+  getBroker: () => PermissionBroker | null,
+): CortexAgentConfig {
+  if (!config.resolvePermission && !config.resolveNetworkAccess) return config;
+  const brokered: CortexAgentConfig = { ...config };
+  if (config.resolvePermission) {
+    brokered.resolvePermission = buildBrokeredPermissionResolver(
+      config.resolvePermission,
+      config.isAutoApprove,
+      getBroker,
+    );
+  }
+  if (config.resolveNetworkAccess) {
+    brokered.resolveNetworkAccess = buildBrokeredNetworkResolver(
+      config.resolveNetworkAccess,
+      getBroker,
+    );
+  }
+  return brokered;
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,6 +1053,13 @@ export class CortexAgent {
   private talkerRepairPending = false;
   /** The consumer's base prompt without the appended role prompts. */
   private consumerBasePrompt: string | null = null;
+  /**
+   * The network egress decision function the facade actually enforces: the
+   * broker-routed wrapper in duplex, the consumer's own function in
+   * passthrough. Exposed via getNetworkAccessResolver() for the sandbox
+   * ask-callback wiring.
+   */
+  private readonly networkResolver: ResolveNetworkAccess | null;
   /** Lazily-built D6 fan-out view over both loops' context managers. */
   private fanOutContextManager: FanOutContextManager | null = null;
   private digestionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1098,6 +1144,8 @@ export class CortexAgent {
     this.stateDebounceMs = config.stateChangeDebounceMs ?? DEFAULT_STATE_DEBOUNCE_MS;
     this.consumerBasePrompt = config.initialBasePrompt ?? null;
     this.idleDigestionDelayMs = config.duplex?.idleDigestionDelayMs ?? 10_000;
+    // In duplex, create() has already wrapped this in the broker pipeline.
+    this.networkResolver = config.resolveNetworkAccess ?? null;
 
     if (this.mode === 'duplex') {
       this.wireDuplex(config);
@@ -1115,20 +1163,30 @@ export class CortexAgent {
    */
   static async create(config: CortexAgentConfig): Promise<CortexAgent> {
     if ((config.mode ?? 'passthrough') === 'duplex') {
-      const reasoner = await AgentLoop.create(buildDuplexReasonerConfig(config));
+      // Broker the blocking permission surfaces before the loop configs are
+      // built: the loops capture the resolver closures at creation, so the
+      // broker reference is late-bound through a box that is filled
+      // synchronously below, before create() returns and before any tool
+      // call can run. Allow/block/deny decisions pass through untouched;
+      // only `ask` routes through the conversation (D16).
+      const brokerBox: { broker: PermissionBroker | null } = { broker: null };
+      const brokered = withBrokeredPermissions(config, () => brokerBox.broker);
+      const reasoner = await AgentLoop.create(buildDuplexReasonerConfig(brokered));
       let talker: AgentLoop;
       try {
         // Default talker model: the fast tier resolved from the primary
         // provider, which is exactly what the reasoner's utility-model
         // auto-resolution computes.
-        const talkerModel = config.talker?.model ?? reasoner.getAutoResolvedUtilityModel();
-        talker = await AgentLoop.create(buildTalkerConfig(config, talkerModel));
+        const talkerModel = brokered.talker?.model ?? reasoner.getAutoResolvedUtilityModel();
+        talker = await AgentLoop.create(buildTalkerConfig(brokered, talkerModel));
       } catch (err) {
         // A half-assembled duplex must not leak a live reasoner.
         await reasoner.destroy().catch(() => {});
         throw err;
       }
-      return new CortexAgent(reasoner, config, talker);
+      const agent = new CortexAgent(reasoner, brokered, talker);
+      brokerBox.broker = agent.router?.permissionBroker ?? null;
+      return agent;
     }
     const reasoner = await AgentLoop.create(buildReasonerConfig(config));
     return new CortexAgent(reasoner, config);
@@ -1154,6 +1212,7 @@ export class CortexAgent {
         'deliveryDedupWindowMs', 'deliveryDedupMaxEntries',
         'maxDispatchesPerTurn', 'maxDispatchesPerExchange',
         'watchdogIntervalMs', 'deltaBufferMaxChars',
+        'askTimeoutMs', 'escalationAskTimeoutMs',
       ] as const) {
         if (tuning[key] !== undefined) {
           (routerOptions as Record<string, unknown>)[key] = tuning[key];
@@ -1183,6 +1242,17 @@ export class CortexAgent {
       currentTalkerCauseSeq: () => latestCauseSeq(talker.activeRunCauseTags),
       currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
       currentReasonerCauseSeq: () => latestCauseSeq(this.reasoner.activeRunCauseTags),
+      // The broker's ask lane: a real wake delivery carrying the ask-kind
+      // cause tag, so the run that voices the request is identifiable to
+      // the consent check (an answer from that same run cannot bind).
+      voiceAskToTalker: (content, causeTag) => {
+        talker.deliver(content, { wake: true, causeTag });
+      },
+      // Keep the loop registry's voiced flag truthful for tool asks so
+      // headline and consumer surfaces show what has been read out.
+      markAskVoiced: (askId) => {
+        this.reasoner.markAskVoiced(askId);
+      },
       idleSignal: config.idleSignal,
       logger: this.logger,
       talkerLoopPath: talker.loopPath,
@@ -1237,7 +1307,9 @@ export class CortexAgent {
       reasonerUsage: () => this.reasoner.getSessionUsage(),
       activeSubAgents: () => this.reasoner.getActiveSubAgents(),
       delegations: () => router.getDelegations(),
-      pendingAsks: () => this.reasoner.getPendingAsks(),
+      // The merged surface: loop-registry asks plus broker-minted network
+      // asks, so a blocked egress wait is visible in the status block too.
+      pendingAsks: () => this.getPendingAsks(),
     });
     this.headlines = headlines;
     talker.setHeadlineProvider(() => headlines.build(), {
@@ -2066,8 +2138,18 @@ export class CortexAgent {
         for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
           work.push(this.reasoner.cancelSubAgent(taskId));
         }
+        // Pending asks belong to the stopped work and settle as deny: tool
+        // asks through each aborted run's own signal race, network asks
+        // (which carry no signal) here. Double settlement is guarded.
+        this.router!.permissionBroker.settleAll('abort');
       }
       await Promise.all(work);
+      if (scope === 'conversation') {
+        // The work loops kept running, so a voiced ask is still pending,
+        // but its voicing delivery may have been destroyed with the
+        // talker's queues; read it out again.
+        this.router!.permissionBroker.revoiceCurrent(true);
+      }
       return;
     }
 
@@ -2806,12 +2888,38 @@ export class CortexAgent {
 
   // Asks and queues ---------------------------------------------------------
 
+  /**
+   * Permission asks currently blocked on a decision. Tool and escalation
+   * asks come from the reasoner's registry (its sub-agents mirror in); in
+   * duplex, broker-minted network egress asks are appended, since those
+   * never enter a loop registry. Ids never overlap between the two sources.
+   */
   getPendingAsks(): PendingAsk[] {
-    return this.reasoner.getPendingAsks();
+    const asks = this.reasoner.getPendingAsks();
+    const broker = this.router?.permissionBroker;
+    if (!broker) return asks;
+    const networkAsks = broker.getPendingAsks()
+      .filter((ask) => ask.kind === 'network')
+      .map(({ kind: _kind, ...ask }) => ask);
+    return [...asks, ...networkAsks];
   }
 
   markAskVoiced(askId: string): boolean {
     return this.reasoner.markAskVoiced(askId);
+  }
+
+  /**
+   * The network egress decision function this agent actually enforces: in
+   * duplex it is the broker-routed wrapper (a consumer `ask` becomes a
+   * voiced conversation ask), in passthrough the consumer's own function
+   * unchanged, undefined when none was configured. Wire THIS function, not
+   * the raw one from config, into the SandboxProvider's ask callback
+   * (cortex-sandbox `onNetworkRequest`) with `via: 'shell'`, so shell
+   * egress asks flow through the same broker pipeline as WebFetch instead
+   * of blocking a loop invisibly.
+   */
+  getNetworkAccessResolver(): ResolveNetworkAccess | undefined {
+    return this.networkResolver ?? undefined;
   }
 
   // The pi queue surface targets the conversation loop: the single

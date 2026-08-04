@@ -131,7 +131,7 @@ interface SandboxProvider {
 
 interface NetworkAccessRequest { host: string; port?: number; via: 'shell' | 'webfetch'; url?: string; }
 type NetworkAccessScope = 'once' | 'session' | 'always';
-interface NetworkAccessDecision { decision: 'allow' | 'deny'; scope?: NetworkAccessScope; }
+interface NetworkAccessDecision { decision: 'allow' | 'deny' | 'ask'; scope?: NetworkAccessScope; }
 type ResolveNetworkAccess = (req: NetworkAccessRequest) => Promise<NetworkAccessDecision>;
 
 // AgentLoopConfig.resolveNetworkAccess?: ResolveNetworkAccess
@@ -142,6 +142,14 @@ type ResolveNetworkAccess = (req: NetworkAccessRequest) => Promise<NetworkAccess
 // egress proxy consults it for shell commands). A domain granted once then
 // covers both paths. WebFetch's SSRF/private-IP guard stays separate and
 // always on: a private target is blocked even when its host is allowed.
+//
+// 'ask' defers the decision to the human: a duplex CortexAgent wraps the
+// consumer's function in its permission broker, voices the request through
+// the conversation, and settles it from the user's answer. Wherever no
+// broker exists (passthrough, direct AgentLoop use), 'ask' is treated as
+// deny, so the unanswered case fails closed. In duplex, wire
+// CortexAgent.getNetworkAccessResolver() (the broker-routed wrapper), not
+// the raw consumer function, into the provider's ask callback.
 
 interface SandboxStatus {          // the honesty contract
   filesystem: 'enforced' | 'partial' | 'none';
