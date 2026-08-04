@@ -1042,6 +1042,37 @@ describe('AgentLoop.deliver and abort', () => {
   });
 });
 
+describe('AgentLoop.deliver cause tags', () => {
+  it('a run killed by a throwing consumer logger does not leak its cause tags', async () => {
+    // The tag set and its clearing finally must be paired by construction:
+    // logger.debug('loop start') runs between the batch take and the run's
+    // try, and prefixLoggerWithLoopPath does not catch, so a throwing
+    // consumer logger escapes runPromptOnce there. Pre-fix the tags were
+    // assigned before that point and the finally never ran, leaving a dead
+    // run's tags live at gate depth 0, where the error entry for this very
+    // failure would read them as its causation stamp.
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, {
+      logger: {
+        debug: (message: string) => {
+          if (message.includes('loop start')) throw new Error('logger boom');
+        },
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+      },
+    });
+
+    const result = loop.deliver('tagged input', { causeTag: { kind: 'utterance', seq: 7 } });
+    expect(result.outcome).toBe('prompted');
+    await expect(result.turn).rejects.toThrow('logger boom');
+
+    await waitUntil(() => !loop.isLoopActive);
+    // The dead run's tags did not survive it.
+    expect(loop.activeRunCauseTags).toEqual([]);
+  });
+});
+
 describe('AgentLoop follow-up and queue surfaces', () => {
   it('followUp forwards to pi follow-up queue', () => {
     const piAgent = createMockPiAgent();

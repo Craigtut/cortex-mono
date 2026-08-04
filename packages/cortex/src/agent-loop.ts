@@ -860,9 +860,11 @@ export class AgentLoop {
   private _isPrompting = false;
 
   // Cause tags of the run currently holding the gate (see
-  // DeliverOptions.causeTag): set in the same synchronous frame that takes
-  // the delivery batches at run start, cleared in the run's own finally, so
-  // a reader can never observe a previous run's tags from a later run.
+  // DeliverOptions.causeTag): computed in the same synchronous frame that
+  // takes the delivery batches at run start, assigned as the first statement
+  // of the try owning the clearing finally, so the set and the clear are
+  // paired by construction and a reader can never observe a dead or previous
+  // run's tags from a later run.
   private _activeRunCauseTags: readonly unknown[] = [];
   // Tag handoff for the deliver() prompted branch: deliver() sets it
   // immediately before calling prompt() with the gate empty, so the very
@@ -1472,12 +1474,17 @@ export class AgentLoop {
     // silently demote to inert transcript context.
     const wakeBatch = fromDrain ? [] : this.takeDeliverableWakeDeliveries();
 
-    // Bind this run's cause tags in the same synchronous frame the batches
-    // were taken: caller-supplied tags (sweep runs), tags riding the spliced
-    // wake batch, and the deliver()-prompted input's own tag. Cleared in the
-    // finally below, under the same gate acquisition, so the tags can never
-    // outlive the run or leak into the next one.
-    this._activeRunCauseTags = [
+    // Compute this run's cause tags in the same synchronous frame the
+    // batches were taken: caller-supplied tags (sweep runs), tags riding the
+    // spliced wake batch, and the deliver()-prompted input's own tag. The
+    // ASSIGNMENT happens as the first statement of the try below, so the
+    // clearing finally is paired with the set by construction: a throwing
+    // consumer logger (or diagnostics sink) between here and the try leaves
+    // the tags untouched instead of live for a run that never happened,
+    // where the next error entry would read the dead run's stamp (the fault
+    // class the interceptor site fixed the same way). Nothing between the
+    // batch take and the try awaits, so the same-frame property holds.
+    const runCauseTags: readonly unknown[] = [
       ...(causeTags ?? []),
       ...wakeBatch.map((item) => item.causeTag).filter((tag) => tag !== undefined),
       ...(directCauseTag !== undefined ? [directCauseTag] : []),
@@ -1528,6 +1535,7 @@ export class AgentLoop {
 
     let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
     try {
+      this._activeRunCauseTags = runCauseTags;
       return await this.runTurnWithRetry(
         input, fromDrain, retryPolicyOverride, silentBatch, wakeBatch,
       );
