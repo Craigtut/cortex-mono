@@ -54,7 +54,11 @@ Adopted vocabulary from Gemini Live's result scheduling (decisions.md D10). Ever
 
 The producer proposes a class and the router may demote it (D19). The idle signal is advisory: the facade enforces its own minimum inter-delivery spacing regardless, so an always-idle signal cannot collapse the dampening properties.
 
-**Permission asks need their own lane.** They are `interrupt` class, so under the shipped backpressure defaults a chatty reasoner that burns the interrupt token bucket can push an ask up to the degrade delay behind, while the loop that raised it blocks the whole time. Backpressure exists to stop a reasoner monopolizing the conversation, not to delay the one message that has a human waiting on the other side of it. Asks get a reserved token or a class exempt from the bucket, decided when the broker lands.
+**Permission asks have their own lane.** They are `interrupt` class, so under the shipped backpressure defaults a chatty reasoner that burns the interrupt token bucket could push an ask up to the degrade delay behind, while the loop that raised it blocks the whole time. Backpressure exists to stop a reasoner monopolizing the conversation, not to delay the one message that has a human waiting on the other side of it.
+
+As built: voicings bypass the bucket, content dedup, the spacing hold, and both queues entirely, rather than holding a reserved token. They do stamp the spacing clock, so queued ordinary deliveries hold off one window behind a fresh ask instead of talking over it, and re-voicing is damped to one delivery per ask per couple of seconds so a spraying turn cannot flood the voice channel while the ask stays answerable throughout.
+
+The verbatim request is fenced with a nonce minted *after* the request text exists, so content inside it cannot forge a matching close fence and escape the quotation. Sandbox escalation is voiced with the actual command and explicit no-containment language rather than the synthetic `Bash(escalate)` name, and carries no default timeout: auto-denying an escalation leaves the command running contained and failing, which invites a retry loop. Ordinary tool asks time out to deny.
 
 Defaults per entry type: milestones `silent`, final results `when_idle`, permission asks `interrupt`, conversation deltas to the reasoner `silent` (D18). Without a consumer idle signal, `when_idle` degrades to `interrupt` after a configurable delay; the same delay bounds the case where a signal exists but never reports a lull.
 
