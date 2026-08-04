@@ -472,14 +472,67 @@ describe('control-tool dispatch', () => {
     )).toHaveLength(4);
   });
 
-  it('a new utterance opens a fresh exchange: dedup and caps reset', async () => {
+  it('a CONSUMED utterance opens a fresh exchange: dedup and caps reset (SF-3)', async () => {
     const h = createHarness();
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: 1 }]);
     h.router.noteUserUtterance('scan please');
     await callTool(h, 'spawn_task', { instructions: 'scan the repo' });
+    // The next utterance arrives AND the talker's next run carries its
+    // tag: the exchange rolls over, so the deliberate repeat ("scan it
+    // again") dispatches anew instead of replaying the memoized receipt.
     h.router.noteUserUtterance('scan it again');
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: 5 }]);
     const second = await callTool(h, 'spawn_task', { instructions: 'scan the repo' });
     expect(second.content[0]!.text).toBe('Started task-2.');
     expect(h.reasonerDispatches).toHaveLength(2);
+  });
+
+  it('a mid-batch barge-in does not defeat dispatch dedup (SF-3)', async () => {
+    const h = createHarness();
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: 1 }]);
+    h.router.noteUserUtterance('do X');
+    const first = await callTool(h, 'spawn_task', { instructions: 'do X' });
+    expect(first.content[0]!.text).toBe('Started task-1.');
+    // The user barges in mid-batch: the facade notes the utterance at
+    // arrival, but the LIVE run's cause set is unchanged (the barge-in
+    // parked for the next run). The retry-induced identical call in the
+    // same batch must replay the receipt, not spawn a second task doing
+    // identical work.
+    h.router.noteUserUtterance('wait, one more thing');
+    const retry = await callTool(h, 'spawn_task', { instructions: 'do X' });
+    expect(retry.content[0]!.text).toBe('Started task-1.');
+    expect(h.reasonerDispatches).toHaveLength(1);
+  });
+
+  it('a mid-batch barge-in does not refresh exhausted delegation caps (SF-3)', async () => {
+    const h = createHarness({ maxDispatchesPerTurn: 10, maxDispatchesPerExchange: 1 });
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: 1 }]);
+    h.router.noteUserUtterance('do many things');
+    await callTool(h, 'spawn_task', { instructions: 'thing one' });
+    // Arrival alone must not hand the capped turn a fresh budget.
+    h.router.noteUserUtterance('barge-in mid-batch');
+    const refused = await callTool(h, 'spawn_task', { instructions: 'thing two' });
+    expect(refused.content[0]!.text).toMatch(/limit reached for this exchange/i);
+    expect(h.reasonerDispatches).toHaveLength(1);
+
+    // Once the next run consumes the barge-in, the budget refreshes.
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: 4 }]);
+    const allowed = await callTool(h, 'spawn_task', { instructions: 'thing two' });
+    expect(allowed.content[0]!.text).toMatch(/^Started task-/);
+    expect(h.reasonerDispatches).toHaveLength(2);
+  });
+
+  it('a delivery- or directive-caused run never refreshes the exchange budget (SF-3)', async () => {
+    const h = createHarness({ maxDispatchesPerTurn: 10, maxDispatchesPerExchange: 1 });
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: 1 }]);
+    h.router.noteUserUtterance('kick off');
+    await callTool(h, 'spawn_task', { instructions: 'thing one' });
+    // A later run woken by a background delivery is not the user speaking:
+    // D16's shape (utterance-kind only) gates the rollover too.
+    h.setTalkerCauseTags([{ kind: 'delivery', seq: 9 }]);
+    const refused = await callTool(h, 'spawn_task', { instructions: 'thing two' });
+    expect(refused.content[0]!.text).toMatch(/limit reached for this exchange/i);
+    expect(h.reasonerDispatches).toHaveLength(1);
   });
 
   it('enforces the per-turn delegation cap with a voiceable refusal', async () => {

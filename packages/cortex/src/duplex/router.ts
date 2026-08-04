@@ -214,6 +214,11 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * after the reasoner visibly ignored it) dispatches again.
    */
   private dispatchTurnIndex = 0;
+  /**
+   * Highest utterance seq a talker run has been seen consuming; the
+   * exchange rollover watermark (see {@link maybeRolloverExchange}).
+   */
+  private lastConsumedUtteranceSeq = 0;
   /** dedup key -> receipt of the original dispatch (retries replay it). */
   private dispatchDedup = new Map<string, string>();
   /** Refusal lifecycle entries written this turn (bounded, N4). */
@@ -262,21 +267,26 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   // -------------------------------------------------------------------------
 
   /**
-   * A new user utterance: buffer the delta and open a fresh exchange.
+   * A new user utterance arrived: buffer the delta. The exchange rollover
+   * (caps, dedup, turn index) deliberately does NOT happen here: arrival
+   * can be mid talker turn (a barge-in parks behind the live run), and
+   * resetting at arrival would clear the dedup map under the batch still
+   * running, so its retry-induced duplicate spawn would dispatch identical
+   * work twice, and a talker that had exhausted its caps would earn a
+   * fresh budget inside the very turn that was capped. The rollover
+   * happens when a talker run CONSUMES the utterance instead: its cause
+   * tag appears on the run and the next dispatch sees it
+   * ({@link maybeRolloverExchange}).
    *
-   * Open question (review N1): the per-exchange cap clears ONLY here, so a
-   * long autonomous stretch (deliveries waking the talker with no new user
-   * input) runs against one fixed delegation budget until the user next
-   * speaks. Whether autonomous turns should ever refresh the cap is a
-   * policy call deferred until real usage data exists.
+   * Open question (review N1): the per-exchange cap refreshes only on a
+   * consumed user utterance, so a long autonomous stretch (deliveries
+   * waking the talker with no new user input) runs against one fixed
+   * delegation budget until the user next speaks. Whether autonomous
+   * turns should ever refresh the cap is a policy call deferred until
+   * real usage data exists.
    */
   noteUserUtterance(text: string): void {
     this.pushDelta({ speaker: 'user', text });
-    this.dispatchesThisExchange = 0;
-    this.dispatchesThisTurn = 0;
-    this.dispatchTurnIndex = 0;
-    this.refusalEntriesThisTurn = 0;
-    this.dispatchDedup.clear();
   }
 
   /** A talker reply: the other half of the conversation delta (F4). */
@@ -326,11 +336,36 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.reasonerRunning = false;
   }
 
+  /**
+   * Open a fresh exchange (caps, dedup, turn index) when the talker's live
+   * run has consumed a user utterance newer than the one that opened the
+   * current exchange. Keyed on CONSUMPTION (the utterance's cause tag
+   * arriving on the run), never on facade arrival; checked lazily at each
+   * dispatch, which is the only place exchange state matters. Only
+   * utterance-kind tags advance the watermark: a delivery- or
+   * directive-caused run is not the user speaking and must not refresh
+   * delegation budgets. The cause set carries no ordering guarantee, so
+   * the whole set is scanned.
+   */
+  private maybeRolloverExchange(): void {
+    let newest = this.lastConsumedUtteranceSeq;
+    for (const tag of this.ports.currentTalkerCauseTags()) {
+      if (tag.kind === 'utterance' && tag.seq > newest) newest = tag.seq;
+    }
+    if (newest === this.lastConsumedUtteranceSeq) return;
+    this.lastConsumedUtteranceSeq = newest;
+    this.dispatchesThisExchange = 0;
+    this.dispatchesThisTurn = 0;
+    this.dispatchTurnIndex = 0;
+    this.dispatchDedup.clear();
+  }
+
   // -------------------------------------------------------------------------
   // Control-tool dispatch (D8/D17: every return is a voiceable receipt)
   // -------------------------------------------------------------------------
 
   dispatchSpawn(instructionsRaw: unknown): string {
+    this.maybeRolloverExchange();
     const instructions = asTrimmedString(instructionsRaw);
     if (!instructions) {
       return this.refuseDispatch('spawn_task', 'missing instructions',
@@ -370,6 +405,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   }
 
   dispatchSteer(taskAliasRaw: unknown, messageRaw: unknown): string {
+    this.maybeRolloverExchange();
     const message = asTrimmedString(messageRaw);
     if (!message) {
       return this.refuseDispatch('steer_task', 'missing message',
@@ -410,6 +446,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   }
 
   dispatchCancel(taskAliasRaw: unknown): string {
+    this.maybeRolloverExchange();
     const aliasName = asTrimmedString(taskAliasRaw);
     if (!aliasName) {
       return this.refuseDispatch('cancel_task', 'missing task alias',
@@ -438,6 +475,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   }
 
   dispatchLookup(questionRaw: unknown): string {
+    this.maybeRolloverExchange();
     const question = asTrimmedString(questionRaw);
     if (!question) {
       return this.refuseDispatch('quick_lookup', 'missing question',
@@ -787,6 +825,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.dispatchesThisTurn = 0;
     this.dispatchesThisExchange = 0;
     this.dispatchTurnIndex = 0;
+    this.lastConsumedUtteranceSeq = 0;
     this.refusalEntriesThisTurn = 0;
     this.reasonerRunning = false;
     this.lastDeliveryAt = 0;

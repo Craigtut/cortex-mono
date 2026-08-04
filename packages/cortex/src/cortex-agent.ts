@@ -1710,8 +1710,11 @@ export class CortexAgent {
         causedBy: null,
       });
       // The user's own words reach the reasoner with the next dispatch
-      // (D18); a fresh utterance also opens a new exchange for the
-      // delegation caps and dispatch dedup.
+      // (D18). The exchange rollover for the delegation caps and dispatch
+      // dedup happens when a talker run consumes this utterance (the
+      // router reads its cause tag off the run), not here at arrival: a
+      // barge-in arriving mid-batch must not reset state under the batch
+      // still running.
       this.router!.noteUserUtterance(input);
       // The utterance travels with the content as a discriminated cause tag
       // (kind + seq): the run that consumes the input (the turn started

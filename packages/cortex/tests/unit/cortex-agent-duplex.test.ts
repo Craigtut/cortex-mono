@@ -590,6 +590,31 @@ describe('duplex prompt routing', () => {
     expect(directive.causedBy).toBe(bargeIn.seq);
   });
 
+  it('a barge-in mid talker turn does not double-dispatch a retried spawn (SF-3)', async () => {
+    const { facade, talkerPi, reasonerPi } = createDuplexFacade();
+    talkerPi.hold = true;
+    const turn = facade.prompt('do X');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+    const spawn = getPiTool(talkerPi, 'spawn_task');
+    const first = await spawn.execute('c1', { instructions: 'do X' }) as {
+      content: Array<{ text: string }>;
+    };
+    expect(first.content[0]!.text).toBe('Started task-1.');
+    // The user barges in mid-batch (parks behind the live run), then the
+    // retry-induced identical call lands in the same batch. It must replay
+    // the receipt, not spawn a second task doing identical work.
+    const bargeIn = facade.prompt('wait, one more thing');
+    const retry = await spawn.execute('c2', { instructions: 'do X' }) as {
+      content: Array<{ text: string }>;
+    };
+    expect(retry.content[0]!.text).toBe('Started task-1.');
+    talkerPi.releaseRun();
+    await Promise.all([turn, bargeIn]);
+    await waitUntil(() => !facade.isRunning);
+    // Exactly one dispatch reached the reasoner.
+    expect(reasonerPi.promptCalls).toHaveLength(1);
+  });
+
   it('a delivery-woken talker run inherits no stamp from the previous run', async () => {
     const { facade, talkerPi, reasonerPi } = createDuplexFacade();
     talkerPi.hold = true;
