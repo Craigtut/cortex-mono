@@ -108,7 +108,9 @@ Validating that an askId exists and is pending establishes well-formedness, not 
 - `deny` is unrestricted;
 - anything else returns a voiceable refusal and re-voices the pending ask. (The refusal costs one recovery turn and leaves the anomaly in the log.)
 
-This makes the log's causation stamps load-bearing for security, not just for observability, so they are built in P2 with the log rather than added later. Secondary mitigation for the few-shot-precedent problem named in D8: control-tool results are bare uniform receipts, so the transcript carries as little imitable decision text as possible.
+This makes the log's causation stamps load-bearing for security, not just for observability, so they are built in P2 with the log rather than added later.
+
+**The broker must read the full cause set, never the latest-cause helper.** A run can consume several delivered items with different causes, and the loop exposes all of their tags; `latestCauseSeq` collapses that to one for log-stamping convenience. This check asks whether the chain *includes* a qualifying user utterance, so collapsing first would refuse a legitimate allow whenever any later-sequenced item rode the same run: ask voiced at seq 10, user says "yes" at seq 12, an unrelated delivery lands at seq 14, the run carries both, the helper returns 14, and a genuine consent is denied. Answering while other content is in flight is the ordinary case, so this would fail often and look like flakiness rather than a rule. Secondary mitigation for the few-shot-precedent problem named in D8: control-tool results are bare uniform receipts, so the transcript carries as little imitable decision text as possible.
 
 These are router rules and never prompt rules, because the talker's judgment is precisely what an attacker targets (review-findings.md F2). Ask entries carry per-ask nonces, a `voiced` state, and a mandatory verbatim `renderedRequest`; the talker reads destructive and escalation requests verbatim rather than summarizing them (F14).
 
