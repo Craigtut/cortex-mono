@@ -350,11 +350,19 @@ const COMPACTION_THRESHOLD_STAGGER = 0.05;
  * room for it, and a pathologically low reasoner threshold shrinks the
  * stagger to half the reasoner's value instead of letting the pair
  * collapse to equality or invert. Strictly below the reasoner for every
- * positive input, which is the property the stagger exists for.
+ * input in (0, 1], which is the property the stagger exists for.
+ *
+ * The input is clamped into [0, 1] first (thresholds are fractions of the
+ * context window) rather than trusting the caller: below zero the raw
+ * arithmetic INVERTS (a negative half-value stagger lands the talker ABOVE
+ * the reasoner), and a non-finite or non-positive threshold is
+ * misconfiguration where both loops degenerate to the same always-compact
+ * posture anyway.
  */
 function staggerBelow(reasonerThreshold: number): number {
-  const stagger = Math.min(COMPACTION_THRESHOLD_STAGGER, reasonerThreshold / 2);
-  return reasonerThreshold - stagger;
+  const clamped = reasonerThreshold > 0 ? Math.min(reasonerThreshold, 1) : 0;
+  const stagger = Math.min(COMPACTION_THRESHOLD_STAGGER, clamped / 2);
+  return clamped - stagger;
 }
 
 /** Suffix appended to the consumer session id for the talker's cache key. */
@@ -393,6 +401,19 @@ export function buildDuplexReasonerConfig(
 }
 
 /**
+ * Drop explicitly-undefined keys before spreading, so a consumer object
+ * like `{ threshold: 0.8, preserveRecentTurns: undefined }` cannot clobber
+ * a default with `undefined` (the spread copies the key; `?? default`
+ * downstream never runs because the key exists).
+ */
+function stripUndefined<T extends object>(value: T | undefined): Partial<T> {
+  if (!value) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
+  ) as Partial<T>;
+}
+
+/**
  * The talker's compaction posture: the consumer's config forced
  * non-blocking (a synchronous observer call inside transformContext is
  * multi-second dead air on the presence loop, review-findings F7) with
@@ -409,15 +430,15 @@ function buildTalkerCompactionConfig(
     ?? OBSERVATIONAL_MEMORY_DEFAULTS.activationThreshold;
   const reasonerClassic = consumer?.compaction?.threshold ?? COMPACTION_DEFAULTS.threshold;
   return {
-    ...(consumer ?? {}),
+    ...stripUndefined(consumer),
     nonBlocking: true,
     observational: {
-      ...(consumer?.observational ?? {}),
+      ...stripUndefined(consumer?.observational),
       activationThreshold: staggerBelow(reasonerActivation),
     },
     compaction: {
       ...COMPACTION_DEFAULTS,
-      ...(consumer?.compaction ?? {}),
+      ...stripUndefined(consumer?.compaction),
       threshold: staggerBelow(reasonerClassic),
     },
   };

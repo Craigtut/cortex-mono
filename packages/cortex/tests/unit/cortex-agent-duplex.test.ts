@@ -348,6 +348,35 @@ describe('duplex config builders', () => {
     }
   });
 
+  it('clamps a nonsensical compaction threshold instead of inverting the stagger', () => {
+    // Negative input inverted the raw arithmetic (the talker landed ABOVE
+    // the reasoner); inputs are clamped into [0, 1] instead.
+    const negative = buildTalkerConfig(
+      { ...baseConfig, compaction: { observational: { activationThreshold: -0.4 } } },
+      testModel(),
+    );
+    expect(negative.compaction?.observational?.activationThreshold).toBe(0);
+    const huge = buildTalkerConfig(
+      { ...baseConfig, compaction: { observational: { activationThreshold: 7 } } },
+      testModel(),
+    );
+    expect(huge.compaction?.observational?.activationThreshold).toBeCloseTo(0.95);
+  });
+
+  it('a consumer key explicitly set to undefined does not clobber a compaction default', () => {
+    const talker = buildTalkerConfig(
+      {
+        ...baseConfig,
+        compaction: { compaction: { threshold: 0.8, preserveRecentTurns: undefined } },
+      },
+      testModel(),
+    );
+    // The explicit undefined is stripped before the merge, so the default
+    // survives instead of being spread over.
+    expect(talker.compaction?.compaction?.preserveRecentTurns).toBe(6);
+    expect(talker.compaction?.compaction?.threshold).toBeCloseTo(0.75);
+  });
+
   it('staggers the classic threshold on defaults, not only when the consumer set it', () => {
     const talker = buildTalkerConfig(baseConfig, testModel());
     // Reasoner default is COMPACTION_DEFAULTS.threshold (0.70); the talker
