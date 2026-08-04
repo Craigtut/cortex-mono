@@ -150,6 +150,16 @@ type ResolvedOptions = typeof DUPLEX_ROUTER_DEFAULTS;
  */
 const MAX_REFUSAL_ENTRIES_PER_TURN = 3;
 
+/**
+ * Bound on delivery_absorbed lifecycle entries per reasoner run (the N4
+ * rule applied to the intake side): a reasoner (or its retry ladder)
+ * re-emitting the same content arbitrarily many times in one run must not
+ * write an entry per repeat. The dedup itself still absorbs every repeat;
+ * past the bound only the log stays quiet, with the last written entry
+ * marking the suppression.
+ */
+const MAX_ABSORBED_ENTRIES_PER_RUN = 3;
+
 /** One tracked delegation (a spawn_task dispatch), keyed by alias. */
 export interface DelegationSnapshot {
   alias: string;
@@ -223,6 +233,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   private dispatchDedup = new Map<string, string>();
   /** Refusal lifecycle entries written this turn (bounded, N4). */
   private refusalEntriesThisTurn = 0;
+  /** Absorbed-duplicate lifecycle entries written this reasoner run (bounded). */
+  private absorbedEntriesThisRun = 0;
 
   // Delivery backpressure (D19).
   private interruptTokens: number;
@@ -327,6 +339,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   /** Reasoner run lifecycle, for the liveness watchdog. */
   noteReasonerRunStart(): void {
     this.reasonerRunning = true;
+    this.absorbedEntriesThisRun = 0;
     const now = this.now();
     this.reasonerRunStartAt = now;
     this.lastReasonerOutputAt = now;
@@ -544,18 +557,26 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     if (this.recentDeliveryHashes.some((entry) => entry.hash === hash)) {
       this.logger.info('duplicate delivery absorbed', { hash });
       // An absorbed duplicate still leaves a trace: communication.md says
-      // results are never silently dropped from the audit trail.
-      this.ports.appendLog({
-        type: 'lifecycle',
-        loopPath: this.reasonerLoopPath,
-        content: 'Duplicate delivery absorbed',
-        data: {
-          event: 'delivery_absorbed',
-          ...(meta?.implicit ? { implicit: true } : {}),
-          ...(meta?.synthetic ? { synthetic: true } : {}),
-        },
-        ...cause,
-      });
+      // results are never silently dropped from the audit trail. Entries
+      // are bounded per reasoner run (same rule as dispatch_refused, N4)
+      // so a run re-emitting the same content in a loop cannot grow the
+      // log unboundedly.
+      if (this.absorbedEntriesThisRun < MAX_ABSORBED_ENTRIES_PER_RUN) {
+        this.absorbedEntriesThisRun += 1;
+        const atBound = this.absorbedEntriesThisRun === MAX_ABSORBED_ENTRIES_PER_RUN;
+        this.ports.appendLog({
+          type: 'lifecycle',
+          loopPath: this.reasonerLoopPath,
+          content: 'Duplicate delivery absorbed',
+          data: {
+            event: 'delivery_absorbed',
+            ...(meta?.implicit ? { implicit: true } : {}),
+            ...(meta?.synthetic ? { synthetic: true } : {}),
+            ...(atBound ? { furtherAbsorbedSuppressed: true } : {}),
+          },
+          ...cause,
+        });
+      }
       return { delivered: false, reason: 'duplicate of a recent delivery' };
     }
     this.recentDeliveryHashes.push({ hash, at: now });
@@ -827,6 +848,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.dispatchTurnIndex = 0;
     this.lastConsumedUtteranceSeq = 0;
     this.refusalEntriesThisTurn = 0;
+    this.absorbedEntriesThisRun = 0;
     this.reasonerRunning = false;
     this.lastDeliveryAt = 0;
     this.interruptTokens = this.options.interruptBucketCapacity;

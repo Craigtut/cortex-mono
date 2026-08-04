@@ -250,6 +250,29 @@ describe('backpressure', () => {
     expect(absorbed!.data).toMatchObject({ implicit: true });
   });
 
+  it('bounds delivery_absorbed lifecycle entries per reasoner run', () => {
+    const h = createHarness();
+    expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(true);
+    // A run re-emitting the same content in a loop: every repeat is
+    // absorbed, but only a bounded number writes a lifecycle entry.
+    for (let i = 0; i < 5; i++) {
+      expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(false);
+    }
+    const absorbed = h.log.filter(
+      (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'delivery_absorbed',
+    );
+    expect(absorbed).toHaveLength(3);
+    expect(absorbed[2]!.data).toMatchObject({ furtherAbsorbedSuppressed: true });
+
+    // The bound is per reasoner run, not per session.
+    h.router.noteReasonerRunStart();
+    expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(false);
+    expect(h.log.filter(
+      (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'delivery_absorbed',
+    )).toHaveLength(4);
+    h.router.noteReasonerRunEnd();
+  });
+
   it('identical content under a new causing directive is delivered, not absorbed (S3)', () => {
     const h = createHarness({ reasonerCauseSeq: 7 });
     expect(h.router.deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
