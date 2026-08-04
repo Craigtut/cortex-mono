@@ -59,6 +59,27 @@ describe('SessionLog: append and seq', () => {
 });
 
 describe('SessionLog: getLog snapshots', () => {
+  it('deep-copies nested data, so no read surface shares objects with the log', () => {
+    const log = new SessionLog();
+    const appended = log.append({
+      type: 'lifecycle',
+      loopPath: 'main',
+      content: 'spawned',
+      data: { nested: { taskId: 'task-1' }, list: [{ step: 1 }] },
+    });
+
+    // Mutating nested structures on any returned copy must not reach the
+    // log's retained entry.
+    (appended.data!['nested'] as Record<string, unknown>)['taskId'] = 'mutated';
+    (appended.data!['list'] as Array<Record<string, unknown>>)[0]!['step'] = 99;
+    const fromLog = log.getLog()[0]!;
+    expect(fromLog.data).toEqual({ nested: { taskId: 'task-1' }, list: [{ step: 1 }] });
+
+    // And mutating a getLog() copy must not reach later reads.
+    (fromLog.data!['nested'] as Record<string, unknown>)['taskId'] = 'also mutated';
+    expect((log.getLog()[0]!.data!['nested'] as Record<string, unknown>)['taskId']).toBe('task-1');
+  });
+
   it('returns a snapshot copy, never a live reference', () => {
     const log = new SessionLog();
     appendUtterance(log, 'first');
@@ -227,6 +248,30 @@ describe('SessionLog: subscriptions', () => {
     expect(events[3]).toEqual({ kind: 'entry', entry: expect.objectContaining({ seq: 5 }) });
   });
 
+  it('a subscriber added by a sync callback during an append receives that entry once', () => {
+    const log = new SessionLog();
+    appendUtterance(log, 'earlier');
+
+    const received: number[] = [];
+    let added = false;
+    log.subscribeLog(() => {
+      if (added) return;
+      added = true;
+      // Subscribing mid-emit with replay: the new subscriber must get the
+      // in-flight entry from replay only, never a second live copy.
+      log.subscribeLog((event) => {
+        if (event.kind === 'entry') received.push(event.entry.seq);
+      }, 1);
+    });
+
+    appendUtterance(log, 'during emit');
+    expect(received).toEqual([1, 2]);
+
+    // Later appends reach the new subscriber normally.
+    appendUtterance(log, 'after emit');
+    expect(received).toEqual([1, 2, 3]);
+  });
+
   it('slowness in one subscriber never delays a fast peer', () => {
     const log = new SessionLog();
     const fastSeen: number[] = [];
@@ -326,6 +371,31 @@ describe('SessionLog: restore', () => {
     artifact.length = 0;
 
     expect(log.getLog().map((e) => [e.seq, e.content])).toEqual([[1, 'a'], [3, 'b']]);
+  });
+
+  it('an over-cap restore trims to retention without spilling through onEvict', () => {
+    const onEvict = vi.fn();
+    const log = new SessionLog({ maxEntries: 2, onEvict });
+    const entries = Array.from({ length: 4 }, (_, i) => ({
+      seq: i + 1,
+      type: 'utterance' as const,
+      timestamp: i + 1,
+      loopPath: 'main',
+      content: `u${i + 1}`,
+    }));
+
+    // Restored entries came FROM the persistence artifact; spilling the
+    // overflow back through onEvict would re-persist them on every restore.
+    log.restore(entries);
+    log.restore(entries);
+    expect(onEvict).not.toHaveBeenCalled();
+    expect(log.size).toBe(2);
+    expect(log.getLog().map((e) => e.seq)).toEqual([3, 4]);
+
+    // Live appends still evict and spill normally afterwards.
+    appendUtterance(log, 'live');
+    expect(onEvict).toHaveBeenCalledTimes(1);
+    expect(onEvict.mock.calls[0]![0].map((e: SessionLogEntry) => e.seq)).toEqual([3]);
   });
 
   it('an empty restore resets contents but never rewinds seq numbering', () => {

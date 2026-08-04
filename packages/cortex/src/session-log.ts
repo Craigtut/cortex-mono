@@ -240,7 +240,10 @@ export class SessionLog {
     this.entries.push(entry);
     this.applyRetention();
 
-    for (const sub of this.subscribers) {
+    // Snapshot the subscriber set: a sync callback may subscribe during
+    // this emit, and iterating the live set would hand the new subscriber
+    // this entry a second time (replay already delivered it).
+    for (const sub of [...this.subscribers]) {
       this.pushToSubscriber(sub, { kind: 'entry', entry: cloneEntry(entry) });
       this.drain(sub);
     }
@@ -312,10 +315,15 @@ export class SessionLog {
    */
   restore(entries: SessionLogEntry[]): void {
     const restored = entries.map(cloneEntry).sort((a, b) => a.seq - b.seq);
-    this.entries = restored;
+    // The retention cap applies on restore too, but WITHOUT the onEvict
+    // spill: these entries came from the persistence artifact, so spilling
+    // the overflow back through persistResult would re-persist the same
+    // entries on every restore.
+    this.entries = restored.length > this.maxEntries
+      ? restored.slice(restored.length - this.maxEntries)
+      : restored;
     const maxSeq = restored.length > 0 ? restored[restored.length - 1]!.seq : 0;
     this.nextSeq = Math.max(this.nextSeq, maxSeq + 1);
-    this.applyRetention();
   }
 
   /** Drop every subscriber (owner teardown). Queued events are discarded. */
@@ -427,9 +435,14 @@ export class SessionLog {
   }
 }
 
-/** Detached copy of an entry (data shallow-copied). */
+/**
+ * Detached copy of an entry. `data` is deep-copied: a shallow copy would
+ * share nested objects, letting a caller mutate the log (or the log mutate
+ * under a caller) through them, breaking the never-a-live-reference
+ * contract every read surface promises.
+ */
 function cloneEntry(entry: SessionLogEntry): SessionLogEntry {
   const copy: SessionLogEntry = { ...entry };
-  if (entry.data !== undefined) copy.data = { ...entry.data };
+  if (entry.data !== undefined) copy.data = structuredClone(entry.data);
   return copy;
 }
