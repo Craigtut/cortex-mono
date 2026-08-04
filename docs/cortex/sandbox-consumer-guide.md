@@ -89,6 +89,8 @@ async function resolveNetworkAccess(req: NetworkAccessRequest): Promise<NetworkA
 
 Fail closed: if the prompt throws or is dismissed, return `deny`. The seeded registries (`SEEDED_REGISTRY_DOMAINS`) are pre-allowed, so normal installs do not prompt.
 
+On `CortexAgent`, wire `agent.getNetworkAccessResolver()` into the provider's `onNetworkRequest`, not your raw function. The facade may wrap the one you configured (in duplex mode an `ask` becomes a spoken permission request), and the wrapped function is what the agent actually enforces. Wiring the raw one instead sends shell egress down a different path than WebFetch, which fails closed and silently: egress stops working and no request is ever put to the user. The agent logs a warning if it is holding a wrapped resolver nobody ever collected.
+
 ## Single-command escalation
 
 When the sandbox blocks a command, the model may set the Bash param `escalateOutsideSandbox: true` to request running that one command uncontained. Cortex re-presents that call to your `resolvePermission` under `BASH_ESCALATION_PERMISSION_NAME` so you can render a distinct prompt:
