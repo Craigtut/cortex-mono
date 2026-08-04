@@ -786,6 +786,63 @@ describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {
     expect(piAgent.promptCalls).toHaveLength(1);
     expect(loop.pendingWakeDeliveryCount).toBe(0);
   });
+
+  it('does not re-deliver a spliced batch when a mid-run front trim moved the boundary', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, { compaction: { strategy: 'classic' } });
+    loop.restoreConversationHistory([
+      { role: 'user', content: 'old question', timestamp: 1 } as AgentMessage,
+      { role: 'assistant', content: 'old answer', timestamp: 2 } as AgentMessage,
+      { role: 'user', content: 'old follow-up', timestamp: 3 } as AgentMessage,
+    ]);
+
+    // The run pushes its batch, then a mid-run front trim rewrites the
+    // transcript exactly the way observational activation does through
+    // setSourceHistory (splice the observed prefix, reassign
+    // state.messages, recalculate _prePromptMessageCount, the only in-run
+    // writer), then the provider fails before any output. The spliced wake
+    // message is still in the transcript verbatim, just shifted down: the
+    // repark must not misread that as "never pushed" and deliver it twice.
+    const internals = loop as unknown as { _prePromptMessageCount: number };
+    let failuresLeft = 1;
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      if (failuresLeft > 0) {
+        failuresLeft -= 1;
+        const source = piAgent.state.messages;
+        const currentTickCount = source.length - internals._prePromptMessageCount;
+        source.splice(0, 2);
+        piAgent.state.messages = [...source];
+        internals._prePromptMessageCount = Math.max(
+          0,
+          piAgent.state.messages.length - currentTickCount,
+        );
+        throw new Error('provider exploded after activation trim');
+      }
+      piAgent.state.messages.push({ role: 'assistant', content: 'ok', timestamp: Date.now() });
+      return { content: 'ok' };
+    };
+
+    const turn = loop.prompt('real question');
+    const result = loop.deliver('trim-shifted wake content');
+    expect(result.outcome).toBe('parked');
+
+    await expect(turn).rejects.toThrow('provider exploded after activation trim');
+
+    // The failed run never progressed past the batch: the content is
+    // unwound at the SHIFTED boundary, re-parked, and delivered exactly
+    // once by the sweep.
+    await waitUntil(() => piAgent.promptCalls.length === 2);
+    expect(piAgent.promptCalls[1]).toBe('trim-shifted wake content');
+    await waitUntil(() => !loop.isLoopActive);
+    expect(occurrences(piAgent, 'trim-shifted wake content')).toBe(1);
+    expect(occurrences(piAgent, 'real question')).toBe(1);
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+  });
 });
 
 describe('AgentLoop.deliver and abort', () => {

@@ -2127,12 +2127,26 @@ export class AgentLoop {
     if (wakeBatch.length === 0) return;
     const messages = this.agent.state.messages;
 
+    // A mid-run front trim (observational activation through
+    // setSourceHistory, the only in-run writer of _prePromptMessageCount)
+    // shifts every message down: the pushed batch is still in the
+    // transcript verbatim, just no longer at the captured boundary.
+    // Walking from the stale offset would misread "rewritten down" as
+    // "never pushed" and re-park content the transcript already carries,
+    // so the sweep would deliver it twice. The recalculated
+    // _prePromptMessageCount tracks exactly that shift (new length minus
+    // current-tick messages), so walk from the live value when it moved;
+    // unwindFailedDelivery reasons about mid-run rewrites the same way.
+    const boundary = this._prePromptMessageCount !== preDeliveryCount
+      ? this._prePromptMessageCount
+      : preDeliveryCount;
+
     // How many spliced wake messages sit at the batch position, identity-
     // checked by role and content so a mid-run history rewrite can never
     // cause an unrelated message to be removed.
     let landed = 0;
     while (landed < wakeBatch.length) {
-      const idx = preDeliveryCount + landed;
+      const idx = boundary + landed;
       if (idx >= messages.length) break;
       const msg = messages[idx] as unknown as Record<string, unknown>;
       if (msg['role'] !== 'user' || msg['content'] !== wakeBatch[landed]!.content) break;
@@ -2144,15 +2158,15 @@ export class AgentLoop {
       // beyond the pushed batch (wake, silent, and the prompt input) means
       // the run progressed past the content.
       let end = messages.length;
-      while (end > preDeliveryCount) {
+      while (end > boundary) {
         const msg = messages[end - 1] as unknown as Record<string, unknown>;
         if (!AgentLoop.isTrimmableFailureMessage(msg)) break;
         end -= 1;
       }
-      if (end > preDeliveryCount + wakeBatch.length + trailingBatchCount + 1) {
+      if (end > boundary + wakeBatch.length + trailingBatchCount + 1) {
         return; // Durable history; re-parking would duplicate it.
       }
-      messages.splice(preDeliveryCount, landed);
+      messages.splice(boundary, landed);
       this.notifySourceHistoryTailTrimmed();
     } else if (landed > 0) {
       // pi pushes the whole batch at run start, so a partial match means
