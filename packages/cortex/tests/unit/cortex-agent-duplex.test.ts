@@ -2086,6 +2086,45 @@ describe('duplex permission broker', () => {
     expect(decisions).toHaveLength(0);
   });
 
+  it('warns once when the network resolver is configured but never wired into the sandbox', async () => {
+    // Nothing enforces the wiring, and the misconfiguration is silent in
+    // the direction that looks fine: shell egress hard-denies and no ask is
+    // ever voiced.
+    const warnings: string[] = [];
+    const logger = {
+      debug: () => {}, info: () => {}, error: () => {},
+      warn: (message: string) => { warnings.push(message); },
+    };
+    const sandbox = {
+      initialize: async () => ({}),
+      wrapSpawn: async (spec: unknown) => spec,
+    } as never;
+    const h = createDuplexFacade({
+      logger,
+      sandbox,
+      resolveNetworkAccess: async () => ({ decision: 'ask' as const }),
+    });
+    await h.facade.prompt('hello');
+    const unwired = warnings.filter((message) => message.includes('getNetworkAccessResolver()'));
+    expect(unwired).toHaveLength(1);
+    expect(unwired[0]).toContain('fail closed');
+
+    // Once only, and never again after the consumer takes it.
+    await h.facade.prompt('again');
+    expect(warnings.filter((message) => message.includes('getNetworkAccessResolver()')))
+      .toHaveLength(1);
+
+    const wired = createDuplexFacade({
+      logger,
+      sandbox,
+      resolveNetworkAccess: async () => ({ decision: 'ask' as const }),
+    });
+    expect(wired.facade.getNetworkAccessResolver()).toBeDefined();
+    await wired.facade.prompt('hello');
+    expect(warnings.filter((message) => message.includes('getNetworkAccessResolver()')))
+      .toHaveLength(1);
+  });
+
   it('withBrokeredPermissions wraps exactly the configured surfaces', async () => {
     const bare: CortexAgentConfig = {
       model: testModel(),

@@ -1188,6 +1188,11 @@ export class CortexAgent {
    * ask-callback wiring.
    */
   private readonly networkResolver: ResolveNetworkAccess | null;
+  /** Whether a sandbox was configured (for the egress-wiring warning). */
+  private readonly sandboxConfigured: boolean;
+  /** Whether anyone took the resolver to wire into a sandbox. */
+  private networkResolverHandedOut = false;
+  private unwiredNetworkResolverWarned = false;
   /** Lazily-built D6 fan-out view over both loops' context managers. */
   private fanOutContextManager: FanOutContextManager | null = null;
   private digestionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1280,6 +1285,7 @@ export class CortexAgent {
     this.idleDigestionDelayMs = config.duplex?.idleDigestionDelayMs ?? 10_000;
     // In duplex, create() has already wrapped this in the broker pipeline.
     this.networkResolver = config.resolveNetworkAccess ?? null;
+    this.sandboxConfigured = config.sandbox !== undefined;
 
     if (this.mode === 'duplex') {
       this.wireDuplex(config);
@@ -2181,6 +2187,7 @@ export class CortexAgent {
   /** Duplex prompt path: talker deliver(), never talker prompt() (F15). */
   private async promptDuplex(input: string, options?: DirectCompletionOptions): Promise<unknown> {
     const talker = this.talker!;
+    this.warnOnUnwiredNetworkResolver();
     this.pendingFacadePrompts += 1;
     try {
       const entry = this.appendEntry({
@@ -3258,7 +3265,29 @@ export class CortexAgent {
    * of blocking a loop invisibly.
    */
   getNetworkAccessResolver(): ResolveNetworkAccess | undefined {
+    this.networkResolverHandedOut = true;
     return this.networkResolver ?? undefined;
+  }
+
+  /**
+   * Warn once when a duplex agent is configured for shell egress asks but
+   * nobody ever took the resolver to wire into the sandbox. Nothing
+   * enforces the wiring, and the failure is silent in the direction that
+   * looks fine: the sandbox falls back to hard-denied egress, so shell
+   * network access stops working with no ask ever voiced. That is a
+   * usability failure rather than a security one, which is exactly why it
+   * needs to be said out loud.
+   */
+  private warnOnUnwiredNetworkResolver(): void {
+    if (this.unwiredNetworkResolverWarned) return;
+    if (this.networkResolverHandedOut) return;
+    if (!this.sandboxConfigured || this.networkResolver === null) return;
+    this.unwiredNetworkResolverWarned = true;
+    this.logger.warn(
+      'sandbox and resolveNetworkAccess are configured but getNetworkAccessResolver() ' +
+      'was never called: shell egress asks bypass the permission broker and fail closed. ' +
+      "Wire getNetworkAccessResolver() into the SandboxProvider's network ask callback.",
+    );
   }
 
   // The pi queue surface targets the conversation loop: the single
