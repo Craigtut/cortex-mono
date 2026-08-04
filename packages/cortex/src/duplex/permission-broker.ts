@@ -205,6 +205,9 @@ export const PERMISSION_BROKER_DEFAULTS = {
  */
 const REVOICE_MIN_INTERVAL_MS = 2_000;
 
+/** Cap on {@link PermissionBroker.settledAskIds}. */
+const MAX_SETTLED_ASK_IDS = 64;
+
 // ---------------------------------------------------------------------------
 // Receipts and reasons (bare and uniform, D16/D17: as little imitable
 // decision text in the talker's transcript as possible)
@@ -212,6 +215,9 @@ const REVOICE_MIN_INTERVAL_MS = 2_000;
 
 const NO_PENDING_RECEIPT = 'There are no pending permission requests to answer.';
 const NOT_PENDING_RECEIPT = 'That permission request is no longer pending; nothing was changed.';
+const UNKNOWN_ASK_RECEIPT =
+  'No permission request has that id. The pending one will be read to the user again; ' +
+  'answer that one.';
 const ALLOW_RECEIPT = 'Approval passed along.';
 const DENY_RECEIPT = 'Denial passed along.';
 const CONSENT_REFUSED_RECEIPT =
@@ -299,6 +305,13 @@ export class PermissionBroker {
   private voiceQueue: string[] = [];
   /** Pending coalesced voice-the-next-ask timer (see {@link settle}). */
   private settleVoiceTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Recently settled ask ids, bounded and FIFO-evicted. Only used to tell
+   * "you already answered that" from "no such request" in the answer_ask
+   * receipt. An evicted id degrades to the unknown-id path, which refuses
+   * and re-reads: never a grant, so the cap is safe to be small.
+   */
+  private readonly settledAskIds = new Set<string>();
   /** The most recently voiced, still-pending ask (exactly one at a time). */
   private voicedAskId: string | null = null;
   /** True while settleAll drains, so settlement never voices a doomed ask. */
@@ -449,10 +462,16 @@ export class PermissionBroker {
     if (askId !== null) {
       ask = this.asks.get(askId);
       if (!ask) {
-        // Unknown id, or an already-settled ask: the replay path. A second
-        // allow for the same ask finds nothing here, which is what makes
-        // allow take effect exactly once.
-        return { receipt: NOT_PENDING_RECEIPT };
+        // An already-settled ask is the replay path: a second allow for the
+        // same ask finds nothing here, which is what makes allow take
+        // effect exactly once, and the receipt says so.
+        if (this.settledAskIds.has(askId)) return { receipt: NOT_PENDING_RECEIPT };
+        // An id that never existed is something else: a typo or a
+        // fabrication, with the real request still pending. Reported as
+        // "no longer pending" it tells the user the request went away while
+        // it sits there waiting, so it refuses and re-reads instead.
+        this.revoiceCurrent();
+        return { receipt: UNKNOWN_ASK_RECEIPT, refusal: 'unknown ask id' };
       }
     } else if (this.voicedAskId !== null) {
       // A bare answer binds to the one voiced ask; with exactly one voiced
@@ -795,6 +814,7 @@ export class PermissionBroker {
       ask.abortListener = null;
     }
     this.asks.delete(ask.request.askId);
+    this.rememberSettled(ask.request.askId);
     this.voiceQueue = this.voiceQueue.filter((id) => id !== ask.request.askId);
     if (this.voicedAskId === ask.request.askId) {
       this.voicedAskId = null;
@@ -822,6 +842,16 @@ export class PermissionBroker {
     }, this.settleVoiceDelayMs);
     timer.unref?.();
     this.settleVoiceTimer = timer;
+  }
+
+  private rememberSettled(askId: string): void {
+    this.settledAskIds.add(askId);
+    while (this.settledAskIds.size > MAX_SETTLED_ASK_IDS) {
+      // Sets iterate in insertion order, so the first entry is the oldest.
+      const oldest = this.settledAskIds.values().next().value;
+      if (oldest === undefined) break;
+      this.settledAskIds.delete(oldest);
+    }
   }
 
   private clearSettleVoiceTimer(): void {

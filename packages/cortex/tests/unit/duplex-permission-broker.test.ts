@@ -621,6 +621,30 @@ describe('D16 consent binding', () => {
     expect(late.content[0]!.text).toBe('There are no pending permission requests to answer.');
   });
 
+  it('a mistyped ask id reads differently from one that already settled', async () => {
+    // Same receipt for both tells the user their request went away while it
+    // sits there pending, and leaves the ask silently unanswered.
+    const h = createHarness();
+    const first = requestAsk(h, { askId: 'ask-1' });
+    requestAsk(h, { askId: 'ask-2', renderedRequest: 'Write: /tmp/b' });
+    h.setTalkerCauseTags([]);
+
+    await callAnswerAsk(h, { askId: 'ask-1', decision: 'deny' });
+    await waitUntil(() => first.decisions.length === 1);
+    await waitUntil(() => h.askVoicings.length === 2);
+
+    const settled = await callAnswerAsk(h, { askId: 'ask-1', decision: 'deny' });
+    expect(settled.content[0]!.text).toContain('no longer pending');
+
+    h.advance(4_001);
+    const typo = await callAnswerAsk(h, { askId: 'ask-2x', decision: 'deny' });
+    expect(typo.content[0]!.text).not.toContain('no longer pending');
+    expect(typo.content[0]!.text).toContain('No permission request has that id');
+    // And the real ask is re-read rather than left silently pending.
+    expect(h.askVoicings).toHaveLength(3);
+    expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+  });
+
   it('an unreadable decision is a voiceable refusal, never a grant or a throw', async () => {
     const h = createHarness();
     const { decisions } = requestAsk(h);
