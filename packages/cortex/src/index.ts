@@ -160,11 +160,14 @@ export type {
   DeliverResult,
   IdleDigestionResult,
   QueueDrainMode,
+  ToolResultInterceptor,
+  ToolResultInterceptorInfo,
+  ToolResultInterceptorResult,
 } from './agent-loop.js';
 
-// CortexAgent (the composite facade over AgentLoop; passthrough mode today,
-// duplex mode arrives with Phase 2b). AgentLoop remains the loop primitive
-// and the package's primary agent surface until the duplex default flips.
+// CortexAgent (the composite facade over AgentLoop: passthrough and duplex
+// modes). AgentLoop remains the loop primitive and the package's primary
+// agent surface until the duplex default flips (Phase 3).
 export { CortexAgent, CONFIG_ROUTING, buildReasonerConfig } from './cortex-agent.js';
 export type {
   CortexAgentMode,
@@ -173,6 +176,7 @@ export type {
   CortexDeliverOptions,
   CortexSessionLogConfig,
   TalkerConfig,
+  DuplexTuningConfig,
   ConfigDestination,
   CortexAgentStateV1,
   CortexAgentStateV2,

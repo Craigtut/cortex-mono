@@ -247,6 +247,24 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.pushDelta({ speaker: 'consumer', text });
   }
 
+  /**
+   * A silent conversation input (facade deliver, wake false): conversation
+   * context without opening a new exchange.
+   */
+  noteUserContext(text: string): void {
+    this.pushDelta({ speaker: 'user', text });
+  }
+
+  /**
+   * Compose a consumer work-input dispatch: the pending conversation block
+   * ahead of the directive, exactly like a control-tool dispatch. The
+   * facade delivers the returned message to the reasoner itself (it owns
+   * the causation binding for the run).
+   */
+  composeWorkDispatch(content: string): string {
+    return composeDispatchMessage(this.consumeConversationBlock(), buildWorkInputDirective(content));
+  }
+
   /** A talker turn boundary: resets the per-turn dispatch cap. */
   noteTalkerTurnEnd(): void {
     this.dispatchesThisTurn = 0;

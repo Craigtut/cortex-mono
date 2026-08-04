@@ -288,17 +288,7 @@ function trackFakeSubAgent(
 // ---------------------------------------------------------------------------
 
 describe('CortexAgent modes', () => {
-  it('create() with duplex mode throws the Phase 2b not-implemented error', async () => {
-    await expect(
-      CortexAgent.create({
-        model: testModel(),
-        workingDirectory: '/tmp/test-workspace',
-        mode: 'duplex',
-      }),
-    ).rejects.toThrow(/duplex mode is not implemented yet \(Phase 2b\)/);
-  });
-
-  it('the test constructor also rejects duplex, so it can never silently degrade', () => {
+  it('duplex without a talker loop throws rather than silently degrading', () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
     const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
@@ -309,7 +299,7 @@ describe('CortexAgent modes', () => {
           workingDirectory: '/tmp/test-workspace',
           mode: 'duplex',
         }),
-    ).toThrow(/duplex mode is not implemented yet/);
+    ).toThrow(/requires a talker loop/);
   });
 
   it('defaults to passthrough and runs prompts through the reasoner', async () => {

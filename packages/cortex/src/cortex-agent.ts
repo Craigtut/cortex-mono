@@ -3,14 +3,15 @@
  * (docs/cortex/duplex/facade-api.md, architecture.md).
  *
  * Consumers interact with one CortexAgent. Internally it owns the resident
- * loop(s), the session log, settlement predicates, and composite
- * persistence. Two modes:
+ * loop(s), the session log, the duplex router, settlement predicates, and
+ * composite persistence. Two modes:
  *
- * - `passthrough` (the default until Phase 2b lands): a single reasoner
+ * - `passthrough` (the default until Phase 3 flips it): a single reasoner
  *   loop, reproducing direct AgentLoop behavior exactly. This is the
  *   consumer opt-out and the parity baseline for tests.
- * - `duplex`: a fast talker loop fronting the reasoner. NOT IMPLEMENTED
- *   YET; constructing with it throws until Phase 2b.
+ * - `duplex`: a fast talker loop fronting the persistent reasoner. The
+ *   talker carries the fixed control toolset only; the reasoner does all
+ *   real work and reports back through the router's wake policy.
  *
  * The talker/reasoner split is never exposed in this API; consumer config
  * is routed internally per the routing table below.
@@ -23,6 +24,8 @@ import type {
   IdleDigestionOptions,
   IdleDigestionResult,
   QueueDrainMode,
+  ToolResultInterceptorInfo,
+  ToolResultInterceptorResult,
 } from './agent-loop.js';
 import type { McpClientManager } from './mcp-client.js';
 import type { CompactionManager } from './compaction/index.js';
@@ -30,11 +33,13 @@ import type { DirectCompletionContext } from './cache-breakpoints.js';
 import type {
   AgentLoopConfig,
   AgentTextOutput,
+  BudgetGuardConfig,
   ClassifiedError,
   CompactionDegradedInfo,
   CompactionExhaustedInfo,
   CompactionResult,
   CompactionTarget,
+  CortexCompactionConfig,
   CortexLifecycleState,
   CortexLogger,
   CortexUsage,
@@ -47,6 +52,7 @@ import type {
   ModelThinkingCapabilities,
   PendingAsk,
   RetryExhaustedInfo,
+  RetryPolicy,
   RetryScheduledInfo,
   RetrySucceededInfo,
   SessionUsage,
@@ -59,8 +65,9 @@ import type { CortexTool } from './tool-contract.js';
 import type { CortexModel } from './model-wrapper.js';
 import type { AgentMessage } from './context-manager.js';
 import type { ContextManager } from './context-manager.js';
-import type { EventBridge } from './event-bridge.js';
-import type { BudgetGuard } from './budget-guard.js';
+import { EventBridge } from './event-bridge.js';
+import type { CortexEvent } from './event-bridge.js';
+import { BudgetGuard } from './budget-guard.js';
 import type { SkillRegistry } from './skill-registry.js';
 import type {
   ObservationEvent,
@@ -68,8 +75,20 @@ import type {
   ReflectionEvent,
 } from './compaction/index.js';
 import { SessionLog } from './session-log.js';
-import type { SessionLogEntry, SessionLogSubscriber } from './session-log.js';
+import type { SessionLogEntry, SessionLogSubscriber, WakeClass } from './session-log.js';
 import { NOOP_LOGGER } from './noop-logger.js';
+import { stripWorkingTags } from './working-tags.js';
+import { TOOL_NAMES } from './tools/index.js';
+import { DuplexRouter } from './duplex/router.js';
+import type { DuplexRouterOptions, DuplexRouterPorts } from './duplex/router.js';
+import { buildControlTools, isControlToolName } from './duplex/control-tools.js';
+import { buildDeliverTool, buildSteerSubAgentTool } from './duplex/reasoner-tools.js';
+import {
+  REASONER_ROLE_PROMPT,
+  SPEAK_NOW_APPENDIX,
+  TALKER_ROLE_PROMPT,
+  TALKER_TRUNCATION_REPAIR_MESSAGE,
+} from './duplex/prompts.js';
 
 // ---------------------------------------------------------------------------
 // Modes and config
@@ -78,23 +97,37 @@ import { NOOP_LOGGER } from './noop-logger.js';
 /**
  * Facade mode. `passthrough` routes everything to the single reasoner loop
  * and reproduces direct AgentLoop behavior exactly. `duplex` (talker +
- * reasoner) is the planned default once Phase 2b lands (decisions.md D14);
- * until then requesting it throws rather than silently degrading to
- * passthrough.
+ * reasoner) becomes the default at the Phase 3 flip (decisions.md D14).
  */
 export type CortexAgentMode = 'passthrough' | 'duplex';
 
 /** Scope for {@link CortexAgent.abort} (facade-api.md abort table). */
 export type CortexAbortScope = 'conversation' | 'work' | 'all';
 
-/** Talker-loop overrides (consumed in duplex mode, Phase 2b). */
+/** Talker-loop overrides (duplex mode). */
 export interface TalkerConfig {
   /**
-   * Talker model. Default: a fast tier resolved from the primary provider.
-   * The talker's toolset is fixed (control tools only, decisions.md D5/D8);
-   * consumer tools never route to it.
+   * Talker model. Default: the fast tier resolved from the primary
+   * provider (the reasoner's auto-resolved utility model). The talker's
+   * toolset is fixed (control tools only, decisions.md D5/D8); consumer
+   * tools never route to it.
    */
   model?: CortexModel;
+}
+
+/**
+ * Duplex tuning: router backpressure and scheduling knobs plus the facade's
+ * idle-digestion delay. Every field has a production default; the talker's
+ * hard maxTurns is deliberately NOT here (consumer config cannot raise it,
+ * decisions.md D17).
+ */
+export interface DuplexTuningConfig extends Omit<DuplexRouterOptions, 'now'> {
+  /**
+   * Quiet time after a run completes before the facade digests both loops
+   * (pending observation buffers, threshold compaction) outside a prompt.
+   * Default: 10000.
+   */
+  idleDigestionDelayMs?: number;
 }
 
 /** Session log tuning (retention and subscriber buffering). */
@@ -112,16 +145,19 @@ export interface CortexSessionLogConfig {
 export interface CortexAgentConfig extends AgentLoopConfig {
   /** Consumer tools. Routed to the reasoner only (decisions.md D5). */
   tools?: CortexTool[];
-  /** Facade mode. Default: 'passthrough' until Phase 2b. */
+  /** Facade mode. Default: 'passthrough' until the Phase 3 flip. */
   mode?: CortexAgentMode;
-  /** Talker overrides (duplex mode, Phase 2b). */
+  /** Talker overrides (duplex mode). */
   talker?: TalkerConfig;
   /**
-   * Consumer idle signal for the wake policy (duplex mode, Phase 2b): is
-   * the user/channel idle right now? Advisory; the facade enforces its own
-   * minimum inter-delivery spacing.
+   * Consumer idle signal for the wake policy (duplex mode): is the
+   * user/channel idle right now? Advisory; the facade enforces its own
+   * minimum inter-delivery spacing, and a held when_idle delivery degrades
+   * to interrupt after a configurable delay.
    */
   idleSignal?: () => boolean;
+  /** Duplex router and scheduling tuning (duplex mode). */
+  duplex?: DuplexTuningConfig;
   /** Session log retention and subscription tuning. */
   sessionLog?: CortexSessionLogConfig;
   /**
@@ -236,6 +272,7 @@ export const CONFIG_ROUTING: { [K in keyof Required<CortexAgentConfig>]: ConfigD
   mode: 'facade',
   talker: 'facade',
   idleSignal: 'facade',
+  duplex: 'facade',
   sessionLog: 'facade',
   stateChangeDebounceMs: 'facade',
 };
@@ -257,6 +294,164 @@ export function buildReasonerConfig(
     }
   }
   return routed as unknown as AgentLoopConfig & { tools?: CortexTool[] };
+}
+
+// ---------------------------------------------------------------------------
+// Duplex loop configs
+// ---------------------------------------------------------------------------
+
+/**
+ * The talker's facade-set hard turn cap per exchange (decisions.md D17).
+ * Consumer budget config cannot raise it: an unbounded talker plus any
+ * result missing `terminate` is an unbounded retry cycle with no attacker
+ * involved (review-findings F9). Low but with room for the deliberate
+ * recovery turns the guards force (empty-spoken-text follow-up, truncation
+ * repair, one malformed-call recovery).
+ */
+export const TALKER_MAX_TURNS = 8;
+
+/**
+ * Fail-fast talker retries (facade-api.md): a transient provider error on
+ * the presence loop must never become minutes of silent backoff. The
+ * reasoner keeps the consumer's (or default) long-haul policy.
+ */
+const TALKER_RETRY_POLICY: Partial<RetryPolicy> = {
+  maxAttempts: 2,
+  backoffMs: [1_000, 2_000],
+  maxBackoffMs: 2_000,
+  maxElapsedMs: 10_000,
+};
+
+/**
+ * Threshold stagger between the loops (log-and-context.md): the talker
+ * compacts slightly earlier than the reasoner so blocking work on one
+ * never coincides with an activation on the other.
+ */
+const COMPACTION_THRESHOLD_STAGGER = 0.05;
+
+/** Floor below which staggering stops making thresholds more aggressive. */
+const COMPACTION_THRESHOLD_FLOOR = 0.5;
+
+/** Suffix appended to the consumer session id for the talker's cache key. */
+const TALKER_SESSION_ID_SUFFIX = ':talker';
+
+function appendRolePrompt(basePrompt: string | undefined, rolePrompt: string): string | undefined {
+  // An absent or blank base prompt stays absent so the facade's
+  // prompt-not-configured guard still trips; the role prompt alone is not
+  // a usable identity.
+  if (basePrompt === undefined || basePrompt.trim().length === 0) return basePrompt;
+  return `${basePrompt}\n\n${rolePrompt}`;
+}
+
+/**
+ * The reasoner's config in duplex mode: consumer routing per the table,
+ * plus the duplex posture. Exported for tests.
+ */
+export function buildDuplexReasonerConfig(
+  config: CortexAgentConfig,
+): AgentLoopConfig & { tools?: CortexTool[] } {
+  const routed = buildReasonerConfig(config);
+  const duplexed: AgentLoopConfig & { tools?: CortexTool[] } = {
+    ...routed,
+    loopPath: 'reasoner',
+    // A resident reasoner woken repeatedly by dispatches continues one
+    // logical working session; wiping tool-runtime state (cwd,
+    // read-before-edit, undo) per prompt would break it mid-task. An
+    // explicit consumer value still wins.
+    persistentRuntime: config.persistentRuntime ?? true,
+  };
+  const basePrompt = appendRolePrompt(config.initialBasePrompt, REASONER_ROLE_PROMPT);
+  if (basePrompt !== undefined) duplexed.initialBasePrompt = basePrompt;
+  // The reasoner keeps the bare consumer sessionId (routing table): a
+  // session that flips modes keeps its reasoner prefix cache warm.
+  return duplexed;
+}
+
+/**
+ * The talker's compaction posture: the consumer's config forced
+ * non-blocking (a synchronous observer call inside transformContext is
+ * multi-second dead air on the presence loop, review-findings F7) with
+ * activation staggered ahead of the reasoner's.
+ */
+function buildTalkerCompactionConfig(
+  consumer: Partial<CortexCompactionConfig> | undefined,
+): Partial<CortexCompactionConfig> {
+  const staggered = (threshold: number): number =>
+    Math.max(COMPACTION_THRESHOLD_FLOOR, threshold - COMPACTION_THRESHOLD_STAGGER);
+  const talker: Partial<CortexCompactionConfig> = {
+    ...(consumer ?? {}),
+    nonBlocking: true,
+    observational: {
+      ...(consumer?.observational ?? {}),
+      activationThreshold: staggered(consumer?.observational?.activationThreshold ?? 0.9),
+    },
+  };
+  if (consumer?.compaction?.threshold !== undefined) {
+    talker.compaction = {
+      ...consumer.compaction,
+      threshold: staggered(consumer.compaction.threshold),
+    };
+  }
+  return talker;
+}
+
+/**
+ * The talker's AgentLoop config (architecture.md): fast model, the fixed
+ * control toolset only (registered by the facade after construction), no
+ * built-in tools, no permission resolver, a facade-set hard maxTurns that
+ * consumer config cannot raise, fail-fast retries, non-blocking compaction
+ * with a staggered threshold, and a derived stable session id. Exported
+ * for tests.
+ */
+export function buildTalkerConfig(
+  config: CortexAgentConfig,
+  talkerModel: CortexModel,
+): AgentLoopConfig & { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean } {
+  const talker: AgentLoopConfig & {
+    enableSubAgentTool?: boolean;
+    enableLoadSkillTool?: boolean;
+  } = {
+    model: talkerModel,
+    workingDirectory: config.workingDirectory,
+    loopPath: 'talker',
+    // The talker separates thinking from speech with working tags in-band;
+    // API-level reasoning would sit on the presence loop's latency budget.
+    thinkingLevel: 'off',
+    budgetGuard: { maxTurns: TALKER_MAX_TURNS, scope: 'prompt' },
+    retryPolicy: TALKER_RETRY_POLICY,
+    compaction: buildTalkerCompactionConfig(config.compaction),
+    // No built-in toolset: the talker's turns are structurally incapable of
+    // blocking on tool execution (D5). The observational Recall tool is the
+    // one allowed non-control tool (review-findings F19) and registers via
+    // the compaction config like anywhere else.
+    disableTools: Object.values(TOOL_NAMES),
+    enableSubAgentTool: false,
+    enableLoadSkillTool: false,
+    // Deliberately absent: resolvePermission (wiring the broker as the
+    // talker's resolver would deadlock answer_ask against the ask it is
+    // answering, communication.md), resolveNetworkAccess, consumer tools,
+    // MCP, skills, sub-agent config, and the consumer's budget guard.
+  };
+
+  // Consumer slots go to both loops, identical content (D6); the base
+  // prompt goes to both in full with the role prompt appended.
+  if (config.slots) talker.slots = config.slots;
+  const basePrompt = appendRolePrompt(config.initialBasePrompt, TALKER_ROLE_PROMPT);
+  if (basePrompt !== undefined) talker.initialBasePrompt = basePrompt;
+  if (config.workingTags) talker.workingTags = config.workingTags;
+
+  // Shared environment-level wiring.
+  if (config.getApiKey) talker.getApiKey = config.getApiKey;
+  if (config.sandbox) talker.sandbox = config.sandbox;
+  if (config.envOverrides) talker.envOverrides = config.envOverrides;
+  if (config.logger) talker.logger = config.logger;
+  if (config.diagnostics) talker.diagnostics = config.diagnostics;
+  if (config.persistResult) talker.persistResult = config.persistResult;
+
+  // Distinct stable per-loop cache identity derived from the consumer's.
+  if (config.sessionId) talker.sessionId = `${config.sessionId}${TALKER_SESSION_ID_SUFFIX}`;
+
+  return talker;
 }
 
 // ---------------------------------------------------------------------------
@@ -683,25 +878,79 @@ function yieldMacrotask(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+/**
+ * User-facing text of a pi assistant message: text blocks joined, working
+ * tags stripped, trimmed. Empty means the message spoke nothing.
+ */
+function extractSpokenText(assistantMessage: unknown): string {
+  const content = (assistantMessage as { content?: unknown } | null | undefined)?.content;
+  let raw = '';
+  if (typeof content === 'string') {
+    raw = content;
+  } else if (Array.isArray(content)) {
+    raw = content
+      .filter((block): block is { type: string; text: string } =>
+        (block as { type?: string } | null)?.type === 'text' &&
+        typeof (block as { text?: unknown }).text === 'string')
+      .map((block) => block.text)
+      .join('');
+  }
+  if (raw.length === 0) return '';
+  return stripWorkingTags(raw).trim();
+}
+
+/** Append the D17 speak-now appendix to a control-tool receipt. */
+function appendSpeakNudge(content: unknown): unknown {
+  const nudge = `\n\n${SPEAK_NOW_APPENDIX}`;
+  if (typeof content === 'string') return content + nudge;
+  if (Array.isArray(content)) return [...content, { type: 'text', text: nudge }];
+  return content;
+}
+
 export class CortexAgent {
   private readonly reasoner: AgentLoop;
+  /** The talker loop; null in passthrough. */
+  private readonly talker: AgentLoop | null;
   private readonly mode: CortexAgentMode;
   private readonly log: SessionLog;
   private readonly logger: CortexLogger;
+
+  // Duplex machinery (null in passthrough).
+  private router: DuplexRouter | null = null;
+  private mergedBridge: EventBridge | null = null;
+  private aggregateGuard: BudgetGuard | null = null;
+  private aggregateBreachLogged = false;
+  /** Whether the current reasoner run called Deliver (implicit-delivery guard). */
+  private reasonerDeliverCalledThisRun = false;
+  /** One truncation repair per streak (D17 stop-reason audit). */
+  private talkerRepairPending = false;
+  /** The consumer's base prompt without the appended role prompts. */
+  private consumerBasePrompt: string | null = null;
+  private digestionTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleDigestionDelayMs = 10_000;
 
   /** Serializes facade prompt() calls (concurrent prompts queue, never throw). */
   private promptChain: Promise<void> = Promise.resolve();
   /** Facade prompts accepted but not yet settled (chain-queued or running). */
   private pendingFacadePrompts = 0;
+  /** Waiters released whenever pendingFacadePrompts returns to zero. */
+  private promptSettlers: Array<() => void> = [];
 
   /**
-   * Seq of the utterance whose facade-initiated run is currently live.
+   * Seq of the utterance whose facade-initiated conversation run is
+   * currently live (the reasoner in passthrough, the talker in duplex).
    * Entries produced by that run (replies, errors, spawn lifecycle) carry
    * it as their causation stamp. Null while no facade-initiated run is
    * live; entries produced then (e.g. by a background delivery run) carry
    * no stamp rather than a guessed one.
    */
   private activeCauseSeq: number | null = null;
+  /**
+   * Seq of the directive whose reasoner run is currently live (duplex).
+   * Entries the work surface produces during that run (deliveries, errors,
+   * spawn lifecycle) default to it.
+   */
+  private activeReasonerCauseSeq: number | null = null;
   /** Spawn lifecycle seq per live task, for completion causation. */
   private readonly spawnSeqByTaskId = new Map<string, number>();
 
@@ -712,6 +961,8 @@ export class CortexAgent {
   private usageBaseline: { talker: SessionUsage | null; reasoner: SessionUsage } | null = null;
   /** Reasoner live counters at the moment of the last restore. */
   private usageAtRestore: SessionUsage | null = null;
+  /** Talker live counters at the moment of the last restore (duplex). */
+  private talkerUsageAtRestore: SessionUsage | null = null;
   /**
    * Talker-side artifact content carried through a passthrough session
    * opaquely: passthrough has no talker loop to hydrate, but a restored
@@ -729,15 +980,13 @@ export class CortexAgent {
   private destroyPromise: Promise<void> | null = null;
   private destroyed = false;
 
-  private constructor(reasoner: AgentLoop, config: CortexAgentConfig) {
+  private constructor(reasoner: AgentLoop, config: CortexAgentConfig, talker?: AgentLoop) {
     this.mode = config.mode ?? 'passthrough';
-    if (this.mode === 'duplex') {
-      throw new Error(
-        'CortexAgent duplex mode is not implemented yet (Phase 2b). ' +
-        "Use mode: 'passthrough' (the current default).",
-      );
+    if (this.mode === 'duplex' && !talker) {
+      throw new Error('CortexAgent duplex mode requires a talker loop.');
     }
     this.reasoner = reasoner;
+    this.talker = this.mode === 'duplex' ? talker! : null;
     const baseLogger = config.logger ?? NOOP_LOGGER;
     this.logger = {
       debug: (message, data) => baseLogger.debug(`[CortexAgent] ${message}`, data),
@@ -758,27 +1007,348 @@ export class CortexAgent {
     });
 
     this.stateDebounceMs = config.stateChangeDebounceMs ?? DEFAULT_STATE_DEBOUNCE_MS;
+    this.consumerBasePrompt = config.initialBasePrompt ?? null;
+    this.idleDigestionDelayMs = config.duplex?.idleDigestionDelayMs ?? 10_000;
 
-    this.wireLogProducers();
+    if (this.mode === 'duplex') {
+      this.wireDuplex(config);
+    } else {
+      this.wireLogProducers();
+    }
     this.wireStateTriggers();
   }
 
   /**
    * Create a CortexAgent. Routes consumer config per {@link CONFIG_ROUTING}
-   * and constructs the reasoner loop. `mode: 'duplex'` throws until Phase
-   * 2b lands; passthrough reproduces direct AgentLoop behavior exactly.
+   * and constructs the resident loop(s): the reasoner alone in passthrough
+   * (reproducing direct AgentLoop behavior exactly), or the talker plus the
+   * persistent reasoner in duplex.
    */
   static async create(config: CortexAgentConfig): Promise<CortexAgent> {
     if ((config.mode ?? 'passthrough') === 'duplex') {
-      // Checked before any loop is constructed so a rejected mode cannot
-      // leak a live AgentLoop.
-      throw new Error(
-        'CortexAgent duplex mode is not implemented yet (Phase 2b). ' +
-        "Use mode: 'passthrough' (the current default).",
-      );
+      const reasoner = await AgentLoop.create(buildDuplexReasonerConfig(config));
+      let talker: AgentLoop;
+      try {
+        // Default talker model: the fast tier resolved from the primary
+        // provider, which is exactly what the reasoner's utility-model
+        // auto-resolution computes.
+        const talkerModel = config.talker?.model ?? reasoner.getAutoResolvedUtilityModel();
+        talker = await AgentLoop.create(buildTalkerConfig(config, talkerModel));
+      } catch (err) {
+        // A half-assembled duplex must not leak a live reasoner.
+        await reasoner.destroy().catch(() => {});
+        throw err;
+      }
+      return new CortexAgent(reasoner, config, talker);
     }
     const reasoner = await AgentLoop.create(buildReasonerConfig(config));
     return new CortexAgent(reasoner, config);
+  }
+
+  // -------------------------------------------------------------------------
+  // Duplex assembly
+  // -------------------------------------------------------------------------
+
+  /** The loop holding the conversation surface: talker in duplex. */
+  private get conversationLoop(): AgentLoop {
+    return this.talker ?? this.reasoner;
+  }
+
+  private wireDuplex(config: CortexAgentConfig): void {
+    const talker = this.talker!;
+    const routerOptions: DuplexRouterOptions = {};
+    const tuning = config.duplex;
+    if (tuning) {
+      for (const key of [
+        'minDeliverySpacingMs', 'whenIdleDegradeMs', 'idlePollMs',
+        'interruptBucketCapacity', 'interruptRefillMs',
+        'deliveryDedupWindowMs', 'deliveryDedupMaxEntries',
+        'maxDispatchesPerTurn', 'maxDispatchesPerExchange',
+        'watchdogIntervalMs', 'deltaBufferMaxChars',
+      ] as const) {
+        if (tuning[key] !== undefined) {
+          (routerOptions as Record<string, unknown>)[key] = tuning[key];
+        }
+      }
+    }
+
+    const ports: DuplexRouterPorts = {
+      deliverToTalker: (content, wake) => {
+        talker.deliver(content, { wake });
+      },
+      talkerIdle: () => !talker.isLoopActive,
+      dispatchToReasoner: (message, causeSeq) => this.dispatchToReasoner(message, causeSeq),
+      appendLog: (input) => this.appendEntry({
+        type: input.type,
+        loopPath: input.loopPath,
+        content: input.content,
+        // The router supplies causation explicitly; entries it cannot
+        // attribute carry no stamp rather than a guessed one.
+        causedBy: input.causedBy ?? null,
+        ...(input.wake !== undefined ? { wake: input.wake } : {}),
+        ...(input.data !== undefined ? { data: input.data } : {}),
+      }).seq,
+      currentTalkerCauseSeq: () => this.activeCauseSeq,
+      currentReasonerCauseSeq: () => this.activeReasonerCauseSeq,
+      idleSignal: config.idleSignal,
+      logger: this.logger,
+      talkerLoopPath: talker.loopPath,
+      reasonerLoopPath: this.reasoner.loopPath,
+    };
+    const router = new DuplexRouter(ports, routerOptions);
+    this.router = router;
+
+    // The talker carries exactly the control toolset (D5/D8); the reasoner
+    // gains Deliver (F1) and SteerSubAgent (D12).
+    for (const tool of buildControlTools(router)) {
+      talker.addConsumerTool(tool);
+    }
+    this.reasoner.addConsumerTool(buildDeliverTool({
+      deliverFromReasoner: (content, wake, meta) => {
+        // An explicit Deliver this run suppresses the implicit final-text
+        // delivery for the same run.
+        this.reasonerDeliverCalledThisRun = true;
+        return router.deliverFromReasoner(content, wake, meta);
+      },
+    }));
+    this.reasoner.addConsumerTool(buildSteerSubAgentTool(this.reasoner));
+
+    // D17 terminate guards: bare receipts and empty-spoken-text
+    // suppression, enforced in the tool-result path, not by prompt.
+    talker.setToolResultInterceptor((info) => this.talkerToolResultGuard(info));
+
+    // Conversation-side log producers and delta capture.
+    talker.onTurnComplete((output: AgentTextOutput, origin: LoopOriginContext) => {
+      if (output.userFacing.trim().length === 0) return;
+      this.appendEntry({
+        type: 'reply',
+        loopPath: origin.loopPath,
+        content: output.userFacing,
+      });
+      router.noteTalkerReply(output.userFacing);
+    });
+    this.wireErrorProducers(talker);
+    this.wireErrorProducers(this.reasoner);
+    this.wireWorkLoopProducers();
+
+    // Run tracking: implicit deliveries, the liveness watchdog, the
+    // per-turn dispatch cap, and the stop-reason audit.
+    const reasonerBridge = this.reasoner.getEventBridge();
+    reasonerBridge.on('loop_start', (event) => {
+      if (event.childTaskId) return;
+      this.reasonerDeliverCalledThisRun = false;
+      router.noteReasonerRunStart();
+    });
+    reasonerBridge.on('loop_end', (event) => {
+      if (event.childTaskId) return;
+      this.handleReasonerRunEnd(event);
+      this.scheduleIdleDigestion();
+    });
+    const talkerBridge = talker.getEventBridge();
+    talkerBridge.on('turn_end', (event) => {
+      if (event.childTaskId) return;
+      router.noteTalkerTurnEnd();
+      this.auditTalkerTurnEnd(event);
+    });
+    talkerBridge.on('loop_end', (event) => {
+      if (event.childTaskId) return;
+      this.scheduleIdleDigestion();
+    });
+
+    // One merged event stream, every event labeled with its loop path.
+    this.mergedBridge = new EventBridge(false, this.logger);
+    this.mergedBridge.forwardFrom(talkerBridge, talker.loopPath);
+    this.mergedBridge.forwardFrom(reasonerBridge, this.reasoner.loopPath);
+
+    // The aggregate budget guard, active from the first duplex assembly
+    // (D19): lifetime scope over both loops, every sub-agent, and utility
+    // spend (observer/reflector/summarization), which per-prompt loop
+    // guards never see. Only maxCost aggregates: the consumer's maxTurns
+    // keeps its per-prompt meaning on the reasoner, and turn counts across
+    // two loops plus children have no comparable composite meaning.
+    const aggregateConfig: Partial<BudgetGuardConfig> = {
+      scope: 'lifetime',
+      includeChildUsage: true,
+      includeUtilityUsage: true,
+    };
+    if (config.budgetGuard?.maxCost !== undefined) {
+      aggregateConfig.maxCost = config.budgetGuard.maxCost;
+    }
+    this.aggregateGuard = new BudgetGuard(
+      aggregateConfig,
+      () => this.handleAggregateBreach(),
+      this.logger,
+    );
+    this.aggregateGuard.wire(this.mergedBridge);
+  }
+
+  /** Wake-deliver a dispatch to the reasoner, binding run causation. */
+  private dispatchToReasoner(message: string, causeSeq: number | null): void {
+    const result = this.reasoner.deliver(message);
+    if (result.outcome === 'prompted' && result.turn && causeSeq !== null) {
+      this.activeReasonerCauseSeq = causeSeq;
+      const clear = (): void => {
+        if (this.activeReasonerCauseSeq === causeSeq) {
+          this.activeReasonerCauseSeq = null;
+        }
+      };
+      void result.turn.then(clear, clear);
+    }
+    // Parked dispatches ride the sweep's run, which has no bindable
+    // causation (same rule as parked facade deliveries).
+  }
+
+  /**
+   * D17 terminate guards over control-tool results. Bare receipts (the
+   * working-tags reminder is suppressed: a dispatch receipt must not carry
+   * permanent per-exchange reminder tokens), and terminate suppression
+   * when the assistant message spoke nothing, so a preamble-less tool call
+   * cannot end the exchange silently: the forced follow-up turn speaks.
+   */
+  private talkerToolResultGuard(
+    info: ToolResultInterceptorInfo,
+  ): ToolResultInterceptorResult | undefined {
+    if (!isControlToolName(info.toolName)) return undefined;
+    if (info.isError) {
+      // A pi-level error result already omits terminate, buying the one
+      // recovery turn (bounded by the talker's hard maxTurns).
+      return undefined;
+    }
+    const spoken = extractSpokenText(info.assistantMessage);
+    if (spoken.length === 0) {
+      return {
+        terminate: false,
+        suppressWorkingTagsReminder: true,
+        content: appendSpeakNudge(info.result.content),
+      };
+    }
+    return { suppressWorkingTagsReminder: true };
+  }
+
+  /**
+   * Stop-reason audit (D17): a maxTokens ('length') stop with no tool call
+   * in the truncated message can leave a spoken acknowledgment with
+   * nothing dispatched and no error anywhere. Run one repair turn; a
+   * truncated repair does not repair again until a clean turn resets the
+   * streak.
+   */
+  private auditTalkerTurnEnd(event: CortexEvent): void {
+    const message = (event.data as { message?: { stopReason?: unknown; content?: unknown } } | undefined)?.message;
+    const truncated = message?.stopReason === 'length';
+    const content = message?.content;
+    const hasToolCall = Array.isArray(content) &&
+      content.some((block) => (block as { type?: string } | null)?.type === 'toolCall');
+    if (truncated && !hasToolCall) {
+      if (!this.talkerRepairPending && this.talker) {
+        this.talkerRepairPending = true;
+        try {
+          this.talker.deliver(TALKER_TRUNCATION_REPAIR_MESSAGE, { wake: true });
+        } catch (err) {
+          this.logger.warn('truncation repair delivery failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      return;
+    }
+    this.talkerRepairPending = false;
+  }
+
+  /**
+   * A reasoner run ended: if it never called Deliver and its final
+   * assistant text is user-facing, deliver that text as an implicit
+   * when_idle delivery so results always surface (review-findings F1).
+   */
+  private handleReasonerRunEnd(event: CortexEvent): void {
+    this.router?.noteReasonerRunEnd();
+    if (this.reasonerDeliverCalledThisRun) return;
+    const messages = (event.data as { messages?: unknown[] } | undefined)?.messages;
+    if (!Array.isArray(messages)) return;
+    let last: { stopReason?: unknown; content?: unknown } | null = null;
+    for (const message of messages) {
+      if ((message as { role?: string } | null)?.role === 'assistant') {
+        last = message as { stopReason?: unknown; content?: unknown };
+      }
+    }
+    if (!last) return;
+    if (last.stopReason === 'error' || last.stopReason === 'aborted') return;
+    const spoken = extractSpokenText(last);
+    if (spoken.length === 0) return;
+    this.router?.deliverFromReasoner(spoken, 'when_idle', { implicit: true });
+  }
+
+  /**
+   * Aggregate budget breach: log once, then stop both loops and every
+   * child. The lifetime guard keeps stopping anything that starts after
+   * the breach, so later dispatches cannot leak spend.
+   */
+  private handleAggregateBreach(): void {
+    if (this.destroyed) return;
+    if (!this.aggregateBreachLogged) {
+      this.aggregateBreachLogged = true;
+      this.appendEntry({
+        type: 'lifecycle',
+        loopPath: this.reasoner.loopPath,
+        content: 'Aggregate budget limit breached; stopping work',
+        data: {
+          event: 'budget_breached',
+          totalCost: this.aggregateGuard?.getTotalCost() ?? 0,
+          maxCost: this.aggregateGuard?.getMaxCost() ?? 0,
+        },
+        causedBy: null,
+      });
+    }
+    const swallow = (err: unknown): void => {
+      this.logger.warn('budget-breach abort failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    };
+    if (this.talker) void this.talker.abort().catch(swallow);
+    void this.reasoner.abort().catch(swallow);
+    for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
+      void this.reasoner.cancelSubAgent(taskId).catch(swallow);
+    }
+  }
+
+  /**
+   * Schedule deferred digestion (pending observation buffers, threshold
+   * compaction) for a quiet moment. The talker runs a non-blocking
+   * compaction posture, so this is where its blocking work happens; the
+   * reasoner benefits opportunistically.
+   */
+  private scheduleIdleDigestion(): void {
+    if (this.mode !== 'duplex' || this.destroyed) return;
+    if (this.digestionTimer !== null) clearTimeout(this.digestionTimer);
+    const timer = setTimeout(() => {
+      this.digestionTimer = null;
+      void this.runIdleDigestion();
+    }, this.idleDigestionDelayMs);
+    timer.unref?.();
+    this.digestionTimer = timer;
+  }
+
+  private async runIdleDigestion(): Promise<void> {
+    if (this.destroyed || !this.talker || !this.router) return;
+    // Only when genuinely quiet; a digestion pass holds the loop gate, so a
+    // busy moment skips and the next run completion reschedules.
+    if (!this.conversationIdle || this.router.pendingDeliveryCount > 0) return;
+    try {
+      if (!this.talker.isLoopActive) await this.talker.digestIdle();
+    } catch (err) {
+      this.logger.warn('talker idle digestion failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    if (this.destroyed) return;
+    try {
+      if (!this.reasoner.isLoopActive && this.reasoner.getSubAgentManager().activeCount === 0) {
+        await this.reasoner.digestIdle();
+      }
+    } catch (err) {
+      this.logger.warn('reasoner idle digestion failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -786,9 +1356,10 @@ export class CortexAgent {
   // -------------------------------------------------------------------------
 
   /**
-   * Register the facade's own handlers on the reasoner. All registrations
-   * are additive (the loop keeps handler arrays), so consumer handlers and
-   * their signatures are untouched; passthrough parity holds.
+   * Register the facade's own handlers on the reasoner (passthrough). All
+   * registrations are additive (the loop keeps handler arrays), so
+   * consumer handlers and their signatures are untouched; passthrough
+   * parity holds.
    */
   private wireLogProducers(): void {
     this.reasoner.onTurnComplete((output: AgentTextOutput, origin: LoopOriginContext) => {
@@ -799,8 +1370,13 @@ export class CortexAgent {
         content: output.userFacing,
       });
     });
+    this.wireErrorProducers(this.reasoner);
+    this.wireWorkLoopProducers();
+  }
 
-    this.reasoner.onError((error: ClassifiedError, origin: LoopOriginContext) => {
+  /** Error and retry log producers for one loop (both loops in duplex). */
+  private wireErrorProducers(loop: AgentLoop): void {
+    loop.onError((error: ClassifiedError, origin: LoopOriginContext) => {
       this.appendEntry({
         type: 'error',
         loopPath: origin.loopPath,
@@ -813,10 +1389,10 @@ export class CortexAgent {
       });
     });
 
-    this.reasoner.onRetryScheduled((info: RetryScheduledInfo) => {
+    loop.onRetryScheduled((info: RetryScheduledInfo) => {
       this.appendEntry({
         type: 'retrying',
-        loopPath: this.reasoner.loopPath,
+        loopPath: loop.loopPath,
         content: info.originalMessage,
         data: {
           category: info.category,
@@ -827,7 +1403,10 @@ export class CortexAgent {
         },
       });
     });
+  }
 
+  /** Sub-agent lifecycle and dead-letter producers (the work surface). */
+  private wireWorkLoopProducers(): void {
     this.reasoner.onSubAgentSpawned((taskId, instructions, background) => {
       const entry = this.appendEntry({
         type: 'lifecycle',
@@ -913,35 +1492,51 @@ export class CortexAgent {
    * appends mark it in appendEntry.
    */
   private wireStateTriggers(): void {
-    this.reasoner.onLoopComplete(() => this.markStateDirty());
-    this.reasoner.onPostCompaction(() => this.markStateDirty());
-    this.reasoner.onObservation(() => this.markStateDirty());
-    this.reasoner.onReflection(() => this.markStateDirty());
+    for (const loop of this.talker ? [this.reasoner, this.talker] : [this.reasoner]) {
+      loop.onLoopComplete(() => this.markStateDirty());
+      loop.onPostCompaction(() => this.markStateDirty());
+      loop.onObservation(() => this.markStateDirty());
+      loop.onReflection(() => this.markStateDirty());
+    }
   }
 
   /**
    * Append a log entry, stamping causation from the live facade-initiated
-   * run unless the caller supplies (or suppresses, with null) its own.
+   * run unless the caller supplies (or suppresses, with null) its own. In
+   * duplex the fallback follows the producing surface: work-loop entries
+   * default to the live dispatch's directive seq, everything else to the
+   * live conversation run's utterance seq.
    */
   private appendEntry(input: {
     type: SessionLogEntry['type'];
     loopPath: string;
     content: string;
     causedBy?: number | null;
+    wake?: WakeClass;
     data?: Record<string, unknown>;
   }): SessionLogEntry {
+    const fallback = this.defaultCauseSeqFor(input.loopPath);
     const causedBy = input.causedBy === null
       ? undefined
-      : input.causedBy ?? this.activeCauseSeq ?? undefined;
+      : input.causedBy ?? fallback ?? undefined;
     const entry = this.log.append({
       type: input.type,
       loopPath: input.loopPath,
       content: input.content,
       ...(causedBy !== undefined ? { causedBy } : {}),
+      ...(input.wake !== undefined ? { wake: input.wake } : {}),
       ...(input.data !== undefined ? { data: input.data } : {}),
     });
     this.markStateDirty();
     return entry;
+  }
+
+  /** Which live-run causation track a producer's entries default to. */
+  private defaultCauseSeqFor(loopPath: string): number | null {
+    if (this.talker && loopPath !== this.talker.loopPath) {
+      return this.activeReasonerCauseSeq;
+    }
+    return this.activeCauseSeq;
   }
 
   /** Spill retention-evicted entries through persistResult when configured. */
@@ -974,14 +1569,14 @@ export class CortexAgent {
    */
   private assertPromptable(action: 'prompt' | 'deliver'): void {
     this.assertNotDestroyed();
-    const loopState = this.reasoner.state;
+    const loopState = this.conversationLoop.state;
     if (loopState === 'destroying') {
       throw new Error('Agent is being destroyed');
     }
     if (loopState === 'destroyed') {
       throw new Error('Agent has been destroyed');
     }
-    if (this.reasoner.getCurrentSystemPrompt().trim().length === 0) {
+    if (this.conversationLoop.getCurrentSystemPrompt().trim().length === 0) {
       throw new Error(
         `CortexAgent prompt is not configured. Call setBasePrompt() before ${action}(), ` +
         'or provide initialBasePrompt during creation.',
@@ -991,15 +1586,22 @@ export class CortexAgent {
 
   /**
    * Prompt the agent. Routes to the reasoner (passthrough) or the talker
-   * (duplex, 2b). Never throws on a busy loop: concurrent calls are
-   * serialized by the facade, each resolving against the turn that carries
-   * its input. The utterance is appended to the log when its run starts
-   * (append-then-emit still holds: the entry lands before any event of the
-   * run), so log order always matches execution order even when a deliver()
-   * issued in the same tick starts its run ahead of a queued prompt().
+   * (duplex). Never throws on a busy loop. In passthrough, concurrent
+   * calls are serialized by the facade, each resolving against the turn
+   * that carries its input; the utterance is appended to the log when its
+   * run starts (append-then-emit still holds: the entry lands before any
+   * event of the run), so log order always matches execution order even
+   * when a deliver() issued in the same tick starts its run ahead of a
+   * queued prompt(). In duplex the input goes through the talker's
+   * deliver() (barge-in is the conversation's core event, so a held gate
+   * parks rather than queues behind the turn), and a parked input resolves
+   * when the talker next quiesces, which is after the run that carried it.
    */
   async prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
     this.assertPromptable('prompt');
+    if (this.mode === 'duplex') {
+      return this.promptDuplex(input, options);
+    }
 
     this.pendingFacadePrompts += 1;
     const run = this.promptChain.then(async () => {
@@ -1035,9 +1637,63 @@ export class CortexAgent {
     });
     const settle = (): void => {
       this.pendingFacadePrompts -= 1;
+      this.notifyPromptSettled();
     };
     this.promptChain = run.then(settle, settle);
     return run;
+  }
+
+  /** Duplex prompt path: talker deliver(), never talker prompt() (F15). */
+  private async promptDuplex(input: string, options?: DirectCompletionOptions): Promise<unknown> {
+    const talker = this.talker!;
+    this.pendingFacadePrompts += 1;
+    try {
+      const entry = this.appendEntry({
+        type: 'utterance',
+        loopPath: talker.loopPath,
+        content: input,
+        causedBy: null,
+      });
+      // The user's own words reach the reasoner with the next dispatch
+      // (D18); a fresh utterance also opens a new exchange for the
+      // delegation caps and dispatch dedup.
+      this.router!.noteUserUtterance(input);
+      const result = talker.deliver(
+        input,
+        options ? { wake: true, promptOptions: options } : { wake: true },
+      );
+      if (result.outcome === 'prompted' && result.turn) {
+        this.activeCauseSeq = entry.seq;
+        try {
+          return await result.turn;
+        } finally {
+          if (this.activeCauseSeq === entry.seq) {
+            this.activeCauseSeq = null;
+          }
+        }
+      }
+      // Parked (barge-in): the input rides the talker's next run. Resolve
+      // at the next gate quiescence, which is after that run.
+      for (;;) {
+        await talker.waitForLoopIdle();
+        if (!talker.isLoopActive) return undefined;
+      }
+    } finally {
+      this.pendingFacadePrompts -= 1;
+      this.notifyPromptSettled();
+    }
+  }
+
+  private notifyPromptSettled(): void {
+    if (this.pendingFacadePrompts > 0 || this.promptSettlers.length === 0) return;
+    const waiters = this.promptSettlers.splice(0);
+    for (const resolve of waiters) resolve();
+  }
+
+  /** Resolves once no facade prompt is queued or running. */
+  private waitForPromptSettled(): Promise<void> {
+    if (this.pendingFacadePrompts === 0) return Promise.resolve();
+    return new Promise((resolve) => this.promptSettlers.push(resolve));
   }
 
   /**
@@ -1052,6 +1708,9 @@ export class CortexAgent {
     this.assertPromptable('deliver');
     if (typeof content !== 'string' || content.trim().length === 0) {
       throw new Error('deliver() requires non-whitespace string content');
+    }
+    if (this.mode === 'duplex') {
+      return this.deliverDuplex(content, options);
     }
     const entry = this.appendEntry({
       type: 'utterance',
@@ -1081,12 +1740,80 @@ export class CortexAgent {
   }
 
   /**
+   * Duplex deliver: 'conversation' (default) reaches the talker,
+   * 'work' reaches the reasoner as a dispatch. A no-wake work delivery is
+   * context only: it joins the conversation-delta buffer and rides the
+   * next dispatch rather than starting a reasoner turn (D18).
+   */
+  private deliverDuplex(content: string, options?: CortexDeliverOptions): DeliverResult {
+    const target = options?.target ?? 'conversation';
+    const router = this.router!;
+    if (target === 'work') {
+      const entry = this.appendEntry({
+        type: 'utterance',
+        loopPath: this.reasoner.loopPath,
+        content,
+        causedBy: null,
+        data: { target },
+      });
+      if (options?.wake === false) {
+        router.noteWorkContext(content);
+        return { outcome: 'queued' };
+      }
+      const message = router.composeWorkDispatch(content);
+      const result = this.reasoner.deliver(message);
+      if (result.outcome === 'prompted' && result.turn) {
+        this.activeReasonerCauseSeq = entry.seq;
+        const clear = (): void => {
+          if (this.activeReasonerCauseSeq === entry.seq) {
+            this.activeReasonerCauseSeq = null;
+          }
+        };
+        void result.turn.then(clear, clear);
+      }
+      return result;
+    }
+
+    const talker = this.talker!;
+    const entry = this.appendEntry({
+      type: 'utterance',
+      loopPath: talker.loopPath,
+      content,
+      causedBy: null,
+      ...(options?.target !== undefined ? { data: { target } } : {}),
+    });
+    if (options?.wake === false) {
+      // Silent conversation input is context for the reasoner too, but it
+      // does not open a new exchange (nothing is being asked yet).
+      router.noteUserContext(content);
+    } else {
+      router.noteUserUtterance(content);
+    }
+    const result = talker.deliver(
+      content,
+      options?.wake !== undefined ? { wake: options.wake } : undefined,
+    );
+    if (result.outcome === 'prompted' && result.turn) {
+      this.activeCauseSeq = entry.seq;
+      const clear = (): void => {
+        if (this.activeCauseSeq === entry.seq) {
+          this.activeCauseSeq = null;
+        }
+      };
+      void result.turn.then(clear, clear);
+    }
+    return result;
+  }
+
+  /**
    * Queue a steering message into the running turn (drained at the next
    * turn boundary). No-op while idle, exactly like AgentLoop.steer().
+   * Duplex: the conversation surface (the talker) is what a consumer
+   * steers; directives reach the reasoner through the router.
    */
   steer(message: string): void {
     this.assertNotDestroyed();
-    this.reasoner.steer(message);
+    this.conversationLoop.steer(message);
   }
 
   /**
@@ -1103,11 +1830,36 @@ export class CortexAgent {
     this.assertNotDestroyed();
     this.appendEntry({
       type: 'lifecycle',
-      loopPath: this.reasoner.loopPath,
+      loopPath: scope === 'conversation' ? this.conversationLoop.loopPath : this.reasoner.loopPath,
       content: `Abort requested (scope: ${scope})`,
       data: { event: 'abort', scope },
       causedBy: null,
     });
+
+    if (this.mode === 'duplex') {
+      // Per the facade-api.md abort table: each scope aborts its loop's
+      // in-flight turn, drops queued deliveries to that target, and clears
+      // its pi queues; router-held deliveries are dropped but stay in the
+      // log (retained, not delivered). Pending asks resolve as deny
+      // through the abort race on the aborted loop.
+      const work: Array<Promise<unknown>> = [];
+      if (scope === 'conversation' || scope === 'all') {
+        this.router!.dropPendingDeliveries();
+        this.talker!.clearAllQueues();
+        work.push(this.talker!.abort());
+      }
+      if (scope === 'work' || scope === 'all') {
+        this.router!.dropWorkContext();
+        this.reasoner.clearAllQueues();
+        work.push(this.reasoner.abort());
+        for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
+          work.push(this.reasoner.cancelSubAgent(taskId));
+        }
+      }
+      await Promise.all(work);
+      return;
+    }
+
     // Dropped queued content: silent deliveries, parked wake deliveries
     // (abort() drops those itself too), and pi's steering/follow-up queues.
     this.reasoner.clearAllQueues();
@@ -1129,10 +1881,19 @@ export class CortexAgent {
       clearTimeout(this.stateTimer);
       this.stateTimer = null;
     }
+    if (this.digestionTimer !== null) {
+      clearTimeout(this.digestionTimer);
+      this.digestionTimer = null;
+    }
+    this.router?.destroy();
+    this.aggregateGuard?.destroy();
     this.destroyPromise = (async () => {
       try {
-        await this.reasoner.destroy(timeoutMs);
+        const teardowns: Array<Promise<void>> = [this.reasoner.destroy(timeoutMs)];
+        if (this.talker) teardowns.push(this.talker.destroy(timeoutMs));
+        await Promise.all(teardowns);
       } finally {
+        this.mergedBridge?.destroy();
         this.log.clearSubscribers();
       }
     })();
@@ -1184,7 +1945,8 @@ export class CortexAgent {
     this.assertNotDestroyed();
     for (;;) {
       await this.reasoner.waitForLoopIdle();
-      if (!this.reasoner.isLoopActive) {
+      if (this.talker) await this.talker.waitForLoopIdle();
+      if (!this.reasoner.isLoopActive && !(this.talker?.isLoopActive ?? false)) {
         return this.captureStateInFrame();
       }
     }
@@ -1193,20 +1955,22 @@ export class CortexAgent {
   /** Synchronous composite snapshot; caller guarantees gate quiescence. */
   private captureStateInFrame(): CortexAgentStateV2 {
     const reasonerUsage = this.reasonerUsageWithBaseline();
-    const talkerUsage = this.usageBaseline?.talker
-      ? cloneUsage(this.usageBaseline.talker)
-      : null;
+    const talkerUsage = this.talkerUsageWithBaseline();
     return {
       version: 2,
       log: this.log.getLog(),
-      // Passthrough has no talker loop; a restored duplex artifact's talker
-      // side is carried through unchanged so nothing is lost on round trip.
-      // Copied like getLog(): a persistence layer that normalizes the
-      // snapshot in place must never mutate live facade state (and becomes
-      // load-bearing when talkerHistory is a live loop's history in 2b).
-      talkerHistory: structuredClone(this.retainedTalkerHistory),
+      // Duplex reads the live talker; passthrough carries a restored duplex
+      // artifact's talker side through unchanged so nothing is lost on
+      // round trip. Copied like getLog(): a persistence layer that
+      // normalizes the snapshot in place must never mutate live facade
+      // state.
+      talkerHistory: this.talker
+        ? this.talker.getConversationHistory()
+        : structuredClone(this.retainedTalkerHistory),
       reasonerHistory: this.reasoner.getConversationHistory(),
-      talkerMemory: structuredClone(this.retainedTalkerMemory),
+      talkerMemory: this.talker
+        ? this.talker.getObservationalMemoryState()
+        : structuredClone(this.retainedTalkerMemory),
       reasonerMemory: this.reasoner.getObservationalMemoryState(),
       usage: {
         total: talkerUsage ? addUsage(reasonerUsage, talkerUsage) : reasonerUsage,
@@ -1221,6 +1985,21 @@ export class CortexAgent {
     if (!this.usageBaseline) return live;
     const delta = this.usageAtRestore ? diffUsage(live, this.usageAtRestore) : live;
     return addUsage(this.usageBaseline.reasoner, delta);
+  }
+
+  /**
+   * Talker usage under the same model. Null only when no talker loop
+   * exists and no restored baseline carries a talker side.
+   */
+  private talkerUsageWithBaseline(): SessionUsage | null {
+    if (!this.talker) {
+      return this.usageBaseline?.talker ? cloneUsage(this.usageBaseline.talker) : null;
+    }
+    const live = this.talker.getSessionUsage();
+    if (!this.usageBaseline) return live;
+    const delta = this.talkerUsageAtRestore ? diffUsage(live, this.talkerUsageAtRestore) : live;
+    const baseline = this.usageBaseline.talker;
+    return baseline ? addUsage(baseline, delta) : delta;
   }
 
   /**
@@ -1239,6 +2018,7 @@ export class CortexAgent {
     this.assertNotDestroyed();
     if (
       this.reasoner.isLoopActive ||
+      (this.talker?.isLoopActive ?? false) ||
       this.pendingFacadePrompts > 0 ||
       this.reasoner.getSubAgentManager().activeCount > 0
     ) {
@@ -1257,13 +2037,23 @@ export class CortexAgent {
     const talkerHistory = structuredClone(v2.talkerHistory);
     const talkerMemory = structuredClone(v2.talkerMemory);
 
-    // History before observational state (restore ordering).
+    // History before observational state (restore ordering), per loop.
     this.reasoner.restoreConversationHistory(v2.reasonerHistory);
     if (v2.reasonerMemory) {
       this.reasoner.restoreObservationalMemoryState(v2.reasonerMemory);
     }
-    this.retainedTalkerHistory = talkerHistory;
-    this.retainedTalkerMemory = talkerMemory;
+    if (this.talker) {
+      // Live talker hydration; the retained fields stay empty in duplex.
+      this.talker.restoreConversationHistory(talkerHistory);
+      if (talkerMemory) {
+        this.talker.restoreObservationalMemoryState(talkerMemory);
+      }
+      this.retainedTalkerHistory = [];
+      this.retainedTalkerMemory = null;
+    } else {
+      this.retainedTalkerHistory = talkerHistory;
+      this.retainedTalkerMemory = talkerMemory;
+    }
     this.log.restore(v2.log);
 
     this.usageBaseline = {
@@ -1271,12 +2061,20 @@ export class CortexAgent {
       reasoner: cloneUsage(v2.usage.perLoop.reasoner),
     };
     this.usageAtRestore = this.reasoner.getSessionUsage();
+    this.talkerUsageAtRestore = this.talker ? this.talker.getSessionUsage() : null;
     this.spawnSeqByTaskId.clear();
     this.activeCauseSeq = null;
+    this.activeReasonerCauseSeq = null;
     // Pre-restore queued content belongs to the replaced session: left in
     // place, queued silent deliveries would flush into the first
     // post-restore prompt (and stale steer/follow-up content into its run).
     this.reasoner.clearAllQueues();
+    this.talker?.clearAllQueues();
+    // Router state (delegations, deltas, held deliveries, dedup) describes
+    // the replaced session too.
+    this.router?.resetForRestore();
+    this.aggregateBreachLogged = false;
+    this.talkerRepairPending = false;
   }
 
   /**
@@ -1317,14 +2115,14 @@ export class CortexAgent {
   }
 
   /**
-   * Whether the loop is tearing down without the facade knowing (a direct
-   * AgentLoop.destroy()). Its final onLoopComplete checkpoint would
+   * Whether a resident loop is tearing down without the facade knowing (a
+   * direct AgentLoop.destroy()). Its final onLoopComplete checkpoint would
    * otherwise schedule a debounce timer that holds its handle for the full
    * window and then snapshots a torn-down loop.
    */
   private isReasonerShuttingDown(): boolean {
-    const loopState = this.reasoner.state;
-    return loopState === 'destroying' || loopState === 'destroyed';
+    const states = [this.reasoner.state, ...(this.talker ? [this.talker.state] : [])];
+    return states.some((loopState) => loopState === 'destroying' || loopState === 'destroyed');
   }
 
   private async emitStateChanged(): Promise<void> {
@@ -1365,20 +2163,24 @@ export class CortexAgent {
    * this keys on the talker.
    */
   get conversationIdle(): boolean {
-    return this.pendingFacadePrompts === 0 && !this.reasoner.isLoopActive;
+    return this.pendingFacadePrompts === 0 && !this.conversationLoop.isLoopActive;
   }
 
   /**
    * Whether all work has settled: conversation idle, reasoner gate empty,
-   * no active sub-agents (or quick lookups, 2b), no parked wake
-   * deliveries, no pending permission asks. Queued silent deliveries do
-   * not count: silent content deliberately waits for the next prompt.
+   * no active sub-agents, no parked wake deliveries on either loop, no
+   * router-held deliveries, no pending permission asks. Queued silent
+   * deliveries do not count: silent content deliberately waits for the
+   * next prompt.
    */
   get workSettled(): boolean {
     return (
       this.conversationIdle &&
+      !this.reasoner.isLoopActive &&
       this.reasoner.getSubAgentManager().activeCount === 0 &&
       this.reasoner.pendingWakeDeliveryCount === 0 &&
+      (this.talker?.pendingWakeDeliveryCount ?? 0) === 0 &&
+      (this.router?.pendingDeliveryCount ?? 0) === 0 &&
       this.reasoner.getPendingAsks().length === 0
     );
   }
@@ -1387,10 +2189,10 @@ export class CortexAgent {
   async waitForConversationIdle(): Promise<void> {
     for (;;) {
       if (this.pendingFacadePrompts > 0) {
-        await this.promptChain;
+        await this.waitForPromptSettled();
         continue;
       }
-      await this.reasoner.waitForLoopIdle();
+      await this.conversationLoop.waitForLoopIdle();
       if (this.conversationIdle) return;
     }
   }
@@ -1405,10 +2207,19 @@ export class CortexAgent {
   async waitForWorkSettled(): Promise<void> {
     for (;;) {
       if (this.pendingFacadePrompts > 0) {
-        await this.promptChain;
+        await this.waitForPromptSettled();
         continue;
       }
       await this.reasoner.waitForLoopIdle();
+      if (this.talker) {
+        await this.talker.waitForLoopIdle();
+        if (this.router && this.router.pendingDeliveryCount > 0) {
+          // Held wake deliveries start talker runs when they land; wait
+          // event-driven on the router rather than spinning.
+          await this.router.waitForDeliveriesSettled();
+          continue;
+        }
+      }
 
       const manager = this.reasoner.getSubAgentManager();
       const activeIds = manager.getActiveTaskIds();
@@ -1449,18 +2260,25 @@ export class CortexAgent {
   /**
    * The merged event stream. In passthrough this is the reasoner's bridge
    * verbatim, so event identity and ordering match direct AgentLoop use
-   * exactly; 2b labels every event with a loop path.
+   * exactly. In duplex it is the facade's merged bridge: every event
+   * carries its loop path as childTaskId ('talker', 'reasoner',
+   * 'reasoner/task-7').
    */
   getEventBridge(): EventBridge {
-    return this.reasoner.getEventBridge();
+    return this.mergedBridge ?? this.reasoner.getEventBridge();
   }
 
   getContextManager(): ContextManager {
     return this.reasoner.getContextManager();
   }
 
+  /**
+   * The budget guard with composite meaning: the facade's aggregate guard
+   * in duplex (lifetime scope over both loops, children, and utility
+   * spend), the reasoner's own guard in passthrough.
+   */
   getBudgetGuard(): BudgetGuard {
-    return this.reasoner.getBudgetGuard();
+    return this.aggregateGuard ?? this.reasoner.getBudgetGuard();
   }
 
   getSkillRegistry(): SkillRegistry {
@@ -1469,11 +2287,27 @@ export class CortexAgent {
 
   // Prompt and model surface -----------------------------------------------
 
+  /**
+   * Set the consumer base prompt. Duplex appends each loop's role prompt
+   * (the consumer supplies one undifferentiated prompt, facade-api.md);
+   * the returned composition is the reasoner's, matching passthrough.
+   */
   setBasePrompt(basePrompt: string): string {
+    if (this.talker) {
+      this.consumerBasePrompt = basePrompt;
+      const talkerPrompt = appendRolePrompt(basePrompt, TALKER_ROLE_PROMPT);
+      this.talker.setBasePrompt(talkerPrompt ?? basePrompt);
+      const reasonerPrompt = appendRolePrompt(basePrompt, REASONER_ROLE_PROMPT);
+      return this.reasoner.setBasePrompt(reasonerPrompt ?? basePrompt);
+    }
     return this.reasoner.setBasePrompt(basePrompt);
   }
 
+  /** The consumer's base prompt (role prompts excluded in duplex). */
   getBasePrompt(): string {
+    if (this.talker) {
+      return this.consumerBasePrompt ?? '';
+    }
     return this.reasoner.getBasePrompt();
   }
 
@@ -1549,8 +2383,14 @@ export class CortexAgent {
     return this.reasoner.getCacheRetention();
   }
 
+  /**
+   * Set the cache session id. Duplex derives the talker's stable id from
+   * the same value (distinct per-loop prefix caches, log-and-context.md);
+   * the reasoner keeps the bare id so mode flips keep its cache warm.
+   */
   setSessionId(value: string | null): void {
     this.reasoner.setSessionId(value);
+    this.talker?.setSessionId(value === null ? null : `${value}:talker`);
   }
 
   getSessionId(): string | null {
@@ -1627,16 +2467,15 @@ export class CortexAgent {
   }
 
   /**
-   * Accumulated session usage: the composite aggregate. Without a restore
-   * this is the reasoner's live counters verbatim; after one it is the
-   * restored baseline plus live deltas (loops restart at zero), including
-   * any restored talker-side spend, so totals survive restores without
+   * Accumulated session usage: the composite aggregate across both loops
+   * (children counted once via each loop's own accounting), under the
+   * baseline-plus-delta restore model, so totals survive restores without
    * double-counting.
    */
   getSessionUsage(): SessionUsage {
     const reasoner = this.reasonerUsageWithBaseline();
-    const talkerBaseline = this.usageBaseline?.talker;
-    return talkerBaseline ? addUsage(reasoner, talkerBaseline) : reasoner;
+    const talker = this.talkerUsageWithBaseline();
+    return talker ? addUsage(reasoner, talker) : reasoner;
   }
 
   // Tools, MCP, skills ------------------------------------------------------
@@ -1743,41 +2582,41 @@ export class CortexAgent {
     return this.reasoner.markAskVoiced(askId);
   }
 
-  // The pi queue surface targets the single reasoner in passthrough; 2b
-  // decides which loop each of these addresses in duplex (the conversation
-  // surface holds the talker's queues, directives ride the router).
+  // The pi queue surface targets the conversation loop: the single
+  // reasoner in passthrough, the talker in duplex (directives reach the
+  // duplex reasoner through the router, never through these).
 
   /** Queue a follow-up that drains at the run's would-stop point. */
   followUp(message: string): void {
-    this.reasoner.followUp(message);
+    this.conversationLoop.followUp(message);
   }
 
   setSteeringQueueMode(mode: QueueDrainMode): void {
-    this.reasoner.setSteeringQueueMode(mode);
+    this.conversationLoop.setSteeringQueueMode(mode);
   }
 
   setFollowUpQueueMode(mode: QueueDrainMode): void {
-    this.reasoner.setFollowUpQueueMode(mode);
+    this.conversationLoop.setFollowUpQueueMode(mode);
   }
 
   clearSteeringQueue(): void {
-    this.reasoner.clearSteeringQueue();
+    this.conversationLoop.clearSteeringQueue();
   }
 
   clearFollowUpQueue(): void {
-    this.reasoner.clearFollowUpQueue();
+    this.conversationLoop.clearFollowUpQueue();
   }
 
   get queuedDeliveryCount(): number {
-    return this.reasoner.queuedDeliveryCount;
+    return this.conversationLoop.queuedDeliveryCount;
   }
 
   get pendingWakeDeliveryCount(): number {
-    return this.reasoner.pendingWakeDeliveryCount;
+    return this.conversationLoop.pendingWakeDeliveryCount;
   }
 
   clearQueuedDeliveries(): string[] {
-    return this.reasoner.clearQueuedDeliveries();
+    return this.conversationLoop.clearQueuedDeliveries();
   }
 
   getDeadLetteredBackgroundResults(): DeadLetteredBackgroundResult[] {
@@ -1832,16 +2671,17 @@ export class CortexAgent {
   // State reads -------------------------------------------------------------
 
   get isRunning(): boolean {
-    return this.reasoner.isRunning;
+    return this.reasoner.isRunning || (this.talker?.isRunning ?? false);
   }
 
   /**
-   * True while a logical turn is in flight on the loop. Narrower than the
-   * settlement predicates: it reads idle while gate tasks are still queued,
-   * so prefer conversationIdle / workSettled for settlement decisions.
+   * True while a logical turn is in flight on any resident loop. Narrower
+   * than the settlement predicates: it reads idle while gate tasks are
+   * still queued, so prefer conversationIdle / workSettled for settlement
+   * decisions.
    */
   get isPrompting(): boolean {
-    return this.reasoner.isPrompting;
+    return this.reasoner.isPrompting || (this.talker?.isPrompting ?? false);
   }
 
   get state(): CortexLifecycleState {
@@ -1856,59 +2696,71 @@ export class CortexAgent {
     return this.reasoner.isWorkingTagsEnabled;
   }
 
+  // Working tags route to both loops (CONFIG_ROUTING workingTags:
+  // both-loops); the talker relies on them to separate thinking from
+  // speech.
   setWorkingTagsEnabled(enabled: boolean): void {
     this.reasoner.setWorkingTagsEnabled(enabled);
+    this.talker?.setWorkingTagsEnabled(enabled);
   }
 
   setLastInteractionTime(timestamp: number): void {
     this.reasoner.setLastInteractionTime(timestamp);
+    this.talker?.setLastInteractionTime(timestamp);
   }
 
-  // Callback registration (facade-level fan-in with origin context in 2b;
-  // direct delegation to the single loop in passthrough) -------------------
+  // Callback registration. In passthrough these delegate to the single
+  // loop; in duplex, loop-lifecycle and compaction callbacks register on
+  // BOTH resident loops (origin context distinguishes them), while
+  // sub-agent callbacks stay on the reasoner (the only loop that spawns).
+
+  /** Every resident loop, for handlers that fan out in duplex. */
+  private get residentLoops(): AgentLoop[] {
+    return this.talker ? [this.reasoner, this.talker] : [this.reasoner];
+  }
 
   onLoopComplete(handler: () => void): void {
-    this.reasoner.onLoopComplete(handler);
+    for (const loop of this.residentLoops) loop.onLoopComplete(handler);
   }
 
   onError(handler: (error: ClassifiedError, origin: LoopOriginContext) => void): void {
-    this.reasoner.onError(handler);
+    for (const loop of this.residentLoops) loop.onError(handler);
   }
 
   onTurnComplete(handler: (output: AgentTextOutput, origin: LoopOriginContext) => void): void {
-    this.reasoner.onTurnComplete(handler);
+    for (const loop of this.residentLoops) loop.onTurnComplete(handler);
   }
 
   onRetryScheduled(handler: (info: RetryScheduledInfo) => void): void {
-    this.reasoner.onRetryScheduled(handler);
+    for (const loop of this.residentLoops) loop.onRetryScheduled(handler);
   }
 
   onRetrySucceeded(handler: (info: RetrySucceededInfo) => void): void {
-    this.reasoner.onRetrySucceeded(handler);
+    for (const loop of this.residentLoops) loop.onRetrySucceeded(handler);
   }
 
   onRetryExhausted(handler: (info: RetryExhaustedInfo) => void): void {
-    this.reasoner.onRetryExhausted(handler);
+    for (const loop of this.residentLoops) loop.onRetryExhausted(handler);
   }
 
   onBeforeCompaction(handler: (target: CompactionTarget) => Promise<void>): void {
-    this.reasoner.onBeforeCompaction(handler);
+    for (const loop of this.residentLoops) loop.onBeforeCompaction(handler);
   }
 
   onPostCompaction(handler: (result: CompactionResult) => void): void {
-    this.reasoner.onPostCompaction(handler);
+    for (const loop of this.residentLoops) loop.onPostCompaction(handler);
   }
 
   onCompactionError(handler: (error: Error) => void): void {
-    this.reasoner.onCompactionError(handler);
+    for (const loop of this.residentLoops) loop.onCompactionError(handler);
   }
 
   onCompactionDegraded(handler: (info: CompactionDegradedInfo) => void): void {
-    this.reasoner.onCompactionDegraded(handler);
+    for (const loop of this.residentLoops) loop.onCompactionDegraded(handler);
   }
 
   onCompactionExhausted(handler: (info: CompactionExhaustedInfo) => void): void {
-    this.reasoner.onCompactionExhausted(handler);
+    for (const loop of this.residentLoops) loop.onCompactionExhausted(handler);
   }
 
   onSubAgentSpawned(handler: (taskId: string, instructions: string, background: boolean) => void): void {
@@ -1936,10 +2788,10 @@ export class CortexAgent {
   }
 
   onObservation(handler: (event: ObservationEvent) => void): void {
-    this.reasoner.onObservation(handler);
+    for (const loop of this.residentLoops) loop.onObservation(handler);
   }
 
   onReflection(handler: (event: ReflectionEvent) => void): void {
-    this.reasoner.onReflection(handler);
+    for (const loop of this.residentLoops) loop.onReflection(handler);
   }
 }
