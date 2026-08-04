@@ -480,6 +480,39 @@ describe('CortexAgent.restore', () => {
     expect(second.talkerMemory!.observations).toBe('observed things');
   });
 
+  it('rejects a non-cloneable artifact before touching any facade state', async () => {
+    const { facade } = createFacade();
+    await facade.prompt('existing turn');
+    const historyBefore = facade.getConversationHistory();
+    const logBefore = facade.getLog();
+    const usageBefore = facade.getSessionUsage();
+
+    const zero = { totalCost: 0, totalTurns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const artifact: CortexAgentStateV2 = {
+      version: 2,
+      log: [],
+      // A consumer keeping session state in a reactive store (Vue
+      // reactive(), a Solid store) hands restore() a Proxy, and
+      // structuredClone throws DataCloneError on it.
+      talkerHistory: new Proxy(
+        [{ role: 'user', content: 'proxied', timestamp: 1 } as AgentMessage],
+        {},
+      ),
+      reasonerHistory: [{ role: 'user', content: 'replaced', timestamp: 1 } as AgentMessage],
+      talkerMemory: null,
+      reasonerMemory: null,
+      usage: { total: zero, perLoop: { talker: null, reasoner: zero } },
+    };
+
+    expect(() => facade.restore(artifact)).toThrow();
+
+    // The restore was rejected whole: no half-applied reasoner history
+    // (applied first pre-fix), log, or usage baseline.
+    expect(facade.getConversationHistory()).toEqual(historyBefore);
+    expect(facade.getLog()).toEqual(logBefore);
+    expect(facade.getSessionUsage()).toEqual(usageBefore);
+  });
+
   it('carries a restored talker side through a passthrough round trip', async () => {
     const { facade } = createFacade();
     const talkerHistory = [

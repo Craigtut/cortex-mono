@@ -1233,15 +1233,22 @@ export class CortexAgent {
     }
     const v2 = normalizePersistedState(state);
 
+    // Deep copies: the caller's artifact stays the caller's (a later
+    // in-place mutation of it must never reach live facade state). Taken
+    // before the first mutation below: structuredClone throws on proxies
+    // and functions (a reactive-store artifact hands it exactly that), and
+    // a clone failure must reject the restore with the facade untouched,
+    // never half-applied.
+    const talkerHistory = structuredClone(v2.talkerHistory);
+    const talkerMemory = structuredClone(v2.talkerMemory);
+
     // History before observational state (restore ordering).
     this.reasoner.restoreConversationHistory(v2.reasonerHistory);
     if (v2.reasonerMemory) {
       this.reasoner.restoreObservationalMemoryState(v2.reasonerMemory);
     }
-    // Deep copies: the caller's artifact stays the caller's (a later
-    // in-place mutation of it must never reach live facade state).
-    this.retainedTalkerHistory = structuredClone(v2.talkerHistory);
-    this.retainedTalkerMemory = structuredClone(v2.talkerMemory);
+    this.retainedTalkerHistory = talkerHistory;
+    this.retainedTalkerMemory = talkerMemory;
     this.log.restore(v2.log);
 
     this.usageBaseline = {
