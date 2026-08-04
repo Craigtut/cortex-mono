@@ -843,6 +843,41 @@ describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {
     expect(occurrences(piAgent, 'real question')).toBe(1);
     expect(loop.pendingWakeDeliveryCount).toBe(0);
   });
+
+  it('unwind recovery stamps re-parked injected content with the run-start abort epoch', () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const internals = loop as unknown as {
+      _abortEpoch: number;
+      unwindFailedDelivery(preDeliveryCount: number, runAbortEpoch: number): boolean;
+      pendingWakeDeliveries: Array<{ content: string; abortEpoch?: number }>;
+    };
+
+    // A failed delivery run whose transcript ends on an unpaired assistant
+    // tool call, with a steer pi injected mid-run in the spliced range.
+    piAgent.state.messages = [
+      { role: 'user', content: 'delivery body', timestamp: 1 },
+      { role: 'user', content: 'injected steer', timestamp: 2 },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_call', id: 't1', name: 'Bash' }],
+        timestamp: 3,
+      },
+    ] as AgentMessage[];
+
+    // The run started at epoch 3; an abort completed during the run and
+    // advanced the live epoch before the failure's catch ran.
+    internals._abortEpoch = 3;
+    const runStartEpoch = 3;
+    internals._abortEpoch = 4;
+
+    expect(internals.unwindFailedDelivery(0, runStartEpoch)).toBe(true);
+    expect(internals.pendingWakeDeliveries.map((d) => d.content)).toEqual(['injected steer']);
+    // Stamped with the epoch the run started under, so the abort's epoch
+    // gate cancels the recovered content with the run it rode in, instead
+    // of a late-running catch resurrecting it under the new epoch.
+    expect(internals.pendingWakeDeliveries[0]!.abortEpoch).toBe(runStartEpoch);
+  });
 });
 
 describe('AgentLoop.deliver and abort', () => {
