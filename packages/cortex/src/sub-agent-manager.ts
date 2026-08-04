@@ -34,6 +34,14 @@ export interface SubAgentLifecycleHooks {
   onFailed?: (taskId: string, error: string) => void;
 }
 
+/**
+ * Why a task was cancelled: an explicit cancel() of that task, or the
+ * parent's destroy-time cancelAll() sweep. Recorded alongside the cancelled
+ * ID so downstream records (the facade's lifecycle log entry, 2b's
+ * delivery router) can distinguish the two.
+ */
+export type SubAgentCancellationReason = 'cancel' | 'shutdown';
+
 // ---------------------------------------------------------------------------
 // SubAgentManager
 // ---------------------------------------------------------------------------
@@ -46,7 +54,7 @@ export class SubAgentManager {
   private readonly maxConcurrent: number;
   private readonly pools: Record<string, number>;
   private hooks: SubAgentLifecycleHooks = {};
-  private readonly cancelledTaskIds = new Set<string>();
+  private readonly cancelledTaskIds = new Map<string, SubAgentCancellationReason>();
 
   constructor(config?: Partial<SubAgentManagerConfig>) {
     this.maxConcurrent = config?.maxConcurrent ?? 4;
@@ -189,7 +197,7 @@ export class SubAgentManager {
     if (!entry) return false;
 
     this.agents.delete(taskId);
-    this.markCancelled(taskId);
+    this.markCancelled(taskId, 'cancel');
 
     try {
       await abortFn(entry.agent);
@@ -254,11 +262,19 @@ export class SubAgentManager {
     return this.cancelledTaskIds.has(taskId);
   }
 
-  /** Record a cancelled task ID, evicting the oldest past the cap. */
-  private markCancelled(taskId: string): void {
-    this.cancelledTaskIds.add(taskId);
+  /**
+   * Why a cancelled task was cancelled; undefined for tasks never
+   * cancelled (or evicted past the cap).
+   */
+  cancellationReason(taskId: string): SubAgentCancellationReason | undefined {
+    return this.cancelledTaskIds.get(taskId);
+  }
+
+  /** Record a cancelled task ID and reason, evicting the oldest past the cap. */
+  private markCancelled(taskId: string, reason: SubAgentCancellationReason): void {
+    this.cancelledTaskIds.set(taskId, reason);
     if (this.cancelledTaskIds.size > MAX_CANCELLED_TASK_IDS) {
-      const oldest = this.cancelledTaskIds.values().next().value;
+      const oldest = this.cancelledTaskIds.keys().next().value;
       if (oldest !== undefined) this.cancelledTaskIds.delete(oldest);
     }
   }
@@ -315,7 +331,7 @@ export class SubAgentManager {
     const entries = [...this.agents.values()];
     this.agents.clear();
     for (const entry of entries) {
-      this.markCancelled(entry.taskId);
+      this.markCancelled(entry.taskId, 'shutdown');
     }
 
     const settled = await Promise.allSettled(

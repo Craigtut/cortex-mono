@@ -856,12 +856,19 @@ export class CortexAgent {
       // log-and-context.md lists cancellations as their own milestone, not
       // failures. The manager marks the ID cancelled before any hook fires,
       // so this discriminator is reliable, unlike matching the error text.
-      if (this.reasoner.getSubAgentManager().isCancelled(taskId)) {
+      const manager = this.reasoner.getSubAgentManager();
+      if (manager.isCancelled(taskId)) {
         this.appendEntry({
           type: 'lifecycle',
           loopPath: this.reasoner.loopPath,
           content: `Sub-agent ${taskId} cancelled`,
-          data: { event: 'sub_agent_cancelled', taskId },
+          // reason distinguishes an explicit cancel from a shutdown
+          // teardown; 2b's delivery router keys on it.
+          data: {
+            event: 'sub_agent_cancelled',
+            taskId,
+            reason: manager.cancellationReason(taskId),
+          },
           ...(spawnSeq !== undefined ? { causedBy: spawnSeq } : {}),
         });
         return;

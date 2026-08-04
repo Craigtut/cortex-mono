@@ -605,6 +605,9 @@ describe('CortexAgent session log', () => {
     expect(cancelled.type).toBe('lifecycle');
     expect(cancelled.content).toBe('Sub-agent task-cancel cancelled');
     expect(cancelled.causedBy).toBe(spawn.seq);
+    // An explicit cancel carries its reason, distinct from a shutdown
+    // teardown (next test); 2b's delivery router keys on it.
+    expect(cancelled.data).toMatchObject({ taskId: 'task-cancel', reason: 'cancel' });
     expect(entries.find((e) => e.data?.['event'] === 'sub_agent_failed')).toBeUndefined();
 
     // A genuine failure still logs as one.
@@ -613,6 +616,18 @@ describe('CortexAgent session log', () => {
     const failed = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_failed')!;
     expect(failed.content).toBe('Sub-agent task-fail failed: child exploded');
     expect(failed.data).toMatchObject({ taskId: 'task-fail', error: 'child exploded' });
+  });
+
+  it('a shutdown teardown logs the cancellation with reason shutdown', async () => {
+    const { facade, loop } = createFacade();
+    trackFakeSubAgent(loop, 'task-teardown');
+
+    // Direct loop destroy: the cancelAll sweep, not an explicit cancel.
+    await loop.destroy();
+
+    const cancelled = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_cancelled')!;
+    expect(cancelled).toBeDefined();
+    expect(cancelled.data).toMatchObject({ taskId: 'task-teardown', reason: 'shutdown' });
   });
 
   it('entries produced outside any facade-initiated run carry no causation stamp', () => {
