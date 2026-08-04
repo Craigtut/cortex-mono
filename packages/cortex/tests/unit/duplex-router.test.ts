@@ -26,6 +26,8 @@ interface Harness {
   reasonerDispatches: Array<{ message: string; causeSeq: number | null }>;
   setTalkerIdle: (idle: boolean) => void;
   setIdleSignal: (signal: (() => boolean) | undefined) => void;
+  /** Make dispatchToReasoner throw until cleared with null. */
+  setDispatchError: (error: Error | null) => void;
   advance: (ms: number) => void;
   now: () => number;
 }
@@ -37,6 +39,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   let clock = 1_000_000;
   let talkerIdle = true;
   let idleSignal: (() => boolean) | undefined;
+  let dispatchError: Error | null = null;
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const reasonerDispatches: Array<{ message: string; causeSeq: number | null }> = [];
@@ -45,7 +48,10 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   const ports: DuplexRouterPorts = {
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
     talkerIdle: () => talkerIdle,
-    dispatchToReasoner: (message, causeSeq) => reasonerDispatches.push({ message, causeSeq }),
+    dispatchToReasoner: (message, causeSeq) => {
+      if (dispatchError) throw dispatchError;
+      reasonerDispatches.push({ message, causeSeq });
+    },
     appendLog: (input) => {
       const seq = nextSeq++;
       log.push({ ...input, seq });
@@ -74,6 +80,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     reasonerDispatches,
     setTalkerIdle: (idle) => { talkerIdle = idle; },
     setIdleSignal: (signal) => { idleSignal = signal; },
+    setDispatchError: (error) => { dispatchError = error; },
     advance: (ms) => { clock += ms; },
     now: () => clock,
   };
@@ -327,6 +334,46 @@ describe('control-tool dispatch', () => {
     const result = await callTool(h, 'spawn_task', { instructions: 'x' });
     expect(result.terminate).toBe(true);
     expect(result.content[0]!.text).toMatch(/did not go through/);
+  });
+
+  it('a failed dispatch returns a failure receipt and is never memoized as a success (S2)', async () => {
+    const h = createHarness();
+    h.router.noteUserUtterance('scan please');
+    h.setDispatchError(new Error('reasoner deliver blew up'));
+
+    const failed = await callTool(h, 'spawn_task', { instructions: 'scan the repo' });
+    expect(failed.terminate).toBe(true);
+    // The talker must not report work started that was never handed over.
+    expect(failed.content[0]!.text).not.toMatch(/^Started/);
+    expect(failed.content[0]!.text).toMatch(/did not go through|handoff failed/i);
+    expect(h.reasonerDispatches).toHaveLength(0);
+    // Not tracked as live work either.
+    expect(h.router.getDelegations()).toHaveLength(0);
+    const failure = h.log.find(
+      (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'dispatch_failed',
+    );
+    expect(failure).toBeDefined();
+
+    // An identical retry in the same exchange re-dispatches instead of
+    // replaying the memoized receipt.
+    h.setDispatchError(null);
+    const retry = await callTool(h, 'spawn_task', { instructions: 'scan the repo' });
+    expect(retry.content[0]!.text).toMatch(/^Started task-/);
+    expect(h.reasonerDispatches).toHaveLength(1);
+    expect(h.router.getDelegations()).toHaveLength(1);
+  });
+
+  it('a failed steer dispatch is not memoized either', async () => {
+    const h = createHarness();
+    h.router.noteUserUtterance('adjust course');
+    h.setDispatchError(new Error('down'));
+    const failed = await callTool(h, 'steer_task', { message: 'focus on Europe' });
+    expect(failed.content[0]!.text).not.toMatch(/^Redirect sent/);
+
+    h.setDispatchError(null);
+    const retry = await callTool(h, 'steer_task', { message: 'focus on Europe' });
+    expect(retry.content[0]!.text).toBe('Redirect sent.');
+    expect(h.reasonerDispatches).toHaveLength(1);
   });
 
   it('records refused and unknown-task dispatches as lifecycle entries (F11)', async () => {

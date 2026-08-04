@@ -313,7 +313,13 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       createdAt: this.now(),
       cancelled: false,
     });
-    this.dispatch(buildSpawnDirective(alias, instructions), seq);
+    if (!this.dispatch(buildSpawnDirective(alias, instructions), seq)) {
+      // Never handed over: do not track it as live work (headlines and
+      // steer/cancel must not target a task the reasoner never received),
+      // and never memoize a success receipt for it.
+      this.delegations.delete(alias);
+      return 'Could not start that: the handoff failed. Tell the user and try again.';
+    }
     const receipt = `Started ${alias}.`;
     this.dispatchDedup.set(dedupKey, receipt);
     return receipt;
@@ -351,7 +357,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       data: { tool: 'steer_task', ...(alias ? { alias } : {}), message },
       ...this.talkerCause(),
     });
-    this.dispatch(buildSteerDirective(alias, message), seq);
+    if (!this.dispatch(buildSteerDirective(alias, message), seq)) {
+      return 'The redirect did not go through. Tell the user and try again.';
+    }
     const receipt = `Redirect sent${alias ? ` to ${alias}` : ''}.`;
     this.dispatchDedup.set(dedupKey, receipt);
     return receipt;
@@ -409,7 +417,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       data: { tool: 'quick_lookup', question },
       ...this.talkerCause(),
     });
-    this.dispatch(buildLookupDirective(question), seq);
+    if (!this.dispatch(buildLookupDirective(question), seq)) {
+      return 'Could not start that lookup. Tell the user and try again.';
+    }
     const receipt = 'Looking into that in the background.';
     this.dispatchDedup.set(dedupKey, receipt);
     return receipt;
@@ -746,15 +756,21 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   // Dispatch internals
   // -------------------------------------------------------------------------
 
-  /** Flush the conversation block and hand the dispatch to the reasoner. */
-  private dispatch(directive: string, causeSeq: number | null): void {
+  /**
+   * Flush the conversation block and hand the dispatch to the reasoner.
+   * Returns whether the handover happened: a throw is logged as a
+   * dispatch_failed lifecycle entry (a user instruction must never vanish
+   * silently, F11) and reported to the caller, which must return a failure
+   * receipt and must NOT memoize a success one (S2: a memoized "Started"
+   * for work that was never handed over would replay on the retry that
+   * could have succeeded).
+   */
+  private dispatch(directive: string, causeSeq: number | null): boolean {
     const message = composeDispatchMessage(this.consumeConversationBlock(), directive);
     try {
       this.ports.dispatchToReasoner(message, causeSeq);
+      return true;
     } catch (err) {
-      // A dispatch that never reached the reasoner must not vanish
-      // silently (F11): record it; the receipt already told the talker
-      // something, and the entry keeps the audit trail truthful.
       this.logger.error('dispatch to reasoner failed', {
         error: err instanceof Error ? err.message : String(err),
       });
@@ -768,6 +784,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         },
         ...(causeSeq !== null ? { causedBy: causeSeq } : {}),
       });
+      return false;
     }
   }
 
