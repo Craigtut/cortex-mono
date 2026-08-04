@@ -1289,7 +1289,20 @@ export class CortexAgent {
       if (!this.talkerRepairPending && this.talker) {
         this.talkerRepairPending = true;
         try {
-          this.talker.deliver(TALKER_TRUNCATION_REPAIR_MESSAGE, { wake: true });
+          // The audit runs during the still-live run (turn_end fires while
+          // the gate is held), so the run's cause tags are readable here
+          // and ride the repair delivery as its causeTag. Without this the
+          // repair turn carries an empty chain, and a user's "yes, go
+          // ahead" into a turn that truncates would get consent refused by
+          // D16 for a reason unrelated to consent. The FULL set travels
+          // (as an array in the single causeTag slot; collectCauseTags
+          // flattens it), never a collapsed seq, so mixed-kind causes stay
+          // distinguishable in the repair run.
+          const causeTags = collectCauseTags(this.talker.activeRunCauseTags);
+          this.talker.deliver(TALKER_TRUNCATION_REPAIR_MESSAGE, {
+            wake: true,
+            ...(causeTags.length > 0 ? { causeTag: causeTags } : {}),
+          });
         } catch (err) {
           this.logger.warn('truncation repair delivery failed', {
             error: err instanceof Error ? err.message : String(err),

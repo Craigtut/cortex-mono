@@ -905,6 +905,44 @@ describe('duplex stop-reason audit', () => {
     expect(talkerPi.promptCalls).toHaveLength(1);
   });
 
+  it('the repair turn keeps the truncated run cause chain (SF-4)', async () => {
+    // A user's "yes, go ahead" into a turn that truncates must not lose
+    // its D16 chain: the audit runs while the truncated run still holds
+    // the gate, so its tags are readable and ride the repair delivery. An
+    // untagged repair would carry an empty set into the sweep run, and a
+    // consent given there would be refused for a reason unrelated to
+    // consent.
+    const { facade, talkerPi } = createDuplexFacade();
+    talkerPi.hold = true;
+    const turn = facade.prompt('yes, go ahead');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+    // The live run truncates mid-reply with no dispatched call.
+    talkerPi.emitEvent({
+      type: 'turn_end',
+      message: {
+        stopReason: 'length',
+        content: [{ type: 'text', text: 'Sure, let me start th' }],
+      },
+    });
+    // Hold the repair (sweep) run so a control tool can execute inside it.
+    talkerPi.hold = true;
+    talkerPi.releaseRun();
+    await turn;
+    await waitUntil(() => talkerPi.promptCalls.length === 2);
+    expect(String(talkerPi.promptCalls[1])).toBe(TALKER_TRUNCATION_REPAIR_MESSAGE);
+
+    const spawn = getPiTool(talkerPi, 'spawn_task');
+    await spawn.execute('c1', { instructions: 'proceed with the plan' });
+    talkerPi.releaseRun();
+    await waitUntil(() => !facade.isRunning);
+
+    const log = facade.getLog();
+    const utterance = log.find((entry) => entry.type === 'utterance')!;
+    const directive = log.find((entry) => entry.type === 'directive')!;
+    // The repair-run dispatch still chains back to the user's utterance.
+    expect(directive.causedBy).toBe(utterance.seq);
+  });
+
   it('does not repair a truncated message that did dispatch a tool call', async () => {
     const { talkerPi } = createDuplexFacade();
     talkerPi.emitEvent({
