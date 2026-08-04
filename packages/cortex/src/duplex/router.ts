@@ -460,11 +460,29 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.lastReasonerOutputAt = now;
 
     // Content-hash dedup over recent deliveries: a reasoner (or its retry
-    // ladder) emitting the same content repeatedly costs one delivery.
+    // ladder) emitting the same content repeatedly costs one delivery. The
+    // causing directive seq is part of the identity: a repeat the user
+    // explicitly asked for ("run it again", new directive) whose result is
+    // byte-identical to the previous run's must still be delivered, or the
+    // second request looks unanswered.
     this.pruneRecentHashes(now);
-    const hash = fnv1a(content.trim());
+    const cause = this.reasonerCause();
+    const hash = fnv1a(`${cause.causedBy ?? 'uncaused'}:${content.trim()}`);
     if (this.recentDeliveryHashes.some((entry) => entry.hash === hash)) {
       this.logger.info('duplicate delivery absorbed', { hash });
+      // An absorbed duplicate still leaves a trace: communication.md says
+      // results are never silently dropped from the audit trail.
+      this.ports.appendLog({
+        type: 'lifecycle',
+        loopPath: this.reasonerLoopPath,
+        content: 'Duplicate delivery absorbed',
+        data: {
+          event: 'delivery_absorbed',
+          ...(meta?.implicit ? { implicit: true } : {}),
+          ...(meta?.synthetic ? { synthetic: true } : {}),
+        },
+        ...cause,
+      });
       return { delivered: false, reason: 'duplicate of a recent delivery' };
     }
     this.recentDeliveryHashes.push({ hash, at: now });
@@ -502,7 +520,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         ...(meta?.implicit ? { implicit: true } : {}),
         ...(meta?.synthetic ? { synthetic: true } : {}),
       },
-      ...this.reasonerCause(),
+      ...cause,
     });
 
     if (wake === 'silent') {

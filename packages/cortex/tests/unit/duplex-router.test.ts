@@ -28,6 +28,8 @@ interface Harness {
   setIdleSignal: (signal: (() => boolean) | undefined) => void;
   /** Make dispatchToReasoner throw until cleared with null. */
   setDispatchError: (error: Error | null) => void;
+  /** Change the live reasoner-run cause seq (the causing directive). */
+  setReasonerCauseSeq: (seq: number | null) => void;
   advance: (ms: number) => void;
   now: () => number;
 }
@@ -40,6 +42,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   let talkerIdle = true;
   let idleSignal: (() => boolean) | undefined;
   let dispatchError: Error | null = null;
+  let reasonerCauseSeq: number | null = options?.reasonerCauseSeq ?? null;
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const reasonerDispatches: Array<{ message: string; causeSeq: number | null }> = [];
@@ -58,7 +61,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
       return seq;
     },
     currentTalkerCauseSeq: () => options?.talkerCauseSeq ?? null,
-    currentReasonerCauseSeq: () => options?.reasonerCauseSeq ?? null,
+    currentReasonerCauseSeq: () => reasonerCauseSeq,
     get idleSignal() {
       return idleSignal;
     },
@@ -81,6 +84,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     setTalkerIdle: (idle) => { talkerIdle = idle; },
     setIdleSignal: (signal) => { idleSignal = signal; },
     setDispatchError: (error) => { dispatchError = error; },
+    setReasonerCauseSeq: (seq) => { reasonerCauseSeq = seq; },
     advance: (ms) => { clock += ms; },
     now: () => clock,
   };
@@ -223,6 +227,30 @@ describe('backpressure', () => {
     // Outside the window the same content delivers again.
     h.advance(1_100);
     expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(true);
+  });
+
+  it('a deduped delivery leaves a delivery_absorbed lifecycle trace (S3)', () => {
+    const h = createHarness({ reasonerCauseSeq: 7 });
+    expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(true);
+    const duplicate = h.router.deliverFromReasoner('same text', 'silent', { implicit: true });
+    expect(duplicate.delivered).toBe(false);
+    // An absorbed duplicate still enters the audit trail.
+    const absorbed = h.log.find(
+      (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'delivery_absorbed',
+    );
+    expect(absorbed).toBeDefined();
+    expect(absorbed!.causedBy).toBe(7);
+    expect(absorbed!.data).toMatchObject({ implicit: true });
+  });
+
+  it('identical content under a new causing directive is delivered, not absorbed (S3)', () => {
+    const h = createHarness({ reasonerCauseSeq: 7 });
+    expect(h.router.deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
+    // "Run it again": a new directive, byte-identical result.
+    h.setReasonerCauseSeq(11);
+    expect(h.router.deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
+    expect(h.log.filter((entry) => entry.type === 'delivery')).toHaveLength(2);
+    expect(h.talkerDeliveries).toHaveLength(2);
   });
 
   it('enforces minimum inter-delivery spacing even under an always-idle signal', async () => {

@@ -669,6 +669,25 @@ describe('duplex deliveries', () => {
     expect(entry.causedBy).toBe(directive.seq);
   });
 
+  it('an identical implicit result for a new directive is delivered, not absorbed', async () => {
+    const { facade, talkerPi, reasonerPi } = createDuplexFacade();
+    reasonerPi.nextTurnText = 'Scan complete: no issues.';
+    const spawn = getPiTool(talkerPi, 'spawn_task');
+    await spawn.execute('c1', { instructions: 'scan the repo' });
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+
+    // "Run it again": a new exchange, a new directive, and a reasoner run
+    // whose final text is byte-identical to the previous result.
+    await facade.prompt('run it again');
+    await spawn.execute('c2', { instructions: 'scan the repo' });
+    // The second result reaches the talker; absorbed-as-duplicate here
+    // would leave the user's second request looking unanswered.
+    await waitUntil(() => talkerPi.promptCalls.length === 3);
+    const deliveries = facade.getLog().filter((entry) => entry.type === 'delivery');
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries[0]!.causedBy).not.toBe(deliveries[1]!.causedBy);
+  });
+
   it('an explicit Deliver suppresses the implicit delivery for the same run', async () => {
     const { facade, talkerPi, reasonerPi } = createDuplexFacade();
     // The reasoner "calls Deliver" mid-run: simulate by holding the run and
