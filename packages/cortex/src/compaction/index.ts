@@ -673,8 +673,17 @@ export class CompactionManager {
    *
    * @param messages - The source messages array (mutated in place)
    * @param slotCount - Number of slot messages to skip at the start
+   * @param isStale - When provided and true, the pass has been abandoned
+   *   (digestIdle timed out and advanced the generation) and no further
+   *   mutation may land: the aggregate phase awaits a consumer
+   *   persistResult, and a pass hanging there could otherwise write a
+   *   stale message back at an index a later splice has changed.
    */
-  async applyInsertionCap(messages: AgentMessage[], slotCount: number): Promise<void> {
+  async applyInsertionCap(
+    messages: AgentMessage[],
+    slotCount: number,
+    isStale?: () => boolean,
+  ): Promise<void> {
     const config = this.microcompaction.getConfig();
 
     // Phase 1: Individual per-result cap
@@ -763,6 +772,10 @@ export class CompactionManager {
           } catch {
             replacement = applyBookend(info.text, config.bookendMaxChars, config.bookendMaxChars, info.tokens);
           }
+          // The await above is the pass's only suspension point: an
+          // abandoned pass settling here must not mutate live history it
+          // no longer owns.
+          if (isStale?.()) return;
         } else {
           replacement = applyBookend(info.text, config.bookendMaxChars, config.bookendMaxChars, info.tokens);
         }
@@ -772,6 +785,11 @@ export class CompactionManager {
         newParts[info.index] = { ...part, text: replacement };
       }
 
+      // Identity check before the write-back: if the slot no longer holds
+      // the message this pass read (a splice landed during the awaited
+      // persist), writing the capped copy would resurrect stale content at
+      // an unrelated index. Skipping is safe; the cap is an optimization.
+      if (messages[i] !== msg) continue;
       messages[i] = { ...msg, content: newParts };
     }
   }

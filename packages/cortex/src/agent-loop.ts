@@ -2046,7 +2046,10 @@ export class AgentLoop {
     };
     // Boundary for the failure unwind, captured like the drain captures it:
     // pi pushes the delivery message at run start, before any model call.
+    // The abort epoch is captured beside it so unwind recovery stamps
+    // re-parked content deterministically with the run's own epoch.
     const preDeliveryCount = this.agent.state.messages.length;
+    const runAbortEpoch = this._abortEpoch;
     try {
       // Drain semantics: replace an aborted controller (parked deliveries
       // survive a prior abort, like background completions) and never flush
@@ -2056,7 +2059,7 @@ export class AgentLoop {
       await this.runPromptOnce(message, undefined, true, boundedRetryPolicy);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
-      if (!this.unwindFailedDelivery(preDeliveryCount)) {
+      if (!this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch)) {
         // The run progressed past the parked content: it is durable
         // history now. The run's failure still surfaces, but the delivery
         // itself was made; re-parking would duplicate it.
@@ -4716,9 +4719,13 @@ export class AgentLoop {
       // currentContext.messages array and does not replace it with the
       // transformContext return value, so source mutations must hit this
       // array to persist for the next turn in the same loop.
+      // passIsStale is threaded in: the aggregate phase awaits a consumer
+      // persistResult, and an abandoned pass settling there must not write
+      // a stale message back into an array a later splice has changed.
       await this.compactionManager.applyInsertionCap(
         sourceMessages,
         slotCount,
+        passIsStale,
       );
       if (passIsStale()) return context;
       this.agent.state.messages = [...sourceMessages];
@@ -6497,8 +6504,10 @@ export class AgentLoop {
     // pi pushes the delivery's user message into state.messages at run
     // start, before any model call, so a failed delivery leaves that
     // message (plus a synthetic failure stub) in the transcript. Captured
-    // here so the catch can unwind exactly what this attempt appended.
+    // here so the catch can unwind exactly what this attempt appended. The
+    // abort epoch rides along for deterministic re-park stamping.
     const preDeliveryCount = this.agent.state.messages.length;
+    const runAbortEpoch = this._abortEpoch;
     let attemptError: Error | null = null;
     let requeuedForRetry = false;
     try {
@@ -6512,7 +6521,7 @@ export class AgentLoop {
       // next successful run will see it, and re-queueing would append the
       // same completion a second time.
       attemptError = err instanceof Error ? err : new Error(String(err));
-      if (this.unwindFailedDelivery(preDeliveryCount)) {
+      if (this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch)) {
         this.requeueOrDeadLetter(batch, err);
         requeuedForRetry = true;
       }
@@ -6569,7 +6578,7 @@ export class AgentLoop {
    * its content stays in history, so the completion counts as delivered and
    * re-queueing would duplicate it.
    */
-  private unwindFailedDelivery(preDeliveryCount: number): boolean {
+  private unwindFailedDelivery(preDeliveryCount: number, runAbortEpoch: number): boolean {
     const messages = this.agent.state.messages;
     // Trim failure stubs appended during this run only; a stub predating
     // the delivery belongs to an earlier turn and stays.
@@ -6639,7 +6648,11 @@ export class AgentLoop {
           this.pendingWakeDeliveries.push({
             content,
             timestamp: Date.now(),
-            abortEpoch: this._abortEpoch,
+            // Stamped with the epoch the failed run STARTED under. Read at
+            // push time it would race the abort's epoch advance: a catch
+            // running after the abort's finally would stamp the new epoch
+            // and resurrect content the abort should cancel with its run.
+            abortEpoch: runAbortEpoch,
           });
         }
         this.scheduleWakeSweep();

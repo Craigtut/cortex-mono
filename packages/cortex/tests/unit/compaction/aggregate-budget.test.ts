@@ -228,6 +228,94 @@ describe('CompactionManager.applyInsertionCap aggregate budget', () => {
   });
 
   // -----------------------------------------------------------------------
+  // Test 3b: Stale pass and concurrent splice during the awaited persist
+  // -----------------------------------------------------------------------
+
+  it('abandons the write-back when the pass goes stale during an awaited persist', async () => {
+    let releasePersist!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releasePersist = resolve;
+    });
+    const persistResult: PersistResultFn = vi.fn().mockImplementation(async () => {
+      await gate;
+      return '/tmp/compaction/late.txt';
+    });
+    const config = buildCompactionConfig({
+      microcompaction: {
+        maxResultTokens: 100_000,
+        maxAggregateTurnTokens: 150_000,
+        bookendMaxChars: 200,
+        persistResult,
+      } as MicrocompactionConfig,
+    });
+    const manager = new CompactionManager(config, 0);
+
+    // Three parts under the individual cap whose aggregate exceeds the
+    // budget, so the awaited-persist phase (not the sync phase 1) fires.
+    const staleMsg = makeMultiToolResultMsg([
+      { text: generateContent(60_000), name: 'Read' },
+      { text: generateContent(60_000), name: 'Bash' },
+      { text: generateContent(60_000), name: 'WebFetch' },
+    ]);
+    const messages: AgentMessage[] = [staleMsg];
+
+    let stale = false;
+    const capping = manager.applyInsertionCap(messages, 0, () => stale);
+    expect(persistResult).toHaveBeenCalledTimes(1);
+
+    // While the persist hangs, the pass is abandoned (digestIdle timeout)
+    // and live history is rewritten under it.
+    const replacement = makeUserMsg('live history rewritten meanwhile');
+    messages.splice(0, 1, replacement);
+    stale = true;
+
+    releasePersist();
+    await capping;
+
+    // The stale pass must not write the old message back over the rewrite.
+    expect(messages[0]).toBe(replacement);
+  });
+
+  it('skips the write-back when the slot no longer holds the message it read', async () => {
+    let releasePersist!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releasePersist = resolve;
+    });
+    const persistResult: PersistResultFn = vi.fn().mockImplementation(async () => {
+      await gate;
+      return '/tmp/compaction/late.txt';
+    });
+    const config = buildCompactionConfig({
+      microcompaction: {
+        maxResultTokens: 100_000,
+        maxAggregateTurnTokens: 150_000,
+        bookendMaxChars: 200,
+        persistResult,
+      } as MicrocompactionConfig,
+    });
+    const manager = new CompactionManager(config, 0);
+
+    const originalMsg = makeMultiToolResultMsg([
+      { text: generateContent(60_000), name: 'Read' },
+      { text: generateContent(60_000), name: 'Bash' },
+      { text: generateContent(60_000), name: 'WebFetch' },
+    ]);
+    const messages: AgentMessage[] = [originalMsg];
+
+    // No staleness signal at all: the identity check alone must protect a
+    // slot another splice changed during the awaited persist.
+    const capping = manager.applyInsertionCap(messages, 0);
+    expect(persistResult).toHaveBeenCalledTimes(1);
+    const replacement = makeAssistantMsg('spliced in during the persist');
+    messages.splice(0, 1, replacement);
+
+    releasePersist();
+    await capping;
+
+    expect(messages[0]).toBe(replacement);
+  });
+
+  // -----------------------------------------------------------------------
   // Test 4: No double-cap
   // -----------------------------------------------------------------------
 
