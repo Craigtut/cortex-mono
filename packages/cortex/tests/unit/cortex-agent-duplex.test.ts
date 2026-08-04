@@ -608,6 +608,100 @@ describe('duplex quick lookups', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Sanitized talker delta stream (F6)
+// ---------------------------------------------------------------------------
+
+describe('duplex sanitized talker delta stream', () => {
+  function chunkEvent(delta: string): PiEvent {
+    return {
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', delta },
+    };
+  }
+
+  it('emits voice-safe deltas with working tags held back across chunk boundaries', () => {
+    const h = createDuplexFacade();
+    const sanitized: Array<{ text: string; loopPath?: string }> = [];
+    const raw: string[] = [];
+    h.facade.getEventBridge().on('talker_delta', (event) => {
+      sanitized.push({
+        text: (event.payload as { text: string }).text,
+        ...(event.loopPath !== undefined ? { loopPath: event.loopPath } : {}),
+      });
+    });
+    h.facade.getEventBridge().on('response_chunk', (event) => {
+      const data = event.data as { assistantMessageEvent?: { delta?: string } };
+      if (data.assistantMessageEvent?.delta) raw.push(data.assistantMessageEvent.delta);
+    });
+
+    h.talkerPi.emitEvent({ type: 'message_start' });
+    h.talkerPi.emitEvent(chunkEvent('Sure, <wor'));
+    h.talkerPi.emitEvent(chunkEvent('king>the user wants the port</wor'));
+    h.talkerPi.emitEvent(chunkEvent('king>it uses port 8080.'));
+    h.talkerPi.emitEvent({ type: 'message_end' });
+
+    const spoken = sanitized.map((entry) => entry.text).join('');
+    expect(spoken).toBe('Sure, \nit uses port 8080.');
+    expect(spoken).not.toContain('the user wants');
+    expect(spoken).not.toContain('<working>');
+    expect(sanitized.every((entry) => entry.loopPath === 'talker')).toBe(true);
+
+    // The raw stream is untouched: consumers rendering text still get the
+    // unfiltered deltas, tags and all.
+    expect(raw.join('')).toContain('<wor');
+    expect(raw.join('')).toContain('the user wants the port');
+  });
+
+  it('releases a trailing "<" that never became a tag at stream end', () => {
+    const h = createDuplexFacade();
+    const sanitized: string[] = [];
+    h.facade.getEventBridge().on('talker_delta', (event) => {
+      sanitized.push((event.payload as { text: string }).text);
+    });
+
+    h.talkerPi.emitEvent({ type: 'message_start' });
+    h.talkerPi.emitEvent(chunkEvent('1 is '));
+    h.talkerPi.emitEvent(chunkEvent('<'));
+    h.talkerPi.emitEvent({ type: 'message_end' });
+
+    expect(sanitized.join('')).toBe('1 is <');
+  });
+
+  it('drops unterminated working content at stream end instead of waiting for a close', () => {
+    const h = createDuplexFacade();
+    const sanitized: string[] = [];
+    h.facade.getEventBridge().on('talker_delta', (event) => {
+      sanitized.push((event.payload as { text: string }).text);
+    });
+
+    h.talkerPi.emitEvent({ type: 'message_start' });
+    h.talkerPi.emitEvent(chunkEvent('On it. <working>never closed'));
+    h.talkerPi.emitEvent({ type: 'message_end' });
+    expect(sanitized.join('')).toBe('On it. ');
+
+    // The filter reset at the next message: a fresh stream is clean.
+    h.talkerPi.emitEvent({ type: 'message_start' });
+    h.talkerPi.emitEvent(chunkEvent('Done.'));
+    h.talkerPi.emitEvent({ type: 'message_end' });
+    expect(sanitized.join('')).toBe('On it. Done.');
+  });
+
+  it('only talker chunks feed the stream; reasoner output never becomes speech', () => {
+    const h = createDuplexFacade();
+    const sanitized: string[] = [];
+    h.facade.getEventBridge().on('talker_delta', (event) => {
+      sanitized.push((event.payload as { text: string }).text);
+    });
+
+    h.reasonerPi.emitEvent({ type: 'message_start' });
+    h.reasonerPi.emitEvent(chunkEvent('internal reasoning text'));
+    h.reasonerPi.emitEvent({ type: 'message_end' });
+
+    expect(sanitized).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // MCP multiplexer and skill fan-out
 // ---------------------------------------------------------------------------
 

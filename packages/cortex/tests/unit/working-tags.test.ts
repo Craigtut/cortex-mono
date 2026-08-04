@@ -3,6 +3,7 @@ import {
   stripWorkingTags,
   extractWorkingContent,
   parseWorkingTags,
+  WorkingTagStreamFilter,
 } from '../../src/working-tags.js';
 
 describe('stripWorkingTags', () => {
@@ -229,5 +230,97 @@ Found some promising platforms. Digging into their posting requirements now.`;
     const result = parseWorkingTags(text);
     expect(result.userFacing).toBe('The file contains:\nand more text.');
     expect(result.working).toBe('some code');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WorkingTagStreamFilter (the duplex facade's voice-safe delta stream, F6)
+// ---------------------------------------------------------------------------
+
+describe('WorkingTagStreamFilter', () => {
+  /** Run a whole message through one filter in the given chunks. */
+  function filterChunks(chunks: string[]): string {
+    const filter = new WorkingTagStreamFilter();
+    let out = '';
+    for (const chunk of chunks) out += filter.push(chunk);
+    return out + filter.flush();
+  }
+
+  it('passes plain text through unchanged', () => {
+    expect(filterChunks(['Hello ', 'world.'])).toBe('Hello world.');
+  });
+
+  it('suppresses a complete working block, leaving the newline sentinel', () => {
+    expect(filterChunks(['Hi <working>thinking hard</working>done'])).toBe('Hi \ndone');
+  });
+
+  it('holds back a tag split across chunk boundaries and never emits working content', () => {
+    const out = filterChunks(['Hello <wor', 'king>secret plan</wor', 'king>world']);
+    expect(out).toBe('Hello \nworld');
+    expect(out).not.toContain('secret');
+    expect(out).not.toContain('<working>');
+  });
+
+  it('is split-invariant: every 2-way chunking of a message yields the one-shot output', () => {
+    const samples = [
+      'Hello <working>secret alpha</working> world',
+      '<working>secret at start</working>Answer.',
+      'Tail case <working>secret omega</working>',
+      'No tags at all, just < a stray bracket',
+      'Math: 1 < 2 and <b>bold</b> stay literal',
+      '<working>one</working>mid<working>two</working>end',
+      'Unclosed <working>secret trailing',
+      'Ends ambiguous <wor',
+    ];
+    for (const text of samples) {
+      const oneShot = filterChunks([text]);
+      for (let i = 0; i <= text.length; i++) {
+        const split = filterChunks([text.slice(0, i), text.slice(i)]);
+        expect(split, `split at ${i} of ${JSON.stringify(text)}`).toBe(oneShot);
+        expect(split).not.toContain('secret');
+      }
+      // Character-by-character feeding crosses every boundary at once.
+      expect(filterChunks([...text])).toBe(oneShot);
+    }
+  });
+
+  it('emits a trailing "<" that never became a tag at flush time', () => {
+    const filter = new WorkingTagStreamFilter();
+    expect(filter.push('The answer is x ')).toBe('The answer is x ');
+    expect(filter.push('<')).toBe('');
+    expect(filter.flush()).toBe('<');
+  });
+
+  it('emits a held partial open tag that never completed', () => {
+    const filter = new WorkingTagStreamFilter();
+    expect(filter.push('see <work')).toBe('see ');
+    // Diverges: '<work' + 'flow' is not '<working>'.
+    expect(filter.push('flow>')).toBe('<workflow>');
+    expect(filter.flush()).toBe('');
+  });
+
+  it('cannot deadlock on a close tag that never arrives: flush drops unterminated working content', () => {
+    const filter = new WorkingTagStreamFilter();
+    expect(filter.push('Sure. <working>never closed ')).toBe('Sure. ');
+    expect(filter.push('still going')).toBe('');
+    // flush() is synchronous and unconditional; the working content is
+    // dropped exactly as stripWorkingTags drops an unclosed block.
+    expect(filter.flush()).toBe('');
+  });
+
+  it('keeps literal non-working tags and lone close tags (parity with stripWorkingTags)', () => {
+    expect(filterChunks(['a <b>bold</b> c'])).toBe('a <b>bold</b> c');
+    // A lone close tag with no open block stays literal in the batch
+    // parser, so the stream keeps it too.
+    expect(filterChunks(['no block </working> here'])).toBe('no block </working> here');
+  });
+
+  it('reset() clears mode and held text between messages', () => {
+    const filter = new WorkingTagStreamFilter();
+    filter.push('start <working>unfinished');
+    filter.reset();
+    // A fresh message: nothing left over from the suppressed block.
+    expect(filter.push('clean text')).toBe('clean text');
+    expect(filter.flush()).toBe('');
   });
 });

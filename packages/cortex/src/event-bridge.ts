@@ -29,6 +29,7 @@ import type {
   AgentTextOutput,
   CortexLogger,
   CortexUsage,
+  TalkerDeltaPayload,
   ToolCallStartPayload,
   ToolCallUpdatePayload,
   ToolCallEndPayload,
@@ -53,7 +54,8 @@ export type CortexEventType =
   | 'tool_call_start'
   | 'tool_call_update'
   | 'tool_call_end'
-  | 'utility_usage';
+  | 'utility_usage'
+  | 'talker_delta';
 
 /**
  * Normalized event data emitted by the event bridge.
@@ -66,10 +68,15 @@ export interface CortexEvent {
   textOutput?: AgentTextOutput;
   /**
    * Typed payload for tool events (tool_call_start, tool_call_update,
-   * tool_call_end) and utility_usage events. Provides typed access without
-   * casting `data`.
+   * tool_call_end), utility_usage events, and the duplex facade's
+   * talker_delta events. Provides typed access without casting `data`.
    */
-  payload?: ToolCallStartPayload | ToolCallUpdatePayload | ToolCallEndPayload | UtilityUsagePayload;
+  payload?:
+    | ToolCallStartPayload
+    | ToolCallUpdatePayload
+    | ToolCallEndPayload
+    | UtilityUsagePayload
+    | TalkerDeltaPayload;
   /**
    * Extracted usage data from the LLM response, present on turn_end events
    * (from pi-ai's AssistantMessage.usage) and on utility_usage events (from
@@ -137,6 +144,31 @@ export interface PiEventSource {
 // ---------------------------------------------------------------------------
 // Event type mapping
 // ---------------------------------------------------------------------------
+
+/**
+ * Extract the streaming text delta from a response_chunk event's raw pi
+ * data. Pi-agent-core message_update events carry the delta inside
+ * `assistantMessageEvent` (type 'text_delta'); the fallbacks cover other
+ * provider shapes. Shared by the duplex facade's sanitized delta stream and
+ * available to consumers rendering raw chunks.
+ */
+export function extractResponseChunkText(data: unknown): string | null {
+  if (!data || typeof data !== 'object') return null;
+  const record = data as Record<string, unknown>;
+
+  const assistantEvent = record['assistantMessageEvent'] as Record<string, unknown> | undefined;
+  if (assistantEvent && assistantEvent['type'] === 'text_delta') {
+    const delta = assistantEvent['delta'];
+    if (typeof delta === 'string') return delta;
+  }
+
+  if (typeof record['text'] === 'string') return record['text'];
+  if (typeof record['delta'] === 'string') return record['delta'];
+  if (typeof record['content'] === 'string') return record['content'];
+  const delta = record['delta'] as Record<string, unknown> | undefined;
+  if (delta && typeof delta['text'] === 'string') return delta['text'];
+  return null;
+}
 
 const PI_TO_CORTEX_MAP: Partial<Record<PiEventType, CortexEventType>> = {
   agent_start: 'loop_start',
@@ -293,6 +325,20 @@ export class EventBridge {
       type: 'utility_usage',
       usage,
       payload: { category } satisfies UtilityUsagePayload,
+    });
+  }
+
+  /**
+   * Emit a sanitized talker-delta event (the duplex facade's voice-safe
+   * stream): text with working-tag content removed by holdback buffering,
+   * labeled with the conversation loop's path. Voice consumers subscribe to
+   * 'talker_delta' instead of routing raw response_chunk to TTS.
+   */
+  emitTalkerDelta(text: string, loopPath: string): void {
+    this.emit({
+      type: 'talker_delta',
+      loopPath,
+      payload: { text } satisfies TalkerDeltaPayload,
     });
   }
 

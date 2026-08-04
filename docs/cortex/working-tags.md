@@ -92,6 +92,18 @@ When enabled, Cortex appends working tag guidance to its operational rules secti
 
 The consumer decides when to enable or disable. A common pattern: enable for text-based channels, disable for voice channels where the interaction is conversational and low-latency streaming matters more than internal/external separation.
 
+## Streaming Sanitization (WorkingTagStreamFilter)
+
+Raw `response_chunk` deltas carry `<working>` content verbatim (tags are stripped only at `turn_end`), and a tag can split across chunks at any position, so chunk-by-chunk stripping cannot be done by consumers. `WorkingTagStreamFilter` is the streaming counterpart of `stripWorkingTags`, with holdback buffering:
+
+- `push(chunk)` returns the text safe to emit now. Text from any `<` is held until the tag disambiguates: released verbatim when it provably is not a working tag, swallowed when it opens one. A completed block emits one newline (the same sentinel `stripWorkingTags` uses).
+- `flush()` at stream end releases a held prefix that never became a tag (a trailing `<` is emitted) and drops unterminated working content, matching the batch parser's unclosed-tag rule. It is synchronous and unconditional, so a close tag that never arrives cannot wedge the stream.
+- `reset()` clears state for the next assistant message.
+
+Whitespace differs slightly from the batch parser (which normalizes whole messages); the voice-relevant invariants hold exactly: no working content is ever emitted, and all user-facing content is emitted by flush time.
+
+The duplex `CortexAgent` uses this filter internally to emit `talker_delta` events on its merged event bridge (payload `{ text }`, `loopPath: 'talker'`). Voice consumers subscribe to `talker_delta` for TTS instead of `response_chunk`.
+
 ## System Prompt Guidance
 
 When `workingTags.enabled` is true, Cortex adds working tag guidance in two places:

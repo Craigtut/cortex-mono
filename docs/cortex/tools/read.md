@@ -36,6 +36,9 @@ Read the contents of a file from the local filesystem.
 ### Read-Before-Write/Edit Contract
 The Read tool tracks which files have been read in the current agentic loop. The Write and Edit tools enforce that a file must be Read before it can be modified. This prevents blind overwrites and ensures the model has seen the current state of a file before changing it.
 
+### Path Allowlist (restricted loops)
+When `AgentLoopConfig.readPathAllowlist` is set, reads are confined to paths under the listed roots, enforced in-tool before any disk I/O. Targets and roots are symlink-resolved through their nearest existing ancestor (a link inside a root pointing outside it is refused), and the refusal is a visible "Access denied" result with `rejected: true`, never a silent empty read. Used by duplex quick-lookup loops, whose answers become spoken conversation. Inherited by spawned sub-agents. Also applies to Glob and Grep search paths.
+
 ### Special File Types
 - **Images** (PNG, JPG, GIF, WebP): Return as base64 in an `ImageContent` block. For vision-capable models, the image is presented visually.
 - **PDFs**: Text extraction via `unpdf` (pure-ESM, zero native deps). Implementation: `packages/cortex/src/tools/shared/pdf-extractor.ts`.

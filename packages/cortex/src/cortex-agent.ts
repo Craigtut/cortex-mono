@@ -66,7 +66,7 @@ import type { CortexTool } from './tool-contract.js';
 import type { CortexModel } from './model-wrapper.js';
 import type { AgentMessage } from './context-manager.js';
 import type { ContextManager } from './context-manager.js';
-import { EventBridge } from './event-bridge.js';
+import { EventBridge, extractResponseChunkText } from './event-bridge.js';
 import type { CortexEvent } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
 import type { SkillRegistry } from './skill-registry.js';
@@ -80,7 +80,7 @@ import { OBSERVATIONAL_MEMORY_DEFAULTS } from './compaction/observational/consta
 import { SessionLog } from './session-log.js';
 import type { SessionLogEntry, SessionLogSubscriber, WakeClass } from './session-log.js';
 import { NOOP_LOGGER } from './noop-logger.js';
-import { stripWorkingTags } from './working-tags.js';
+import { stripWorkingTags, WorkingTagStreamFilter } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter } from './duplex/router.js';
 import type { DuplexRouterOptions, DuplexRouterPorts } from './duplex/router.js';
@@ -1532,6 +1532,37 @@ export class CortexAgent {
     this.mergedBridge = new EventBridge(false, this.logger);
     this.mergedBridge.forwardLoopFrom(talkerBridge, talker.loopPath);
     this.mergedBridge.forwardLoopFrom(reasonerBridge, this.reasoner.loopPath);
+
+    // The sanitized talker-delta stream (F6): voice consumers must never
+    // route raw response_chunk to TTS, because working tags are stripped
+    // only at turn_end and split across chunks at arbitrary positions. The
+    // filter holds text from any '<' until the tag disambiguates, per
+    // assistant message; stream end releases a trailing prefix that never
+    // became a tag and drops unterminated working content. flush() is
+    // unconditional, so a close tag that never arrives cannot wedge the
+    // stream.
+    const mergedBridge = this.mergedBridge;
+    const deltaFilter = new WorkingTagStreamFilter();
+    talkerBridge.on('response_start', (event) => {
+      if (event.childTaskId) return;
+      deltaFilter.reset();
+    });
+    talkerBridge.on('response_chunk', (event) => {
+      if (event.childTaskId) return;
+      const delta = extractResponseChunkText(event.data);
+      if (delta === null || delta.length === 0) return;
+      const clean = deltaFilter.push(delta);
+      if (clean.length > 0) mergedBridge.emitTalkerDelta(clean, talker.loopPath);
+    });
+    const flushDeltaFilter = (event: CortexEvent): void => {
+      if (event.childTaskId) return;
+      const tail = deltaFilter.flush();
+      if (tail.length > 0) mergedBridge.emitTalkerDelta(tail, talker.loopPath);
+    };
+    // response_end is the per-message end; turn_end backstops it (flush is
+    // idempotent: the held text clears on the first release).
+    talkerBridge.on('response_end', flushDeltaFilter);
+    talkerBridge.on('turn_end', flushDeltaFilter);
 
     // The aggregate budget guard, active from the first duplex assembly
     // (D19): lifetime scope over both loops, every sub-agent, and utility

@@ -18,6 +18,7 @@ export type {
   SessionUsage,
   UtilityUsageBucket,
   UtilityUsagePayload,
+  TalkerDeltaPayload,
   CortexLifecycleState,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
@@ -95,6 +96,7 @@ export {
   stripWorkingTags,
   extractWorkingContent,
   parseWorkingTags,
+  WorkingTagStreamFilter,
 } from './working-tags.js';
 
 // Error Classifier
@@ -136,7 +138,7 @@ export type {
 } from './cache-breakpoints.js';
 
 // Event Bridge (Phase 1B)
-export { EventBridge } from './event-bridge.js';
+export { EventBridge, extractResponseChunkText } from './event-bridge.js';
 export type {
   CortexEventType,
   CortexEvent,

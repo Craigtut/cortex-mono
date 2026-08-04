@@ -898,6 +898,18 @@ export interface UtilityUsagePayload {
   category: string;
 }
 
+/**
+ * Typed payload for the duplex facade's sanitized talker-delta events
+ * ('talker_delta'): the voice-safe streaming text of the talker's current
+ * assistant message, with working-tag content removed by holdback buffering
+ * across chunk boundaries. Voice consumers route THIS to TTS, never raw
+ * response_chunk (whose deltas carry `<working>` content verbatim).
+ */
+export interface TalkerDeltaPayload {
+  /** Sanitized delta text, safe to speak. */
+  text: string;
+}
+
 // ---------------------------------------------------------------------------
 // Budget Guard
 // ---------------------------------------------------------------------------
