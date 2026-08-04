@@ -1178,6 +1178,54 @@ describe('duplex abort scopes', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Wake-delivery dead-lettering (drops must be visible in the session log)
+// ---------------------------------------------------------------------------
+
+describe('duplex wake-delivery dead-lettering', () => {
+  it('a dropped talker wake delivery leaves a delivery_dead_lettered lifecycle entry', async () => {
+    const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+    // Every talker run fails terminally with a clean unwind, so a parked
+    // utterance exhausts its sweep attempts and is dropped.
+    talkerPi.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      talkerPi.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? [...input]
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      talkerPi.state.messages.push(...messages);
+      talkerPi.state.messages.push({
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'c1', name: 'spawn_task', arguments: {} }],
+      } as never);
+      throw new Error('provider dropped mid-batch');
+    };
+
+    // Hold the gate with an empty background drain so the utterance parks
+    // instead of prompting, putting it on the sweep path.
+    const drain = (talkerLoop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    const turn = facade.prompt('did you hear me');
+    await drain;
+
+    // Without the lifecycle entry, the log would show this utterance with
+    // no reply and nothing saying why.
+    await waitUntil(() => facade.getLog().some((entry) =>
+      entry.type === 'lifecycle' &&
+      (entry.data as { event?: string } | undefined)?.event === 'delivery_dead_lettered' &&
+      (entry.data as { kind?: string } | undefined)?.kind === 'wake_delivery'));
+    const entry = facade.getLog().find((item) =>
+      (item.data as { kind?: string } | undefined)?.kind === 'wake_delivery')!;
+    expect(entry.loopPath).toBe('talker');
+    expect(entry.data).toMatchObject({
+      attempts: 3,
+      lastError: 'provider dropped mid-batch',
+      message: 'did you hear me',
+    });
+    await turn;
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Composite persistence over two live loops
 // ---------------------------------------------------------------------------
 

@@ -724,6 +724,49 @@ describe('AgentLoop.deliver sweep failure recovery', () => {
     expect(occurrences(piAgent, 'doomed content')).toBe(0);
     expect(piAgent.state.messages.some((m) => Array.isArray(m.content))).toBe(false);
   });
+
+  it('dead-letters dropped wake deliveries so the drop is inspectable, not just a log line', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    loop.onError(() => {});
+    const deadLettered = vi.fn();
+    loop.onBackgroundResultDeadLettered(deadLettered);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      piAgent.state.messages.push({
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'call_1', name: 'Bash', arguments: {} }],
+      } as never);
+      throw new Error('provider dropped mid-batch');
+    };
+
+    const drain = (loop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    loop.deliver('doomed content');
+    await drain;
+
+    await waitUntil(() => deadLettered.mock.calls.length === 1 && !loop.isLoopActive);
+    const entry = deadLettered.mock.calls[0]![0] as {
+      kind: string; taskId: string; attempts: number; lastError: string; message: string;
+    };
+    expect(entry.kind).toBe('wake_delivery');
+    expect(entry.taskId).toBe('wake-delivery');
+    expect(entry.attempts).toBe(3);
+    expect(entry.lastError).toContain('provider dropped mid-batch');
+    // The dropped content itself is retained for inspection or re-drive.
+    expect(entry.message).toBe('doomed content');
+    expect(
+      loop.getDeadLetteredBackgroundResults().some((result) => result.kind === 'wake_delivery'),
+    ).toBe(true);
+  });
 });
 
 describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {

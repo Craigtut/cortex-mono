@@ -1541,16 +1541,21 @@ export interface SubAgentResult {
 }
 
 /**
- * A background completion (sub-agent result or backgrounded Bash command)
- * whose delivery to the loop failed repeatedly and was dropped from the
- * delivery queue. Returned by getDeadLetteredBackgroundResults() so a
- * consumer can surface or re-drive the work; without this, a deterministic
- * delivery failure would either redeliver forever or vanish silently.
+ * Content the loop gave up on delivering after repeated failures: a
+ * background completion (sub-agent result or backgrounded Bash command)
+ * dropped from the delivery queue, or a parked wake delivery whose
+ * carrying runs failed until its attempt cap or elapsed budget ran out.
+ * Returned by getDeadLetteredBackgroundResults() so a consumer can surface
+ * or re-drive the work; without this, a deterministic delivery failure
+ * would either redeliver forever or vanish silently.
  */
 export interface DeadLetteredBackgroundResult {
-  /** What kind of background work produced the result. */
-  kind: 'subagent' | 'bash';
-  /** Task ID of the sub-agent or background Bash command. */
+  /** What kind of work produced the dropped content. */
+  kind: 'subagent' | 'bash' | 'wake_delivery';
+  /**
+   * Task ID of the sub-agent or background Bash command. Dropped wake
+   * deliveries have no task; they carry the synthetic id 'wake-delivery'.
+   */
   taskId: string;
   /** Delivery attempts made before giving up. */
   attempts: number;

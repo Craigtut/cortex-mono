@@ -1185,6 +1185,10 @@ export class CortexAgent {
     this.wireErrorProducers(talker);
     this.wireErrorProducers(this.reasoner);
     this.wireWorkLoopProducers();
+    // The talker has no background completions, but its parked wake
+    // deliveries (user utterances among them) can dead-letter after
+    // repeated failed carrying runs; those drops must reach the log.
+    this.wireDeadLetterProducer(talker);
 
     // Run tracking: implicit deliveries, the liveness watchdog, the
     // per-turn dispatch cap, and the stop-reason audit.
@@ -1550,17 +1554,40 @@ export class CortexAgent {
       });
     });
 
-    this.reasoner.onBackgroundResultDeadLettered((result: DeadLetteredBackgroundResult) => {
+    this.wireDeadLetterProducer(this.reasoner);
+  }
+
+  /**
+   * Dead-letter log producer for one loop. Background-completion drops
+   * come from the reasoner; wake-delivery drops can come from either
+   * resident loop (duplex wires the talker too), and without a lifecycle
+   * entry for those the session log would show a user utterance with no
+   * reply and nothing saying why.
+   */
+  private wireDeadLetterProducer(loop: AgentLoop): void {
+    loop.onBackgroundResultDeadLettered((result: DeadLetteredBackgroundResult) => {
       this.appendEntry({
         type: 'lifecycle',
-        loopPath: this.reasoner.loopPath,
-        content: `Background ${result.kind} ${result.taskId} delivery dead-lettered after ${result.attempts} attempts`,
+        loopPath: loop.loopPath,
+        content: result.kind === 'wake_delivery'
+          ? `Wake delivery dropped after ${result.attempts} failed carrying runs`
+          : `Background ${result.kind} ${result.taskId} delivery dead-lettered after ${result.attempts} attempts`,
         data: {
           event: 'delivery_dead_lettered',
           kind: result.kind,
           taskId: result.taskId,
           attempts: result.attempts,
           lastError: result.lastError,
+          // A bounded preview of what vanished, so the log entry is
+          // diagnosable on its own; the full content stays in the loop's
+          // dead-letter store.
+          ...(result.kind === 'wake_delivery'
+            ? {
+                message: result.message.length > 300
+                  ? `${result.message.slice(0, 300)}…`
+                  : result.message,
+              }
+            : {}),
         },
       });
     });

@@ -674,6 +674,12 @@ const MAX_BACKGROUND_DELIVERY_ELAPSED_MS = 4 * 60 * 60 * 1000;
 const MAX_DEAD_LETTERED_RESULTS = 50;
 
 /**
+ * Synthetic taskId for dead-lettered wake deliveries, which have no task
+ * behind them (see DeadLetteredBackgroundResult.taskId).
+ */
+const WAKE_DELIVERY_DEAD_LETTER_ID = 'wake-delivery';
+
+/**
  * Escape text interpolated into the <background-tasks> block. Task
  * instructions, tool summaries, commands, and stdout tails are untrusted;
  * without escaping they could forge or terminate the block's XML-ish tags.
@@ -1548,7 +1554,9 @@ export class AgentLoop {
       // own. An aborted turn instead cancels its spliced deliveries, the
       // same way abort() cancels parked ones.
       if (promptStatus !== 'cancelled') {
-        this.reparkUndeliveredWakeBatch(wakeBatch, preDeliveryCount, silentBatch.length);
+        this.reparkUndeliveredWakeBatch(
+          wakeBatch, preDeliveryCount, silentBatch.length, error.message,
+        );
       }
       // Classification, overflow handling, retry orchestration, and the onError
       // emission all happen inside runTurnWithRetry. Here we only record status
@@ -2213,18 +2221,25 @@ export class AgentLoop {
       }
       // Otherwise re-park for another sweep attempt, dropping items whose
       // attempt cap or total delivery budget is exhausted so a terminal
-      // error cannot loop the gate forever.
-      const requeue = pending.filter((item) => {
+      // error cannot loop the gate forever. Dropped items dead-letter so
+      // the drop is observable (a bare count in a log line leaves the
+      // session log showing content that simply never got a run).
+      const requeue: QueuedDelivery[] = [];
+      const droppedItems: QueuedDelivery[] = [];
+      for (const item of pending) {
         item.deliveryAttempts = (item.deliveryAttempts ?? 0) + 1;
-        if (item.deliveryAttempts >= MAX_WAKE_DELIVERY_ATTEMPTS) return false;
         const elapsedMs = Date.now() - (item.firstDeliveryAttemptAt ?? Date.now());
-        return elapsedMs < MAX_WAKE_DELIVERY_ELAPSED_MS;
-      });
-      if (requeue.length < pending.length) {
+        const exhausted =
+          item.deliveryAttempts >= MAX_WAKE_DELIVERY_ATTEMPTS ||
+          elapsedMs >= MAX_WAKE_DELIVERY_ELAPSED_MS;
+        (exhausted ? droppedItems : requeue).push(item);
+      }
+      if (droppedItems.length > 0) {
         this.logger.error('dropping parked wake deliveries after repeated failed runs', {
-          dropped: pending.length - requeue.length,
+          dropped: droppedItems.length,
           attempts: MAX_WAKE_DELIVERY_ATTEMPTS,
         });
+        this.deadLetterWakeDeliveries(droppedItems, error.message);
       }
       if (requeue.length > 0) {
         // Ahead of anything that parked meanwhile, preserving arrival order.
@@ -2263,6 +2278,7 @@ export class AgentLoop {
     wakeBatch: QueuedDelivery[],
     preDeliveryCount: number,
     trailingBatchCount: number,
+    lastError: string,
   ): void {
     if (wakeBatch.length === 0) return;
     const messages = this.agent.state.messages;
@@ -2318,17 +2334,24 @@ export class AgentLoop {
     // landed === 0: the failure hit before pi pushed the batch. Nothing to
     // unwind, but the content is not in history and must be re-parked.
 
-    const requeue = wakeBatch.filter((item) => {
+    const requeue: QueuedDelivery[] = [];
+    const droppedItems: QueuedDelivery[] = [];
+    for (const item of wakeBatch) {
       item.deliveryAttempts = (item.deliveryAttempts ?? 0) + 1;
       item.firstDeliveryAttemptAt ??= Date.now();
-      if (item.deliveryAttempts >= MAX_WAKE_DELIVERY_ATTEMPTS) return false;
-      return Date.now() - item.firstDeliveryAttemptAt < MAX_WAKE_DELIVERY_ELAPSED_MS;
-    });
-    if (requeue.length < wakeBatch.length) {
+      const exhausted =
+        item.deliveryAttempts >= MAX_WAKE_DELIVERY_ATTEMPTS ||
+        Date.now() - item.firstDeliveryAttemptAt >= MAX_WAKE_DELIVERY_ELAPSED_MS;
+      (exhausted ? droppedItems : requeue).push(item);
+    }
+    if (droppedItems.length > 0) {
       this.logger.error('dropping wake deliveries after repeated failed carrying runs', {
-        dropped: wakeBatch.length - requeue.length,
+        dropped: droppedItems.length,
         attempts: MAX_WAKE_DELIVERY_ATTEMPTS,
       });
+      // Dead-lettered like the sweep's drops: the drop must be observable,
+      // not a bare count in a log line.
+      this.deadLetterWakeDeliveries(droppedItems, lastError);
     }
     if (requeue.length > 0) {
       // Ahead of anything that parked meanwhile, preserving arrival order.
@@ -4342,11 +4365,13 @@ export class AgentLoop {
   }
 
   /**
-   * Register a handler that fires when a background completion is
-   * dead-lettered: delivery gave up (attempts exhausted, elapsed budget
-   * spent, or a fatal error) or the agent shut down before delivering it.
-   * The consumer can surface the result to the user or re-drive the work;
-   * Cortex will not retry it.
+   * Register a handler that fires when content is dead-lettered: a
+   * background completion whose delivery gave up (attempts exhausted,
+   * elapsed budget spent, or a fatal error) or that the agent shut down
+   * before delivering, or a parked wake delivery dropped after its
+   * carrying runs failed repeatedly (kind 'wake_delivery'). The consumer
+   * can surface the content to the user or re-drive the work; Cortex will
+   * not retry it.
    */
   onBackgroundResultDeadLettered(
     handler: (result: DeadLetteredBackgroundResult) => void,
@@ -6941,14 +6966,41 @@ export class AgentLoop {
     // format here to preserve the payload. Empty only when the source is
     // already gone (a Bash completion landing after runtime teardown).
     const message = item.formattedMessage ?? this.formatPendingCompletion(item) ?? '';
-    const entry: DeadLetteredBackgroundResult = {
+    this.recordDeadLetteredResult({
       kind: item.kind,
       taskId: item.taskId,
       attempts,
       lastError,
       deadLetteredAt: Date.now(),
       message,
-    };
+    });
+  }
+
+  /**
+   * Record wake deliveries the loop gives up on (attempt cap or elapsed
+   * budget exhausted across failed carrying runs), one dead-letter entry
+   * per item. Routed through the same surface as background completions so
+   * the drop is observable rather than a bare log line: the bounded store
+   * keeps the content for inspection, and onBackgroundResultDeadLettered
+   * handlers fire (the CortexAgent facade turns those into session-log
+   * lifecycle entries; without one, the log shows a user utterance with no
+   * reply and nothing saying why).
+   */
+  private deadLetterWakeDeliveries(dropped: QueuedDelivery[], lastError: string): void {
+    for (const item of dropped) {
+      this.recordDeadLetteredResult({
+        kind: 'wake_delivery',
+        taskId: WAKE_DELIVERY_DEAD_LETTER_ID,
+        attempts: item.deliveryAttempts ?? 0,
+        lastError,
+        deadLetteredAt: Date.now(),
+        message: item.content,
+      });
+    }
+  }
+
+  /** Append to the bounded dead-letter store and notify handlers. */
+  private recordDeadLetteredResult(entry: DeadLetteredBackgroundResult): void {
     this.deadLetteredBackgroundResults.push(entry);
     const excess = this.deadLetteredBackgroundResults.length - MAX_DEAD_LETTERED_RESULTS;
     if (excess > 0) {
@@ -6970,9 +7022,10 @@ export class AgentLoop {
   }
 
   /**
-   * Background completions whose delivery failed repeatedly and were dropped
-   * from the delivery queue (newest last, bounded). The consumer can surface
-   * these to the user or re-drive the work; Cortex will not retry them.
+   * Dead-lettered content (newest last, bounded): background completions
+   * whose delivery failed repeatedly, and wake deliveries dropped after
+   * their carrying runs failed repeatedly. The consumer can surface these
+   * to the user or re-drive the work; Cortex will not retry them.
    */
   getDeadLetteredBackgroundResults(): DeadLetteredBackgroundResult[] {
     return [...this.deadLetteredBackgroundResults];
