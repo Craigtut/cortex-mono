@@ -78,7 +78,12 @@ import type {
 import { COMPACTION_DEFAULTS } from './compaction/compaction.js';
 import { OBSERVATIONAL_MEMORY_DEFAULTS } from './compaction/observational/constants.js';
 import { SessionLog } from './session-log.js';
-import type { SessionLogEntry, SessionLogSubscriber, WakeClass } from './session-log.js';
+import type {
+  SessionLogEntry,
+  SessionLogEntryType,
+  SessionLogSubscriber,
+  WakeClass,
+} from './session-log.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { stripWorkingTags, WorkingTagStreamFilter } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
@@ -1090,6 +1095,22 @@ export interface CortexDeliverOptions {
    * reasoner. Default: 'conversation'.
    */
   target?: 'conversation' | 'work';
+  /**
+   * Who is speaking. Only 'user' mints a consent-qualifying cause tag, so a
+   * caller relaying actual human speech must say so; everything else
+   * (notifications, status, anything the application itself says) defaults
+   * to 'system' and cannot satisfy a permission ask.
+   *
+   * The default is deliberately not 'user'. Defaulting the other way makes
+   * every notification path a silent consent source: voice an escalation
+   * ask, wait for any routine "your build finished", and a persuaded talker
+   * can grant permission whose audit trail points at the build message.
+   * Defaulting to 'system' costs at most one re-voice when a consumer
+   * forgets to mark real speech. See docs/cortex/duplex/decisions.md D16.
+   *
+   * `prompt()` is unambiguous user speech and always mints the user tag.
+   */
+  speaker?: 'user' | 'system';
 }
 
 // ---------------------------------------------------------------------------
@@ -2258,6 +2279,12 @@ export class CortexAgent {
   private deliverDuplex(content: string, options?: CortexDeliverOptions): DeliverResult {
     const target = options?.target ?? 'conversation';
     const router = this.router!;
+    // Only an explicit 'user' speaker mints the consent-qualifying kind.
+    // The default is 'system' so that a consumer notification can never
+    // stand in for the user answering a permission ask (D16); prompt() is
+    // unambiguous user speech and stamps 'utterance' directly.
+    const causeKind: SessionLogEntryType =
+      options?.speaker === 'user' ? 'utterance' : 'delivery';
     if (target === 'work') {
       const entry = this.appendEntry({
         type: 'utterance',
@@ -2270,12 +2297,13 @@ export class CortexAgent {
         router.noteWorkContext(content);
         return { outcome: 'queued' };
       }
-      // The utterance rides the dispatch as its cause tag (parked
-      // dispatches keep it through the sweep, exactly like router
-      // dispatches).
+      // The input rides the dispatch as its cause tag (parked dispatches
+      // keep it through the sweep, exactly like router dispatches). Only a
+      // 'user' speaker mints the consent-qualifying kind; see the speaker
+      // field on CortexDeliverOptions.
       const message = router.composeWorkDispatch(content);
       return this.reasoner.deliver(message, {
-        causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag,
+        causeTag: { kind: causeKind, seq: entry.seq } satisfies CauseTag,
       });
     }
 
@@ -2294,12 +2322,14 @@ export class CortexAgent {
     } else {
       router.noteUserUtterance(content);
     }
-    // Wake deliveries carry the utterance as their cause tag (a no-wake
-    // delivery is silent context and carries no causation).
+    // Wake deliveries carry a cause tag (a no-wake delivery is silent
+    // context and carries no causation). Only a 'user' speaker mints the
+    // consent-qualifying kind: a consumer notification spoken on this
+    // surface must never be able to satisfy a pending permission ask.
     return talker.deliver(content, {
       ...(options?.wake !== undefined ? { wake: options.wake } : {}),
       ...(options?.wake !== false
-        ? { causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag }
+        ? { causeTag: { kind: causeKind, seq: entry.seq } satisfies CauseTag }
         : {}),
     });
   }

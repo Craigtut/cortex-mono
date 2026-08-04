@@ -35,7 +35,7 @@ Config is routed per the table in `src/cortex-agent.ts` (`CONFIG_ROUTING`). The 
 ## Interaction surface
 
 - **`prompt(input, options?)`**: never throws on a busy loop. Concurrent calls serialize; each resolves against the turn that carries its input. (Direct `AgentLoop.prompt()` fails fast while the loop gate is held; the facade absorbs that.)
-- **`deliver(content, { wake?, target? })`**: fire-and-forget input with the loop's `deliver()` outcomes (`prompted`, `parked`, `queued`). `target` is `'conversation'` (default) or `'work'`; both resolve to the reasoner in passthrough.
+- **`deliver(content, { wake?, target?, speaker? })`**: fire-and-forget input with the loop's `deliver()` outcomes (`prompted`, `parked`, `queued`). `target` is `'conversation'` (default) or `'work'`; both resolve to the reasoner in passthrough. `speaker` is `'system'` by default and must be set to `'user'` when the call relays actual human speech: only a user-speaker delivery can satisfy a pending permission ask. The default is deliberately the safe one, because otherwise every notification path becomes a silent consent source (`prompt()` is unambiguous user speech and always qualifies). See decisions.md D16.
 - **`steer(message)`**: queue into the running turn, as on the loop.
 - **`abort(scope?)`**: `'conversation'`, `'work'`, or `'all'` (default). Every scope aborts the in-flight turn, drops queued deliveries, and clears pi's steering and follow-up queues; `'work'` and `'all'` additionally cancel running sub-agents. Pending permission asks resolve as deny through the abort race.
 - **`destroy(timeoutMs?)`**: tears down the facade and its loops. Idempotent.
