@@ -207,7 +207,9 @@ interface Harness {
   turnOutputs: Array<{ userFacing: string; loopPath: string }>;
   loopCompletes: number;
   errors: Array<{ category: string; severity: string; loopPath: string }>;
-  retriesScheduled: Array<{ attempt: number; category: string }>;
+  // delayMs is deterministic (jitter-free backoff from config), so it is
+  // asserted: a facade mis-routing retryPolicy diverges here first.
+  retriesScheduled: Array<{ attempt: number; category: string; delayMs: number }>;
   prompt: (input: string, options?: { sessionId?: string }) => Promise<unknown>;
   deliver: (content: string, options?: { wake?: boolean }) => DeliverResult;
   steer: (message: string) => void;
@@ -242,11 +244,24 @@ function baseConfig(overrides?: Partial<AgentLoopConfig>): AgentLoopConfig {
 /**
  * Deep-normalize a value for cross-side comparison: volatile wall-clock
  * values (timestamps, durations, *At fields) are replaced with a marker so
- * everything else in the payload shape still must match. A projection to
+ * everything else in the payload shape still must match. delayMs is
+ * deliberately not scrubbed: backoffForAttempt is jitter-free, so the
+ * scheduled backoff is fully determined by config and a facade that
+ * mis-routed retryPolicy must fail parity on it. A projection to
  * event.type alone would miss exactly the payload-shaped changes 2b makes
  * (loop paths stamped on every event).
  */
-const VOLATILE_KEY = /^(timestamp|durationMs|delayMs)$|At$/;
+const VOLATILE_KEY = /^(timestamp|durationMs)$|At$/;
+
+/**
+ * Identity-shaped fields carry UUIDs minted independently on each side
+ * (askId, sub-agent task ids), so raw values can never match across
+ * harnesses. Scrubbing them away would also stop asserting their presence
+ * and correlation; instead each harness maps values to stable placeholders
+ * in first-seen order, so the same id keeps the same placeholder wherever
+ * it reappears on that side.
+ */
+const IDENTITY_KEY = /^(askId|taskId|childTaskId)$/;
 
 function scrubVolatile(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(scrubVolatile);
@@ -258,6 +273,34 @@ function scrubVolatile(value: unknown): unknown {
     return out;
   }
   return value;
+}
+
+/** Per-harness event normalizer: volatile scrub plus identity placeholders. */
+function createEventNormalizer(): (value: unknown) => unknown {
+  const placeholders = new Map<string, string>();
+  const normalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value && typeof value === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        if (VOLATILE_KEY.test(key)) {
+          out[key] = '<volatile>';
+        } else if (IDENTITY_KEY.test(key) && typeof entry === 'string') {
+          let placeholder = placeholders.get(entry);
+          if (placeholder === undefined) {
+            placeholder = `<id-${placeholders.size + 1}>`;
+            placeholders.set(entry, placeholder);
+          }
+          out[key] = placeholder;
+        } else {
+          out[key] = normalize(entry);
+        }
+      }
+      return out;
+    }
+    return value;
+  };
+  return normalize;
 }
 
 /** Record every AgentLoop.prompt() invocation (input plus options). */
@@ -282,8 +325,9 @@ function collect(
     onRetryScheduled: (handler: (info: RetryScheduledInfo) => void) => void;
   },
 ): void {
+  const normalizeEvent = createEventNormalizer();
   surface.getEventBridge().onAll((event) => {
-    harness.events.push(scrubVolatile(event));
+    harness.events.push(normalizeEvent(event));
   });
   surface.onTurnComplete((output, origin) => {
     harness.turnOutputs.push({ userFacing: output.userFacing, loopPath: origin.loopPath });
@@ -299,7 +343,11 @@ function collect(
     });
   });
   surface.onRetryScheduled((info) => {
-    harness.retriesScheduled.push({ attempt: info.attempt, category: info.category });
+    harness.retriesScheduled.push({
+      attempt: info.attempt,
+      category: info.category,
+      delayMs: info.delayMs,
+    });
   });
 }
 
@@ -524,7 +572,9 @@ describe('CortexAgent passthrough parity', () => {
     }
 
     expectParity(direct, facade);
-    expect(facade.retriesScheduled).toEqual([{ attempt: 1, category: 'network' }]);
+    // delayMs pins the configured backoff: a facade that mis-routed
+    // retryPolicy would schedule the default backoff instead.
+    expect(facade.retriesScheduled).toEqual([{ attempt: 1, category: 'network', delayMs: 1 }]);
   });
 
   it('abort mid-run: same cancellation surface, both reusable after', async () => {
