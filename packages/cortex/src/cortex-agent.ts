@@ -109,6 +109,7 @@ import {
   SPEAK_NOW_APPENDIX,
   TALKER_ROLE_PROMPT,
   TALKER_TRUNCATION_REPAIR_MESSAGE,
+  wrapConsumerDeliveryForTalker,
 } from './duplex/prompts.js';
 
 // ---------------------------------------------------------------------------
@@ -2246,6 +2247,14 @@ export class CortexAgent {
    * prompt(): the loop's own deliver() state machine decides whether the
    * content starts a turn now ('prompted'), opens the next run ('parked'),
    * or waits silently for the next real prompt ('queued').
+   *
+   * In duplex, content delivered to the conversation surface is fenced in
+   * an `<external-update>` wrapper before it reaches the talker, the same
+   * way reasoner deliveries and lookup results are fenced: everything
+   * DELIVERED is content about something, and only prompt() (the user
+   * speaking) arrives bare. Consumers relay third-party text here, so the
+   * fence is what keeps an email body out of the talker's instruction lane.
+   * The session log keeps the unwrapped content.
    */
   deliver(content: string, options?: CortexDeliverOptions): DeliverResult {
     // Mirror AgentLoop.deliver's synchronous validation before appending,
@@ -2336,11 +2345,16 @@ export class CortexAgent {
     } else {
       router.noteUserUtterance(content);
     }
+    // Fenced like every other delivered channel: the log holds the raw
+    // content (the durable record), and what reaches the talker's transcript
+    // is wrapped, so relayed third-party text cannot sit in the instruction
+    // channel unmarked. prompt() is the user speaking and stays bare.
+    const wrapped = wrapConsumerDeliveryForTalker(content);
     // Wake deliveries carry a cause tag (a no-wake delivery is silent
     // context and carries no causation). Only a 'user' speaker mints the
     // consent-qualifying kind: a consumer notification spoken on this
     // surface must never be able to satisfy a pending permission ask.
-    return talker.deliver(content, {
+    return talker.deliver(wrapped, {
       ...(options?.wake !== undefined ? { wake: options.wake } : {}),
       ...(options?.wake !== false
         ? { causeTag: { kind: causeKind, seq: entry.seq } satisfies CauseTag }
