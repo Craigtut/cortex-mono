@@ -27,7 +27,7 @@ import type {
   ToolResultInterceptorInfo,
   ToolResultInterceptorResult,
 } from './agent-loop.js';
-import type { McpClientManager } from './mcp-client.js';
+import { McpClientManager } from './mcp-client.js';
 import type { CompactionManager } from './compaction/index.js';
 import type { DirectCompletionContext } from './cache-breakpoints.js';
 import type {
@@ -56,6 +56,7 @@ import type {
   RetryScheduledInfo,
   RetrySucceededInfo,
   SessionUsage,
+  SkillConfig,
   UtilityUsageBucket,
   SubAgentSnapshot,
   SubAgentSpawnConfig,
@@ -269,6 +270,10 @@ export const CONFIG_ROUTING: { [K in keyof Required<CortexAgentConfig>]: ConfigD
   // Reasoner and sub-agents (the talker has no read tools). The facade's
   // quick-lookup loops get their own facade-set allowlist regardless.
   readPathAllowlist: 'reasoner',
+  // MCP projects to the reasoner (and its sub-agents via tool closures),
+  // never the talker. In duplex the facade supplies a shared manager here
+  // when the consumer did not: one connection per server total.
+  mcpClientManager: 'reasoner',
   deferredTools: 'reasoner',
   toolResultThresholds: 'reasoner',
   webFetch: 'reasoner',
@@ -1142,6 +1147,12 @@ export class CortexAgent {
   private aggregateGuard: BudgetGuard | null = null;
   /** Facade-owned quick-lookup fleet (D13); null in passthrough. */
   private lookups: QuickLookupManager | null = null;
+  /**
+   * The facade-minted shared MCP manager (duplex): loops sharing it never
+   * close it, so the facade does at destroy. Null in passthrough and when
+   * the consumer supplied their own manager (their lifecycle, not ours).
+   */
+  private ownedMcpManager: McpClientManager | null = null;
   private aggregateBreachLogged = false;
   /** Whether the current reasoner run called Deliver (implicit-delivery guard). */
   private reasonerDeliverCalledThisRun = false;
@@ -1272,7 +1283,21 @@ export class CortexAgent {
       // call can run. Allow/block/deny decisions pass through untouched;
       // only `ask` routes through the conversation (D16).
       const brokerBox: { broker: PermissionBroker | null } = { broker: null };
-      const brokered = withBrokeredPermissions(config, () => brokerBox.broker);
+      let brokered = withBrokeredPermissions(config, () => brokerBox.broker);
+      // The MCP multiplexer: one manager, one connection per server total,
+      // projected to the reasoner (and its sub-agents via tool closures);
+      // never the talker. A consumer-provided manager is adopted (and its
+      // lifecycle stays the consumer's); otherwise the facade mints and
+      // owns one, configured here because loops only configure managers
+      // they own.
+      const facadeMintedMcp = config.mcpClientManager === undefined;
+      const sharedMcp = config.mcpClientManager ?? new McpClientManager();
+      if (facadeMintedMcp) {
+        if (config.logger) sharedMcp.logger = config.logger;
+        if (config.envOverrides) sharedMcp.envOverrides = config.envOverrides;
+        if (config.sandbox) sharedMcp.sandbox = config.sandbox;
+      }
+      brokered = { ...brokered, mcpClientManager: sharedMcp };
       const reasoner = await AgentLoop.create(buildDuplexReasonerConfig(brokered));
       let talker: AgentLoop;
       try {
@@ -1284,10 +1309,12 @@ export class CortexAgent {
       } catch (err) {
         // A half-assembled duplex must not leak a live reasoner.
         await reasoner.destroy().catch(() => {});
+        if (facadeMintedMcp) await sharedMcp.closeAll().catch(() => {});
         throw err;
       }
       const agent = new CortexAgent(reasoner, brokered, talker);
       brokerBox.broker = agent.router?.permissionBroker ?? null;
+      if (facadeMintedMcp) agent.ownedMcpManager = sharedMcp;
       return agent;
     }
     const reasoner = await AgentLoop.create(buildReasonerConfig(config));
@@ -2353,6 +2380,12 @@ export class CortexAgent {
         if (this.lookups) teardowns.push(this.lookups.destroy());
         await Promise.all(teardowns);
       } finally {
+        // After the loops detach their listeners: the shared connections
+        // (and stdio subprocesses) are facade-owned, so the loops never
+        // close them.
+        if (this.ownedMcpManager) {
+          await this.ownedMcpManager.closeAll().catch(() => {});
+        }
         this.mergedBridge?.destroy();
         this.log.clearSubscribers();
       }
@@ -2802,6 +2835,34 @@ export class CortexAgent {
 
   getSkillRegistry(): SkillRegistry {
     return this.reasoner.getSkillRegistry();
+  }
+
+  /**
+   * Register a skill with every loop that carries skills. The facade
+   * registration API (docs/cortex/duplex/sub-agents.md): skills stay
+   * per-loop (registry instances are never shared between loops), and this
+   * fans the registration out so a consumer never reaches into a specific
+   * loop's registry. Today the fan-out set is the reasoner; the talker
+   * carries no skills by design (facade-api.md routing table), and any
+   * future skill-carrying loop joins here without a consumer-visible
+   * change.
+   */
+  addSkill(config: SkillConfig): void {
+    for (const loop of this.skillLoops) {
+      loop.getSkillRegistry().addSkill(config);
+    }
+  }
+
+  /** Remove a skill from every loop that carries skills. */
+  removeSkill(name: string): void {
+    for (const loop of this.skillLoops) {
+      loop.getSkillRegistry().removeSkill(name);
+    }
+  }
+
+  /** The loops skills fan out to (never the talker). */
+  private get skillLoops(): AgentLoop[] {
+    return [this.reasoner];
   }
 
   // Prompt and model surface -----------------------------------------------

@@ -143,10 +143,36 @@ export class SkillRegistry {
   private scriptContext: Record<string, unknown> = {};
 
   /**
-   * Callback fired when skills are added or removed.
-   * AgentLoop sets this to rebuild the load_skill tool description.
+   * Listeners fired when skills are added or removed. An ARRAY, not a
+   * single assignable slot: the owning loop rebuilds its load_skill tool
+   * description from here, and a facade fanning registration across loops
+   * needs its own observation without displacing the loop's (last-writer-
+   * wins was how shared registries went silently dark,
+   * docs/cortex/duplex/sub-agents.md "MCP and Shared Services").
    */
-  onChange: (() => void) | null = null;
+  private readonly changeListeners: Array<() => void> = [];
+
+  /**
+   * Register a listener fired when skills are added or removed. Returns an
+   * idempotent unsubscribe function.
+   */
+  addChangeListener(listener: () => void): () => void {
+    this.changeListeners.push(listener);
+    return () => {
+      const index = this.changeListeners.indexOf(listener);
+      if (index >= 0) this.changeListeners.splice(index, 1);
+    };
+  }
+
+  private emitChange(): void {
+    for (const listener of [...this.changeListeners]) {
+      try {
+        listener();
+      } catch {
+        // A throwing observer must not break registration for the others.
+      }
+    }
+  }
 
   constructor(configs?: SkillConfig[]) {
     if (configs) {
@@ -198,7 +224,7 @@ export class SkillRegistry {
     }
 
     this.entries.set(name, entry);
-    this.onChange?.();
+    this.emitChange();
   }
 
   /**
@@ -207,7 +233,7 @@ export class SkillRegistry {
   removeSkill(name: string): void {
     const existed = this.entries.delete(name);
     if (existed) {
-      this.onChange?.();
+      this.emitChange();
     }
   }
 

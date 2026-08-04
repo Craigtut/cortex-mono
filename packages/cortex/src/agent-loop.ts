@@ -896,8 +896,15 @@ export class AgentLoop {
   // Tracked subprocess PIDs for synchronous exit cleanup (Level 3 safety net)
   private readonly trackedPids = new Set<number>();
 
-  // MCP Client Manager for tool server connections
+  // MCP Client Manager for tool server connections. May be an external
+  // shared manager (config.mcpClientManager); ownership decides whether
+  // destroy() closes its connections.
   private readonly mcpClientManager: McpClientManager;
+  private readonly ownsMcpClientManager: boolean;
+  /** This loop's own manager-listener registrations, removed on destroy. */
+  private readonly mcpListenerUnsubscribers: Array<() => void> = [];
+  /** The consumer's single progress-handler slot (replace semantics). */
+  private mcpProgressUnsubscribe: (() => void) | null = null;
 
   // Sub-Agent Manager for tracking active sub-agents
   private readonly subAgentManager: SubAgentManager;
@@ -1085,26 +1092,36 @@ export class AgentLoop {
     );
     this.budgetGuard.wire(this.eventBridge);
 
-    // Set up MCP Client Manager with PID tracking and env overrides
-    this.mcpClientManager = new McpClientManager();
-    this.mcpClientManager.logger = this.logger;
-    this.mcpClientManager.onSubprocessSpawned = (pid) => {
-      this.trackPid(pid);
-    };
-    this.mcpClientManager.onSubprocessExited = (pid) => {
-      this.untrackPid(pid);
-    };
-    if (this.envOverrides) {
-      this.mcpClientManager.envOverrides = this.envOverrides;
+    // Set up the MCP client manager: a private one by default, or an
+    // external shared one (config.mcpClientManager: one connection per
+    // server total, multiplexed across loops). Listener registration is
+    // additive either way; manager-level settings (logger, env overrides,
+    // sandbox) are applied only to a manager this loop owns, since a shared
+    // manager's owner configures those once.
+    this.ownsMcpClientManager = config.mcpClientManager === undefined;
+    this.mcpClientManager = config.mcpClientManager ?? new McpClientManager();
+    if (this.ownsMcpClientManager) {
+      this.mcpClientManager.logger = this.logger;
+      if (this.envOverrides) {
+        this.mcpClientManager.envOverrides = this.envOverrides;
+      }
+      // Contain stdio MCP server subprocesses in the same OS sandbox as shell
+      // commands (enforces denyRead over secrets). No-op when no provider is set.
+      if (this.config.sandbox) {
+        this.mcpClientManager.sandbox = this.config.sandbox;
+      }
     }
-    // Contain stdio MCP server subprocesses in the same OS sandbox as shell
-    // commands (enforces denyRead over secrets). No-op when no provider is set.
-    if (this.config.sandbox) {
-      this.mcpClientManager.sandbox = this.config.sandbox;
-    }
-    this.mcpClientManager.onToolsChanged = () => {
-      this.refreshTools();
-    };
+    this.mcpListenerUnsubscribers.push(
+      this.mcpClientManager.addSubprocessSpawnedListener((pid) => {
+        this.trackPid(pid);
+      }),
+      this.mcpClientManager.addSubprocessExitedListener((pid) => {
+        this.untrackPid(pid);
+      }),
+      this.mcpClientManager.addToolsChangedListener(() => {
+        this.refreshTools();
+      }),
+    );
 
     // Set up Sub-Agent Manager (must be before wireSubAgentHooks)
     this.subAgentManager = new SubAgentManager({
@@ -1114,7 +1131,7 @@ export class AgentLoop {
 
     // Set up Skill Registry with auto-rebuild callback
     this.skillRegistry = new SkillRegistry();
-    this.skillRegistry.onChange = () => this.rebuildLoadSkillDescription();
+    this.skillRegistry.addChangeListener(() => this.rebuildLoadSkillDescription());
 
     // Wire sub-agent manager hooks to AgentLoop event handlers
     // (must be after subAgentManager is initialized)
@@ -4901,14 +4918,18 @@ export class AgentLoop {
    * Register a callback fired when MCP tool servers emit
    * `notifications/progress` during a long-running `tools/call`. Consumers
    * wire this to whatever UI affordance they have for "still waiting…".
+   * Replace semantics per loop: setting a handler displaces this loop's
+   * previous one (undefined clears it), while other holders of a shared
+   * manager keep their own registrations.
    */
   setMcpToolCallProgressHandler(
     handler: ((progress: McpToolCallProgress) => void) | undefined,
   ): void {
-    if (handler === undefined) {
-      delete this.mcpClientManager.onToolCallProgress;
-    } else {
-      this.mcpClientManager.onToolCallProgress = handler;
+    this.mcpProgressUnsubscribe?.();
+    this.mcpProgressUnsubscribe = null;
+    if (handler !== undefined) {
+      this.mcpProgressUnsubscribe =
+        this.mcpClientManager.addToolCallProgressListener(handler);
     }
   }
 
@@ -5940,11 +5961,19 @@ export class AgentLoop {
       }
     }
 
-    // 4. Close all MCP client connections
-    try {
-      await this.mcpClientManager.closeAll();
-    } catch {
-      // Best-effort MCP cleanup
+    // 4. Detach from the MCP manager; close connections only when owned (a
+    // shared manager's connections belong to its owner and outlive this loop)
+    for (const unsub of this.mcpListenerUnsubscribers.splice(0)) {
+      unsub();
+    }
+    this.mcpProgressUnsubscribe?.();
+    this.mcpProgressUnsubscribe = null;
+    if (this.ownsMcpClientManager) {
+      try {
+        await this.mcpClientManager.closeAll();
+      } catch {
+        // Best-effort MCP cleanup
+      }
     }
 
     // 5. Clear skill buffer and registry

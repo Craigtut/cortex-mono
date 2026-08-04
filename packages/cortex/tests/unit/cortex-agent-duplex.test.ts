@@ -10,6 +10,9 @@
  * loops, and settlement.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { AgentLoop, TOOL_RESULT_WORKING_TAGS_REMINDER } from '../../src/agent-loop.js';
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import { EventBridge } from '../../src/event-bridge.js';
@@ -42,6 +45,7 @@ import {
   CONVERSATION_CONTEXT_OPEN,
 } from '../../src/duplex/prompts.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
+import { McpClientManager } from '../../src/mcp-client.js';
 
 // ---------------------------------------------------------------------------
 // Mock pi agent: holdable runs, pi-shaped turn_end/agent_end payloads
@@ -600,6 +604,99 @@ describe('duplex quick lookups', () => {
     // Still live after the work abort; releasing it completes normally.
     stub.pis[0]!.releaseRun();
     await waitUntil(() => h.facade.getLog().some((entry) => entry.type === 'lookup_result'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP multiplexer and skill fan-out
+// ---------------------------------------------------------------------------
+
+describe('duplex shared services (MCP, skills)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function stubAgentLoopCreate(): AgentLoopConfig[] {
+    const configs: AgentLoopConfig[] = [];
+    const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+    vi.spyOn(AgentLoop, 'create').mockImplementation(async (config) => {
+      configs.push(config);
+      return new AgentLoopCtor(createMockPiAgent(), config, [], {
+        enableSubAgentTool: (config as { enableSubAgentTool?: boolean }).enableSubAgentTool ?? true,
+        enableLoadSkillTool: (config as { enableLoadSkillTool?: boolean }).enableLoadSkillTool ?? true,
+      });
+    });
+    return configs;
+  }
+
+  it('duplex create mints one shared MCP manager for the reasoner only, closed at facade destroy', async () => {
+    const configs = stubAgentLoopCreate();
+    const facade = await CortexAgent.create({
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'p',
+      mode: 'duplex',
+      talker: { model: testModel() },
+    });
+    liveFacades.push(facade);
+
+    const reasonerConfig = configs[0]!;
+    const talkerConfig = configs[1]!;
+    expect(reasonerConfig.loopPath).toBe('reasoner');
+    expect(reasonerConfig.mcpClientManager).toBeInstanceOf(McpClientManager);
+    // The talker never sees MCP: no shared manager, all built-ins disabled.
+    expect(talkerConfig.mcpClientManager).toBeUndefined();
+
+    const shared = facade.getMcpClientManager();
+    expect(shared).toBe(reasonerConfig.mcpClientManager);
+
+    // Ownership: the loops never close a shared manager; the facade does.
+    const closeSpy = vi.spyOn(shared, 'closeAll');
+    await facade.destroy();
+    expect(closeSpy).toHaveBeenCalled();
+  });
+
+  it('adopts a consumer-provided MCP manager without owning its lifecycle', async () => {
+    stubAgentLoopCreate();
+    const consumerManager = new McpClientManager();
+    const facade = await CortexAgent.create({
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'p',
+      mode: 'duplex',
+      talker: { model: testModel() },
+      mcpClientManager: consumerManager,
+    });
+    liveFacades.push(facade);
+
+    expect(facade.getMcpClientManager()).toBe(consumerManager);
+    const closeSpy = vi.spyOn(consumerManager, 'closeAll');
+    await facade.destroy();
+    expect(closeSpy).not.toHaveBeenCalled();
+  });
+
+  it('facade skill registration fans out to the reasoner and never the talker', () => {
+    const h = createDuplexFacade();
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-duplex-skill-'));
+    try {
+      const skillPath = path.join(tmpDir, 'SKILL.md');
+      fs.writeFileSync(skillPath, '---\nname: demo-skill\ndescription: demo\n---\nBody.\n');
+
+      const observed: string[] = [];
+      h.reasonerLoop.getSkillRegistry().addChangeListener(() => observed.push('reasoner'));
+
+      h.facade.addSkill({ path: skillPath, source: 'user' });
+      expect(h.reasonerLoop.getSkillRegistry().getEntry('demo-skill')).not.toBeNull();
+      expect(h.talkerLoop.getSkillRegistry().getEntry('demo-skill')).toBeNull();
+      // Additive observation: the facade-fed registration fires alongside
+      // the loop's own rebuild listener instead of displacing it.
+      expect(observed).toEqual(['reasoner']);
+
+      h.facade.removeSkill('demo-skill');
+      expect(h.reasonerLoop.getSkillRegistry().getEntry('demo-skill')).toBeNull();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

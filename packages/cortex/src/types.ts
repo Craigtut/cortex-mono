@@ -20,6 +20,9 @@ import type {
   ReflectionEvent,
 } from './compaction/observational/types.js';
 import type { SandboxProvider, ResolveNetworkAccess } from './sandbox/types.js';
+// Type-only: mcp-client.ts imports this module's types, so a runtime import
+// here would be a cycle; the erased type import is not.
+import type { McpClientManager } from './mcp-client.js';
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -580,6 +583,21 @@ export interface AgentLoopConfig {
    * it could not delegate. Omit to always allow (subject to concurrency).
    */
   canSpawnSubAgent?: () => boolean | { allowed: boolean; reason?: string };
+
+  /**
+   * External shared MCP client manager. When provided, this loop uses it
+   * instead of constructing its own: one connection (and one stdio
+   * subprocess) per server total, shared across every loop holding the same
+   * manager. Registration is additive (listener arrays), so several loops
+   * observe tool changes and subprocess lifecycle without displacing each
+   * other. Ownership stays with the provider: the loop unsubscribes its own
+   * listeners on destroy but never closes the shared connections, and the
+   * owner configures the manager's logger, envOverrides, and sandbox. The
+   * duplex facade uses this to multiplex one manager into the reasoner
+   * (docs/cortex/duplex/sub-agents.md "MCP and Shared Services"). When
+   * omitted, the loop owns a private manager exactly as before.
+   */
+  mcpClientManager?: McpClientManager;
 }
 
 /**
