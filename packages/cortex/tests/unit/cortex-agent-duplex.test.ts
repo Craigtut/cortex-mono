@@ -1407,3 +1407,61 @@ describe('duplex destroyed-content recording', () => {
     await turn.catch(() => {});
   });
 });
+
+// ---------------------------------------------------------------------------
+// Headlines (facade-fed talker status block)
+// ---------------------------------------------------------------------------
+
+describe('duplex headlines', () => {
+  function talkerHeadline(talkerLoop: AgentLoop): string | null {
+    const provider = (talkerLoop as unknown as {
+      headlineProvider: (() => string | null) | null;
+    }).headlineProvider;
+    expect(provider).toBeTypeOf('function');
+    return provider!();
+  }
+
+  it('feeds the talker a status block reflecting live reasoner activity', async () => {
+    const { facade, talkerLoop, reasonerPi } = createDuplexFacade();
+    // Nothing running, nothing delegated: no block is injected.
+    expect(talkerHeadline(talkerLoop)).toBeNull();
+
+    // Hold a reasoner run and surface a tool call mid-run.
+    reasonerPi.hold = true;
+    const work = facade.deliver('start working', { target: 'work' });
+    expect(work.outcome).toBe('prompted');
+    await waitUntil(() => reasonerPi.promptCalls.length === 1);
+    reasonerPi.emitEvent({
+      type: 'tool_execution_start',
+      toolCallId: 'c1',
+      toolName: 'Bash',
+      args: { command: 'npm test' },
+    });
+
+    const block = talkerHeadline(talkerLoop)!;
+    expect(block).toContain('state="working"');
+    expect(block).toContain('Current: Bash npm test');
+
+    reasonerPi.releaseRun();
+    await waitUntil(() => !facade.isPrompting);
+    // After the run: idle state with the last user-facing output on offer.
+    const after = talkerHeadline(talkerLoop)!;
+    expect(after).toContain('state="idle"');
+    expect(after).toContain('Last update');
+  });
+
+  it('shows delegations under their friendly alias', async () => {
+    const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+    talkerPi.hold = true;
+    const turn = facade.prompt('please scan the repo');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+    const spawn = getPiTool(talkerPi, 'spawn_task');
+    await spawn.execute('c1', { instructions: 'scan the repo' });
+    talkerPi.releaseRun();
+    await turn;
+
+    const block = talkerHeadline(talkerLoop)!;
+    expect(block).toContain('alias="task-1"');
+    expect(block).toContain('scan the repo');
+  });
+});

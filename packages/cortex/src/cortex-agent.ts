@@ -85,6 +85,7 @@ import { DuplexRouter } from './duplex/router.js';
 import type { DuplexRouterOptions, DuplexRouterPorts } from './duplex/router.js';
 import { collectCauseTags, latestCauseSeq } from './duplex/cause-tags.js';
 import { FanOutContextManager } from './duplex/fanout-context-manager.js';
+import { DuplexHeadlines } from './duplex/headlines.js';
 import type { CauseTag } from './duplex/cause-tags.js';
 import { buildControlTools, isControlToolName } from './duplex/control-tools.js';
 import { buildDeliverTool, buildSteerSubAgentTool } from './duplex/reasoner-tools.js';
@@ -368,6 +369,39 @@ function staggerBelow(reasonerThreshold: number): number {
 
 /** Suffix appended to the consumer session id for the talker's cache key. */
 const TALKER_SESSION_ID_SUFFIX = ':talker';
+
+/**
+ * Hard token cap on the talker's headline block (log-and-context.md):
+ * injected user-role content is never trimmed by microcompaction, so an
+ * unbounded block would inflate utilization and trigger early source
+ * compaction without itself shrinking. Enforced with truncation by the
+ * loop's headline provider machinery.
+ */
+export const TALKER_HEADLINE_MAX_TOKENS = 1_500;
+
+/**
+ * Identifying detail for the headline's "Current:" line, mirroring the
+ * loop's own log-line summarization: paths, commands, and patterns without
+ * content or results. Escaping happens inside the headline builder.
+ */
+function summarizeHeadlineArgs(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+): string | null {
+  if (!args) return null;
+  const str = (value: unknown): string | null => (typeof value === 'string' ? value : null);
+  switch (toolName) {
+    case 'Bash': return str(args['command'])?.slice(0, 120) ?? null;
+    case 'Read':
+    case 'Write':
+    case 'Edit':
+    case 'UndoEdit': return str(args['file_path']);
+    case 'Glob':
+    case 'Grep': return str(args['pattern']);
+    case 'WebFetch': return str(args['url']);
+    default: return null;
+  }
+}
 
 function appendRolePrompt(basePrompt: string | undefined, rolePrompt: string): string | undefined {
   // An absent or blank base prompt stays absent so the facade's
@@ -970,6 +1004,7 @@ export class CortexAgent {
 
   // Duplex machinery (null in passthrough).
   private router: DuplexRouter | null = null;
+  private headlines: DuplexHeadlines | null = null;
   private mergedBridge: EventBridge | null = null;
   private aggregateGuard: BudgetGuard | null = null;
   private aggregateBreachLogged = false;
@@ -1193,18 +1228,57 @@ export class CortexAgent {
     // repeated failed carrying runs; those drops must reach the log.
     this.wireDeadLetterProducer(talker);
 
+    // The facade-fed headline block (communication.md): live status per
+    // loop and running sub-agent, view-injected into the talker every turn
+    // outside BP3, hard token cap with truncation, all interpolated values
+    // escaped. Facade state, never log entries.
+    const headlines = new DuplexHeadlines({
+      reasonerRunning: () => this.reasoner.isPrompting,
+      reasonerUsage: () => this.reasoner.getSessionUsage(),
+      activeSubAgents: () => this.reasoner.getActiveSubAgents(),
+      delegations: () => router.getDelegations(),
+      pendingAsks: () => this.reasoner.getPendingAsks(),
+    });
+    this.headlines = headlines;
+    talker.setHeadlineProvider(() => headlines.build(), {
+      maxTokens: TALKER_HEADLINE_MAX_TOKENS,
+    });
+
     // Run tracking: implicit deliveries, the liveness watchdog, the
-    // per-turn dispatch cap, and the stop-reason audit.
+    // per-turn dispatch cap, the stop-reason audit, and the headline feed.
     const reasonerBridge = this.reasoner.getEventBridge();
     reasonerBridge.on('loop_start', (event) => {
       if (event.childTaskId) return;
       this.reasonerDeliverCalledThisRun = false;
       router.noteReasonerRunStart();
+      headlines.noteRunStart();
     });
     reasonerBridge.on('loop_end', (event) => {
       if (event.childTaskId) return;
       this.handleReasonerRunEnd(event);
+      headlines.noteRunEnd();
       this.scheduleIdleDigestion();
+    });
+    // Headline activity feed: the reasoner's own tool calls and last
+    // user-facing output. Child tool activity reaches the block through
+    // getActiveSubAgents() (the sub-agent manager tracks it), so only
+    // main-loop events feed here.
+    reasonerBridge.on('tool_call_start', (event) => {
+      if (event.childTaskId) return;
+      const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
+      if (!payload?.toolName) return;
+      headlines.noteToolStart(payload.toolName, summarizeHeadlineArgs(payload.toolName, payload.args));
+    });
+    reasonerBridge.on('tool_call_end', (event) => {
+      if (event.childTaskId) return;
+      headlines.noteToolEnd();
+    });
+    reasonerBridge.on('turn_end', (event) => {
+      if (event.childTaskId) return;
+      const userFacing = event.textOutput?.userFacing;
+      if (userFacing && userFacing.trim().length > 0) {
+        headlines.noteOutput(userFacing);
+      }
     });
     const talkerBridge = talker.getEventBridge();
     talkerBridge.on('turn_end', (event) => {
