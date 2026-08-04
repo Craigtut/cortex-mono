@@ -622,6 +622,43 @@ describe('CortexAgent.onStateChanged', () => {
     expect(snapshots[0]!.log.map((e) => e.type)).toEqual(['utterance', 'reply']);
   });
 
+  it('routes a snapshot failure to the logger, never an unhandled rejection', async () => {
+    const errors: string[] = [];
+    const { facade } = createFacade({
+      stateChangeDebounceMs: 5,
+      logger: {
+        debug: () => {},
+        info: () => {},
+        warn: () => {},
+        error: (message) => {
+          errors.push(message);
+        },
+      },
+    });
+    // Simulates 2b, where the talker side holds a live loop's history: one
+    // non-cloneable value makes getState() reject inside the debounce
+    // timer, where nothing awaits it.
+    (facade as unknown as { retainedTalkerHistory: unknown[] }).retainedTalkerHistory = [
+      { role: 'user', content: 'x', callback: () => {} },
+    ];
+
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on('unhandledRejection', onRejection);
+    try {
+      facade.onStateChanged(() => {});
+      await facade.prompt('trigger a snapshot');
+      await waitUntil(() => errors.length > 0 || rejections.length > 0);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+
+    expect(rejections).toEqual([]);
+    expect(errors.some((m) => m.includes('onStateChanged snapshot failed'))).toBe(true);
+  });
+
   it('stops firing after destroy', async () => {
     const { facade } = createFacade({ stateChangeDebounceMs: 5 });
     const snapshots: CortexAgentStateV2[] = [];

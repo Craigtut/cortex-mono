@@ -1289,7 +1289,15 @@ export class CortexAgent {
     if (this.isReasonerShuttingDown()) return;
     this.stateTimer = setTimeout(() => {
       this.stateTimer = null;
-      void this.emitStateChanged();
+      // No awaiter exists here: a getState() rejection escaping this timer
+      // would be an unhandled rejection and, under Node's default
+      // --unhandled-rejections=throw, kill the host process from a
+      // debounce timer. Route it to the consumer's logger instead.
+      this.emitStateChanged().catch((err: unknown) => {
+        this.logger.error('onStateChanged snapshot failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }, this.stateDebounceMs);
   }
 
