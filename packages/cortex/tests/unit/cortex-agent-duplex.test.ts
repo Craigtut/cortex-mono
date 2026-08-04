@@ -1352,3 +1352,58 @@ describe('duplex slot fan-out (D6)', () => {
     expect(facade.getContextManager().getEphemeral()).toBe('for this call only');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Destroyed-content recording (abort/restore drops reach the log)
+// ---------------------------------------------------------------------------
+
+describe('duplex destroyed-content recording', () => {
+  it('facade abort records the queued content it drops as a lifecycle entry', async () => {
+    const { facade, talkerPi } = createDuplexFacade();
+    // Hold a talker run so the barge-in parks instead of prompting.
+    talkerPi.hold = true;
+    const first = facade.prompt('first');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+    const parked = facade.prompt('a barge-in that will be aborted');
+
+    await facade.abort('conversation');
+    talkerPi.releaseRun();
+    await Promise.allSettled([first, parked]);
+
+    const entry = facade.getLog().find((item) =>
+      item.type === 'lifecycle' &&
+      (item.data as { event?: string } | undefined)?.event === 'queued_content_dropped');
+    expect(entry).toBeDefined();
+    expect(entry!.loopPath).toBe('talker');
+    expect((entry!.data as { reason?: string }).reason).toBe('abort');
+    expect((entry!.data as { items?: string[] }).items).toContain('a barge-in that will be aborted');
+  });
+
+  it('a dead-lettered wake delivery carries its FULL content in the log entry', async () => {
+    const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+    const longUtterance = `please remember all of this: ${'x'.repeat(600)}`;
+    talkerPi.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      talkerPi.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? [...input]
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      talkerPi.state.messages.push(...messages);
+      throw new Error('provider down');
+    };
+    const drain = (talkerLoop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    const turn = facade.prompt(longUtterance);
+    await drain;
+
+    await waitUntil(() => facade.getLog().some((entry) =>
+      (entry.data as { kind?: string } | undefined)?.kind === 'wake_delivery'));
+    const entry = facade.getLog().find((item) =>
+      (item.data as { kind?: string } | undefined)?.kind === 'wake_delivery')!;
+    // The full destroyed content, not a 300-char preview: the log is the
+    // durable record, and the in-memory dead-letter store dies with the
+    // process.
+    expect((entry.data as { message?: string }).message).toBe(longUtterance);
+    await turn.catch(() => {});
+  });
+});

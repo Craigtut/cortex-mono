@@ -1573,7 +1573,9 @@ export class CortexAgent {
         type: 'lifecycle',
         loopPath: loop.loopPath,
         content: result.kind === 'wake_delivery'
-          ? `Wake delivery dropped after ${result.attempts} failed carrying runs`
+          ? (result.attempts > 0
+              ? `Wake delivery dropped after ${result.attempts} failed carrying runs`
+              : `Wake delivery dropped: ${result.lastError}`)
           : `Background ${result.kind} ${result.taskId} delivery dead-lettered after ${result.attempts} attempts`,
         data: {
           event: 'delivery_dead_lettered',
@@ -1581,18 +1583,37 @@ export class CortexAgent {
           taskId: result.taskId,
           attempts: result.attempts,
           lastError: result.lastError,
-          // A bounded preview of what vanished, so the log entry is
-          // diagnosable on its own; the full content stays in the loop's
-          // dead-letter store.
-          ...(result.kind === 'wake_delivery'
-            ? {
-                message: result.message.length > 300
-                  ? `${result.message.slice(0, 300)}…`
-                  : result.message,
-              }
-            : {}),
+          // The FULL destroyed content, not a preview: in duplex the router
+          // owns delivery and the session log is the durable record of
+          // undelivered content, so a truncated copy here would make the
+          // in-memory dead-letter store (which does not survive the
+          // process) the only complete record.
+          ...(result.kind === 'wake_delivery' ? { message: result.message } : {}),
         },
       });
+    });
+  }
+
+  /**
+   * Record loop-queued content (silent deliveries, parked wake content, in
+   * queue order as clearAllQueues returns it) destroyed by a facade abort
+   * or restore. Without this the dropped content is unrecoverable AND
+   * unrecorded: clearAllQueues returns it for re-routing and the facade is
+   * the only caller in a position to preserve it (the loop-level abort
+   * dead-letter path never sees content the facade already cleared).
+   */
+  private recordDroppedQueueContent(
+    loop: AgentLoop,
+    reason: 'abort' | 'restore',
+    dropped: string[],
+  ): void {
+    if (dropped.length === 0) return;
+    this.appendEntry({
+      type: 'lifecycle',
+      loopPath: loop.loopPath,
+      content: `${dropped.length} queued item(s) dropped by ${reason}`,
+      data: { event: 'queued_content_dropped', reason, items: dropped },
+      causedBy: null,
     });
   }
 
@@ -1956,7 +1977,7 @@ export class CortexAgent {
       const work: Array<Promise<unknown>> = [];
       if (scope === 'conversation' || scope === 'all') {
         this.router!.dropPendingDeliveries();
-        this.talker!.clearAllQueues();
+        this.recordDroppedQueueContent(this.talker!, 'abort', this.talker!.clearAllQueues());
         work.push(this.talker!.abort());
       }
       if (scope === 'work' || scope === 'all') {
@@ -1966,7 +1987,7 @@ export class CortexAgent {
         // every scope. Without this a completed-but-undelivered when_idle
         // result from the stopped work would degrade and still be voiced.
         this.router!.dropPendingDeliveries();
-        this.reasoner.clearAllQueues();
+        this.recordDroppedQueueContent(this.reasoner, 'abort', this.reasoner.clearAllQueues());
         work.push(this.reasoner.abort());
         for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
           work.push(this.reasoner.cancelSubAgent(taskId));
@@ -1978,7 +1999,7 @@ export class CortexAgent {
 
     // Dropped queued content: silent deliveries, parked wake deliveries
     // (abort() drops those itself too), and pi's steering/follow-up queues.
-    this.reasoner.clearAllQueues();
+    this.recordDroppedQueueContent(this.reasoner, 'abort', this.reasoner.clearAllQueues());
 
     const work: Array<Promise<unknown>> = [this.reasoner.abort()];
     if (scope !== 'conversation') {
@@ -2183,8 +2204,12 @@ export class CortexAgent {
     // Pre-restore queued content belongs to the replaced session: left in
     // place, queued silent deliveries would flush into the first
     // post-restore prompt (and stale steer/follow-up content into its run).
-    this.reasoner.clearAllQueues();
-    this.talker?.clearAllQueues();
+    // What gets destroyed is recorded in the restored log, which is the
+    // durable record of undelivered content from here on.
+    this.recordDroppedQueueContent(this.reasoner, 'restore', this.reasoner.clearAllQueues());
+    if (this.talker) {
+      this.recordDroppedQueueContent(this.talker, 'restore', this.talker.clearAllQueues());
+    }
     // Router state (delegations, deltas, held deliveries, dedup) describes
     // the replaced session too.
     this.router?.resetForRestore();

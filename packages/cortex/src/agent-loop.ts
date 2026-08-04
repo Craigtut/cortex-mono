@@ -2104,11 +2104,16 @@ export class AgentLoop {
     const deliverable = abortInFlight
       ? []
       : taken.filter((item) => (item.abortEpoch ?? this._abortEpoch) === this._abortEpoch);
-    const dropped = taken.length - deliverable.length;
-    if (dropped > 0) {
+    const dropped = taken.filter((item) => !deliverable.includes(item));
+    if (dropped.length > 0) {
       this.logger.info('dropped wake deliveries parked during abort', {
-        count: dropped,
+        count: dropped.length,
       });
+      // Content destroyed here (parked during an abort window, or stamped
+      // with a previous abort epoch) is durably recorded, not just counted:
+      // the dead-letter surface is what turns the drop into a session-log
+      // lifecycle entry.
+      this.deadLetterWakeDeliveries(dropped, 'cancelled by abort (parked during the abort window)');
     }
     return deliverable;
   }
@@ -2212,11 +2217,14 @@ export class AgentLoop {
       }
       // Content is back out of the transcript. An abort cancels parked
       // deliveries exactly like it cancels the turn that carried them;
-      // re-parking would resurrect a run the user just stopped.
+      // re-parking would resurrect a run the user just stopped. The
+      // cancellation is dead-lettered like every other destruction of
+      // parked content, so the drop reaches the session log.
       if (classifyError(error, { wasAborted: this.isAborted() }).category === 'cancelled') {
         this.logger.info('wake delivery run aborted; parked content cancelled', {
           count: pending.length,
         });
+        this.deadLetterWakeDeliveries(pending, 'cancelled by abort (carrying run aborted)');
         return;
       }
       // Otherwise re-park for another sweep attempt, dropping items whose
@@ -4079,11 +4087,15 @@ export class AgentLoop {
     // Parked wake deliveries are cancelled with the turn: left parked, a
     // queued sweep would start a full model run for them AFTER the user
     // stopped the agent, and the gate wait below would block on that run.
+    // The cancellation dead-letters so the destroyed content is durably
+    // recorded (the session log is the record of undelivered content), not
+    // just counted in a log line.
     const droppedWake = this.pendingWakeDeliveries.splice(0);
     if (droppedWake.length > 0) {
       this.logger.info('abort dropped parked wake deliveries', {
         count: droppedWake.length,
       });
+      this.deadLetterWakeDeliveries(droppedWake, 'cancelled by abort');
     }
     // A delivery can also park DURING the await windows below; it is
     // cancelled the same way. The live controller cannot express that (a

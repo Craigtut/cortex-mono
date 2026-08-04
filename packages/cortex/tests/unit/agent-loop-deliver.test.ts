@@ -1172,3 +1172,158 @@ describe('AgentLoop follow-up and queue surfaces', () => {
     expect(piAgent.clearFollowUpQueueCalls).toBe(0);
   });
 });
+
+describe('AgentLoop abort-cancelled wake deliveries are dead-lettered', () => {
+  // An abort deliberately destroys parked wake content. The destruction
+  // must reach the dead-letter surface (and through it the facade's
+  // session log): in duplex the router owns delivery and the log is the
+  // durable record of undelivered content, so a bare log line would leave
+  // an utterance with no reply and nothing saying why.
+
+  it('abort() dead-letters the parked deliveries it drops at entry', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const deadLettered = vi.fn();
+    loop.onBackgroundResultDeadLettered(deadLettered);
+
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    loop.deliver('cancelled with the turn');
+    expect(loop.pendingWakeDeliveryCount).toBe(1);
+
+    await loop.abort();
+    await turn.catch(() => {});
+    await waitUntil(() => !loop.isLoopActive);
+
+    expect(deadLettered).toHaveBeenCalledTimes(1);
+    const entry = deadLettered.mock.calls[0]![0] as {
+      kind: string; attempts: number; lastError: string; message: string;
+    };
+    expect(entry.kind).toBe('wake_delivery');
+    expect(entry.lastError).toContain('cancelled by abort');
+    expect(entry.message).toBe('cancelled with the turn');
+    expect(
+      loop.getDeadLetteredBackgroundResults().some(
+        (result) => result.message === 'cancelled with the turn',
+      ),
+    ).toBe(true);
+  });
+
+  it('the epoch gate dead-letters deliveries parked during the abort window', async () => {
+    // Same shape as the SF-D window test above: with a background
+    // completion pending, abort() skips the gate wait, and a delivery that
+    // parks during abort's await windows is dropped by the epoch gate at
+    // the next take of the parked queue.
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const deadLettered = vi.fn();
+    loop.onBackgroundResultDeadLettered(deadLettered);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    let rejectRun: ((err: Error) => void) | null = null;
+    let firstCall = true;
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      if (firstCall) {
+        firstCall = false;
+        await new Promise<never>((_resolve, reject) => {
+          rejectRun = reject;
+        });
+      }
+      piAgent.state.messages.push({ role: 'assistant', content: 'ok', timestamp: Date.now() });
+      return { content: 'ok' };
+    };
+    piAgent.abort = (): void => {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      rejectRun?.(err);
+      rejectRun = null;
+    };
+
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    void (loop as unknown as {
+      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
+    }).deliverOrQueueBackgroundCompletion({
+      kind: 'subagent',
+      taskId: 'task-mid-abort',
+      result: {
+        output: 'done',
+        status: 'completed',
+        usage: { turns: 1, cost: 0, durationMs: 5, contextTokens: 10 },
+      },
+    });
+
+    const abortPromise = loop.abort();
+    const result = loop.deliver('parked mid-abort');
+    expect(result.outcome).toBe('parked');
+
+    await abortPromise;
+    await turn.catch(() => {});
+    await waitUntil(() => deadLettered.mock.calls.some((call) =>
+      (call[0] as { message: string }).message === 'parked mid-abort'));
+    const entry = deadLettered.mock.calls
+      .map((call) => call[0] as { kind: string; lastError: string; message: string })
+      .find((candidate) => candidate.message === 'parked mid-abort')!;
+    expect(entry.kind).toBe('wake_delivery');
+    expect(entry.lastError).toContain('abort window');
+  });
+
+  it('an abort during a swept run dead-letters the cancelled content', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    loop.onError(() => {});
+    const deadLettered = vi.fn();
+    loop.onBackgroundResultDeadLettered(deadLettered);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+
+    let rejectRun: ((err: Error) => void) | null = null;
+    let first = true;
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      if (first) {
+        first = false;
+        await new Promise<never>((_resolve, reject) => {
+          rejectRun = reject;
+        });
+      }
+      piAgent.state.messages.push({ role: 'assistant', content: 'ok', timestamp: Date.now() });
+      return { content: 'ok' };
+    };
+    piAgent.abort = (): void => {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      rejectRun?.(err);
+      rejectRun = null;
+    };
+
+    const drain = (loop as unknown as {
+      schedulePendingResultDelivery: () => Promise<void>;
+    }).schedulePendingResultDelivery();
+    loop.deliver('swept then aborted');
+    await drain;
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    await loop.abort();
+    await waitUntil(() => !loop.isLoopActive);
+
+    await waitUntil(() => deadLettered.mock.calls.length === 1);
+    const entry = deadLettered.mock.calls[0]![0] as {
+      kind: string; lastError: string; message: string;
+    };
+    expect(entry.kind).toBe('wake_delivery');
+    expect(entry.lastError).toContain('carrying run aborted');
+    expect(entry.message).toBe('swept then aborted');
+  });
+});
