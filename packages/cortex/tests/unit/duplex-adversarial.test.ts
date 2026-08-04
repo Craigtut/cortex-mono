@@ -78,6 +78,15 @@ function brokeredScenario(
   return h;
 }
 
+/** A sub-agent result that settles after its task was cancelled. */
+function lateSubAgentResult(): SubAgentResult {
+  return {
+    output: 'here are the numbers you asked for',
+    status: 'completed',
+    usage: { turns: 1, cost: 0, durationMs: 1, contextTokens: 0 },
+  };
+}
+
 function askIds(h: DuplexScenarioHarness): string[] {
   return entriesOfType(h.facade, 'ask')
     .map((entry) => String((entry.data as { askId: string }).askId));
@@ -536,8 +545,10 @@ describe('adversarial: races around cancel, abort, and barge-in', () => {
   /**
    * Pins: the cancelled-task discard in the background completion path. It is
    * a PAIR of isCancelled() checks, one at enqueue and one in the drain (a
-   * cancel can land between delivery attempts), and the test only fails when
-   * both are removed: defense in depth, verified as such.
+   * cancel can land between delivery attempts). In the common shape below
+   * either check alone suffices, so this test passes with one of them
+   * removed; the two that follow separate them, so a single-site regression
+   * is visible.
    */
   it('a result that lands after its cancel is discarded, not delivered', async () => {
     const h = createDuplexScenario();
@@ -570,6 +581,100 @@ describe('adversarial: races around cancel, abort, and barge-in', () => {
     expect(h.reasonerLoop.getDeadLetteredBackgroundResults()).toHaveLength(0);
     expect(JSON.stringify(h.talkerPi.state.messages))
       .not.toContain('here are the numbers you asked for');
+  });
+
+  /**
+   * Pins the ENQUEUE-side check alone. It sits ahead of the shutdown gate on
+   * purpose: work discarded deliberately is not dead-letter material, even
+   * when the discard happens mid-teardown. Remove that check and the drain
+   * one still stops delivery, but the item takes the shutdown branch on the
+   * way past and is recorded as lost work, which is a false report about a
+   * result nobody wanted. Verified failing with the enqueue check removed.
+   */
+  it('a cancelled result arriving during teardown is discarded, not dead-lettered', async () => {
+    const h = createDuplexScenario();
+    const spawned = stubChildAgents(h.reasonerLoop, (pi) => { pi.hold = true; });
+    const { taskId } = await h.reasonerLoop.spawnBackgroundSubAgent({
+      instructions: 'crunch the numbers',
+    });
+    await waitUntil(() => spawned.children.length === 1, 2000, 'child running');
+    expect(await h.reasonerLoop.cancelSubAgent(taskId)).toBe(true);
+
+    // Teardown starts, and the cancelled child's completion path settles
+    // inside the teardown window (destroy() marks the loop shutting down
+    // synchronously, before its first await).
+    const teardown = h.reasonerLoop.destroy();
+    await (h.reasonerLoop as unknown as {
+      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
+    }).deliverOrQueueBackgroundCompletion({
+      kind: 'subagent',
+      taskId,
+      result: lateSubAgentResult(),
+    });
+    await teardown;
+
+    // The dead-letter list survives destroy() by design, so an entry here
+    // would be a permanent record of work "lost" that was cancelled.
+    expect(h.reasonerLoop.getDeadLetteredBackgroundResults()).toHaveLength(0);
+    expect(lifecycleEvents(h.facade, 'delivery_dead_lettered')).toHaveLength(0);
+  });
+
+  /**
+   * Pins the DRAIN-side check alone.
+   *
+   * A cancel while the item merely SITS in the queue is caught by
+   * cancelSubAgent's own purge, so that shape proves nothing about the
+   * drain. The window the drain check exists for is narrower: the drain has
+   * already spliced the item out of the queue (the purge now finds nothing),
+   * the delivery attempt fails and re-queues it, and the cancel landed in
+   * between. Only the drain filter stands between the discarded work and the
+   * reasoner's context on the retry.
+   *
+   * Verified failing with the drain check removed, which re-attempts and
+   * delivers the cancelled result into a fresh run.
+   */
+  it('a cancel during a failed delivery attempt still discards the re-queued result', async () => {
+    const h = createDuplexScenario();
+    const spawned = stubChildAgents(h.reasonerLoop, (pi) => { pi.hold = true; });
+    h.reasonerPi.defaultText = '';
+    const { taskId } = await h.reasonerLoop.spawnBackgroundSubAgent({
+      instructions: 'crunch the numbers',
+    });
+    await waitUntil(() => spawned.children.length === 1, 2000, 'child running');
+
+    // The first delivery attempt is held open, then fails. The error class
+    // matters: a retryable one takes the in-run ladder and a fatal one
+    // dead-letters on the spot, so neither reaches the re-queue path this
+    // test is about.
+    h.reasonerPi.hold = true;
+    h.reasonerPi.failWith = new Error('provider returned a malformed response body');
+    const runsBefore = h.reasonerPi.promptCalls.length;
+    void (h.reasonerLoop as unknown as {
+      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
+    }).deliverOrQueueBackgroundCompletion({
+      kind: 'subagent',
+      taskId,
+      result: lateSubAgentResult(),
+    });
+    await waitUntil(
+      () => h.reasonerPi.promptCalls.length === runsBefore + 1,
+      2000, 'delivery attempt in flight',
+    );
+
+    // The cancel lands while the item is in flight inside the drain: the
+    // pending queue is empty, so the purge is a no-op here.
+    expect(await h.reasonerLoop.cancelSubAgent(taskId)).toBe(true);
+    h.reasonerPi.releaseRun();
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'drain finished');
+    await settle();
+
+    // The re-queued item was dropped instead of re-attempted: no second run
+    // carrying it, nothing of it left in the transcript, nothing recorded
+    // as lost work.
+    expect(h.reasonerPi.promptCalls).toHaveLength(runsBefore + 1);
+    expect(JSON.stringify(h.reasonerPi.state.messages))
+      .not.toContain('here are the numbers you asked for');
+    expect(h.reasonerLoop.getDeadLetteredBackgroundResults()).toHaveLength(0);
   });
 
   /**
