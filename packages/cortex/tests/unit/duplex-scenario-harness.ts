@@ -559,6 +559,99 @@ export function createDuplexScenario(
   return { facade, talkerLoop, reasonerLoop, talkerPi, reasonerPi };
 }
 
+/**
+ * A duplex facade assembled by the REAL {@link CortexAgent.create}, with one
+ * substitution: the pi agent each loop wraps. Everything create() itself does
+ * runs for real (permission brokering, the MCP multiplexer, the talker and
+ * reasoner config builders, wireDuplex), so an assembled property that is
+ * merely computed and never applied fails here rather than passing on the
+ * strength of a config-builder unit test.
+ *
+ * The hooks installed on each scripted pi are built from the config create()
+ * assembled for THAT loop, not from a fresh minimal one, so the brokered
+ * resolver a reasoner tool call hits is the one create() wired.
+ *
+ * What the substitution still leaves out: pi-agent-core's own Agent (turn
+ * construction, streaming, real tool dispatch) and every provider call.
+ */
+export interface RealDuplexScenarioHarness extends DuplexScenarioHarness {
+  /** Every loop config create() assembled, in construction order. */
+  loopConfigs: AgentLoopConfig[];
+  /** Loops built through create(), by loopPath ('talker', 'reasoner', ...). */
+  builtLoops: Map<string, { loop: AgentLoop; pi: ScriptedPiAgent }>;
+}
+
+export async function createRealDuplexScenario(
+  config: Partial<CortexAgentConfig> = {},
+): Promise<RealDuplexScenarioHarness> {
+  const statics = AgentLoop as unknown as {
+    buildPiAgentConfig: (params: {
+      cortexConfig: AgentLoopConfig;
+      cacheBreakpointState: { agentLoop: AgentLoop | null };
+    }) => Record<string, unknown>;
+    wireManagedPiAgent: (loop: AgentLoop, pi: PiAgent) => void;
+  };
+  const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+  const loopConfigs: AgentLoopConfig[] = [];
+  const builtLoops = new Map<string, { loop: AgentLoop; pi: ScriptedPiAgent }>();
+
+  vi.spyOn(AgentLoop, 'create').mockImplementation(async (loopConfig) => {
+    const pi = createScriptedPiAgent();
+    const extras = loopConfig as {
+      tools?: unknown[];
+      enableSubAgentTool?: boolean;
+      enableLoadSkillTool?: boolean;
+    };
+    const loop = new AgentLoopCtor(pi, loopConfig, extras.tools ?? [], {
+      enableSubAgentTool: extras.enableSubAgentTool ?? true,
+      enableLoadSkillTool: extras.enableLoadSkillTool ?? true,
+    });
+    // The real hooks, from the real assembled config: afterToolCall carries
+    // the D17 terminate guards, beforeToolCall carries ask identity and
+    // whatever resolver create() decided this loop should have.
+    const agentConfig = statics.buildPiAgentConfig({
+      cortexConfig: loopConfig,
+      cacheBreakpointState: { agentLoop: loop },
+    });
+    pi.afterToolCall = agentConfig['afterToolCall'] as AfterToolCallHook;
+    pi.beforeToolCall = agentConfig['beforeToolCall'] as BeforeToolCallHook | undefined;
+    statics.wireManagedPiAgent(loop, pi);
+    loopConfigs.push(loopConfig);
+    builtLoops.set(loopConfig.loopPath ?? 'main', { loop, pi });
+    return loop;
+  });
+
+  const facade = await CortexAgent.create({
+    model: testModel(),
+    workingDirectory: '/tmp/test-workspace',
+    initialBasePrompt: 'Test base prompt',
+    ...config,
+    mode: 'duplex',
+    duplex: {
+      minDeliverySpacingMs: 0,
+      idlePollMs: 5,
+      whenIdleDegradeMs: 60_000,
+      watchdogIntervalMs: 3_600_000,
+      idleDigestionDelayMs: 3_600_000,
+      ...config.duplex,
+    },
+  });
+  liveFacades.push(facade);
+
+  const talker = builtLoops.get('talker');
+  const reasoner = builtLoops.get('reasoner');
+  if (!talker || !reasoner) throw new Error('create() did not build both resident loops');
+  return {
+    facade,
+    talkerLoop: talker.loop,
+    talkerPi: talker.pi,
+    reasonerLoop: reasoner.loop,
+    reasonerPi: reasoner.pi,
+    loopConfigs,
+    builtLoops,
+  };
+}
+
 /** The same shape in passthrough: one loop, no talker, no control tools. */
 export function createPassthroughScenario(
   overrides?: Partial<CortexAgentConfig>,
