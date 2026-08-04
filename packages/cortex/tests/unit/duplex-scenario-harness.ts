@@ -19,6 +19,7 @@
  * and the transcript shape nothing exercised before Phase 3.
  */
 
+import { vi } from 'vitest';
 import { AgentLoop } from '../../src/agent-loop.js';
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
@@ -28,6 +29,8 @@ import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 import { CortexAgent } from '../../src/cortex-agent.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
+import type { PermissionBroker } from '../../src/duplex/permission-broker.js';
+import type { SessionLogEntry } from '../../src/session-log.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 
 // ---------------------------------------------------------------------------
@@ -67,8 +70,16 @@ export interface ScriptedPiAgent extends PiAgent {
   modelCalls: number;
   /** The real Cortex afterToolCall hook, installed by the harness. */
   afterToolCall?: AfterToolCallHook;
+  /**
+   * The real Cortex beforeToolCall hook (the permission gate), installed by
+   * {@link installPermissionGate}. Consulted before every tool execution,
+   * exactly where pi consults it.
+   */
+  beforeToolCall?: BeforeToolCallHook;
   /** Fail the next run with this error instead of producing a turn. */
   failWith: Error | null;
+  /** Abort signal of the live run, or null when idle. */
+  runSignal: AbortSignal | null;
 }
 
 export type AfterToolCallHook = (ctx: {
@@ -78,6 +89,11 @@ export type AfterToolCallHook = (ctx: {
   result: { content: unknown };
   isError: boolean;
 }) => Promise<{ content?: unknown; terminate?: boolean } | undefined>;
+
+export type BeforeToolCallHook = (
+  ctx: { toolCall: { name: string }; args: unknown },
+  signal?: AbortSignal,
+) => Promise<{ block?: boolean; reason?: string } | undefined>;
 
 /**
  * Bound on scripted turns per run, so a scenario that fails to terminate
@@ -110,6 +126,7 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
   let releaseRun: (() => void) | null = null;
   let rejectRun: ((err: Error) => void) | null = null;
   let idleResolve: (() => void) | null = null;
+  let abortController: AbortController | null = null;
   let running = false;
   let callCounter = 0;
 
@@ -124,6 +141,7 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
     toolResults: [],
     modelCalls: 0,
     failWith: null,
+    runSignal: null,
 
     subscribe(handler: (event: PiEvent) => void): () => void {
       eventHandler = handler;
@@ -137,6 +155,9 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
     async prompt(input: string | AgentMessage[]): Promise<unknown> {
       agent.promptCalls.push(input);
       running = true;
+      const controller = new AbortController();
+      abortController = controller;
+      agent.runSignal = controller.signal;
       try {
         agent.emitEvent({ type: 'agent_start' });
         const runMessages: AgentMessage[] = Array.isArray(input)
@@ -210,7 +231,20 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
             }>).find((candidate) => candidate.name === call.name);
             let raw: unknown;
             let isError = false;
-            if (!tool) {
+            // The permission gate runs exactly where pi runs it: before the
+            // tool, awaited, with the run's abort signal.
+            const gate = agent.beforeToolCall
+              ? await agent.beforeToolCall(
+                { toolCall: { name: call.name }, args: call.args ?? {} },
+                controller.signal,
+              )
+              : undefined;
+            if (gate?.block) {
+              raw = {
+                content: [{ type: 'text', text: gate.reason ?? 'Blocked by permission policy.' }],
+              };
+              isError = true;
+            } else if (!tool) {
               // Pi's own unknown-tool error result: no terminate, which is
               // exactly the shape that reopens the loop.
               raw = { content: [{ type: 'text', text: `Unknown tool: ${call.name}` }] };
@@ -266,6 +300,13 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
             toolResults: toolResultMessages,
           } as unknown as PiEvent);
 
+          // Pi checks the abort signal at the turn boundary, so a run
+          // unblocked by an abort-raced permission ask unwinds here.
+          if (controller.signal.aborted) {
+            const err = new Error('Request was aborted.');
+            err.name = 'AbortError';
+            throw err;
+          }
           if (calls.length === 0 || terminateBatch) break;
         }
 
@@ -274,6 +315,8 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
         return { content: lastText };
       } finally {
         running = false;
+        agent.runSignal = null;
+        abortController = null;
         idleResolve?.();
         idleResolve = null;
       }
@@ -290,6 +333,9 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
     },
 
     abort(): void {
+      // The signal first: a run blocked inside a permission ask is unblocked
+      // by the abort race, not by rejecting the hold.
+      abortController?.abort();
       if (rejectRun) {
         const err = new Error('Request was aborted.');
         err.name = 'AbortError';
@@ -375,6 +421,70 @@ export function realAfterToolCall(loop: AgentLoop): AfterToolCallHook {
     cacheBreakpointState: { agentLoop: loop },
   });
   return agentConfig['afterToolCall'] as AfterToolCallHook;
+}
+
+/**
+ * Install the REAL permission gate on a loop's scripted pi: the same
+ * beforeToolCall hook the loop's own construction builds, carrying ask
+ * identity, the pending-ask registry write, the verbatim rendered request,
+ * and the abort race. With it wired, a scripted tool call really blocks on a
+ * decision instead of the test simulating one.
+ */
+export function installPermissionGate(
+  loop: AgentLoop,
+  pi: ScriptedPiAgent,
+  resolvePermission: NonNullable<AgentLoopConfig['resolvePermission']>,
+): void {
+  const statics = AgentLoop as unknown as {
+    buildPiAgentConfig: (params: {
+      cortexConfig: AgentLoopConfig;
+      cacheBreakpointState: { agentLoop: AgentLoop | null };
+    }) => Record<string, unknown>;
+  };
+  const agentConfig = statics.buildPiAgentConfig({
+    cortexConfig: {
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      loopPath: loop.loopPath,
+      resolvePermission,
+    },
+    cacheBreakpointState: { agentLoop: loop },
+  });
+  pi.beforeToolCall = agentConfig['beforeToolCall'] as BeforeToolCallHook;
+}
+
+/**
+ * Build quick-lookup loops over scripted pi agents instead of real provider
+ * loops. Setup runs on each pi BEFORE its prompt, because the lookup answers
+ * in microtasks and configuring after a poll would race the whole run.
+ */
+export function stubLookupLoops(setup?: (pi: ScriptedPiAgent) => void): {
+  pis: ScriptedPiAgent[];
+  configs: AgentLoopConfig[];
+} {
+  const pis: ScriptedPiAgent[] = [];
+  const configs: AgentLoopConfig[] = [];
+  const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+  vi.spyOn(AgentLoop, 'create').mockImplementation(async (config) => {
+    const pi = createScriptedPiAgent();
+    setup?.(pi);
+    pis.push(pi);
+    configs.push(config);
+    return new AgentLoopCtor(pi, config, [], {
+      enableSubAgentTool: false,
+      enableLoadSkillTool: false,
+    });
+  });
+  return { pis, configs };
+}
+
+/** The headline block the talker is actually fed on its next call. */
+export function talkerHeadline(talkerLoop: AgentLoop): string | null {
+  const provider = (talkerLoop as unknown as {
+    headlineProvider: (() => string | null) | null;
+  }).headlineProvider;
+  if (typeof provider !== 'function') throw new Error('no headline provider wired');
+  return provider();
 }
 
 export interface DuplexScenarioHarness {
@@ -480,7 +590,10 @@ export function createPassthroughScenario(
  * provider is involved. Everything the parent touches (steering queue,
  * budget guard, event bridge, abort, destroy) is the real implementation.
  */
-export function stubChildAgents(parent: AgentLoop): {
+export function stubChildAgents(
+  parent: AgentLoop,
+  setup?: (pi: ScriptedPiAgent) => void,
+): {
   children: Array<{ loop: AgentLoop; pi: ScriptedPiAgent; instructions: string }>;
 } {
   const children: Array<{ loop: AgentLoop; pi: ScriptedPiAgent; instructions: string }> = [];
@@ -489,6 +602,7 @@ export function stubChildAgents(parent: AgentLoop): {
     createChildAgent: (params: { instructions: string; taskId: string }) => Promise<AgentLoop>;
   }).createChildAgent = async (params) => {
     const pi = createScriptedPiAgent();
+    setup?.(pi);
     const loop = new AgentLoopCtor(pi, {
       model: testModel(),
       workingDirectory: '/tmp/test-workspace',
@@ -547,4 +661,27 @@ export function promptTexts(pi: ScriptedPiAgent): string[] {
 
 export function roles(messages: AgentMessage[]): string[] {
   return messages.map((message) => String(message.role));
+}
+
+/** The duplex facade's consent boundary. */
+export function getBroker(facade: CortexAgent): PermissionBroker {
+  return (facade as unknown as {
+    router: { permissionBroker: PermissionBroker };
+  }).router.permissionBroker;
+}
+
+/** Log entries of one type, in seq order. */
+export function entriesOfType(
+  facade: CortexAgent,
+  type: SessionLogEntry['type'],
+): SessionLogEntry[] {
+  return facade.getLog().filter((entry) => entry.type === type);
+}
+
+/** Lifecycle entries carrying a given `data.event` tag. */
+export function lifecycleEvents(facade: CortexAgent, event: string): SessionLogEntry[] {
+  return facade.getLog().filter(
+    (entry) => entry.type === 'lifecycle' &&
+      (entry.data as { event?: string } | undefined)?.event === event,
+  );
 }
