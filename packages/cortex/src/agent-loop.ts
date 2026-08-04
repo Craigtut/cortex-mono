@@ -1053,6 +1053,7 @@ export class AgentLoop {
       maxCost?: number;
       scope?: BudgetScope;
       includeChildUsage?: boolean;
+      includeUtilityUsage?: boolean;
     } = {};
     if (config.budgetGuard?.maxTurns !== undefined) {
       budgetGuardConfig.maxTurns = config.budgetGuard.maxTurns;
@@ -1065,6 +1066,9 @@ export class AgentLoop {
     }
     if (config.budgetGuard?.includeChildUsage !== undefined) {
       budgetGuardConfig.includeChildUsage = config.budgetGuard.includeChildUsage;
+    }
+    if (config.budgetGuard?.includeUtilityUsage !== undefined) {
+      budgetGuardConfig.includeUtilityUsage = config.budgetGuard.includeUtilityUsage;
     }
     this.budgetGuard = new BudgetGuard(
       budgetGuardConfig,

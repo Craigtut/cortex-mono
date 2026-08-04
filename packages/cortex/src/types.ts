@@ -328,6 +328,12 @@ export interface AgentLoopConfig {
      * must cover a loop and everything it spawns sets this true.
      */
     includeChildUsage?: boolean;
+    /**
+     * Whether direct/utility completion spend (observer, reflector,
+     * summarization, WebFetch, Bash utility calls) counts against maxCost.
+     * Default false. See BudgetGuardConfig.includeUtilityUsage.
+     */
+    includeUtilityUsage?: boolean;
   };
 
   /**

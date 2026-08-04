@@ -44,7 +44,7 @@ function createMockPiAgent(): PiAgent {
   } as unknown as PiAgent;
 }
 
-function createLoop(): AgentLoop {
+function createLoop(configOverrides?: Partial<AgentLoopConfig>): AgentLoop {
   const Ctor = AgentLoop as unknown as TestAgentLoopConstructor;
   return new Ctor(
     createMockPiAgent(),
@@ -57,6 +57,7 @@ function createLoop(): AgentLoop {
       workingDirectory: '/tmp/test-workspace',
       initialBasePrompt: 'Test prompt',
       slots: [],
+      ...configOverrides,
     },
     [],
     { enableSubAgentTool: false, enableLoadSkillTool: false },
@@ -110,6 +111,34 @@ describe('utility usage accounting', () => {
     expect(usage.utility!['direct']?.calls).toBe(1);
     expect(usage.utility!['utility']?.calls).toBe(1);
     expect(usage.totalCost).toBeCloseTo(0.002);
+  });
+
+  it('threads budgetGuard.includeUtilityUsage into the loop guard (S7)', async () => {
+    mockComplete.mockResolvedValue(completionResult(0.25));
+    const loop = createLoop({
+      budgetGuard: { maxTurns: 100, maxCost: 10, includeUtilityUsage: true },
+    });
+
+    await loop.utilityComplete(
+      { systemPrompt: 's', messages: [{ role: 'user', content: 'x' }] },
+      { usageCategory: 'observer' },
+    );
+
+    // The declared config field reaches the guard: utility spend counts
+    // toward maxCost instead of being silently dropped.
+    expect(loop.getBudgetGuard().getTotalCost()).toBeCloseTo(0.25);
+  });
+
+  it('leaves utility spend out of the loop guard by default', async () => {
+    mockComplete.mockResolvedValue(completionResult(0.25));
+    const loop = createLoop({ budgetGuard: { maxTurns: 100, maxCost: 10 } });
+
+    await loop.utilityComplete(
+      { systemPrompt: 's', messages: [{ role: 'user', content: 'x' }] },
+      { usageCategory: 'observer' },
+    );
+
+    expect(loop.getBudgetGuard().getTotalCost()).toBe(0);
   });
 
   it('emits a utility_usage event with the category and typed usage', async () => {
