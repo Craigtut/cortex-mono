@@ -980,6 +980,28 @@ describe('duplex abort scopes', () => {
     await waitUntil(() => !facade.isRunning);
   });
 
+  it("abort('work') drops held deliveries from the stopped work (retained in the log, not voiced)", async () => {
+    const { facade, talkerPi, reasonerPi } = createDuplexFacade({
+      idleSignal: () => false,
+      duplex: { whenIdleDegradeMs: 3_600_000 },
+    });
+    reasonerPi.hold = true;
+    facade.deliver('long analysis', { target: 'work' });
+    await waitUntil(() => reasonerPi.promptCalls.length === 1);
+    const deliver = getPiTool(reasonerPi, 'Deliver');
+    await deliver.execute('c1', { content: 'held result of stopped work', wake: 'when_idle' });
+    expect(facade.workSettled).toBe(false);
+
+    await facade.abort('work');
+    // Retained in the log, never delivered: the held result belongs to the
+    // work the user just stopped.
+    expect(facade.getLog().some(
+      (entry) => entry.type === 'delivery' && entry.content === 'held result of stopped work',
+    )).toBe(true);
+    await waitUntil(() => facade.workSettled);
+    expect(talkerPi.promptCalls).toHaveLength(0);
+  });
+
   it("abort('work') cancels the reasoner and drops buffered deltas; the talker survives", async () => {
     const { facade, talkerPi, reasonerPi } = createDuplexFacade();
     facade.deliver('note for later', { target: 'work', wake: false });

@@ -1876,6 +1876,11 @@ export class CortexAgent {
       }
       if (scope === 'work' || scope === 'all') {
         this.router!.dropWorkContext();
+        // Held deliveries are results of the work being stopped: per the
+        // abort table they are retained in the log, not delivered, for
+        // every scope. Without this a completed-but-undelivered when_idle
+        // result from the stopped work would degrade and still be voiced.
+        this.router!.dropPendingDeliveries();
         this.reasoner.clearAllQueues();
         work.push(this.reasoner.abort());
         for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
