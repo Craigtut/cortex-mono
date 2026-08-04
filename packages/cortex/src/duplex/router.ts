@@ -287,8 +287,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * work twice, and a talker that had exhausted its caps would earn a
    * fresh budget inside the very turn that was capped. The rollover
    * happens when a talker run CONSUMES the utterance instead: its cause
-   * tag appears on the run and the next dispatch sees it
-   * ({@link maybeRolloverExchange}).
+   * tag appears on the run and the next dispatch, or the turn boundary at
+   * the latest, sees it ({@link maybeRolloverExchange}).
    *
    * Open question (review N1): the per-exchange cap refreshes only on a
    * consumed user utterance, so a long autonomous stretch (deliveries
@@ -329,8 +329,20 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     return composeDispatchMessage(this.consumeConversationBlock(), buildWorkInputDirective(content));
   }
 
-  /** A talker turn boundary: resets the per-turn dispatch cap. */
+  /**
+   * A talker turn boundary: resets the per-turn dispatch cap. The turn_end
+   * event fires while the run is still live and its cause tags readable
+   * (the stop-reason audit relies on the same property), so this is also
+   * where a consumed utterance rolls the exchange when the consuming run
+   * dispatched nothing: without it the tag set is gone when the run's
+   * cleanup clears it, and a later delivery-woken run that does dispatch
+   * would be refused against a budget the user's utterance should have
+   * refreshed. Ordering is idempotent: the rollover zeroes the turn state
+   * and clears the dedup map, then the turn-boundary bump advances the
+   * index off the fresh exchange's zero.
+   */
   noteTalkerTurnEnd(): void {
+    this.maybeRolloverExchange();
     this.dispatchesThisTurn = 0;
     this.dispatchTurnIndex += 1;
     this.refusalEntriesThisTurn = 0;
@@ -353,8 +365,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * Open a fresh exchange (caps, dedup, turn index) when the talker's live
    * run has consumed a user utterance newer than the one that opened the
    * current exchange. Keyed on CONSUMPTION (the utterance's cause tag
-   * arriving on the run), never on facade arrival; checked lazily at each
-   * dispatch, which is the only place exchange state matters. Only
+   * arriving on the run), never on facade arrival; checked at each dispatch
+   * and at each talker turn end, the last point the consuming run's tags
+   * are still readable when it dispatched nothing. Only
    * utterance-kind tags advance the watermark: a delivery- or
    * directive-caused run is not the user speaking and must not refresh
    * delegation budgets. The cause set carries no ordering guarantee, so

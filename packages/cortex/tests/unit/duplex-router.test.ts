@@ -545,6 +545,30 @@ describe('control-tool dispatch', () => {
     expect(h.reasonerDispatches).toHaveLength(2);
   });
 
+  it('a run that consumes an utterance but dispatches nothing still rolls the exchange', async () => {
+    const h = createHarness({ maxDispatchesPerTurn: 10, maxDispatchesPerExchange: 1 });
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: 1 }]);
+    h.router.noteUserUtterance('kick off');
+    await callTool(h, 'spawn_task', { instructions: 'thing one' });
+    h.router.noteTalkerTurnEnd();
+
+    // The user speaks again and the consuming run just acknowledges,
+    // calling no control tool. Its turn end fires while the utterance tag
+    // is still live on the run; that boundary is the only chance to
+    // observe the consumption before the run's cleanup clears the tags.
+    h.router.noteUserUtterance('now the next thing');
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: 5 }]);
+    h.router.noteTalkerTurnEnd();
+
+    // A later run woken by a reasoner delivery carries no utterance tag.
+    // Its dispatch must run against the budget the consumed utterance
+    // refreshed, not be refused as if the user never spoke.
+    h.setTalkerCauseTags([{ kind: 'delivery', seq: 9 }]);
+    const allowed = await callTool(h, 'spawn_task', { instructions: 'thing two' });
+    expect(allowed.content[0]!.text).toMatch(/^Started task-/);
+    expect(h.reasonerDispatches).toHaveLength(2);
+  });
+
   it('a delivery- or directive-caused run never refreshes the exchange budget (SF-3)', async () => {
     const h = createHarness({ maxDispatchesPerTurn: 10, maxDispatchesPerExchange: 1 });
     h.setTalkerCauseTags([{ kind: 'utterance', seq: 1 }]);
