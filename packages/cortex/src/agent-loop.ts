@@ -752,6 +752,8 @@ export class AgentLoop {
   // children's, so one query surfaces the whole subtree. Entries are removed
   // the moment an ask settles, however it settles.
   private readonly pendingAsks = new Map<string, PendingAsk>();
+  /** Resolvers blocked in waitForAskSettlement(), woken on any settlement. */
+  private askSettlementWaiters: Array<() => void> = [];
 
   // Consumer-fed headline block: rebuilt from the provider on every LLM
   // call, view-injected after the BP3 cache boundary (never in the cached
@@ -2281,6 +2283,27 @@ export class AgentLoop {
     return true;
   }
 
+  /**
+   * Resolve once the pending-ask set next shrinks: an ask settled (however
+   * it settled: answered, blocked, or aborted) or teardown cleared the
+   * registry. Resolves immediately when no ask is pending. This is the
+   * event-driven form settlement predicates wait on instead of polling
+   * getPendingAsks(), which can otherwise spin for as long as an ask
+   * outlives the work that raised it.
+   */
+  async waitForAskSettlement(): Promise<void> {
+    if (this.pendingAsks.size === 0) return;
+    return new Promise<void>((resolve) => {
+      this.askSettlementWaiters.push(resolve);
+    });
+  }
+
+  /** Wake everything blocked in {@link waitForAskSettlement}. */
+  private notifyAskSettlement(): void {
+    const waiters = this.askSettlementWaiters.splice(0);
+    for (const waiter of waiters) waiter();
+  }
+
   // -----------------------------------------------------------------------
   // Headline feed
   // -----------------------------------------------------------------------
@@ -2347,6 +2370,7 @@ export class AgentLoop {
   /** Remove an ask once its resolver call settles (any outcome). */
   private settlePendingAsk(askId: string): void {
     this.pendingAsks.delete(askId);
+    this.notifyAskSettlement();
   }
 
   /**
@@ -5673,6 +5697,7 @@ export class AgentLoop {
     // Any ask still pending at teardown settles as a block via the abort
     // race; the registry entries just have not been reaped yet.
     this.pendingAsks.clear();
+    this.notifyAskSettlement();
     // deadLetteredBackgroundResults is deliberately NOT cleared: it is the
     // consumer's bounded post-mortem record of undelivered completed work,
     // and getDeadLetteredBackgroundResults() must still answer after

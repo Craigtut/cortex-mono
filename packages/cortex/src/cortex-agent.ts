@@ -298,6 +298,7 @@ export const AGENT_LOOP_DELEGATION = {
   // reads; in duplex a single loop's gate is not "the agent is idle".
   isLoopActive: 'subsumed',
   waitForLoopIdle: 'subsumed',
+  waitForAskSettlement: 'subsumed',
   // Queues.
   setSteeringQueueMode: 'forwarded',
   setFollowUpQueueMode: 'forwarded',
@@ -1348,6 +1349,15 @@ export class CortexAgent {
           .filter((completion) => completion !== undefined);
         await Promise.all(completions);
         await yieldMacrotask();
+        continue;
+      }
+
+      // Pending asks block on the loop's settlement signal, never on a
+      // polling yield: an ask can outlive the child that raised it, and a
+      // setImmediate spin would otherwise run hot for as long as it stays
+      // unanswered.
+      if (this.reasoner.getPendingAsks().length > 0) {
+        await this.reasoner.waitForAskSettlement();
         continue;
       }
 

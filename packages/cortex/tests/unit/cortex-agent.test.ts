@@ -768,6 +768,48 @@ describe('CortexAgent settlement', () => {
     expect(facade.workSettled).toBe(true);
   });
 
+  it('waitForWorkSettled blocks on ask settlement without hot-polling', async () => {
+    const { facade, loop } = createFacade();
+    const registry = loop as unknown as {
+      registerPendingAsk(ask: {
+        askId: string;
+        loopPath: string;
+        toolName: string;
+        renderedRequest: string;
+        requestedAt: number;
+        voiced: boolean;
+      }): void;
+      settlePendingAsk(askId: string): void;
+    };
+    registry.registerPendingAsk({
+      askId: 'ask-outlives-child',
+      loopPath: 'main',
+      toolName: 'Bash',
+      renderedRequest: 'Bash: make deploy',
+      requestedAt: Date.now(),
+      voiced: false,
+    });
+    expect(facade.workSettled).toBe(false);
+
+    // Fixed observation window for a negative assertion: while the ask is
+    // pending the wait must neither resolve nor spin. A setImmediate poll
+    // re-evaluates the predicate hundreds of times in this window; the
+    // event-driven wait checks a handful of times then blocks.
+    const pendingAsksSpy = vi.spyOn(loop, 'getPendingAsks');
+    let settled = false;
+    const wait = facade.waitForWorkSettled().then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+    expect(pendingAsksSpy.mock.calls.length).toBeLessThan(20);
+
+    registry.settlePendingAsk('ask-outlives-child');
+    await wait;
+    expect(settled).toBe(true);
+    expect(facade.workSettled).toBe(true);
+  });
+
   it('workSettled counts parked wake deliveries (and settles once they deliver)', async () => {
     const { facade, piAgent } = createFacade();
 
