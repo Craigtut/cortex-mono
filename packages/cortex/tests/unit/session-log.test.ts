@@ -367,6 +367,116 @@ describe('SessionLog: retention', () => {
   });
 });
 
+describe('SessionLog: retention protects conversation over churn', () => {
+  function appendChurn(log: SessionLog, content: string): SessionLogEntry {
+    return log.append({ type: 'lifecycle', loopPath: 'reasoner', content });
+  }
+
+  it('evicts task churn while the conversation that generated it survives', () => {
+    const log = new SessionLog({ maxEntries: 4 });
+
+    appendUtterance(log, 'fix the flaky test');
+    log.append({ type: 'reply', loopPath: 'talker', content: 'on it' });
+    // A busy task fleet: churn at machine frequency.
+    for (let i = 0; i < 8; i += 1) appendChurn(log, `task-event-${i}`);
+
+    // Pre-fix this is ['task-event-4' .. 'task-event-7']: the conversation
+    // is gone and only the churn that displaced it remains.
+    const kept = log.getLog();
+    expect(kept.map((e) => e.content)).toEqual([
+      'fix the flaky test',
+      'on it',
+      'task-event-6',
+      'task-event-7',
+    ]);
+    expect(log.size).toBe(4);
+  });
+
+  it('protects asks, answers, and errors alongside utterances and replies', () => {
+    const log = new SessionLog({ maxEntries: 5 });
+    log.append({ type: 'ask', loopPath: 'reasoner', content: 'may I run rm?' });
+    log.append({ type: 'ask_answer', loopPath: 'talker', content: 'no' });
+    log.append({ type: 'error', loopPath: 'reasoner', content: 'auth failed' });
+    for (const type of ['delivery', 'directive', 'lookup_result', 'retrying'] as const) {
+      log.append({ type, loopPath: 'reasoner', content: `churn-${type}` });
+    }
+    appendUtterance(log, 'what happened?');
+
+    expect(log.getLog().map((e) => e.type)).toEqual([
+      'ask', 'ask_answer', 'error', 'retrying', 'utterance',
+    ]);
+  });
+
+  it('falls back to oldest-first over conversation once churn is exhausted', () => {
+    const log = new SessionLog({ maxEntries: 2 });
+    appendUtterance(log, 'u1');
+    appendUtterance(log, 'u2');
+    appendUtterance(log, 'u3');
+    expect(log.getLog().map((e) => e.content)).toEqual(['u2', 'u3']);
+  });
+
+  it('spills evicted churn through onEvict in seq order', () => {
+    const evicted: SessionLogEntry[] = [];
+    const log = new SessionLog({ maxEntries: 2, onEvict: (batch) => evicted.push(...batch) });
+    appendChurn(log, 'c1');
+    appendUtterance(log, 'u1');
+    appendChurn(log, 'c2');
+    appendChurn(log, 'c3');
+
+    expect(log.getLog().map((e) => e.content)).toEqual(['u1', 'c3']);
+    expect(evicted.map((e) => e.content)).toEqual(['c1', 'c2']);
+  });
+
+  it('announces interior holes to a replaying subscriber, not just the leading one', () => {
+    const log = new SessionLog({ maxEntries: 3 });
+    appendUtterance(log, 'u1');   // seq 1, durable
+    appendChurn(log, 'c2');       // seq 2, evicted
+    appendUtterance(log, 'u3');   // seq 3, durable
+    appendChurn(log, 'c4');       // seq 4, evicted
+    appendUtterance(log, 'u5');   // seq 5, durable
+
+    expect(log.getLog().map((e) => e.seq)).toEqual([1, 3, 5]);
+
+    const events: SessionLogEvent[] = [];
+    log.subscribeLog((event) => events.push(event), 1);
+
+    // A hole between every retained entry, each one reported.
+    expect(events).toEqual([
+      { kind: 'entry', entry: expect.objectContaining({ seq: 1 }) },
+      { kind: 'gap', fromSeq: 2, toSeq: 2, dropped: 1 },
+      { kind: 'entry', entry: expect.objectContaining({ seq: 3 }) },
+      { kind: 'gap', fromSeq: 4, toSeq: 4, dropped: 1 },
+      { kind: 'entry', entry: expect.objectContaining({ seq: 5 }) },
+    ]);
+  });
+
+  it('announces a trailing hole when the newest entries were the churn evicted', () => {
+    const log = new SessionLog({ maxEntries: 2 });
+    appendUtterance(log, 'u1');
+    appendUtterance(log, 'u2');
+    appendChurn(log, 'c3');
+
+    expect(log.getLog().map((e) => e.seq)).toEqual([1, 2]);
+
+    const events: SessionLogEvent[] = [];
+    log.subscribeLog((event) => events.push(event), 1);
+    expect(events[events.length - 1]).toEqual({
+      kind: 'gap', fromSeq: 3, toSeq: 3, dropped: 1,
+    });
+  });
+
+  it('an over-cap restore uses the same churn-first policy', () => {
+    const log = new SessionLog({ maxEntries: 2 });
+    log.restore([
+      { seq: 1, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'u1' },
+      { seq: 2, type: 'lifecycle', timestamp: 2, loopPath: 'main', content: 'c2' },
+      { seq: 3, type: 'delivery', timestamp: 3, loopPath: 'main', content: 'd3' },
+      { seq: 4, type: 'reply', timestamp: 4, loopPath: 'main', content: 'r4' },
+    ]);
+    expect(log.getLog().map((e) => e.content)).toEqual(['u1', 'r4']);
+  });
+});
+
 describe('SessionLog: restore', () => {
   it('replaces contents and resumes seq numbering after the restored max', () => {
     const log = new SessionLog();

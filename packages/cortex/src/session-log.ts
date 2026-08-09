@@ -165,10 +165,13 @@ export type SessionLogSubscriber = (event: SessionLogEvent) => void | Promise<vo
 
 export interface SessionLogOptions {
   /**
-   * Retention cap: the log keeps at most this many entries, evicting the
-   * oldest past it. The log is the persistence artifact and never
-   * compacts, so without a cap it would grow unboundedly in a long
-   * session. Default: 10000.
+   * Retention cap: the log keeps at most this many entries. The log is the
+   * persistence artifact and never compacts, so without a cap it would
+   * grow unboundedly in a long session. Default: 10000.
+   *
+   * Overflow comes off churn first and conversational history only once
+   * churn is exhausted (see {@link DURABLE_ENTRY_TYPES}); the cap itself
+   * still bounds the whole log.
    */
   maxEntries?: number;
   /**
@@ -189,6 +192,30 @@ export interface SessionLogOptions {
 
 const DEFAULT_MAX_ENTRIES = 10_000;
 const DEFAULT_MAX_SUBSCRIBER_BUFFER = 1_000;
+
+/**
+ * Entry types retention protects: what a human would call the conversation,
+ * plus the errors that explain it. These are evicted only once every
+ * disposable entry is already gone.
+ *
+ * The rest is churn: `lifecycle`, `delivery`, `directive`, `lookup_result`,
+ * and `retrying` are produced at machine frequency (a busy task fleet emits
+ * spawn, completion, and delivery entries continuously), while a session
+ * accumulates utterances at human frequency. A flat FIFO therefore lets an
+ * hour of task chatter push out the first half of the conversation, which
+ * inverts what a reader of the log actually wants back.
+ *
+ * `error` sits with the durable set rather than with churn: it is rare
+ * enough that protecting it crowds out nothing, and it is the entry a
+ * consumer most needs when reconstructing why a session went wrong.
+ */
+const DURABLE_ENTRY_TYPES: ReadonlySet<SessionLogEntryType> = new Set<SessionLogEntryType>([
+  'utterance',
+  'reply',
+  'ask',
+  'ask_answer',
+  'error',
+]);
 
 // ---------------------------------------------------------------------------
 // Subscriber state
@@ -244,6 +271,10 @@ export class SessionLog {
    * Seq of the oldest entry still retained. When eviction has run, seqs
    * below this exist only wherever the onEvict spill put them. Equals
    * nextSeq when the log is empty.
+   *
+   * Not a promise of contiguity above it: retention evicts churn before
+   * conversation, so seqs above this one can be missing too. Replay
+   * announces every hole; do not derive one from this value alone.
    */
   get firstRetainedSeq(): number {
     return this.entries.length > 0 ? this.entries[0]!.seq : this.nextSeq;
@@ -324,20 +355,29 @@ export class SessionLog {
 
     if (fromSeq !== undefined) {
       const from = Math.max(1, fromSeq);
-      const retainedFrom = this.firstRetainedSeq;
-      if (from < retainedFrom) {
-        // The requested range starts below retention; the missing seqs are
-        // announced as a gap only when they ever existed.
-        const missingTo = Math.min(retainedFrom - 1, this.lastSeq);
-        if (missingTo >= from) {
-          sub.pendingGap = { fromSeq: from, toSeq: missingTo, dropped: missingTo - from + 1 };
-        }
-      }
+      // Retention is churn-first, so the retained set is no longer a
+      // contiguous suffix: holes can open anywhere above firstRetainedSeq,
+      // including at the very end. Every hole in [from, lastSeq] is
+      // announced, not just the leading one, or a replaying subscriber
+      // renders a timeline with silent holes in it. Seqs are contiguous
+      // over the session, so a range of width n held exactly n entries.
+      let expected = from;
+      const announceGap = (toSeq: number): void => {
+        if (toSeq < expected) return;
+        this.pushToSubscriber(sub, {
+          kind: 'gap',
+          fromSeq: expected,
+          toSeq,
+          dropped: toSeq - expected + 1,
+        });
+      };
       for (const entry of this.entries) {
-        if (entry.seq >= from) {
-          this.pushToSubscriber(sub, { kind: 'entry', entry: cloneEntry(entry) });
-        }
+        if (entry.seq < from) continue;
+        if (entry.seq > expected) announceGap(entry.seq - 1);
+        this.pushToSubscriber(sub, { kind: 'entry', entry: cloneEntry(entry) });
+        expected = entry.seq + 1;
       }
+      announceGap(this.lastSeq);
     }
 
     this.subscribers.add(sub);
@@ -361,13 +401,12 @@ export class SessionLog {
    */
   restore(entries: SessionLogEntry[]): void {
     const restored = entries.map(cloneEntry).sort((a, b) => a.seq - b.seq);
-    // The retention cap applies on restore too, but WITHOUT the onEvict
-    // spill: these entries came from the persistence artifact, so spilling
-    // the overflow back through persistResult would re-persist the same
-    // entries on every restore.
-    this.entries = restored.length > this.maxEntries
-      ? restored.slice(restored.length - this.maxEntries)
-      : restored;
+    // The retention cap applies on restore too, under the same churn-first
+    // policy as a live append, but WITHOUT the onEvict spill: these entries
+    // came from the persistence artifact, so spilling the overflow back
+    // through persistResult would re-persist the same entries on every
+    // restore.
+    this.entries = selectUnderCap(restored, this.maxEntries).kept;
     const maxSeq = restored.length > 0 ? restored[restored.length - 1]!.seq : 0;
     this.nextSeq = Math.max(this.nextSeq, maxSeq + 1);
 
@@ -400,10 +439,15 @@ export class SessionLog {
   // Internals
   // -------------------------------------------------------------------------
 
-  /** Evict oldest entries past the retention cap, spilling via onEvict. */
+  /**
+   * Evict past the retention cap, churn before conversation, spilling via
+   * onEvict. `maxEntries` still bounds the whole log exactly as before;
+   * what changed is only which entries pay for the overflow.
+   */
   private applyRetention(): void {
     if (this.entries.length <= this.maxEntries) return;
-    const evicted = this.entries.splice(0, this.entries.length - this.maxEntries);
+    const { kept, evicted } = selectUnderCap(this.entries, this.maxEntries);
+    this.entries = kept;
     if (this.onEvict) {
       try {
         this.onEvict(evicted);
@@ -519,4 +563,46 @@ function cloneEntry(entry: SessionLogEntry): SessionLogEntry {
   const copy: SessionLogEntry = { ...entry };
   if (entry.data !== undefined) copy.data = structuredClone(entry.data);
   return copy;
+}
+
+/**
+ * Split entries into what fits under `cap` and what has to go, dropping
+ * churn oldest-first and only then falling back to durable entries
+ * oldest-first (see {@link DURABLE_ENTRY_TYPES}). Both halves stay in seq
+ * order, so the kept array remains sorted and a spill arrives in the order
+ * the entries were written.
+ *
+ * Live appends and over-cap restores share this, because "which entries
+ * survive the cap" is one question and answering it two ways is how the two
+ * paths drift apart.
+ */
+function selectUnderCap(
+  entries: readonly SessionLogEntry[],
+  cap: number,
+): { kept: SessionLogEntry[]; evicted: SessionLogEntry[] } {
+  let remaining = entries.length - cap;
+  if (remaining <= 0) return { kept: [...entries], evicted: [] };
+
+  const dropped = new Set<number>();
+  for (let i = 0; i < entries.length && remaining > 0; i += 1) {
+    if (!DURABLE_ENTRY_TYPES.has(entries[i]!.type)) {
+      dropped.add(i);
+      remaining -= 1;
+    }
+  }
+  // Churn alone did not cover the overflow: the rest comes off the front of
+  // the conversation, which is the flat-FIFO behavior and the right floor.
+  for (let i = 0; i < entries.length && remaining > 0; i += 1) {
+    if (!dropped.has(i)) {
+      dropped.add(i);
+      remaining -= 1;
+    }
+  }
+
+  const kept: SessionLogEntry[] = [];
+  const evicted: SessionLogEntry[] = [];
+  for (let i = 0; i < entries.length; i += 1) {
+    (dropped.has(i) ? evicted : kept).push(entries[i]!);
+  }
+  return { kept, evicted };
 }
