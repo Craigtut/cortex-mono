@@ -11,6 +11,7 @@ import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
 import type { AgentLoopConfig, SubAgentResult, TrackedSubAgent } from '../../src/types.js';
 import type { AgentMessage } from '../../src/context-manager.js';
+import type { CortexTool } from '../../src/tool-contract.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 import {
@@ -952,13 +953,18 @@ type PostDestroyProbe =
   | { readonly call: (target: PostDestroyTarget) => unknown }
   | { readonly skip: string };
 
-/** A minimal consumer tool, only ever registered on a destroyed target. */
-const probeTool = {
+/**
+ * A minimal consumer tool, only ever registered on a destroyed target.
+ * Annotated rather than asserted: the literal satisfies CortexTool on its
+ * own, so the `as unknown as` this used to carry bought nothing and would
+ * have hidden the shape drifting later.
+ */
+const probeTool: CortexTool = {
   name: 'post_destroy_probe',
   description: 'probe',
   parameters: { type: 'object', properties: {} },
   execute: async () => 'probe',
-} as unknown as Parameters<AgentLoop['addConsumerTool']>[0];
+};
 
 const POST_DESTROY_PROBES: Record<ForwardedLoopMember, PostDestroyProbe> = {
   // Interaction surface.
