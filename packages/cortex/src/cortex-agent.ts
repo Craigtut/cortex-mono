@@ -3601,10 +3601,33 @@ export class CortexAgent {
 
   // History, memory, digestion ---------------------------------------------
 
+  /**
+   * The CONVERSATION loop's post-slot transcript: the talker in duplex, the
+   * reasoner in passthrough.
+   *
+   * The name is the contract. In duplex the reasoner's transcript is the
+   * WORK transcript, in which the user's own words appear only as
+   * `<conversation-context>` fragments quoted inside dispatch messages, so a
+   * consumer rendering or exporting "the conversation" from it got dispatch
+   * scaffolding and directives instead of the dialogue. Both transcripts,
+   * plus the log and per-loop usage, are on {@link getState}.
+   */
   getConversationHistory(): AgentMessage[] {
-    return this.reasoner.getConversationHistory();
+    return this.conversationLoop.getConversationHistory();
   }
 
+  /**
+   * The REASONER's observational state, in both modes.
+   *
+   * Deliberately not the conversation loop's, unlike
+   * {@link getConversationHistory} above: observational memory is what the
+   * agent learned while working, and the reasoner is the loop that works.
+   * The consequence to know about is that in duplex these two reads are no
+   * longer an order-coupled pair, so they must not be assembled into a v1
+   * artifact together (the watermark would align to the wrong history).
+   * {@link getState} is the coherent composite and the only supported
+   * persistence surface.
+   */
   getObservationalMemoryState(): ObservationalMemoryState | null {
     return this.reasoner.getObservationalMemoryState();
   }

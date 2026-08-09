@@ -11,6 +11,7 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
+  createPassthroughScenario,
   createRealDuplexScenario,
   destroyLiveFacades,
   getBroker,
@@ -18,6 +19,7 @@ import {
   testModel,
   waitUntil,
 } from './duplex-scenario-harness.js';
+import type { AgentMessage } from '../../src/context-manager.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
 import type { NetworkAccessRequest } from '../../src/sandbox/types.js';
 import type { CortexLogger } from '../../src/types.js';
@@ -123,5 +125,52 @@ describe('duplex settlement predicates and broker-minted asks', () => {
     await waitUntil(() => settledEarly, 2000, 'waitForWorkSettled resolves');
     expect(facade.workSettled).toBe(true);
     expect(talkerPi.promptCalls.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S6: getConversationHistory() must be the conversation
+// ---------------------------------------------------------------------------
+
+/** Flatten a transcript to searchable text, whatever shape its blocks take. */
+function transcriptText(messages: AgentMessage[]): string {
+  return messages
+    .map((message) => (typeof message.content === 'string'
+      ? message.content
+      : JSON.stringify(message.content)))
+    .join('\n');
+}
+
+describe('duplex getConversationHistory', () => {
+  it('exports the dialogue, not the work transcript with its dispatch scaffolding', async () => {
+    const { facade, talkerPi, reasonerPi } = await createRealDuplexScenario();
+    talkerPi.script = [{
+      text: 'Sure, taking a look at the config now.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'audit the config' } }],
+    }];
+
+    await facade.prompt('please audit the deploy config');
+    await waitUntil(() => reasonerPi.promptCalls.length > 0, 2000, 'dispatch reached the reasoner');
+
+    const exported = transcriptText(facade.getConversationHistory());
+
+    // What a consumer rendering "the conversation" expects to find.
+    expect(exported).toContain('please audit the deploy config');
+    expect(exported).toContain('Sure, taking a look at the config now.');
+    // What it must not find: the reasoner's work transcript is made of
+    // directives with the user's words quoted inside a context fence.
+    expect(exported).not.toContain('[Directive]');
+    expect(exported).not.toContain('<conversation-context>');
+
+    // The work transcript is still reachable, through the composite artifact.
+    const state = await facade.getState();
+    expect(transcriptText(state.reasonerHistory)).toContain('[Directive]');
+    expect(transcriptText(state.talkerHistory)).toContain('please audit the deploy config');
+  });
+
+  it('passthrough is unchanged: the single loop is the conversation loop', async () => {
+    const { facade, reasonerLoop } = createPassthroughScenario();
+    await facade.prompt('hello there');
+    expect(facade.getConversationHistory()).toEqual(reasonerLoop.getConversationHistory());
   });
 });
