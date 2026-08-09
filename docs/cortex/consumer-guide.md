@@ -248,6 +248,8 @@ context.setSlot('app-config', buildCurrentAppConfig());
 
 A v1 artifact (`{ version: 1, history, memory?, usage? }`) or a bare message array restores into the reasoner with an empty log, so existing single-loop sessions upgrade transparently. Usage restore is a baseline, not a replay: the facade reports `restoredBaseline + live deltas`, so repeated restores are idempotent.
 
+`getConversationHistory()` and `getObservationalMemoryState()` are still forwarded and still return the reasoner's, which is the right answer for inspection and debugging. Persist `getState()`, not those: it is the only surface that carries both loops and the log.
+
 Slots should usually be rebuilt from current application state instead of restored from prior serialized messages.
 
 ## Context Slots
@@ -344,7 +346,7 @@ agent.steerSubAgent(taskId, 'Focus on the last two years only.');
 await agent.cancelSubAgent(taskId);
 ```
 
-Sub-agents belong to the reasoner. In duplex the talker can also dispatch work through its control tools, and the reasoner spawns children of its own; all of it lands in the same pool and the same lifecycle log entries.
+Sub-agents belong to the reasoner. A talker control tool that starts a task dispatches it to the reasoner rather than spawning directly, so consumer spawns, model spawns, and talker-dispatched work all share one pool and one set of lifecycle log entries. Quick lookups are the exception: they get their own small pool so a busy task fleet cannot starve them.
 
 `cancelSubAgent(taskId)` destroys the child, resolves its completion promise as `cancelled`, and discards any pending or late result so cancelled work is never delivered to the loop. It returns `false` for an unknown task ID. A cancelled foreground child reports `status: 'cancelled'` to the SubAgent tool.
 
