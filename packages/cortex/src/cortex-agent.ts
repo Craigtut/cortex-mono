@@ -860,8 +860,13 @@ export const AGENT_LOOP_DELEGATION = {
 
 type DelegationTable = typeof AGENT_LOOP_DELEGATION;
 
-/** The keys the table marks 'forwarded'. */
-type ForwardedLoopMember = {
+/**
+ * The keys the table marks 'forwarded'. Exported so the behavioural
+ * delegation test can be exhaustive over it: the structural test only sees
+ * that a forwarded member EXISTS on the facade, never that it behaves the
+ * same, which is how the post-destroy divergence in steer()/abort() shipped.
+ */
+export type ForwardedLoopMember = {
   [K in keyof DelegationTable]: DelegationTable[K] extends 'forwarded' ? K : never;
 }[keyof DelegationTable];
 
@@ -2393,9 +2398,14 @@ export class CortexAgent {
    * turn boundary). No-op while idle, exactly like AgentLoop.steer().
    * Duplex: the conversation surface (the talker) is what a consumer
    * steers; directives reach the reasoner through the router.
+   *
+   * No-op after destroy, matching AgentLoop.steer(). Teardown races are
+   * ordinary here (a keystroke landing while shutdown runs), and the loop
+   * has nothing left to steer, so idempotent teardown beats making every
+   * consumer guard the call.
    */
   steer(message: string): void {
-    this.assertNotDestroyed();
+    if (this.destroyed) return;
     this.conversationLoop.steer(message);
   }
 
@@ -2408,9 +2418,15 @@ export class CortexAgent {
    * race. Completed-but-undelivered background results follow today's loop
    * behavior (delivered by a later drain); routing them to the log instead
    * is duplex delivery routing (2b).
+   *
+   * No-op after destroy (and once teardown has begun), matching
+   * AgentLoop.abort(). Consumers wire abort to Ctrl+C and Escape
+   * fire-and-forget, so a throw here lands as an unhandled rejection during
+   * shutdown rather than anywhere a catch could see it; destroy() has
+   * already aborted every loop, so there is nothing left to stop.
    */
   async abort(scope: CortexAbortScope = 'all'): Promise<void> {
-    this.assertNotDestroyed();
+    if (this.destroyed) return;
     this.appendEntry({
       type: 'lifecycle',
       loopPath: scope === 'conversation' ? this.conversationLoop.loopPath : this.reasoner.loopPath,
@@ -3475,8 +3491,25 @@ export class CortexAgent {
     for (const loop of this.residentLoops) loop.onError(handler);
   }
 
+  /**
+   * The CONVERSATION loop only, unlike its neighbours here.
+   *
+   * onTurnComplete is not a diagnostic: it is the "the assistant finished
+   * saying something" signal consumers build user-visible output on (a TUI
+   * finalizes the assistant bubble, a voice app speaks the text). In duplex
+   * the reasoner's assistant text is internal working prose that reaches the
+   * user only after the talker performs a delivery, so fanning out fires
+   * twice per exchange and the reasoner's private text is one of the two.
+   * The facade's own log producer already draws `reply` entries from the
+   * talker alone; this is the same rule on the consumer surface.
+   *
+   * Diagnostics (onError, onRetryScheduled, the merged event bridge) stay
+   * fanned out and loopPath-labeled: a consumer WANTS to see a reasoner
+   * failure, and those surfaces carry the origin needed to tell the loops
+   * apart. Passthrough is unchanged (the conversation loop is the reasoner).
+   */
   onTurnComplete(handler: (output: AgentTextOutput, origin: LoopOriginContext) => void): void {
-    for (const loop of this.residentLoops) loop.onTurnComplete(handler);
+    this.conversationLoop.onTurnComplete(handler);
   }
 
   onRetryScheduled(handler: (info: RetryScheduledInfo) => void): void {

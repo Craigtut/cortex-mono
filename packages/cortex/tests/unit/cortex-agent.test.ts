@@ -19,7 +19,7 @@ import {
   AGENT_LOOP_DELEGATION,
   buildReasonerConfig,
 } from '../../src/cortex-agent.js';
-import type { CortexAgentConfig } from '../../src/cortex-agent.js';
+import type { CortexAgentConfig, ForwardedLoopMember } from '../../src/cortex-agent.js';
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent (holdable runs, steering/follow-up queues), the shared shape
@@ -904,13 +904,11 @@ describe('CortexAgent delegation', () => {
     expect(loop.state).toBe('destroyed');
   });
 
-  it('every interaction and read surface rejects after destroy', async () => {
+  it('the state and log surfaces reject after destroy', async () => {
     const { facade } = createFacade();
     await facade.prompt('before destroy');
     await facade.destroy();
 
-    expect(() => facade.steer('late')).toThrow('CortexAgent has been destroyed');
-    await expect(facade.abort()).rejects.toThrow('CortexAgent has been destroyed');
     await expect(facade.getState()).rejects.toThrow('CortexAgent has been destroyed');
     expect(() => facade.getLog()).toThrow('CortexAgent has been destroyed');
     expect(() => facade.subscribeLog(() => {})).toThrow('CortexAgent has been destroyed');
@@ -926,5 +924,274 @@ describe('CortexAgent delegation', () => {
     // holds its handle for the window and then snapshots a dead loop.
     await loop.destroy();
     expect((facade as unknown as { stateTimer: unknown }).stateTimer).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Forwarded semantics on the lifecycle edge
+//
+// The structural test above sees only that a forwarded member EXISTS on the
+// facade. It cannot see that a forwarded member's BEHAVIOUR diverges, which
+// is how steer() and abort() shipped throwing after destroy where the loop
+// no-ops: a consumer wiring abort to Ctrl+C fire-and-forget turned the throw
+// into an unhandled rejection that killed its shutdown mid-flight.
+// ---------------------------------------------------------------------------
+
+type PostDestroyTarget = CortexAgent | AgentLoop;
+
+/**
+ * How to exercise one forwarded member on a torn-down target, or why it is
+ * not exercised. Keyed by ForwardedLoopMember, so a newly forwarded member
+ * is a type error until it carries a probe or an explicit reason.
+ */
+type PostDestroyProbe =
+  | { readonly call: (target: PostDestroyTarget) => unknown }
+  | { readonly skip: string };
+
+/** A minimal consumer tool, only ever registered on a destroyed target. */
+const probeTool = {
+  name: 'post_destroy_probe',
+  description: 'probe',
+  parameters: { type: 'object', properties: {} },
+  execute: async () => 'probe',
+} as unknown as Parameters<AgentLoop['addConsumerTool']>[0];
+
+const POST_DESTROY_PROBES: Record<ForwardedLoopMember, PostDestroyProbe> = {
+  // Interaction surface.
+  prompt: { call: (t) => t.prompt('post-destroy') },
+  deliver: { call: (t) => t.deliver('post-destroy') },
+  steer: { call: (t) => t.steer('post-destroy') },
+  abort: { call: (t) => t.abort() },
+  destroy: { call: (t) => t.destroy() },
+  followUp: { call: (t) => t.followUp('post-destroy') },
+  isPrompting: { call: (t) => t.isPrompting },
+  // Queues.
+  setSteeringQueueMode: { call: (t) => t.setSteeringQueueMode('all') },
+  setFollowUpQueueMode: { call: (t) => t.setFollowUpQueueMode('all') },
+  clearSteeringQueue: { call: (t) => t.clearSteeringQueue() },
+  clearFollowUpQueue: { call: (t) => t.clearFollowUpQueue() },
+  clearQueuedDeliveries: { call: (t) => t.clearQueuedDeliveries() },
+  queuedDeliveryCount: { call: (t) => t.queuedDeliveryCount },
+  pendingWakeDeliveryCount: { call: (t) => t.pendingWakeDeliveryCount },
+  // Asks and headlines.
+  getPendingAsks: { call: (t) => t.getPendingAsks() },
+  markAskVoiced: { call: (t) => t.markAskVoiced('no-such-ask') },
+  setHeadlineProvider: { call: (t) => t.setHeadlineProvider(null) },
+  // Prompt and model surface.
+  setBasePrompt: { call: (t) => t.setBasePrompt('Test base prompt') },
+  getBasePrompt: { call: (t) => t.getBasePrompt() },
+  getCurrentSystemPrompt: { call: (t) => t.getCurrentSystemPrompt() },
+  composeSystemPrompt: { call: (t) => t.composeSystemPrompt('Test base prompt') },
+  getSystemPromptSections: { call: (t) => t.getSystemPromptSections() },
+  getModel: { call: (t) => t.getModel() },
+  setModel: { call: (t) => t.setModel(testModel()) },
+  getUtilityModel: { call: (t) => t.getUtilityModel() },
+  setUtilityModel: { call: (t) => t.setUtilityModel(testModel()) },
+  resetUtilityModel: { call: (t) => t.resetUtilityModel() },
+  getAutoResolvedUtilityModel: { call: (t) => t.getAutoResolvedUtilityModel() },
+  isUtilityModelOverridden: { call: (t) => t.isUtilityModelOverridden() },
+  getThinkingLevel: { call: (t) => t.getThinkingLevel() },
+  setThinkingLevel: { call: (t) => t.setThinkingLevel('off') },
+  getModelThinkingCapabilities: { call: (t) => t.getModelThinkingCapabilities() },
+  clampThinkingLevel: { call: (t) => t.clampThinkingLevel('off') },
+  setCacheRetention: { call: (t) => t.setCacheRetention('none') },
+  getCacheRetention: { call: (t) => t.getCacheRetention() },
+  setSessionId: { call: (t) => t.setSessionId(null) },
+  getSessionId: { call: (t) => t.getSessionId() },
+  // Context window and token accounting.
+  setContextWindow: { call: (t) => t.setContextWindow(200_000) },
+  setContextWindowLimit: { call: (t) => t.setContextWindowLimit(null) },
+  contextWindowLimit: { call: (t) => t.contextWindowLimit },
+  effectiveContextWindow: { call: (t) => t.effectiveContextWindow },
+  modelContextWindow: { call: (t) => t.modelContextWindow },
+  currentContextTokenCount: { call: (t) => t.currentContextTokenCount },
+  updateCurrentContextTokenCount: { call: (t) => t.updateCurrentContextTokenCount(0) },
+  estimateCurrentContextTokens: { call: (t) => t.estimateCurrentContextTokens() },
+  capToolResult: { call: (t) => t.capToolResult('probe') },
+  // Direct completions and usage.
+  directComplete: { skip: 'issues a real model completion' },
+  structuredComplete: { skip: 'issues a real model completion' },
+  utilityComplete: { skip: 'issues a real model completion' },
+  getLastDirectUsage: { call: (t) => t.getLastDirectUsage() },
+  getSessionUsage: { call: (t) => t.getSessionUsage() },
+  // History, memory, digestion, compaction.
+  getConversationHistory: { call: (t) => t.getConversationHistory() },
+  getObservationalMemoryState: { call: (t) => t.getObservationalMemoryState() },
+  digestIdle: { skip: 'runs the observer/reflector against a real model' },
+  checkAndRunCompaction: { skip: 'can run real summarization completions' },
+  triggerObservation: { skip: 'runs the observer against a real model' },
+  getCompactionManager: { call: (t) => t.getCompactionManager() },
+  // Tools, MCP, skills.
+  addConsumerTool: { call: (t) => t.addConsumerTool(probeTool) },
+  removeConsumerTool: { call: (t) => t.removeConsumerTool('post_destroy_probe') },
+  refreshTools: { call: (t) => t.refreshTools() },
+  connectMcpServer: { skip: 'opens a real transport (subprocess or socket)' },
+  disconnectMcpServer: { call: (t) => t.disconnectMcpServer('no-such-server') },
+  getMcpServerStates: { call: (t) => t.getMcpServerStates() },
+  mcpConfigMatches: {
+    call: (t) => t.mcpConfigMatches(
+      'no-such-server',
+      { type: 'stdio', command: 'true' } as Parameters<AgentLoop['mcpConfigMatches']>[1],
+    ),
+  },
+  setMcpToolCallProgressHandler: { call: (t) => t.setMcpToolCallProgressHandler(undefined) },
+  getMcpClientManager: { call: (t) => t.getMcpClientManager() },
+  getMcpTools: { call: (t) => t.getMcpTools() },
+  getSkillRegistry: { call: (t) => t.getSkillRegistry() },
+  loadSkill: { call: (t) => t.loadSkill('no-such-skill') },
+  clearSkillBuffer: { call: (t) => t.clearSkillBuffer() },
+  getSkillBuffer: { call: (t) => t.getSkillBuffer() },
+  setPreprocessorVariables: { call: (t) => t.setPreprocessorVariables({}) },
+  setScriptContext: { call: (t) => t.setScriptContext({}) },
+  // Sub-agents.
+  spawnBackgroundSubAgent: { skip: 'spawns a real child loop against a real model' },
+  cancelSubAgent: { call: (t) => t.cancelSubAgent('no-such-task') },
+  steerSubAgent: { call: (t) => t.steerSubAgent('no-such-task', 'probe') },
+  getActiveSubAgents: { call: (t) => t.getActiveSubAgents() },
+  getDeadLetteredBackgroundResults: { call: (t) => t.getDeadLetteredBackgroundResults() },
+  // State reads and misc.
+  isRunning: { call: (t) => t.isRunning },
+  state: { call: (t) => t.state },
+  isWorkingTagsEnabled: { call: (t) => t.isWorkingTagsEnabled },
+  setWorkingTagsEnabled: { call: (t) => t.setWorkingTagsEnabled(true) },
+  setLastInteractionTime: { call: (t) => t.setLastInteractionTime(Date.now()) },
+  getEnvOverrides: { call: (t) => t.getEnvOverrides() },
+  getEventBridge: { call: (t) => t.getEventBridge() },
+  getBudgetGuard: { call: (t) => t.getBudgetGuard() },
+  getContextManager: { call: (t) => t.getContextManager() },
+  // Callback registration.
+  onLoopComplete: { call: (t) => t.onLoopComplete(() => {}) },
+  onError: { call: (t) => t.onError(() => {}) },
+  onTurnComplete: { call: (t) => t.onTurnComplete(() => {}) },
+  onRetryScheduled: { call: (t) => t.onRetryScheduled(() => {}) },
+  onRetrySucceeded: { call: (t) => t.onRetrySucceeded(() => {}) },
+  onRetryExhausted: { call: (t) => t.onRetryExhausted(() => {}) },
+  onBeforeCompaction: { call: (t) => t.onBeforeCompaction(async () => {}) },
+  onPostCompaction: { call: (t) => t.onPostCompaction(() => {}) },
+  onCompactionError: { call: (t) => t.onCompactionError(() => {}) },
+  onCompactionDegraded: { call: (t) => t.onCompactionDegraded(() => {}) },
+  onCompactionExhausted: { call: (t) => t.onCompactionExhausted(() => {}) },
+  onSubAgentSpawned: { call: (t) => t.onSubAgentSpawned(() => {}) },
+  onSubAgentCompleted: { call: (t) => t.onSubAgentCompleted(() => {}) },
+  onSubAgentFailed: { call: (t) => t.onSubAgentFailed(() => {}) },
+  onBackgroundResultDelivery: { call: (t) => t.onBackgroundResultDelivery(() => {}) },
+  onBackgroundResultDeadLettered: { call: (t) => t.onBackgroundResultDeadLettered(() => {}) },
+  onObservation: { call: (t) => t.onObservation(() => {}) },
+  onReflection: { call: (t) => t.onReflection(() => {}) },
+};
+
+/**
+ * The outcome class a consumer can observe. 'threw' and 'rejected' are kept
+ * apart deliberately: a synchronous throw where the consumer awaits (or
+ * discards) a promise is a different bug from a rejection.
+ */
+type Outcome = 'ok' | 'threw' | 'rejected';
+
+async function observe(invoke: () => unknown): Promise<Outcome> {
+  let value: unknown;
+  try {
+    value = invoke();
+  } catch {
+    return 'threw';
+  }
+  if (value instanceof Promise) {
+    try {
+      await value;
+    } catch {
+      return 'rejected';
+    }
+  }
+  return 'ok';
+}
+
+describe('CortexAgent forwarded lifecycle semantics', () => {
+  it('carries a probe for every forwarded member', () => {
+    // The Record<ForwardedLoopMember, ...> type above says the same thing,
+    // but tests are outside the tsc project (tsconfig excludes them), so
+    // the exhaustiveness has to be asserted at runtime to actually bite.
+    const forwarded = Object.entries(AGENT_LOOP_DELEGATION)
+      .filter(([, disposition]) => disposition === 'forwarded')
+      .map(([member]) => member)
+      .sort();
+    expect(Object.keys(POST_DESTROY_PROBES).sort()).toEqual(forwarded);
+  });
+
+  it('every practically callable forwarded member behaves as the loop does after destroy', async () => {
+    const { facade, loop } = createFacade();
+    await facade.prompt('before destroy');
+    await facade.destroy();
+
+    const divergences: string[] = [];
+    for (const [member, probe] of Object.entries(POST_DESTROY_PROBES)) {
+      if ('skip' in probe) continue;
+      // The facade first, then the loop it forwards to: same underlying
+      // teardown state, so any difference is the facade's own guard.
+      const viaFacade = await observe(() => probe.call(facade));
+      const viaLoop = await observe(() => probe.call(loop));
+      if (viaFacade !== viaLoop) {
+        divergences.push(`${member}: facade ${viaFacade}, loop ${viaLoop}`);
+      }
+    }
+    expect(divergences).toEqual([]);
+  });
+
+  it('names every forwarded member it cannot probe, and why', () => {
+    // Not silence: the members below run real model completions, spawn real
+    // child loops, or open real transports, so their post-destroy behaviour
+    // is verified by review rather than by this loop.
+    const skipped = Object.entries(POST_DESTROY_PROBES)
+      .filter(([, probe]) => 'skip' in probe)
+      .map(([member]) => member)
+      .sort();
+    expect(skipped).toEqual([
+      'checkAndRunCompaction',
+      'connectMcpServer',
+      'digestIdle',
+      'directComplete',
+      'spawnBackgroundSubAgent',
+      'structuredComplete',
+      'triggerObservation',
+      'utilityComplete',
+    ]);
+  });
+
+  it('steer() after destroy is a silent no-op, like the loop', async () => {
+    const { facade, piAgent } = createFacade();
+    await facade.destroy();
+
+    expect(() => facade.steer('late keystroke')).not.toThrow();
+    expect(piAgent.steeringQueue).toEqual([]);
+  });
+
+  it('abort() after destroy resolves instead of rejecting', async () => {
+    const { facade } = createFacade();
+    await facade.destroy();
+
+    await expect(facade.abort()).resolves.toBeUndefined();
+    await expect(facade.abort('conversation')).resolves.toBeUndefined();
+    await expect(facade.abort('work')).resolves.toBeUndefined();
+  });
+
+  it('a fire-and-forget abort during teardown never becomes an unhandled rejection', async () => {
+    const { facade, piAgent } = createFacade();
+    piAgent.hold = true;
+    const turn = facade.prompt('long turn').catch(() => undefined);
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    // The consumer symptom: a TUI wires abort to Ctrl+C and Escape and
+    // discards the promise, so a quit races its own teardown. destroy()
+    // marks the facade destroyed synchronously, so this abort lands
+    // mid-teardown, exactly where the throw used to escape uncaught.
+    const teardown = facade.destroy();
+    const rejections: unknown[] = [];
+    process.once('unhandledRejection', (err) => rejections.push(err));
+    void facade.abort();
+    facade.steer('escape during teardown');
+
+    await teardown;
+    await turn;
+    // Let any queued microtask rejection surface before asserting.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(rejections).toEqual([]);
   });
 });
