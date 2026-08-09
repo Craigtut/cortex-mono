@@ -182,6 +182,47 @@ export interface DuplexTuningConfig extends Omit<DuplexRouterOptions, 'now'> {
   maxTotalCost?: number;
 }
 
+/**
+ * Every router option a consumer can set, as a compile-time-exhaustive
+ * record. The value is ignored; the KEY SET is the contract, and it is what
+ * {@link CortexAgent.wireDuplex} iterates when it copies tuning into the
+ * router.
+ *
+ * The mapped type is the whole point. `DuplexTuningConfig` extends
+ * `Omit<DuplexRouterOptions, 'now'>`, so adding a router option instantly
+ * makes it settable by consumers and typechecks at their call site; before
+ * this, the copy was a hand-written string list, so the new option was
+ * accepted and then silently dropped, which is worse than not offering it.
+ * That is exactly how `delegationMaxAgeMs` shipped dead. Now the record fails
+ * to compile until the new key is listed.
+ *
+ * `now` is excluded deliberately: it is a test clock, not consumer tuning,
+ * and `DuplexTuningConfig` omits it for the same reason.
+ */
+const ROUTER_TUNING_KEY_SET: {
+  [K in keyof Required<Omit<DuplexRouterOptions, 'now'>>]: true;
+} = {
+  minDeliverySpacingMs: true,
+  whenIdleDegradeMs: true,
+  idlePollMs: true,
+  interruptBucketCapacity: true,
+  interruptRefillMs: true,
+  deliveryDedupWindowMs: true,
+  deliveryDedupMaxEntries: true,
+  maxDispatchesPerTurn: true,
+  maxDispatchesPerExchange: true,
+  watchdogIntervalMs: true,
+  delegationMaxAgeMs: true,
+  deltaBufferMaxChars: true,
+  askTimeoutMs: true,
+  escalationAskTimeoutMs: true,
+  settleVoiceDelayMs: true,
+};
+
+const ROUTER_TUNING_KEYS = Object.keys(ROUTER_TUNING_KEY_SET) as Array<
+  keyof typeof ROUTER_TUNING_KEY_SET
+>;
+
 /** Session log tuning (retention and subscriber buffering). */
 export interface CortexSessionLogConfig {
   /** Retention cap on held entries (see SessionLogOptions.maxEntries). */
@@ -1501,16 +1542,10 @@ export class CortexAgent {
     const routerOptions: DuplexRouterOptions = {};
     const tuning = config.duplex;
     if (tuning) {
-      for (const key of [
-        'minDeliverySpacingMs', 'whenIdleDegradeMs', 'idlePollMs',
-        'interruptBucketCapacity', 'interruptRefillMs',
-        'deliveryDedupWindowMs', 'deliveryDedupMaxEntries',
-        'maxDispatchesPerTurn', 'maxDispatchesPerExchange',
-        'watchdogIntervalMs', 'deltaBufferMaxChars',
-        'askTimeoutMs', 'escalationAskTimeoutMs', 'settleVoiceDelayMs',
-      ] as const) {
-        if (tuning[key] !== undefined) {
-          (routerOptions as Record<string, unknown>)[key] = tuning[key];
+      for (const key of ROUTER_TUNING_KEYS) {
+        const value = tuning[key];
+        if (value !== undefined) {
+          (routerOptions as Record<string, unknown>)[key] = value;
         }
       }
     }

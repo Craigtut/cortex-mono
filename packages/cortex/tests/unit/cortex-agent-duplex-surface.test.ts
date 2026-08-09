@@ -19,6 +19,7 @@ import {
   lifecycleEvents,
   promptTexts,
   settle,
+  talkerHeadline,
   testModel,
   waitUntil,
 } from './duplex-scenario-harness.js';
@@ -82,6 +83,58 @@ describe('facade session-log reads', () => {
     const { facade } = await createRealDuplexScenario();
     await facade.destroy();
     expect(() => facade.getLogEvents()).toThrow('CortexAgent has been destroyed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Router tuning has to reach the router
+//
+// `DuplexTuningConfig extends Omit<DuplexRouterOptions, 'now'>`, so every
+// router option is settable by a consumer the moment it is declared and
+// typechecks at their call site. The facade used to copy them with a
+// hand-written key list, which is how `delegationMaxAgeMs` shipped accepted
+// and then dropped.
+// ---------------------------------------------------------------------------
+
+describe('duplex router tuning', () => {
+  it('applies delegationMaxAgeMs, so stale work stops being reported as live', async () => {
+    const { facade, talkerLoop, talkerPi, reasonerPi } = await createRealDuplexScenario({
+      duplex: { delegationMaxAgeMs: 30 },
+    });
+    // Hold the reasoner so the delegation is never retired by a result: the
+    // age bound is the only thing that can drop it, which is the point.
+    reasonerPi.hold = true;
+    talkerPi.script = [{
+      text: 'On it.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'audit the deploy config' } }],
+    }];
+
+    await facade.prompt('audit the deploy config please');
+    await waitUntil(
+      () => (talkerHeadline(talkerLoop) ?? '').includes('audit the deploy config'),
+      2000, 'delegation reported to the talker',
+    );
+
+    // Past the bound, the talker must stop being told this work is live, or
+    // its grounding rules have it answering "still working on it" forever.
+    await waitUntil(
+      () => !(talkerHeadline(talkerLoop) ?? '').includes('audit the deploy config'),
+      2000, 'stale delegation retired',
+    );
+
+    reasonerPi.releaseRun();
+  });
+
+  it('still applies the neighbouring keys the hand-written list did carry', async () => {
+    const { facade } = await createRealDuplexScenario({
+      duplex: { maxDispatchesPerTurn: 1 },
+    });
+    const options = (facade as unknown as {
+      router: { options: { maxDispatchesPerTurn: number; delegationMaxAgeMs: number } };
+    }).router.options;
+    expect(options.maxDispatchesPerTurn).toBe(1);
+    // And an unset key keeps the router's own default rather than undefined.
+    expect(options.delegationMaxAgeMs).toBeGreaterThan(0);
   });
 });
 
