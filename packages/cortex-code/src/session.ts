@@ -1949,7 +1949,10 @@ export class Session {
       ...(saved.meta.usage ? { usage: saved.meta.usage } : {}),
     };
     try {
-      this.agent.restore(artifact);
+      // Awaited: restore() reports its guards as a rejection, so an
+      // unawaited call would leave a /resume typed during a turn escaping
+      // this catch as an unhandled rejection.
+      await this.agent.restore(artifact);
     } catch (err) {
       log.warn('Resume restore rejected', {
         sessionId,

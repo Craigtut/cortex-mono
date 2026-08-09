@@ -319,7 +319,7 @@ describe('terminated batch: restore round-trip', () => {
     // Restore into a fresh session and confirm nothing about the shape was
     // lost: roles, tool linkage, and the receipt text.
     const target = createDuplexScenario();
-    target.facade.restore(state);
+    await target.facade.restore(state);
     const restored = target.talkerLoop.getConversationHistory();
     expect(roles(restored)).toEqual(roles(savedTalker));
     assertNoOrphans(restored);

@@ -2665,8 +2665,14 @@ export class CortexAgent {
    * history length). Usage becomes the restored baseline; live counters
    * accumulate as deltas on top, so repeated restores are idempotent, not
    * additive.
+   *
+   * Async so every rejection is a rejection: the guards below are the
+   * documented failure mode, and a synchronous throw next to the async
+   * getState() means `await agent.restore(x).catch(...)` catches nothing.
+   * The body still applies in one frame (there is no await inside it), so
+   * the all-or-nothing property is unchanged.
    */
-  restore(state: CortexAgentPersistedState): void {
+  async restore(state: CortexAgentPersistedState): Promise<void> {
     this.assertNotDestroyed();
     if (
       this.reasoner.isLoopActive ||

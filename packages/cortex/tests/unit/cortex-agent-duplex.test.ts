@@ -1442,7 +1442,7 @@ describe('duplex aggregate budget guard', () => {
     reasonerLoop.getEventBridge().emitUtilityUsage('observer', usage);
     expect(facade.getBudgetGuard().isBreached()).toBe(true);
 
-    facade.restore({
+    await facade.restore({
       version: 2,
       log: [],
       talkerHistory: [],
@@ -1630,11 +1630,11 @@ describe('duplex persistence', () => {
     const artifact = await source.getState();
 
     const { facade: target, talkerLoop } = createDuplexFacade();
-    target.restore(artifact);
+    await target.restore(artifact);
     expect(talkerLoop.getConversationHistory()).toEqual(artifact.talkerHistory);
     expect(target.getSessionUsage().totalCost).toBeCloseTo(artifact.usage.total.totalCost);
     // Idempotent: restoring the same artifact again does not double-count.
-    target.restore(artifact);
+    await target.restore(artifact);
     expect(target.getSessionUsage().totalCost).toBeCloseTo(artifact.usage.total.totalCost);
   });
 
@@ -1658,10 +1658,7 @@ describe('duplex persistence', () => {
         },
       },
     };
-    expect(() => target(artifact)).toThrow(/a loop is running/);
-    function target(state: CortexAgentStateV2): void {
-      facade.restore(state);
-    }
+    await expect(facade.restore(artifact)).rejects.toThrow(/a loop is running/);
     talkerPi.releaseRun();
     await turn;
   });

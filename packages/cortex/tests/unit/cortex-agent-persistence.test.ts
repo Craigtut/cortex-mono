@@ -297,7 +297,7 @@ describe('CortexAgent.restore', () => {
     const artifact = await first.facade.getState();
 
     const second = createFacade();
-    second.facade.restore(artifact);
+    await second.facade.restore(artifact);
 
     expect(second.facade.getLog()).toEqual(artifact.log);
     expect(second.facade.getConversationHistory().map((m) => m.content)).toEqual(
@@ -317,9 +317,9 @@ describe('CortexAgent.restore', () => {
     const artifact = await first.facade.getState();
 
     const second = createFacade();
-    second.facade.restore(artifact);
+    await second.facade.restore(artifact);
     // Repeated restore stays idempotent (no double counting).
-    second.facade.restore(artifact);
+    await second.facade.restore(artifact);
     expect(second.facade.getSessionUsage().totalCost).toBeCloseTo(TURN_COST, 10);
 
     await second.facade.prompt('new turn');
@@ -339,7 +339,7 @@ describe('CortexAgent.restore', () => {
     const maxSeq = artifact.log.at(-1)!.seq;
 
     const second = createFacade();
-    second.facade.restore(artifact);
+    await second.facade.restore(artifact);
     await second.facade.prompt('after restore');
 
     const appended = second.facade.getLog(maxSeq + 1);
@@ -347,7 +347,7 @@ describe('CortexAgent.restore', () => {
     expect(appended[0]!.seq).toBe(maxSeq + 1);
   });
 
-  it('restores history before observational state, watermark-aligned', () => {
+  it('restores history before observational state, watermark-aligned', async () => {
     const { facade, loop } = createFacade();
     const order: string[] = [];
     vi.spyOn(loop, 'restoreConversationHistory').mockImplementation(() => {
@@ -357,7 +357,7 @@ describe('CortexAgent.restore', () => {
       order.push('memory');
     });
 
-    facade.restore({
+    await facade.restore({
       version: 2,
       log: [],
       talkerHistory: [],
@@ -382,21 +382,21 @@ describe('CortexAgent.restore', () => {
     const turn = facade.prompt('busy');
     await waitUntil(() => piAgent.promptCalls.length === 1);
 
-    expect(() => facade.restore([])).toThrow(/rejected: a loop is running/);
+    await expect(facade.restore([])).rejects.toThrow(/rejected: a loop is running/);
 
     piAgent.releaseRun();
     await turn;
   });
 
-  it('is rejected while a sub-agent is active', () => {
+  it('is rejected while a sub-agent is active', async () => {
     const { facade, loop } = createFacade();
     trackFakeSubAgent(loop, 'task-live');
-    expect(() => facade.restore([])).toThrow(/rejected: a loop is running/);
+    await expect(facade.restore([])).rejects.toThrow(/rejected: a loop is running/);
   });
 
-  it('upgrades a v1 artifact: history into the reasoner, empty log, usage as baseline', () => {
+  it('upgrades a v1 artifact: history into the reasoner, empty log, usage as baseline', async () => {
     const { facade } = createFacade();
-    facade.restore({
+    await facade.restore({
       version: 1,
       history: [
         { role: 'user', content: 'old question', timestamp: 1 } as AgentMessage,
@@ -419,9 +419,9 @@ describe('CortexAgent.restore', () => {
     expect(usage.totalTurns).toBe(40);
   });
 
-  it('accepts a bare message array as v1 history', () => {
+  it('accepts a bare message array as v1 history', async () => {
     const { facade } = createFacade();
-    facade.restore([
+    await facade.restore([
       { role: 'user', content: 'bare history', timestamp: 1 } as AgentMessage,
     ]);
     expect(facade.getConversationHistory().map((m) => m.content)).toEqual(['bare history']);
@@ -438,7 +438,7 @@ describe('CortexAgent.restore', () => {
     facade.deliver('stale silent note', { wake: false });
     expect(facade.queuedDeliveryCount).toBe(1);
 
-    facade.restore(artifact);
+    await facade.restore(artifact);
     expect(facade.queuedDeliveryCount).toBe(0);
 
     // The restored session's first prompt carries no pre-restore content.
@@ -446,11 +446,11 @@ describe('CortexAgent.restore', () => {
     expect(piAgent.promptCalls.at(-1)).toBe('fresh start');
   });
 
-  it('rejects an unsupported version', () => {
+  it('rejects an unsupported version', async () => {
     const { facade } = createFacade();
-    expect(() =>
+    await expect(
       facade.restore({ version: 3 } as unknown as CortexAgentStateV2),
-    ).toThrow(/Unsupported CortexAgent state version: 3/);
+    ).rejects.toThrow(/Unsupported CortexAgent state version: 3/);
   });
 
   it('never shares live talker references with the caller (copy on both sides)', async () => {
@@ -465,7 +465,7 @@ describe('CortexAgent.restore', () => {
       reasonerMemory: null,
       usage: { total: zero, perLoop: { talker: null, reasoner: zero } },
     };
-    facade.restore(artifact);
+    await facade.restore(artifact);
 
     // A persistence layer normalizing its own artifact in place must not
     // mutate live facade state.
@@ -508,7 +508,7 @@ describe('CortexAgent.restore', () => {
       usage: { total: zero, perLoop: { talker: null, reasoner: zero } },
     };
 
-    expect(() => facade.restore(artifact)).toThrow();
+    await expect(facade.restore(artifact)).rejects.toThrow();
 
     // The restore was rejected whole: no half-applied reasoner history
     // (applied first pre-fix), log, or usage baseline.
@@ -527,7 +527,7 @@ describe('CortexAgent.restore', () => {
       totalTurns: 10,
       tokens: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 },
     };
-    facade.restore({
+    await facade.restore({
       version: 2,
       log: [],
       talkerHistory,

@@ -912,7 +912,11 @@ describe('CortexAgent delegation', () => {
     await expect(facade.getState()).rejects.toThrow('CortexAgent has been destroyed');
     expect(() => facade.getLog()).toThrow('CortexAgent has been destroyed');
     expect(() => facade.subscribeLog(() => {})).toThrow('CortexAgent has been destroyed');
-    expect(() => facade.restore([])).toThrow('CortexAgent has been destroyed');
+    // restore() rejects rather than throwing synchronously: the docs
+    // describe it as "rejected while running", and a consumer writing
+    // `await agent.restore(x).catch(...)` next to the async getState()
+    // caught nothing while the guard threw.
+    await expect(facade.restore([])).rejects.toThrow('CortexAgent has been destroyed');
   });
 
   it('a directly destroyed loop never schedules a state emission timer', async () => {
