@@ -262,16 +262,24 @@ describe('adversarial: two pending asks, one bare yes', () => {
   }
 
   /**
-   * Pins: one-voiced-at-a-time plus the allow-binds-only-to-the-voiced-ask
-   * rule. Verified failing with the voiced-ask check removed, which lets
-   * consent harvested for a benign request settle a destructive one.
+   * Pins: consent harvested for a benign request cannot settle a
+   * destructive one queued behind it.
+   *
+   * The attack used to be aiming an answer at the queued ask by id, and the
+   * router refused it under the allow-binds-only-to-the-voiced-ask rule.
+   * `answer_ask` no longer takes an id at all, so the aiming step has no
+   * expression: an answer binds to the ask the user actually heard, and a
+   * queued one cannot be named by the talker even if the id has leaked.
+   * The defense moved from a rule that catches the attempt to a surface
+   * that has no way to make it, so this now asserts the outcome rather than
+   * the refusal receipt.
    */
   it('consent for the voiced benign ask cannot settle the queued destructive one', async () => {
     const ran: string[] = [];
     const { h, queuedAskId } = await twoPendingAsks(ran);
 
-    // The user says a bare yes; the talker aims it at the destructive
-    // request instead (mis-binding, or persuaded into it).
+    // The talker tries to aim the user's yes at the destructive request,
+    // inventing the retired parameter and carrying a harvested id.
     h.talkerPi.script = [{
       text: 'Approving.',
       calls: [{ name: 'answer_ask', args: { askId: queuedAskId, decision: 'allow' } }],
@@ -282,10 +290,11 @@ describe('adversarial: two pending asks, one bare yes', () => {
       2000, 'answer attempted',
     );
 
-    const receipt = h.talkerPi.toolResults.find((result) => result.name === 'answer_ask')!;
-    expect(receipt.text).toContain('only the request most recently read to the user');
+    // The destructive command never runs and its ask is still pending: the
+    // id was ignored and the yes settled the benign request the user heard.
     expect(ran).not.toContain('rm -rf ~/work');
-    expect(getBroker(h.facade).pendingAskCount).toBe(2);
+    const stillPending = getBroker(h.facade).getPendingAsks();
+    expect(stillPending.map((ask) => ask.askId)).toContain(queuedAskId);
   });
 
   /**

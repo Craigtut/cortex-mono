@@ -182,15 +182,27 @@ export function buildControlTools(router: ControlDispatchTarget): CortexTool[] {
     },
   };
 
+  /**
+   * No `askId` parameter, deliberately (decisions.md D16, communication.md).
+   * The answer binds to the voiced ask, exactly one ask is voiced at a
+   * time, and the router refuses an allow for anything else, so an id could
+   * never make an accepted answer possible that a bare answer would not.
+   * Taking one had a real cost and no benefit: the id is the nonce fencing
+   * the untrusted request text, and a parameter for it put that nonce in
+   * front of the talker in a form it was invited to repeat back, which is
+   * the leak the fence exists to prevent.
+   *
+   * Denying a specific queued ask goes with it. Nothing legitimate needed
+   * that: the user can only answer a request they have heard, queued asks
+   * are re-voiced as each predecessor settles, unanswered ones time out to
+   * deny, and "stop everything" is `abort()`, which denies them all.
+   */
   const answerAsk: CortexTool = {
     name: 'answer_ask',
     description:
-      "Relay the user's decision on a pending permission request, after " +
-      'reading the request to them.',
+      "Relay the user's decision on the permission request you read out, " +
+      'after reading it to them. It applies to that request.',
     parameters: Type.Object({
-      askId: Type.Optional(Type.String({
-        description: 'The pending ask id.',
-      })),
       decision: Type.Optional(Type.String({
         description: "'allow' or 'deny'.",
       })),
@@ -200,8 +212,12 @@ export function buildControlTools(router: ControlDispatchTarget): CortexTool[] {
     }),
     execute: async (params: unknown) => {
       const p = (params ?? {}) as Record<string, unknown>;
+      // Always undefined for the id: the binding is the broker's, not the
+      // talker's, and a stray field on an off-schema call must not become
+      // one. The dispatch keeps its parameter for the router's other
+      // callers and for the broker's own settled/unknown-id receipts.
       return safeDispatch(() =>
-        router.dispatchAnswerAsk(p['askId'], p['decision'], p['reason']),
+        router.dispatchAnswerAsk(undefined, p['decision'], p['reason']),
       );
     },
   };

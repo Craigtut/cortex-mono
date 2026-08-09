@@ -155,12 +155,40 @@ function requestAsk(
   return { decisions };
 }
 
+/**
+ * Answer through the talker's control tool. The tool takes no ask id, so
+ * every answer made this way binds to the voiced ask.
+ */
 async function callAnswerAsk(
   h: Harness,
   params: unknown,
 ): Promise<{ content: Array<{ type: string; text: string }>; terminate?: boolean }> {
   const tool = buildControlTools(h.router).find((candidate) => candidate.name === 'answer_ask')!;
   return await tool.execute(params) as never;
+}
+
+/**
+ * Answer a NAMED ask through the dispatch directly, below the tool.
+ *
+ * D16's deny rule is unrestricted and the broker still implements answering
+ * by id; what the talker lost is the ability to address one, because a
+ * parameter for it meant handing the fence nonce to the party most likely
+ * to repeat it. Tests of the broker's binding rules therefore call the
+ * layer that still has the capability, so removing it from the talker did
+ * not quietly delete their coverage.
+ */
+async function answerAskById(
+  h: Harness,
+  askId: unknown,
+  decision: unknown,
+  reason?: unknown,
+): Promise<string> {
+  const receipt = h.router.dispatchAnswerAsk(askId, decision, reason);
+  // The dispatch is synchronous but settling resolves the asking
+  // resolver's promise, so yield once before asserting on it. The tool
+  // call these replaced was async and gave that turn for free.
+  await Promise.resolve();
+  return receipt;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,8 +295,8 @@ describe('ask intake and voicing', () => {
     requestAsk(h, { askId: 'ask-c', renderedRequest: 'Bash: c' });
     expect(h.askVoicings).toHaveLength(1);
 
-    await callAnswerAsk(h, { askId: 'ask-a', decision: 'deny' });
-    await callAnswerAsk(h, { askId: 'ask-b', decision: 'deny' });
+    await callAnswerAsk(h, { decision: 'deny' });
+    await answerAskById(h, 'ask-b', 'deny');
     await waitUntil(() => a.decisions.length === 1 && b.decisions.length === 1);
 
     await waitUntil(() => h.askVoicings.length >= 2);
@@ -323,7 +351,7 @@ describe('unheard voicings', () => {
     // that was never read out.
     expect(h.askVoicings).toHaveLength(0);
     h.setTalkerCauseTags([{ kind: 'utterance', seq: h.lastVoicedSeq() + 1 }]);
-    const refused = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const refused = await callAnswerAsk(h, { decision: 'allow' });
     expect(refused.content[0]!.text).toContain('Not accepted');
     expect(decisions).toHaveLength(0);
 
@@ -338,11 +366,11 @@ describe('unheard voicings', () => {
     // now binds: the rule is "unheard", not "permanently poisoned".
     h.failVoicing(false);
     h.advance(3_001);
-    await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    await callAnswerAsk(h, { decision: 'allow' });
     expect(h.askVoicings).toHaveLength(1);
     expect(h.voicedRegistryIds).toEqual(['ask-1']);
     h.setTalkerCauseTags([{ kind: 'utterance', seq: h.lastVoicedSeq() + 1 }]);
-    const allowed = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const allowed = await callAnswerAsk(h, { decision: 'allow' });
     expect(allowed.content[0]!.text).toBe('Approval passed along.');
     await waitUntil(() => decisions.length === 1);
     expect(decisions).toEqual([{ decision: 'allow' }]);
@@ -365,12 +393,12 @@ describe('unheard voicings', () => {
     // An utterance newer than the destroyed voicing's anchor but older than
     // the one the user actually heard is refused.
     h.setTalkerCauseTags([{ kind: 'utterance', seq: firstAnchor + 1 }]);
-    const refused = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const refused = await callAnswerAsk(h, { decision: 'allow' });
     expect(refused.content[0]!.text).toContain('Not accepted');
     expect(decisions).toHaveLength(0);
 
     h.setTalkerCauseTags([{ kind: 'utterance', seq: secondAnchor + 1 }]);
-    const allowed = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const allowed = await callAnswerAsk(h, { decision: 'allow' });
     expect(allowed.content[0]!.text).toBe('Approval passed along.');
   });
 
@@ -396,7 +424,7 @@ describe('D16 consent binding', () => {
     const voicedSeq = h.lastVoicedSeq();
 
     h.setTalkerCauseTags([{ kind: 'utterance', seq: voicedSeq + 1 }]);
-    const result = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const result = await callAnswerAsk(h, { decision: 'allow' });
     expect(result.terminate).toBe(true);
     expect(result.content[0]!.text).toBe('Approval passed along.');
     await waitUntil(() => decisions.length === 1);
@@ -423,7 +451,7 @@ describe('D16 consent binding', () => {
     const voicedSeq = h.lastVoicedSeq();
 
     h.setTalkerCauseTags([{ kind: 'delivery', seq: voicedSeq + 5 }]);
-    const result = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const result = await callAnswerAsk(h, { decision: 'allow' });
     expect(result.terminate).toBe(true);
     expect(result.content[0]!.text).toContain('Not accepted');
     expect(decisions).toHaveLength(0);
@@ -441,7 +469,7 @@ describe('D16 consent binding', () => {
 
     // A "yes" the user said before this ask was ever read out.
     h.setTalkerCauseTags([{ kind: 'utterance', seq: askSeq - 1 }]);
-    const result = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const result = await callAnswerAsk(h, { decision: 'allow' });
     expect(result.content[0]!.text).toContain('Not accepted');
     expect(decisions).toHaveLength(0);
     expect(h.router.permissionBroker.pendingAskCount).toBe(1);
@@ -461,7 +489,7 @@ describe('D16 consent binding', () => {
       { kind: 'ask', seq: askSeq },
       { kind: 'utterance', seq: voicedSeq + 2 },
     ]);
-    const result = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const result = await callAnswerAsk(h, { decision: 'allow' });
     expect(result.content[0]!.text).toContain('Not accepted');
     expect(decisions).toHaveLength(0);
     expect(h.router.permissionBroker.pendingAskCount).toBe(1);
@@ -474,12 +502,12 @@ describe('D16 consent binding', () => {
 
     // Within the damping window the refusal does not re-deliver.
     h.setTalkerCauseTags([]);
-    await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    await callAnswerAsk(h, { decision: 'allow' });
     expect(h.askVoicings).toHaveLength(1);
 
     // Past the window it re-reads the request.
     h.advance(3_001);
-    await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    await callAnswerAsk(h, { decision: 'allow' });
     expect(h.askVoicings).toHaveLength(2);
     expect(h.askVoicings[1]!.content).toContain('still waiting on the user');
     expect(h.lastVoicedSeq()).toBeGreaterThan(firstVoicedSeq);
@@ -498,12 +526,12 @@ describe('D16 consent binding', () => {
 
     // The talker fumbles the decision field; the refusal re-reads the ask.
     h.advance(3_001);
-    const refused = await callAnswerAsk(h, { askId: 'ask-1', decision: 'yes please' });
+    const refused = await callAnswerAsk(h, { decision: 'yes please' });
     expect(refused.content[0]!.text).toContain('allow or deny');
     expect(h.askVoicings).toHaveLength(2);
 
     // The same yes still binds on the retry.
-    const allowed = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const allowed = await callAnswerAsk(h, { decision: 'allow' });
     expect(allowed.content[0]!.text).toBe('Approval passed along.');
     await waitUntil(() => decisions.length === 1);
     const answer = h.log.find((entry) => entry.type === 'ask_answer')!;
@@ -523,8 +551,8 @@ describe('D16 consent binding', () => {
 
     // Allow naming the unvoiced second ask: refused even with a qualifying
     // utterance, because only the most recently voiced ask can be allowed.
-    const misdirected = await callAnswerAsk(h, { askId: 'ask-2', decision: 'allow' });
-    expect(misdirected.content[0]!.text).toContain('Not accepted');
+    const misdirected = await answerAskById(h, 'ask-2', 'allow');
+    expect(misdirected).toContain('Not accepted');
     expect(second.decisions).toHaveLength(0);
 
     // A bare yes (no askId) binds to the voiced ask, never the other one.
@@ -555,7 +583,7 @@ describe('D16 consent binding', () => {
     for (const [label, tags] of nearMisses) {
       h.setRawTalkerCauseTags(tags);
       h.advance(3_001);
-      const refused = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+      const refused = await callAnswerAsk(h, { decision: 'allow' });
       expect(refused.content[0]!.text, label).toContain('Not accepted');
       expect(decisions, label).toHaveLength(0);
     }
@@ -563,7 +591,7 @@ describe('D16 consent binding', () => {
     // A real tag nested one level (the truncation-repair delivery shape)
     // still binds, so the strictness is the validator's and not the port's.
     h.setRawTalkerCauseTags([[{ kind: 'utterance', seq: newer }]]);
-    const allowed = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const allowed = await callAnswerAsk(h, { decision: 'allow' });
     expect(allowed.content[0]!.text).toBe('Approval passed along.');
     await waitUntil(() => decisions.length === 1);
   });
@@ -574,12 +602,8 @@ describe('D16 consent binding', () => {
     const second = requestAsk(h, { askId: 'ask-2' });
     h.setTalkerCauseTags([]);
 
-    const result = await callAnswerAsk(h, {
-      askId: 'ask-2',
-      decision: 'deny',
-      reason: 'the user said not that file',
-    });
-    expect(result.content[0]!.text).toBe('Denial passed along.');
+    const result = await answerAskById(h, 'ask-2', 'deny', 'the user said not that file');
+    expect(result).toBe('Denial passed along.');
     expect(second.decisions).toEqual([
       { decision: 'deny', reason: 'the user said not that file' },
     ]);
@@ -607,14 +631,14 @@ describe('D16 consent binding', () => {
     const voicedSeq = h.lastVoicedSeq();
     h.setTalkerCauseTags([{ kind: 'utterance', seq: voicedSeq + 1 }]);
 
-    const firstCall = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const firstCall = await callAnswerAsk(h, { decision: 'allow' });
     expect(firstCall.content[0]!.text).toBe('Approval passed along.');
     await waitUntil(() => first.decisions.length === 1);
 
     // Same run, same cause set: the follow-up allow for the newly voiced
     // second ask is refused.
-    const secondCall = await callAnswerAsk(h, { askId: 'ask-2', decision: 'allow' });
-    expect(secondCall.content[0]!.text).toContain('Not accepted');
+    const secondCall = await answerAskById(h, 'ask-2', 'allow');
+    expect(secondCall).toContain('Not accepted');
     expect(second.decisions).toHaveLength(0);
     expect(h.router.permissionBroker.pendingAskCount).toBe(1);
   });
@@ -629,10 +653,10 @@ describe('D16 consent binding', () => {
     const voicedSeq = h.lastVoicedSeq();
     h.setTalkerCauseTags([{ kind: 'utterance', seq: voicedSeq + 1 }]);
 
-    const firstCall = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    const firstCall = await callAnswerAsk(h, { decision: 'allow' });
     expect(firstCall.content[0]!.text).toBe('Approval passed along.');
-    const replay = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
-    expect(replay.content[0]!.text).toContain('no longer pending');
+    const replay = await answerAskById(h, 'ask-1', 'allow');
+    expect(replay).toContain('no longer pending');
     await waitUntil(() => decisions.length === 1);
     expect(decisions).toEqual([{ decision: 'allow' }]);
     expect(second.decisions).toHaveLength(0);
@@ -640,8 +664,8 @@ describe('D16 consent binding', () => {
     expect(h.log.filter((entry) => entry.type === 'ask_answer')).toHaveLength(1);
     // A replay after every ask settles gets the bare no-pending receipt.
     h.router.dispatchAnswerAsk('ask-2', 'deny', undefined);
-    const late = await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
-    expect(late.content[0]!.text).toBe('There are no pending permission requests to answer.');
+    const late = await answerAskById(h, 'ask-1', 'allow');
+    expect(late).toBe('There are no pending permission requests to answer.');
   });
 
   it('a mistyped ask id reads differently from one that already settled', async () => {
@@ -652,17 +676,17 @@ describe('D16 consent binding', () => {
     requestAsk(h, { askId: 'ask-2', renderedRequest: 'Write: /tmp/b' });
     h.setTalkerCauseTags([]);
 
-    await callAnswerAsk(h, { askId: 'ask-1', decision: 'deny' });
+    await answerAskById(h, 'ask-1', 'deny');
     await waitUntil(() => first.decisions.length === 1);
     await waitUntil(() => h.askVoicings.length === 2);
 
-    const settled = await callAnswerAsk(h, { askId: 'ask-1', decision: 'deny' });
-    expect(settled.content[0]!.text).toContain('no longer pending');
+    const settled = await answerAskById(h, 'ask-1', 'deny');
+    expect(settled).toContain('no longer pending');
 
     h.advance(4_001);
-    const typo = await callAnswerAsk(h, { askId: 'ask-2x', decision: 'deny' });
-    expect(typo.content[0]!.text).not.toContain('no longer pending');
-    expect(typo.content[0]!.text).toContain('No permission request has that id');
+    const typo = await answerAskById(h, 'ask-2x', 'deny');
+    expect(typo).not.toContain('no longer pending');
+    expect(typo).toContain('No permission request has that id');
     // And the real ask is re-read rather than left silently pending.
     expect(h.askVoicings).toHaveLength(3);
     expect(h.router.permissionBroker.pendingAskCount).toBe(1);
@@ -674,7 +698,7 @@ describe('D16 consent binding', () => {
     const voicedSeq = h.lastVoicedSeq();
     h.setTalkerCauseTags([{ kind: 'utterance', seq: voicedSeq + 1 }]);
 
-    const result = await callAnswerAsk(h, { askId: 'ask-1', decision: 'sure go ahead' });
+    const result = await callAnswerAsk(h, { decision: 'sure go ahead' });
     expect(result.terminate).toBe(true);
     expect(result.content[0]!.text).toContain('allow or deny');
     expect(decisions).toHaveLength(0);
@@ -683,7 +707,7 @@ describe('D16 consent binding', () => {
 
   it('answers with nothing pending keep the bare no-pending receipt', async () => {
     const h = createHarness();
-    const result = await callAnswerAsk(h, { askId: 'ask-9', decision: 'allow' });
+    const result = await callAnswerAsk(h, { decision: 'allow' });
     expect(result.terminate).toBe(true);
     expect(result.content[0]!.text).toBe('There are no pending permission requests to answer.');
   });
@@ -800,11 +824,11 @@ describe('ask timeouts and settlement', () => {
     h.setTalkerCauseTags([]);
 
     h.advance(DUPLEX_ROUTER_DEFAULTS.minDeliverySpacingMs);
-    await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    await callAnswerAsk(h, { decision: 'allow' });
     expect(h.askVoicings).toHaveLength(1);
 
     h.advance(1);
-    await callAnswerAsk(h, { askId: 'ask-1', decision: 'allow' });
+    await callAnswerAsk(h, { decision: 'allow' });
     expect(h.askVoicings).toHaveLength(1);
   });
 
