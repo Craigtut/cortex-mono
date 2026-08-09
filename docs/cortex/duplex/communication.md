@@ -42,6 +42,10 @@ Two speeds, mapped to the two context channels (log-and-context.md):
 
 A facade watchdog synthesizes periodic `when_idle` progress deliveries when a reasoner run has produced nothing for an extended period, so a working reasoner is distinguishable from a hung one.
 
+**Failures.** A reasoner run that dies produces a delivery too, because otherwise the headline block still lists the delegation as live and the grounding rules have the talker honestly report "still working on it" for as long as the retry ladder runs, which on the default policy is hours. The split matters: **retrying is a headline fact, giving up is a delivery fact.** A retry in progress belongs in the status block, where it is churn that updates and expires; only an exhausted ladder or a terminal failure earns a delivery. Announcing mid-ladder hands the talker two contradictory facts about one event, and the delivery is the louder one.
+
+The boundary is the reasoner's own run. A sub-agent failure is not delivered by the facade; it reaches the reasoner through the background drain, which hands it the failed result and starts a run it can speak from. The reasoner is the right narrator there, because it knows what the failure means for the task in hand, and a facade-level delivery would bypass that judgment and race whatever the reasoner says a moment later. Two producers for one event, with the less informed one arriving first, is the defect this rule exists to avoid.
+
 ## Wake Policy
 
 Adopted vocabulary from Gemini Live's result scheduling (decisions.md D10). Every delivery and ask carries a wake class:
