@@ -65,6 +65,61 @@ describe('stripAskFence: the nonce never survives', () => {
     expect(out).toContain('and then we continue');
   });
 
+  /**
+   * The truncated-marker property held only while no `>` appeared later in
+   * the text, because the marker pattern was "everything to the next `>`"
+   * and that reads prose as a tag body. A later `>` is the ordinary case in
+   * a coding session, not the exotic one: `=>`, `->`, JSX, a diff line.
+   * These three are the reported probe and the isolated pair that showed
+   * the property was conditional, so the pattern cannot regress to a
+   * to-the-next-bracket match without one of them failing.
+   */
+  it('a truncated marker eats nothing even when a later > appears in the text', () => {
+    expect(stripAskFence('I saw <permission-request in the build log. Should I use x => y here?'))
+      .toBe('I saw [permission request omitted] in the build log. Should I use x => y here?');
+  });
+
+  it('the truncated-marker property does not depend on there being no later >', () => {
+    // Isolated pair: same sentence, the second with a `>` after the marker.
+    expect(stripAskFence('the tag <permission-request appears in that file'))
+      .toBe('the tag [permission request omitted] appears in that file');
+    expect(stripAskFence('the tag <permission-request appears in <div> that file'))
+      .toBe('the tag [permission request omitted] appears in <div> that file');
+  });
+
+  it('keeps ordinary code punctuation around a real fence intact', () => {
+    const out = stripAskFence(
+      `Use x => y. <permission-request ask="${NONCE}">Bash: ls</permission-request ask="${NONCE}"> ` +
+      'Then a -> b and <div>markup</div>.',
+    );
+    expect(out).not.toContain(NONCE);
+    expect(out).toContain('Use x => y.');
+    expect(out).toContain('Then a -> b and <div>markup</div>.');
+  });
+
+  it('a > inside a quoted attribute does not end the marker early', () => {
+    // Unpaired, which is where this shows: a paired construct swallows the
+    // stray fragment along with everything else and hides the defect.
+    const out = stripAskFence(`before <permission-request ask="${NONCE}" note="a>b"> after`);
+    expect(out).not.toContain(NONCE);
+    expect(out).not.toContain('b">');
+    expect(out).toBe(`before ${ASK_FENCE_PLACEHOLDER} after`);
+  });
+
+  it('an appended character cannot carry the nonce through', () => {
+    // A trailing word boundary let `ask-<uuid>x` survive whole.
+    const out = stripAskFence(`the id is ${NONCE}xyz here`);
+    expect(out).not.toContain(NONCE);
+    expect(out).toContain(ASK_ID_PLACEHOLDER);
+  });
+
+  it('leaves a legitimate task- prefixed uuid alone', () => {
+    // The leading boundary excludes a hyphen precisely so this survives:
+    // `\b` would not fire between `t` and `a` and would eat the id.
+    const text = 'the record task-3f7a1c2e-9b04-4d61-8a3f-5c2e7d901b64 in their table';
+    expect(stripAskFence(text)).toBe(text);
+  });
+
   it('survives nesting: no marker or nonce is left behind', () => {
     const inner = `<permission-request ask="${NONCE}">payload</permission-request ask="${NONCE}">`;
     const out = stripAskFence(

@@ -33,22 +33,48 @@ export const ASK_FENCE_PLACEHOLDER = '[permission request omitted]';
 /** Stands in for a removed ask nonce. */
 export const ASK_ID_PLACEHOLDER = '[ask id omitted]';
 
+/**
+ * The attribute region of a marker: zero or more `name="value"` pairs, with
+ * the value quoted either way or bare.
+ *
+ * Deliberately not `[^>]*`, which is the obvious spelling and is wrong. It
+ * treats everything up to the next `>` ANYWHERE in the text as the inside
+ * of a tag, so `I saw <permission-request in the log. Use x => y?` reads as
+ * one enormous marker and the strip eats the sentence. A `>` after a
+ * truncated marker is not exotic in a coding session: `=>`, `->`, a JSX
+ * tag, a diff line, or a quoted comparison all supply one. Matching actual
+ * attribute syntax means prose cannot be mistaken for a tag body, so a
+ * truncated marker falls through to {@link PARTIAL_RE}, which removes the
+ * tag token alone and leaves the sentence standing.
+ *
+ * It also fixes the quoted-`>` case for free: `ask="a>b"` is one attribute
+ * here, where the old pattern ended the tag inside the quotes.
+ */
+const ATTRIBUTES = `(?:\\s+[A-Za-z_:][\\w.:-]*\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]+))*\\s*`;
+
 // A complete marker in either direction: `<permission-request ask="x">` or
 // `</permission-request ask="x">`, tolerant of whitespace, attribute
 // quoting, and case, because the talker retypes these from its own context
 // rather than echoing bytes.
-const OPEN_MARKER = `<\\s*${PERMISSION_REQUEST_TAG}\\b[^>]*>`;
-const CLOSE_MARKER = `<\\s*\\/\\s*${PERMISSION_REQUEST_TAG}\\b[^>]*>`;
+const OPEN_MARKER = `<\\s*${PERMISSION_REQUEST_TAG}\\b${ATTRIBUTES}\\/?>`;
+const CLOSE_MARKER = `<\\s*\\/\\s*${PERMISSION_REQUEST_TAG}\\b${ATTRIBUTES}>`;
 
 /** A whole fenced construct, markers and everything between them. */
 const PAIRED_RE = new RegExp(`${OPEN_MARKER}[\\s\\S]*?${CLOSE_MARKER}`, 'gi');
 /** A complete marker with no partner. */
 const LONE_RE = new RegExp(`${OPEN_MARKER}|${CLOSE_MARKER}`, 'gi');
 /**
- * An unterminated marker: `<permission-request ask="x` with the `>` never
- * typed. Only the tag token is removed, not the rest of the line, so a
- * truncated marker cannot be used to make the stripper eat real content.
- * The nonce it was carrying is caught by {@link ASK_ID_RE} instead.
+ * Anything tag-shaped the two above did not take: an unterminated marker
+ * (`<permission-request ask="x` with the `>` never typed) or one whose
+ * attribute region is not attribute-shaped. Only the tag token is removed,
+ * never the text after it, so neither a truncated marker nor a deliberately
+ * malformed one can make the stripper eat real content. Whatever the tag
+ * was carrying stays put, and the nonce in it is caught by
+ * {@link ASK_ID_RE}, which is why removing less here costs nothing.
+ *
+ * Runs after the two complete forms, not before: it matches the tag token
+ * of every marker, so running it first would decapitate well-formed
+ * markers and leave their attribute text behind as residue.
  */
 const PARTIAL_RE = new RegExp(`<\\s*\\/?\\s*${PERMISSION_REQUEST_TAG}\\b`, 'gi');
 
@@ -63,8 +89,20 @@ const PARTIAL_RE = new RegExp(`<\\s*\\/?\\s*${PERMISSION_REQUEST_TAG}\\b`, 'gi')
  * The `ask-` prefix is required. A bare uuid is not redacted, because a
  * user can legitimately be talking about one in their own data and the
  * reasoner would need to see it.
+ *
+ * **No trailing boundary**, so `ask-<uuid>xyz` still loses the nonce. A
+ * `\b` there let one appended character carry the whole id through, which
+ * is a keystroke for a hostile talker. The leading boundary stays, and is
+ * spelled as a lookbehind rather than `\b` so it also excludes a hyphen:
+ * that is what keeps a legitimate `task-<uuid>` intact, which `\b` would
+ * not, since `\b` sees the `t` and the `a` as one word and never fires.
+ * Asymmetric on purpose. Dropping the leading one too would catch
+ * `Xask-<uuid>` and would also eat `task-<uuid>`, and protecting real task
+ * ids is worth more than closing one more hostile spelling that the fence
+ * markers no longer carry anyway.
  */
-const ASK_ID_RE = /\bask-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const ASK_ID_RE =
+  /(?<![A-Za-z0-9_-])ask-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
 /**
  * Cheap pre-filter: the tag name or an `ask-` token. Every branch below
@@ -78,12 +116,23 @@ const MAY_CONTAIN_RE = new RegExp(`${PERMISSION_REQUEST_TAG}|\\bask-`, 'i');
  * Remove ask-fence markers and ask nonces from talker-authored text bound
  * for the reasoner.
  *
- * A whole fenced construct is replaced, contents included, rather than
- * being unwrapped. Unwrapping would keep whatever sat inside, and inside a
+ * A fenced construct is replaced, contents included, rather than being
+ * unwrapped. Unwrapping would keep whatever sat inside, and inside a
  * fabricated fence that is precisely the payload; inside a real one it is
  * the rendered request, which the reasoner authored and already has. So
  * dropping it costs the reasoner nothing and denies the attacker the
  * laundering step.
+ *
+ * **Not every byte of a nested fabrication**, and the claim is worth
+ * stating narrowly. The paired match is lazy, running from an open marker
+ * to the NEXT close marker, so `<a>A<b>B</b>C</a>` loses everything through
+ * `</b>` and leaves `C` before the lone pass takes `</a>`. A greedy match
+ * would collect `C` and would also merge two unrelated fences in one
+ * message into a single construct, deleting the legitimate text between
+ * them; lazy is the right trade for the common case. What survives is a
+ * fragment of hostile prose with every marker and nonce stripped out of it,
+ * so it has no framing power left. Hostile-talker only: nothing produces
+ * nested fences legitimately.
  *
  * Text with no marker and no nonce is returned unchanged. Angle brackets on
  * their own are left alone: only this exact tag name matches, so a talker
