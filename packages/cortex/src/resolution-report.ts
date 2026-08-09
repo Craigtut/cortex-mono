@@ -200,21 +200,37 @@ export function collectAssemblyResolutionNotes(
 }
 
 /**
- * The one note that is not an assembly fact: nobody took the egress resolver
- * to wire into the sandbox. It cannot be known at assembly (a consumer wires
- * it on the line after create() returns), so it is recorded when the check
- * first runs, through the same note pathway as the rest.
+ * The one note that is not an assembly fact: nobody took the brokered egress
+ * resolver to wire into the sandbox. It cannot be known at assembly (a
+ * consumer wires it on the line after create() returns), so it is recorded
+ * when the check first runs, through the same note pathway as the rest.
+ *
+ * Duplex only, and it claims only what is observable. An earlier version
+ * asserted that egress "bypasses the permission broker and fails closed",
+ * which was an inference about consumer wiring Cortex cannot see: a consumer
+ * that hands its sandbox its own decision function answers those asks
+ * perfectly well, and the first real consumer did exactly that. What is
+ * certain is narrower: the brokered wrapper is reachable only through
+ * getNetworkAccessResolver(), so a consumer who never called it cannot have
+ * the shell path routed through the broker, and in duplex the broker is what
+ * turns an ask into speech.
  */
-export function networkResolverUnwiredNote(mode: 'duplex' | 'passthrough'): ResolutionNote {
+export function networkResolverUnwiredNote(): ResolutionNote {
   return {
     code: 'network-resolver-unwired',
     severity: 'degraded',
-    summary: 'Shell egress asks are unwired: sandbox network access fails closed.',
+    summary: 'Shell egress asks are never voiced: the sandbox bypasses the broker.',
     detail:
       'sandbox and resolveNetworkAccess are configured but getNetworkAccessResolver() ' +
-      'was never called: shell egress asks bypass the permission broker and fail closed.',
+      'was never called, so nothing the sandbox asks can reach the permission broker. ' +
+      'Shell egress is settled by whatever the sandbox was wired to instead: never ' +
+      'voiced to the talker, never recorded as an ask. WebFetch egress still routes ' +
+      'through the broker, so the same question is spoken on one path and silent on ' +
+      'the other.',
     remedy:
-      "Wire getNetworkAccessResolver() into the SandboxProvider's network ask callback.",
-    data: { mode, observedAt: 'first-prompt' },
+      "Wire getNetworkAccessResolver() into the SandboxProvider's network ask callback " +
+      'to have shell egress voiced like WebFetch is. Ignore this if the sandbox is ' +
+      'deliberately wired to your own permission UI.',
+    data: { observedAt: 'first-prompt' },
   };
 }

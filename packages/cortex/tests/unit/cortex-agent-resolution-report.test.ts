@@ -387,7 +387,12 @@ describe('resolution report: the unwired egress resolver', () => {
     const report = facade.getResolutionReport();
     expect(codes(report)).toEqual(['network-resolver-unwired']);
     expect(report[0]!.severity).toBe('degraded');
-    expect(report[0]!.data['mode']).toBe('duplex');
+    // It claims only what is observable. Asserting the absence of the old
+    // inference, not just the presence of the new wording: "fails closed" is
+    // a statement about consumer wiring Cortex cannot see, and it was false
+    // for the first consumer that read it.
+    expect(report[0]!.detail).not.toContain('fail closed');
+    expect(report[0]!.detail).toContain('never voiced to the talker');
     expect(loggedNotes(facade)).toEqual(report);
     expect(warnings).toEqual(
       report.map((note) => `[CortexAgent] ${note.detail} ${note.remedy}`),
@@ -427,18 +432,41 @@ describe('resolution report: passthrough', () => {
     expect(facade.getResolutionReport()).toEqual([]);
   });
 
-  it('still reports the unwired egress resolver, which is not a duplex condition', async () => {
-    // The sandbox fails closed the same way with no talker in front of it, so
-    // a consumer should not have to be in duplex to find out.
-    const { facade } = await createRealPassthroughScenario({
-      sandbox: fakeSandbox(),
-      resolveNetworkAccess: async () => ({ decision: 'ask' as const }),
-    });
+  it('never reports the unwired egress resolver, where the same wiring in duplex does', async () => {
+    // The note's subject is the broker, and passthrough has none:
+    // getNetworkAccessResolver() hands back the consumer's own function
+    // unchanged there, so calling it would change nothing and never calling
+    // it proves nothing. Reported anyway, this lit permanently for the first
+    // real consumer, which is pinned passthrough and wires its sandbox to its
+    // own decision function.
+    const sandbox = fakeSandbox();
+    const resolveNetworkAccess = async () => ({ decision: 'ask' as const });
 
-    await facade.prompt('hello');
-    const report = facade.getResolutionReport();
-    expect(codes(report)).toEqual(['network-resolver-unwired']);
-    expect(report[0]!.data['mode']).toBe('passthrough');
-    expect(loggedNotes(facade)).toEqual(report);
+    const { facade: passthrough } = await createRealPassthroughScenario({
+      sandbox,
+      resolveNetworkAccess,
+    });
+    await passthrough.prompt('hello');
+
+    // Positive precondition: the prompt really ran, so the check point this
+    // note is recorded from was actually reached rather than skipped.
+    expect(passthrough.getLog().filter((entry) => entry.type === 'utterance'))
+      .toHaveLength(1);
+    expect(passthrough.getResolutionReport()).toEqual([]);
+    expect(loggedNotes(passthrough)).toEqual([]);
+
+    // The second positive precondition, and the one that makes the silence
+    // above a decision rather than an accident: the SAME sandbox and the SAME
+    // resolver, differing only in mode, still produce the note. Deliberately
+    // not asserted by calling getNetworkAccessResolver() on the passthrough
+    // facade, which would set the handed-out flag and suppress the note for
+    // the wrong reason.
+    const { facade: duplex } = await createRealDuplexScenario({
+      duplex: { maxTotalCost: 25 },
+      sandbox,
+      resolveNetworkAccess,
+    });
+    await duplex.prompt('hello');
+    expect(codes(duplex.getResolutionReport())).toEqual(['network-resolver-unwired']);
   });
 });

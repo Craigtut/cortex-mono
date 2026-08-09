@@ -99,9 +99,9 @@ for (const note of agent.getResolutionReport()) {
 }
 ```
 
-`degraded` means you asked for something and are not getting it, or duplex is not delivering its premise (a talker on the primary model, a `utilityModel` the talker could not take, an unwired sandbox egress resolver). `info` means a default is in force you may want to change (no `duplex.maxTotalCost`, so no session cost ceiling).
+`degraded` means you asked for something and are not getting it, or duplex is not delivering its premise (a talker on the primary model, a `utilityModel` the talker could not take, shell egress asks that cannot be voiced because nothing took `getNetworkAccessResolver()`). `info` means a default is in force you may want to change (no `duplex.maxTotalCost`, so no session cost ceiling).
 
-Read it once after `create()` and render it wherever your configuration lives. Cortex also logs each note through your `logger` and writes it into the session log as a `lifecycle` entry, so it survives into your persistence artifact; both are generated from the report, so they cannot disagree with it. If you never wire a `logger`, the report is the only place these appear. One code, `network-resolver-unwired`, cannot be known at assembly and lands after the first `prompt()`.
+Read it once after `create()` and render it wherever your configuration lives. Cortex also logs each note through your `logger` and writes it into the session log as a `lifecycle` entry, so it survives into your persistence artifact; both are generated from the report, so they cannot disagree with it. If you never wire a `logger`, the report is the only place these appear. One code, `network-resolver-unwired`, cannot be known at assembly and lands after the first `prompt()`. It is duplex-only, and it means your shell egress asks are settled somewhere other than the broker and so are never spoken; if you wired your sandbox's `onNetworkRequest` to your own permission UI on purpose, that is what it is telling you and you can ignore it.
 
 ### When to use AgentLoop directly
 

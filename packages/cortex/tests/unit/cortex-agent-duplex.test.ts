@@ -2227,9 +2227,9 @@ describe('duplex permission broker', () => {
   });
 
   it('warns once when the network resolver is configured but never wired into the sandbox', async () => {
-    // Nothing enforces the wiring, and the misconfiguration is silent in
-    // the direction that looks fine: shell egress hard-denies and no ask is
-    // ever voiced.
+    // Nothing enforces the wiring, and in duplex the consequence is silent:
+    // whatever the sandbox was wired to settles shell egress, so the ask
+    // never becomes conversation the way WebFetch's does.
     const warnings: string[] = [];
     const logger = {
       debug: () => {}, info: () => {}, error: () => {},
@@ -2247,7 +2247,7 @@ describe('duplex permission broker', () => {
     await h.facade.prompt('hello');
     const unwired = warnings.filter((message) => message.includes('getNetworkAccessResolver()'));
     expect(unwired).toHaveLength(1);
-    expect(unwired[0]).toContain('fail closed');
+    expect(unwired[0]).toContain('never voiced to the talker');
 
     // Once only, and never again after the consumer takes it.
     await h.facade.prompt('again');

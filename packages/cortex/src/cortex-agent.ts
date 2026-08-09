@@ -3992,26 +3992,31 @@ export class CortexAgent {
   }
 
   /**
-   * Record, once, that this agent is configured for shell egress asks but
-   * nobody ever took the resolver to wire into the sandbox. Nothing enforces
-   * the wiring, and the failure is silent in the direction that looks fine:
-   * the sandbox falls back to hard-denied egress, so shell network access
-   * stops working with no ask ever voiced. That is a usability failure
-   * rather than a security one, which is exactly why it needs saying.
+   * Record, once, that this agent brokered an egress resolver that nobody
+   * ever took to wire into the sandbox, so shell egress asks cannot become
+   * conversation the way WebFetch's do.
    *
    * The one resolution note that is not an assembly fact. It cannot be: a
    * consumer wires the resolver on the line after create() returns, so the
-   * only honest moment to look is the first prompt. Checked in both modes
-   * (the sandbox fails closed the same way without a talker in front of it),
-   * and it takes the same note pathway as the assembly notes, so it reaches
-   * the report, the log and the warn identically.
+   * only honest moment to look is the first prompt.
+   *
+   * **Duplex only, and the gate is the correctness fix rather than a
+   * narrowing.** In passthrough there is no broker: getNetworkAccessResolver()
+   * hands back the consumer's own function unchanged, so calling it would
+   * change nothing and never calling it proves nothing. The check has no
+   * information content there, and it fired anyway, telling the first real
+   * consumer that its egress was broken when that consumer had wired the
+   * sandbox to its own decision function and was answering every ask through
+   * its own UI. Both call sites still call in; this guard is the single
+   * statement of the rule.
    */
   private noteUnwiredNetworkResolver(): void {
+    if (this.mode !== 'duplex') return;
     if (this.unwiredNetworkResolverWarned) return;
     if (this.networkResolverHandedOut) return;
     if (!this.sandboxConfigured || this.networkResolver === null) return;
     this.unwiredNetworkResolverWarned = true;
-    this.recordResolutionNote(networkResolverUnwiredNote(this.mode));
+    this.recordResolutionNote(networkResolverUnwiredNote());
   }
 
   // The pi queue surface targets the conversation loop: the single
