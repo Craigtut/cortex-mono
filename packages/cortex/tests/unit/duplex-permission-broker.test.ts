@@ -1002,6 +1002,131 @@ describe('ask timeouts and settlement', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The broker's own abort drain (settleAll('abort'))
+// ---------------------------------------------------------------------------
+
+/**
+ * A tool ask usually settles through its own run's abort signal, so the
+ * broker's drain looks redundant from the scenario level. It is not: a
+ * network ask carries no signal at all (NetworkAccessRequest has no abort
+ * signal to pass), so for that whole class of ask the drain is the ONLY
+ * thing that unblocks the caller. These tests drive the drain directly.
+ */
+describe("settleAll('abort')", () => {
+  it('denies every pending ask, voiced or merely queued, in intake order and explains each', async () => {
+    const h = createHarness();
+    const a = requestAsk(h, { askId: 'ask-a', renderedRequest: 'Bash: a' });
+    const b = requestAsk(h, { askId: 'ask-b', renderedRequest: 'Bash: b' });
+    const c = requestAsk(h, { askId: 'ask-c', renderedRequest: 'Bash: c' });
+    expect(h.askVoicings).toHaveLength(1);
+
+    h.router.permissionBroker.settleAll('abort');
+
+    // The queued asks settle too. A drain that only reached the voiced one
+    // would leave the loops behind ask-b and ask-c blocked on a decision
+    // nobody can now give, with nothing in the log saying why.
+    await waitUntil(() =>
+      a.decisions.length === 1 && b.decisions.length === 1 && c.decisions.length === 1);
+    for (const ask of [a, b, c]) {
+      expect(ask.decisions[0]).toEqual({
+        decision: 'deny',
+        reason: 'Aborted before the user answered the permission request.',
+      });
+    }
+
+    // One lifecycle record each, in intake order, each caused by its own ask.
+    const dropped = h.log.filter((entry) => entry.data?.['event'] === 'ask_dropped');
+    expect(dropped.map((entry) => entry.data!['askId'])).toEqual(['ask-a', 'ask-b', 'ask-c']);
+    expect(dropped.map((entry) => entry.causedBy)).toEqual([
+      h.askEntrySeq('ask-a'), h.askEntrySeq('ask-b'), h.askEntrySeq('ask-c'),
+    ]);
+    expect(dropped.every((entry) => entry.data!['cause'] === 'abort')).toBe(true);
+    // Nobody answered, so nothing in the audit trail says anyone did.
+    expect(h.log.filter((entry) => entry.type === 'ask_answer')).toHaveLength(0);
+
+    // The registry is empty, so a late answer is told so rather than
+    // rebinding to whatever is left.
+    expect(h.router.permissionBroker.pendingAskCount).toBe(0);
+    const late = await callAnswerAsk(h, { decision: 'allow' });
+    expect(late.content[0]!.text).toBe('There are no pending permission requests to answer.');
+  });
+
+  it('never voices a doomed ask, even with the coalescing window switched off', async () => {
+    // Each settlement schedules the successor's voicing, and with the
+    // window at zero that scheduling is inline. Without the drain guard the
+    // drain would therefore read ask-b out as it killed ask-a, and ask-c as
+    // it killed ask-b: the user hears two requests they cannot answer,
+    // spoken by an agent that has just been told to stop.
+    const h = createHarness({ settleVoiceDelayMs: 0 });
+    const a = requestAsk(h, { askId: 'ask-a', renderedRequest: 'Bash: a' });
+    const b = requestAsk(h, { askId: 'ask-b', renderedRequest: 'Bash: b' });
+    const c = requestAsk(h, { askId: 'ask-c', renderedRequest: 'Bash: c' });
+    expect(h.askVoicings).toHaveLength(1);
+
+    h.router.permissionBroker.settleAll('abort');
+    await waitUntil(() =>
+      a.decisions.length === 1 && b.decisions.length === 1 && c.decisions.length === 1);
+    expect(h.askVoicings).toHaveLength(1);
+
+    // And the queue went with them: the next real ask is what gets read out.
+    requestAsk(h, { askId: 'ask-d', renderedRequest: 'Bash: d' });
+    expect(h.askVoicings).toHaveLength(2);
+    expect(h.askVoicings[1]!.content).toContain('Bash: d');
+  });
+
+  it('hands a resolver blocked at abort time a refusal it can report, never a grant', async () => {
+    const h = createHarness();
+    const toolResolver = buildBrokeredPermissionResolver(
+      async () => ({ decision: 'ask' }),
+      undefined,
+      () => h.router.permissionBroker,
+    );
+    // The network resolver's ask carries no abort signal, so the drain is
+    // its only settlement path: get this wrong and egress hangs the loop.
+    const networkResolver = buildBrokeredNetworkResolver(
+      async () => ({ decision: 'ask' }),
+      () => h.router.permissionBroker,
+    );
+    const tool = toolResolver('Bash', { command: 'rm -rf /' }, {
+      askId: 'ask-tool',
+      loopPath: 'reasoner',
+      renderedRequest: 'Bash: rm -rf /',
+    });
+    const egress = networkResolver({ host: 'evil.example', port: 443, via: 'webfetch' });
+    await waitUntil(() => h.router.permissionBroker.pendingAskCount === 2);
+
+    h.router.permissionBroker.settleAll('abort');
+
+    expect(await tool).toEqual({
+      decision: 'block',
+      reason: 'Aborted before the user answered the permission request.',
+    });
+    expect(await egress).toEqual({ decision: 'deny' });
+  });
+
+  it('leaves the broker usable: the next ask still voices and still binds', async () => {
+    // The drain sets a flag that suppresses voicing while it runs. Left
+    // set (an early return, a throw inside the loop) the broker goes
+    // permanently mute: asks keep arriving, nothing is ever read out, and
+    // every one of them dies of its own timeout instead.
+    const h = createHarness();
+    const dropped = requestAsk(h, { askId: 'ask-1' });
+    h.router.permissionBroker.settleAll('abort');
+    await waitUntil(() => dropped.decisions.length === 1);
+
+    const fresh = requestAsk(h, { askId: 'ask-2', renderedRequest: 'Bash: after the abort' });
+    await waitUntil(() => h.askVoicings.length === 2);
+    expect(h.askVoicings[1]!.content).toContain('Bash: after the abort');
+
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: h.lastVoicedSeq() + 1 }]);
+    const allowed = await callAnswerAsk(h, { decision: 'allow' });
+    expect(allowed.content[0]!.text).toBe('Approval passed along.');
+    await waitUntil(() => fresh.decisions.length === 1);
+    expect(fresh.decisions).toEqual([{ decision: 'allow' }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Brokered resolvers
 // ---------------------------------------------------------------------------
 
