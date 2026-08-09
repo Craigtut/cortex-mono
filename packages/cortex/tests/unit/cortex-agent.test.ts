@@ -1033,10 +1033,9 @@ const POST_DESTROY_PROBES: Record<ForwardedLoopMember, PostDestroyProbe> = {
   disconnectMcpServer: { call: (t) => t.disconnectMcpServer('no-such-server') },
   getMcpServerStates: { call: (t) => t.getMcpServerStates() },
   mcpConfigMatches: {
-    call: (t) => t.mcpConfigMatches(
-      'no-such-server',
-      { type: 'stdio', command: 'true' } as Parameters<AgentLoop['mcpConfigMatches']>[1],
-    ),
+    // `transport`, not `type`. Written unasserted so the shape is checked
+    // against McpStdioConfig rather than waved through by a cast.
+    call: (t) => t.mcpConfigMatches('no-such-server', { transport: 'stdio', command: 'true' }),
   },
   setMcpToolCallProgressHandler: { call: (t) => t.setMcpToolCallProgressHandler(undefined) },
   getMcpClientManager: { call: (t) => t.getMcpClientManager() },
