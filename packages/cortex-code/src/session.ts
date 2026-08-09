@@ -165,7 +165,34 @@ export class Session {
   /** True when this session was launched to resume a saved one. */
   private readonly isResume: boolean;
   private saver: ReturnType<typeof createDebouncedSaver>;
+  /**
+   * True while the agent as a whole is busy: any resident loop running, a
+   * sub-agent alive, a delivery parked, an ask pending. Drives the spinner,
+   * the abort gate and the MCP reload gate.
+   *
+   * Deliberately NOT keyed on `onLoopComplete`. That callback fans out to
+   * every resident loop and carries no origin, so under duplex the talker's
+   * sub-second turn would report the whole agent idle while the reasoner is
+   * still working: the spinner would vanish and Ctrl+C would become a no-op
+   * for the rest of a multi-minute run. It is keyed on the facade's
+   * `workSettled` predicate instead, via {@link awaitWorkSettled}.
+   */
   private isRunning = false;
+  /**
+   * True from the moment `handleInput` commits to a turn until its
+   * `prompt()` settles. Conversation-scoped, unlike {@link isRunning}: it
+   * covers the pre-prompt window (ephemeral context, pre_turn hooks) that
+   * the facade cannot see, so a second input arriving in it still steers.
+   */
+  private promptInFlight = false;
+  /**
+   * Bumped whenever new work starts. A settlement wait that spans a bump is
+   * stale (the user started something else) and re-waits instead of
+   * reporting idle.
+   */
+  private workGeneration = 0;
+  /** Guards against stacking settlement waiters; one is enough. */
+  private settleWatcherActive = false;
   /**
    * In-flight OAuth resolve/refresh promises, keyed by provider. Providers like
    * Anthropic rotate the refresh token on every use and invalidate the prior
@@ -521,8 +548,12 @@ export class Session {
 
     if (!this.agent) return;
 
-    // If the agent is already running, steer it with the new message
-    if (this.isRunning) {
+    // If the CONVERSATION is already mid-turn, steer it with the new
+    // message. Deliberately narrower than isRunning: under duplex the
+    // reasoner can be minutes into a task while the talker is free, and the
+    // user's next sentence belongs to the talker as a fresh prompt, not
+    // steered into a loop that is not listening for it.
+    if (this.promptInFlight || !this.agent.conversationIdle) {
       log.info('Steering agent with user message', { text: text.slice(0, 100) });
       void this.activity.recordWorking();
       this.app!.transcript.addUserMessage(text);
@@ -547,8 +578,8 @@ export class Session {
 
     // Show spinner
     this.app!.showStatusSpinner(randomThinkingLabel());
-    this.isRunning = true;
-    this.freezeDiagnostics.setSessionRunning(true);
+    this.promptInFlight = true;
+    this.beginWork();
     await this.activity.recordWorking();
 
     // Run pre_turn hooks: outside processes can inject context the agent
@@ -584,11 +615,88 @@ export class Session {
         }
       }
     } finally {
-      this.isRunning = false;
-      this.freezeDiagnostics.setSessionRunning(false);
-      this.app!.hideStatusSpinner();
-      this.app!.focusEditor();
-      void this.activity.recordAwaitingInput();
+      this.promptInFlight = false;
+      // The turn is NOT necessarily over: under duplex prompt() resolves
+      // when the talker has spoken, with the reasoner still working. Hand
+      // the "we are done" UI to the settlement watcher, which reads the
+      // whole agent rather than the loop that happened to finish first.
+      this.watchForWorkSettled();
+    }
+  }
+
+  /**
+   * Mark the agent busy for a newly started piece of work. Bumping the
+   * generation invalidates any settlement wait already in flight, so work
+   * that starts while the previous wait is resolving cannot be reported as
+   * idle by it.
+   */
+  private beginWork(): void {
+    this.workGeneration += 1;
+    this.isRunning = true;
+    this.freezeDiagnostics.setSessionRunning(true);
+  }
+
+  /**
+   * Arm (once) a wait for the whole agent to go quiet, and apply the
+   * end-of-work UI when it does.
+   */
+  private watchForWorkSettled(): void {
+    if (this.settleWatcherActive) return;
+    this.settleWatcherActive = true;
+    void this.awaitWorkSettled()
+      .then((settled) => {
+        if (settled) this.applyWorkSettledUi();
+      })
+      .catch((err: unknown) => {
+        log.debug('Work settlement wait failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        this.settleWatcherActive = false;
+      });
+  }
+
+  /**
+   * Resolve true once the agent as a whole is quiet. Resolves false when the
+   * verdict no longer belongs to this session (the agent was replaced or
+   * torn down), so the caller leaves the UI alone.
+   */
+  private async awaitWorkSettled(): Promise<boolean> {
+    const agent = this.agent;
+    if (!agent) return false;
+    for (;;) {
+      const generation = this.workGeneration;
+      await agent.waitForWorkSettled();
+      if (this.agent !== agent) return false;
+      // A destroyed agent is as settled as it will ever get; without this a
+      // prompt() that rejected on teardown would leave the spinner up.
+      if (agent.state === 'destroyed' || agent.state === 'destroying') return true;
+      if (this.workGeneration !== generation) continue;
+      if (agent.workSettled) return true;
+    }
+  }
+
+  /**
+   * The end-of-work UI: everything the user reads as "the agent is done and
+   * waiting for me". Fires once per settled exchange, not once per loop.
+   */
+  private applyWorkSettledUi(): void {
+    this.isRunning = false;
+    this.promptInFlight = false;
+    this.freezeDiagnostics.setSessionRunning(false);
+    this.app?.transcript.closeActiveToolGroups();
+    this.app?.hideStatusSpinner();
+    this.app?.focusEditor();
+    void this.activity.recordAwaitingInput();
+    // One completed exchange: advance the title cadence (regenerates every
+    // N turns, idle here so it never competes with the main loop).
+    this.titleManager?.onUserTurnComplete();
+    // If the MCP config changed during the turn, apply it now. Doing this
+    // here (vs mid-turn) avoids invalidating the tool snapshot that
+    // pi-agent-core captured at prompt() entry.
+    if (this.mcpReloadPending) {
+      void this.runQueuedMcpReload();
     }
   }
 
@@ -1095,24 +1203,15 @@ export class Session {
       workingTagOpen = false;
     });
 
-    // Loop complete (auto-save, update footer, hide spinner)
+    // A loop finished. Not "the agent is idle": this callback is registered
+    // on every resident loop and carries no origin, so under duplex the
+    // talker's sub-second turn fires it while the reasoner is minutes from
+    // done. Only the cheap per-loop refresh happens here; the end-of-work
+    // UI waits for the facade's settlement predicate.
     this.agent.onLoopComplete(() => {
-      this.isRunning = false;
       this.triggerAutoSave();
       this.updateFooterContextUsage();
-      this.app?.transcript.closeActiveToolGroups();
-      this.app?.hideStatusSpinner();
-      this.app?.focusEditor();
-      void this.activity.recordAwaitingInput();
-      // One completed user turn: advance the title cadence (regenerates every
-      // N turns, idle here so it never competes with the main loop).
-      this.titleManager?.onUserTurnComplete();
-      // If the MCP config changed during the turn, apply it now. Doing this
-      // here (vs mid-turn) avoids invalidating the tool snapshot that
-      // pi-agent-core captured at prompt() entry.
-      if (this.mcpReloadPending) {
-        void this.runQueuedMcpReload();
-      }
+      this.watchForWorkSettled();
     });
 
     // Error handling with per-category display
@@ -1257,7 +1356,7 @@ export class Session {
     // Background sub-agent result delivery: Cortex restarts the agentic loop
     // automatically; update TUI state so the user sees activity.
     this.agent.onBackgroundResultDelivery(() => {
-      this.isRunning = true;
+      this.beginWork();
       this.app!.showStatusSpinner('Processing background results...');
       void this.activity.recordWorking();
     });
@@ -2021,9 +2120,14 @@ export class Session {
    * Abort the current agent loop without destroying.
    *
    * Skipped once teardown has begun: the editor discards the promise this
-   * returns (Ctrl+C is fire-and-forget), and CortexAgent.abort() throws on a
-   * destroyed agent where the loop's abort() was a no-op, so a Ctrl+C landing
-   * inside shutdown()'s destroy await would otherwise reject unhandled.
+   * returns (Ctrl+C is fire-and-forget), so anything that rejects in here
+   * rejects unhandled. CortexAgent.abort() is itself a no-op after destroy,
+   * but abort() during shutdown still has nothing to cancel and its activity
+   * record would land after the "done" record, so skip the whole body.
+   *
+   * The `isRunning` gate is what makes Ctrl+C work at all, which is why that
+   * flag is keyed on the facade's settlement predicate and not on any single
+   * loop's completion.
    */
   async abort(): Promise<void> {
     this.freezeDiagnostics.recordAbortRequested('session.abort');
@@ -2037,6 +2141,7 @@ export class Session {
       });
     }
     this.isRunning = false;
+    this.promptInFlight = false;
     this.freezeDiagnostics.setSessionRunning(false);
     this.app?.hideStatusSpinner();
     this.app?.focusEditor();
