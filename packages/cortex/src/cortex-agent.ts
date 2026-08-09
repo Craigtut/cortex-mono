@@ -743,6 +743,11 @@ export const AGENT_LOOP_DELEGATION = {
   // currently unrecoverable and unrecorded; routing it to the session log
   // is 2b delivery routing.
   clearAllQueues: 'subsumed',
+  // Withheld: a retraction primitive the facade uses to drop permission
+  // voicings whose ask an abort already settled. It asks the caller to
+  // recognize its own content by text, which is a composition concern; a
+  // consumer wanting to drop queued content has clearQueuedDeliveries().
+  dropPendingWakeDeliveries: 'withheld',
   // Asks and headlines.
   getPendingAsks: 'forwarded',
   markAskVoiced: 'forwarded',
@@ -1215,6 +1220,23 @@ function clipFailureDetail(message: string): string {
     : trimmed;
 }
 
+/**
+ * Why a voicing hand-off was refused. Surfaces in the broker's delivery-failed
+ * log line, so a deliberate hold reads as one rather than as a talker fault.
+ */
+const ASK_VOICING_HELD_REASON =
+  'conversation aborted; the permission request is held until the conversation reopens';
+
+/**
+ * Cap on remembered ask-voicing texts. They exist only to recognize the
+ * facade's own content among the talker's PARKED deliveries, which a run
+ * drains at the next turn, so the live window is a handful at most. An
+ * evicted text degrades to "not recognized as a voicing", which leaves a
+ * moot request readable rather than dropping something else: the safe
+ * direction for a bounded cache to fail in.
+ */
+const MAX_TRACKED_ASK_VOICINGS = 32;
+
 /** Append the D17 speak-now appendix to a control-tool receipt. */
 function appendSpeakNudge(content: unknown): unknown {
   const nudge = `\n\n${SPEAK_NOW_APPENDIX}`;
@@ -1256,6 +1278,21 @@ export class CortexAgent {
   private reasonerFailureDeliveredThisRun = false;
   /** One truncation repair per streak (D17 stop-reason audit). */
   private talkerRepairPending = false;
+  /**
+   * Ask-voicing texts handed to the talker, so the facade can recognize its
+   * own voicings among the talker's parked deliveries and retract the ones
+   * an abort has made moot. Bounded; see MAX_TRACKED_ASK_VOICINGS.
+   */
+  private readonly trackedAskVoicings = new Set<string>();
+  /** True while a conversation abort is refusing voicing hand-offs. */
+  private askVoicingHeld = false;
+  /**
+   * A voicing was withheld by a conversation abort and the request is now
+   * pending and silent. It is read out again the next time the conversation
+   * surface receives input, which is the next moment the agent is talking to
+   * the user anyway.
+   */
+  private deferredAskVoicing = false;
   /** The consumer's base prompt without the appended role prompts. */
   private consumerBasePrompt: string | null = null;
   /**
@@ -1533,6 +1570,17 @@ export class CortexAgent {
       // cause tag, so the run that voices the request is identifiable to
       // the consent check (an answer from that same run cannot bind).
       voiceAskToTalker: (content, causeTag) => {
+        if (this.askVoicingHeld) {
+          // A conversation abort just happened: the user said stop, so the
+          // request is not read out now. Refusing the hand-off is how the
+          // ask stays SAFE while it stays quiet: the broker treats a throw
+          // as "nothing reached the user" and withdraws the consent anchor,
+          // which is exactly true here. Delivering and then discarding
+          // would leave the ask anchored for a voicing nobody heard.
+          throw new Error(ASK_VOICING_HELD_REASON);
+        }
+        this.deferredAskVoicing = false;
+        this.trackAskVoicing(content);
         talker.deliver(content, { wake: true, causeTag });
       },
       // Keep the loop registry's voiced flag truthful for tool asks so
@@ -2431,6 +2479,9 @@ export class CortexAgent {
         causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag,
         ...(options ? { promptOptions: options } : {}),
       });
+      // The user is back, so a request an abort silenced is read out again,
+      // behind this input rather than ahead of it.
+      this.reopenHeldAskVoicing();
       if (result.outcome === 'prompted' && result.turn) {
         return await result.turn;
       }
@@ -2592,12 +2643,17 @@ export class CortexAgent {
     // context and carries no causation). Only a 'user' speaker mints the
     // consent-qualifying kind: a consumer notification spoken on this
     // surface must never be able to satisfy a pending permission ask.
-    return talker.deliver(wrapped, {
+    const result = talker.deliver(wrapped, {
       ...(options?.wake !== undefined ? { wake: options.wake } : {}),
       ...(options?.wake !== false
         ? { causeTag: { kind: causeKind, seq: entry.seq } satisfies CauseTag }
         : {}),
     });
+    // A waking delivery reopens the conversation channel, so a request an
+    // abort silenced is read out behind it. A silent one does not: nothing
+    // is being said to the user yet.
+    if (options?.wake !== false) this.reopenHeldAskVoicing();
+    return result;
   }
 
   /**
@@ -2652,6 +2708,8 @@ export class CortexAgent {
       if (scope === 'conversation' || scope === 'all') {
         this.router!.dropPendingDeliveries();
         this.recordDroppedQueueContent(this.talker!, 'abort', this.talker!.clearAllQueues());
+        // Everything parked is gone, voicings included.
+        this.trackedAskVoicings.clear();
         work.push(this.talker!.abort());
         // Quick lookups belong to the conversation surface (abort table):
         // cancelled here, untouched by a 'work' abort.
@@ -2673,15 +2731,16 @@ export class CortexAgent {
         // asks through each aborted run's own signal race, network asks
         // (which carry no signal) here. Double settlement is guarded.
         this.router!.permissionBroker.settleAll('abort');
+        // Settling an ask kills the request; it does not kill the voicing
+        // that was already handed to the talker. A voicing parked behind a
+        // busy talker outlives its ask, gets read out afterwards, and the
+        // user's answer then lands in an empty registry and is told there
+        // is nothing pending. Retract the voicings with their asks.
+        this.dropMootAskVoicings('abort');
       }
       await Promise.all(work);
       if (scope === 'conversation') {
-        // The work loops kept running, so a voiced ask is still pending,
-        // but its voicing delivery was destroyed with the talker's queues
-        // (clearAllQueues takes it before the loop's own dead-letter path
-        // can report it). Treat it as unheard: withdraw the anchor and read
-        // it out again.
-        this.router!.permissionBroker.noteVoicingLost();
+        this.holdVoicingForReopen();
       }
       return;
     }
@@ -2697,6 +2756,101 @@ export class CortexAgent {
       }
     }
     await Promise.all(work);
+  }
+
+  /**
+   * Remember a voicing text so the facade can recognize it later among the
+   * talker's parked deliveries. FIFO-bounded (Sets iterate insertion-order).
+   */
+  private trackAskVoicing(content: string): void {
+    this.trackedAskVoicings.add(content);
+    while (this.trackedAskVoicings.size > MAX_TRACKED_ASK_VOICINGS) {
+      const oldest = this.trackedAskVoicings.values().next().value;
+      if (oldest === undefined) break;
+      this.trackedAskVoicings.delete(oldest);
+    }
+  }
+
+  /**
+   * Retract ask voicings still parked on the talker after their asks were
+   * settled wholesale. Only the facade's own voicing texts are matched, so
+   * a parked user utterance (and the cause tag that makes it able to grant
+   * consent) is left exactly where it is.
+   */
+  private dropMootAskVoicings(reason: 'abort' | 'restore'): void {
+    const talker = this.talker;
+    if (!talker || this.trackedAskVoicings.size === 0) return;
+    const dropped = talker.dropPendingWakeDeliveries(
+      (content) => this.trackedAskVoicings.has(content),
+    );
+    // Every ask is gone, so every remembered voicing is moot whether or not
+    // it was still parked.
+    this.trackedAskVoicings.clear();
+    if (dropped.length === 0) return;
+    this.appendEntry({
+      type: 'lifecycle',
+      loopPath: talker.loopPath,
+      content: `${dropped.length} permission voicing(s) dropped by ${reason}: their requests are settled`,
+      data: { event: 'ask_voicing_dropped', reason, count: dropped.length },
+      causedBy: null,
+    });
+  }
+
+  /**
+   * Conversation abort with a voiced ask still pending on live work.
+   *
+   * Two facts have to come apart here. The user never heard this request
+   * (its voicing went with the talker's queues, or its read-out turn was
+   * aborted mid-sentence), so the consent anchor must be withdrawn NOW:
+   * left standing, the user's next words would satisfy D16's "an utterance
+   * after the voicing" test for a request nobody read to them. But the user
+   * just said stop, and following that with the agent immediately talking
+   * again is the opposite of what they asked for.
+   *
+   * So the anchor is withdrawn and the read-out is not performed. Holding
+   * the hand-off is what keeps those consistent: the broker's contract is
+   * that a refused hand-off means nothing reached the user, which is
+   * literally true, and it leaves the ask pending, silent and answerable
+   * with no anchor. The request is read out again at the next conversation
+   * opening ({@link reopenHeldAskVoicing}); until then it is still visible
+   * in the headline block and still bounded by its own timeout.
+   */
+  private holdVoicingForReopen(): void {
+    const broker = this.router?.permissionBroker;
+    if (!broker) return;
+    this.askVoicingHeld = true;
+    let held: boolean;
+    try {
+      held = broker.noteVoicingLost();
+    } finally {
+      this.askVoicingHeld = false;
+    }
+    if (!held) return;
+    this.deferredAskVoicing = true;
+    this.appendEntry({
+      type: 'lifecycle',
+      loopPath: this.talker!.loopPath,
+      content: 'Permission request held silent after a conversation abort; ' +
+        'it will be read out again when the conversation reopens',
+      data: { event: 'ask_voicing_deferred', reason: 'conversation_abort' },
+      causedBy: null,
+    });
+  }
+
+  /**
+   * The conversation surface just received input, so the channel is open
+   * again: read out any request {@link holdVoicingForReopen} silenced.
+   * Called after the input is handed to the talker, so the voicing parks
+   * behind that run and arrives carrying its ask cause tag, which is what
+   * stops the same run from granting the request it is about to read.
+   */
+  private reopenHeldAskVoicing(): void {
+    if (!this.deferredAskVoicing) return;
+    this.deferredAskVoicing = false;
+    // noteVoicingLost rather than revoiceCurrent: the anchor is already
+    // withdrawn and this re-read must take a fresh one, and it must not be
+    // swallowed by the re-voice damping window the abort just stamped.
+    this.router?.permissionBroker.noteVoicingLost();
   }
 
   /** Tear down the facade and its loops. Idempotent; shares one teardown. */
@@ -2953,6 +3107,11 @@ export class CortexAgent {
     this.aggregateGuard?.reset();
     this.aggregateBreachLogged = false;
     this.talkerRepairPending = false;
+    // Voicings of the replaced session's asks: the queues that held them are
+    // already cleared above, and resetForRestore settled the asks, so there
+    // is nothing left for a deferred read-out to be about.
+    this.trackedAskVoicings.clear();
+    this.deferredAskVoicing = false;
   }
 
   /**

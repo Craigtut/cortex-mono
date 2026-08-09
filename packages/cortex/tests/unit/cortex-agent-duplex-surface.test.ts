@@ -15,6 +15,7 @@ import {
   createRealDuplexScenario,
   destroyLiveFacades,
   getBroker,
+  lifecycleEvents,
   promptTexts,
   settle,
   testModel,
@@ -270,5 +271,71 @@ describe('duplex deliver fencing', () => {
     expect(logged).toContain('spoken words');
     expect(logged).toContain('system words');
     expect(logged.some((line) => line.includes('<external-update>'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5: a scope that settles asks must retract their voicings too
+// ---------------------------------------------------------------------------
+
+describe('duplex abort and parked ask voicings', () => {
+  it("abort('work') does not let a dead request get read out afterwards", async () => {
+    const { facade, talkerLoop, talkerPi } = await createRealDuplexScenario(ASKING_NETWORK);
+    const resolver = facade.getNetworkAccessResolver();
+    if (!resolver) throw new Error('duplex did not wire a network resolver');
+
+    // Busy talker, so the voicing parks instead of being read out now.
+    talkerPi.hold = true;
+    const spoken = facade.prompt('kick something off');
+    await waitUntil(() => talkerPi.promptCalls.length === 1, 2000, 'talker busy');
+
+    const blocked = resolver(EGRESS);
+    await waitUntil(() => talkerLoop.pendingWakeDeliveryCount === 1, 2000, 'voicing parked');
+
+    // The work is stopped, so the request dies with it.
+    await facade.abort('work');
+    expect(await blocked).toEqual({ decision: 'deny' });
+    expect(facade.getPendingAsks()).toEqual([]);
+
+    // Release the talker. Its next run must not read out a request that no
+    // longer exists: the user would answer it into an empty registry and be
+    // told there is nothing pending.
+    talkerPi.releaseRun();
+    await spoken;
+    await waitUntil(() => facade.conversationIdle, 2000, 'talker idle');
+    await settle();
+
+    const voiced = promptTexts(talkerPi).filter((text) => text.includes('<permission-request'));
+    expect(voiced).toEqual([]);
+    expect(lifecycleEvents(facade, 'ask_voicing_dropped')).toHaveLength(1);
+  });
+
+  it('leaves other parked content, and its cause tags, alone', async () => {
+    const { facade, talkerLoop, talkerPi } = await createRealDuplexScenario(ASKING_NETWORK);
+    const resolver = facade.getNetworkAccessResolver();
+    if (!resolver) throw new Error('duplex did not wire a network resolver');
+
+    talkerPi.hold = true;
+    const spoken = facade.prompt('kick something off');
+    await waitUntil(() => talkerPi.promptCalls.length === 1, 2000, 'talker busy');
+
+    const blocked = resolver(EGRESS);
+    await waitUntil(() => talkerLoop.pendingWakeDeliveryCount === 1, 2000, 'voicing parked');
+    // A user barge-in parks behind the voicing.
+    const bargeIn = facade.prompt('actually, also check the logs');
+    await waitUntil(() => talkerLoop.pendingWakeDeliveryCount === 2, 2000, 'barge-in parked');
+
+    await facade.abort('work');
+    expect(await blocked).toEqual({ decision: 'deny' });
+    // Only the voicing was retracted.
+    expect(talkerLoop.pendingWakeDeliveryCount).toBe(1);
+
+    talkerPi.releaseRun();
+    await Promise.all([spoken, bargeIn]);
+    await waitUntil(() => facade.conversationIdle, 2000, 'talker idle');
+
+    const sweep = promptTexts(talkerPi).join('\n');
+    expect(sweep).toContain('actually, also check the logs');
+    expect(sweep).not.toContain('<permission-request');
   });
 });

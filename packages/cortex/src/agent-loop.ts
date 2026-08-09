@@ -2518,6 +2518,34 @@ export class AgentLoop {
     return this.queuedSilentDeliveries.splice(0).map((item) => item.content);
   }
 
+  /**
+   * Retract parked wake deliveries whose content matches `predicate`,
+   * returning the dropped content in queue order. Silent deliveries and pi's
+   * queues are untouched.
+   *
+   * The narrow form exists because the broad one destroys information. An
+   * owner that needs to retract ONE class of parked content (a facade
+   * dropping permission voicings whose ask has already been settled, so a
+   * dead request is never read out) would otherwise have to call
+   * {@link clearAllQueues} and re-deliver the survivors, which loses their
+   * cause tags: a parked user utterance re-delivered without its tag can no
+   * longer satisfy a permission ask, so retracting one delivery would
+   * silently revoke the consent value of another.
+   *
+   * Nothing is dead-lettered here. The drop is the caller's deliberate
+   * decision about content it produced, not a delivery failure, and the
+   * caller is the one holding the context to record it.
+   */
+  dropPendingWakeDeliveries(predicate: (content: string) => boolean): string[] {
+    const dropped: string[] = [];
+    this.pendingWakeDeliveries = this.pendingWakeDeliveries.filter((item) => {
+      if (!predicate(item.content)) return true;
+      dropped.push(item.content);
+      return false;
+    });
+    return dropped;
+  }
+
   // -----------------------------------------------------------------------
   // Pending permission asks
   // -----------------------------------------------------------------------

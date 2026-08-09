@@ -2088,18 +2088,60 @@ describe('duplex permission broker', () => {
     expect(facade.getPendingAsks()).toEqual([]);
   });
 
-  it("abort('conversation') keeps the ask pending and re-voices it", async () => {
+  it("abort('conversation') keeps the ask pending and silent until the conversation reopens", async () => {
     const { facade, talkerLoop, talkerPi } = createDuplexFacade();
     const { decisions } = startToolAsk(facade, 'ask-rv', 'Bash: make deploy');
     await waitUntil(() => talkerPi.promptCalls.length === 1);
     await waitUntil(() => !talkerLoop.isLoopActive);
+    const voicings = (): number => talkerPi.promptCalls
+      .filter((call) => promptText(call).includes('ask-rv')).length;
 
     await facade.abort('conversation');
-    // The work side kept running, so the ask survives and is read again.
+    // The work side kept running, so the ask survives.
     expect(decisions).toHaveLength(0);
     expect(getBroker(facade).pendingAskCount).toBe(1);
-    await waitUntil(() => talkerPi.promptCalls
-      .filter((call) => promptText(call).includes('ask-rv')).length >= 2);
+    // But "stop talking" is not followed by talking. The request is held,
+    // and the log says so rather than leaving it looking like a drop.
+    for (let tick = 0; tick < 8; tick++) await new Promise((r) => setTimeout(r, 1));
+    expect(voicings()).toBe(1);
+    expect(facade.getLog().some((entry) =>
+      (entry.data as { event?: string } | undefined)?.event === 'ask_voicing_deferred')).toBe(true);
+
+    // The next conversation input reopens the channel, and the request is
+    // read out again behind it.
+    await facade.prompt('where were we?');
+    await waitUntil(() => voicings() >= 2);
+    expect(getBroker(facade).pendingAskCount).toBe(1);
+  });
+
+  it('a request silenced by a conversation abort cannot be approved off the words that reopen the channel', async () => {
+    // The other half of holding the request: silence must not come at the
+    // cost of safety. The old immediate re-voice made these same words a
+    // valid approval, because by then the request HAD been read out again.
+    // Held, it has not been, so they cannot approve it.
+    const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+    const { decisions } = startToolAsk(facade, 'ask-anchor', 'Bash: make deploy');
+    await waitUntil(() => talkerPi.promptCalls.length === 1);
+    await waitUntil(() => !talkerLoop.isLoopActive);
+
+    await facade.abort('conversation');
+    await waitUntil(() => !talkerLoop.isLoopActive);
+
+    // The user comes back, which reopens the channel and re-reads the
+    // request. Those words were spoken BEFORE the re-read, so they cannot
+    // approve it, however the talker reports them.
+    talkerPi.hold = true;
+    const spoken = facade.prompt('yes, go ahead');
+    await waitUntil(() => talkerPi.promptCalls.length >= 2);
+    const outcome = getBroker(facade).answer('ask-anchor', 'allow', undefined);
+
+    expect(outcome.refusal).toBeDefined();
+    expect(decisions).toHaveLength(0);
+    expect(getBroker(facade).pendingAskCount).toBe(1);
+
+    talkerPi.hold = false;
+    talkerPi.releaseRun();
+    await spoken;
   });
 
   it('a real barge-in yes riding the same run as the voicing still cannot grant it', async () => {
