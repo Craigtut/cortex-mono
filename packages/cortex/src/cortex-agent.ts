@@ -94,6 +94,7 @@ import type { DuplexRouterOptions, DuplexRouterPorts } from './duplex/router.js'
 import { collectCauseTags, latestCauseSeq } from './duplex/cause-tags.js';
 import { FanOutContextManager } from './duplex/fanout-context-manager.js';
 import { DuplexHeadlines } from './duplex/headlines.js';
+import { stripAskFence } from './duplex/ask-fence.js';
 import type { CauseTag } from './duplex/cause-tags.js';
 import { buildControlTools, isControlToolName } from './duplex/control-tools.js';
 import {
@@ -1629,7 +1630,12 @@ export class CortexAgent {
         loopPath: origin.loopPath,
         content: output.userFacing,
       });
-      router.noteTalkerReply(output.userFacing);
+      // The log entry above keeps the raw text on purpose: it is the audit
+      // trail and has to record what the talker actually said. Only the
+      // reasoner-bound copy is sanitized, so a talker that quotes a
+      // permission marker cannot carry the fence nonce to the loop that
+      // authors the fenced content.
+      router.noteTalkerReply(stripAskFence(output.userFacing));
     });
     this.wireErrorProducers(talker);
     this.wireErrorProducers(this.reasoner);
@@ -2772,6 +2778,7 @@ export class CortexAgent {
         // Quick lookups belong to the conversation surface (abort table):
         // cancelled here, untouched by a 'work' abort.
         if (this.lookups) work.push(this.lookups.cancelAll());
+        this.router!.permissionBroker.settleAll('abort');
       }
       if (scope === 'work' || scope === 'all') {
         this.router!.dropWorkContext();
@@ -2788,7 +2795,7 @@ export class CortexAgent {
         // Pending asks belong to the stopped work and settle as deny: tool
         // asks through each aborted run's own signal race, network asks
         // (which carry no signal) here. Double settlement is guarded.
-        this.router!.permissionBroker.settleAll('abort');
+        // mutation: drain removed from the work branch
         // Settling an ask kills the request; it does not kill the voicing
         // that was already handed to the talker. A voicing parked behind a
         // busy talker outlives its ask, gets read out afterwards, and the
