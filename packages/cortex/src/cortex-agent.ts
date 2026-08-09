@@ -87,6 +87,13 @@ import type {
   WakeClass,
 } from './session-log.js';
 import { NOOP_LOGGER } from './noop-logger.js';
+import {
+  cloneResolutionNote,
+  collectAssemblyResolutionNotes,
+  networkResolverUnwiredNote,
+  resolutionWarnText,
+} from './resolution-report.js';
+import type { ResolutionNote } from './resolution-report.js';
 import { stripWorkingTags, WorkingTagStreamFilter } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter } from './duplex/router.js';
@@ -634,28 +641,23 @@ export function buildTalkerConfig(
   // outright on any consumer whose talker runs elsewhere. Copying nothing is
   // wrong too: the talker defaults to the fast tier of the PRIMARY provider,
   // so the providers match for most consumers and the setting is exactly
-  // what they meant. So: copy when it can apply, and say so out loud when it
-  // cannot, because that is the one case where the talker's observational
-  // spend silently goes to a model the consumer did not choose.
+  // what they meant. So: copy when it can apply, and skip when it cannot.
+  //
+  // The skip is the one case where the talker's observational spend silently
+  // goes to a model the consumer did not choose, and it is reported as a
+  // 'talker-utility-model-skipped' resolution note. That note is read off
+  // the ASSEMBLED loops rather than announced from here, so it cannot claim
+  // a skip this branch did not make (resolution-report.ts).
   if (config.utilityModel === 'default') {
     // Not a model, so no provider to disagree with: it means auto-resolve,
     // which is what the talker would do anyway. Copied so the two loops
     // report the same dial.
     talker.utilityModel = 'default';
-  } else if (config.utilityModel !== undefined) {
-    if (config.utilityModel.provider === talkerModel.provider) {
-      talker.utilityModel = config.utilityModel;
-    } else {
-      (config.logger ?? NOOP_LOGGER).warn(
-        `[CortexAgent] utilityModel "${config.utilityModel.modelId}" is a ` +
-        `"${config.utilityModel.provider}" model, and the talker runs on ` +
-        `"${talkerModel.modelId}" ("${talkerModel.provider}"), which rejects a ` +
-        'utility model from another provider. The talker will run its ' +
-        'observational memory on its own auto-resolved utility model instead; ' +
-        'the reasoner uses the one you set. To have both loops use it, set ' +
-        `talker.model to a "${config.utilityModel.provider}" model.`,
-      );
-    }
+  } else if (
+    config.utilityModel !== undefined &&
+    config.utilityModel.provider === talkerModel.provider
+  ) {
+    talker.utilityModel = config.utilityModel;
   }
 
   // Shared environment-level wiring.
@@ -1261,6 +1263,13 @@ export interface CortexDeliverOptions {
 
 const DEFAULT_STATE_DEBOUNCE_MS = 500;
 
+/**
+ * Producer identity on a resolution note's lifecycle entry. Not a loop: the
+ * facade resolved the configuration, and attributing it to the reasoner or
+ * the talker would claim a loop said something about its own assembly.
+ */
+const RESOLUTION_LOOP_PATH = 'facade';
+
 /** One macrotask yield: lets pending microtask cascades finish. */
 function yieldMacrotask(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
@@ -1454,6 +1463,15 @@ export class CortexAgent {
   private destroyPromise: Promise<void> | null = null;
   private destroyed = false;
 
+  /**
+   * What this assembly resolved to where it differs from what was asked for
+   * (resolution-report.ts). Computed once at construction, plus the one
+   * condition that cannot be known then (the unwired egress resolver). The
+   * warns and the lifecycle log entries are both derived from these, never
+   * written alongside them.
+   */
+  private readonly resolutionNotes: ResolutionNote[] = [];
+
   private constructor(reasoner: AgentLoop, config: CortexAgentConfig, talker?: AgentLoop) {
     this.mode = config.mode ?? DEFAULT_MODE;
     if (this.mode === 'duplex' && !talker) {
@@ -1493,6 +1511,10 @@ export class CortexAgent {
       this.wireLogProducers();
     }
     this.wireStateTriggers();
+    // Last, because it reads the assembly back: the loops are built, the
+    // aggregate guard exists, and every note below is a statement about what
+    // this constructor just produced.
+    this.collectAssemblyResolution(config);
   }
 
   /**
@@ -1534,20 +1556,11 @@ export class CortexAgent {
         // provider Cortex cannot enumerate (Ollama, custom OpenAI-compatible
         // endpoints) it falls back to the primary model, so duplex still
         // assembles and runs but the talker is as slow as the reasoner,
-        // which is the whole latency case gone. Say so once at construction
-        // rather than leaving it to be discovered as unexplained latency.
+        // which is the whole latency case gone. That outcome is reported as
+        // a 'talker-model-fallback' resolution note, computed in the
+        // constructor from the loops as assembled rather than from this
+        // local, so the report describes the agent that exists.
         const talkerModel = brokered.talker?.model ?? reasoner.getAutoResolvedUtilityModel();
-        if (
-          brokered.talker?.model === undefined &&
-          talkerModel.provider === reasoner.getModel().provider &&
-          talkerModel.modelId === reasoner.getModel().modelId
-        ) {
-          (brokered.logger ?? NOOP_LOGGER).warn(
-            `[CortexAgent] No fast model resolved for provider "${talkerModel.provider}"; ` +
-            `the talker will run on the primary model "${talkerModel.modelId}". ` +
-            'Set talker.model to a fast model, or use mode: \'passthrough\'.',
-          );
-        }
         talker = await AgentLoop.create(buildTalkerConfig(brokered, talkerModel));
       } catch (err) {
         // A half-assembled duplex must not leak a live reasoner.
@@ -1841,24 +1854,18 @@ export class CortexAgent {
       includeChildUsage: true,
       includeUtilityUsage: true,
     };
+    // No finite default is invented when maxTotalCost is unset: a
+    // session-level cost ceiling that silently aborts a long session is a
+    // worse failure than an uncapped one, and any number Cortex picked would
+    // be wrong for somebody. What is not acceptable is picking silently,
+    // because the shape of duplex hides the exposure: two resident loops,
+    // sub-agents, quick lookups and doubled observational spend, while the
+    // only cost number most consumers set (budgetGuard.maxCost) keeps its
+    // per-prompt meaning on the reasoner and bounds none of it. The uncapped
+    // guard is reported as a 'duplex-cost-cap-unset' resolution note, read
+    // back off the guard this builds rather than from the config.
     if (config.duplex?.maxTotalCost !== undefined) {
       aggregateConfig.maxCost = config.duplex.maxTotalCost;
-    } else {
-      // No finite default is invented here: a session-level cost ceiling
-      // that silently aborts a long session is a worse failure than an
-      // uncapped one, and any number Cortex picked would be wrong for
-      // somebody. What is not acceptable is picking silently, because the
-      // shape of duplex hides the exposure: two resident loops, sub-agents,
-      // quick lookups and doubled observational spend, while the only cost
-      // number most consumers set (budgetGuard.maxCost) keeps its per-prompt
-      // meaning on the reasoner and bounds none of it. Same remedy as the
-      // talker-model fallback: say it once at assembly.
-      this.logger.warn(
-        'duplex has no aggregate spend cap. budgetGuard.maxCost is per prompt on the ' +
-        'reasoner and does not bound the session, so both resident loops, sub-agents, ' +
-        'quick lookups and observational spend accumulate without a ceiling. ' +
-        'Set duplex.maxTotalCost.',
-      );
     }
     this.aggregateGuard = new BudgetGuard(
       aggregateConfig,
@@ -2543,6 +2550,7 @@ export class CortexAgent {
     if (this.mode === 'duplex') {
       return this.promptDuplex(input, options);
     }
+    this.noteUnwiredNetworkResolver();
 
     this.pendingFacadePrompts += 1;
     const run = this.promptChain.then(async () => {
@@ -2587,7 +2595,7 @@ export class CortexAgent {
   /** Duplex prompt path: talker deliver(), never talker prompt() (F15). */
   private async promptDuplex(input: string, options?: DirectCompletionOptions): Promise<unknown> {
     const talker = this.talker!;
-    this.warnOnUnwiredNetworkResolver();
+    this.noteUnwiredNetworkResolver();
     this.pendingFacadePrompts += 1;
     try {
       const entry = this.appendEntry({
@@ -3029,6 +3037,77 @@ export class CortexAgent {
     if (this.destroyed) {
       throw new Error('CortexAgent has been destroyed');
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Resolution report
+  // -------------------------------------------------------------------------
+
+  /**
+   * What this assembly resolved to, where that differs from what was asked
+   * for: the talker silently on the primary model, a utilityModel the talker
+   * could not take, an unwired egress resolver, an uncapped session
+   * (resolution-report.ts for the full rationale).
+   *
+   * Present in both modes. Two of the conditions are not duplex-specific,
+   * and a consumer should not have to branch on mode to ask "did I get what
+   * I configured?"; passthrough simply earns fewer notes.
+   *
+   * A snapshot copy, so a consumer cannot mutate the record the log entries
+   * were derived from. Readable after destroy() on purpose: the report is an
+   * immutable statement about an assembly with no live resource behind it,
+   * and "why was that session slow or expensive" is asked after the session,
+   * not during it.
+   */
+  getResolutionReport(): ResolutionNote[] {
+    return this.resolutionNotes.map(cloneResolutionNote);
+  }
+
+  /**
+   * Read the assembly back and record what it resolved to. Eager rather than
+   * lazy on first read: a report built on demand would observe post-assembly
+   * mutation (a setModel(), a setUtilityModel()) and present it as an
+   * assembly fact, and would also mean the log entries appeared whenever the
+   * consumer happened to look.
+   */
+  private collectAssemblyResolution(config: CortexAgentConfig): void {
+    const notes = collectAssemblyResolutionNotes({
+      mode: this.mode,
+      requestedTalkerModel: config.talker?.model,
+      talkerModel: this.talker?.getModel() ?? null,
+      reasonerModel: this.reasoner.getModel(),
+      configuredUtilityModel: config.utilityModel,
+      talkerUtilityModel: this.talker?.getUtilityModel() ?? null,
+      aggregateCostCap: this.aggregateGuard?.getMaxCost() ?? null,
+      perPromptMaxCost: config.budgetGuard?.maxCost,
+    });
+    for (const note of notes) this.recordResolutionNote(note);
+  }
+
+  /**
+   * The single write path for a note, and the reason the surfaces cannot
+   * drift: the log line and the lifecycle entry are both built from the note
+   * here, so there is no second place where the same fact is described.
+   *
+   * Every note warns regardless of severity. `info` is a classification for
+   * the consumer's renderer, not a log level: the warn is the surface a
+   * headless consumer has, and demoting the uncapped-session note to
+   * `logger.info` would silently withdraw a warning consumers are
+   * documented to receive.
+   */
+  private recordResolutionNote(note: ResolutionNote): void {
+    this.resolutionNotes.push(cloneResolutionNote(note));
+    this.logger.warn(resolutionWarnText(note));
+    this.appendEntry({
+      type: 'lifecycle',
+      loopPath: RESOLUTION_LOOP_PATH,
+      content: note.summary,
+      // Assembly is nobody's turn: there is no causing entry to point at,
+      // and the fallback stamp would attach it to whatever run happened to
+      // be live when a late note landed.
+      causedBy: null,
+      data: { event: 'resolution_note', note: cloneResolutionNote(note) },
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -3913,24 +3992,26 @@ export class CortexAgent {
   }
 
   /**
-   * Warn once when a duplex agent is configured for shell egress asks but
-   * nobody ever took the resolver to wire into the sandbox. Nothing
-   * enforces the wiring, and the failure is silent in the direction that
-   * looks fine: the sandbox falls back to hard-denied egress, so shell
-   * network access stops working with no ask ever voiced. That is a
-   * usability failure rather than a security one, which is exactly why it
-   * needs to be said out loud.
+   * Record, once, that this agent is configured for shell egress asks but
+   * nobody ever took the resolver to wire into the sandbox. Nothing enforces
+   * the wiring, and the failure is silent in the direction that looks fine:
+   * the sandbox falls back to hard-denied egress, so shell network access
+   * stops working with no ask ever voiced. That is a usability failure
+   * rather than a security one, which is exactly why it needs saying.
+   *
+   * The one resolution note that is not an assembly fact. It cannot be: a
+   * consumer wires the resolver on the line after create() returns, so the
+   * only honest moment to look is the first prompt. Checked in both modes
+   * (the sandbox fails closed the same way without a talker in front of it),
+   * and it takes the same note pathway as the assembly notes, so it reaches
+   * the report, the log and the warn identically.
    */
-  private warnOnUnwiredNetworkResolver(): void {
+  private noteUnwiredNetworkResolver(): void {
     if (this.unwiredNetworkResolverWarned) return;
     if (this.networkResolverHandedOut) return;
     if (!this.sandboxConfigured || this.networkResolver === null) return;
     this.unwiredNetworkResolverWarned = true;
-    this.logger.warn(
-      'sandbox and resolveNetworkAccess are configured but getNetworkAccessResolver() ' +
-      'was never called: shell egress asks bypass the permission broker and fail closed. ' +
-      "Wire getNetworkAccessResolver() into the SandboxProvider's network ask callback.",
-    );
+    this.recordResolutionNote(networkResolverUnwiredNote(this.mode));
   }
 
   // The pi queue surface targets the conversation loop: the single

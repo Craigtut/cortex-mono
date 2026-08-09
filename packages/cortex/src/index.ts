@@ -186,6 +186,15 @@ export type {
   CortexAgentUsageBreakdown,
 } from './cortex-agent.js';
 
+// Resolution report (what a CortexAgent assembly resolved to, where that
+// differs from what the consumer asked for)
+export { RESOLUTION_NOTE_CODES } from './resolution-report.js';
+export type {
+  ResolutionNote,
+  ResolutionNoteCode,
+  ResolutionSeverity,
+} from './resolution-report.js';
+
 // Session Log (the CortexAgent composite's append-only session record)
 export { SessionLog } from './session-log.js';
 export type {
