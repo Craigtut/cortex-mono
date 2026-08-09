@@ -91,3 +91,38 @@ describe('duplex: only the talker speaks into the assistant bubble', () => {
     expect(new Set(app.finalized)).toEqual(new Set(['Still working on the payments module.']));
   });
 });
+
+describe('duplex: the talker\'s control tools stay out of the transcript', () => {
+  it('renders no tool row for a control-tool dispatch', async () => {
+    const { internals, app, harness } = await createDuplexSession(cwd);
+    harness.reasonerPi.hold = true;
+    harness.talkerPi.script = [{
+      text: 'On it.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'Refactor the payments module.' } }],
+    }];
+
+    await internals.handleInput('refactor the payments module');
+    await waitUntil(() => harness.reasonerPi.running, 2000, 'reasoner run started');
+    await settle();
+
+    expect(app.calls).not.toContain('transcript.startToolCall');
+    expect(app.calls).not.toContain('transcript.completeToolCall');
+
+    harness.reasonerPi.releaseRun();
+  });
+
+  it('still renders the reasoner\'s tool calls', async () => {
+    const { app, harness } = await createDuplexSession(cwd);
+    harness.reasonerPi.script = [{
+      text: 'Reading it.',
+      calls: [{ name: 'Glob', args: { pattern: '*.md' } }],
+    }];
+
+    harness.agent.deliver('Refactor the payments module', { target: 'work' });
+    await waitUntil(
+      () => app.calls.includes('transcript.startToolCall'),
+      2000,
+      'the reasoner tool row rendered',
+    );
+  });
+});

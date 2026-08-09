@@ -153,6 +153,15 @@ export function createScriptedPi(): ScriptedPi {
           let terminateBatch = calls.length > 0;
           for (const [index, call] of calls.entries()) {
             const callId = callIds[index]!;
+            // The pi events the real EventBridge maps to tool_call_start /
+            // tool_call_end, so a consumer's tool rendering is driven the way
+            // production drives it rather than by a hand-built bridge event.
+            pi.emitEvent({
+              type: 'tool_execution_start',
+              toolCallId: callId,
+              toolName: call.name,
+              args: call.args ?? {},
+            });
             const tool = (pi.state.tools as Array<{
               name: string;
               execute: (id: string, params: unknown) => Promise<unknown>;
@@ -187,6 +196,14 @@ export function createScriptedPi(): ScriptedPi {
             const finalContent = after?.content ?? normalized.content;
             const terminate = after?.terminate ?? normalized.terminate ?? false;
             if (!terminate) terminateBatch = false;
+            pi.emitEvent({
+              type: 'tool_execution_end',
+              toolCallId: callId,
+              toolName: call.name,
+              result: { content: finalContent },
+              isError,
+              durationMs: 1,
+            });
             const resultMessage = {
               role: 'toolResult',
               toolCallId: callId,

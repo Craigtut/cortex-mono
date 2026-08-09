@@ -1057,6 +1057,11 @@ export class Session {
     }
   }
 
+  /** The duplex talker's loop path, or null in passthrough, which has none. */
+  private get talkerLoopPath(): string | null {
+    return this.agentMode === 'duplex' ? 'talker' : null;
+  }
+
   /**
    * The loop whose streamed text is the user-visible reply: the reasoner in
    * passthrough, the talker in duplex. Passthrough hands back the reasoner's
@@ -1064,12 +1069,32 @@ export class Session {
    * merged bridge stamps every event with one.
    */
   private get conversationLoopPath(): string {
-    return this.agentMode === 'duplex' ? 'talker' : 'reasoner';
+    return this.talkerLoopPath ?? 'reasoner';
   }
 
   /** True when an event came from the loop the user is actually talking to. */
   private isConversationEvent(event: CortexEvent): boolean {
     return event.loopPath === undefined || event.loopPath === this.conversationLoopPath;
+  }
+
+  /**
+   * True when an event came from the talker.
+   *
+   * Used to keep the talker's tool calls out of the transcript. The talker's
+   * toolset is fixed and is entirely control plumbing (`spawn_task`,
+   * `steer_task`, `cancel_task`, `quick_lookup`, `answer_ask`): it has no
+   * file, shell, MCP or sub-agent tools, by construction. A coding CLI's
+   * transcript is a record of what was done to the workspace, and routing
+   * chatter rendered beside Read/Edit/Bash is noise that reads like work.
+   *
+   * Filtered on the loop rather than on a list of tool names deliberately, so
+   * a control tool added to the talker later is hidden by inheritance instead
+   * of appearing in the transcript the day it ships. Sub-agent tool calls are
+   * unaffected: they carry `childTaskId` and their own `reasoner/<taskId>`
+   * path, and are handled by the child branches above.
+   */
+  private isTalkerEvent(event: CortexEvent): boolean {
+    return this.talkerLoopPath !== null && event.loopPath === this.talkerLoopPath;
   }
 
   /** Wire all agent events to the TUI. */
@@ -1126,6 +1151,9 @@ export class Session {
         this.recordSubAgentToolStart(event);
         return;
       }
+      // The talker's control tools are routing plumbing, not work. See
+      // isTalkerEvent().
+      if (this.isTalkerEvent(event)) return;
 
       // A tool starting means the agent is making progress again.
       this.noteProgressAfterRetry();
@@ -1168,6 +1196,7 @@ export class Session {
     // Streaming tool updates (bash output, etc.)
     bridge.on('tool_call_update', (event: CortexEvent) => {
       if (event.childTaskId) return;
+      if (this.isTalkerEvent(event)) return;
 
       const p = event.payload as ToolCallUpdatePayload | undefined;
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
@@ -1185,6 +1214,7 @@ export class Session {
         this.recordSubAgentToolEnd(event);
         return;
       }
+      if (this.isTalkerEvent(event)) return;
 
       const p = event.payload as ToolCallEndPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
