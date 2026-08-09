@@ -2778,7 +2778,6 @@ export class CortexAgent {
         // Quick lookups belong to the conversation surface (abort table):
         // cancelled here, untouched by a 'work' abort.
         if (this.lookups) work.push(this.lookups.cancelAll());
-        this.router!.permissionBroker.settleAll('abort');
       }
       if (scope === 'work' || scope === 'all') {
         this.router!.dropWorkContext();
@@ -2795,7 +2794,7 @@ export class CortexAgent {
         // Pending asks belong to the stopped work and settle as deny: tool
         // asks through each aborted run's own signal race, network asks
         // (which carry no signal) here. Double settlement is guarded.
-        // mutation: drain removed from the work branch
+        this.router!.permissionBroker.settleAll('abort');
         // Settling an ask kills the request; it does not kill the voicing
         // that was already handed to the talker. A voicing parked behind a
         // busy talker outlives its ask, gets read out afterwards, and the
@@ -3785,19 +3784,42 @@ export class CortexAgent {
   // Asks and queues ---------------------------------------------------------
 
   /**
-   * Permission asks currently blocked on a decision. Tool and escalation
-   * asks come from the reasoner's registry (its sub-agents mirror in); in
-   * duplex, broker-minted network egress asks are appended, since those
-   * never enter a loop registry. Ids never overlap between the two sources.
+   * Every permission ask currently blocked on a decision, from both
+   * registries, deduplicated by askId.
+   *
+   * Two registries exist because two different things track asks. The
+   * reasoner's holds its own and its sub-agents' (children mirror in through
+   * the child resolver wrapper). The broker's holds everything routed
+   * through the conversation in duplex, whichever loop raised it. They
+   * overlap for reasoner tool asks, which carry the same askId in both, and
+   * each holds asks the other never sees.
+   *
+   * This used to append only the broker's `network` asks, on the reasoning
+   * that a loop registry covers everything else. It does not. A quick-lookup
+   * loop is built through `AgentLoop.create`, not `createChildAgent`, so
+   * there is no mirror into the reasoner, and its asks are `tool` kind, so
+   * the network filter dropped them too: a blocked lookup was invisible on
+   * every consumer surface while its resolver sat waiting. Taking the union
+   * fixes that without a third special case, and it is what the method name
+   * has always claimed.
+   *
+   * Lookup asks are deliberately NOT mirrored into the reasoner's registry
+   * the way sub-agent asks are. A lookup is not in the reasoner's subtree:
+   * it is a facade-owned peer on the conversation side (D13) with its own
+   * pool, its own wall-clock timeout, and cancellation by a *conversation*
+   * abort. Mirroring would make `reasoner.waitForAskSettlement()` block on
+   * something the reasoner cannot influence and its registry claim work it
+   * does not own.
    */
   getPendingAsks(): PendingAsk[] {
     const asks = this.reasoner.getPendingAsks();
     const broker = this.router?.permissionBroker;
     if (!broker) return asks;
-    const networkAsks = broker.getPendingAsks()
-      .filter((ask) => ask.kind === 'network')
+    const mirrored = new Set(asks.map((ask) => ask.askId));
+    const brokerOnly = broker.getPendingAsks()
+      .filter((ask) => !mirrored.has(ask.askId))
       .map(({ kind: _kind, ...ask }) => ask);
-    return [...asks, ...networkAsks];
+    return [...asks, ...brokerOnly];
   }
 
   markAskVoiced(askId: string): boolean {
