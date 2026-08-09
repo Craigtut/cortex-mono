@@ -142,6 +142,8 @@ refactor(cortex): extract provider registry into separate module
 
   The expected-old-value on `update-ref` is the load-bearing part: it fails loudly instead of racing. Two caveats: this bypasses the pre-commit hook, so run `npm run typecheck` and the affected tests yourself first; and it leaves the *shared* index still holding the pre-commit entry for those paths, so finish with `git reset -q HEAD -- <paths>` or they keep showing as modified and another agent's commit can revert them.
 - After every commit, check `git show --stat HEAD` against the size of the change you actually made. A commit that swept up a foreign hunk almost always has exactly the filenames you expected; the line counts are what give it away.
+- **Do not rewrite a commit once anything is on top of it.** A mislabeled commit is a documentation problem; the repair's blast radius is other people's commits. Record the correction instead. If a rewrite is genuinely necessary, it belongs to whoever can pause the branch.
+- **Never compute a parent as `HEAD^` on a shared branch.** Capture the full SHA you inspected and pass it explicitly. An agent doing surgery here read `HEAD^` moments after another commit landed, so the parent was one commit too new and the rewrite dropped an unrelated commit off the branch. The `update-ref` compare-and-swap passed, because the *old value* was current; it was the parent that was stale.
 
 ## Documentation
 
