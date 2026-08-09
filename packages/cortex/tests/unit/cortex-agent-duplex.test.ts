@@ -17,6 +17,7 @@ import { AgentLoop, TOOL_RESULT_WORKING_TAGS_REMINDER } from '../../src/agent-lo
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import { EventBridge } from '../../src/event-bridge.js';
 import type { PiEvent } from '../../src/event-bridge.js';
+import type { BudgetGuard } from '../../src/budget-guard.js';
 import type { AgentLoopConfig } from '../../src/types.js';
 import type { AgentMessage } from '../../src/context-manager.js';
 import { wrapModel } from '../../src/model-wrapper.js';
@@ -1376,12 +1377,24 @@ describe('duplex stop-reason audit', () => {
 // Aggregate budget guard (active from first assembly; sees utility spend)
 // ---------------------------------------------------------------------------
 
+/**
+ * The aggregate is read through getAggregateBudgetGuard(), never through
+ * getBudgetGuard(): the latter returns the guard the consumer configured, so
+ * a UI reading back its own maxCost gets its own number rather than the
+ * facade's session-level substitute.
+ */
+function aggregateGuard(facade: CortexAgent): BudgetGuard {
+  const guard = facade.getAggregateBudgetGuard();
+  if (!guard) throw new Error('duplex assembled without an aggregate guard');
+  return guard;
+}
+
 describe('duplex aggregate budget guard', () => {
   it('counts talker and reasoner turns plus utility spend in one lifetime aggregate', async () => {
     const { facade, reasonerLoop } = createDuplexFacade({
       duplex: { maxTotalCost: 10 },
     });
-    const guard = facade.getBudgetGuard();
+    const guard = aggregateGuard(facade);
     await facade.prompt('hello'); // one talker turn, cost 0.003
     expect(guard.getTotalCost()).toBeCloseTo(0.003);
 
@@ -1402,9 +1415,9 @@ describe('duplex aggregate budget guard', () => {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 },
     };
     reasonerLoop.getEventBridge().emitUtilityUsage('observer', usage);
-    expect(facade.getBudgetGuard().isBreached()).toBe(false);
+    expect(aggregateGuard(facade).isBreached()).toBe(false);
     reasonerLoop.getEventBridge().emitUtilityUsage('reflector', usage);
-    expect(facade.getBudgetGuard().isBreached()).toBe(true);
+    expect(aggregateGuard(facade).isBreached()).toBe(true);
     await waitUntil(() =>
       facade.getLog().some((entry) =>
         entry.type === 'lifecycle' &&
@@ -1415,20 +1428,24 @@ describe('duplex aggregate budget guard', () => {
   });
 
   it("never reinterprets the consumer's per-prompt maxCost as the session aggregate cap", () => {
-    const { facade } = createDuplexFacade({
+    const { facade, reasonerLoop } = createDuplexFacade({
       budgetGuard: { maxTurns: 500, maxCost: 42 },
       duplex: { maxTotalCost: 5 },
     });
     // budgetGuard.maxCost keeps its per-prompt meaning on the reasoner;
-    // the aggregate's cap is its own key.
-    expect(facade.getBudgetGuard().getMaxCost()).toBe(5);
+    // the aggregate's cap is its own key. They are two objects, and
+    // getBudgetGuard() hands back the configured one rather than
+    // substituting the aggregate for it.
+    expect(aggregateGuard(facade).getMaxCost()).toBe(5);
+    expect(facade.getBudgetGuard()).toBe(reasonerLoop.getBudgetGuard());
+    expect(facade.getBudgetGuard()).not.toBe(aggregateGuard(facade));
   });
 
   it('leaves the aggregate uncapped when only budgetGuard.maxCost is set', () => {
     const { facade } = createDuplexFacade({
       budgetGuard: { maxCost: 42 },
     });
-    expect(facade.getBudgetGuard().getMaxCost()).toBe(Infinity);
+    expect(aggregateGuard(facade).getMaxCost()).toBe(Infinity);
   });
 
   it('restore() resets the aggregate guard so a restored session is not wedged by a pre-restore breach', async () => {
@@ -1440,7 +1457,7 @@ describe('duplex aggregate budget guard', () => {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 },
     };
     reasonerLoop.getEventBridge().emitUtilityUsage('observer', usage);
-    expect(facade.getBudgetGuard().isBreached()).toBe(true);
+    expect(aggregateGuard(facade).isBreached()).toBe(true);
 
     await facade.restore({
       version: 2,
@@ -1458,16 +1475,16 @@ describe('duplex aggregate budget guard', () => {
       },
     });
     // Counters and the breach flag describe the replaced session.
-    expect(facade.getBudgetGuard().isBreached()).toBe(false);
-    expect(facade.getBudgetGuard().getTotalCost()).toBe(0);
+    expect(aggregateGuard(facade).isBreached()).toBe(false);
+    expect(aggregateGuard(facade).getTotalCost()).toBe(0);
     // The restored session still enforces the cap on fresh spend.
     reasonerLoop.getEventBridge().emitUtilityUsage('observer', usage);
-    expect(facade.getBudgetGuard().isBreached()).toBe(true);
+    expect(aggregateGuard(facade).isBreached()).toBe(true);
   });
 
   it('counts a forwarded child event exactly once after the loopPath split', () => {
     const { facade, reasonerLoop } = createDuplexFacade();
-    const guard = facade.getBudgetGuard();
+    const guard = aggregateGuard(facade);
     // One child utility completion, forwarded child bridge -> reasoner
     // bridge -> merged bridge. The aggregate must count its cost once.
     const childBridge = new EventBridge(false);
@@ -1481,7 +1498,7 @@ describe('duplex aggregate budget guard', () => {
 
   it('is wired even when the consumer sets no budget (mechanism active from assembly)', () => {
     const { facade } = createDuplexFacade();
-    const guard = facade.getBudgetGuard();
+    const guard = aggregateGuard(facade);
     expect(guard.getMaxCost()).toBe(Infinity);
     // The aggregate exists and accumulates; it just has no finite bound.
     expect(guard.getTotalCost()).toBe(0);

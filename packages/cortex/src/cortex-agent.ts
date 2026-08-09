@@ -1705,6 +1705,22 @@ export class CortexAgent {
     };
     if (config.duplex?.maxTotalCost !== undefined) {
       aggregateConfig.maxCost = config.duplex.maxTotalCost;
+    } else {
+      // No finite default is invented here: a session-level cost ceiling
+      // that silently aborts a long session is a worse failure than an
+      // uncapped one, and any number Cortex picked would be wrong for
+      // somebody. What is not acceptable is picking silently, because the
+      // shape of duplex hides the exposure: two resident loops, sub-agents,
+      // quick lookups and doubled observational spend, while the only cost
+      // number most consumers set (budgetGuard.maxCost) keeps its per-prompt
+      // meaning on the reasoner and bounds none of it. Same remedy as the
+      // talker-model fallback: say it once at assembly.
+      this.logger.warn(
+        'duplex has no aggregate spend cap. budgetGuard.maxCost is per prompt on the ' +
+        'reasoner and does not bound the session, so both resident loops, sub-agents, ' +
+        'quick lookups and observational spend accumulate without a ceiling. ' +
+        'Set duplex.maxTotalCost.',
+      );
     }
     this.aggregateGuard = new BudgetGuard(
       aggregateConfig,
@@ -3147,12 +3163,30 @@ export class CortexAgent {
   }
 
   /**
-   * The budget guard with composite meaning: the facade's aggregate guard
-   * in duplex (lifetime scope over both loops, children, and utility
-   * spend), the reasoner's own guard in passthrough.
+   * The guard built from the consumer's `budgetGuard` config, in both modes.
+   *
+   * This returns what the caller configured, which is the only thing a
+   * `getMaxCost()` / `isBreached()` read can be checked against. It used to
+   * return the facade's aggregate guard in duplex: a different object with a
+   * different scope, a different cap (Infinity unless `duplex.maxTotalCost`
+   * is set) and a different breach state, so a UI that set `maxCost` and
+   * read it back silently got someone else's number. The aggregate is a
+   * separate fact and has {@link getAggregateBudgetGuard}.
    */
   getBudgetGuard(): BudgetGuard {
-    return this.aggregateGuard ?? this.reasoner.getBudgetGuard();
+    return this.reasoner.getBudgetGuard();
+  }
+
+  /**
+   * The facade's aggregate guard: lifetime scope across both resident loops,
+   * every sub-agent, quick lookups, and utility spend, capped by
+   * `duplex.maxTotalCost`. This is the guard that stops a duplex session, so
+   * a consumer showing "the agent halted on budget" reads `isBreached()`
+   * here, not on the per-prompt guard above. Null in passthrough, where no
+   * aggregate exists and the reasoner's own guard is the whole story.
+   */
+  getAggregateBudgetGuard(): BudgetGuard | null {
+    return this.aggregateGuard;
   }
 
   getSkillRegistry(): SkillRegistry {

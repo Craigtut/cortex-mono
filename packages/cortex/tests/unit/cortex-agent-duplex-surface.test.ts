@@ -174,3 +174,41 @@ describe('duplex getConversationHistory', () => {
     expect(facade.getConversationHistory()).toEqual(reasonerLoop.getConversationHistory());
   });
 });
+
+// ---------------------------------------------------------------------------
+// S3: the aggregate spend bound, and which guard a consumer reads back
+// ---------------------------------------------------------------------------
+
+describe('duplex budget guards', () => {
+  it('getBudgetGuard returns the guard the consumer configured', async () => {
+    const { facade } = await createRealDuplexScenario({
+      budgetGuard: { maxCost: 5 },
+      duplex: { maxTotalCost: 50 },
+    });
+
+    // What a UI that set maxCost and reads it back must see.
+    expect(facade.getBudgetGuard().getMaxCost()).toBe(5);
+    // The session-level guard is a separate, explicit fact.
+    expect(facade.getAggregateBudgetGuard()?.getMaxCost()).toBe(50);
+  });
+
+  it('passthrough exposes the same guard and no aggregate', async () => {
+    const { facade, reasonerLoop } = createPassthroughScenario({
+      budgetGuard: { maxCost: 7 },
+    });
+    expect(facade.getBudgetGuard()).toBe(reasonerLoop.getBudgetGuard());
+    expect(facade.getAggregateBudgetGuard()).toBeNull();
+  });
+
+  it('warns once at assembly when duplex has no aggregate spend cap', async () => {
+    const { logger, warnings } = recordingLogger();
+    await createRealDuplexScenario({ logger, budgetGuard: { maxCost: 5 } });
+    expect(warnings.filter((line) => line.includes('duplex.maxTotalCost'))).toHaveLength(1);
+  });
+
+  it('stays quiet when an aggregate cap is configured', async () => {
+    const { logger, warnings } = recordingLogger();
+    await createRealDuplexScenario({ logger, duplex: { maxTotalCost: 25 } });
+    expect(warnings.filter((line) => line.includes('duplex.maxTotalCost'))).toHaveLength(0);
+  });
+});
