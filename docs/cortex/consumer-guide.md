@@ -223,19 +223,43 @@ Registered on both loops: `onLoopComplete`, `onError`, `onRetryScheduled`, `onRe
 
 The facade keeps an append-only log of the session: utterances, replies, deliveries, errors, retries, sub-agent lifecycle, permission asks and answers, and lookup results. It is the routing bus and the audit trail, and it is part of the persistence artifact. It is not a context surface; no prompt is ever built from it.
 
+A subscriber receives three kinds of event, and must handle all three:
+
 ```typescript
+let cursor = lastSeenSeq;
+
 const unsubscribe = agent.subscribeLog((event) => {
-  if (event.kind === 'gap') {
-    resyncFrom(event.toSeq); // entries this subscriber will never see
-    return;
+  switch (event.kind) {
+    case 'entry':
+      renderTimeline(event.entry);
+      cursor = event.entry.seq + 1;
+      break;
+
+    case 'gap':
+      // Entries this subscriber will never see: evicted by retention
+      // before its replay position, or dropped because it fell behind.
+      noteMissing(event.fromSeq, event.toSeq, event.dropped);
+      cursor = event.toSeq + 1;
+      break;
+
+    case 'reset':
+      // restore() replaced the log. Everything rendered so far belongs to
+      // a session that no longer exists: discard it and render the
+      // restored log, which arrives with the event.
+      replaceTimeline(event.entries);
+      cursor = event.nextSeq;
+      break;
   }
-  renderTimeline(event.entry);
 }, lastSeenSeq);
 
 const snapshot = agent.getLog(lastSeenSeq); // copy, never a live reference
 ```
 
-Entries carry a monotonic `seq` (the ordering authority; timestamps collide under burst), the producing `loopPath`, and a `causedBy` stamp linking an entry to the input that caused it. Ordering is append-then-emit: an entry reaches subscribers before the events of the run it triggers. A subscriber that falls behind is buffered to `sessionLog.maxSubscriberBuffer` and then dropped oldest-first with a gap marker, rather than applying backpressure to the loops. Reconnecting UIs pass the last `seq` they rendered and get a replay.
+Entries carry a monotonic `seq` (the ordering authority; timestamps collide under burst), the producing `loopPath`, and a `causedBy` stamp linking an entry to the input that caused it. Ordering is append-then-emit: an entry reaches subscribers before the events of the run it triggers. A subscriber that falls behind is buffered to `sessionLog.maxSubscriberBuffer` and then dropped oldest-first with a gap marker, rather than applying backpressure to the loops.
+
+**A `reset` is not a gap.** A gap says some entries are missing from a timeline that is otherwise still yours. A reset says the timeline itself was replaced, which is what `restore()` does, so the correct response is to throw away what you have rendered rather than to append to it. The event carries the restored log in `entries` (already a detached copy, so render it directly) and it is delivered ahead of any later append, even to a subscriber that was mid-callback when the restore landed.
+
+**Reconnecting.** Track a cursor as above and pass it back to `subscribeLog` to resume: you get everything from there on, with a leading gap if any of it has since been evicted. Take the cursor from `reset.nextSeq` after a reset rather than from the last restored entry's seq. Sequence numbers never rewind across a restore, so after restoring an older artifact (or an artifact with no log at all, which is what a v1 session upgrades to) the next append can sit well above the highest restored entry. `nextSeq` is the seq that append will carry.
 
 ## Persistence
 
@@ -263,6 +287,8 @@ context.setSlot('app-config', buildCurrentAppConfig());
 `restore()` is all-or-nothing and **rejects** if any loop is running or any sub-agent is active. It is async, so await it (or attach a `.catch`); its guards never throw synchronously, and an unawaited call that hits one becomes an unhandled rejection. It replaces the three loop-level methods (`restoreConversationHistory`, `restoreObservationalMemoryState`, `restoreSessionUsage`), which are not exposed on the facade: those are independently callable at any time, so a consumer migrating from them rewrites the call site rather than renaming it.
 
 A v1 artifact (`{ version: 1, history, memory?, usage? }`) or a bare message array restores into the reasoner with an empty log, so existing single-loop sessions upgrade transparently. Both optional v1 fields accept an explicit `null`, so a consumer whose saved memory and usage are each `T | null` can assign both directly instead of spreading one conditionally. Usage restore is a baseline, not a replay: the facade reports `restoredBaseline + live deltas`, so repeated restores are idempotent.
+
+A restore reaches every live log subscriber as a `reset` event, so a UI attached before the call ends up on the restored session instead of quietly rendering the replaced one. See [the session log](#the-session-log) for how to handle it, and note that a v1 restore produces a reset with **no** entries, since a v1 artifact has no log.
 
 `getConversationHistory()` and `getObservationalMemoryState()` are still forwarded and still return the reasoner's, which is the right answer for inspection and debugging. Persist `getState()`, not those: it is the only surface that carries both loops and the log.
 

@@ -137,10 +137,29 @@ export interface SessionLogReset {
   kind: 'reset';
   /** The restored log in full: every retained entry, oldest first. */
   entries: SessionLogEntry[];
-  /** Seq of the oldest retained entry after the restore. */
-  firstRetainedSeq: number;
-  /** Seq of the newest retained entry after the restore. */
-  lastSeq: number;
+  /**
+   * The seq the next appended entry will carry. Pass it to
+   * {@link SessionLog.subscribeLog} to resume from exactly here: a later
+   * reconnect gets everything appended after this reset and nothing it has
+   * already been handed.
+   *
+   * This is the log's counter, and it is the counter that answers the
+   * question. `restore()` never lowers it (appends stay monotonic across a
+   * restore), so it is not "one past the newest restored entry" and must
+   * not be described as one: restoring an artifact that ends at seq 2 into
+   * a session that reached seq 5 resumes at 6, not at 3. An earlier version
+   * of this event carried `lastSeq` and `firstRetainedSeq` read off the
+   * same counter but documented as bounds of the restored entries, which
+   * they were not: after an empty restore they named a range of entries
+   * that had just been discarded, and a UI storing `lastSeq` as its
+   * watermark reconnected above everything the reset had handed it and
+   * silently rendered nothing.
+   *
+   * Bounds of the restored entries are deliberately not fields. `entries`
+   * carries them exactly (`entries[0]`, `entries.at(-1)`), and a second
+   * copy of a derivable fact is a second thing that can be wrong.
+   */
+  nextSeq: number;
 }
 
 /** What a subscriber receives: an entry, a gap marker, or a restore reset. */
@@ -410,18 +429,23 @@ export class SessionLog {
     const maxSeq = restored.length > 0 ? restored[restored.length - 1]!.seq : 0;
     this.nextSeq = Math.max(this.nextSeq, maxSeq + 1);
 
-    const firstRetainedSeq = this.firstRetainedSeq;
-    const lastSeq = this.lastSeq;
+    const nextSeq = this.nextSeq;
     for (const sub of [...this.subscribers]) {
       // Anything already queued describes the replaced session, so it is
       // discarded rather than delivered after the reset.
       sub.queue.length = 0;
       sub.pendingGap = null;
+      // One deep copy of the retained log per subscriber, inside this
+      // frame. At the default 10,000-entry cap that is 10,000 clones per
+      // subscriber (structuredClone on every `data`), so the cost of a
+      // restore scales with maxEntries times subscriber count. Raising
+      // maxEntries raises this too. Per-subscriber rather than one shared
+      // array on purpose: subscribers must not be able to mutate each
+      // other's view, and N is 1 or 2 in every shape we ship.
       sub.pendingReset = {
         kind: 'reset',
         entries: this.entries.map(cloneEntry),
-        firstRetainedSeq,
-        lastSeq,
+        nextSeq,
       };
       this.drain(sub);
     }

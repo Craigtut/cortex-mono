@@ -11,6 +11,7 @@ import { SessionLog } from '../../src/session-log.js';
 import type {
   SessionLogEntry,
   SessionLogEvent,
+  SessionLogReset,
 } from '../../src/session-log.js';
 
 function appendUtterance(log: SessionLog, content: string): SessionLogEntry {
@@ -577,7 +578,7 @@ describe('SessionLog: restore notifies subscribers', () => {
     expect(ui.rendered()).toEqual(log.getLog().map((e) => e.content));
   });
 
-  it('the reset carries the restored bounds and detached entry copies', () => {
+  it('the reset carries the restored log and detached entry copies', () => {
     const log = new SessionLog();
     const events: SessionLogEvent[] = [];
     log.subscribeLog((event) => events.push(event));
@@ -590,8 +591,9 @@ describe('SessionLog: restore notifies subscribers', () => {
     expect(events).toHaveLength(1);
     const reset = events[0]!;
     if (reset.kind !== 'reset') throw new Error('expected a reset event');
-    expect(reset.firstRetainedSeq).toBe(7);
-    expect(reset.lastSeq).toBe(9);
+    // The payload is the log, asserted against the log rather than against
+    // a hand-computed expectation.
+    expect(reset.entries).toEqual(log.getLog());
     expect(reset.entries.map((e) => e.seq)).toEqual([7, 9]);
 
     // Detached: mutating the delivered copy cannot reach the log.
@@ -610,6 +612,105 @@ describe('SessionLog: restore notifies subscribers', () => {
     log.restore([]);
 
     expect(ui.rendered()).toEqual([]);
+  });
+
+  /**
+   * The reset's seq field is a resume cursor, so it is tested by resuming,
+   * not by comparing it to a number the test worked out for itself. A
+   * hand-computed expectation is exactly how the field it replaced went
+   * wrong: read off the counter, checked against the counter, and described
+   * as something else entirely.
+   */
+  function reconnectAfterReset(
+    log: SessionLog,
+    reset: SessionLogEvent,
+  ): SessionLogEntry[] {
+    if (reset.kind !== 'reset') throw new Error('expected a reset event');
+    const resumed: SessionLogEntry[] = [];
+    log.subscribeLog((event) => {
+      if (event.kind === 'entry') resumed.push(event.entry);
+    }, reset.nextSeq);
+    return resumed;
+  }
+
+  it('reconnecting at reset.nextSeq resumes with no gap and no repeat', () => {
+    const log = new SessionLog();
+    appendUtterance(log, 'pre-1');
+    appendUtterance(log, 'pre-2');
+
+    let reset: SessionLogEvent | null = null;
+    log.subscribeLog((event) => { if (event.kind === 'reset') reset = event; });
+
+    // The probe case: a live log at seq 2 restoring an artifact that ends
+    // BELOW it. Seq numbering does not rewind, so a cursor derived from the
+    // restored entries would sit far below the next append.
+    log.restore([
+      { seq: 1, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'restored-1' },
+    ]);
+    const after = appendUtterance(log, 'after-restore');
+
+    const resumed = reconnectAfterReset(log, reset!);
+    expect(resumed.map((e) => e.content)).toEqual(['after-restore']);
+    expect(resumed.map((e) => e.seq)).toEqual([after.seq]);
+  });
+
+  it('reconnecting at reset.nextSeq works after an empty v1-shaped restore', () => {
+    // cortex-code's /resume takes this path on every resume: a v1 artifact
+    // restores an empty log into a session that has already appended.
+    const log = new SessionLog();
+    appendUtterance(log, 'pre-1');
+    appendUtterance(log, 'pre-2');
+    appendUtterance(log, 'pre-3');
+
+    let reset: SessionLogEvent | null = null;
+    log.subscribeLog((event) => { if (event.kind === 'reset') reset = event; });
+
+    log.restore([]);
+    const first = appendUtterance(log, 'first-after-resume');
+
+    const resumed = reconnectAfterReset(log, reset!);
+    // The defect this pins: the reset used to report a range naming the
+    // pre-restore entries it had just discarded, so a UI storing it as a
+    // watermark reconnected past everything and rendered an empty timeline.
+    expect(resumed.map((e) => e.content)).toEqual(['first-after-resume']);
+    expect(resumed.map((e) => e.seq)).toEqual([first.seq]);
+  });
+
+  it('reconnecting at reset.nextSeq before any later append yields nothing, not a gap', () => {
+    const log = new SessionLog();
+    appendUtterance(log, 'pre');
+    let reset: SessionLogEvent | null = null;
+    log.subscribeLog((event) => { if (event.kind === 'reset') reset = event; });
+    log.restore([
+      { seq: 1, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'restored' },
+    ]);
+
+    if (reset === null) throw new Error('expected a reset event');
+    // Asserted before it is used: passing undefined to subscribeLog means
+    // "live from here", which would make this pass with no cursor at all.
+    expect(typeof (reset as SessionLogReset).nextSeq).toBe('number');
+    const events: SessionLogEvent[] = [];
+    log.subscribeLog((event) => events.push(event), (reset as SessionLogReset).nextSeq);
+    expect(events).toEqual([]);
+  });
+
+  it('the whole restored log plus everything after it reconstructs the session', () => {
+    const log = new SessionLog();
+    appendUtterance(log, 'pre');
+
+    let reset: SessionLogReset | null = null;
+    log.subscribeLog((event) => { if (event.kind === 'reset') reset = event; });
+    log.restore([
+      { seq: 3, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'r-1' },
+      { seq: 4, type: 'reply', timestamp: 2, loopPath: 'main', content: 'r-2' },
+    ]);
+    appendUtterance(log, 'later');
+
+    if (reset === null) throw new Error('expected a reset event');
+    const resumed = reconnectAfterReset(log, reset);
+    // What a reconnecting UI ends up holding equals the log itself: the
+    // reset's entries, then everything from its cursor onward.
+    expect([...(reset as SessionLogReset).entries, ...resumed]).toEqual(log.getLog());
   });
 
   it('discards content queued before the restore rather than delivering it after', async () => {
