@@ -15,6 +15,7 @@ import {
   createRealDuplexScenario,
   createScriptedPiAgent,
   destroyLiveFacades,
+  entriesOfType,
   getBroker,
   lifecycleEvents,
   promptTexts,
@@ -276,6 +277,72 @@ describe('duplex auto-approve and network egress', () => {
 });
 
 // ---------------------------------------------------------------------------
+// H1: the same wiring on the TOOL resolver
+//
+// withBrokeredPermissions passes isAutoApprove to both resolvers, and only
+// the network one was guarded. The two arguments are wired at different
+// positions in different calls, so covering one says nothing about the other.
+// ---------------------------------------------------------------------------
+
+/** A tool that exists and reports having run, so "allowed" is observable. */
+const PROBE_TOOL = {
+  name: 'probe',
+  description: 'A no-op tool used to observe whether the permission gate allowed a call.',
+  parameters: { type: 'object', properties: {} },
+  execute: async () => 'probe ran',
+} as unknown as NonNullable<CortexAgentConfig['tools']>[number];
+
+/** Config whose tool resolver always defers to the user. */
+const ASKING_TOOLS: Partial<CortexAgentConfig> = {
+  resolvePermission: async () => ({ decision: 'ask' as const }),
+  tools: [PROBE_TOOL],
+};
+
+describe('duplex auto-approve and tool asks', () => {
+  it('does not voice a tool ask at a consumer that asked not to be interrupted', async () => {
+    const { facade, talkerPi, reasonerPi } = await createRealDuplexScenario({
+      ...ASKING_TOOLS,
+      isAutoApprove: () => true,
+      // Bounds the unwired shape: without auto-approve this brokers a real
+      // ask, and the assertions should fail rather than hang on the default.
+      duplex: { askTimeoutMs: 50 },
+    });
+    reasonerPi.script = [{ text: '', calls: [{ name: 'probe' }] }];
+
+    facade.deliver('run the probe', { target: 'work' });
+    await waitUntil(() => reasonerPi.toolResults.length === 1, 2000, 'tool call settled');
+
+    // The symptom: nothing minted, nothing read out, and the call proceeds.
+    // The log entry rather than getPendingAsks(): the registry is empty by
+    // this point either way, because the gate only returns once the ask has
+    // settled, so a registry check here cannot tell the two shapes apart.
+    expect(entriesOfType(facade, 'ask')).toEqual([]);
+    expect(promptTexts(talkerPi).join('\n')).not.toContain('<permission-request');
+    expect(reasonerPi.toolResults[0]!.text).toContain('probe ran');
+
+    // Passing for the right reason: the auto-approve branch ran and left the
+    // audit entry that is the only record of a decision the user never saw.
+    // Without this the test would also pass if the tool were never gated.
+    const audit = lifecycleEvents(facade, 'ask_auto_approved');
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.content).toContain('probe');
+  });
+
+  it('still brokers a tool ask when the callback reads false', async () => {
+    const { facade, reasonerPi } = await createRealDuplexScenario({
+      ...ASKING_TOOLS,
+      isAutoApprove: () => false,
+    });
+    reasonerPi.script = [{ text: '', calls: [{ name: 'probe' }] }];
+
+    facade.deliver('run the probe', { target: 'work' });
+    await waitUntil(() => facade.getPendingAsks().length === 1, 2000, 'ask brokered');
+    expect(lifecycleEvents(facade, 'ask_auto_approved')).toHaveLength(0);
+    expect(facade.getPendingAsks()[0]!.toolName).toBe('probe');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // V4: a quick-lookup loop's ask must be visible too
 //
 // Lookups are built through AgentLoop.create, not createChildAgent, so
@@ -382,6 +449,67 @@ describe('duplex pending asks from a quick lookup', () => {
     // longer exists, for the broker's whole (much longer) ask timeout.
     await waitUntil(() => facade.getPendingAsks().length === 0, 3000, 'ask settled with the lookup');
     await waitUntil(() => facade.workSettled, 3000, 'work settles');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H2: the talker's error and retry log producers
+//
+// wireErrorProducers is called for both loops and only the reasoner's half
+// was asserted. The talker is the presence loop, so its failures are the
+// ones a user experiences as silence, and the session log is where a
+// consumer looks to explain that silence.
+// ---------------------------------------------------------------------------
+
+/** Log entries produced by one loop, by type. */
+function entriesFrom(
+  facade: Parameters<typeof entriesOfType>[0],
+  type: Parameters<typeof entriesOfType>[1],
+  loopPath: string,
+) {
+  return entriesOfType(facade, type).filter((entry) => entry.loopPath === loopPath);
+}
+
+describe('duplex talker log producers', () => {
+  it('records a talker retry in the session log, attributed to the talker', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario();
+    // Network class: the retry hook fires before the backoff wait, so this
+    // asserts without waiting one out.
+    talkerPi.failWith = new Error('ECONNRESET while contacting the provider');
+
+    void facade.prompt('hello').catch(() => {});
+    await waitUntil(
+      () => entriesFrom(facade, 'retrying', 'talker').length === 1,
+      2000, 'talker retry logged',
+    );
+
+    const entry = entriesFrom(facade, 'retrying', 'talker')[0]!;
+    expect(entry.content).toContain('ECONNRESET');
+    expect(entry.data).toMatchObject({ category: 'network', attempt: 1, maxAttempts: 2 });
+    // The reasoner is fine and must not be blamed for it.
+    expect(entriesFrom(facade, 'retrying', 'reasoner')).toHaveLength(0);
+
+    await facade.abort('conversation');
+  });
+
+  it('records a fatal talker error in the session log, attributed to the talker', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario();
+    // Authentication class is fatal, so the ladder never runs and onError
+    // fires promptly rather than after a backoff.
+    talkerPi.failWith = new Error('401 Unauthorized: invalid api key');
+
+    void facade.prompt('hello').catch(() => {});
+    await waitUntil(
+      () => entriesFrom(facade, 'error', 'talker').length === 1,
+      2000, 'talker error logged',
+    );
+
+    const entry = entriesFrom(facade, 'error', 'talker')[0]!;
+    expect(entry.content).toContain('Unauthorized');
+    expect(entry.data).toMatchObject({ category: 'authentication', severity: 'fatal' });
+    // A talker failure is the consumer's to see, not something the reasoner
+    // announces: it must not become a spoken delivery about background work.
+    expect(promptTexts(talkerPi).join('\n')).not.toContain('background work');
   });
 });
 
