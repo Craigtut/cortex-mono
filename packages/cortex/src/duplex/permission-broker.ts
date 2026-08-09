@@ -975,16 +975,38 @@ export function buildBrokeredPermissionResolver(
  * identity, so a network ask raised by a sub-agent is filed under the
  * reasoner's path. The ask entry marks the attribution approximate rather
  * than asserting a path the broker cannot actually know.
+ *
+ * `isAutoApprove` bypasses voicing exactly as it does for tool asks. A
+ * consumer in an auto-approve posture asked not to be interrupted, and an
+ * egress ask is an interruption like any other; without this the two ask
+ * pipelines disagree about what auto-approve means. It is checked after the
+ * broker lookup, matching the tool resolver, so an unbound broker still
+ * fails closed rather than opening egress.
+ *
+ * The parameter is optional and last, unlike the tool resolver where it
+ * sits second. That is deliberate: appending it keeps every existing
+ * two-argument call compiling, so wiring it at the facade is a one-line
+ * change instead of a coordinated one.
  */
 export function buildBrokeredNetworkResolver(
   consumer: ResolveNetworkAccess,
   getBroker: () => PermissionBroker | null,
+  isAutoApprove?: (() => boolean) | undefined,
 ): ResolveNetworkAccess {
   return async (req) => {
     const upstream = await consumer(req);
     if (upstream.decision !== 'ask') return upstream;
     const broker = getBroker();
     if (!broker) return { decision: 'deny' };
+    if (isAutoApprove?.() === true) {
+      // Same audit trail a tool ask leaves: the decision is invisible to the
+      // user by design, so the log is the only record it happened.
+      broker.noteAutoApproved(NETWORK_ACCESS_PERMISSION_NAME, {
+        loopPath: 'reasoner',
+        renderedRequest: renderNetworkAccessRequest(req),
+      });
+      return { decision: 'allow' };
+    }
     const answer = await broker.requestDecision({
       askId: `ask-${crypto.randomUUID()}`,
       loopPath: 'reasoner',

@@ -970,4 +970,72 @@ describe('brokered resolvers', () => {
     );
     expect(await resolver({ host: 'x.example', via: 'webfetch' })).toEqual({ decision: 'deny' });
   });
+
+  it('isAutoApprove suppresses the egress voicing exactly as it does a tool ask', async () => {
+    const h = createHarness();
+    const resolver = buildBrokeredNetworkResolver(
+      async () => ({ decision: 'ask' }),
+      () => h.router.permissionBroker,
+      () => true,
+    );
+
+    const decision = await resolver({
+      host: 'evil.example',
+      port: 443,
+      via: 'webfetch',
+      url: 'https://evil.example/exfil?q=secret',
+    });
+
+    // The symptom: a consumer in an auto-approve posture is interrupted by
+    // an egress request read out loud, in the one mode that says not to.
+    expect(h.askVoicings).toHaveLength(0);
+    expect(h.log.some((entry) => entry.type === 'ask')).toBe(false);
+    expect(decision).toEqual({ decision: 'allow' });
+
+    // Invisible to the user, so the log is the only record it happened.
+    const audit = h.log.find((entry) => entry.data?.['event'] === 'ask_auto_approved')!;
+    expect(audit).toBeDefined();
+    expect(audit.content).toContain('evil.example:443');
+    expect(audit.content).toContain('https://evil.example/exfil?q=secret');
+    expect(audit.data).toMatchObject({ toolName: 'NetworkAccess' });
+    expect(audit.loopPath).toBe('reasoner');
+  });
+
+  it('auto-approve never opens egress when no broker is bound', async () => {
+    const resolver = buildBrokeredNetworkResolver(
+      async () => ({ decision: 'ask' }),
+      () => null,
+      () => true,
+    );
+    // Matches the tool resolver's ordering: an unbound broker fails closed
+    // before auto-approve is ever consulted.
+    expect(await resolver({ host: 'x.example', via: 'webfetch' })).toEqual({ decision: 'deny' });
+  });
+
+  it('an auto-approve callback that reads false still brokers the ask', async () => {
+    const h = createHarness();
+    const resolver = buildBrokeredNetworkResolver(
+      async () => ({ decision: 'ask' }),
+      () => h.router.permissionBroker,
+      () => false,
+    );
+    const pending = resolver({ host: 'internal.corp', port: 8443, via: 'shell' });
+    await waitUntil(() => h.askVoicings.length === 1);
+    const askId = String(h.log.find((entry) => entry.type === 'ask')!.data!['askId']);
+    h.router.dispatchAnswerAsk(askId, 'deny', undefined);
+    expect(await pending).toEqual({ decision: 'deny' });
+  });
+
+  it('an allow or deny from the consumer never consults auto-approve', async () => {
+    const h = createHarness();
+    let consulted = 0;
+    const resolver = buildBrokeredNetworkResolver(
+      async (req) => (req.host === 'ok.example' ? { decision: 'allow' } : { decision: 'deny' }),
+      () => h.router.permissionBroker,
+      () => { consulted += 1; return true; },
+    );
+    expect(await resolver({ host: 'ok.example', via: 'shell' })).toEqual({ decision: 'allow' });
+    expect(await resolver({ host: 'no.example', via: 'shell' })).toEqual({ decision: 'deny' });
+    expect(consulted).toBe(0);
+  });
 });
