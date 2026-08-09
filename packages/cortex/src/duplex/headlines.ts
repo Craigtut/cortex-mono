@@ -275,8 +275,8 @@ export class DuplexHeadlines {
   }
 
   /**
-   * The ask sections: the VOICED one verbatim with its id, everything queued
-   * behind it as a bare count.
+   * The ask sections: the VOICED one verbatim, everything queued behind it
+   * as a bare count.
    *
    * Rendering every pending ask with its request text re-opens F2
    * mis-binding through a surface the D16 router rules never see. Two asks
@@ -287,10 +287,20 @@ export class DuplexHeadlines {
    * npm one", and a bare answer_ask binds to whichever the broker voiced
    * first. The consent would be genuine and the audit trail clean.
    *
-   * So the block carries only what the user could actually have heard. The
-   * id rides along because an answer needs one and the voicing message that
-   * carried it can be arbitrarily far back in the transcript; it is the same
-   * id already spoken to this loop, and the block reaches the talker alone.
+   * So the block carries only what the user could actually have heard.
+   *
+   * **No ask id here, deliberately.** The id is the nonce that fences the
+   * verbatim request in the voicing (prompts.ts buildAskVoicing), and that
+   * fence holds only while the id stays away from whoever authored the text
+   * inside it. This block is rebuilt and injected on EVERY talker call, in
+   * the surface the talker is most encouraged to quote from, and the
+   * talker's own output reaches the reasoner verbatim through two channels
+   * (spoken replies in the conversation-delta buffer, and the answer_ask
+   * reason). "The block reaches the talker alone" is true of the block and
+   * not of what the talker then says. It also buys nothing: a bare
+   * `answer_ask({decision})` binds to the voiced ask, and the router refuses
+   * an allow for anything else, so an id can never make an accepted answer
+   * possible that a bare answer would not.
    */
   private appendAskSections(
     sections: string[],
@@ -305,7 +315,7 @@ export class DuplexHeadlines {
       // hostile rendering must not fabricate block structure. Over-cap
       // renderings keep their tail, matching the producer's rule.
       sections.push(
-        `<pending-ask id="${escapeAttribute(ask.askId)}" voiced="true" ` +
+        `<pending-ask voiced="true" ` +
         `age="${ageSeconds(now, ask.requestedAt)}s">` +
         `${escapeText(clipHeadTail(ask.renderedRequest, MAX_ASK_CHARS, ASK_HEAD_CHARS, ASK_TAIL_CHARS))}` +
         '</pending-ask>',

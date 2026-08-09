@@ -307,9 +307,11 @@ describe('adversarial: two pending asks, one bare yes', () => {
     // cannot voice it, and no answer can be collected against it here.
     expect(block).not.toContain('rm -rf ~/work');
     expect(block).toContain('count="1"');
-    // What IS answerable is identified, so the answer does not have to fall
-    // through to the broker's bare-answer binding.
-    expect(block).toContain(`id="${voicedAskId}"`);
+    // And no ask id: that is the nonce fencing the verbatim request in the
+    // voicing, and this block is rebuilt into the talker's context every
+    // call, where a quoted id would ride the talker's own output back to the
+    // reasoner. A bare answer_ask binds to the voiced ask regardless.
+    expect(block).not.toContain(voicedAskId);
   });
 
   it('a bare yes with no id binds to the voiced ask and nothing else', async () => {

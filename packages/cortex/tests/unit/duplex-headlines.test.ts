@@ -242,9 +242,12 @@ describe('DuplexHeadlines', () => {
     expect(block).not.toContain('rm -rf ~/work');
     expect(block).not.toContain('ask-queued');
     expect(block).toContain('<queued-asks count="1">');
-    // The answerable ask carries its id, so an answer from the block binds
-    // explicitly rather than falling back to the broker's voiced pointer.
-    expect(block).toContain('id="ask-voiced"');
+    // No ask id anywhere: it is the fence nonce for the verbatim request in
+    // the voicing, and this block is rebuilt into the talker's context on
+    // every call, where the talker is most likely to quote it back into
+    // output that reaches the reasoner verbatim. A bare answer_ask binds to
+    // the voiced ask anyway, so carrying the id buys nothing.
+    expect(block).not.toContain('ask-voiced');
   });
 
   it('renders an unvoiced ask as a count alone, with nothing answerable', () => {
