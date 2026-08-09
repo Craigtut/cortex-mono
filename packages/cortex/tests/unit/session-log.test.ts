@@ -431,6 +431,134 @@ describe('SessionLog: restore', () => {
   });
 });
 
+describe('SessionLog: restore notifies subscribers', () => {
+  /**
+   * The symptom, not the internal state change: a UI subscribed before the
+   * restore renders the replaced session and has no way to know.
+   */
+  function renderingSubscriber(log: SessionLog): { rendered: () => string[] } {
+    let view: SessionLogEntry[] = [];
+    log.subscribeLog((event) => {
+      if (event.kind === 'reset') view = [...event.entries];
+      else if (event.kind === 'entry') view.push(event.entry);
+    });
+    return { rendered: () => view.map((e) => e.content) };
+  }
+
+  it('a subscriber attached before a restore ends up rendering the restored log', () => {
+    const log = new SessionLog();
+    appendUtterance(log, 'old-1');
+    appendUtterance(log, 'old-2');
+
+    const ui = renderingSubscriber(log);
+    appendUtterance(log, 'old-3');
+    expect(ui.rendered()).toEqual(['old-3']);
+
+    log.restore([
+      { seq: 40, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'restored-1' },
+      { seq: 41, type: 'reply', timestamp: 2, loopPath: 'main', content: 'restored-2' },
+    ]);
+
+    // Pre-fix this still reads ['old-3']: the replaced session, forever.
+    expect(ui.rendered()).toEqual(['restored-1', 'restored-2']);
+
+    appendUtterance(log, 'after');
+    expect(ui.rendered()).toEqual(['restored-1', 'restored-2', 'after']);
+    expect(ui.rendered()).toEqual(log.getLog().map((e) => e.content));
+  });
+
+  it('the reset carries the restored bounds and detached entry copies', () => {
+    const log = new SessionLog();
+    const events: SessionLogEvent[] = [];
+    log.subscribeLog((event) => events.push(event));
+
+    log.restore([
+      { seq: 7, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'a', data: { n: 1 } },
+      { seq: 9, type: 'reply', timestamp: 2, loopPath: 'main', content: 'b' },
+    ]);
+
+    expect(events).toHaveLength(1);
+    const reset = events[0]!;
+    if (reset.kind !== 'reset') throw new Error('expected a reset event');
+    expect(reset.firstRetainedSeq).toBe(7);
+    expect(reset.lastSeq).toBe(9);
+    expect(reset.entries.map((e) => e.seq)).toEqual([7, 9]);
+
+    // Detached: mutating the delivered copy cannot reach the log.
+    reset.entries[0]!.content = 'tampered';
+    (reset.entries[0]!.data as { n: number }).n = 99;
+    expect(log.getLog()[0]!.content).toBe('a');
+    expect(log.getLog()[0]!.data).toEqual({ n: 1 });
+  });
+
+  it('an empty restore still tells subscribers the session is gone', () => {
+    const log = new SessionLog();
+    appendUtterance(log, 'a');
+    const ui = renderingSubscriber(log);
+    appendUtterance(log, 'b');
+
+    log.restore([]);
+
+    expect(ui.rendered()).toEqual([]);
+  });
+
+  it('discards content queued before the restore rather than delivering it after', async () => {
+    const log = new SessionLog();
+    let release: (() => void) | null = null;
+    const seen: SessionLogEvent[] = [];
+    log.subscribeLog(async (event) => {
+      seen.push(event);
+      if (seen.length === 1) await new Promise<void>((resolve) => { release = resolve; });
+    });
+
+    appendUtterance(log, 'blocking');
+    await waitUntil(() => release !== null);
+    // These queue behind the blocked callback and belong to the old session.
+    appendUtterance(log, 'stale-1');
+    appendUtterance(log, 'stale-2');
+
+    log.restore([
+      { seq: 60, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'restored' },
+    ]);
+    release!();
+
+    await waitUntil(() => seen.length >= 2);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(seen.map((e) => e.kind)).toEqual(['entry', 'reset']);
+    expect(seen.some((e) => e.kind === 'entry' && e.entry.content.startsWith('stale')))
+      .toBe(false);
+  });
+
+  it('a slow subscriber cannot have the reset dropped by the buffer bound', async () => {
+    const log = new SessionLog({ maxSubscriberBuffer: 2 });
+    let release: (() => void) | null = null;
+    const seen: SessionLogEvent[] = [];
+    log.subscribeLog(async (event) => {
+      seen.push(event);
+      if (seen.length === 1) await new Promise<void>((resolve) => { release = resolve; });
+    });
+
+    appendUtterance(log, 'blocking');
+    await waitUntil(() => release !== null);
+    log.restore([
+      { seq: 80, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'restored' },
+    ]);
+    // A burst well past the bound, all of it after the restore.
+    for (let i = 0; i < 10; i += 1) appendUtterance(log, `burst-${i}`);
+    release!();
+
+    await waitUntil(() => seen.some((e) => e.kind === 'reset'));
+    const reset = seen.find((e) => e.kind === 'reset')!;
+    expect(reset).toMatchObject({ kind: 'reset' });
+    // And it arrives before any post-restore entry, never after.
+    const resetIdx = seen.indexOf(reset);
+    const firstEntryAfter = seen.findIndex(
+      (e, i) => i > 0 && e.kind === 'entry' && e.entry.content.startsWith('burst'),
+    );
+    expect(firstEntryAfter).toBeGreaterThan(resetIdx);
+  });
+});
+
 describe('SessionLog: clearSubscribers', () => {
   it('drops every subscriber', () => {
     const log = new SessionLog();

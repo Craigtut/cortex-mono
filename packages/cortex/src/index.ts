@@ -194,6 +194,7 @@ export type {
   SessionLogAppendInput,
   SessionLogEvent,
   SessionLogGap,
+  SessionLogReset,
   SessionLogSubscriber,
   SessionLogOptions,
   WakeClass,

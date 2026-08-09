@@ -121,10 +121,33 @@ export interface SessionLogGap {
   dropped: number;
 }
 
-/** What a subscriber receives: an entry, or a gap marker. */
+/**
+ * Delivered when {@link SessionLog.restore} replaces the log wholesale. It
+ * is not a gap: a gap says "you missed some entries", where a restore says
+ * "the timeline you have been rendering is no longer this session". A
+ * subscriber that treated one as the other would append restored entries
+ * underneath stale ones.
+ *
+ * The event carries the restored log rather than telling the subscriber to
+ * go read it, so the handoff is atomic. Re-reading through `getLog()` from
+ * the callback would race any append landing between the two calls, and the
+ * subscriber would render that entry twice.
+ */
+export interface SessionLogReset {
+  kind: 'reset';
+  /** The restored log in full: every retained entry, oldest first. */
+  entries: SessionLogEntry[];
+  /** Seq of the oldest retained entry after the restore. */
+  firstRetainedSeq: number;
+  /** Seq of the newest retained entry after the restore. */
+  lastSeq: number;
+}
+
+/** What a subscriber receives: an entry, a gap marker, or a restore reset. */
 export type SessionLogEvent =
   | { kind: 'entry'; entry: SessionLogEntry }
-  | SessionLogGap;
+  | SessionLogGap
+  | SessionLogReset;
 
 /**
  * Subscriber callback. A synchronous callback is invoked inline at append
@@ -177,6 +200,13 @@ interface SubscriberState {
   queue: SessionLogEvent[];
   /** Coalesced drop range awaiting delivery ahead of the queue. */
   pendingGap: { fromSeq: number; toSeq: number; dropped: number } | null;
+  /**
+   * Restore notification awaiting delivery, held outside the queue so the
+   * buffer bound can never drop it. A subscriber that missed this and then
+   * received post-restore entries would splice a new session onto an old
+   * one, which is worse than the staleness the event exists to prevent.
+   */
+  pendingReset: SessionLogReset | null;
   /** True while the drain loop is running (sync or awaiting a slow cb). */
   draining: boolean;
   unsubscribed: boolean;
@@ -287,6 +317,7 @@ export class SessionLog {
       cb,
       queue: [],
       pendingGap: null,
+      pendingReset: null,
       draining: false,
       unsubscribed: false,
     };
@@ -321,9 +352,12 @@ export class SessionLog {
   /**
    * Replace the log wholesale from a persisted artifact. Sequence numbering
    * resumes after the highest restored seq so appends stay monotonic across
-   * a restore. Entries are defensively copied and sorted by seq. Existing
-   * subscribers keep receiving appends made after the restore; replay
-   * positions from before the restore are not revisited.
+   * a restore. Entries are defensively copied and sorted by seq.
+   *
+   * Every live subscriber is handed a {@link SessionLogReset} carrying the
+   * restored log, ahead of any later append. Without it a subscriber has no
+   * way to notice the replacement short of polling, so a UI attached before
+   * the restore would keep rendering a session that no longer exists.
    */
   restore(entries: SessionLogEntry[]): void {
     const restored = entries.map(cloneEntry).sort((a, b) => a.seq - b.seq);
@@ -336,6 +370,22 @@ export class SessionLog {
       : restored;
     const maxSeq = restored.length > 0 ? restored[restored.length - 1]!.seq : 0;
     this.nextSeq = Math.max(this.nextSeq, maxSeq + 1);
+
+    const firstRetainedSeq = this.firstRetainedSeq;
+    const lastSeq = this.lastSeq;
+    for (const sub of [...this.subscribers]) {
+      // Anything already queued describes the replaced session, so it is
+      // discarded rather than delivered after the reset.
+      sub.queue.length = 0;
+      sub.pendingGap = null;
+      sub.pendingReset = {
+        kind: 'reset',
+        entries: this.entries.map(cloneEntry),
+        firstRetainedSeq,
+        lastSeq,
+      };
+      this.drain(sub);
+    }
   }
 
   /** Drop every subscriber (owner teardown). Queued events are discarded. */
@@ -373,7 +423,11 @@ export class SessionLog {
     sub.queue.push(event);
     while (sub.queue.length > this.maxSubscriberBuffer) {
       const droppedEvent = sub.queue.shift()!;
-      if (droppedEvent.kind === 'entry') {
+      if (droppedEvent.kind === 'reset') {
+        // Unreachable: a reset is held in pendingReset, never queued. Kept
+        // as a total case so the union stays exhaustively handled.
+        sub.pendingReset = droppedEvent;
+      } else if (droppedEvent.kind === 'entry') {
         const seq = droppedEvent.entry.seq;
         if (sub.pendingGap) {
           sub.pendingGap.toSeq = seq;
@@ -436,8 +490,16 @@ export class SessionLog {
     sub.draining = false;
   }
 
-  /** Next event for a subscriber: a coalesced gap first, then the queue. */
+  /**
+   * Next event for a subscriber: a pending restore first (it supersedes
+   * everything older), then a coalesced gap, then the queue.
+   */
   private takeNext(sub: SubscriberState): SessionLogEvent | null {
+    if (sub.pendingReset) {
+      const reset = sub.pendingReset;
+      sub.pendingReset = null;
+      return reset;
+    }
     if (sub.pendingGap) {
       const gap = sub.pendingGap;
       sub.pendingGap = null;
