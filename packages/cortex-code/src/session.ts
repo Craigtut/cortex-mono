@@ -22,6 +22,7 @@ import {
   type CortexModel,
   type CortexAgentConfig,
   type CortexAgentStateV1,
+  type CortexAgentStateV2,
   type CortexEvent,
   type CortexToolPermissionResult,
   type ToolPermissionRequestContext,
@@ -57,7 +58,7 @@ import { checkProjectMcpTrust, trustProjectMcpConfig } from './discovery/mcp-tru
 import { checkProjectTrust, recordProjectTrust } from './discovery/project-trust.js';
 import {
   generateSessionId,
-  createDebouncedSaver,
+  createDebouncedStateSaver,
   createToolResultPersistor,
   type SessionMeta,
 } from './persistence/sessions.js';
@@ -102,6 +103,13 @@ import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * How long shutdown waits for a fresh composite snapshot before falling back
+ * to the last one the facade published. getState() resolves at a quiescence
+ * window, which a session that is still working may not reach.
+ */
+const SHUTDOWN_SNAPSHOT_TIMEOUT_MS = 2000;
 
 function formatEffortLabel(level: ThinkingLevel): string {
   return level === 'max'
@@ -164,7 +172,13 @@ export class Session {
   private sessionId: string;
   /** True when this session was launched to resume a saved one. */
   private readonly isResume: boolean;
-  private saver: ReturnType<typeof createDebouncedSaver>;
+  private saver: ReturnType<typeof createDebouncedStateSaver>;
+  /**
+   * The last composite snapshot the facade handed over. Shutdown falls back
+   * to it when a fresh `getState()` cannot settle in time, so a session that
+   * is still busy at exit is saved slightly stale rather than not at all.
+   */
+  private lastCompositeState: CortexAgentStateV2 | null = null;
   /**
    * True while the agent as a whole is busy: any resident loop running, a
    * sub-agent alive, a delivery parked, an ask pending. Drives the spinner,
@@ -276,7 +290,7 @@ export class Session {
     });
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.isResume = options.resumeSessionId !== undefined;
-    this.saver = createDebouncedSaver(this.sessionId);
+    this.saver = createDebouncedStateSaver(this.sessionId);
     this.compactionStrategy = options.compactionStrategy ?? 'observational';
     this.updateInfo = options.updateInfo ?? null;
     this.createdAt = Date.now();
@@ -1209,9 +1223,19 @@ export class Session {
     // done. Only the cheap per-loop refresh happens here; the end-of-work
     // UI waits for the facade's settlement predicate.
     this.agent.onLoopComplete(() => {
-      this.triggerAutoSave();
       this.updateFooterContextUsage();
       this.watchForWorkSettled();
+    });
+
+    // Persistence trigger. Debounced by the facade and fired with a
+    // consistent composite snapshot (log plus both loops' histories and
+    // memory), which is why autosave hangs off this rather than off
+    // onLoopComplete and turn_end: those fire per loop and per turn, so one
+    // exchange used to write the session out three times, each time from a
+    // reasoner-only read that under duplex would silently drop the user's
+    // actual dialogue.
+    this.agent.onStateChanged((state) => {
+      this.recordComposite(state);
     });
 
     // Error handling with per-category display
@@ -1361,12 +1385,12 @@ export class Session {
       void this.activity.recordWorking();
     });
 
-    // Update tokens and auto-save on turn_end (fires after each LLM turn,
-    // including mid-loop turns between tool calls)
+    // Update tokens on turn_end (fires after each LLM turn, including
+    // mid-loop turns between tool calls). Persistence is not driven from
+    // here: onStateChanged already fires on a settled, consistent snapshot.
     bridge.on('turn_end', () => {
       this.updateFooterContextUsage();
       this.updateObservationalMemoryStatus();
-      this.triggerAutoSave();
     });
   }
 
@@ -2053,41 +2077,32 @@ export class Session {
     );
   }
 
-  /** Resume a previous session by loading and restoring its history. */
+  /**
+   * Resume a previous session.
+   *
+   * Composite (v2) saves are preferred; a session written before the
+   * composite format existed still loads through the v1 pair, which the
+   * facade upgrades transparently. Both go in through the one all-or-nothing
+   * `restore()`, which subsumes the three separate loop-level restore calls
+   * (history, observational state, usage): those could each land
+   * independently and mid-run, while `restore()` applies them in order and
+   * refuses outright while a loop is running, so a /resume typed during a
+   * turn fails loudly instead of splicing history out from under it.
+   */
   async resume(sessionId: string): Promise<void> {
-    const { loadSession: load, loadObservationalState } = await import('./persistence/sessions.js');
-    const saved = await load(sessionId);
-    if (!saved) {
+    if (!this.agent) return;
+
+    const loaded = await this.loadResumableSession(sessionId);
+    if (!loaded) {
       this.app?.transcript.addNotification('Resume Failed', `Session ${sessionId} not found.`);
       return;
     }
 
-    if (!this.agent) return;
-
-    // Observational memory state, loaded before the restore because history
-    // and memory now go in together (the buffer watermark indexes into the
-    // history, so the facade orders them itself rather than trusting the
-    // caller to).
-    const omState = this.compactionStrategy === 'observational'
-      ? await loadObservationalState(sessionId)
-      : null;
-
-    // One all-or-nothing restore. This subsumes the three separate loop-level
-    // restore calls (history, observational state, usage), which could each
-    // land independently and mid-run; restore() applies them in order and
-    // refuses outright while a loop is running, so a /resume typed during a
-    // turn now fails loudly instead of splicing history out from under it.
-    const artifact: CortexAgentStateV1 = {
-      version: 1,
-      history: saved.history as CortexAgentStateV1['history'],
-      memory: (omState ?? null) as ObservationalMemoryState | null,
-      ...(saved.meta.usage ? { usage: saved.meta.usage } : {}),
-    };
     try {
       // Awaited: restore() reports its guards as a rejection, so an
       // unawaited call would leave a /resume typed during a turn escaping
       // this catch as an unhandled rejection.
-      await this.agent.restore(artifact);
+      await this.agent.restore(loaded.artifact);
     } catch (err) {
       log.warn('Resume restore rejected', {
         sessionId,
@@ -2099,8 +2114,8 @@ export class Session {
       );
       return;
     }
-    this.createdAt = saved.meta.createdAt;
-    if (omState) this.updateObservationalMemoryStatus();
+    this.createdAt = loaded.meta.createdAt;
+    this.updateObservationalMemoryStatus();
 
     // Replay message history into the transcript so the user sees the
     // previous conversation. Cortex already has the history in context; this
@@ -2109,11 +2124,60 @@ export class Session {
       const { replayHistoryToTranscript } = await import('./utils/replay-history.js');
       this.app.transcript.addNotification(
         'Session Resumed',
-        `Replaying ${saved.history.length} messages from previous session.`,
+        `Replaying ${loaded.dialogue.length} messages from previous session.`,
       );
-      replayHistoryToTranscript(saved.history, this.app.transcript);
+      replayHistoryToTranscript(loaded.dialogue, this.app.transcript);
     }
     this.updateFooterContextUsage();
+  }
+
+  /**
+   * Load a saved session as something `restore()` accepts, plus the history
+   * the transcript should replay. The replayed half is the DIALOGUE, which
+   * under duplex is the talker's transcript, not the reasoner's work log.
+   */
+  private async loadResumableSession(sessionId: string): Promise<{
+    artifact: CortexAgentStateV1 | CortexAgentStateV2;
+    meta: SessionMeta;
+    dialogue: unknown[];
+  } | null> {
+    const {
+      loadSessionState,
+      loadSession: load,
+      loadObservationalState,
+    } = await import('./persistence/sessions.js');
+
+    const composite = await loadSessionState(sessionId);
+    if (composite) {
+      const { state } = composite;
+      return {
+        artifact: state,
+        meta: composite.meta,
+        dialogue: state.talkerHistory.length > 0 ? state.talkerHistory : state.reasonerHistory,
+      };
+    }
+
+    const saved = await load(sessionId);
+    if (!saved) return null;
+
+    // Observational memory state, loaded before the restore because history
+    // and memory now go in together (the buffer watermark indexes into the
+    // history, so the facade orders them itself rather than trusting the
+    // caller to).
+    const omState = this.compactionStrategy === 'observational'
+      ? await loadObservationalState(sessionId)
+      : null;
+
+    return {
+      artifact: {
+        version: 1,
+        history: saved.history as CortexAgentStateV1['history'],
+        memory: (omState ?? null) as ObservationalMemoryState | null,
+        ...(saved.meta.usage ? { usage: saved.meta.usage } : {}),
+      },
+      meta: saved.meta,
+      dialogue: saved.history,
+    };
   }
 
   /**
@@ -2172,17 +2236,11 @@ export class Session {
     // Immediate final save
     if (this.agent) {
       try {
-        const history = this.agent.getConversationHistory();
-        const meta = this.buildSessionMeta();
-        const { saveSession, saveObservationalState } = await import('./persistence/sessions.js');
-        const saves: Promise<void>[] = [saveSession(this.sessionId, history, meta)];
-        if (this.compactionStrategy === 'observational') {
-          const omState = this.agent.getObservationalMemoryState();
-          if (omState) {
-            saves.push(saveObservationalState(this.sessionId, omState));
-          }
+        const state = await this.finalCompositeState(this.agent);
+        if (state) {
+          const { saveSessionState } = await import('./persistence/sessions.js');
+          await saveSessionState(this.sessionId, state, this.buildSessionMeta());
         }
-        await Promise.all(saves);
       } catch {
         // Best-effort save during shutdown
       }
@@ -2389,17 +2447,41 @@ export class Session {
     );
   }
 
-  private triggerAutoSave(): void {
-    if (!this.agent) return;
+  /**
+   * Take the facade's composite snapshot and queue it for disk. The snapshot
+   * carries the session log, BOTH loops' histories and observational memory,
+   * and per-loop usage, so nothing that only exists on the conversation loop
+   * is lost. The reasoner-only trio (`getConversationHistory()` plus
+   * `getObservationalMemoryState()` plus `getSessionUsage()`) that used to
+   * build a v1 artifact here reads the work transcript under duplex, and the
+   * dialogue it omits was never written, so no later migration could get it
+   * back.
+   */
+  /**
+   * The composite snapshot to write at exit. `getState()` resolves only at a
+   * quiescence window, so a session still mid-run at exit would block the
+   * shutdown path; bound the wait and fall back to the last snapshot the
+   * facade published, which is stale by at most one debounce rather than
+   * absent.
+   */
+  private async finalCompositeState(agent: CortexAgent): Promise<CortexAgentStateV2 | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), SHUTDOWN_SNAPSHOT_TIMEOUT_MS);
+      timer.unref();
+    });
     try {
-      const history = this.agent.getConversationHistory();
-      const meta = this.buildSessionMeta();
-      // Bundle observational state into the same debounced write so the
-      // persisted buffer watermark stays aligned with the saved history.
-      const omState = this.compactionStrategy === 'observational'
-        ? this.agent.getObservationalMemoryState() ?? undefined
-        : undefined;
-      this.saver.save(history, meta, omState);
+      const fresh = await Promise.race([agent.getState().catch(() => null), bound]);
+      return fresh ?? this.lastCompositeState;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private recordComposite(state: CortexAgentStateV2): void {
+    this.lastCompositeState = state;
+    try {
+      this.saver.save(state, this.buildSessionMeta());
     } catch {
       // Swallow auto-save errors silently
     }
