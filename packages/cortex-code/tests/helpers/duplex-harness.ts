@@ -455,6 +455,54 @@ export async function createDuplexSession(
   return { session, internals, app, harness };
 }
 
+export interface PassthroughSession {
+  session: Session;
+  internals: SessionInternals;
+  app: FakeApp;
+  agent: CortexAgent;
+  reasonerPi: ScriptedPi;
+}
+
+/**
+ * The same wiring in the mode cortex-code actually ships. Keying the busy
+ * state on a settlement predicate rather than on loop completion has to leave
+ * the single-loop path behaving exactly as it did.
+ */
+export async function createPassthroughSession(cwd: string): Promise<PassthroughSession> {
+  const { session, internals } = makeSession(cwd);
+  const statics = AgentLoop as unknown as LoopStatics;
+  const LoopCtor = AgentLoop as unknown as LoopCtor;
+  let reasonerPi: ScriptedPi | null = null;
+
+  vi.spyOn(AgentLoop, 'create').mockImplementation(async (loopConfig) => {
+    const pi = createScriptedPi();
+    reasonerPi = pi;
+    const loop = new LoopCtor(pi, loopConfig as unknown as Record<string, unknown>, []);
+    const agentConfig = statics.buildPiAgentConfig({
+      cortexConfig: loopConfig as unknown as Record<string, unknown>,
+      cacheBreakpointState: { agentLoop: loop },
+    });
+    pi['afterToolCall'] = agentConfig['afterToolCall'];
+    statics.wireManagedPiAgent(loop, pi);
+    const initial = (loopConfig as { initialBasePrompt?: string }).initialBasePrompt;
+    if (typeof initial === 'string') loop.setBasePrompt(initial);
+    return loop;
+  });
+
+  const agent = await CortexAgent.create({
+    ...internals.buildAgentConfig(),
+    model: testModel(),
+  });
+  liveAgents.push(agent);
+  if (!reasonerPi) throw new Error('create() did not build the reasoner loop');
+
+  const app = createFakeApp();
+  internals.agent = agent;
+  internals.app = app;
+  internals.wireEvents();
+  return { session, internals, app, agent, reasonerPi };
+}
+
 /** Put the reasoner into a long-running task and wait until it is really in it. */
 export async function startHeldReasonerWork(harness: DuplexHarness): Promise<void> {
   harness.reasonerPi.hold = true;

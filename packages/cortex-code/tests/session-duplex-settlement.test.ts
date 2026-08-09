@@ -32,6 +32,7 @@ vi.mock('node:os', async (importOriginal) => {
 
 import {
   createDuplexSession,
+  createPassthroughSession,
   destroyHarnessAgents,
   startHeldReasonerWork,
   waitUntil,
@@ -123,5 +124,37 @@ describe('duplex: the TUI must not report idle while the reasoner works', () => 
 
     harness.talkerPi.releaseRun();
     await first;
+  });
+});
+
+describe('passthrough: the mode cortex-code actually ships is unchanged', () => {
+  it('shows the spinner for a turn and clears it when the turn ends', async () => {
+    const { internals, app, reasonerPi } = await createPassthroughSession(cwd);
+
+    reasonerPi.hold = true;
+    const turn = internals.handleInput('list the files');
+    await waitUntil(() => reasonerPi.running, 2000, 'reasoner run started');
+    expect(internals.isRunning).toBe(true);
+    expect(app.spinnerVisible).toBe(true);
+
+    reasonerPi.releaseRun();
+    await turn;
+    await waitUntil(() => !internals.isRunning, 2000, 'session settles');
+    expect(app.spinnerVisible).toBe(false);
+    expect(app.calls).toContain('transcript.closeActiveToolGroups');
+  });
+
+  it('steers a second message typed into a running turn', async () => {
+    const { internals, agent, reasonerPi } = await createPassthroughSession(cwd);
+    reasonerPi.hold = true;
+    const turn = internals.handleInput('list the files');
+    await waitUntil(() => reasonerPi.running, 2000, 'reasoner run started');
+
+    const steer = vi.spyOn(agent, 'steer');
+    await internals.handleInput('actually, just the top level');
+    expect(steer).toHaveBeenCalledWith('actually, just the top level');
+
+    reasonerPi.releaseRun();
+    await turn;
   });
 });
