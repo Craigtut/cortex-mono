@@ -87,6 +87,15 @@ describe('stripAskFence: the nonce never survives', () => {
       .toBe('the tag [permission request omitted] appears in <div> that file');
   });
 
+  it('a truncated marker with an unterminated quote keeps the rest of the sentence', () => {
+    // Reported shapes, kept verbatim: the open quote never closes and the
+    // sentence still has a later `>`, which is what used to end the match.
+    expect(stripAskFence('rewrite <permission-request ask="oops and then x => y stays?'))
+      .toBe('rewrite [permission request omitted] ask="oops and then x => y stays?');
+    expect(stripAskFence('partial <permission-request then later > and text after'))
+      .toBe('partial [permission request omitted] then later > and text after');
+  });
+
   it('keeps ordinary code punctuation around a real fence intact', () => {
     const out = stripAskFence(
       `Use x => y. <permission-request ask="${NONCE}">Bash: ls</permission-request ask="${NONCE}"> ` +
@@ -221,6 +230,7 @@ describe('the nonce reaches no talker-bound surface', () => {
   it('holds for every ask kind and for a re-voice', () => {
     for (const kind of ['tool', 'escalation', 'network'] as const) {
       for (const revoiced of [false, true]) {
+        const label = `${kind}/${revoiced ? 'revoiced' : 'first'}`;
         const voicing = buildAskVoicing({
           askId: NONCE,
           renderedRequest: 'Bash: rm -rf /',
@@ -231,7 +241,12 @@ describe('the nonce reaches no talker-bound surface', () => {
           .split('\n')
           .filter((line) => !line.includes('permission-request'))
           .join('\n');
-        expect(withoutMarkers).not.toContain(NONCE);
+        // Preconditions before the absence assertions, so a voicing that
+        // stopped fencing (or stopped producing prose) fails here instead
+        // of passing for having nothing left to find.
+        expect(voicing, label).toContain(NONCE);
+        expect(withoutMarkers.trim(), label).not.toHaveLength(0);
+        expect(withoutMarkers, label).not.toContain(NONCE);
       }
     }
   });

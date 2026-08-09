@@ -66,11 +66,21 @@ const LONE_RE = new RegExp(`${OPEN_MARKER}|${CLOSE_MARKER}`, 'gi');
 /**
  * Anything tag-shaped the two above did not take: an unterminated marker
  * (`<permission-request ask="x` with the `>` never typed) or one whose
- * attribute region is not attribute-shaped. Only the tag token is removed,
- * never the text after it, so neither a truncated marker nor a deliberately
- * malformed one can make the stripper eat real content. Whatever the tag
- * was carrying stays put, and the nonce in it is caught by
- * {@link ASK_ID_RE}, which is why removing less here costs nothing.
+ * attribute region is not attribute-shaped. It matches the tag token and
+ * nothing else, and whatever the tag was carrying stays put; the nonce in
+ * it is caught by {@link ASK_ID_RE}, which is why matching less costs
+ * nothing.
+ *
+ * **This regex being narrow is not what keeps the stripper from eating
+ * prose.** That property belongs to {@link ATTRIBUTES}, and saying it here
+ * is how the bug it describes stayed hidden: an earlier version of this
+ * comment claimed "a truncated marker cannot make the stripper eat real
+ * content", which was true of this regex and false of the module, because
+ * `LONE_RE` ran first with a to-the-next-bracket match and consumed the
+ * span before this ever saw it. The comment was accurate about its subject
+ * and wrong about its scope, and a reader hardening the regex the comment
+ * sat on would not have touched the cause. Claims about the whole strip
+ * belong on {@link stripAskFence}.
  *
  * Runs after the two complete forms, not before: it matches the tag token
  * of every marker, so running it first would decapitate well-formed
@@ -137,6 +147,14 @@ const MAY_CONTAIN_RE = new RegExp(`${PERMISSION_REQUEST_TAG}|\\bask-`, 'i');
  * Text with no marker and no nonce is returned unchanged. Angle brackets on
  * their own are left alone: only this exact tag name matches, so a talker
  * quoting a user's `a < b` or a snippet of HTML is not touched.
+ *
+ * **Nothing here ever removes more than a marker.** A truncated or
+ * malformed marker costs its tag token and no surrounding prose, whatever
+ * else the text contains. That is a property of the whole pipeline rather
+ * than of any one pattern, so it is stated here: it holds because
+ * {@link ATTRIBUTES} refuses to read prose as a tag body, and it would stop
+ * holding if any pattern above went back to matching to the next `>`.
+ * Regression cases for it live in duplex-ask-fence.test.ts.
  */
 export function stripAskFence(text: string): string {
   if (text.length === 0) return text;
