@@ -181,3 +181,18 @@ The reasoner-lifecycle section states the facade digests during idle windows, bu
 The red-team confirmed that moving from in-band tags to control tools does close injection-by-echo: with no parser, untrusted text cannot dispatch by being echoed. It withdrew its own pre-amendment findings on that basis.
 
 The caveat is that echo-resistance is not persuasion-resistance, and D8's wording implied more than it delivered. Tools are marginally worse than tags against persuasion, because each control-tool result lands in the talker's transcript, so prior `answer_ask(..., allow)` calls accumulate as few-shot precedent on a fast-tier model selected for compliance. D8 is amended to scope its claim to echo and to name the voiced-first router rules (F2) as the persuasion mitigation.
+
+## Commit Messages That Lie, and Why They Stand
+
+Several commits on this branch carry content their messages do not mention. Anyone tracing this work by `git log -S` will be misled, so the corrections are recorded here rather than rewritten into history: on a branch six agents were writing simultaneously, rewriting shared history is the more dangerous repair.
+
+| Commit | Message says | Also contains |
+|---|---|---|
+| `d6dd29b` | pins the settle-to-voice coalescing window | the `isAutoApprove` production wiring at `cortex-agent.ts` and 52 lines of facade-surface tests |
+| `8d25b63` | restores the broker abort drain to the work scope | the `getPendingAsks()` union that made lookup asks visible (the V4 source fix) |
+| `d38921a` | strips ask-fence markers from the talker reply | a deliberate test mutation that moved `settleAll('abort')` out of the work scope, leaving abort unable to deny pending asks until `8d25b63` restored it |
+| `f4b176c` | records the git hazards | the `utilityModel` provider-aware routing and its tests |
+
+Every one has the same cause: a shared file, two agents, and a staging or commit step that took the whole worktree copy of a path rather than one author's hunks. The mechanics are written up in the repo's `CLAUDE.md` under Git safety. Three forms all failed under concurrency: `git add` on a shared file loses to another agent's bare `git commit`; leaving work unstaged loses to their `git add`; and `git commit -- <path>` loses to everything, because it bypasses the index entirely.
+
+The generalizable point, which is the same one the technical findings keep making from the other direction: **a command that is safe when you check is not a safe command, it is a command with a procedure attached, and procedures decay under concurrency.** The durable fixes were the ones that removed the hazard rather than documenting it: running mutations in a detached worktree so the shared tree is never modified, and building an intended blob and committing it in one uninterrupted shell invocation.
