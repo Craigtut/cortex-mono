@@ -466,6 +466,125 @@ describe('SessionLog: retention protects conversation over churn', () => {
     });
   });
 
+  /** A log with holes in the middle and at the end. */
+  function holedLog(): SessionLog {
+    const log = new SessionLog({ maxEntries: 3 });
+    appendUtterance(log, 'u1');   // seq 1, kept
+    appendChurn(log, 'c2');       // seq 2, evicted
+    appendUtterance(log, 'u3');   // seq 3, kept
+    appendChurn(log, 'c4');       // seq 4, evicted
+    appendUtterance(log, 'u5');   // seq 5, kept
+    appendChurn(log, 'c6');       // seq 6, evicted (trailing hole)
+    return log;
+  }
+
+  it('getLogEvents reports the same holes the subscription replays', () => {
+    const log = holedLog();
+    expect(log.getLog().map((e) => e.seq)).toEqual([1, 3, 5]);
+
+    const replayed: SessionLogEvent[] = [];
+    log.subscribeLog((event) => replayed.push(event), 1);
+
+    // Asserted against each other, not against a hand-written list: the
+    // defect was the two surfaces disagreeing, so the test is the equality.
+    expect(log.getLogEvents(1)).toEqual(replayed);
+    expect(log.getLogEvents()).toEqual(replayed);
+  });
+
+  it('getLogEvents interleaves gaps with entries in seq order, trailing hole included', () => {
+    const log = holedLog();
+    expect(log.getLogEvents(1)).toEqual([
+      { kind: 'entry', entry: expect.objectContaining({ seq: 1 }) },
+      { kind: 'gap', fromSeq: 2, toSeq: 2, dropped: 1 },
+      { kind: 'entry', entry: expect.objectContaining({ seq: 3 }) },
+      { kind: 'gap', fromSeq: 4, toSeq: 4, dropped: 1 },
+      { kind: 'entry', entry: expect.objectContaining({ seq: 5 }) },
+      { kind: 'gap', fromSeq: 6, toSeq: 6, dropped: 1 },
+    ]);
+  });
+
+  it('getLogEvents honors fromSeq and returns detached entry copies', () => {
+    const log = holedLog();
+    expect(log.getLogEvents(3)).toEqual([
+      { kind: 'entry', entry: expect.objectContaining({ seq: 3 }) },
+      { kind: 'gap', fromSeq: 4, toSeq: 4, dropped: 1 },
+      { kind: 'entry', entry: expect.objectContaining({ seq: 5 }) },
+      { kind: 'gap', fromSeq: 6, toSeq: 6, dropped: 1 },
+    ]);
+
+    const events = log.getLogEvents(1);
+    const first = events[0]!;
+    if (first.kind !== 'entry') throw new Error('expected an entry');
+    first.entry.content = 'tampered';
+    expect(log.getLog()[0]!.content).toBe('u1');
+  });
+
+  it('getLogEvents on a contiguous log is entries and nothing else', () => {
+    const log = new SessionLog({ maxEntries: 10 });
+    appendUtterance(log, 'a');
+    appendUtterance(log, 'b');
+    expect(log.getLogEvents(1).every((e) => e.kind === 'entry')).toBe(true);
+    expect(log.getLogEvents(1)).toHaveLength(2);
+  });
+
+  it('a reset carries the holes in the log it restored', () => {
+    const log = new SessionLog({ maxEntries: 2 });
+    let reset: SessionLogReset | null = null;
+    log.subscribeLog((event) => { if (event.kind === 'reset') reset = event; });
+
+    // A persisted artifact that already had churn evicted from it, over cap
+    // so the restore opens one more hole on the way in.
+    log.restore([
+      { seq: 1, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'u1' },
+      { seq: 3, type: 'lifecycle', timestamp: 3, loopPath: 'main', content: 'c3' },
+      { seq: 5, type: 'reply', timestamp: 5, loopPath: 'main', content: 'r5' },
+    ]);
+
+    if (reset === null) throw new Error('expected a reset event');
+    const delivered = reset as SessionLogReset;
+    expect(delivered.entries.map((e) => e.seq)).toEqual([1, 5]);
+    // Same holes the other two surfaces report over the same log.
+    expect(delivered.gaps).toEqual(
+      log.getLogEvents(log.firstRetainedSeq).filter((e) => e.kind === 'gap'),
+    );
+    expect(delivered.gaps).toEqual([{ kind: 'gap', fromSeq: 2, toSeq: 4, dropped: 3 }]);
+  });
+
+  it('a reset over a contiguous restore carries no gaps', () => {
+    const log = new SessionLog();
+    let reset: SessionLogReset | null = null;
+    log.subscribeLog((event) => { if (event.kind === 'reset') reset = event; });
+    log.restore([
+      { seq: 1, type: 'utterance', timestamp: 1, loopPath: 'main', content: 'a' },
+      { seq: 2, type: 'reply', timestamp: 2, loopPath: 'main', content: 'b' },
+    ]);
+    if (reset === null) throw new Error('expected a reset event');
+    expect((reset as SessionLogReset).gaps).toEqual([]);
+  });
+
+  it('lastSeq is the seq space bound; newestRetainedSeq is the newest entry held', () => {
+    // Churn-first eviction can take the NEWEST entry, so these two differ
+    // with no restore involved. lastSeq naming an evicted entry is correct
+    // for its job (bounding the trailing hole) and wrong for any reader
+    // that wants "the newest thing I hold".
+    const log = new SessionLog({ maxEntries: 5 });
+    for (let i = 1; i <= 5; i += 1) appendUtterance(log, `u${i}`);
+    appendChurn(log, 'c6');
+
+    expect(log.getLog().map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
+    expect(log.lastSeq).toBe(6);
+    expect(log.newestRetainedSeq).toBe(5);
+    expect(log.newestRetainedSeq).toBe(log.getLog().at(-1)!.seq);
+  });
+
+  it('newestRetainedSeq is 0 on an empty log', () => {
+    const log = new SessionLog();
+    expect(log.newestRetainedSeq).toBe(0);
+    appendUtterance(log, 'a');
+    log.restore([]);
+    expect(log.newestRetainedSeq).toBe(0);
+  });
+
   it('an over-cap restore uses the same churn-first policy', () => {
     const log = new SessionLog({ maxEntries: 2 });
     log.restore([

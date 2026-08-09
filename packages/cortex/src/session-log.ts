@@ -135,8 +135,26 @@ export interface SessionLogGap {
  */
 export interface SessionLogReset {
   kind: 'reset';
-  /** The restored log in full: every retained entry, oldest first. */
+  /**
+   * The restored log in full: every retained entry, oldest first.
+   *
+   * Retained, not contiguous. A restored artifact can arrive with holes
+   * (it was persisted from a log that had already evicted churn) and the
+   * cap can open more on the way in, so check {@link gaps} before
+   * rendering this as an unbroken timeline.
+   */
   entries: SessionLogEntry[];
+  /**
+   * Holes inside the restored range, in seq order, computed by the same
+   * function that builds replay and {@link SessionLog.getLogEvents}. Empty
+   * in the ordinary case.
+   *
+   * Precomputed rather than left to the consumer, who would otherwise have
+   * to scan `entries` for seq discontinuity and would mostly not bother:
+   * that is precisely the silent-holes rendering this field exists to
+   * prevent. To render in order, merge the two by seq.
+   */
+  gaps: SessionLogGap[];
   /**
    * The seq the next appended entry will carry. Pass it to
    * {@link SessionLog.subscribeLog} to resume from exactly here: a later
@@ -205,6 +223,14 @@ export interface SessionLogOptions {
    * Called with entries evicted by the retention cap, so an owner can spill
    * them to durable storage before they leave memory. Errors are swallowed
    * (eviction must never fail the append that triggered it).
+   *
+   * **The spill is not monotonic across calls.** Eviction takes churn from
+   * anywhere in the log, so a later call can hand over a lower seq than an
+   * earlier one did: seq 500 goes out while a conversational seq 200 is
+   * still held, and 200 follows once churn runs out. Each batch is ordered
+   * internally, and every entry carries its own seq, so a reader that
+   * sorts on ingest is fine. A reader that assumes append-order and treats
+   * the spill as a growing tail is not.
    */
   onEvict?: (evicted: SessionLogEntry[]) => void;
 }
@@ -227,6 +253,23 @@ const DEFAULT_MAX_SUBSCRIBER_BUFFER = 1_000;
  * `error` sits with the durable set rather than with churn: it is rare
  * enough that protecting it crowds out nothing, and it is the entry a
  * consumer most needs when reconstructing why a session went wrong.
+ *
+ * **The ask record is protected, the consent record is not, and that is
+ * deliberate.** `ask` and `ask_answer` survive; the `ask_voiced` anchor the
+ * D16 allow rule compares against is a `lifecycle` entry and is churn, so a
+ * long session can retain the request and the answer while dropping the
+ * voicing between them. Two reasons to leave it that way. The split is by
+ * entry TYPE, and keeping one lifecycle subtype would mean reading `data`
+ * inside the retention policy, turning a rule into a heuristic that the
+ * next subtype has to argue with. And the log was never the consent
+ * authority: D16 requires an audit to reconstruct from the live cause-tag
+ * set precisely because a single `causedBy` cannot express multi-cause, so
+ * promoting the anchor would buy a more complete narrative, not a sounder
+ * check. What the durable set claims is the conversational record, not a
+ * replayable consent trail. Making the anchor durable properly means
+ * promoting `ask_voiced` to a real entry type, which is a persisted-artifact
+ * vocabulary change (the cause-tag kind union reuses this type) and wants
+ * its own decision.
  */
 const DURABLE_ENTRY_TYPES: ReadonlySet<SessionLogEntryType> = new Set<SessionLogEntryType>([
   'utterance',
@@ -281,9 +324,26 @@ export class SessionLog {
     this.onEvict = options?.onEvict;
   }
 
-  /** Seq of the most recently appended entry; 0 before the first append. */
+  /**
+   * Highest seq ever issued in this session; 0 before the first append.
+   *
+   * **Not** the newest entry the log holds, and the difference is not a
+   * corner case: churn-first retention can evict the newest entry, so a log
+   * holding seqs 1 to 5 can report a `lastSeq` of 6. Use it as the upper
+   * bound of the seq space (which is what makes a trailing hole detectable)
+   * and {@link newestRetainedSeq} for the newest entry actually held.
+   */
   get lastSeq(): number {
     return this.nextSeq - 1;
+  }
+
+  /**
+   * Seq of the newest entry still retained, or 0 when the log is empty.
+   * Cheap: the alternative is `getLog().at(-1)?.seq`, which copies the
+   * whole log to read one number.
+   */
+  get newestRetainedSeq(): number {
+    return this.entries.length > 0 ? this.entries[this.entries.length - 1]!.seq : 0;
   }
 
   /**
@@ -341,12 +401,33 @@ export class SessionLog {
    * entries when omitted). Never a live reference: the array and each entry
    * are copies, so a caller cannot corrupt the log and the log cannot
    * mutate under the caller.
+   *
+   * **Entries only: this does not report holes.** Retention evicts churn
+   * before conversation, so a snapshot can be missing entries from the
+   * middle or the end of its range and nothing in the array says so. A
+   * surface that renders a timeline should use {@link getLogEvents}, which
+   * returns exactly what {@link subscribeLog} would replay. This stays for
+   * callers that want the entries and nothing else.
    */
   getLog(fromSeq?: number): SessionLogEntry[] {
     const from = fromSeq ?? 0;
     const startIdx = this.entries.findIndex((entry) => entry.seq >= from);
     if (startIdx === -1) return [];
     return this.entries.slice(startIdx).map(cloneEntry);
+  }
+
+  /**
+   * Snapshot of the log as an event sequence: the retained entries with
+   * seq >= fromSeq, interleaved with gap markers for every hole in the
+   * range, in seq order.
+   *
+   * This is the snapshot counterpart of {@link subscribeLog}'s replay and
+   * is built by the same function, so the two cannot disagree about where
+   * the holes are. Use it wherever a subscription would render a timeline
+   * but a one-shot read is what you have.
+   */
+  getLogEvents(fromSeq?: number): SessionLogEvent[] {
+    return this.buildReplayEvents(fromSeq ?? 1);
   }
 
   /**
@@ -373,30 +454,9 @@ export class SessionLog {
     };
 
     if (fromSeq !== undefined) {
-      const from = Math.max(1, fromSeq);
-      // Retention is churn-first, so the retained set is no longer a
-      // contiguous suffix: holes can open anywhere above firstRetainedSeq,
-      // including at the very end. Every hole in [from, lastSeq] is
-      // announced, not just the leading one, or a replaying subscriber
-      // renders a timeline with silent holes in it. Seqs are contiguous
-      // over the session, so a range of width n held exactly n entries.
-      let expected = from;
-      const announceGap = (toSeq: number): void => {
-        if (toSeq < expected) return;
-        this.pushToSubscriber(sub, {
-          kind: 'gap',
-          fromSeq: expected,
-          toSeq,
-          dropped: toSeq - expected + 1,
-        });
-      };
-      for (const entry of this.entries) {
-        if (entry.seq < from) continue;
-        if (entry.seq > expected) announceGap(entry.seq - 1);
-        this.pushToSubscriber(sub, { kind: 'entry', entry: cloneEntry(entry) });
-        expected = entry.seq + 1;
+      for (const event of this.buildReplayEvents(Math.max(1, fromSeq))) {
+        this.pushToSubscriber(sub, event);
       }
-      announceGap(this.lastSeq);
     }
 
     this.subscribers.add(sub);
@@ -430,6 +490,10 @@ export class SessionLog {
     this.nextSeq = Math.max(this.nextSeq, maxSeq + 1);
 
     const nextSeq = this.nextSeq;
+    // Holes computed once from the same builder replay and getLogEvents
+    // use, so the three descriptions of this log cannot diverge.
+    const gaps = this.buildReplayEvents(this.firstRetainedSeq)
+      .filter((event): event is SessionLogGap => event.kind === 'gap');
     for (const sub of [...this.subscribers]) {
       // Anything already queued describes the replaced session, so it is
       // discarded rather than delivered after the reset.
@@ -445,6 +509,7 @@ export class SessionLog {
       sub.pendingReset = {
         kind: 'reset',
         entries: this.entries.map(cloneEntry),
+        gaps: gaps.map((gap) => ({ ...gap })),
         nextSeq,
       };
       this.drain(sub);
@@ -462,6 +527,43 @@ export class SessionLog {
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
+
+  /**
+   * The retained entries from `from` onward as an event sequence, with a
+   * gap marker for every hole.
+   *
+   * The single definition of "what does this range look like", shared by
+   * replay, {@link getLogEvents}, and the restore reset. Three surfaces
+   * describing the same holes three times is how they end up disagreeing,
+   * which they did: replay reported holes and the snapshot did not, so the
+   * same session rendered honestly through a subscription and with silent
+   * holes through a one-shot read.
+   *
+   * Holes exist because retention is churn-first, so the retained set is
+   * not a contiguous suffix: seqs can be missing from the middle and from
+   * the end. Seqs are contiguous over the session as a whole, so a missing
+   * range of width n held exactly n entries and `dropped` is exact.
+   *
+   * The trailing hole is bounded by `lastSeq` (highest seq ever issued),
+   * not by the newest retained entry: the newest entry is exactly what
+   * churn-first eviction can take, and bounding by it would hide that.
+   */
+  private buildReplayEvents(from: number): SessionLogEvent[] {
+    const events: SessionLogEvent[] = [];
+    let expected = from;
+    const announceGap = (toSeq: number): void => {
+      if (toSeq < expected) return;
+      events.push({ kind: 'gap', fromSeq: expected, toSeq, dropped: toSeq - expected + 1 });
+    };
+    for (const entry of this.entries) {
+      if (entry.seq < from) continue;
+      if (entry.seq > expected) announceGap(entry.seq - 1);
+      events.push({ kind: 'entry', entry: cloneEntry(entry) });
+      expected = entry.seq + 1;
+    }
+    announceGap(this.lastSeq);
+    return events;
+  }
 
   /**
    * Evict past the retention cap, churn before conversation, spilling via
@@ -599,6 +701,11 @@ function cloneEntry(entry: SessionLogEntry): SessionLogEntry {
  * Live appends and over-cap restores share this, because "which entries
  * survive the cap" is one question and answering it two ways is how the two
  * paths drift apart.
+ *
+ * Cost: O(cap), two passes over the retained array plus a Set, where the
+ * flat FIFO it replaced was one splice. Measured at 0.062 ms per append at
+ * the 10,000 default, and it runs only on appends that actually overflow.
+ * It scales with `maxEntries`, so a much larger cap pays proportionally.
  */
 function selectUnderCap(
   entries: readonly SessionLogEntry[],

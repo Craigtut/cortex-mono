@@ -154,7 +154,7 @@ const agent = await CortexAgent.create({
 | `talker.model` | Talker model. Default: the fast tier auto-resolved from the primary provider |
 | `idleSignal` | `() => boolean`: is the user or channel idle right now? Advisory input to the wake policy |
 | `duplex` | Router and scheduling tuning (delivery spacing, backpressure caps, ask timeouts, lookup pool and timeout, `maxTotalCost`). Every field has a production default except `maxTotalCost`, which is unlimited until you set it |
-| `sessionLog.maxEntries` | Session log retention cap (default 10000, ring buffer) |
+| `sessionLog.maxEntries` | Session log retention cap (default 10000). Overflow comes off machine-generated churn first, conversational history last |
 | `sessionLog.maxSubscriberBuffer` | Per-subscriber replay buffer bound (default 1000) |
 | `stateChangeDebounceMs` | Debounce for the `onStateChanged` persistence trigger (default 500) |
 
@@ -245,19 +245,22 @@ const unsubscribe = agent.subscribeLog((event) => {
     case 'reset':
       // restore() replaced the log. Everything rendered so far belongs to
       // a session that no longer exists: discard it and render the
-      // restored log, which arrives with the event.
-      replaceTimeline(event.entries);
+      // restored log, which arrives with the event. `gaps` is usually
+      // empty; it is non-empty when the restored log itself has holes.
+      replaceTimeline(event.entries, event.gaps);
       cursor = event.nextSeq;
       break;
   }
 }, lastSeenSeq);
 
-const snapshot = agent.getLog(lastSeenSeq); // copy, never a live reference
+const events = agent.getLogEvents(lastSeenSeq); // the same sequence, as a snapshot
 ```
 
 Entries carry a monotonic `seq` (the ordering authority; timestamps collide under burst), the producing `loopPath`, and a `causedBy` stamp linking an entry to the input that caused it. Ordering is append-then-emit: an entry reaches subscribers before the events of the run it triggers. A subscriber that falls behind is buffered to `sessionLog.maxSubscriberBuffer` and then dropped oldest-first with a gap marker, rather than applying backpressure to the loops.
 
-**A `reset` is not a gap.** A gap says some entries are missing from a timeline that is otherwise still yours. A reset says the timeline itself was replaced, which is what `restore()` does, so the correct response is to throw away what you have rendered rather than to append to it. The event carries the restored log in `entries` (already a detached copy, so render it directly) and it is delivered ahead of any later append, even to a subscriber that was mid-callback when the restore landed.
+**The log is not contiguous, so use `getLogEvents()` for snapshots.** Retention evicts machine-generated churn (sub-agent lifecycle, deliveries, directives, lookup results, retry notices) before it touches conversational history (utterances, replies, permission asks and answers, errors), which means entries go missing from the middle and the end of the range, not just the beginning. `getLogEvents(fromSeq?)` returns exactly what `subscribeLog` would replay, gap markers included, and is built by the same code so the two cannot disagree. `getLog(fromSeq?)` still returns bare entries and is still the right call when you want the entries and nothing else, but it reports no holes: render a timeline from it and the holes are silent.
+
+**A `reset` is not a gap.** A gap says some entries are missing from a timeline that is otherwise still yours. A reset says the timeline itself was replaced, which is what `restore()` does, so the correct response is to throw away what you have rendered rather than to append to it. The event carries the restored log in `entries` (already a detached copy, so render it directly), any holes in it as `gaps`, and it is delivered ahead of any later append, even to a subscriber that was mid-callback when the restore landed.
 
 **Reconnecting.** Track a cursor as above and pass it back to `subscribeLog` to resume: you get everything from there on, with a leading gap if any of it has since been evicted. Take the cursor from `reset.nextSeq` after a reset rather than from the last restored entry's seq. Sequence numbers never rewind across a restore, so after restoring an older artifact (or an artifact with no log at all, which is what a v1 session upgrades to) the next append can sit well above the highest restored entry. `nextSeq` is the seq that append will carry.
 
