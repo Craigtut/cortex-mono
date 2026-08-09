@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "baseUrl": "../..",
+    "paths": {
+      "@animus-labs/cortex": ["packages/cortex/src/index.ts"]
+    }
+  },
+  "include": ["preamble.ts", ".generated/**/*"]
+}
