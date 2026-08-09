@@ -857,10 +857,6 @@ export class AgentLoop {
   private retryScheduledHandlers: Array<(info: RetryScheduledInfo, origin: LoopOriginContext) => void> = [];
   private retrySucceededHandlers: Array<(info: RetrySucceededInfo, origin: LoopOriginContext) => void> = [];
   private retryExhaustedHandlers: Array<(info: RetryExhaustedInfo, origin: LoopOriginContext) => void> = [];
-  private beforeCompactionHandlers: Array<(target: CompactionTarget, origin: LoopOriginContext) => Promise<void>> = [];
-  private compactionErrorHandlers: Array<(error: Error, origin: LoopOriginContext) => void> = [];
-  private compactionDegradedHandlers: Array<(info: CompactionDegradedInfo, origin: LoopOriginContext) => void> = [];
-  private compactionExhaustedHandlers: Array<(info: CompactionExhaustedInfo, origin: LoopOriginContext) => void> = [];
   private turnCompleteHandlers: Array<(output: AgentTextOutput, origin: LoopOriginContext) => void> = [];
   private subAgentSpawnedHandlers: Array<(taskId: string, instructions: string, background: boolean) => void> = [];
   private subAgentCompletedHandlers: Array<(taskId: string, result: string, status: string, usage: unknown) => void> = [];
@@ -4431,7 +4427,6 @@ export class AgentLoop {
   onBeforeCompaction(
     handler: (target: CompactionTarget, origin: LoopOriginContext) => Promise<void>,
   ): void {
-    this.beforeCompactionHandlers.push(handler);
     this.compactionManager.onBeforeCompaction(
       (target) => handler(target, this.originContext),
     );
@@ -4456,7 +4451,6 @@ export class AgentLoop {
   onCompactionError(
     handler: (error: Error, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionErrorHandlers.push(handler);
     this.compactionManager.onCompactionError(
       (error) => handler(error, this.originContext),
     );
@@ -4470,7 +4464,6 @@ export class AgentLoop {
   onCompactionDegraded(
     handler: (info: CompactionDegradedInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionDegradedHandlers.push(handler);
     this.compactionManager.onCompactionDegraded(
       (info) => handler(info, this.originContext),
     );
@@ -4484,7 +4477,6 @@ export class AgentLoop {
   onCompactionExhausted(
     handler: (info: CompactionExhaustedInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionExhaustedHandlers.push(handler);
     this.compactionManager.onCompactionExhausted(
       (info) => handler(info, this.originContext),
     );
@@ -6184,10 +6176,6 @@ export class AgentLoop {
     // 9. Clear all handler arrays
     this.loopCompleteHandlers = [];
     this.errorHandlers = [];
-    this.beforeCompactionHandlers = [];
-    this.compactionErrorHandlers = [];
-    this.compactionDegradedHandlers = [];
-    this.compactionExhaustedHandlers = [];
     this.turnCompleteHandlers = [];
     this.subAgentSpawnedHandlers = [];
     this.subAgentCompletedHandlers = [];
