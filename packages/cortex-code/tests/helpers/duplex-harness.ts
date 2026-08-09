@@ -431,6 +431,7 @@ export interface SessionInternals {
   saver: { save: (...args: unknown[]) => void; flush: () => Promise<void> };
   buildAgentConfig: () => CortexAgentConfig;
   wireEvents: () => void;
+  pushInitialFooterState: (branch: string, effortLevel: string) => void;
   writeInitialCheckpoint?: () => Promise<void>;
   handleInput: (text: string) => Promise<void>;
 }
@@ -471,6 +472,7 @@ export interface DuplexSession {
 export async function createDuplexSession(
   cwd: string,
   overrides: Record<string, unknown> = {},
+  agentConfig: Partial<CortexAgentConfig> = {},
 ): Promise<DuplexSession> {
   const { session, internals } = makeSession(cwd, overrides);
   // Readonly in TypeScript; what is under test is the behavior the flip would
@@ -479,11 +481,15 @@ export async function createDuplexSession(
   const harness = await createDuplexAgent({
     ...internals.buildAgentConfig(),
     model: testModel(),
+    ...agentConfig,
   });
   const app = createFakeApp();
   internals.agent = harness.agent;
   internals.app = app;
   internals.wireEvents();
+  // Stands in for start()'s opening footer push, by calling the same method,
+  // so the state a test reads is the state a real session opens with.
+  internals.pushInitialFooterState?.('', 'medium');
   // Stands in for start(), which checkpoints the session before it can do any
   // work and skips that for a resumed one so the saved artifact survives
   // until resume() reads it. Optional-chained so a run against pre-checkpoint

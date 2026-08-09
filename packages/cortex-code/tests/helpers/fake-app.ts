@@ -17,6 +17,14 @@ export interface FakeApp {
   finalized: Array<string | undefined>;
   /** True while a status spinner is showing. */
   spinnerVisible: boolean;
+  /**
+   * Accumulated footer state, merged from every `updateStatus` partial the
+   * way the real App does. Tests feed this to a real StatusBar rather than
+   * constructing renderer input themselves: what is under test is whether the
+   * session's state reaches the footer, and a hand-built input would skip
+   * exactly that half.
+   */
+  statusState: Record<string, unknown>;
   transcript: Record<string, ReturnType<typeof vi.fn>>;
   [k: string]: unknown;
 }
@@ -32,6 +40,7 @@ export function createFakeApp(): FakeApp {
     assistantChunks,
     finalized,
     spinnerVisible: false,
+    statusState: {},
     transcript: {
       addUserMessage: record('transcript.addUserMessage'),
       addNotification: record('transcript.addNotification'),
@@ -65,7 +74,10 @@ export function createFakeApp(): FakeApp {
       app.spinnerVisible = false;
     }),
     focusEditor: record('focusEditor'),
-    updateStatus: record('updateStatus'),
+    updateStatus: vi.fn((partial: Record<string, unknown>) => {
+      calls.push('updateStatus');
+      Object.assign(app.statusState, partial);
+    }),
     removeWorkingTagSubtitle: record('removeWorkingTagSubtitle'),
     enqueueWorkingTagText: record('enqueueWorkingTagText'),
     traceNextRender: record('traceNextRender'),

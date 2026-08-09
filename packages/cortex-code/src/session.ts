@@ -33,6 +33,7 @@ import {
   type RetrySucceededInfo,
   type RetryExhaustedInfo,
   type LoopOriginContext,
+  type ResolutionNote,
   type ThinkingLevel,
   type McpStdioConfig,
   type ObservationalMemoryState,
@@ -449,19 +450,7 @@ export class Session {
     });
 
     // Update footer
-    this.app.updateStatus({
-      mode: this.mode.name,
-      modeCount: AVAILABLE_MODES.length,
-      provider: this.provider,
-      model: this.modelId,
-      contextTokenCount: this.getDisplayedCurrentContextTokens(),
-      contextTokenLimit: this.agent.effectiveContextWindow,
-      gitBranch: branch,
-      yoloMode: this.yoloMode,
-      effortLevel: initialEffort,
-      observationalMode: this.compactionStrategy === 'observational',
-      ...this.sandboxIndicatorState(),
-    });
+    this.pushInitialFooterState(branch, initialEffort);
 
     // Recommend (never apply) /sandbox off when already inside a container.
     void this.surfaceContainerRecommendation();
@@ -2464,12 +2453,53 @@ export class Session {
     return { promptWatchdog: watchdog };
   }
 
+  /**
+   * The footer's full opening state. Separate from start() so a test can put
+   * the footer in the state a real session opens with by calling the same
+   * code, rather than by assembling a state object of its own and proving
+   * only that the renderer works.
+   */
+  private pushInitialFooterState(branch: string, effortLevel: ThinkingLevel): void {
+    if (!this.agent || !this.app) return;
+    this.app.updateStatus({
+      mode: this.mode.name,
+      modeCount: AVAILABLE_MODES.length,
+      provider: this.provider,
+      model: this.modelId,
+      contextTokenCount: this.getDisplayedCurrentContextTokens(),
+      contextTokenLimit: this.agent.effectiveContextWindow,
+      gitBranch: branch,
+      yoloMode: this.yoloMode,
+      effortLevel,
+      observationalMode: this.compactionStrategy === 'observational',
+      ...this.sandboxIndicatorState(),
+      ...this.resolutionIndicatorState(),
+    });
+  }
+
   private updateFooterContextUsage(): void {
     if (!this.agent || !this.app) return;
     this.app.updateStatus({
       contextTokenCount: this.getDisplayedCurrentContextTokens(),
       contextTokenLimit: this.agent.effectiveContextWindow,
+      ...this.resolutionIndicatorState(),
     });
+  }
+
+  /**
+   * The footer's degraded marker. Recomputed on every footer refresh rather
+   * than set once: `network-resolver-unwired` is appended at the first
+   * prompt, so a flag written only at startup would never light for it.
+   *
+   * `info` notes are excluded deliberately. `duplex-cost-cap-unset` is an
+   * info note that fires on every default duplex session, so counting info
+   * here would leave the marker permanently on and carrying no information.
+   */
+  private resolutionIndicatorState(): { resolutionDegraded: boolean } {
+    return {
+      resolutionDegraded: this.getResolutionReport()
+        .some((note) => note.severity === 'degraded'),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -2915,6 +2945,19 @@ export class Session {
 
   getAgent(): CortexAgent | null { return this.agent; }
   getApp(): App | null { return this.app; }
+
+  /**
+   * The session's resolution report: what the assembly actually resolved to
+   * where that differs from what was configured.
+   *
+   * Read live rather than snapshotted at startup. Most notes are assembly
+   * facts, but `network-resolver-unwired` is recorded when the check first
+   * runs, which is at the first prompt, so a report captured once at startup
+   * would permanently miss the one note this CLI can currently produce.
+   */
+  getResolutionReport(): ResolutionNote[] {
+    return this.agent?.getResolutionReport() ?? [];
+  }
   getYoloMode(): boolean { return this.yoloMode; }
   getCompactionStrategy(): 'observational' | 'classic' { return this.compactionStrategy; }
   setYoloMode(enabled: boolean): void {
