@@ -27,7 +27,7 @@ const agent = await CortexAgent.create({
   workingDirectory: process.cwd(),
   initialBasePrompt: 'You are a helpful assistant.',
   getApiKey: async (provider) => {
-    const key = await credentialStore.load(provider);
+    const key = await loadApiKey(provider);
     if (!key) throw new Error(`No API key configured for ${provider}`);
     return key;
   },
