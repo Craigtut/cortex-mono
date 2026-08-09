@@ -327,7 +327,7 @@ const TAKING_ACTION_SECTION = `# Taking Action
   files.
 - Do not modify files you haven't read. Read first, then modify.`;
 
-const TOOL_USAGE_SECTION = `# Tool Usage
+const TOOL_USAGE_BASE_SECTION = `# Tool Usage
 
 - Do NOT use Bash for operations that have dedicated tools:
   - To read files: use Read
@@ -345,9 +345,13 @@ const TOOL_USAGE_SECTION = `# Tool Usage
   file in a single response. Edit or Write different files in
   parallel, but serialize changes to the same file across turns.
 - Do not poll, loop, or sleep-wait for backgrounded tasks. You
-  will be notified when they complete.
+  will be notified when they complete.`;
 
-## IMPORTANT: Text output during tool use
+/**
+ * Text-output discipline for the working-tags-enabled prompt. Analysis has
+ * somewhere to go, so the model is told to put it inside the tags.
+ */
+const TOOL_OUTPUT_TAGGED_SECTION = `## IMPORTANT: Text output during tool use
 
 When you are using tools, do NOT produce text that narrates what
 you are doing. Just call the tool. No preamble, no commentary,
@@ -374,6 +378,61 @@ Rules:
    meaningful to tell the user: a finding, a question, or a final answer.
 4. A brief acknowledgment on the FIRST message is fine ("Sure, let me
    look into that."). After that, work silently until you have results.`;
+
+/**
+ * Text-output discipline for the working-tags-disabled prompt. There is no
+ * second channel, so the model must not write its analysis at all. This
+ * variant must never mention <working> tags: instructing the model to emit
+ * a delimiter that nothing parses or strips leaks internal reasoning
+ * verbatim to the consumer (and, for voice consumers, to TTS).
+ */
+const TOOL_OUTPUT_UNTAGGED_SECTION = `## IMPORTANT: Text output during tool use
+
+When you are using tools, do NOT produce text that narrates what
+you are doing. Just call the tool. No preamble, no commentary,
+no "let me look at that", no "I found it", no status updates
+between every tool call.
+
+Everything you write outside of a tool call is delivered to the
+user exactly as written. There is no separate channel for internal
+reasoning, so do not write your reasoning out. Think it through
+silently, then say only the part meant for the user.
+
+BAD (do not do this):
+  "Let me search for that file." [tool_use: Glob]
+  "Found it. Let me read it now." [tool_use: Read]
+  "Good, I can see the code. Let me trace the function." [tool_use: Grep]
+  "The function traces through three layers: router -> service -> store,
+  and the foreign key constraint is in the messages table schema."
+
+GOOD (do this instead):
+  [tool_use: Glob]
+  [tool_use: Read]
+  [tool_use: Grep]
+  The issue is in the messages table schema. Here is what I found: ...
+
+Rules:
+1. When calling a tool, produce ONLY the tool call. No text.
+2. After receiving results, keep your analysis to yourself. Do not
+   write out your reasoning, your plan, or your read of the results.
+3. Only produce text when you have something meaningful to tell the
+   user: a finding, a question, or a final answer.
+4. A brief acknowledgment on the FIRST message is fine ("Sure, let me
+   look into that."). After that, work silently until you have results.`;
+
+/**
+ * Assemble the Tool Usage section for the current working-tags mode.
+ *
+ * The tool-selection rules are shared; only the text-output discipline
+ * differs, because whether the model has a place to put its analysis
+ * depends on whether working tags are parsed.
+ */
+function buildToolUsageSection(workingTagsEnabled: boolean): string {
+  const output = workingTagsEnabled
+    ? TOOL_OUTPUT_TAGGED_SECTION
+    : TOOL_OUTPUT_UNTAGGED_SECTION;
+  return `${TOOL_USAGE_BASE_SECTION}\n\n${output}`;
+}
 
 const EXECUTING_WITH_CARE_SECTION = `# Executing with Care
 
@@ -3473,8 +3532,8 @@ export class AgentLoop {
     // Section 3: Taking Action
     sections.push(TAKING_ACTION_SECTION);
 
-    // Section 4: Tool Usage
-    sections.push(TOOL_USAGE_SECTION);
+    // Section 4: Tool Usage (text-output discipline varies with workingTags)
+    sections.push(buildToolUsageSection(this.workingTagsEnabled));
 
     // Section 5: Executing with Care
     sections.push(EXECUTING_WITH_CARE_SECTION);
@@ -3521,7 +3580,7 @@ export class AgentLoop {
     }
     sections.push({ name: 'System Rules', content: SYSTEM_RULES_SECTION });
     sections.push({ name: 'Taking Action', content: TAKING_ACTION_SECTION });
-    sections.push({ name: 'Tool Usage', content: TOOL_USAGE_SECTION });
+    sections.push({ name: 'Tool Usage', content: buildToolUsageSection(this.workingTagsEnabled) });
     sections.push({ name: 'Executing with Care', content: EXECUTING_WITH_CARE_SECTION });
     sections.push({ name: 'Environment', content: this.buildEnvironmentSection() });
     return sections;

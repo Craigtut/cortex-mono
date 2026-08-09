@@ -244,9 +244,9 @@ See **`skill-system.md`** for the full design: SKILL.md format, SkillRegistry, l
 
 When an agent runs multi-turn agentic loops, it generates intermediate text (reasoning, analysis, planning) mixed with user-facing text (acknowledgments, progress updates, final answers). Working tags let the agent wrap internal content in `<working>` XML tags. Text outside these tags is direct communication for the user. Both stay in conversation history; the difference is only in delivery.
 
-This feature is enabled by default and configurable via `AgentLoopConfig.workingTags.enabled`. When enabled, Cortex appends a "Response Delivery" section to its operational rules in the system prompt.
+This feature is enabled by default and configurable via `AgentLoopConfig.workingTags.enabled`. When enabled, Cortex appends a "Response Delivery" section to its operational rules in the system prompt. When disabled, the prompt stops mentioning the tags entirely: the Response Delivery section is dropped, the tool result reminder is not appended, and the Tool Usage section swaps to a variant that tells the model to withhold its reasoning rather than tag it.
 
-At the streaming level, Cortex passes raw text through with zero buffering. At turn completion, Cortex parses the complete text into a structured `AgentTextOutput` object with `userFacing`, `working`, and `raw` properties. The consumer decides per-channel what to deliver (e.g., SMS sends `userFacing` only; the frontend renders everything with working content dimmed).
+At the streaming level, Cortex passes raw text through with zero buffering. At turn completion, Cortex parses the complete text into a structured `AgentTextOutput` object with `userFacing`, `working`, and `raw` properties. Parsing only runs when the feature is enabled, so with it disabled `turn_end.textOutput` is left undefined and consumers must read the turn text themselves. The consumer decides per-channel what to deliver (e.g., SMS sends `userFacing` only; the frontend renders everything with working content dimmed).
 
 See **`working-tags.md`** for the full design: tag rules, system prompt guidance, event model, parsing utilities, consumer integration, and multi-layer response delivery framework.
 

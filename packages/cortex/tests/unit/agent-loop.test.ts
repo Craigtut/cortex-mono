@@ -569,6 +569,71 @@ describe('AgentLoop', () => {
       expect(prompt).not.toContain('# Response Delivery');
     });
 
+    it('never mentions working tags anywhere when they are disabled', () => {
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        workingTags: { enabled: false },
+      });
+      const prompt = agent.composeSystemPrompt('Consumer content');
+
+      // A disabled tag that the prompt still asks for is worse than no tag
+      // at all: nothing parses or strips it, so the delimiter and the
+      // reasoning inside it reach the consumer verbatim.
+      expect(prompt).not.toContain('<working>');
+      expect(prompt).not.toContain('</working>');
+    });
+
+    it('keeps the shared Tool Usage rules in both working-tag modes', () => {
+      const tagged = createTestAgentLoop(piAgent, config)
+        .composeSystemPrompt('Consumer');
+      const untagged = createTestAgentLoop(piAgent, {
+        ...config,
+        workingTags: { enabled: false },
+      }).composeSystemPrompt('Consumer');
+
+      for (const prompt of [tagged, untagged]) {
+        expect(prompt).toContain('# Tool Usage');
+        expect(prompt).toContain('## IMPORTANT: Text output during tool use');
+        expect(prompt).toContain('When calling a tool, produce ONLY the tool call.');
+      }
+    });
+
+    it('tells the model to withhold its analysis when working tags are disabled', () => {
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        workingTags: { enabled: false },
+      });
+      const prompt = agent.composeSystemPrompt('Consumer');
+
+      expect(prompt).toContain('keep your analysis to yourself');
+    });
+
+    it('swaps the Tool Usage variant when working tags are toggled at runtime', () => {
+      const agent = createTestAgentLoop(piAgent, config);
+      agent.setBasePrompt('Consumer');
+      expect(agent.getCurrentSystemPrompt()).toContain('<working>');
+
+      agent.setWorkingTagsEnabled(false);
+      expect(agent.getCurrentSystemPrompt()).not.toContain('<working>');
+      expect(agent.getCurrentSystemPrompt()).toContain('keep your analysis to yourself');
+
+      agent.setWorkingTagsEnabled(true);
+      expect(agent.getCurrentSystemPrompt()).toContain('<working>');
+      expect(agent.getCurrentSystemPrompt()).not.toContain('keep your analysis to yourself');
+    });
+
+    it('reports the matching Tool Usage variant in getSystemPromptSections', () => {
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        workingTags: { enabled: false },
+      });
+      const sections = agent.getSystemPromptSections();
+      const toolUsage = sections.find(s => s.name === 'Tool Usage');
+
+      expect(sections.some(s => s.name === 'Response Delivery')).toBe(false);
+      expect(toolUsage?.content).not.toContain('<working>');
+    });
+
     it('includes System Rules section', () => {
       const agent = createTestAgentLoop(piAgent, config);
       const prompt = agent.composeSystemPrompt('Consumer');
