@@ -8,11 +8,13 @@
  * settleAll is the only thing that can unblock it, and a scope wired to the
  * wrong branch is visible rather than masked.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import type { CortexAgent } from '../../src/cortex-agent.js';
 import type { BrokeredAskDecision } from '../../src/duplex/permission-broker.js';
+import type { NetworkAccessDecision } from '../../src/sandbox/types.js';
 import {
   createDuplexScenario,
+  createRealDuplexScenario,
   destroyLiveFacades,
   getBroker,
   lifecycleEvents,
@@ -22,6 +24,7 @@ import {
 
 afterEach(async () => {
   await destroyLiveFacades();
+  vi.restoreAllMocks();
 });
 
 /**
@@ -90,4 +93,41 @@ describe('abort scope and the broker drain', () => {
       expect(h.facade.getLog().some((entry) => entry.type === 'ask_answer')).toBe(false);
     });
   }
+
+  it("abort('work') drains an ask that arrived through the real wiring, not one handed to the broker", async () => {
+    // The tests above put the ask into the broker themselves, which proves
+    // the drain but assumes the path into it. That assumption is the shape
+    // that passes while production wiring is absent: if create() stopped
+    // wrapping the consumer's resolveNetworkAccess, no egress ask would
+    // ever reach the broker and every test that injects one directly would
+    // still be green. So this one goes the whole way: the consumer's own
+    // resolver says `ask`, the facade hands back the wrapped resolver it
+    // gives a sandbox, and the ask has to arrive on its own.
+    const h = await createRealDuplexScenario({
+      resolveNetworkAccess: async (): Promise<NetworkAccessDecision> => ({ decision: 'ask' }),
+    });
+
+    const resolver = h.facade.getNetworkAccessResolver();
+    expect(resolver).toBeDefined();
+    const pending = resolver!({
+      host: 'evil.example',
+      port: 443,
+      via: 'webfetch',
+      url: 'https://evil.example/exfil?q=secret',
+    });
+
+    await waitUntil(() => getBroker(h.facade).pendingAskCount === 1, 2000, 'ask brokered');
+    const askEntry = h.facade.getLog().find((entry) => entry.type === 'ask')!;
+    expect(askEntry.content).toContain('evil.example:443');
+
+    await h.facade.abort('work');
+
+    // The egress caller is unblocked with a deny. Nothing else can do this
+    // for it: a NetworkAccessRequest carries no abort signal.
+    expect(await pending).toEqual({ decision: 'deny' });
+    expect(getBroker(h.facade).pendingAskCount).toBe(0);
+    const dropped = lifecycleEvents(h.facade, 'ask_dropped');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]!.data).toMatchObject({ cause: 'abort' });
+  });
 });
