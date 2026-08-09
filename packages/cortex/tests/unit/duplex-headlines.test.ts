@@ -8,6 +8,7 @@ import { DuplexHeadlines } from '../../src/duplex/headlines.js';
 import type { DuplexHeadlinePorts } from '../../src/duplex/headlines.js';
 import type { PendingAsk, SessionUsage, SubAgentSnapshot } from '../../src/types.js';
 import type { DelegationSnapshot } from '../../src/duplex/router.js';
+import { TALKER_HEADLINE_MAX_TOKENS } from '../../src/cortex-agent.js';
 
 function usage(overrides?: Partial<SessionUsage>): SessionUsage {
   return {
@@ -268,12 +269,20 @@ describe('DuplexHeadlines', () => {
 
   it('keeps the ask section whole when the token cap cuts the block', () => {
     // The loop enforces the cap by slicing from the tail, and the sections
-    // above the asks are unbounded in count. With asks rendered last, thirty
-    // or so delegations pushed the live permission request past the cut and
-    // the talker simply stopped seeing it, while the loop that raised it
-    // blocked the whole time.
+    // above the asks are unbounded in count. With asks rendered last, enough
+    // delegations pushed the live permission request past the cut and the
+    // talker simply stopped seeing it, while the loop that raised it blocked
+    // the whole time.
+    //
+    // The delegation count here is sized to overshoot the budget, not to
+    // claim a threshold: it takes closer to fifty realistic delegations to
+    // reach the cap, and the point of the test is the ordering, not the
+    // number. BUDGET_CHARS mirrors agent-loop.ts buildHeadlineInjection
+    // (maxTokens * 4, minus the truncation marker) at the facade's
+    // TALKER_HEADLINE_MAX_TOKENS.
+    const BUDGET_CHARS = TALKER_HEADLINE_MAX_TOKENS * 4 - '\n[headline block truncated]'.length;
     const { headlines, state } = createHeadlines();
-    state.delegations = Array.from({ length: 40 }, (_, index) => ({
+    state.delegations = Array.from({ length: 120 }, (_, index) => ({
       alias: `task-${index + 1}`,
       instructions: `background job number ${index + 1} with a fairly wordy description`,
       seq: index + 1,
@@ -291,11 +300,17 @@ describe('DuplexHeadlines', () => {
     }];
 
     const block = headlines.build()!;
-    // Simulate the loop's cap the way it actually applies it: keep the head,
-    // drop the tail (agent-loop.ts buildHeadlineInjection).
-    const capped = block.slice(0, 1500 * 4);
+    // Self-check: if the block ever stops overshooting the budget, the
+    // truncation below is a no-op and the assertion proves nothing.
+    expect(block.length).toBeGreaterThan(BUDGET_CHARS);
+
+    // The loop's cap, applied the way it actually applies it: keep the head,
+    // drop the tail.
+    const capped = block.slice(0, BUDGET_CHARS);
     expect(capped).toContain('rm -rf ~/work');
     expect(capped.indexOf('<pending-ask')).toBeLessThan(capped.indexOf('<task '));
+    // The cut really did land in the delegations, not past them.
+    expect(capped).not.toContain('task-120');
   });
 
   it('escapes markup in instructions and tool summaries', () => {
