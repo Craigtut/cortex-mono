@@ -47,12 +47,15 @@ describe('the framework build this suite is testing', () => {
   it('was told which build to use', () => {
     // Absent means vitest.config.ts never loaded, which means no alias, which
     // means every other test in this package just ran against dist without
-    // saying so. Run the suite as `npm run test:run -w packages/cortex-code`,
-    // or through the root workspace config, so the package config applies.
+    // saying so. The message names the repair, because the tempting fix when
+    // a guard fires on a command you were told to run is to delete the guard,
+    // and that puts the hazard back.
     expect(
       target,
-      'CORTEX_TEST_TARGET is unset: packages/cortex-code/vitest.config.ts did not load, '
-        + 'so @animus-labs/cortex resolved to dist and this run may be testing a stale build',
+      'CORTEX_TEST_TARGET is unset, so packages/cortex-code/vitest.config.ts did not load and '
+        + '@animus-labs/cortex resolved to dist: this run may be testing a stale build. '
+        + 'The root runner reaches that config through vitest.workspace.ts; if that file is '
+        + 'missing or no longer globs this package, restore it rather than removing this check.',
     ).toBeDefined();
     expect(target).toMatch(/^(source|dist)$/);
   });
