@@ -1325,6 +1325,48 @@ describe('brokered resolvers', () => {
     expect(await resolver({ host: 'x.example', via: 'webfetch' })).toEqual({ decision: 'deny' });
   });
 
+  it('auto-approve never opens the tool surface when no broker is bound', async () => {
+    // The mirror of the egress test above, and the larger half: the same
+    // reordering that would open one host here opens EVERY gated tool,
+    // because this resolver screens Bash, Write, Edit and every consumer
+    // tool. The claim the test above makes about "the tool resolver's
+    // ordering" was, until now, asserted about the resolver it does not
+    // exercise.
+    //
+    // The property is the ordering itself: the unbound-broker check comes
+    // first and fails closed, so auto-approve is never reached. Swapping
+    // the two (auto-approve first, audit call optional-chained) leaves a
+    // resolver that reads fine and allows everything.
+    let consulted = 0;
+    const isAutoApprove = () => { consulted += 1; return true; };
+
+    const unbound = buildBrokeredPermissionResolver(
+      async () => ({ decision: 'ask' }),
+      isAutoApprove,
+      () => null,
+    );
+    // The consumer's own `ask` is handed back, which the loop treats as a
+    // block. What matters is that it is not `allow`.
+    expect(await unbound('Bash', { command: 'rm -rf /' }, undefined))
+      .toEqual({ decision: 'ask' });
+    expect(consulted).toBe(0);
+
+    // Positive precondition, in this same test: the callback IS reached on
+    // this path once a broker exists. Without it, `consulted === 0` above
+    // would also be satisfied by a callback that is simply never called,
+    // and the assertion would pin nothing.
+    const h = createHarness();
+    const bound = buildBrokeredPermissionResolver(
+      async () => ({ decision: 'ask' }),
+      isAutoApprove,
+      () => h.router.permissionBroker,
+    );
+    expect(await bound('Bash', { command: 'rm -rf /' }, undefined))
+      .toEqual({ decision: 'allow' });
+    expect(consulted).toBe(1);
+    expect(h.askVoicings).toHaveLength(0);
+  });
+
   it('an auto-approve callback that reads false still brokers the ask', async () => {
     const h = createHarness();
     const resolver = buildBrokeredNetworkResolver(
