@@ -170,6 +170,7 @@ Loop configuration, routed for you:
 | `slots` | Optional ordered persistent context slots | both loops, identical content |
 | `workingTags.enabled` | Defaults to `true`; controls `<working>` response parsing guidance | both loops |
 | `budgetGuard.maxTurns` / `maxCost` | Per-prompt safety limits. Your values reach the reasoner only; the talker runs a facade-built guard with a hard turn cap and no cost cap of yours | reasoner, plus `duplex.maxTotalCost` as the session aggregate |
+| `contextWindowLimit` | Optional compaction budget below the model's real window | per loop: the same number on both, clamped separately against each loop's own model window |
 | `disableTools` | Built-in tool names to exclude | reasoner and sub-agents |
 | `resolvePermission` | Optional permission gate for tool calls | facade broker in duplex, direct in passthrough |
 | `resolveNetworkAccess` | Optional network gate (sandbox) | facade broker, same pipeline |
@@ -293,7 +294,12 @@ A v1 artifact (`{ version: 1, history, memory?, usage? }`) or a bare message arr
 
 A restore reaches every live log subscriber as a `reset` event, so a UI attached before the call ends up on the restored session instead of quietly rendering the replaced one. See [the session log](#the-session-log) for how to handle it, and note that a v1 restore produces a reset with **no** entries, since a v1 artifact has no log.
 
-`getConversationHistory()` and `getObservationalMemoryState()` are still forwarded and still return the reasoner's, which is the right answer for inspection and debugging. Persist `getState()`, not those: it is the only surface that carries both loops and the log.
+`getConversationHistory()` and `getObservationalMemoryState()` are both still forwarded, but they no longer read the same loop, and the difference is deliberate:
+
+- **`getConversationHistory()`** returns the **conversation** loop's transcript: the talker in duplex, the reasoner in passthrough. The name is the contract. In duplex the reasoner's transcript is the *work* transcript, in which the user's own words survive only as quoted fragments inside dispatch messages, so reading "the conversation" off it hands you dispatch scaffolding instead of the dialogue.
+- **`getObservationalMemoryState()`** returns the **reasoner's** in both modes, because observational memory is what the agent learned while working, and the reasoner is the loop that works.
+
+Both are fine for inspection and debugging. Persist `getState()`, not those: it is the only surface that carries both loops and the log.
 
 Slots should usually be rebuilt from current application state instead of restored from prior serialized messages.
 
@@ -301,9 +307,9 @@ Slots should usually be rebuilt from current application state instead of restor
 
 `getConversationHistory()` + `getObservationalMemoryState()` + `getSessionUsage()` written out as a v1 artifact still works, and it is the right choice for the first pass of a migration: keeping it means the on-disk format does not change, so the migration stays behavior-preserving and reviewable.
 
-It is also a trap with a deadline. That trio reads the **reasoner only**. Under duplex the talker has its own history and its own observational memory, and none of it is in what you saved, so a session restored from a v1 artifact comes back with the conversational half of the agent blank, silently and with no error.
+It is also a trap with a deadline, and the trap is sharper than "you lose the talker". In passthrough the trio is coherent: all three read the one loop. Under duplex they read three different scopes. History comes from the talker, observational memory from the reasoner, and usage is the aggregate of both. An artifact assembled from them is not merely incomplete, it is internally inconsistent: the observation watermark indexes into the history the memory was built against, so pairing the reasoner's memory with the talker's history misaligns it, and restoring that artifact is worse than restoring nothing.
 
-So the order matters. Migrate onto the facade pinned to `mode: 'passthrough'` and keep v1 for that pass, then move to `getState()` / `restore()`, and only then drop the pin. Dropping it first means every session written in between is already lossy, and no later migration recovers what was never persisted.
+So the pin is load-bearing, not a convenience. Migrate onto the facade with `mode: 'passthrough'` and keep v1 for that pass, then move to `getState()` / `restore()`, and only then drop the pin. Dropping it first means every session written in between is already corrupt, and no later migration recovers what was never persisted coherently.
 
 ## Context Slots
 
@@ -341,7 +347,7 @@ Beyond `prompt()`:
 
 - **`deliver(content, { wake?, target?, speaker? })`**: fire-and-forget input for things the user did not type: a notification, a webhook, a completed job. `wake` (default true) decides whether the content may start a turn on an idle loop or wait for the next one. `target` is `'conversation'` (default) or `'work'`. `speaker` defaults to `'system'` and must be set to `'user'` when you are relaying actual human speech, because only a user-speaker delivery can satisfy a pending permission ask. The safe default is deliberate: otherwise every notification path becomes a silent source of consent.
 
-  > **Under revision.** Delivered content is fenced in an `<external-update>` wrapper before it reaches the talker, and that happens regardless of `speaker`, so speech relayed with `speaker: 'user'` currently counts as consent while being presented to the model as third-party content. Only `prompt()` arrives unfenced today. This paragraph gets updated with the fix; if you are relaying human speech and can use `prompt()`, prefer it.
+  `speaker` also decides how the content is framed. Everything delivered is fenced in an `<external-update>` wrapper, which tells the loop "this is content about something, not the user speaking", and that fence is what keeps a relayed email body out of the instruction lane. `speaker: 'user'` is the one exception: it arrives bare, exactly as `prompt()` does, because fencing a relayed ASR transcript would tell the talker to disbelieve the only thing in the session that really is the user. One declaration, one trust class. A voice pipeline that prefers non-blocking `deliver()` over `await prompt()` gets the same framing either way.
 - **`steer(message)`**: queue content into the turn that is already running.
 - **`abort(scope?)`**: `'conversation'`, `'work'`, or `'all'` (default). Every scope aborts the in-flight turn on its target, drops queued deliveries, and clears the steering and follow-up queues; `'work'` and `'all'` additionally cancel running sub-agents and resolve pending permission asks as deny. `'conversation'` does neither: the work loop is still running, so its asks stay pending. Aborting after `destroy()` is a no-op rather than an error, so a fire-and-forget abort on a quit key does not need a teardown guard.
 - **`destroy(timeoutMs?)`**: tears everything down. Idempotent.
@@ -356,6 +362,8 @@ await agent.waitForWorkSettled();      // plus: no sub-agents, no parked deliver
 ```
 
 Both read loop gate depth rather than a "prompting" flag, so they do not report idle while work is still queued. `workSettled` deliberately ignores queued silent deliveries, which wait for the next prompt by design.
+
+Its ask term reads the facade's merged ask registry, not any one loop's, so a network ask raised through `resolveNetworkAccess` (sandbox egress, WebFetch) holds it open too. Those never enter a loop registry at all, and reporting settled while one of your resolvers is still blocked is the case the predicate exists to rule out.
 
 ## Permissions
 
@@ -565,7 +573,12 @@ const agent = await CortexAgent.create({
 
 `getSessionUsage()` returns one aggregate across both loops, every sub-agent, every quick lookup, and utility spend (observer, reflector, summarization, WebFetch, Bash utility calls). Children are counted exactly once, so do not add `SubAgentResult.usage` on top of it. The v2 persistence artifact keeps per-loop attribution alongside the total, so a restore does not flatten it.
 
-`budgetGuard.maxCost` keeps its per-prompt meaning on the reasoner. For a whole-session ceiling across everything, set `duplex.maxTotalCost`.
+`budgetGuard.maxCost` keeps its per-prompt meaning on the reasoner. For a whole-session ceiling across everything, set `duplex.maxTotalCost`. Leave it unset and the aggregate is uncapped; Cortex logs a warning at construction rather than inventing a number for you.
+
+There are two guards, and reading the wrong one is easy:
+
+- **`getBudgetGuard()`** returns the guard built from your `budgetGuard` config, in both modes. This is the one to check a `maxCost` you set against, because it is the object that holds your number.
+- **`getAggregateBudgetGuard()`** returns the facade's lifetime guard across both loops, sub-agents, lookups, and utility spend, capped by `duplex.maxTotalCost`. This is the guard that stops a duplex session, so a UI reporting "the agent halted on budget" reads `isBreached()` here. It is `null` in passthrough, where the reasoner's own guard is the whole story.
 
 ## Direct Model Calls
 
