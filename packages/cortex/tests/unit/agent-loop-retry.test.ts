@@ -165,7 +165,9 @@ describe('AgentLoop background retry', () => {
       attempt: 1,
       maxAttempts: 3,
     });
-    expect(succeeded).toHaveBeenCalledWith({ attempts: 1 });
+    // Second argument is the loop's origin context: every fan-out callback
+    // carries it so a composite consumer can tell which loop retried.
+    expect(succeeded).toHaveBeenCalledWith({ attempts: 1 }, { loopPath: 'main' });
     expect(errored).not.toHaveBeenCalled();
   });
 
@@ -191,7 +193,10 @@ describe('AgentLoop background retry', () => {
 
     expect(scheduled).toHaveBeenCalledTimes(3); // one per allowed retry
     expect(mock.continueCalls).toBe(3);
-    expect(exhausted).toHaveBeenCalledWith({ attempts: 3, category: 'network' });
+    expect(exhausted).toHaveBeenCalledWith(
+      { attempts: 3, category: 'network' },
+      { loopPath: 'main' },
+    );
     expect(errored).toHaveBeenCalledTimes(1);
     expect(errored.mock.calls[0][0].category).toBe('network');
   });

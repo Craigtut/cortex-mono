@@ -4049,15 +4049,24 @@ export class CortexAgent {
 
   // Callback registration. In passthrough these delegate to the single
   // loop; in duplex, loop-lifecycle and compaction callbacks register on
-  // BOTH resident loops (origin context distinguishes them), while
-  // sub-agent callbacks stay on the reasoner (the only loop that spawns).
+  // BOTH resident loops, while sub-agent callbacks stay on the reasoner
+  // (the only loop that spawns).
+  //
+  // EVERY fan-out callback takes a trailing LoopOriginContext, so a consumer
+  // receiving one can tell which loop produced it. That is not decoration:
+  // the fan-out is correct (both loops really do complete turns, retry, and
+  // compact), so without the label a duplex consumer renders two retry
+  // countdowns for one provider hiccup and two compaction notifications for
+  // one compaction, with no way to collapse or attribute them. onError and
+  // onTurnComplete carried origin from the start; the rest were the defect.
+  // onTurnComplete is also the one deliberate non-fan-out: see its comment.
 
   /** Every resident loop, for handlers that fan out in duplex. */
   private get residentLoops(): AgentLoop[] {
     return this.talker ? [this.reasoner, this.talker] : [this.reasoner];
   }
 
-  onLoopComplete(handler: () => void): void {
+  onLoopComplete(handler: (origin: LoopOriginContext) => void): void {
     for (const loop of this.residentLoops) loop.onLoopComplete(handler);
   }
 
@@ -4086,35 +4095,51 @@ export class CortexAgent {
     this.conversationLoop.onTurnComplete(handler);
   }
 
-  onRetryScheduled(handler: (info: RetryScheduledInfo) => void): void {
+  onRetryScheduled(
+    handler: (info: RetryScheduledInfo, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onRetryScheduled(handler);
   }
 
-  onRetrySucceeded(handler: (info: RetrySucceededInfo) => void): void {
+  onRetrySucceeded(
+    handler: (info: RetrySucceededInfo, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onRetrySucceeded(handler);
   }
 
-  onRetryExhausted(handler: (info: RetryExhaustedInfo) => void): void {
+  onRetryExhausted(
+    handler: (info: RetryExhaustedInfo, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onRetryExhausted(handler);
   }
 
-  onBeforeCompaction(handler: (target: CompactionTarget) => Promise<void>): void {
+  onBeforeCompaction(
+    handler: (target: CompactionTarget, origin: LoopOriginContext) => Promise<void>,
+  ): void {
     for (const loop of this.residentLoops) loop.onBeforeCompaction(handler);
   }
 
-  onPostCompaction(handler: (result: CompactionResult) => void): void {
+  onPostCompaction(
+    handler: (result: CompactionResult, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onPostCompaction(handler);
   }
 
-  onCompactionError(handler: (error: Error) => void): void {
+  onCompactionError(
+    handler: (error: Error, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onCompactionError(handler);
   }
 
-  onCompactionDegraded(handler: (info: CompactionDegradedInfo) => void): void {
+  onCompactionDegraded(
+    handler: (info: CompactionDegradedInfo, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onCompactionDegraded(handler);
   }
 
-  onCompactionExhausted(handler: (info: CompactionExhaustedInfo) => void): void {
+  onCompactionExhausted(
+    handler: (info: CompactionExhaustedInfo, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onCompactionExhausted(handler);
   }
 
@@ -4142,11 +4167,15 @@ export class CortexAgent {
     this.reasoner.onBackgroundResultDeadLettered(handler);
   }
 
-  onObservation(handler: (event: ObservationEvent) => void): void {
+  onObservation(
+    handler: (event: ObservationEvent, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onObservation(handler);
   }
 
-  onReflection(handler: (event: ReflectionEvent) => void): void {
+  onReflection(
+    handler: (event: ReflectionEvent, origin: LoopOriginContext) => void,
+  ): void {
     for (const loop of this.residentLoops) loop.onReflection(handler);
   }
 }

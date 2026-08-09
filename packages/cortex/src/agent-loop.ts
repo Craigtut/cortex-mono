@@ -776,6 +776,21 @@ export class AgentLoop {
    * and log prefixes; sub-agents extend it with '/<taskId>'.
    */
   readonly loopPath: string;
+
+  /**
+   * This loop's identity as the trailing argument of every fan-out callback.
+   *
+   * A composite agent registers one consumer handler on several loops, so
+   * without this a duplex consumer receives two of everything with no way to
+   * tell them apart: two retry countdowns for one provider hiccup, two
+   * compaction notifications, two observation events. The fan-out itself is
+   * correct (both loops really did do the thing); what was missing was the
+   * label saying which.
+   */
+  private get originContext(): LoopOriginContext {
+    return { loopPath: this.loopPath };
+  }
+
   private readonly promptDiagnostics: PromptWatchdogDiagnostics;
   private workingTagsEnabled: boolean;
   private readonly workingDirectory: string;
@@ -837,15 +852,15 @@ export class AgentLoop {
   private _warnedContextWindowOverride: string | null = null;
 
   // Event handlers (consumer-registered callbacks)
-  private loopCompleteHandlers: Array<() => void> = [];
+  private loopCompleteHandlers: Array<(origin: LoopOriginContext) => void> = [];
   private errorHandlers: Array<(error: ClassifiedError, origin: LoopOriginContext) => void> = [];
-  private retryScheduledHandlers: Array<(info: RetryScheduledInfo) => void> = [];
-  private retrySucceededHandlers: Array<(info: RetrySucceededInfo) => void> = [];
-  private retryExhaustedHandlers: Array<(info: RetryExhaustedInfo) => void> = [];
-  private beforeCompactionHandlers: Array<(target: CompactionTarget) => Promise<void>> = [];
-  private compactionErrorHandlers: Array<(error: Error) => void> = [];
-  private compactionDegradedHandlers: Array<(info: CompactionDegradedInfo) => void> = [];
-  private compactionExhaustedHandlers: Array<(info: CompactionExhaustedInfo) => void> = [];
+  private retryScheduledHandlers: Array<(info: RetryScheduledInfo, origin: LoopOriginContext) => void> = [];
+  private retrySucceededHandlers: Array<(info: RetrySucceededInfo, origin: LoopOriginContext) => void> = [];
+  private retryExhaustedHandlers: Array<(info: RetryExhaustedInfo, origin: LoopOriginContext) => void> = [];
+  private beforeCompactionHandlers: Array<(target: CompactionTarget, origin: LoopOriginContext) => Promise<void>> = [];
+  private compactionErrorHandlers: Array<(error: Error, origin: LoopOriginContext) => void> = [];
+  private compactionDegradedHandlers: Array<(info: CompactionDegradedInfo, origin: LoopOriginContext) => void> = [];
+  private compactionExhaustedHandlers: Array<(info: CompactionExhaustedInfo, origin: LoopOriginContext) => void> = [];
   private turnCompleteHandlers: Array<(output: AgentTextOutput, origin: LoopOriginContext) => void> = [];
   private subAgentSpawnedHandlers: Array<(taskId: string, instructions: string, background: boolean) => void> = [];
   private subAgentCompletedHandlers: Array<(taskId: string, result: string, status: string, usage: unknown) => void> = [];
@@ -1991,7 +2006,7 @@ export class AgentLoop {
   private fireRetryScheduled(info: RetryScheduledInfo): void {
     for (const handler of this.retryScheduledHandlers) {
       try {
-        handler(info);
+        handler(info, this.originContext);
       } catch (err) {
         this.logger.error('onRetryScheduled handler threw', {
           error: err instanceof Error ? err.message : String(err),
@@ -2003,7 +2018,7 @@ export class AgentLoop {
   private fireRetrySucceeded(info: RetrySucceededInfo): void {
     for (const handler of this.retrySucceededHandlers) {
       try {
-        handler(info);
+        handler(info, this.originContext);
       } catch (err) {
         this.logger.error('onRetrySucceeded handler threw', {
           error: err instanceof Error ? err.message : String(err),
@@ -2015,7 +2030,7 @@ export class AgentLoop {
   private fireRetryExhausted(info: RetryExhaustedInfo): void {
     for (const handler of this.retryExhaustedHandlers) {
       try {
-        handler(info);
+        handler(info, this.originContext);
       } catch (err) {
         this.logger.error('onRetryExhausted handler threw', {
           error: err instanceof Error ? err.message : String(err),
@@ -4357,8 +4372,12 @@ export class AgentLoop {
    * Register a handler for when the full agentic loop completes.
    * Maps to pi-agent-core's agent_end event.
    * The consumer uses this to trigger conversation history checkpoints.
+   *
+   * The origin context identifies which loop completed. It used to take no
+   * arguments at all, which under a composite agent meant a consumer was told
+   * that "a" loop had finished and could not act on which.
    */
-  onLoopComplete(handler: () => void): void {
+  onLoopComplete(handler: (origin: LoopOriginContext) => void): void {
     this.loopCompleteHandlers.push(handler);
   }
 
@@ -4375,7 +4394,9 @@ export class AgentLoop {
    * Consumers use this to render a compact, in-place retry status (countdown,
    * attempt count) instead of a hard error. See {@link RetryPolicy}.
    */
-  onRetryScheduled(handler: (info: RetryScheduledInfo) => void): void {
+  onRetryScheduled(
+    handler: (info: RetryScheduledInfo, origin: LoopOriginContext) => void,
+  ): void {
     this.retryScheduledHandlers.push(handler);
   }
 
@@ -4383,7 +4404,9 @@ export class AgentLoop {
    * Register a handler fired when a background retry resolves the turn.
    * The consumer clears the retry status.
    */
-  onRetrySucceeded(handler: (info: RetrySucceededInfo) => void): void {
+  onRetrySucceeded(
+    handler: (info: RetrySucceededInfo, origin: LoopOriginContext) => void,
+  ): void {
     this.retrySucceededHandlers.push(handler);
   }
 
@@ -4392,7 +4415,9 @@ export class AgentLoop {
    * matching fatal `onError` fires immediately after, so the consumer shows a
    * terminal state.
    */
-  onRetryExhausted(handler: (info: RetryExhaustedInfo) => void): void {
+  onRetryExhausted(
+    handler: (info: RetryExhaustedInfo, origin: LoopOriginContext) => void,
+  ): void {
     this.retryExhaustedHandlers.push(handler);
   }
 
@@ -4403,9 +4428,13 @@ export class AgentLoop {
    *
    * NOT called during mid-loop emergency truncation (Layer 3).
    */
-  onBeforeCompaction(handler: (target: CompactionTarget) => Promise<void>): void {
+  onBeforeCompaction(
+    handler: (target: CompactionTarget, origin: LoopOriginContext) => Promise<void>,
+  ): void {
     this.beforeCompactionHandlers.push(handler);
-    this.compactionManager.onBeforeCompaction(handler);
+    this.compactionManager.onBeforeCompaction(
+      (target) => handler(target, this.originContext),
+    );
   }
 
   /**
@@ -4413,16 +4442,24 @@ export class AgentLoop {
    * The consumer uses this to re-seed messages from messages.db,
    * update internal state, or perform other post-compaction work.
    */
-  onPostCompaction(handler: (result: CompactionResult) => void): void {
-    this.compactionManager.onPostCompaction(handler);
+  onPostCompaction(
+    handler: (result: CompactionResult, origin: LoopOriginContext) => void,
+  ): void {
+    this.compactionManager.onPostCompaction(
+      (result) => handler(result, this.originContext),
+    );
   }
 
   /**
    * Register a handler for compaction errors.
    */
-  onCompactionError(handler: (error: Error) => void): void {
+  onCompactionError(
+    handler: (error: Error, origin: LoopOriginContext) => void,
+  ): void {
     this.compactionErrorHandlers.push(handler);
-    this.compactionManager.onCompactionError(handler);
+    this.compactionManager.onCompactionError(
+      (error) => handler(error, this.originContext),
+    );
   }
 
   /**
@@ -4430,9 +4467,13 @@ export class AgentLoop {
    * (emergency truncation) was used as fallback. The session continues
    * but context quality is degraded.
    */
-  onCompactionDegraded(handler: (info: CompactionDegradedInfo) => void): void {
+  onCompactionDegraded(
+    handler: (info: CompactionDegradedInfo, origin: LoopOriginContext) => void,
+  ): void {
     this.compactionDegradedHandlers.push(handler);
-    this.compactionManager.onCompactionDegraded(handler);
+    this.compactionManager.onCompactionDegraded(
+      (info) => handler(info, this.originContext),
+    );
   }
 
   /**
@@ -4440,9 +4481,13 @@ export class AgentLoop {
    * The consumer should take recovery action (e.g., pause heartbeat,
    * abort the session, or notify the user).
    */
-  onCompactionExhausted(handler: (info: CompactionExhaustedInfo) => void): void {
+  onCompactionExhausted(
+    handler: (info: CompactionExhaustedInfo, origin: LoopOriginContext) => void,
+  ): void {
     this.compactionExhaustedHandlers.push(handler);
-    this.compactionManager.onCompactionExhausted(handler);
+    this.compactionManager.onCompactionExhausted(
+      (info) => handler(info, this.originContext),
+    );
   }
 
   /**
@@ -4854,16 +4899,24 @@ export class AgentLoop {
    * Register a handler for observation events.
    * Fires when messages are compressed into observations.
    */
-  onObservation(handler: (event: ObservationEvent) => void): void {
-    this.compactionManager.onObservation(handler);
+  onObservation(
+    handler: (event: ObservationEvent, origin: LoopOriginContext) => void,
+  ): void {
+    this.compactionManager.onObservation(
+      (event) => handler(event, this.originContext),
+    );
   }
 
   /**
    * Register a handler for reflection events.
    * Fires when the reflector condenses observations.
    */
-  onReflection(handler: (event: ReflectionEvent) => void): void {
-    this.compactionManager.onReflection(handler);
+  onReflection(
+    handler: (event: ReflectionEvent, origin: LoopOriginContext) => void,
+  ): void {
+    this.compactionManager.onReflection(
+      (event) => handler(event, this.originContext),
+    );
   }
 
   /**
@@ -5657,7 +5710,7 @@ export class AgentLoop {
         this.skillBuffer = [];
         for (const handler of this.loopCompleteHandlers) {
           try {
-            handler();
+            handler(this.originContext);
           } catch (err) {
             this.logger.error('onLoopComplete handler threw', {
               error: err instanceof Error ? err.message : String(err),
@@ -6087,7 +6140,7 @@ export class AgentLoop {
     // 3. Emit onLoopComplete for final checkpoint (best-effort)
     for (const handler of this.loopCompleteHandlers) {
       try {
-        handler();
+        handler(this.originContext);
       } catch {
         // Ignore checkpoint failures during shutdown
       }
