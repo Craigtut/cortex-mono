@@ -1018,6 +1018,7 @@ describe('scenario: work that finished stops being described as live', () => {
    */
   it('drops a finished delegation from the block instead of listing it forever', async () => {
     const h = createDuplexScenario();
+    h.reasonerPi.hold = true;
     h.talkerPi.script = [{
       text: 'On it.',
       calls: [{ name: 'spawn_task', args: { instructions: 'build the release' } }],
@@ -1025,19 +1026,28 @@ describe('scenario: work that finished stops being described as live', () => {
     h.reasonerPi.script = [{ text: 'The release is built.' }];
     await h.facade.prompt('build the release');
     await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'work dispatched');
+
+    // Precondition, so the negative assertions below cannot pass by the task
+    // never having been rendered at all: while the work is genuinely live,
+    // the block does list it.
+    const during = talkerHeadline(h.talkerLoop)!;
+    expect(during).toContain('alias="task-1"');
+    expect(during).toContain('build the release');
+
+    h.reasonerPi.releaseRun();
     await waitUntil(
       () => entriesOfType(h.facade, 'delivery').length === 1,
       2000, 'the result was delivered',
     );
     await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner idle');
 
-    const block = talkerHeadline(h.talkerLoop);
     // Either nothing left to say, or a block that no longer claims the task
     // is running. What must never happen is a live task beside an idle loop.
-    if (block !== null) {
-      expect(block).not.toContain('build the release');
-      expect(block).not.toContain('alias="task-1"');
-    }
+    // Coalesced to '' rather than guarded by a null check, so the assertion
+    // always runs: a null block that asserted nothing would look like a pass.
+    const after = talkerHeadline(h.talkerLoop) ?? '';
+    expect(after).not.toContain('build the release');
+    expect(after).not.toContain('alias="task-1"');
   });
 });
 
