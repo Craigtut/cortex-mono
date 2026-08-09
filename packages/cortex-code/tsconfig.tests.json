@@ -14,7 +14,23 @@
     "composite": false,
     "declaration": false,
     "declarationMap": false,
-    "rootDir": "."
+    // The repo root, not ".". One test deliberately imports framework source
+    // by relative path (tests/framework-target.test.ts compares it against
+    // the bare specifier to prove the suite is resolving source, not a stale
+    // dist), which makes it a root file of this program and trips TS6059
+    // under a package-scoped rootDir. That is a project-layout complaint
+    // about an intentional import, not a contract miss, and this report's
+    // value is its signal-to-noise.
+    //
+    // Widening it and nothing else: rootDir only constrains output layout,
+    // and nothing is emitted here (noEmit, composite and declaration are all
+    // off above). Verified by `--listFiles`: the set of compiled files is
+    // byte-identical before and after, 70 either way, and the other 24 errors
+    // are untouched. Do NOT remove the key instead of widening it, which
+    // looks equivalent and is not: it falls back to `./src` from
+    // tsconfig.json and every test file then fails TS6059, reporting a clean
+    // zero over a program that checked no tests at all.
+    "rootDir": "../.."
   },
   "include": ["src/**/*", "tests/**/*"],
   // `exclude` is inherited and beats `include`, so dropping "tests" here is
