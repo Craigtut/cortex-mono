@@ -707,18 +707,21 @@ export class Session {
    */
   private async registerSkillsWithTrust(): Promise<void> {
     if (!this.agent) return;
-    const registry = this.agent.getSkillRegistry();
+    // Through the facade's addSkill(), not getSkillRegistry().addSkill():
+    // the facade owns which loops a skill lands on, and reaching past it
+    // registers on whatever loop the getter happens to return today.
+    const agent = this.agent;
     const skills = await discoverSkills(this.cwd);
 
     const globalSkills = skills.filter((s) => !isProjectSkill(s));
     const projectSkills = skills.filter(isProjectSkill);
-    for (const skill of globalSkills) registry.addSkill(skill);
+    for (const skill of globalSkills) agent.addSkill(skill);
 
     if (projectSkills.length === 0) return;
 
     const signature = await computeProjectSkillsSignature(skills);
     if (await checkProjectTrust(this.cwd, 'skills', signature)) {
-      for (const skill of projectSkills) registry.addSkill(skill);
+      for (const skill of projectSkills) agent.addSkill(skill);
       return;
     }
 
@@ -729,7 +732,7 @@ export class Session {
     );
     if (decision === 'trust' && signature !== null) {
       await recordProjectTrust(this.cwd, 'skills', signature);
-      for (const skill of projectSkills) registry.addSkill(skill);
+      for (const skill of projectSkills) agent.addSkill(skill);
       this.app!.transcript.addNotification('Skills', `Registered ${projectSkills.length} project skill(s).`);
       return;
     }
