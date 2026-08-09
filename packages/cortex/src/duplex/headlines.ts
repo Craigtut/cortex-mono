@@ -15,8 +15,25 @@
  * must not be able to fabricate sections or close the block early.
  */
 
-import type { PendingAsk, SessionUsage, SubAgentSnapshot } from '../types.js';
+import type { SessionUsage, SubAgentSnapshot } from '../types.js';
 import type { DelegationSnapshot } from './router.js';
+
+/**
+ * What the block needs of a pending ask.
+ *
+ * Deliberately keyed on `voicedAtSeq` rather than the registry's `voiced`
+ * boolean. `voiced` is sticky (set at hand-off, never cleared), so an ask
+ * whose voicing was lost keeps reporting true while the broker has already
+ * decided the user never heard it, and the block would read out a request as
+ * answerable that the router would refuse an answer for. The anchor is the
+ * broker's live answer to the only question this block is asking.
+ */
+export interface HeadlineAsk {
+  renderedRequest: string;
+  requestedAt: number;
+  /** Seq of the ask_voiced entry anchoring the CURRENT voicing, or null. */
+  voicedAtSeq: number | null;
+}
 
 // ---------------------------------------------------------------------------
 // Ports and options
@@ -32,8 +49,13 @@ export interface DuplexHeadlinePorts {
   activeSubAgents(): SubAgentSnapshot[];
   /** Tracked delegations (friendly aliases) from the router. */
   delegations(): DelegationSnapshot[];
-  /** Pending permission asks (voiced state included). */
-  pendingAsks(): PendingAsk[];
+  /**
+   * Pending permission asks, from the BROKER rather than the facade's merged
+   * consumer view. The broker holds every ask (tool, escalation, network) and
+   * is the authority on whether one has actually been read out, which the
+   * loop registry's sticky flag is not.
+   */
+  pendingAsks(): HeadlineAsk[];
   /** Clock override for tests. */
   now?: () => number;
 }
@@ -304,10 +326,10 @@ export class DuplexHeadlines {
    */
   private appendAskSections(
     sections: string[],
-    asks: readonly PendingAsk[],
+    asks: readonly HeadlineAsk[],
     now: number,
   ): void {
-    const voicedAsks = asks.filter((ask) => ask.voiced);
+    const voicedAsks = asks.filter((ask) => ask.voicedAtSeq !== null);
     const queuedCount = asks.length - voicedAsks.length;
     for (const ask of voicedAsks) {
       // The verbatim rendering, escaped: the talker's answer to "what is

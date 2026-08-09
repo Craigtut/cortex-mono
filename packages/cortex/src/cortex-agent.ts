@@ -1648,9 +1648,14 @@ export class CortexAgent {
       reasonerUsage: () => this.reasoner.getSessionUsage(),
       activeSubAgents: () => this.reasoner.getActiveSubAgents(),
       delegations: () => router.getDelegations(),
-      // The merged surface: loop-registry asks plus broker-minted network
-      // asks, so a blocked egress wait is visible in the status block too.
-      pendingAsks: () => this.getPendingAsks(),
+      // The BROKER, not the facade's merged consumer view. The broker holds
+      // every ask (tool, escalation, network, so a blocked egress wait is
+      // visible here too) and is the authority on whether one has actually
+      // been read out: the loop registry's `voiced` is set at hand-off and
+      // never cleared, so a voicing the broker later withdrew still reads as
+      // heard there, and the block would offer a request as answerable that
+      // the router would refuse an answer for.
+      pendingAsks: () => router.permissionBroker.getPendingAsks(),
     });
     this.headlines = headlines;
     talker.setHeadlineProvider(() => headlines.build(), {

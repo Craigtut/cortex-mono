@@ -677,10 +677,19 @@ export class PermissionBroker {
 
   /**
    * Snapshot of asks the broker is holding, in the loop registry's shape
-   * plus the broker's kind. Tool and escalation asks also appear in the
-   * asking loop's own registry (same askId); network asks exist only here.
+   * plus the broker's kind and its live consent anchor. Tool and escalation
+   * asks also appear in the asking loop's own registry (same askId); network
+   * asks exist only here.
+   *
+   * `voicedAtSeq` is the field a status surface should key on, not `voiced`.
+   * `voiced` is sticky: it is set once when a voicing is handed over and
+   * never cleared, so an ask whose voicing was lost (a destroyed delivery, a
+   * hand-off that threw) still reports true while the broker has decided the
+   * user never heard it. The anchor is the broker's own answer to "could the
+   * user have heard this", it is what the D16 consent check reads, and
+   * {@link noteVoicingLost} withdraws it.
    */
-  getPendingAsks(): Array<PendingAsk & { kind: BrokeredAskKind }> {
+  getPendingAsks(): Array<PendingAsk & { kind: BrokeredAskKind; voicedAtSeq: number | null }> {
     return [...this.asks.values()].map((ask) => ({
       askId: ask.request.askId,
       loopPath: ask.request.loopPath,
@@ -688,6 +697,7 @@ export class PermissionBroker {
       renderedRequest: ask.request.renderedRequest,
       requestedAt: ask.requestedAt,
       voiced: ask.voiced,
+      voicedAtSeq: ask.voicedAtSeq,
       kind: ask.request.kind,
     }));
   }
