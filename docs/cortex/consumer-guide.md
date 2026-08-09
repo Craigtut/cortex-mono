@@ -238,19 +238,27 @@ Restore before the agent does anything:
 ```typescript
 const agent = await CortexAgent.create(config);
 
-agent.restore(saved); // v2 artifact, v1 artifact, or a bare message array
+await agent.restore(saved); // v2 artifact, v1 artifact, or a bare message array
 
 const context = agent.getContextManager();
 context.setSlot('app-config', buildCurrentAppConfig());
 ```
 
-`restore()` is all-or-nothing and throws if any loop is running or any sub-agent is active. It replaces the three loop-level methods (`restoreConversationHistory`, `restoreObservationalMemoryState`, `restoreSessionUsage`), which are not exposed on the facade: those are independently callable at any time, so a consumer migrating from them rewrites the call site rather than renaming it.
+`restore()` is all-or-nothing and **rejects** if any loop is running or any sub-agent is active. It is async, so await it (or attach a `.catch`); its guards never throw synchronously, and an unawaited call that hits one becomes an unhandled rejection. It replaces the three loop-level methods (`restoreConversationHistory`, `restoreObservationalMemoryState`, `restoreSessionUsage`), which are not exposed on the facade: those are independently callable at any time, so a consumer migrating from them rewrites the call site rather than renaming it.
 
-A v1 artifact (`{ version: 1, history, memory?, usage? }`) or a bare message array restores into the reasoner with an empty log, so existing single-loop sessions upgrade transparently. Usage restore is a baseline, not a replay: the facade reports `restoredBaseline + live deltas`, so repeated restores are idempotent.
+A v1 artifact (`{ version: 1, history, memory?, usage? }`) or a bare message array restores into the reasoner with an empty log, so existing single-loop sessions upgrade transparently. Both optional v1 fields accept an explicit `null`, so a consumer whose saved memory and usage are each `T | null` can assign both directly instead of spreading one conditionally. Usage restore is a baseline, not a replay: the facade reports `restoredBaseline + live deltas`, so repeated restores are idempotent.
 
 `getConversationHistory()` and `getObservationalMemoryState()` are still forwarded and still return the reasoner's, which is the right answer for inspection and debugging. Persist `getState()`, not those: it is the only surface that carries both loops and the log.
 
 Slots should usually be rebuilt from current application state instead of restored from prior serialized messages.
+
+### Migrating off the v1 path
+
+`getConversationHistory()` + `getObservationalMemoryState()` + `getSessionUsage()` written out as a v1 artifact still works, and it is the right choice for the first pass of a migration: keeping it means the on-disk format does not change, so the migration stays behavior-preserving and reviewable.
+
+It is also a trap with a deadline. That trio reads the **reasoner only**. Under duplex the talker has its own history and its own observational memory, and none of it is in what you saved, so a session restored from a v1 artifact comes back with the conversational half of the agent blank, silently and with no error.
+
+So the order matters. Migrate onto the facade pinned to `mode: 'passthrough'` and keep v1 for that pass, then move to `getState()` / `restore()`, and only then drop the pin. Dropping it first means every session written in between is already lossy, and no later migration recovers what was never persisted.
 
 ## Context Slots
 
@@ -501,6 +509,8 @@ const agent = await CortexAgent.create({
   },
 });
 ```
+
+`persistResult` is not only called for tool results. When the session log passes its retention cap, the evicted entries are spilled through the same callback as JSON lines under the synthetic tool name `_session_log`. A persistor that names files after `metadata.toolName` will find `_session_log-*.md` sitting in its tool-results directory. Branch on the name if those belong somewhere else.
 
 ## Usage and Cost
 
