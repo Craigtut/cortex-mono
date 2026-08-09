@@ -885,6 +885,43 @@ describe('scenario: what the consumer observes across a duplex session', () => {
     expect(seen.every((event) => event.childTaskId === undefined)).toBe(true);
   });
 
+  it('finalizes user-visible output from the talker only, never the reasoner prose', async () => {
+    // onTurnComplete is the "the assistant finished saying something" signal
+    // a TUI finalizes its assistant bubble on and a voice app speaks. Fanned
+    // out across both resident loops it fires twice per exchange and one of
+    // the two is the reasoner's internal working text, which the user was
+    // never meant to see: the TUI interleaves it with the talker's speech,
+    // and the voice app reads it aloud.
+    const h = createDuplexScenario();
+    const outputs: Array<{ text: string; loopPath: string }> = [];
+    h.facade.onTurnComplete((output, origin) => {
+      outputs.push({ text: output.userFacing, loopPath: origin.loopPath });
+    });
+
+    h.reasonerPi.hold = true;
+    h.reasonerPi.script = [{ text: 'Reasoner internal final text.' }];
+    h.talkerPi.script = [{
+      text: 'Working on it.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'do the work' } }],
+    }];
+    await h.facade.prompt('do the work');
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'work dispatched');
+
+    // One exchange, one finalization: the spoken acknowledgment.
+    expect(outputs).toEqual([{ text: 'Working on it.', loopPath: 'talker' }]);
+
+    // Let the reasoner finish. Its final text surfaces as a delivery the
+    // talker performs, which is a talker turn; the reasoner's own turn
+    // completion is not a user-visible one and must not fire.
+    h.reasonerPi.releaseRun();
+    await h.facade.waitForWorkSettled();
+    await settle();
+
+    expect(outputs.map((output) => output.loopPath)).not.toContain('reasoner');
+    expect(outputs.map((output) => output.text))
+      .not.toContain('Reasoner internal final text.');
+  });
+
   it('settles both predicates once the conversation and the work are done', async () => {
     const h = createDuplexScenario();
     h.reasonerPi.hold = true;
