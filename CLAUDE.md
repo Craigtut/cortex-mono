@@ -140,7 +140,7 @@ refactor(cortex): extract provider registry into separate module
   git update-ref refs/heads/<branch> "$commit" HEAD   # compare-and-swap: fails if the branch moved
   ```
 
-  The expected-old-value on `update-ref` is the load-bearing part: it fails loudly instead of racing. Note this bypasses the pre-commit hook, so run `npm run typecheck` and the affected tests yourself first.
+  The expected-old-value on `update-ref` is the load-bearing part: it fails loudly instead of racing. Two caveats: this bypasses the pre-commit hook, so run `npm run typecheck` and the affected tests yourself first; and it leaves the *shared* index still holding the pre-commit entry for those paths, so finish with `git reset -q HEAD -- <paths>` or they keep showing as modified and another agent's commit can revert them.
 - After every commit, check `git show --stat HEAD` against the size of the change you actually made. A commit that swept up a foreign hunk almost always has exactly the filenames you expected; the line counts are what give it away.
 
 ## Documentation
