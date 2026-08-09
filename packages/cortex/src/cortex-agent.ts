@@ -1270,12 +1270,11 @@ export class CortexAgent {
   /** Whether the current reasoner run called Deliver (implicit-delivery guard). */
   private reasonerDeliverCalledThisRun = false;
   /**
-   * Whether this reasoner run's failure already produced a delivery. A
-   * terminal failure can surface twice (onRetryExhausted before the throw,
-   * then an error-stopped loop_end), and the user needs to hear about it
-   * once.
+   * Whether the reasoner's current terminal failure already produced a
+   * delivery. See deliverReasonerFailure for why a per-run reset is the
+   * right unit for this and would not be for anything announced mid-ladder.
    */
-  private reasonerFailureDeliveredThisRun = false;
+  private reasonerFailureAnnounced = false;
   /** One truncation repair per streak (D17 stop-reason audit). */
   private talkerRepairPending = false;
   /**
@@ -1658,7 +1657,7 @@ export class CortexAgent {
     reasonerBridge.on('loop_start', (event) => {
       if (event.childTaskId) return;
       this.reasonerDeliverCalledThisRun = false;
-      this.reasonerFailureDeliveredThisRun = false;
+      this.reasonerFailureAnnounced = false;
       router.noteReasonerRunStart();
       headlines.noteRunStart();
     });
@@ -1882,20 +1881,34 @@ export class CortexAgent {
     if (this.reasonerDeliverCalledThisRun) return;
     const messages = (event.data as { messages?: unknown[] } | undefined)?.messages;
     if (!Array.isArray(messages)) return;
-    let last: { stopReason?: unknown; content?: unknown } | null = null;
+    let last: { stopReason?: unknown; content?: unknown; errorMessage?: unknown } | null = null;
     for (const message of messages) {
       if ((message as { role?: string } | null)?.role === 'assistant') {
-        last = message as { stopReason?: unknown; content?: unknown };
+        last = message as { stopReason?: unknown; content?: unknown; errorMessage?: unknown };
       }
     }
     if (!last) return;
     if (last.stopReason === 'error') {
-      // A run that ended on pi's failure stub produced no result and there is
-      // nothing else in the system that will say so: the log gains an error
-      // entry, and every other delivery producer (Deliver, this implicit
-      // path, the watchdog) is either not called or returns early. Left here
-      // the delegation stays listed as live work and the grounding rules have
-      // the talker honestly answer "still working on it" forever.
+      // Only when nothing else in the system is going to speak.
+      //
+      // pi emits agent_end for a FAILED run too, and on a retryable failure
+      // that is attempt 1 of N. Announcing "it stopped with an error" here
+      // contradicts the headline block, which correctly says "Retrying after
+      // a network failure: attempt 1 of 3" at the same moment, and the
+      // delivery is the louder of the two.
+      //
+      // The discriminator is the stub's own errorMessage. pi mirrors an
+      // assistant message's errorMessage into state.errorMessage
+      // (pi-agent-core agent.js:394), and the loop turns a recorded
+      // state.errorMessage into a throw (agent-loop.ts runTurnWithRetry), so
+      // a stub carrying one is guaranteed to reach the retry ladder and then
+      // either onRetryExhausted or onError. Those own it, and they fire when
+      // the ladder is DONE rather than per attempt.
+      //
+      // A stub with an error stop reason and NO errorMessage is the other
+      // case: prompt() resolved, no throw, no ladder, no onError. This branch
+      // is the only thing that can speak for it.
+      if (last.errorMessage != null) return;
       this.deliverReasonerFailure(
         'The background work stopped with an error before producing a result. ' +
         'Tell the user plainly and offer to try again.',
@@ -1920,14 +1933,25 @@ export class CortexAgent {
    * reasoner was indistinguishable from a working one for as long as the
    * session lasted.
    *
-   * Once per run: a terminal failure can reach here twice (onRetryExhausted
-   * fires before the throw, and an error-stopped run also ends in a loop_end
-   * carrying the failure stub).
+   * Once per terminal failure. An exhausted ladder reaches here twice:
+   * onRetryExhausted fires first, then emitError for the same failure, a few
+   * statements later in the same synchronous unwind. The first wins because
+   * its message is the better one ("gave up after N attempts").
+   *
+   * The guard is reset on `loop_start`, which is the correct unit ONLY
+   * because nothing announces a failure mid-ladder any more: the run-end
+   * branch defers a recorded stub to the error path, so the two calls above
+   * are the only ones, and no run start falls between them. It is emphatically
+   * not "once per logical turn" (pi emits agent_start per retry attempt, so a
+   * turn spanning a ladder crosses several resets). Were a mid-ladder
+   * announcement ever added back, this guard would not stop it repeating, and
+   * the only thing standing behind it would be the router's content-hash
+   * dedup, which has a time window the default backoff ladder outlives.
    */
   private deliverReasonerFailure(text: string): void {
     if (this.destroyed || !this.router) return;
-    if (this.reasonerFailureDeliveredThisRun) return;
-    this.reasonerFailureDeliveredThisRun = true;
+    if (this.reasonerFailureAnnounced) return;
+    this.reasonerFailureAnnounced = true;
     // interrupt: a user waiting on work that is never coming is exactly the
     // case the class exists for. The router may still demote it under
     // backpressure, which is the intended tradeoff. `terminal` marks it as a
@@ -1969,14 +1993,36 @@ export class CortexAgent {
       );
     });
     this.reasoner.onError((error: ClassifiedError) => {
-      // Retryable and recoverable failures are handled elsewhere (the ladder,
-      // compaction, the abort path); a fatal one means the run is over and no
-      // retry is coming.
-      if (error.severity !== 'fatal') return;
+      // Only a failure that ended a reasoner TURN. emitError also serves the
+      // direct and utility completion paths (an observation call failing,
+      // say), which are not the user's work dying and must not be announced
+      // as such. Inside a run the loop is still prompting here: the flag is
+      // cleared in runPromptOnce's finally, well after this fires.
+      if (!this.reasoner.isPrompting) return;
+
+      // An abort is the user's own doing, already acknowledged on the
+      // conversation surface. It also has to clear the retry line: an abort
+      // during a backoff window produces neither a run start nor a run end,
+      // and neither onRetrySucceeded nor onRetryExhausted, so nothing else
+      // would ever take "Retrying, attempt 2 of 3" back down.
+      if (error.category === 'cancelled') {
+        headlines.clearRetry();
+        return;
+      }
+
+      // Everything else here is terminal by construction: the loop emits
+      // onError from runTurnWithRetry only on the path where it has decided
+      // NOT to retry, so reaching this point means the ladder is over (or
+      // never ran). Severity picks the wording, not whether to speak: a
+      // 'recoverable' classification that still ended the turn with no
+      // result is exactly as silent to the user as a fatal one.
+      const detail = clipFailureDetail(error.originalMessage);
       this.deliverReasonerFailure(
-        'The background work stopped with an error it cannot recover from: ' +
-        `${clipFailureDetail(error.originalMessage)}. Tell the user plainly; ` +
-        'it will not retry on its own.',
+        error.severity === 'fatal'
+          ? `The background work stopped with an error it cannot recover from: ${detail}. ` +
+            'Tell the user plainly; it will not retry on its own.'
+          : `The background work stopped and produced no result: ${detail}. ` +
+            'Tell the user plainly and offer to try again.',
       );
     });
   }

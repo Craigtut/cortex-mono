@@ -1150,6 +1150,117 @@ describe('scenario: the reasoner fails', () => {
     h.reasonerPi.releaseRun();
   });
 
+  it('stays quiet mid-ladder and says "retrying", not "it failed"', async () => {
+    // The consumer symptom: on the first transient provider failure of a
+    // session, the user was told "it stopped with an error, offer to try
+    // again" at interrupt class while the block simultaneously and correctly
+    // said "Retrying after a server_error failure: attempt 1 of 3". Two
+    // contradictory facts about one event, with the wrong one louder.
+    //
+    // pi emits agent_end for a failed attempt too, so loop_end fires
+    // mid-ladder; only the recorded errorMessage distinguishes it from a run
+    // that really is over.
+    const h = createDuplexScenario({
+      retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 3 },
+    });
+    h.reasonerPi.script = [
+      { text: '', runErrorMessage: '500 internal server error' },
+      { text: 'Built it on the retry.' },
+    ];
+    await failedWork(h);
+
+    // The ladder really ran: one retry attempt, through continue().
+    await waitUntil(() => h.reasonerPi.continueCalls === 1, 3000, 'the ladder retried');
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 3000, 'the turn finished');
+
+    // Not one failure delivery anywhere in the ladder, and the result that
+    // did arrive is the successful one.
+    const deliveries = entriesOfType(h.facade, 'delivery');
+    expect(deliveries.map((entry) => entry.content))
+      .not.toContain(expect.stringContaining('stopped with an error'));
+    for (const entry of deliveries) {
+      expect(entry.content).not.toContain('stopped with an error');
+      expect(entry.content).not.toContain('given up retrying');
+    }
+    expect(deliveredToTalker(h)).toContain('Built it on the retry.');
+  });
+
+  it('shows the retry in the block while the ladder is still running', async () => {
+    // A long backoff keeps the turn parked mid-ladder, which is exactly the
+    // window the user asks "how's it going?" in.
+    const h = createDuplexScenario({
+      retryPolicy: { backoffMs: [60_000], maxBackoffMs: 60_000, maxAttempts: 3 },
+    });
+    h.reasonerPi.script = [{ text: '', runErrorMessage: '500 internal server error' }];
+    await failedWork(h);
+    await waitUntil(
+      () => talkerHeadline(h.talkerLoop)?.includes('Retrying after') === true,
+      3000, 'the block reports the retry',
+    );
+
+    const block = talkerHeadline(h.talkerLoop)!;
+    expect(block).toMatch(/Retrying after a server_error failure: attempt 1 of \d+/);
+    // And the block is the ONLY thing saying anything about it so far.
+    expect(entriesOfType(h.facade, 'delivery')).toHaveLength(0);
+  });
+
+  it('announces an exhausted ladder exactly once, in the better of the two wordings', async () => {
+    // A terminal ladder reaches the announcer twice: onRetryExhausted fires,
+    // then emitError for the same failure a few statements later in the same
+    // unwind. The user hears about it once, and hears the wording that knows
+    // how many attempts there were. This is the property the once-per-failure
+    // guard actually protects; before, repeat suppression leaned on the
+    // router's content-hash dedup, which has a 120s window the real backoff
+    // ladder outlives.
+    const h = createDuplexScenario({
+      retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 1 },
+    });
+    h.reasonerPi.script = [
+      { text: '', runErrorMessage: '500 internal server error' },
+      { text: '', runErrorMessage: '500 internal server error' },
+    ];
+    await failedWork(h);
+
+    await waitUntil(
+      () => entriesOfType(h.facade, 'delivery').length > 0,
+      3000, 'the exhausted ladder was announced',
+    );
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 3000, 'the turn is over');
+    await settle();
+
+    const deliveries = entriesOfType(h.facade, 'delivery');
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.content).toContain('given up retrying');
+    // Not the onError wording, which fires for the same failure right after.
+    expect(deliveries[0]!.content).not.toContain('stopped and produced no result');
+  });
+
+  it('takes the retry line down when the user aborts mid-backoff', async () => {
+    // An abort inside a backoff window produces no run start, no run end,
+    // and neither onRetrySucceeded nor onRetryExhausted, so nothing else in
+    // the system would ever retract "Retrying, attempt 1 of 3". It would sit
+    // in the block for the rest of the session, ageing.
+    const h = createDuplexScenario({
+      retryPolicy: { backoffMs: [60_000], maxBackoffMs: 60_000, maxAttempts: 3 },
+    });
+    h.reasonerPi.script = [{ text: '', runErrorMessage: '500 internal server error' }];
+    await failedWork(h);
+    await waitUntil(
+      () => talkerHeadline(h.talkerLoop)?.includes('Retrying after') === true,
+      3000, 'the block reports the retry',
+    );
+
+    await h.facade.abort('work');
+    await waitUntil(
+      () => talkerHeadline(h.talkerLoop)?.includes('Retrying after') !== true,
+      3000, 'the retry line came down',
+    );
+    // And the abort itself is not announced as a failure.
+    for (const entry of entriesOfType(h.facade, 'delivery')) {
+      expect(entry.content).not.toContain('stopped and produced no result');
+    }
+  });
+
   it('says nothing extra when the user aborted the work themselves', async () => {
     const h = createDuplexScenario();
     h.reasonerPi.script = [{ text: '', stopReason: 'aborted' }];
