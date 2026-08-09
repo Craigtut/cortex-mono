@@ -30,7 +30,7 @@ Production-grade agent infrastructure built on `pi-agent-core`. Cortex wraps `@e
 
 Three main exports:
 
-- **`CortexAgent`**: The composite agent consumers interact with. Owns the session log, persistence, and settlement, and routes to one or more `AgentLoop` instances. Currently passthrough-only (routes straight to a single reasoner loop); the talker/reasoner duplex mode lands in the restructure's Phase 2b. See `docs/cortex/duplex/`.
+- **`CortexAgent`**: The composite agent consumers interact with, and the entry point most consumers want. Owns the session log, persistence, and settlement, and routes to one or more `AgentLoop` instances. Defaults to duplex: a fast talker loop fronting a persistent reasoner. `mode: 'passthrough'` is the single-loop opt-out and the parity baseline. See `docs/cortex/cortex-agent.md` for the consumer surface and `docs/cortex/duplex/` for the design.
 - **`AgentLoop`**: The loop primitive. The agentic loop, tools, context management, compaction, skills. Always-warm session, no cold/warm state machine. Role-neutral by design: the same class runs as talker, reasoner, and sub-agent.
 - **`ProviderManager`**: Provider discovery, OAuth flows, API key validation, model resolution. Wraps pi-ai's multi-provider ecosystem. Independent of the other two.
 
