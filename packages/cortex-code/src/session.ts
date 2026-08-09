@@ -452,6 +452,12 @@ export class Session {
     // Recommend (never apply) /sandbox off when already inside a container.
     void this.surfaceContainerRecommendation();
 
+    // Put the session on disk before it can do any work. Everything after
+    // this point can crash without the session becoming unlistable. A
+    // resumed session already has an artifact and resume() has not read it
+    // yet, so it checkpoints itself once the restore lands instead.
+    if (!this.isResume) await this.writeInitialCheckpoint();
+
     // Start TUI event loop
     this.app.start();
     void this.activity.recordAwaitingInput();
@@ -1416,11 +1422,16 @@ export class Session {
     });
 
     // Update tokens on turn_end (fires after each LLM turn, including
-    // mid-loop turns between tool calls). Persistence is not driven from
-    // here: onStateChanged already fires on a settled, consistent snapshot.
-    bridge.on('turn_end', () => {
+    // mid-loop turns between tool calls), and take a crash-recovery
+    // checkpoint. onStateChanged is the authoritative persistence trigger,
+    // but it cannot fire during a long task, so it is not on its own enough
+    // to keep one on disk. A child's turn boundary says nothing about the
+    // parent's history, so children are skipped.
+    bridge.on('turn_end', (event: CortexEvent) => {
       this.updateFooterContextUsage();
       this.updateObservationalMemoryStatus();
+      if (event.childTaskId) return;
+      this.crashCheckpoint();
     });
   }
 
@@ -2125,6 +2136,10 @@ export class Session {
     const loaded = await this.loadResumableSession(sessionId);
     if (!loaded) {
       this.app?.transcript.addNotification('Resume Failed', `Session ${sessionId} not found.`);
+      // There was nothing under this id, so the session start() skipped a
+      // checkpoint for is effectively a fresh one. Give it the artifact it
+      // would have had, or it stays invisible to listSessions().
+      await this.writeInitialCheckpoint();
       return;
     }
 
@@ -2159,6 +2174,10 @@ export class Session {
       replayHistoryToTranscript(loaded.dialogue, this.app.transcript);
     }
     this.updateFooterContextUsage();
+    // Re-baseline: start() checkpointed an empty agent, so without this the
+    // crash checkpoint's base would still be that empty snapshot and would
+    // blank the restored talker side on the first turn.
+    await this.writeInitialCheckpoint();
   }
 
   /**
@@ -2488,15 +2507,86 @@ export class Session {
   }
 
   /**
-   * Take the facade's composite snapshot and queue it for disk. The snapshot
-   * carries the session log, BOTH loops' histories and observational memory,
-   * and per-loop usage, so nothing that only exists on the conversation loop
-   * is lost. The reasoner-only trio (`getConversationHistory()` plus
-   * `getObservationalMemoryState()` plus `getSessionUsage()`) that used to
-   * build a v1 artifact here reads the work transcript under duplex, and the
-   * dialogue it omits was never written, so no later migration could get it
-   * back.
+   * Write the session out once, now, before it has done anything.
+   *
+   * Persistence is otherwise driven by `onStateChanged`, which the facade
+   * only emits from a `getState()` taken at gate quiescence. A session that
+   * starts work and never reaches quiescence therefore never wrote anything:
+   * a brand-new session killed during its first task left no `meta.json`, so
+   * `listSessions()` could not see it and `/resume` could not find it. Not
+   * stale, invisible.
+   *
+   * The agent is idle at both call sites, so the snapshot is a real
+   * consistent composite rather than a placeholder, and it gives
+   * {@link crashCheckpoint} the talker side it needs as a base.
+   *
+   * Callers must not invoke this on a resumed session before `resume()` has
+   * read the file: `start()` runs first, and an unconditional write there
+   * would overwrite the very session the user asked to resume with an empty
+   * agent.
    */
+  private async writeInitialCheckpoint(): Promise<void> {
+    if (!this.agent) return;
+    try {
+      const state = await this.agent.getState();
+      this.lastCompositeState = state;
+      const { saveSessionState } = await import('./persistence/sessions.js');
+      await saveSessionState(this.sessionId, state, this.buildSessionMeta());
+    } catch (err) {
+      log.warn('Initial session checkpoint failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * A crash-recovery checkpoint taken at a turn boundary, mid-run.
+   *
+   * `getState()` cannot help here: it resolves only when the loop gate is
+   * empty, and a ten-minute task holds the gate for its whole duration, so
+   * settlement-driven persistence writes nothing until the task is over. That
+   * is a crash away from losing the task.
+   *
+   * Passthrough only, deliberately. A turn boundary is a coherent point for
+   * ONE loop (pi has appended the assistant message and every tool result of
+   * the batch before `turn_end` fires), and in passthrough that one loop is
+   * the whole agent, so this is a consistent snapshot rather than the mid-run
+   * partial the old `triggerAutoSave` was taking. Under duplex it would not
+   * be: the other loop can be mid-turn at this instant, and the consumer has
+   * no way to read its history except through the `getState()` that is
+   * blocked. Closing that gap needs a turn-boundary snapshot on the facade,
+   * not a workaround here.
+   *
+   * Observational memory rides along only when neither the observer nor the
+   * reflector is in flight. Its buffer watermark indexes into history, so a
+   * generation landing between the two reads would persist a watermark that
+   * does not match what was saved; omitting it costs observations on crash
+   * recovery and keeps the artifact coherent.
+   */
+  private crashCheckpoint(): void {
+    if (!this.agent || this.agentMode !== 'passthrough') return;
+    const base = this.lastCompositeState;
+    if (!base) return;
+
+    const memorySettled = this.compactionStrategy === 'observational'
+      ? !this.agent.getCompactionManager().isObserverInFlight()
+        && !this.agent.getCompactionManager().isReflectorInFlight()
+      : true;
+    const usage = this.agent.getSessionUsage();
+
+    this.recordComposite({
+      ...base,
+      log: this.agent.getLog(),
+      // Passthrough: the conversation loop IS the reasoner. The talker side
+      // comes from the base snapshot rather than being blanked, so a duplex
+      // artifact restored into this session round-trips instead of losing a
+      // half it cannot see.
+      reasonerHistory: this.agent.getConversationHistory(),
+      reasonerMemory: memorySettled ? this.agent.getObservationalMemoryState() : null,
+      usage: { ...base.usage, total: usage, perLoop: { ...base.usage.perLoop, reasoner: usage } },
+    });
+  }
+
   /**
    * The composite snapshot to write at exit. `getState()` resolves only at a
    * quiescence window, so a session still mid-run at exit would block the
@@ -2518,6 +2608,16 @@ export class Session {
     }
   }
 
+  /**
+   * Cache the composite snapshot and queue it for disk. The snapshot carries
+   * the session log, BOTH loops' histories and observational memory, and
+   * per-loop usage, so nothing that only exists on the conversation loop is
+   * lost. The reasoner-only trio (`getConversationHistory()` plus
+   * `getObservationalMemoryState()` plus `getSessionUsage()`) that used to
+   * build a v1 artifact here reads the work transcript under duplex, and the
+   * dialogue it omits was never written, so no later migration could get it
+   * back.
+   */
   private recordComposite(state: CortexAgentStateV2): void {
     this.lastCompositeState = state;
     try {

@@ -38,6 +38,12 @@ export interface ScriptedPi {
   defaultText: string;
   /** Pause the next run after its input lands, until releaseRun(). */
   hold: boolean;
+  /**
+   * Pause after each turn_end, until releaseRun(). Models a long task: the
+   * loop gate is held for the whole run, so nothing keyed on settlement can
+   * fire, but turn boundaries keep going past.
+   */
+  holdAfterTurn: boolean;
   releaseRun: () => void;
   /** True between a run's start and its end. */
   running: boolean;
@@ -70,6 +76,7 @@ export function createScriptedPi(): ScriptedPi {
     script: [],
     defaultText: 'ok',
     hold: false,
+    holdAfterTurn: false,
     running: false,
     streamChunks: [],
     promptCalls: [],
@@ -218,6 +225,13 @@ export function createScriptedPi(): ScriptedPi {
           }
 
           pi.emitEvent({ type: 'turn_end', message: assistant, toolResults: toolResultMessages });
+
+          if (pi.holdAfterTurn) {
+            await new Promise<void>((resolve, reject) => {
+              release = resolve;
+              rejectHold = reject;
+            });
+          }
 
           if (local.signal.aborted) {
             const err = new Error('Request was aborted.');
@@ -417,6 +431,7 @@ export interface SessionInternals {
   saver: { save: (...args: unknown[]) => void; flush: () => Promise<void> };
   buildAgentConfig: () => CortexAgentConfig;
   wireEvents: () => void;
+  writeInitialCheckpoint?: () => Promise<void>;
   handleInput: (text: string) => Promise<void>;
 }
 
@@ -469,6 +484,13 @@ export async function createDuplexSession(
   internals.agent = harness.agent;
   internals.app = app;
   internals.wireEvents();
+  // Stands in for start(), which checkpoints the session before it can do any
+  // work and skips that for a resumed one so the saved artifact survives
+  // until resume() reads it. Optional-chained so a run against pre-checkpoint
+  // source fails on the assertion that names the symptom rather than here.
+  if (overrides['resumeSessionId'] === undefined) {
+    await internals.writeInitialCheckpoint?.();
+  }
   return { session, internals, app, harness };
 }
 
@@ -517,6 +539,8 @@ export async function createPassthroughSession(cwd: string): Promise<Passthrough
   internals.agent = agent;
   internals.app = app;
   internals.wireEvents();
+  // See createDuplexSession: stands in for start()'s startup checkpoint.
+  await internals.writeInitialCheckpoint?.();
   return { session, internals, app, agent, reasonerPi };
 }
 
