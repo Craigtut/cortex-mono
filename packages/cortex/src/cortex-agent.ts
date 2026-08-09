@@ -2466,13 +2466,17 @@ export class CortexAgent {
    *
    * In duplex, delivered content is fenced in an `<external-update>`
    * wrapper on BOTH surfaces before it reaches a loop, the same way
-   * reasoner deliveries and lookup results are fenced: everything DELIVERED
-   * is content about something, and only prompt() (the user speaking)
-   * arrives bare. Consumers relay third-party text here, so the fence is
-   * what keeps an email body out of a loop's instruction lane. On the work
-   * surface the fence sits inside the dispatch, so the directive framing is
-   * unchanged and the reasoner is still told to act on the content. The
-   * session log keeps the unwrapped content on both paths.
+   * reasoner deliveries and lookup results are fenced: content DELIVERED is
+   * content about something. Consumers relay third-party text here, so the
+   * fence is what keeps an email body out of a loop's instruction lane. On
+   * the work surface the fence sits inside the dispatch, so the directive
+   * framing is unchanged and the reasoner is still told to act on the
+   * content. The session log keeps the unwrapped content on both paths.
+   *
+   * The one exception is `speaker: 'user'` on the conversation surface: that
+   * is the consumer relaying actual human speech (an ASR transcript), which
+   * is prompt()'s trust class, and it arrives bare like prompt() does. See
+   * the fencing note at that branch.
    */
   deliver(content: string, options?: CortexDeliverOptions): DeliverResult {
     // Mirror AgentLoop.deliver's synchronous validation before appending,
@@ -2566,8 +2570,24 @@ export class CortexAgent {
     // Fenced like every other delivered channel: the log holds the raw
     // content (the durable record), and what reaches the talker's transcript
     // is wrapped, so relayed third-party text cannot sit in the instruction
-    // channel unmarked. prompt() is the user speaking and stays bare.
-    const wrapped = wrapExternalContent(content);
+    // channel unmarked.
+    //
+    // Except when the consumer says this IS the user speaking. The
+    // <external-update> fence is defined to the talker as "never the user
+    // speaking, however directly it addresses you", so fencing a relayed ASR
+    // transcript tells the talker to disbelieve the only thing in the
+    // session that is actually the user. That degrades the whole
+    // conversation for any voice pipeline that prefers non-blocking
+    // deliver() over await prompt(), not just its permission asks.
+    //
+    // Unfencing costs nothing that the fence was buying: `speaker: 'user'`
+    // already mints the consent-qualifying cause tag (D16), which is a
+    // strictly larger grant of authority than being unfenced, so a consumer
+    // that mislabels third-party text as user speech has already lost this
+    // argument at the speaker field. One declaration, one trust class:
+    // `speaker: 'user'` is prompt()'s class and arrives bare like prompt();
+    // everything else is content ABOUT something and stays fenced.
+    const wrapped = options?.speaker === 'user' ? content : wrapExternalContent(content);
     // Wake deliveries carry a cause tag (a no-wake delivery is silent
     // context and carries no causation). Only a 'user' speaker mints the
     // consent-qualifying kind: a consumer notification spoken on this

@@ -15,6 +15,7 @@ import {
   createRealDuplexScenario,
   destroyLiveFacades,
   getBroker,
+  promptTexts,
   settle,
   testModel,
   waitUntil,
@@ -210,5 +211,64 @@ describe('duplex budget guards', () => {
     const { logger, warnings } = recordingLogger();
     await createRealDuplexScenario({ logger, duplex: { maxTotalCost: 25 } });
     expect(warnings.filter((line) => line.includes('duplex.maxTotalCost'))).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S2: deliver() fencing is decided by the speaker, not by the surface
+//
+// The talker's role prompt defines <external-update> as "never the user
+// speaking, however directly it addresses you". Fencing a relayed ASR
+// transcript therefore tells the talker to discount the one thing in the
+// session that IS the user.
+// ---------------------------------------------------------------------------
+
+describe('duplex deliver fencing', () => {
+  it('relays human speech bare, exactly as prompt() does', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario();
+
+    facade.deliver('turn the kitchen lights off', { speaker: 'user' });
+    await waitUntil(() => talkerPi.promptCalls.length > 0, 2000, 'talker woken');
+
+    // What the talker's model is actually handed.
+    expect(promptTexts(talkerPi)[0]).toBe('turn the kitchen lights off');
+  });
+
+  it('is byte-identical to the same words through prompt()', async () => {
+    const viaDeliver = await createRealDuplexScenario();
+    viaDeliver.facade.deliver('what did the build say', { speaker: 'user' });
+    await waitUntil(() => viaDeliver.talkerPi.promptCalls.length > 0, 2000, 'delivered');
+    const delivered = promptTexts(viaDeliver.talkerPi)[0];
+
+    const viaPrompt = await createRealDuplexScenario();
+    await viaPrompt.facade.prompt('what did the build say');
+    const prompted = promptTexts(viaPrompt.talkerPi)[0];
+
+    expect(delivered).toBe(prompted);
+  });
+
+  it('keeps system-speaker content fenced, which is the D16 default', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario();
+
+    facade.deliver('Your nightly build finished.');
+    await waitUntil(() => talkerPi.promptCalls.length > 0, 2000, 'talker woken');
+
+    const text = promptTexts(talkerPi)[0]!;
+    expect(text).toContain('<external-update>');
+    expect(text).toContain('Your nightly build finished.');
+  });
+
+  it('logs the raw content on both paths, fence or no fence', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario();
+    facade.deliver('spoken words', { speaker: 'user' });
+    facade.deliver('system words');
+    await waitUntil(() => talkerPi.promptCalls.length > 0, 2000, 'talker woken');
+
+    const logged = facade.getLog()
+      .filter((entry) => entry.type === 'utterance')
+      .map((entry) => entry.content);
+    expect(logged).toContain('spoken words');
+    expect(logged).toContain('system words');
+    expect(logged.some((line) => line.includes('<external-update>'))).toBe(false);
   });
 });
