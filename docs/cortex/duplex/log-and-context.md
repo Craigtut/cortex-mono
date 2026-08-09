@@ -1,6 +1,6 @@
 # The Session Log and Context Mechanics
 
-> **STATUS: IMPLEMENTED.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is not yet the default mode; see migration-plan.md for what remains and for the honest boundary of what the test suite can see.
+> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode (D14); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
 
 ## What the Log Is
 
@@ -101,5 +101,5 @@ Each loop keeps its own transcript, its own stable session ID (`sessionId` per i
 - Every loop runs its own compaction manager. The talker compacts (infinite conversation is a consumer expectation); observational is the default strategy on both resident loops, with classic as a talker tuning option if duplicate observation cost across overlapping content proves material (decisions.md D4).
 - **The talker runs a non-blocking compaction posture.** Its synchronous observer fallback is disabled, leaving emergency truncation as the only in-band path, because a blocking observer call inside `transformContext` is multi-second dead air on the presence loop and would recur at every activation for the whole session. Staggering thresholds between loops does not help the user who is mid-conversation when the talker crosses its own.
 - The facade schedules deferred digestion (pending observation buffers, threshold compaction) during idle-signal windows for both loops, and staggers their thresholds so blocking work on the reasoner never coincides with a talker activation.
-- The log itself never compacts. Since it is also the persistence artifact, it carries a retention policy (ring buffer over lifecycle and headline-source entries, spill to `persistResult`) defined before the v2 schema freezes.
+- The log itself never compacts. Since it is also the persistence artifact, it carries a retention policy, and what shipped is blunter than what this document originally specified. `applyRetention` is a plain FIFO over the whole log, not a ring buffer scoped to lifecycle and headline-source entries, so a long session evicts `utterance` and `reply` entries on the same terms as milestones. Those are only recoverable if `persistResult` is configured to spill them. Scoping retention by entry type, so conversational history outlives churn, is the intended shape and is not yet built.
 - Persisted-result breadcrumbs (`[Result persisted: <path>]`) inside delivered content assume a shared filesystem; both resident loops share `workingDirectory` and the persist layout, so a delivered breadcrumb remains resolvable by the reasoner. The talker has no Read tool and simply speaks around them.

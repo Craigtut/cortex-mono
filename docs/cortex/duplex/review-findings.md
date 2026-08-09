@@ -1,6 +1,6 @@
 # Review Findings
 
-> **STATUS: IMPLEMENTED.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is not yet the default mode; see migration-plan.md for what remains and for the honest boundary of what the test suite can see.
+> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode (D14); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
 
 Two independent reviews were run against the design before implementation began: a plan review (design-versus-code consistency, implementation landmines, latency claims, observability) and a red-team (adversarial attack on the design's mechanics). Both verified their claims against source rather than against the docs.
 
@@ -57,7 +57,9 @@ Staggering thresholds between loops addresses cross-loop collision, not the real
 
 No error log entry type existed, and the default retry policy backs off up to ~3 hours with `loop_end` suppressed during retries. A provider outage would leave the talker saying "still working on it" indefinitely, with grounding rules correctly forbidding it from inventing anything better.
 
-**Resolved:** `error` and `retrying` log entry types, produced from the existing error and retry handlers; retrying surfaces at headline level, exhausted or fatal as an interrupt delivery. The talker also gets its own fail-fast retry policy so a transient error never puts the presence loop into a multi-minute silent backoff.
+**Partially resolved, and the unresolved half is the load-bearing one.** What shipped: `error` and `retrying` log entry types produced from the existing error and retry handlers, plus a fail-fast retry policy on the talker so a transient error never puts the presence loop into a multi-minute silent backoff. What did not ship, despite this entry previously claiming it did: the surfacing. Retries do not appear at headline level, and neither an exhausted ladder nor a fatal reasoner error produces an interrupt delivery. There are exactly three delivery producers (the `Deliver` tool, the implicit final-text delivery, and the watchdog) and none fires on a failed run, so the original scenario is intact: the provider 500s, every attempt ends with no delivery, the headline block still lists the delegation as live work, and the grounding rules have the talker report "still working on it" in good faith for as long as the ladder runs.
+
+The general lesson, which is why this entry is left standing rather than edited into looking clean: a finding is not closed by adding the data structure it needs. This one produced the log entries and stopped, and the entry was written as though the whole thing landed, so the gap survived until a reader traced the delivery producers by hand. Pair every "we now record X" with the sentence that says where a user sees X.
 
 ## Findings That Added Hardening
 
@@ -93,7 +95,7 @@ Nothing bounded delivery rate (a reasoner instructed to emit milestones will emi
 
 ### F14. Permission asks lost their payload
 
-The headline block renders only a tool name for a pending ask, and sandbox escalation reaches the resolver under a synthetic name, so the talker sees `Bash(escalate)` with no command line. Asked to voice that, it produces "it needs a bit of extra access" — softening forced by the data, not by model misbehavior. Grounding rules covered results, not asks.
+The headline block renders only a tool name for a pending ask, and sandbox escalation reaches the resolver under a synthetic name, so the talker sees `Bash(escalate)` with no command line. Asked to voice that, it produces "it needs a bit of extra access", a softening forced by the data rather than by model misbehavior. Grounding rules covered results, not asks.
 
 **Resolved:** ask entries carry a mandatory verbatim `renderedRequest` (tool plus actual command or path, truncated but never summarized); the talker role prompt requires verbatim reading for destructive-verb asks and all escalation asks. `resolveNetworkAccess` and the sandbox ask callback route through the same broker, which they previously bypassed entirely.
 

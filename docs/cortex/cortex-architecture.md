@@ -6,7 +6,7 @@
 
 It does NOT contain application-specific logic (thoughts, emotions, decisions, persona). Those are concerns of the consumer (e.g., a heartbeat system or application-specific pipeline). Think of it as: pi-agent-core provides the bare agentic loop; cortex provides everything needed to wire that loop into real applications.
 
-Two agent surfaces are exported. `AgentLoop` is the loop primitive this document describes. `CortexAgent` is the composite facade over it (session log, composite persistence, settlement predicates; a passthrough mode today, with a duplex talker/reasoner mode in development). See [cortex-agent.md](cortex-agent.md).
+Two agent surfaces are exported. `AgentLoop` is the loop primitive this document describes. `CortexAgent` is the composite facade over it (session log, composite persistence, settlement predicates) and the entry point most consumers want: it defaults to a duplex talker/reasoner pair, with `mode: 'passthrough'` as the single-loop opt-out. See [cortex-agent.md](cortex-agent.md) and [consumer-guide.md](consumer-guide.md).
 
 ## Package Structure
 

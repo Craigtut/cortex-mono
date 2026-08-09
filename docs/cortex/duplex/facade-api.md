@@ -1,6 +1,6 @@
 # Facade API: The Consumer Surface
 
-> **STATUS: IMPLEMENTED.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is not yet the default mode; see migration-plan.md for what remains and for the honest boundary of what the test suite can see.
+> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode (D14); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
 
 The facade is named `CortexAgent`. Consumers interact with one agent; the talker/reasoner split is never exposed in the API. This document defines what the consumer sees and how existing surfaces map onto the composite.
 
@@ -9,7 +9,7 @@ The facade is named `CortexAgent`. Consumers interact with one agent; the talker
 ```typescript
 const agent = await CortexAgent.create({
   // everything AgentLoopConfig has today, applied per the routing table below
-  mode: 'duplex',              // 'passthrough' is still the default; D14 flips it
+  mode: 'duplex',              // the default (D14); pass 'passthrough' to opt out
   talker: {                    // optional overrides, all have defaults
     model,                     // default: fast tier resolved from the primary provider
     // toolset is the fixed control tools only (decisions.md D5/D8);
@@ -71,7 +71,9 @@ Abort semantics, per scope:
 | pi steering/follow-up queues | cleared | cleared | cleared |
 | completed-but-undelivered results | retained in the log, not delivered | same | same |
 
-Concurrency contract: concurrent `prompt()` calls are serialized by the facade rather than throwing; `restore()` is rejected while any loop is running; the consumer idle signal is advisory, with the facade enforcing its own minimum inter-delivery spacing so an always-idle or never-idle signal cannot break the wake policy.
+Concurrency contract: concurrent `prompt()` calls never throw; `restore()` is rejected while any loop is running; the consumer idle signal is advisory, with the facade enforcing its own minimum inter-delivery spacing so an always-idle or never-idle signal cannot break the wake policy.
+
+How the non-throwing part is achieved differs by mode, and the difference is visible to a consumer that awaits the return value. In passthrough, calls serialize on a facade chain and each resolves against its own turn. In duplex, `promptDuplex()` routes through the talker's delivery path instead, which does not serialize and which resolves `undefined` when the input parks behind a busy talker rather than waiting for the turn that eventually consumes it. Both are non-blocking and neither loses input, but a consumer that reads the resolved value of `prompt()` as "the reply to this input" is only correct in passthrough. Read replies from `onTurnComplete` or the event bridge instead.
 
 **Two passthrough footnotes**, from building 2a. Both keep the contracts above while differing in mechanism, and both resolve in 2b.
 
