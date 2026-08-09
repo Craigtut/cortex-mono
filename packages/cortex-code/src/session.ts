@@ -2360,6 +2360,16 @@ export class Session {
   private buildAgentConfig(): CortexAgentConfig {
     const diagnostics = this.buildDiagnosticsConfig();
     return {
+      // No `duplex.maxTotalCost`, and that is a decision rather than an
+      // omission. The facade's aggregate guard is uncapped without it, so a
+      // duplex session would run two resident loops, sub-agents, lookups and
+      // doubled observational spend with no session ceiling. A ceiling is
+      // still the wrong answer here: this CLI sets no `budgetGuard.maxCost`
+      // either, so a session cap would be the only cost limit in the product
+      // and its effect would be a long coding session hard-stopping mid-task
+      // with no prior warning. Cost limits for a coding CLI want a warning
+      // tier before a stop, and that is a product decision, not a constant.
+      // Inert while the mode below is passthrough; revisit together with it.
       mode: this.agentMode,
       model: this.model,
       utilityModel: 'default',
