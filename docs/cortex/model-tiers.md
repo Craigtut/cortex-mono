@@ -25,10 +25,14 @@ Note: Compaction summarization uses the **primary model**, not the utility model
 
 The user never sees utility model output directly. It powers behind-the-scenes operations where speed and cost matter more than peak quality.
 
+### The duplex talker
+
+One exception to "the user never sees it": a `CortexAgent` in its default duplex mode runs the talker on the same auto-resolved fast tier unless `talker.model` overrides it. The talker's output is exactly what the user sees first, so on a provider with no mapping below (where the fast tier resolves to the primary model) the talker is neither fast nor cheap, and Cortex warns at construction. Name a talker model explicitly on those providers. See `consumer-guide.md`.
+
 ## Configuration
 
 ```typescript
-const agent = await AgentLoop.create({
+const agent = await CortexAgent.create({
   model: getModel('anthropic', 'claude-sonnet-4-6'),       // primary
   utilityModel: 'default',                                  // use provider default
   // or: utilityModel: getModel('anthropic', 'claude-haiku-4-5'),  // explicit

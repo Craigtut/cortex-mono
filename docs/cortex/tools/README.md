@@ -1,11 +1,13 @@
 # Cortex Built-in Tools
 
-Built-in tools that ship with `@animus-labs/cortex`. These are general-purpose tools any agent needs regardless of its application. They are **registered automatically** when `AgentLoop.create()` is called, using the `workingDirectory` from the agent config. No consumer-side tool creation is needed.
+Built-in tools that ship with `@animus-labs/cortex`. These are general-purpose tools any agent needs regardless of its application. They are **registered automatically** on every working loop, using the `workingDirectory` from the agent config. No consumer-side tool creation is needed.
+
+That means the loop a bare `AgentLoop.create()` builds, and, through `CortexAgent.create()`, the reasoner and its sub-agents. The duplex talker deliberately gets none of them: it holds the conversation and dispatches work, and never touches a file or a shell.
 
 To disable specific built-in tools, use the `disableTools` config option:
 
 ```typescript
-const agent = await AgentLoop.create({
+const agent = await CortexAgent.create({
   model,
   workingDirectory: cwd,
   disableTools: ['WebFetch'], // Exclude specific tools

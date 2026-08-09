@@ -8,7 +8,7 @@ Cortex separates two axes: containment (what a running command is physically abl
 
 ## What you supply
 
-1. A `SandboxProvider` on `AgentLoopConfig.sandbox`. Use `SandboxRuntimeProvider` from `@animus-labs/cortex-sandbox` (macOS Seatbelt, Linux bubblewrap; native Windows is scaffolded). You initialize it with a `SandboxPolicy`, then hand it to `AgentLoop.create`.
+1. A `SandboxProvider` on `AgentLoopConfig.sandbox`. Use `SandboxRuntimeProvider` from `@animus-labs/cortex-sandbox` (macOS Seatbelt, Linux bubblewrap; native Windows is scaffolded). You initialize it with a `SandboxPolicy`, then hand it to `CortexAgent.create` (or to `AgentLoop.create` if you are building on the loop primitive directly).
 2. `AgentLoopConfig.resolveNetworkAccess`, the single egress decision. Cortex calls it from in-process WebFetch, and you wire the same function into the provider's network ask-callback, so shell egress and WebFetch share one allowlist and one prompt.
 3. `AgentLoopConfig.resolvePermission`, which you already implement for tool permissions. It additionally receives sandbox escalation requests under a distinct tool name (below), so you prompt to run one command outside the box.
 
@@ -17,7 +17,7 @@ That is the whole framework contract. The provider does the OS work; your callba
 ## Quickstart
 
 ```ts
-import { AgentLoop } from '@animus-labs/cortex';
+import { CortexAgent } from '@animus-labs/cortex';
 import { SandboxRuntimeProvider, buildDefaultPolicy } from '@animus-labs/cortex-sandbox';
 
 // 1. Build a policy for the workspace. Writable roots come from TRUSTED config,
@@ -36,13 +36,15 @@ const status = await provider.initialize(policy);
 if (status.backend === 'none') log.warn('sandbox not enforced', { reasons: status.degradations });
 
 // 2. Hand the provider and the shared decision function to the agent.
-const agent = await AgentLoop.create({
+const agent = await CortexAgent.create({
   // ...your normal config...
   sandbox: provider,
   resolveNetworkAccess,        // same function used above for the shell path
   resolvePermission,           // your existing permission callback (handles escalation, below)
 });
 ```
+
+`sandbox` and `envOverrides` are shared config: every loop and every sub-agent the facade builds runs inside the same box. `resolvePermission` and `resolveNetworkAccess` route through the facade's permission broker in duplex mode, so an `ask` is voiced to the user in conversation rather than blocking a loop; your callback's contract is unchanged, and `allow` and `deny` decisions pass straight through.
 
 ## The framework API surface
 
