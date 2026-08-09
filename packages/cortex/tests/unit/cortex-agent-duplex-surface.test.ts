@@ -46,6 +46,42 @@ function recordingLogger(): { logger: CortexLogger; warnings: string[] } {
 }
 
 // ---------------------------------------------------------------------------
+// The session-log read surface: the facade must expose the hole-aware read,
+// not just the entries-only one
+// ---------------------------------------------------------------------------
+
+describe('facade session-log reads', () => {
+  it('exposes the hole-aware read, which getLog() cannot express', async () => {
+    // A tiny retention cap so eviction is guaranteed, and the entry types
+    // are mixed so churn-first retention leaves a hole rather than a clean
+    // leading truncation.
+    const { facade } = await createRealDuplexScenario({
+      sessionLog: { maxEntries: 3 },
+    });
+    for (let i = 0; i < 6; i++) {
+      facade.deliver(`notification ${i}`, { wake: false });
+    }
+
+    const entries = facade.getLog();
+    const events = facade.getLogEvents();
+
+    // getLog() hands back entries with nothing marking what is missing.
+    expect(entries.length).toBeLessThan(6);
+    // getLogEvents() says so, and says it the same way a reconnecting
+    // subscriber would be told.
+    const gaps = events.filter((event) => event.kind === 'gap');
+    expect(gaps.length).toBeGreaterThan(0);
+    expect(events.filter((event) => event.kind === 'entry')).toHaveLength(entries.length);
+  });
+
+  it('rejects after destroy, like its two neighbours', async () => {
+    const { facade } = await createRealDuplexScenario();
+    await facade.destroy();
+    expect(() => facade.getLogEvents()).toThrow('CortexAgent has been destroyed');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // N6: contextWindowLimit is declared per-loop and must be per-loop
 // ---------------------------------------------------------------------------
 

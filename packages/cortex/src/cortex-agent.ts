@@ -82,6 +82,7 @@ import { SessionLog } from './session-log.js';
 import type {
   SessionLogEntry,
   SessionLogEntryType,
+  SessionLogEvent,
   SessionLogSubscriber,
   WakeClass,
 } from './session-log.js';
@@ -2953,6 +2954,22 @@ export class CortexAgent {
   getLog(fromSeq?: number): SessionLogEntry[] {
     this.assertNotDestroyed();
     return this.log.getLog(fromSeq);
+  }
+
+  /**
+   * The same range as {@link getLog}, as an event sequence: retained entries
+   * interleaved with a gap marker for every hole, in seq order.
+   *
+   * This is the hole-aware read, and the one a timeline should use.
+   * `getLog()` returns entries and nothing else, so retention that evicted
+   * churn from the middle or the end of the range is invisible in it. Built
+   * by the same function that builds a subscription's replay, so a one-shot
+   * read and a reconnecting subscriber can never disagree about where the
+   * holes are.
+   */
+  getLogEvents(fromSeq?: number): SessionLogEvent[] {
+    this.assertNotDestroyed();
+    return this.log.getLogEvents(fromSeq);
   }
 
   /**
