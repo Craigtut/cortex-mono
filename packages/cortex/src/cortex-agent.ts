@@ -6,12 +6,13 @@
  * loop(s), the session log, the duplex router, settlement predicates, and
  * composite persistence. Two modes:
  *
- * - `passthrough` (the default until Phase 3 flips it): a single reasoner
- *   loop, reproducing direct AgentLoop behavior exactly. This is the
- *   consumer opt-out and the parity baseline for tests.
- * - `duplex`: a fast talker loop fronting the persistent reasoner. The
- *   talker carries the fixed control toolset only; the reasoner does all
- *   real work and reports back through the router's wake policy.
+ * - `duplex` (the default, decisions.md D14): a fast talker loop fronting
+ *   the persistent reasoner. The talker carries the fixed control toolset
+ *   only; the reasoner does all real work and reports back through the
+ *   router's wake policy.
+ * - `passthrough`: a single reasoner loop, reproducing direct AgentLoop
+ *   behavior exactly. This is the consumer opt-out and the parity baseline
+ *   for tests.
  *
  * The talker/reasoner split is never exposed in this API; consumer config
  * is routed internally per the routing table below.
@@ -117,11 +118,18 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * Facade mode. `passthrough` routes everything to the single reasoner loop
- * and reproduces direct AgentLoop behavior exactly. `duplex` (talker +
- * reasoner) becomes the default at the Phase 3 flip (decisions.md D14).
+ * Facade mode. `duplex` (talker + reasoner) is the default.
+ * `passthrough` is the opt-out: it routes everything to the single reasoner
+ * loop and reproduces direct AgentLoop behavior exactly (decisions.md D14).
  */
 export type CortexAgentMode = 'passthrough' | 'duplex';
+
+/**
+ * The mode a consumer gets without asking. One constant rather than two
+ * defaulted reads, so the construction check and the stored mode can never
+ * disagree about what an omitted `mode` means.
+ */
+export const DEFAULT_MODE: CortexAgentMode = 'duplex';
 
 /** Scope for {@link CortexAgent.abort} (facade-api.md abort table). */
 export type CortexAbortScope = 'conversation' | 'work' | 'all';
@@ -187,7 +195,7 @@ export interface CortexSessionLogConfig {
 export interface CortexAgentConfig extends AgentLoopConfig {
   /** Consumer tools. Routed to the reasoner only (decisions.md D5). */
   tools?: CortexTool[];
-  /** Facade mode. Default: 'passthrough' until the Phase 3 flip. */
+  /** Facade mode. Default: 'duplex'; 'passthrough' is the opt-out (D14). */
   mode?: CortexAgentMode;
   /** Talker overrides (duplex mode). */
   talker?: TalkerConfig;
@@ -1256,7 +1264,7 @@ export class CortexAgent {
   private destroyed = false;
 
   private constructor(reasoner: AgentLoop, config: CortexAgentConfig, talker?: AgentLoop) {
-    this.mode = config.mode ?? 'passthrough';
+    this.mode = config.mode ?? DEFAULT_MODE;
     if (this.mode === 'duplex' && !talker) {
       throw new Error('CortexAgent duplex mode requires a talker loop.');
     }
@@ -1303,7 +1311,7 @@ export class CortexAgent {
    * persistent reasoner in duplex.
    */
   static async create(config: CortexAgentConfig): Promise<CortexAgent> {
-    if ((config.mode ?? 'passthrough') === 'duplex') {
+    if ((config.mode ?? DEFAULT_MODE) === 'duplex') {
       // Broker the blocking permission surfaces before the loop configs are
       // built: the loops capture the resolver closures at creation, so the
       // broker reference is late-bound through a box that is filled
@@ -1331,8 +1339,24 @@ export class CortexAgent {
       try {
         // Default talker model: the fast tier resolved from the primary
         // provider, which is exactly what the reasoner's utility-model
-        // auto-resolution computes.
+        // auto-resolution computes. That resolution cannot fail; for a
+        // provider Cortex cannot enumerate (Ollama, custom OpenAI-compatible
+        // endpoints) it falls back to the primary model, so duplex still
+        // assembles and runs but the talker is as slow as the reasoner,
+        // which is the whole latency case gone. Say so once at construction
+        // rather than leaving it to be discovered as unexplained latency.
         const talkerModel = brokered.talker?.model ?? reasoner.getAutoResolvedUtilityModel();
+        if (
+          brokered.talker?.model === undefined &&
+          talkerModel.provider === reasoner.getModel().provider &&
+          talkerModel.modelId === reasoner.getModel().modelId
+        ) {
+          (brokered.logger ?? NOOP_LOGGER).warn(
+            `[CortexAgent] No fast model resolved for provider "${talkerModel.provider}"; ` +
+            `the talker will run on the primary model "${talkerModel.modelId}". ` +
+            'Set talker.model to a fast model, or use mode: \'passthrough\'.',
+          );
+        }
         talker = await AgentLoop.create(buildTalkerConfig(brokered, talkerModel));
       } catch (err) {
         // A half-assembled duplex must not leak a live reasoner.

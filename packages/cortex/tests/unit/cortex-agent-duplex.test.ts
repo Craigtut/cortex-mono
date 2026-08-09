@@ -2212,3 +2212,117 @@ describe('duplex permission broker', () => {
     expect(await brokered.resolvePermission!('Read', {}, undefined)).toEqual({ decision: 'allow' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// The default mode (D14)
+// ---------------------------------------------------------------------------
+
+describe('CortexAgent default mode', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function stubCreate(): AgentLoopConfig[] {
+    const configs: AgentLoopConfig[] = [];
+    const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+    vi.spyOn(AgentLoop, 'create').mockImplementation(async (config) => {
+      configs.push(config);
+      return new AgentLoopCtor(createMockPiAgent(), config, [], {
+        enableSubAgentTool: (config as { enableSubAgentTool?: boolean }).enableSubAgentTool ?? true,
+        enableLoadSkillTool: (config as { enableLoadSkillTool?: boolean }).enableLoadSkillTool ?? true,
+      });
+    });
+    return configs;
+  }
+
+  it('omitting mode assembles duplex; passthrough is the explicit opt-out', async () => {
+    const configs = stubCreate();
+    const duplex = await CortexAgent.create({
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'p',
+    });
+    liveFacades.push(duplex);
+    expect(configs.map((config) => config.loopPath)).toEqual(['reasoner', 'talker']);
+
+    configs.length = 0;
+    const passthrough = await CortexAgent.create({
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'p',
+      mode: 'passthrough',
+    });
+    liveFacades.push(passthrough);
+    // One loop, and no duplex loop identity: the reasoner keeps the default
+    // 'main' path a bare AgentLoop would have.
+    expect(configs).toHaveLength(1);
+    expect(configs[0]!.loopPath).toBeUndefined();
+  });
+
+  it('a consumer who supplies no talker model gets the auto-resolved fast tier', async () => {
+    const configs = stubCreate();
+    const fast = wrapModel(
+      { provider: 'anthropic', name: 'claude-haiku-4-5' } as PiModel,
+      'anthropic',
+      'claude-haiku-4-5',
+    );
+    vi.spyOn(AgentLoop.prototype, 'getAutoResolvedUtilityModel').mockReturnValue(fast);
+
+    const facade = await CortexAgent.create({
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'p',
+    });
+    liveFacades.push(facade);
+
+    const talkerConfig = configs.find((config) => config.loopPath === 'talker')!;
+    expect(talkerConfig.model.modelId).toBe('claude-haiku-4-5');
+  });
+
+  it('warns when no fast tier exists and the talker falls back to the primary model', async () => {
+    const configs = stubCreate();
+    // What resolveUtilityModels() does for a provider Cortex cannot
+    // enumerate: it hands back the primary model rather than failing.
+    vi.spyOn(AgentLoop.prototype, 'getAutoResolvedUtilityModel')
+      .mockImplementation(function (this: AgentLoop) { return this.getModel(); });
+    const warnings: string[] = [];
+    const logger = {
+      debug: () => {}, info: () => {}, error: () => {},
+      warn: (message: string) => { warnings.push(message); },
+    };
+
+    const facade = await CortexAgent.create({
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'p',
+      logger,
+    });
+    liveFacades.push(facade);
+
+    // Duplex still assembles: a slow talker beats no agent.
+    const talkerConfig = configs.find((config) => config.loopPath === 'talker')!;
+    expect(talkerConfig.model.modelId).toBe('claude-sonnet-4-20250514');
+    expect(warnings.filter((message) => message.includes('No fast model resolved')))
+      .toHaveLength(1);
+  });
+
+  it('stays silent when the consumer deliberately names the primary as the talker', async () => {
+    stubCreate();
+    const warnings: string[] = [];
+    const logger = {
+      debug: () => {}, info: () => {}, error: () => {},
+      warn: (message: string) => { warnings.push(message); },
+    };
+
+    const facade = await CortexAgent.create({
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'p',
+      talker: { model: testModel() },
+      logger,
+    });
+    liveFacades.push(facade);
+
+    expect(warnings.filter((message) => message.includes('No fast model resolved'))).toEqual([]);
+  });
+});

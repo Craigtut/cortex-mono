@@ -226,6 +226,10 @@ function createFacade(overrides?: Partial<CortexAgentConfig>): {
     model: testModel(),
     workingDirectory: '/tmp/test-workspace',
     initialBasePrompt: 'Test base prompt',
+    // Explicit since duplex became the default (D14): this suite drives a
+    // single mock loop through the private constructor, so passthrough is
+    // the mode under test, not the mode that happened to be the default.
+    mode: 'passthrough',
     ...overrides,
   });
   return { facade, loop, piAgent };
@@ -440,6 +444,7 @@ describe('CortexAgent.prompt', () => {
     const facade = new CortexAgentCtor(loop, {
       model: testModel(),
       workingDirectory: '/tmp/test-workspace',
+      mode: 'passthrough',
     });
 
     await expect(facade.prompt('never ran')).rejects.toThrow(/not configured/);

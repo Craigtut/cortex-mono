@@ -174,6 +174,10 @@ function createFacade(overrides?: Partial<CortexAgentConfig>): {
     model: testModel(),
     workingDirectory: '/tmp/test-workspace',
     initialBasePrompt: 'Test base prompt',
+    // Explicit since duplex became the default (D14). The v2 artifact's
+    // talker side is exercised here as restored-but-unhydrated content, so
+    // these cases are passthrough by intent.
+    mode: 'passthrough',
     ...overrides,
   });
   return { facade, loop, piAgent };
