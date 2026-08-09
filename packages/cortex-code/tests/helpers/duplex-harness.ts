@@ -578,3 +578,60 @@ export async function settle(ticks = 8): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
 }
+
+// ---------------------------------------------------------------------------
+// Fan-out callback dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * Fire a loop's retry and compaction callbacks the way the framework fires
+ * them, **including the loop's own origin stamp**: these reach the loop's
+ * private dispatchers rather than fabricating a `LoopOriginContext`, so the
+ * origin a consumer handler receives is the real one the loop would have
+ * supplied.
+ *
+ * Standing in for the framework's dispatch is deliberate. What is under test
+ * is whether the consumer discriminates on the origin; staging a genuine
+ * transient failure or a genuine token-threshold breach would exercise the
+ * framework's retry and compaction engines instead, and those have their own
+ * suites.
+ */
+export function fireRetryScheduled(loop: AgentLoop, info: Record<string, unknown>): void {
+  (loop as unknown as { fireRetryScheduled: (i: unknown) => void }).fireRetryScheduled(info);
+}
+
+export function fireRetrySucceeded(loop: AgentLoop, info: Record<string, unknown>): void {
+  (loop as unknown as { fireRetrySucceeded: (i: unknown) => void }).fireRetrySucceeded(info);
+}
+
+/** Runs the loop's own wrapper, which is what applies the origin stamp. */
+export function firePostCompaction(loop: AgentLoop, result: Record<string, unknown>): void {
+  const handlers = (loop.getCompactionManager() as unknown as {
+    postCompactionHandlers: Array<(r: unknown) => void>;
+  }).postCompactionHandlers;
+  for (const handler of handlers) handler(result);
+}
+
+export function retryScheduledInfo(delayMs = 30_000): Record<string, unknown> {
+  return {
+    category: 'network',
+    attempt: 1,
+    maxAttempts: 3,
+    delayMs,
+    nextAttemptAt: Date.now() + delayMs,
+    originalMessage: 'connection reset',
+  };
+}
+
+export function compactionResult(before: number, after: number): Record<string, unknown> {
+  return {
+    tokensBefore: before,
+    tokensAfter: after,
+    turnsCompacted: 4,
+    turnsPreserved: 6,
+    summaryTokens: 500,
+    oldestPreservedTimestamp: null,
+    oldestPreservedIndex: 0,
+    summary: 'summary',
+  };
+}

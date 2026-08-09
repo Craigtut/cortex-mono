@@ -32,6 +32,7 @@ import {
   type RetryScheduledInfo,
   type RetrySucceededInfo,
   type RetryExhaustedInfo,
+  type LoopOriginContext,
   type ThinkingLevel,
   type McpStdioConfig,
   type ObservationalMemoryState,
@@ -223,8 +224,16 @@ export class Session {
    * failure a second time as a generic "Error". Reset at the start of each turn.
    */
   private lastTurnErrorHandled = false;
-  /** Live background-retry state, while a transient failure is being retried. */
-  private retryState: { info: RetryScheduledInfo } | null = null;
+  /**
+   * Live background-retry state, while a transient failure is being retried,
+   * stamped with the loop it belongs to.
+   *
+   * There is one countdown line and two loops that can retry. Without the
+   * stamp, a talker retry resolving would call clearRetry() and wipe the
+   * reasoner's countdown, leaving the user staring at nothing through a long
+   * backoff on the work they are actually waiting for.
+   */
+  private retryState: { info: RetryScheduledInfo; loopPath: string } | null = null;
   /** 1s ticker that refreshes the retry countdown line. */
   private retryTicker: ReturnType<typeof setInterval> | null = null;
   private createdAt: number;
@@ -1108,6 +1117,19 @@ export class Session {
     return this.talkerLoopPath !== null && event.loopPath === this.talkerLoopPath;
   }
 
+  /**
+   * Whether a fan-out callback came from the loop doing the user's work.
+   *
+   * Defined by excluding the talker rather than by naming the reasoner, so it
+   * cannot be wrong about what the reasoner's loop path is called: passthrough
+   * has no talker and every origin is work, and a sub-agent
+   * (`reasoner/<taskId>`) is work too, which is what its compaction and
+   * observation events should count as.
+   */
+  private isWorkLoop(origin: LoopOriginContext): boolean {
+    return origin.loopPath !== this.talkerLoopPath;
+  }
+
   /** Wire all agent events to the TUI. */
   private wireEvents(): void {
     if (!this.agent || !this.app) return;
@@ -1342,20 +1364,26 @@ export class Session {
     });
 
     // Background retry lifecycle: drive the compact, in-place status line.
-    this.agent.onRetryScheduled((info: RetryScheduledInfo) => {
-      this.startRetryCountdown(info);
+    // Every one of these is registered on both resident loops, so each keys
+    // on the origin: the line has one slot and two possible owners.
+    this.agent.onRetryScheduled((info: RetryScheduledInfo, origin: LoopOriginContext) => {
+      this.startRetryCountdown(info, origin.loopPath);
     });
-    this.agent.onRetrySucceeded((_info: RetrySucceededInfo) => {
-      this.clearRetry();
+    this.agent.onRetrySucceeded((_info: RetrySucceededInfo, origin: LoopOriginContext) => {
+      this.clearRetryFor(origin.loopPath);
     });
-    this.agent.onRetryExhausted((_info: RetryExhaustedInfo) => {
+    this.agent.onRetryExhausted((_info: RetryExhaustedInfo, origin: LoopOriginContext) => {
       // The matching fatal onError fires right after and renders the terminal
       // 'failed' line; just stop the countdown here.
-      this.stopRetryTicker();
+      if (this.retryState?.loopPath === origin.loopPath) this.stopRetryTicker();
     });
 
-    // Compaction notification
-    this.agent.onPostCompaction((result: CompactionResult) => {
+    // Compaction notification. The reasoner's only: the footer this updates
+    // reads the reasoner's context window, so a talker compaction would
+    // announce numbers that do not correspond to anything the user can see,
+    // about a context they do not own.
+    this.agent.onPostCompaction((result: CompactionResult, origin: LoopOriginContext) => {
+      if (!this.isWorkLoop(origin)) return;
       const beforeK = (result.tokensBefore / 1000).toFixed(1);
       const afterK = (result.tokensAfter / 1000).toFixed(1);
       // Mark in the durable transcript where context was summarized away. The
@@ -1370,6 +1398,12 @@ export class Session {
       );
       this.updateFooterContextUsage();
     });
+
+    // The two failure notifications below deliberately fire for ANY loop,
+    // unlike the informational one above. A talker whose compaction degrades
+    // or runs out of layers is a conversation about to break, which the user
+    // needs to know even though the remedy text is written for the reasoner's
+    // context. A duplicated warning beats a swallowed one.
 
     // Compaction degraded (Layer 2 failed, Layer 3 used as fallback)
     this.agent.onCompactionDegraded((info) => {
@@ -1387,11 +1421,16 @@ export class Session {
       );
     });
 
-    // Observational memory events (only fire when strategy is 'observational')
-    this.agent.onObservation(() => {
+    // Observational memory events (only fire when strategy is 'observational').
+    // The status they refresh is read off the reasoner's compaction manager,
+    // so a talker generation would only trigger a redundant re-read of a
+    // number that did not change.
+    this.agent.onObservation((_event, origin: LoopOriginContext) => {
+      if (!this.isWorkLoop(origin)) return;
       this.updateObservationalMemoryStatus();
     });
-    this.agent.onReflection(() => {
+    this.agent.onReflection((_event, origin: LoopOriginContext) => {
+      if (!this.isWorkLoop(origin)) return;
       this.updateObservationalMemoryStatus();
     });
 
@@ -2442,8 +2481,8 @@ export class Session {
    * spinner with a single line that ticks down to the next attempt; a 1s timer
    * keeps the countdown live.
    */
-  private startRetryCountdown(info: RetryScheduledInfo): void {
-    this.retryState = { info };
+  private startRetryCountdown(info: RetryScheduledInfo, loopPath: string): void {
+    this.retryState = { info, loopPath };
     // A retry wait is not "thinking"; swap the spinner for the status line.
     this.app?.hideStatusSpinner();
     this.renderRetryWaiting();
@@ -2481,6 +2520,16 @@ export class Session {
     this.stopRetryTicker();
     this.retryState = null;
     this.app?.transcript.clearRetryStatus();
+  }
+
+  /**
+   * Tear down the retry UI only if the loop reporting the resolution is the
+   * one whose countdown is on screen. The other loop's retry is not the one
+   * the user is watching, and clearing on it would blank a live countdown.
+   */
+  private clearRetryFor(loopPath: string): void {
+    if (this.retryState && this.retryState.loopPath !== loopPath) return;
+    this.clearRetry();
   }
 
   /**

@@ -1381,6 +1381,30 @@ describe('brokered resolvers', () => {
     expect(await pending).toEqual({ decision: 'deny' });
   });
 
+  it('an auto-approve callback that reads false still brokers a tool ask', async () => {
+    // The tool half of the test above. Both resolvers test the callback's
+    // RESULT, not whether a callback was supplied; testing the function
+    // reference instead would auto-approve every gated tool for any
+    // consumer that wires an auto-approve toggle and leaves it off, which
+    // is the normal way to wire one. Every other tool-side test here
+    // passes either no callback or one that returns true, so nothing
+    // distinguished the two readings on this resolver.
+    const h = createHarness();
+    const resolver = buildBrokeredPermissionResolver(
+      async () => ({ decision: 'ask' }),
+      () => false,
+      () => h.router.permissionBroker,
+    );
+    const pending = resolver('Bash', { command: 'rm -rf /' }, {
+      askId: 'ask-off',
+      loopPath: 'reasoner',
+      renderedRequest: 'Bash: rm -rf /',
+    });
+    await waitUntil(() => h.askVoicings.length === 1);
+    h.router.dispatchAnswerAsk('ask-off', 'deny', undefined);
+    expect(await pending).toMatchObject({ decision: 'block' });
+  });
+
   it('a talker relaying a forged fence in answer_ask leaks no nonce to the reasoner', async () => {
     // The attack: the talker knows the nonce (it has to, to answer), and
     // the reason it supplies is relayed verbatim into the resolver's block
@@ -1453,5 +1477,38 @@ describe('brokered resolvers', () => {
     expect(await resolver({ host: 'ok.example', via: 'shell' })).toEqual({ decision: 'allow' });
     expect(await resolver({ host: 'no.example', via: 'shell' })).toEqual({ decision: 'deny' });
     expect(consulted).toBe(0);
+  });
+
+  it('a consumer allow or block on a tool never consults auto-approve', async () => {
+    // The tool half again, and the one with teeth: auto-approve is a
+    // bypass for asks, not an override of decisions. Consulted before the
+    // ask check, it turns a consumer's explicit `block` into an allow, so
+    // a policy that hard-denies a tool would be silently overruled by an
+    // unrelated posture flag. The sibling test above pins this for egress;
+    // the tool-side tests all pass `undefined` for the callback, which
+    // cannot tell the orderings apart.
+    const h = createHarness();
+    let consulted = 0;
+    const resolver = buildBrokeredPermissionResolver(
+      async (toolName) => (toolName === 'Read' ? { decision: 'allow' } : { decision: 'block' }),
+      () => { consulted += 1; return true; },
+      () => h.router.permissionBroker,
+    );
+
+    expect(await resolver('Read', {}, undefined)).toEqual({ decision: 'allow' });
+    expect(await resolver('Bash', { command: 'rm -rf /' }, undefined))
+      .toEqual({ decision: 'block' });
+    expect(consulted).toBe(0);
+    expect(h.askVoicings).toHaveLength(0);
+
+    // Positive precondition, same test: this callback is reachable on an
+    // `ask`, so the zero above is the ordering rather than a dead callback.
+    const asked = buildBrokeredPermissionResolver(
+      async () => ({ decision: 'ask' }),
+      () => { consulted += 1; return true; },
+      () => h.router.permissionBroker,
+    );
+    expect(await asked('Bash', {}, undefined)).toEqual({ decision: 'allow' });
+    expect(consulted).toBe(1);
   });
 });

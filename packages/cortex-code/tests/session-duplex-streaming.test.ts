@@ -25,8 +25,13 @@ vi.mock('node:os', async (importOriginal) => {
 });
 
 import {
+  compactionResult,
   createDuplexSession,
   destroyHarnessAgents,
+  fireRetryScheduled,
+  fireRetrySucceeded,
+  firePostCompaction,
+  retryScheduledInfo,
   startHeldReasonerWork,
   waitUntil,
   settle,
@@ -124,5 +129,43 @@ describe('duplex: the talker\'s control tools stay out of the transcript', () =>
       2000,
       'the reasoner tool row rendered',
     );
+  });
+});
+
+describe('duplex: fan-out callbacks are keyed on the loop they came from', () => {
+  it('keeps the reasoner\'s countdown alive when a talker retry resolves', async () => {
+    const { app, harness } = await createDuplexSession(cwd);
+
+    // The reasoner backs off, so its countdown owns the single status line.
+    fireRetryScheduled(harness.reasonerLoop, retryScheduledInfo());
+    await settle();
+    expect(app.calls).toContain('transcript.setRetryStatus');
+
+    // The talker's own retry then succeeds. That says nothing about the
+    // reasoner's backoff, which is the one the user is waiting on.
+    fireRetrySucceeded(harness.talkerLoop, { attempts: 1, totalDelayMs: 10 });
+    await settle();
+
+    expect(app.calls).not.toContain('transcript.clearRetryStatus');
+
+    // Positive control: the owning loop's resolution does clear it, so the
+    // assertion above is about the origin and not about clearing never firing.
+    fireRetrySucceeded(harness.reasonerLoop, { attempts: 1, totalDelayMs: 10 });
+    await settle();
+    expect(app.calls).toContain('transcript.clearRetryStatus');
+  });
+
+  it('announces only the compaction whose numbers match the footer', async () => {
+    const { app, harness } = await createDuplexSession(cwd);
+
+    firePostCompaction(harness.talkerLoop, compactionResult(90_000, 20_000));
+    await settle();
+    expect(app.calls).not.toContain('transcript.addNotification');
+
+    // Positive control: the reasoner's does announce, so the absence above is
+    // the origin filter rather than a notification path that never runs.
+    firePostCompaction(harness.reasonerLoop, compactionResult(120_000, 40_000));
+    await settle();
+    expect(app.calls).toContain('transcript.addNotification');
   });
 });
