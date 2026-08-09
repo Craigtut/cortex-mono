@@ -290,7 +290,12 @@ export class Session {
     });
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.isResume = options.resumeSessionId !== undefined;
-    this.saver = createDebouncedStateSaver(this.sessionId);
+    // Shorter than the saver's 500 ms default. The facade already debounces
+    // onStateChanged by 500 ms, so a second full window there only delayed
+    // the settled write; and this window is now the crash exposure for
+    // turn-boundary checkpoints, where the whole point is bytes on disk
+    // sooner. Still long enough to coalesce a burst of turns.
+    this.saver = createDebouncedStateSaver(this.sessionId, 150);
     this.compactionStrategy = options.compactionStrategy ?? 'observational';
     this.updateInfo = options.updateInfo ?? null;
     this.createdAt = Date.now();

@@ -39,6 +39,13 @@ export interface SavedSessionState {
  * dialogue lives on the talker, so a reasoner-only save silently drops half
  * the session and no later migration recovers it. Sessions written before
  * this file existed still load, through {@link loadSession}.
+ *
+ * The migration is one-way, deliberately. A session written here has no
+ * `history.json`, so an older build resuming it reports "Session not found"
+ * rather than loading a partial one. Writing both formats would mean every
+ * save also emitting a reasoner-only artifact that is wrong under duplex,
+ * which is the bug this file exists to close. The durable `transcript.jsonl`
+ * is written by a separate writer and stays readable by anything.
  */
 const STATE_FILE = 'state.json';
 
