@@ -2,7 +2,7 @@
  * Session Controller: the central orchestrator bridging TUI and Cortex.
  *
  * Responsibilities:
- * - Creates and configures the AgentLoop with the active mode's settings
+ * - Creates and configures the CortexAgent with the active mode's settings
  * - Provides getApiKey callback (env var > credential store > OAuth refresh)
  * - Provides resolvePermission callback (rules check > inline TUI prompt)
  * - Routes Cortex events to the TUI (streaming, tool calls, errors, compaction)
@@ -16,10 +16,12 @@ const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require('../package.json');
 
 import {
-  AgentLoop,
+  CortexAgent,
   ProviderManager,
   BASH_ESCALATION_PERMISSION_NAME,
   type CortexModel,
+  type CortexAgentConfig,
+  type CortexAgentStateV1,
   type CortexEvent,
   type CortexToolPermissionResult,
   type ToolPermissionRequestContext,
@@ -31,6 +33,7 @@ import {
   type RetryExhaustedInfo,
   type ThinkingLevel,
   type McpStdioConfig,
+  type ObservationalMemoryState,
   type ToolCallEndPayload,
   type ToolCallStartPayload,
   type ToolCallUpdatePayload,
@@ -125,7 +128,7 @@ export interface SessionOptions {
 }
 
 export class Session {
-  private agent: AgentLoop | null = null;
+  private agent: CortexAgent | null = null;
   private sandboxProvider: SandboxProvider | undefined;
   private sandboxStatus: SandboxStatus | undefined;
   /**
@@ -287,26 +290,7 @@ export class Session {
     this.sandboxProvider = await this.initSandbox();
 
     // Create agent (built-in tools are auto-registered by Cortex)
-    this.agent = await AgentLoop.create({
-      model: this.model,
-      utilityModel: 'default',
-      workingDirectory: this.cwd,
-      initialBasePrompt: this.mode.systemPrompt,
-      slots: this.mode.contextSlots,
-      resolvePermission: (toolName, toolArgs, context) =>
-        this.resolvePermission(toolName, toolArgs, context),
-      // WebFetch's egress gate: the same decision function the sandbox egress
-      // proxy consults for shell commands, so one grant covers both paths.
-      resolveNetworkAccess: (req) => this.resolveNetworkAccess(req),
-      isAutoApprove: () => this.yoloMode,
-      ...(this.sandboxProvider ? { sandbox: this.sandboxProvider } : {}),
-      getApiKey: (provider) => this.getApiKey(provider),
-      contextWindowLimit: this.config.contextWindowLimit ?? null,
-      compaction: { strategy: this.compactionStrategy },
-      persistResult: createToolResultPersistor(this.sessionId),
-      logger: log,
-      ...this.buildDiagnosticsConfig() ? { diagnostics: this.buildDiagnosticsConfig()! } : {},
-    });
+    this.agent = await CortexAgent.create(this.buildAgentConfig());
 
     if (this.initialUtilityModelId) {
       try {
@@ -936,7 +920,7 @@ export class Session {
     }
   }
 
-  /** Wire all AgentLoop events to the TUI. */
+  /** Wire all agent events to the TUI. */
   private wireEvents(): void {
     if (!this.agent || !this.app) return;
     const bridge = this.agent.getEventBridge();
@@ -1251,7 +1235,7 @@ export class Session {
     });
   }
 
-  private wireActivityEvents(bridge: ReturnType<AgentLoop['getEventBridge']>): void {
+  private wireActivityEvents(bridge: ReturnType<CortexAgent['getEventBridge']>): void {
     bridge.on('turn_start', () => {
       this.activity.recordTurnStarted();
     });
@@ -1945,26 +1929,40 @@ export class Session {
 
     if (!this.agent) return;
 
-    this.agent.restoreConversationHistory(
-      saved.history as Parameters<typeof this.agent.restoreConversationHistory>[0],
-    );
+    // Observational memory state, loaded before the restore because history
+    // and memory now go in together (the buffer watermark indexes into the
+    // history, so the facade orders them itself rather than trusting the
+    // caller to).
+    const omState = this.compactionStrategy === 'observational'
+      ? await loadObservationalState(sessionId)
+      : null;
+
+    // One all-or-nothing restore. This subsumes the three separate loop-level
+    // restore calls (history, observational state, usage), which could each
+    // land independently and mid-run; restore() applies them in order and
+    // refuses outright while a loop is running, so a /resume typed during a
+    // turn now fails loudly instead of splicing history out from under it.
+    const artifact: CortexAgentStateV1 = {
+      version: 1,
+      history: saved.history as CortexAgentStateV1['history'],
+      memory: (omState ?? null) as ObservationalMemoryState | null,
+      ...(saved.meta.usage ? { usage: saved.meta.usage } : {}),
+    };
+    try {
+      this.agent.restore(artifact);
+    } catch (err) {
+      log.warn('Resume restore rejected', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.app?.transcript.addNotification(
+        'Resume Failed',
+        err instanceof Error ? err.message : String(err),
+      );
+      return;
+    }
     this.createdAt = saved.meta.createdAt;
-
-    // Restore accumulated usage (cost, turns, tokens) from the saved session
-    if (saved.meta.usage) {
-      this.agent.restoreSessionUsage(saved.meta.usage);
-    }
-
-    // Restore observational memory state if the session used observational compaction
-    if (this.compactionStrategy === 'observational') {
-      const omState = await loadObservationalState(sessionId);
-      if (omState) {
-        this.agent.restoreObservationalMemoryState(
-          omState as Parameters<typeof this.agent.restoreObservationalMemoryState>[0],
-        );
-        this.updateObservationalMemoryStatus();
-      }
-    }
+    if (omState) this.updateObservationalMemoryStatus();
 
     // Replay message history into the transcript so the user sees the
     // previous conversation. Cortex already has the history in context; this
@@ -2109,6 +2107,41 @@ export class Session {
     this.agent.getContextManager().setEphemeral(
       `<environment>\n${lines.join('\n')}\n</environment>`,
     );
+  }
+
+  /**
+   * The config handed to CortexAgent.create(). Separate from start() so the
+   * mode is assertable without standing up a TUI and a sandbox.
+   *
+   * `mode` is passed explicitly rather than left to the facade default, which
+   * is duplex: a coding CLI is a typed, single-surface client with no talker
+   * to speak for it, and passthrough routes straight to the reasoner, so
+   * behavior matches the single loop this session drove before the facade.
+   * Turning cortex-code duplex is its own change, not a default it inherits.
+   */
+  private buildAgentConfig(): CortexAgentConfig {
+    const diagnostics = this.buildDiagnosticsConfig();
+    return {
+      mode: 'passthrough',
+      model: this.model,
+      utilityModel: 'default',
+      workingDirectory: this.cwd,
+      initialBasePrompt: this.mode.systemPrompt,
+      slots: this.mode.contextSlots,
+      resolvePermission: (toolName, toolArgs, context) =>
+        this.resolvePermission(toolName, toolArgs, context),
+      // WebFetch's egress gate: the same decision function the sandbox egress
+      // proxy consults for shell commands, so one grant covers both paths.
+      resolveNetworkAccess: (req) => this.resolveNetworkAccess(req),
+      isAutoApprove: () => this.yoloMode,
+      ...(this.sandboxProvider ? { sandbox: this.sandboxProvider } : {}),
+      getApiKey: (provider) => this.getApiKey(provider),
+      contextWindowLimit: this.config.contextWindowLimit ?? null,
+      compaction: { strategy: this.compactionStrategy },
+      persistResult: createToolResultPersistor(this.sessionId),
+      logger: log,
+      ...(diagnostics ? { diagnostics } : {}),
+    };
   }
 
   private buildDiagnosticsConfig(): import('@animus-labs/cortex').CortexDiagnosticsConfig | undefined {
@@ -2454,7 +2487,7 @@ export class Session {
   // Public accessors for command handlers
   // -------------------------------------------------------------------------
 
-  getAgent(): AgentLoop | null { return this.agent; }
+  getAgent(): CortexAgent | null { return this.agent; }
   getApp(): App | null { return this.app; }
   getYoloMode(): boolean { return this.yoloMode; }
   getCompactionStrategy(): 'observational' | 'classic' { return this.compactionStrategy; }

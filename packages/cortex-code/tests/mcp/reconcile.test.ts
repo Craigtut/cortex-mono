@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type {
-  AgentLoop,
+  CortexAgent,
   McpConnectionState,
   McpRedactedTransportConfig,
   McpTransportConfig,
@@ -56,7 +56,7 @@ function fullConfigsEqual(a: McpTransportConfig, b: McpTransportConfig): boolean
 }
 
 function fakeAgent(initial: Array<{ name: string; config: McpTransportConfig }> = []): {
-  agent: AgentLoop;
+  agent: CortexAgent;
   connect: ReturnType<typeof vi.fn>;
   disconnect: ReturnType<typeof vi.fn>;
 } {
@@ -90,7 +90,7 @@ function fakeAgent(initial: Array<{ name: string; config: McpTransportConfig }> 
       if (!stored) return false;
       return fullConfigsEqual(stored, desired);
     },
-  } as unknown as AgentLoop;
+  } as unknown as CortexAgent;
   return { agent, connect, disconnect };
 }
 

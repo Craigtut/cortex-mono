@@ -15,7 +15,7 @@
  * `session.isRunning` and queue until `onLoopComplete`.
  */
 
-import type { AgentLoop } from '@animus-labs/cortex';
+import type { CortexAgent } from '@animus-labs/cortex';
 import { discoverMcpServers, type DiscoveredMcpServer } from '../discovery/mcp.js';
 import { checkProjectMcpTrust, trustProjectMcpConfig } from '../discovery/mcp-trust.js';
 
@@ -52,7 +52,7 @@ export interface ReconcileOptions {
  * set. Returns a summary of changes.
  */
 export async function reconcileMcpServers(
-  agent: AgentLoop,
+  agent: CortexAgent,
   cwd: string,
   options: ReconcileOptions = {},
 ): Promise<McpReconcileResult> {
@@ -66,7 +66,7 @@ export async function reconcileMcpServers(
  * rather than reading config files.
  */
 export async function applyReconcile(
-  agent: AgentLoop,
+  agent: CortexAgent,
   cwd: string,
   desired: DiscoveredMcpServer[],
   resolveProjectTrust: ProjectTrustResolver | undefined,
