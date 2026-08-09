@@ -56,16 +56,32 @@ function check(pkg) {
   // The instrument check. A misconfigured project compiles nothing and
   // reports a confident zero, which is how the original audit of this very
   // gap first came back clean. Never trust the count without it.
+  //
+  // `--listFiles` writes the file list and the diagnostics to the same
+  // stream, so a naive path match counts both and the denominator moves
+  // whenever the error count does. It did: cortex-code read 95 with one
+  // extra TS6059 present and 94 without, while tsc's actual program stayed
+  // at 70 files. A count that tracks diagnostics cannot answer the one
+  // question it exists for, because a config compiling nothing but erroring
+  // on a path with `tests` in it still reports a reassuring non-zero.
+  const countTestFiles = (listed) => listed
+    .split('\n')
+    // A listed path is unindented and carries no diagnostic; a diagnostic
+    // line has the `(line,col): error TSxxxx` shape and its continuations
+    // are indented.
+    .filter((line) => !/^\s/.test(line) && !/error TS\d+/.test(line))
+    .filter((line) => /[/\\]tests[/\\]/.test(line))
+    .length;
+
   let seen = 0;
   try {
     const listed = execFileSync(
       'npx', ['tsc', '--noEmit', '-p', project, '--listFiles'],
       { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
-    seen = listed.split('\n').filter((line) => /[/\\]tests[/\\]/.test(line)).length;
+    seen = countTestFiles(listed);
   } catch (err) {
-    const listed = `${err.stdout ?? ''}`;
-    seen = listed.split('\n').filter((line) => /[/\\]tests[/\\]/.test(line)).length;
+    seen = countTestFiles(`${err.stdout ?? ''}`);
   }
 
   const errors = output.split('\n').filter((line) => /error TS\d+/.test(line));
