@@ -13,6 +13,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   createPassthroughScenario,
   createRealDuplexScenario,
+  createScriptedPiAgent,
   destroyLiveFacades,
   getBroker,
   lifecycleEvents,
@@ -21,6 +22,9 @@ import {
   testModel,
   waitUntil,
 } from './duplex-scenario-harness.js';
+import type { ScriptedPiAgent } from './duplex-scenario-harness.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { AgentLoopConfig } from '../../src/types.js';
 import type { AgentMessage } from '../../src/context-manager.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
 import type { NetworkAccessRequest } from '../../src/sandbox/types.js';
@@ -215,6 +219,116 @@ describe('duplex auto-approve and network egress', () => {
     void resolver(EGRESS);
     await waitUntil(() => facade.getPendingAsks().length === 1, 2000, 'ask brokered');
     expect(lifecycleEvents(facade, 'ask_auto_approved')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// V4: a quick-lookup loop's ask must be visible too
+//
+// Lookups are built through AgentLoop.create, not createChildAgent, so
+// nothing mirrors their asks into the reasoner's registry, and they are
+// `tool` kind, so the old network-only filter dropped them as well. A
+// blocked lookup was therefore invisible on every consumer surface.
+// ---------------------------------------------------------------------------
+
+/**
+ * Lookup loops over scripted pi agents WITH the real permission gate, built
+ * from the config create() assembled for that loop. stubLookupLoops does the
+ * scripting but installs no gate, and the gate is the whole point here.
+ */
+function stubGatedLookupLoops(setup: (pi: ScriptedPiAgent) => void): {
+  built: Array<{ loop: AgentLoop; pi: ScriptedPiAgent; config: AgentLoopConfig }>;
+} {
+  const statics = AgentLoop as unknown as {
+    buildPiAgentConfig: (params: {
+      cortexConfig: AgentLoopConfig;
+      cacheBreakpointState: { agentLoop: AgentLoop | null };
+    }) => Record<string, unknown>;
+    wireManagedPiAgent: (loop: AgentLoop, pi: unknown) => void;
+  };
+  const Ctor = AgentLoop as unknown as new (
+    pi: unknown,
+    config: AgentLoopConfig,
+    tools?: unknown[],
+    options?: { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean },
+  ) => AgentLoop;
+  const built: Array<{ loop: AgentLoop; pi: ScriptedPiAgent; config: AgentLoopConfig }> = [];
+  vi.spyOn(AgentLoop, 'create').mockImplementation(async (config) => {
+    const pi = createScriptedPiAgent();
+    setup(pi);
+    const loop = new Ctor(pi, config, [], {
+      enableSubAgentTool: false,
+      enableLoadSkillTool: false,
+    });
+    const agentConfig = statics.buildPiAgentConfig({
+      cortexConfig: config,
+      cacheBreakpointState: { agentLoop: loop },
+    });
+    pi.afterToolCall = agentConfig['afterToolCall'] as typeof pi.afterToolCall;
+    pi.beforeToolCall = agentConfig['beforeToolCall'] as typeof pi.beforeToolCall;
+    statics.wireManagedPiAgent(loop, pi);
+    built.push({ loop, pi, config });
+    return loop;
+  });
+  return { built };
+}
+
+/** A talker turn that dispatches one quick lookup. */
+const LOOKUP_TURN = {
+  text: 'Let me check that.',
+  calls: [{ name: 'quick_lookup', args: { question: 'what does resolveModel do?' } }],
+};
+
+describe('duplex pending asks from a quick lookup', () => {
+  it('shows a blocked lookup on the facade surface, attributed to its own loop', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario({
+      resolvePermission: async () => ({ decision: 'ask' as const }),
+      // Long enough that the ask is still blocked when we assert.
+      duplex: { lookupTimeoutMs: 5_000 },
+    });
+    const { built } = stubGatedLookupLoops((pi) => {
+      pi.script = [{
+        text: '',
+        calls: [{ name: 'Read', args: { file_path: '/tmp/test-workspace/models.ts' } }],
+      }];
+    });
+
+    talkerPi.script = [LOOKUP_TURN];
+    await facade.prompt('what does resolveModel do?');
+    await waitUntil(() => facade.getPendingAsks().length === 1, 2000, 'lookup ask visible');
+
+    const ask = facade.getPendingAsks()[0]!;
+    expect(ask.loopPath).toMatch(/^lookup\//);
+    expect(ask.toolName).toBe('Read');
+    expect(ask.renderedRequest).toContain('models.ts');
+    // The reasoner never saw it: it is not in that subtree.
+    expect(built).toHaveLength(1);
+    expect(facade.getPendingAsks()).toHaveLength(1);
+  });
+
+  it('does not let the ask outlive the lookup that raised it', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario({
+      resolvePermission: async () => ({ decision: 'ask' as const }),
+      // The lookup's own wall-clock bound, well under the broker's ask
+      // timeout, so this measures the lookup teardown and not the broker.
+      duplex: { lookupTimeoutMs: 60 },
+    });
+    stubGatedLookupLoops((pi) => {
+      pi.script = [{
+        text: '',
+        calls: [{ name: 'Read', args: { file_path: '/tmp/test-workspace/models.ts' } }],
+      }];
+    });
+
+    talkerPi.script = [LOOKUP_TURN];
+    await facade.prompt('what does resolveModel do?');
+    await waitUntil(() => facade.getPendingAsks().length === 1, 2000, 'lookup ask raised');
+
+    // The lookup times out and is destroyed. Its ask must go with it, or the
+    // facade would now be reporting a blocked request against a loop that no
+    // longer exists, for the broker's whole (much longer) ask timeout.
+    await waitUntil(() => facade.getPendingAsks().length === 0, 3000, 'ask settled with the lookup');
+    await waitUntil(() => facade.workSettled, 3000, 'work settles');
   });
 });
 
