@@ -939,9 +939,33 @@ export interface CortexAgentStateV2 {
 export interface CortexAgentStateV1 {
   version: 1;
   history: AgentMessage[];
+  /**
+   * Both optional fields accept an explicit null so a consumer can build
+   * the artifact with a uniform spread. Under exactOptionalPropertyTypes a
+   * `SessionUsage | undefined` cannot be assigned to `usage?: SessionUsage`,
+   * which forced a conditional spread on one field while the other took a
+   * plain `?? null`; treating absent and null alike removes that asymmetry.
+   */
   memory?: ObservationalMemoryState | null;
-  usage?: SessionUsage;
+  usage?: SessionUsage | null;
 }
+
+/**
+ * Compile-time check on that uniformity. A consumer holding both fields as
+ * `T | null` must be able to assign both directly; while `usage` was
+ * `SessionUsage` only, exactOptionalPropertyTypes rejected the null and
+ * forced a conditional spread on one field beside a plain `?? null` on the
+ * other. Fails to typecheck if either field stops accepting null.
+ */
+export type _V1OptionalFieldsAcceptNull = AssertExtends<
+  {
+    version: 1;
+    history: AgentMessage[];
+    memory: ObservationalMemoryState | null;
+    usage: SessionUsage | null;
+  },
+  CortexAgentStateV1
+>;
 
 /**
  * What restore() accepts: a versioned artifact, or a bare message array
