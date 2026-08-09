@@ -31,7 +31,8 @@
     "release:check:cortex": "npm run typecheck -w packages/cortex && npm run build -w packages/cortex && npm run test:run -w packages/cortex && npm pack -w packages/cortex --dry-run",
     "release:check:cortex-code": "npm run typecheck -w packages/cortex-code && npm run build -w packages/cortex && npm run build -w packages/cortex-code && npm run test:run -w packages/cortex-code && npm pack -w packages/cortex-code --dry-run",
     "version:cortex": "npm version -w packages/cortex --no-git-tag-version",
-    "version:cortex-code": "npm version -w packages/cortex-code --no-git-tag-version"
+    "version:cortex-code": "npm version -w packages/cortex-code --no-git-tag-version",
+    "typecheck:tests": "node tools/typecheck-tests.mjs"
   },
   "lint-staged": {
     "packages/*/src/**/*.ts": "eslint",
