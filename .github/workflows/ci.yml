@@ -32,5 +32,15 @@ jobs:
       - name: Test
         run: npm run test:run
 
+      # The run above resolves @animus-labs/cortex to framework source, so it
+      # can never answer about a stale build. That leaves one thing it cannot
+      # see: whether the package a consumer actually installs works. Run the
+      # only in-repo consumer's suite once more against the built artifact,
+      # which exercises the exports map and the files list too.
+      - name: Test the consumer against the built framework package
+        run: npm run test:run -w packages/cortex-code
+        env:
+          CORTEX_TEST_TARGET: dist
+
       - name: Lint
         run: npm run lint
