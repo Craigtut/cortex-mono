@@ -26,6 +26,8 @@ import {
 } from './duplex-scenario-harness.js';
 import type { ScriptedPiAgent } from './duplex-scenario-harness.js';
 import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiModel } from '../../src/agent-loop.js';
+import { wrapModel } from '../../src/model-wrapper.js';
 import type { AgentLoopConfig } from '../../src/types.js';
 import type { AgentMessage } from '../../src/context-manager.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
@@ -136,6 +138,93 @@ describe('duplex router tuning', () => {
     expect(options.maxDispatchesPerTurn).toBe(1);
     // And an unset key keeps the router's own default rather than undefined.
     expect(options.delegationMaxAgeMs).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// utilityModel: per-loop, but only where the provider constraint allows
+// ---------------------------------------------------------------------------
+
+/**
+ * A same-provider utility model with an id auto-resolution cannot produce.
+ *
+ * Deliberately not the real fast-tier id: the talker's own auto-resolved
+ * utility model IS that id, so an assertion against it passes whether or not
+ * anything copied the setting. The distinctive id is what makes "the talker
+ * got the model the consumer chose" a claim that can fail.
+ */
+const UTILITY_MODEL_ID = 'claude-haiku-test-only-utility';
+
+function anthropicUtilityModel() {
+  return wrapModel(
+    { provider: 'anthropic', name: UTILITY_MODEL_ID } as PiModel,
+    'anthropic',
+    UTILITY_MODEL_ID,
+  );
+}
+
+/** A talker on a different provider, so the constraint actually bites. */
+function openAiTalkerModel() {
+  return wrapModel(
+    { provider: 'openai', name: 'gpt-4o-mini' } as PiModel,
+    'openai',
+    'gpt-4o-mini',
+  );
+}
+
+describe('duplex utilityModel routing', () => {
+  it('copies the configured utility model to the talker when the providers agree', async () => {
+    const utility = anthropicUtilityModel();
+    const { talkerLoop, reasonerLoop } = await createRealDuplexScenario({
+      utilityModel: utility,
+    });
+
+    // The common case: the talker defaults to the fast tier of the primary
+    // provider, so the setting applies to both loops and the talker's
+    // observational spend goes to the model the consumer chose.
+    expect(reasonerLoop.getUtilityModel().modelId).toBe(utility.modelId);
+    expect(talkerLoop.getUtilityModel().modelId).toBe(utility.modelId);
+  });
+
+  it('a cross-provider utility model would break assembly if copied blind', async () => {
+    // The precondition for the next test, asserted rather than assumed: a
+    // loop REJECTS a utility model from another provider, so this is not a
+    // question of degraded behavior. Copying blind fails construction.
+    await expect(AgentLoop.create({
+      model: openAiTalkerModel(),
+      utilityModel: anthropicUtilityModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'probe',
+    })).rejects.toThrow(/does not match primary model provider/);
+  });
+
+  it('skips it and says so when the talker runs on another provider', async () => {
+    const { logger, warnings } = recordingLogger();
+    const utility = anthropicUtilityModel();
+    const { facade, talkerLoop, reasonerLoop } = await createRealDuplexScenario({
+      logger,
+      utilityModel: utility,
+      talker: { model: openAiTalkerModel() },
+    });
+
+    // Duplex still assembles, which is the whole point of not copying.
+    expect(facade.getModel().provider).toBe('anthropic');
+    expect(reasonerLoop.getUtilityModel().modelId).toBe(utility.modelId);
+    expect(talkerLoop.getUtilityModel().modelId).not.toBe(utility.modelId);
+
+    // And the one case we cannot honor is visible, naming both sides and
+    // what actually runs rather than only what was skipped.
+    const warned = warnings.filter((line) => line.includes('utilityModel'));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain(UTILITY_MODEL_ID);
+    expect(warned[0]).toContain('gpt-4o-mini');
+    expect(warned[0]).toContain('auto-resolved utility model');
+  });
+
+  it('stays quiet when the providers agree', async () => {
+    const { logger, warnings } = recordingLogger();
+    await createRealDuplexScenario({ logger, utilityModel: anthropicUtilityModel() });
+    expect(warnings.filter((line) => line.includes('utilityModel'))).toHaveLength(0);
   });
 });
 

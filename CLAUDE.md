@@ -129,7 +129,9 @@ refactor(cortex): extract provider registry into separate module
 
 **Git safety:**
 - Never run a bare `git stash pop` or `git stash drop`. The stash may hold unrelated work-in-progress that is not yours, and a bare pop takes whichever entry happens to be on top. To set your own changes aside temporarily, copy the file instead, or use `git stash push -- <paths>` and pop that specific entry by name.
-- To check whether a test genuinely fails against pre-change code, revert only the source file (keep the test) with `git show HEAD:<path> > <path>` and restore it afterwards. Do not stash.
+- To check whether a test genuinely fails against pre-change code, revert only the source file (keep the test) with `git show HEAD:<path> > <path>` and restore it afterwards. Do not stash. **Only when the file is clean.** `git status` first: if anything else is already modified there, that revert-and-restore cycle discards it. On a dirty file use a detached worktree (`git worktree add --detach <dir> HEAD`) and mutate there, so the shared tree is never touched.
+- Never use `git commit -- <path>`. It bypasses the index and commits the current *worktree* content of that path, so it silently includes anyone else's in-progress edits to the same file. Use `git add <paths>`, read `git diff --cached`, then a bare `git commit -m "..."`. Checking the diff first narrows the window but does not close it, so prefer staging and committing as one uninterrupted step.
+- After every commit, check `git show --stat HEAD` against the size of the change you actually made. A commit that swept up a foreign hunk almost always has exactly the filenames you expected; the line counts are what give it away.
 
 ## Documentation
 

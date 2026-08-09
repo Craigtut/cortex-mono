@@ -346,7 +346,11 @@ export const CONFIG_ROUTING: { [K in keyof Required<CortexAgentConfig>]: ConfigD
   // applies here too: a knob that silently reaches one loop is the
   // divergence that rule exists to prevent.
   contextWindowLimit: 'per-loop',
-  // Per loop in 2b (the same-provider constraint is enforced per loop).
+  // Per loop, subject to the same-provider constraint each loop enforces on
+  // itself: copied to the talker when it shares the talker's provider (the
+  // common case, since the talker defaults to the fast tier of the primary
+  // provider), and skipped with a warning when it does not, because a loop
+  // rejects a utility model from another provider outright.
   utilityModel: 'per-loop',
   // Reasoner pool config; quick lookups get a separate facade-owned pool
   // in 2b.
@@ -620,6 +624,38 @@ export function buildTalkerConfig(
   // consumer's compaction budget never reaches.
   if (config.contextWindowLimit !== undefined) {
     talker.contextWindowLimit = config.contextWindowLimit;
+  }
+  // Per loop as well (CONFIG_ROUTING utilityModel), but with the
+  // same-provider constraint checked here rather than assumed.
+  //
+  // A loop THROWS at construction when its utility model's provider differs
+  // from its own primary model's (AgentLoop.resolveUtilityModels), so
+  // copying this one blind would not degrade duplex, it would fail assembly
+  // outright on any consumer whose talker runs elsewhere. Copying nothing is
+  // wrong too: the talker defaults to the fast tier of the PRIMARY provider,
+  // so the providers match for most consumers and the setting is exactly
+  // what they meant. So: copy when it can apply, and say so out loud when it
+  // cannot, because that is the one case where the talker's observational
+  // spend silently goes to a model the consumer did not choose.
+  if (config.utilityModel === 'default') {
+    // Not a model, so no provider to disagree with: it means auto-resolve,
+    // which is what the talker would do anyway. Copied so the two loops
+    // report the same dial.
+    talker.utilityModel = 'default';
+  } else if (config.utilityModel !== undefined) {
+    if (config.utilityModel.provider === talkerModel.provider) {
+      talker.utilityModel = config.utilityModel;
+    } else {
+      (config.logger ?? NOOP_LOGGER).warn(
+        `[CortexAgent] utilityModel "${config.utilityModel.modelId}" is a ` +
+        `"${config.utilityModel.provider}" model, and the talker runs on ` +
+        `"${talkerModel.modelId}" ("${talkerModel.provider}"), which rejects a ` +
+        'utility model from another provider. The talker will run its ' +
+        'observational memory on its own auto-resolved utility model instead; ' +
+        'the reasoner uses the one you set. To have both loops use it, set ' +
+        `talker.model to a "${config.utilityModel.provider}" model.`,
+      );
+    }
   }
 
   // Shared environment-level wiring.
