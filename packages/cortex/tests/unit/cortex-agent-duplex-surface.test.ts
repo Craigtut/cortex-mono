@@ -13,10 +13,13 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   createRealDuplexScenario,
   destroyLiveFacades,
-  promptTexts,
+  getBroker,
+  settle,
+  testModel,
   waitUntil,
 } from './duplex-scenario-harness.js';
-import { testModel } from './duplex-scenario-harness.js';
+import type { CortexAgentConfig } from '../../src/cortex-agent.js';
+import type { NetworkAccessRequest } from '../../src/sandbox/types.js';
 import type { CortexLogger } from '../../src/types.js';
 
 afterEach(async () => {
@@ -69,8 +72,56 @@ describe('duplex contextWindowLimit routing', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Shared: a network egress ask, which blocks a resolver without ever
-// entering a loop's own pending-ask registry.
+// N1: settlement predicates must read the facade's merged ask registry
+//
+// A network egress ask is the case that separates the two registries: it is
+// minted by the broker and never enters any loop's own pending-ask map, so a
+// predicate reading the reasoner's map reports settled while the resolver
+// that raised it is still blocked.
 // ---------------------------------------------------------------------------
 
-export {};
+/** Config whose network resolver always defers to the user. */
+const ASKING_NETWORK: Partial<CortexAgentConfig> = {
+  resolveNetworkAccess: async () => ({ decision: 'ask' as const }),
+};
+
+const EGRESS: NetworkAccessRequest = {
+  host: 'example.com',
+  via: 'shell',
+} as NetworkAccessRequest;
+
+describe('duplex settlement predicates and broker-minted asks', () => {
+  it('workSettled stays false while a network resolver is blocked', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario(ASKING_NETWORK);
+    const resolver = facade.getNetworkAccessResolver();
+    if (!resolver) throw new Error('duplex did not wire a network resolver');
+
+    let resolverSettled = false;
+    const blocked = resolver(EGRESS).then((decision) => {
+      resolverSettled = true;
+      return decision;
+    });
+
+    // The ask is voiced, which wakes the talker; wait for that turn to end
+    // so nothing but the ask itself can hold the predicate down.
+    await waitUntil(() => facade.getPendingAsks().length === 1, 2000, 'ask raised');
+    await waitUntil(() => facade.conversationIdle, 2000, 'talker idle again');
+
+    expect(resolverSettled).toBe(false);
+    expect(facade.workSettled).toBe(false);
+
+    // And the awaitable form does not resolve either.
+    let settledEarly = false;
+    void facade.waitForWorkSettled().then(() => { settledEarly = true; });
+    await settle();
+    expect(settledEarly).toBe(false);
+
+    // Answering releases both the resolver and the wait.
+    const askId = facade.getPendingAsks()[0]!.askId;
+    getBroker(facade).answer(askId, 'deny', undefined);
+    await expect(blocked).resolves.toEqual({ decision: 'deny' });
+    await waitUntil(() => settledEarly, 2000, 'waitForWorkSettled resolves');
+    expect(facade.workSettled).toBe(true);
+    expect(talkerPi.promptCalls.length).toBeGreaterThan(0);
+  });
+});

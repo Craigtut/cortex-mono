@@ -1281,6 +1281,8 @@ export class CortexAgent {
   private pendingFacadePrompts = 0;
   /** Waiters released whenever pendingFacadePrompts returns to zero. */
   private promptSettlers: Array<() => void> = [];
+  /** Waiters released on the next log append (see waitForLogAppend). */
+  private logAppendWaiters: Array<() => void> = [];
 
   /**
    * Passthrough only: seq of the utterance whose facade-initiated reasoner
@@ -2243,7 +2245,22 @@ export class CortexAgent {
       ...(input.data !== undefined ? { data: input.data } : {}),
     });
     this.markStateDirty();
+    if (this.logAppendWaiters.length > 0) {
+      for (const resolve of this.logAppendWaiters.splice(0)) resolve();
+    }
     return entry;
+  }
+
+  /**
+   * Resolve on the next log append. The settlement wait uses this as the
+   * event signal for broker-minted asks, which have no registry of their
+   * own to wake it: every path that settles one appends its entry first, so
+   * an append is guaranteed before the blocked resolver resumes. Deliberately
+   * not a general "something happened" surface; it exists so
+   * {@link waitForWorkSettled} never has to spin.
+   */
+  private waitForLogAppend(): Promise<void> {
+    return new Promise((resolve) => this.logAppendWaiters.push(resolve));
   }
 
   /**
@@ -2673,6 +2690,9 @@ export class CortexAgent {
         }
         this.mergedBridge?.destroy();
         this.log.clearSubscribers();
+        // Nothing appends after teardown, so a settlement wait blocked on
+        // the next append would never resume on its own.
+        for (const resolve of this.logAppendWaiters.splice(0)) resolve();
       }
     })();
     return this.destroyPromise;
@@ -2992,6 +3012,12 @@ export class CortexAgent {
    * either loop, no router-held deliveries, no pending permission asks.
    * Queued silent deliveries do not count: silent content deliberately
    * waits for the next prompt.
+   *
+   * The ask term reads the FACADE's merged registry, never the reasoner's
+   * own. A broker-minted network ask (shell egress through the sandbox
+   * callback, WebFetch) never enters a loop registry at all, so reading the
+   * loop's would report settled with a resolver still blocked, which is the
+   * one thing this predicate exists to rule out.
    */
   get workSettled(): boolean {
     return (
@@ -3002,7 +3028,7 @@ export class CortexAgent {
       this.reasoner.pendingWakeDeliveryCount === 0 &&
       (this.talker?.pendingWakeDeliveryCount ?? 0) === 0 &&
       (this.router?.pendingDeliveryCount ?? 0) === 0 &&
-      this.reasoner.getPendingAsks().length === 0
+      this.getPendingAsks().length === 0
     );
   }
 
@@ -3061,12 +3087,17 @@ export class CortexAgent {
         continue;
       }
 
-      // Pending asks block on the loop's settlement signal, never on a
-      // polling yield: an ask can outlive the child that raised it, and a
+      // Pending asks block on a settlement signal, never on a polling
+      // yield: an ask can outlive the child that raised it, and a
       // setImmediate spin would otherwise run hot for as long as it stays
-      // unanswered.
-      if (this.reasoner.getPendingAsks().length > 0) {
-        await this.reasoner.waitForAskSettlement();
+      // unanswered. Two registries, two signals. Loop asks have the loop's
+      // own; broker-minted network asks have none, so they wait on the next
+      // log append, which every broker settlement path (answer, timeout,
+      // abort, drain) performs before resolving the blocked resolver.
+      if (this.getPendingAsks().length > 0) {
+        await (this.reasoner.getPendingAsks().length > 0
+          ? this.reasoner.waitForAskSettlement()
+          : this.waitForLogAppend());
         continue;
       }
 
