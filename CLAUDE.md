@@ -130,7 +130,17 @@ refactor(cortex): extract provider registry into separate module
 **Git safety:**
 - Never run a bare `git stash pop` or `git stash drop`. The stash may hold unrelated work-in-progress that is not yours, and a bare pop takes whichever entry happens to be on top. To set your own changes aside temporarily, copy the file instead, or use `git stash push -- <paths>` and pop that specific entry by name.
 - To check whether a test genuinely fails against pre-change code, revert only the source file (keep the test) with `git show HEAD:<path> > <path>` and restore it afterwards. Do not stash. **Only when the file is clean.** `git status` first: if anything else is already modified there, that revert-and-restore cycle discards it. On a dirty file use a detached worktree (`git worktree add --detach <dir> HEAD`) and mutate there, so the shared tree is never touched.
-- Never use `git commit -- <path>`. It bypasses the index and commits the current *worktree* content of that path, so it silently includes anyone else's in-progress edits to the same file. Use `git add <paths>`, read `git diff --cached`, then a bare `git commit -m "..."`. Checking the diff first narrows the window but does not close it, so prefer staging and committing as one uninterrupted step.
+- **When more than one agent is working the repo, commit through a private index.** The shared index is global mutable state and the pre-commit hook holds it for the length of a full typecheck, so even `git add … && git commit` in one shell invocation leaves your content exposed for twenty-odd seconds, and any concurrent commit takes it. Both ordinary forms fail, differently: `git commit -- <path>` bypasses the index but commits the *worktree* content of that path, sweeping up another agent's in-flight edit to the same file; `git add` + `git commit` snapshots your file safely but exposes you to the shared index. Neither is safe alone. Instead:
+
+  ```bash
+  export GIT_INDEX_FILE=$(mktemp)
+  git read-tree HEAD && git add -- <paths>
+  tree=$(git write-tree)
+  commit=$(git commit-tree "$tree" -p HEAD -m "message")
+  git update-ref refs/heads/<branch> "$commit" HEAD   # compare-and-swap: fails if the branch moved
+  ```
+
+  The expected-old-value on `update-ref` is the load-bearing part: it fails loudly instead of racing. Note this bypasses the pre-commit hook, so run `npm run typecheck` and the affected tests yourself first.
 - After every commit, check `git show --stat HEAD` against the size of the change you actually made. A commit that swept up a foreign hunk almost always has exactly the filenames you expected; the line counts are what give it away.
 
 ## Documentation
