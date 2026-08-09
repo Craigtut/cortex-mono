@@ -43,7 +43,7 @@ await agent.prompt('List the top-level files in this workspace.');
 await agent.destroy();
 ```
 
-`prompt()` sends user input and resolves against the turn that carries it. It never throws on a busy agent: concurrent calls serialize. The return value is the underlying pi-agent-core result and should be treated as opaque. Most applications render assistant text from `onTurnComplete()` (using `output.userFacing` when working tags are enabled) or from the session log.
+`prompt()` sends user input and never throws on a busy agent, but what it resolves with depends on the mode. In passthrough, concurrent calls serialize and each resolves against the turn that carries its input. In duplex there is no such queue, deliberately: a call arriving while the talker is busy parks and rides the talker's next run, resolving `undefined` when the conversation next settles rather than with that turn's result. Barge-in is the conversation's core event, so new input has to interrupt rather than wait its turn. When the return value is not `undefined` it is the underlying pi-agent-core result and should be treated as opaque. Either way, do not render from it: most applications render assistant text from `onTurnComplete()` (using `output.userFacing` when working tags are enabled) or from the session log.
 
 If `getApiKey` is omitted, pi-ai falls back to provider environment variables such as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
 
@@ -153,7 +153,7 @@ const agent = await CortexAgent.create({
 | `mode` | `'duplex'` (default) or `'passthrough'` |
 | `talker.model` | Talker model. Default: the fast tier auto-resolved from the primary provider |
 | `idleSignal` | `() => boolean`: is the user or channel idle right now? Advisory input to the wake policy |
-| `duplex` | Router and scheduling tuning (delivery spacing, backpressure caps, ask timeouts, lookup pool and timeout, `maxTotalCost`). Every field has a production default |
+| `duplex` | Router and scheduling tuning (delivery spacing, backpressure caps, ask timeouts, lookup pool and timeout, `maxTotalCost`). Every field has a production default except `maxTotalCost`, which is unlimited until you set it |
 | `sessionLog.maxEntries` | Session log retention cap (default 10000, ring buffer) |
 | `sessionLog.maxSubscriberBuffer` | Per-subscriber replay buffer bound (default 1000) |
 | `stateChangeDebounceMs` | Debounce for the `onStateChanged` persistence trigger (default 500) |
@@ -169,7 +169,7 @@ Loop configuration, routed for you:
 | `tools` | Consumer tools | reasoner only |
 | `slots` | Optional ordered persistent context slots | both loops, identical content |
 | `workingTags.enabled` | Defaults to `true`; controls `<working>` response parsing guidance | both loops |
-| `budgetGuard.maxTurns` / `maxCost` | Per-loop safety limits. The talker also gets a hard turn cap your config cannot raise | per loop, plus `duplex.maxTotalCost` as the session aggregate |
+| `budgetGuard.maxTurns` / `maxCost` | Per-prompt safety limits. Your values reach the reasoner only; the talker runs a facade-built guard with a hard turn cap and no cost cap of yours | reasoner, plus `duplex.maxTotalCost` as the session aggregate |
 | `disableTools` | Built-in tool names to exclude | reasoner and sub-agents |
 | `resolvePermission` | Optional permission gate for tool calls | facade broker in duplex, direct in passthrough |
 | `resolveNetworkAccess` | Optional network gate (sandbox) | facade broker, same pipeline |
@@ -189,7 +189,19 @@ Built-in tools are registered automatically on the reasoner and its sub-agents: 
 
 ## Events
 
-`getEventBridge()` returns one merged stream across every loop, sub-agent, and quick lookup. Each event carries its own `loopPath` field (`talker`, `reasoner`, `reasoner/task-7`, `lookup/lk-2`). `childTaskId` keeps its existing meaning of "this came from a sub-agent", so an existing `if (event.childTaskId) return;` filter still does what it did.
+`getEventBridge()` returns one merged stream across every loop, sub-agent, and quick lookup. Each event carries its own `loopPath` field (`talker`, `reasoner`, `reasoner/task-7`, `lookup/lk-2`). `childTaskId` keeps its existing meaning of "this came from a sub-agent", so an existing `if (event.childTaskId) return;` filter is not broken by the split.
+
+**It is no longer enough, though.** That filter used to admit one loop's stream and now admits two. Every pi-derived event, `response_start`, `response_chunk`, `response_end`, `turn_start`, `turn_end`, and the `tool_call_*` family, arrives once from the talker and once from the reasoner, both with no `childTaskId`, distinguished only by `loopPath`. Anything that renders assistant text has to say which loop it means:
+
+```typescript
+agent.getEventBridge().on('response_chunk', (event) => {
+  if (event.childTaskId) return;            // still excludes sub-agents
+  if (event.loopPath !== 'talker') return;  // now also required
+  render(event);
+});
+```
+
+Without the second line a duplex UI renders the reasoner's internal working prose alongside the talker's speech. For text destined for a user, prefer `talker_delta` below, which is already scoped to the talker and already sanitized.
 
 **Voice consumers must subscribe to `talker_delta`, not to raw `response_chunk`.** Working tags are stripped at turn completion, so raw deltas still contain `<working>` content that TTS would read aloud. `talker_delta` is the sanitized stream, with holdback buffering across chunk boundaries so a tag split across two chunks is still caught.
 
@@ -201,7 +213,11 @@ agent.getEventBridge().on('talker_delta', (event) => {
 });
 ```
 
-Callbacks that can fire from more than one loop (`onError`, `onTurnComplete`, `persistResult`) take an origin context as a second argument, carrying the `loopPath` of the producer. Handlers written against the old one-argument signature keep working.
+Callbacks that can fire from more than one loop take an origin context as a second argument carrying the producer's `loopPath`. Handlers written against the old one-argument signature still compile and still run, but arity is not the thing to check: under duplex these now fire **twice per exchange**, once per resident loop, where a single-loop integration saw them once.
+
+Registered on both loops: `onLoopComplete`, `onError`, `onRetryScheduled`, `onRetrySucceeded`, `onRetryExhausted`, `onBeforeCompaction`, `onPostCompaction`, `onCompactionError`, `onCompactionDegraded`, `onCompactionExhausted`, `onObservation`, `onReflection`. That is the right default for diagnostics, where you want to see a reasoner failure, and the origin context tells the loops apart. It is the wrong default for anything that counts, dedupes, or renders once per exchange, so branch on `origin.loopPath`.
+
+`onTurnComplete` is the exception: it registers on the conversation loop only, because it is the "the assistant finished saying something" signal and the reasoner's assistant text is internal working prose. `persistResult` is shared rather than per-loop, and carries origin in its metadata.
 
 ## The Session Log
 
@@ -295,8 +311,10 @@ When observational memory is active, Cortex adds an internal `_observations` slo
 Beyond `prompt()`:
 
 - **`deliver(content, { wake?, target?, speaker? })`**: fire-and-forget input for things the user did not type: a notification, a webhook, a completed job. `wake` (default true) decides whether the content may start a turn on an idle loop or wait for the next one. `target` is `'conversation'` (default) or `'work'`. `speaker` defaults to `'system'` and must be set to `'user'` when you are relaying actual human speech, because only a user-speaker delivery can satisfy a pending permission ask. The safe default is deliberate: otherwise every notification path becomes a silent source of consent.
+
+  > **Under revision.** Delivered content is fenced in an `<external-update>` wrapper before it reaches the talker, and that happens regardless of `speaker`, so speech relayed with `speaker: 'user'` currently counts as consent while being presented to the model as third-party content. Only `prompt()` arrives unfenced today. This paragraph gets updated with the fix; if you are relaying human speech and can use `prompt()`, prefer it.
 - **`steer(message)`**: queue content into the turn that is already running.
-- **`abort(scope?)`**: `'conversation'`, `'work'`, or `'all'` (default). Every scope aborts the in-flight turn on its target, drops queued deliveries, and clears the steering and follow-up queues; `'work'` and `'all'` also cancel running sub-agents. Pending permission asks resolve as deny.
+- **`abort(scope?)`**: `'conversation'`, `'work'`, or `'all'` (default). Every scope aborts the in-flight turn on its target, drops queued deliveries, and clears the steering and follow-up queues; `'work'` and `'all'` additionally cancel running sub-agents and resolve pending permission asks as deny. `'conversation'` does neither: the work loop is still running, so its asks stay pending. Aborting after `destroy()` is a no-op rather than an error, so a fire-and-forget abort on a quit key does not need a teardown guard.
 - **`destroy(timeoutMs?)`**: tears everything down. Idempotent.
 
 Two settlement facts, each with a synchronous getter and an awaitable form:
@@ -370,6 +388,8 @@ agent.onBackgroundResultDeadLettered((result) => {
 // Bounded list, newest last; still available after destroy().
 const undelivered = agent.getDeadLetteredBackgroundResults();
 ```
+
+Both of those are **reasoner-only**. The talker dead-letters too, and its losses are wake deliveries, which can carry user utterances, so they matter more than a background result does. Those reach the session log as `lifecycle` entries with `data.event === 'delivery_dead_lettered'` (carrying the full message, not a preview) and reach neither the callback nor the getter. If undelivered content matters to you, read it off the log rather than off these two surfaces.
 
 A delivery failure that a later re-queued attempt recovers from surfaces no `onError`; a terminal failure surfaces exactly one, and never rejects a consumer `prompt()` that already succeeded.
 
