@@ -219,7 +219,17 @@ export class CompactionManager {
    */
   private _providerCacheTtlMs = 0;
 
-  /** Consumer handlers for compaction lifecycle events. */
+  /**
+   * Consumer handlers for compaction lifecycle events. **These are the live
+   * ones.** `AgentLoop` used to declare four fields with identical names that
+   * were pushed to, reset, and never fired, because its `onBeforeCompaction`
+   * and friends register here and this is where they run. Those namesakes
+   * were deleted as dead storage; do not read a stale memory of that deletion
+   * as covering these. Grepping the names is what makes this confusable in
+   * both directions: it used to return a wall of live hits that made the dead
+   * fields look load-bearing, and it can now return these and make them look
+   * like leftovers.
+   */
   private beforeCompactionHandlers: BeforeCompactionHandler[] = [];
   private postCompactionHandlers: PostCompactionHandler[] = [];
   private compactionErrorHandlers: CompactionErrorHandler[] = [];

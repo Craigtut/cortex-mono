@@ -1837,6 +1837,14 @@ describe('duplex headlines', () => {
     const block = talkerHeadline(talkerLoop)!;
     expect(block).toContain('state="working"');
     expect(block).toContain('Current: Bash npm test');
+    // The run-lifecycle feed, which nothing else asserts the facade wires.
+    // Losing noteRunStart() leaves state="working" and the Current: line
+    // intact (both gate on reasonerRunning(), not on runStartedAt) while the
+    // time attributes silently vanish, so the block degrades to "it is
+    // working" with no staleness and no sign that anything is missing. That
+    // number is the whole point of the block (communication.md) and what the
+    // talker's role prompt tells it to answer "how's it going" with.
+    expect(block).toMatch(/duration="\d+s"/);
 
     reasonerPi.releaseRun();
     await waitUntil(() => !facade.isPrompting);
@@ -1844,6 +1852,8 @@ describe('duplex headlines', () => {
     const after = talkerHeadline(talkerLoop)!;
     expect(after).toContain('state="idle"');
     expect(after).toContain('Last update');
+    // The other half of the feed: noteRunEnd() stamps the idle clock.
+    expect(after).toMatch(/idle_for="\d+s"/);
   });
 
   it('shows delegations under their friendly alias while they are outstanding', async () => {
