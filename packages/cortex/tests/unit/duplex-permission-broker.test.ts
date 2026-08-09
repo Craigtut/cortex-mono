@@ -74,6 +74,7 @@ function createHarness(options?: DuplexRouterOptions): Harness {
     // collectCauseTags is the only validator ahead of the consent decision.
     currentTalkerCauseTags: () => collectCauseTags(rawTalkerCauseTags),
     currentReasonerCauseSeq: () => null,
+    currentReasonerCauseTags: () => [],
   };
 
   const router = new DuplexRouter(ports, {

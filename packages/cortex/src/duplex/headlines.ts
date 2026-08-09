@@ -189,9 +189,27 @@ export class DuplexHeadlines {
     const sections: string[] = [];
 
     const running = this.ports.reasonerRunning();
-    const delegations = this.ports.delegations().filter((delegation) => !delegation.cancelled);
+    // Cancelled and completed delegations are not work in progress. Without
+    // the completed filter the block lists work that finished hours ago
+    // beside `<work state="idle">`, and the talker's grounding rules then
+    // have it honestly report that as still running.
+    const delegations = this.ports.delegations().filter(
+      (delegation) => !delegation.cancelled && delegation.completedAt === null,
+    );
     const subAgents = this.ports.activeSubAgents();
     const asks = this.ports.pendingAsks();
+
+    // Asks render FIRST, ahead of everything else.
+    //
+    // The block has a hard token cap and the loop enforces it by cutting from
+    // the TAIL, so whatever renders last is what disappears when the block
+    // grows. Everything above the asks is unbounded in count (one entry per
+    // delegation, one per running sub-agent), which means the section holding
+    // a live permission request was the one guaranteed to be dropped first,
+    // and the loop that raised it blocks for as long as the talker cannot see
+    // it. Ordering by consequence rather than by section age costs nothing
+    // and removes the failure entirely.
+    this.appendAskSections(sections, asks, now);
 
     if (running || this.retry !== null || this.lastOutputLines.length > 0) {
       const usage = this.ports.reasonerUsage();
@@ -252,23 +270,33 @@ export class DuplexHeadlines {
       );
     }
 
-    // Asks: the VOICED one verbatim with its id, everything queued behind it
-    // as a bare count.
-    //
-    // Rendering every pending ask with its request text re-opens F2
-    // mis-binding through a surface the D16 router rules never see. Two asks
-    // pending is a multi-loop situation (the reasoner's `npm install` voiced,
-    // a sub-agent's `rm -rf ~/work` queued behind it), and a block listing
-    // both hands the talker two readable requests with nothing distinguishing
-    // which one the user was asked about. It reads both out, the user says
-    // "yes, the npm one", and a bare answer_ask binds to whichever the broker
-    // voiced first. The consent would be genuine and the audit trail clean.
-    //
-    // So the block carries only what the user could actually have heard. The
-    // id rides along because an answer needs one and the voicing message that
-    // carried it can be arbitrarily far back in the transcript; it is the
-    // same id already spoken to this loop, and the block reaches the talker
-    // alone.
+    if (sections.length === 0) return null;
+    return `<work-status>\n${sections.join('\n')}\n</work-status>`;
+  }
+
+  /**
+   * The ask sections: the VOICED one verbatim with its id, everything queued
+   * behind it as a bare count.
+   *
+   * Rendering every pending ask with its request text re-opens F2
+   * mis-binding through a surface the D16 router rules never see. Two asks
+   * pending is a multi-loop situation (the reasoner's `npm install` voiced,
+   * a sub-agent's `rm -rf ~/work` queued behind it), and a block listing both
+   * hands the talker two readable requests with nothing distinguishing which
+   * one the user was asked about. It reads both out, the user says "yes, the
+   * npm one", and a bare answer_ask binds to whichever the broker voiced
+   * first. The consent would be genuine and the audit trail clean.
+   *
+   * So the block carries only what the user could actually have heard. The
+   * id rides along because an answer needs one and the voicing message that
+   * carried it can be arbitrarily far back in the transcript; it is the same
+   * id already spoken to this loop, and the block reaches the talker alone.
+   */
+  private appendAskSections(
+    sections: string[],
+    asks: readonly PendingAsk[],
+    now: number,
+  ): void {
     const voicedAsks = asks.filter((ask) => ask.voiced);
     const queuedCount = asks.length - voicedAsks.length;
     for (const ask of voicedAsks) {
@@ -290,8 +318,5 @@ export class DuplexHeadlines {
         '</queued-asks>',
       );
     }
-
-    if (sections.length === 0) return null;
-    return `<work-status>\n${sections.join('\n')}\n</work-status>`;
   }
 }

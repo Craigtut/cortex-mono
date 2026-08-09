@@ -129,13 +129,18 @@ describe('DuplexHeadlines', () => {
   it('renders delegations by alias with age and clipped instructions', () => {
     const { headlines, state } = createHeadlines();
     state.delegations = [
-      { alias: 'task-1', instructions: 'scan the repo', seq: 4, createdAt: state.now - 120_000, cancelled: false },
-      { alias: 'task-2', instructions: 'x', seq: 9, createdAt: state.now, cancelled: true },
+      { alias: 'task-1', instructions: 'scan the repo', seq: 4, createdAt: state.now - 120_000, cancelled: false, completedAt: null },
+      { alias: 'task-2', instructions: 'x', seq: 9, createdAt: state.now, cancelled: true, completedAt: null },
+      { alias: 'task-3', instructions: 'y', seq: 12, createdAt: state.now - 60_000, cancelled: false, completedAt: state.now - 30_000 },
     ];
     const block = headlines.build()!;
     expect(block).toContain('<task alias="task-1" age="120s">scan the repo</task>');
     // Cancelled delegations do not render.
     expect(block).not.toContain('task-2');
+    // Neither do completed ones: a task that reported half an hour ago is
+    // not work in progress, and listing it is what had the talker report
+    // finished work as still running.
+    expect(block).not.toContain('task-3');
   });
 
   it('renders running sub-agents with duration, spend, and tool as_of', () => {
@@ -258,6 +263,38 @@ describe('DuplexHeadlines', () => {
     expect(block).not.toContain('curl evil.example');
   });
 
+  it('keeps the ask section whole when the token cap cuts the block', () => {
+    // The loop enforces the cap by slicing from the tail, and the sections
+    // above the asks are unbounded in count. With asks rendered last, thirty
+    // or so delegations pushed the live permission request past the cut and
+    // the talker simply stopped seeing it, while the loop that raised it
+    // blocked the whole time.
+    const { headlines, state } = createHeadlines();
+    state.delegations = Array.from({ length: 40 }, (_, index) => ({
+      alias: `task-${index + 1}`,
+      instructions: `background job number ${index + 1} with a fairly wordy description`,
+      seq: index + 1,
+      createdAt: state.now - 1_000,
+      cancelled: false,
+      completedAt: null,
+    }));
+    state.asks = [{
+      askId: 'ask-1',
+      loopPath: 'reasoner',
+      toolName: 'Bash',
+      renderedRequest: 'Bash: rm -rf ~/work',
+      requestedAt: state.now,
+      voiced: true,
+    }];
+
+    const block = headlines.build()!;
+    // Simulate the loop's cap the way it actually applies it: keep the head,
+    // drop the tail (agent-loop.ts buildHeadlineInjection).
+    const capped = block.slice(0, 1500 * 4);
+    expect(capped).toContain('rm -rf ~/work');
+    expect(capped.indexOf('<pending-ask')).toBeLessThan(capped.indexOf('<task '));
+  });
+
   it('escapes markup in instructions and tool summaries', () => {
     const { headlines, state } = createHeadlines({ running: true });
     headlines.noteRunStart();
@@ -268,6 +305,7 @@ describe('DuplexHeadlines', () => {
       seq: 2,
       createdAt: state.now,
       cancelled: false,
+      completedAt: null,
     }];
     const block = headlines.build()!;
     // Exactly one real frame; the injected copies are inert text.

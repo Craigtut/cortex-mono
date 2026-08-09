@@ -1829,8 +1829,12 @@ describe('duplex headlines', () => {
     expect(after).toContain('Last update');
   });
 
-  it('shows delegations under their friendly alias', async () => {
-    const { facade, talkerLoop, talkerPi } = createDuplexFacade();
+  it('shows delegations under their friendly alias while they are outstanding', async () => {
+    const { facade, talkerLoop, talkerPi, reasonerPi } = createDuplexFacade();
+    // The reasoner is held, so the delegation is genuinely still in flight.
+    // A delegation whose work has delivered is retired from the block, so
+    // letting the run complete here would be asserting the wrong thing.
+    reasonerPi.hold = true;
     talkerPi.hold = true;
     const turn = facade.prompt('please scan the repo');
     await waitUntil(() => talkerPi.promptCalls.length === 1);
@@ -1842,6 +1846,7 @@ describe('duplex headlines', () => {
     const block = talkerHeadline(talkerLoop)!;
     expect(block).toContain('alias="task-1"');
     expect(block).toContain('scan the repo');
+    reasonerPi.releaseRun();
   });
 });
 

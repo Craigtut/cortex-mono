@@ -31,7 +31,7 @@ export interface DeliveryTarget {
   deliverFromReasoner(
     content: string,
     wake: WakeClass | undefined,
-    meta?: { implicit?: boolean; synthetic?: boolean },
+    meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
   ): DeliveryIntakeResult;
 }
 

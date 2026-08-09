@@ -1510,6 +1510,7 @@ export class CortexAgent {
       currentTalkerCauseSeq: () => latestCauseSeq(talker.activeRunCauseTags),
       currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
       currentReasonerCauseSeq: () => latestCauseSeq(this.reasoner.activeRunCauseTags),
+      currentReasonerCauseTags: () => collectCauseTags(this.reasoner.activeRunCauseTags),
       // The broker's ask lane: a real wake delivery carrying the ask-kind
       // cause tag, so the run that voices the request is identifiable to
       // the consent check (an answer from that same run cannot bind).
@@ -1847,8 +1848,13 @@ export class CortexAgent {
     this.reasonerFailureDeliveredThisRun = true;
     // interrupt: a user waiting on work that is never coming is exactly the
     // case the class exists for. The router may still demote it under
-    // backpressure, which is the intended tradeoff.
-    this.router.deliverFromReasoner(text, 'interrupt', { synthetic: true });
+    // backpressure, which is the intended tradeoff. `terminal` marks it as a
+    // conclusion despite being synthetic, so the delegation it answers stops
+    // being listed as live work.
+    this.router.deliverFromReasoner(text, 'interrupt', {
+      synthetic: true,
+      terminal: true,
+    });
   }
 
   /**

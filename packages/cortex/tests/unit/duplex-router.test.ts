@@ -37,6 +37,8 @@ interface Harness {
   setReasonerCauseSeq: (seq: number | null) => void;
   /** Change the talker's live-run discriminated cause set. */
   setTalkerCauseTags: (tags: readonly CauseTag[]) => void;
+  /** Change the reasoner's live-run discriminated cause set. */
+  setReasonerCauseTags: (tags: readonly CauseTag[]) => void;
   advance: (ms: number) => void;
   now: () => number;
 }
@@ -45,6 +47,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   talkerCauseSeq?: number | null;
   talkerCauseTags?: readonly CauseTag[];
   reasonerCauseSeq?: number | null;
+  reasonerCauseTags?: readonly CauseTag[];
 }): Harness {
   let clock = 1_000_000;
   let talkerIdle = true;
@@ -52,6 +55,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   let dispatchError: Error | null = null;
   let reasonerCauseSeq: number | null = options?.reasonerCauseSeq ?? null;
   let talkerCauseTags: readonly CauseTag[] = options?.talkerCauseTags ?? [];
+  let reasonerCauseTags: readonly CauseTag[] = options?.reasonerCauseTags ?? [];
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const askVoicings: Array<{ content: string; causeTag: CauseTag }> = [];
@@ -82,6 +86,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     currentTalkerCauseSeq: () => options?.talkerCauseSeq ?? null,
     currentTalkerCauseTags: () => talkerCauseTags,
     currentReasonerCauseSeq: () => reasonerCauseSeq,
+    currentReasonerCauseTags: () => reasonerCauseTags,
     get idleSignal() {
       return idleSignal;
     },
@@ -109,6 +114,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     setDispatchError: (error) => { dispatchError = error; },
     setReasonerCauseSeq: (seq) => { reasonerCauseSeq = seq; },
     setTalkerCauseTags: (tags) => { talkerCauseTags = tags; },
+    setReasonerCauseTags: (tags) => { reasonerCauseTags = tags; },
     advance: (ms) => { clock += ms; },
     now: () => clock,
   };
@@ -640,6 +646,96 @@ describe('control-tool dispatch', () => {
     const again = await callTool(h, 'cancel_task', { taskAlias: 'task-1' });
     expect(again.content[0]!.text).toMatch(/already cancelled/);
     expect(h.reasonerDispatches).toHaveLength(2);
+  });
+
+  it('retires a delegation once a result lands against its directive', async () => {
+    // Nothing marked a delegation complete before: it was added on spawn and
+    // removed only by a failed handover or a restore, so a finished task sat
+    // in the status block beside an idle reasoner for the rest of the
+    // session, and activeAliases() kept naming it to the watchdog.
+    const h = createHarness();
+    await callTool(h, 'spawn_task', { instructions: 'build the release' });
+    const spawnSeq = h.log.find((entry) => entry.type === 'directive')!.seq;
+    expect(h.router.getDelegations()[0]).toMatchObject({
+      alias: 'task-1',
+      completedAt: null,
+    });
+
+    // The reasoner run that consumed that directive delivers its result.
+    h.setReasonerCauseTags([{ kind: 'directive', seq: spawnSeq }]);
+    h.router.deliverFromReasoner('the release is built', 'when_idle');
+
+    expect(h.router.getDelegations()[0]!.completedAt).toBe(h.now());
+  });
+
+  it('matches the result against the FULL reasoner cause set, not the collapsed seq', async () => {
+    // A run routinely consumes several directives (a spawn with a steer
+    // parked behind it). The collapsing helper keeps only the newest, so a
+    // retirement written against it would leave the spawn's delegation live
+    // forever, which is the same defect D16 documents on the consent path.
+    const h = createHarness();
+    await callTool(h, 'spawn_task', { instructions: 'build the release' });
+    const spawnSeq = h.log.find((entry) => entry.type === 'directive')!.seq;
+
+    h.setReasonerCauseTags([
+      { kind: 'directive', seq: spawnSeq },
+      { kind: 'directive', seq: spawnSeq + 99 },
+    ]);
+    h.router.deliverFromReasoner('done', 'when_idle');
+    expect(h.router.getDelegations()[0]!.completedAt).toEqual(expect.any(Number));
+  });
+
+  it('a progress note does not retire the work it reports on', async () => {
+    const h = createHarness({ watchdogIntervalMs: 200 });
+    h.setTalkerIdle(true);
+    await callTool(h, 'spawn_task', { instructions: 'build the release' });
+    const spawnSeq = h.log.find((entry) => entry.type === 'directive')!.seq;
+    h.setReasonerCauseTags([{ kind: 'directive', seq: spawnSeq }]);
+
+    // silent is a milestone by contract (the reasoner's role prompt), and
+    // the watchdog's synthetic delivery says the work is STILL running.
+    h.router.deliverFromReasoner('step one done', 'silent');
+    expect(h.router.getDelegations()[0]!.completedAt).toBeNull();
+
+    h.router.noteReasonerRunStart();
+    h.advance(250);
+    await waitUntil(() => h.talkerDeliveries.some((d) => d.content.includes('still running')));
+    expect(h.router.getDelegations()[0]!.completedAt).toBeNull();
+  });
+
+  it('a steer takes a completed delegation back out of the completed state', async () => {
+    // The reasoner is persistent and users iterate on a task that already
+    // reported, so retirement marks rather than deletes: the alias stays
+    // resolvable and a redirect makes it live work again.
+    const h = createHarness();
+    await callTool(h, 'spawn_task', { instructions: 'design the caching layer' });
+    const spawnSeq = h.log.find((entry) => entry.type === 'directive')!.seq;
+    h.setReasonerCauseTags([{ kind: 'directive', seq: spawnSeq }]);
+    h.router.deliverFromReasoner('first cut of the design', 'when_idle');
+    expect(h.router.getDelegations()[0]!.completedAt).toEqual(expect.any(Number));
+
+    const steer = await callTool(h, 'steer_task', {
+      taskAlias: 'task-1',
+      message: 'use an LRU rather than a TTL',
+    });
+    expect(steer.content[0]!.text).toBe('Redirect sent to task-1.');
+    expect(h.router.getDelegations()[0]!.completedAt).toBeNull();
+
+    // And the result of the REDIRECTED run retires it again, which only
+    // works because the steer's own seq joined the delegation's set.
+    const steerSeq = h.log.filter((entry) => entry.type === 'directive').at(-1)!.seq;
+    h.setReasonerCauseTags([{ kind: 'directive', seq: steerSeq }]);
+    h.router.deliverFromReasoner('switched to LRU', 'when_idle');
+    expect(h.router.getDelegations()[0]!.completedAt).toEqual(expect.any(Number));
+  });
+
+  it('ages a delegation out when no attributable result ever arrives', async () => {
+    const h = createHarness({ delegationMaxAgeMs: 60_000 });
+    await callTool(h, 'spawn_task', { instructions: 'something that never reports' });
+    h.advance(59_000);
+    expect(h.router.getDelegations()).toHaveLength(1);
+    h.advance(2_000);
+    expect(h.router.getDelegations()).toHaveLength(0);
   });
 
   it('steer_task without an alias sends a general redirect', async () => {

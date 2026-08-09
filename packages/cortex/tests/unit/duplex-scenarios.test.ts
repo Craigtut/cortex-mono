@@ -1008,6 +1008,39 @@ describe('scenario: grounding material under repeated pressure', () => {
   });
 });
 
+describe('scenario: work that finished stops being described as live', () => {
+  /**
+   * The reviewer's probe: after the reasoner delivered and went idle, the
+   * block still read `<task alias="task-1" age="0s">build the release</task>`
+   * beside `<work state="idle">`, so the talker was told finished work was in
+   * progress. Verified failing against the pre-fix registry, which had no
+   * retirement path at all.
+   */
+  it('drops a finished delegation from the block instead of listing it forever', async () => {
+    const h = createDuplexScenario();
+    h.talkerPi.script = [{
+      text: 'On it.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'build the release' } }],
+    }];
+    h.reasonerPi.script = [{ text: 'The release is built.' }];
+    await h.facade.prompt('build the release');
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'work dispatched');
+    await waitUntil(
+      () => entriesOfType(h.facade, 'delivery').length === 1,
+      2000, 'the result was delivered',
+    );
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner idle');
+
+    const block = talkerHeadline(h.talkerLoop);
+    // Either nothing left to say, or a block that no longer claims the task
+    // is running. What must never happen is a live task beside an idle loop.
+    if (block !== null) {
+      expect(block).not.toContain('build the release');
+      expect(block).not.toContain('alias="task-1"');
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The work fails: the one thing the system could never say
 // ---------------------------------------------------------------------------
