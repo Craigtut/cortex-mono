@@ -33,11 +33,13 @@ interface Harness {
   setIdleSignal: (signal: (() => boolean) | undefined) => void;
   /** Make dispatchToReasoner throw until cleared with null. */
   setDispatchError: (error: Error | null) => void;
-  /** Change the live reasoner-run cause seq (the causing directive). */
-  setReasonerCauseSeq: (seq: number | null) => void;
   /** Change the talker's live-run discriminated cause set. */
   setTalkerCauseTags: (tags: readonly CauseTag[]) => void;
-  /** Change the reasoner's live-run discriminated cause set. */
+  /**
+   * Override the reasoner's live-run cause set, which otherwise derives
+   * from the directives actually dispatched. For tests that need a cause
+   * set no dispatch in the test produced.
+   */
   setReasonerCauseTags: (tags: readonly CauseTag[]) => void;
   advance: (ms: number) => void;
   now: () => number;
@@ -46,16 +48,22 @@ interface Harness {
 function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] & {
   talkerCauseSeq?: number | null;
   talkerCauseTags?: readonly CauseTag[];
-  reasonerCauseSeq?: number | null;
   reasonerCauseTags?: readonly CauseTag[];
 }): Harness {
   let clock = 1_000_000;
   let talkerIdle = true;
   let idleSignal: (() => boolean) | undefined;
   let dispatchError: Error | null = null;
-  let reasonerCauseSeq: number | null = options?.reasonerCauseSeq ?? null;
   let talkerCauseTags: readonly CauseTag[] = options?.talkerCauseTags ?? [];
-  let reasonerCauseTags: readonly CauseTag[] = options?.reasonerCauseTags ?? [];
+  /**
+   * Explicit override of the reasoner's live-run cause set. Null means "use
+   * the derived set below", which is the default on purpose: see
+   * {@link derivedReasonerCauseTags}.
+   */
+  let reasonerCauseTagsOverride: readonly CauseTag[] | null =
+    options?.reasonerCauseTags ?? null;
+  /** Directive seqs actually dispatched to the reasoner, in order. */
+  const dispatchedCauseSeqs: number[] = [];
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const askVoicings: Array<{ content: string; causeTag: CauseTag }> = [];
@@ -64,6 +72,27 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   let lookupRefusal: string | null = null;
   let nextLookupAlias = 1;
   let nextSeq = 1;
+
+  /**
+   * The reasoner's live-run cause set, derived from the directives actually
+   * dispatched to it.
+   *
+   * Deliberately NOT a neutral `() => []`. An empty set means "this delivery
+   * concludes no delegation", which is exactly the never-retires behavior the
+   * retirement logic exists to remove, so a neutral stub would have every
+   * test in this file quietly assert the old bug while the one test written
+   * for retirement passed. Deriving from real dispatches means a test that
+   * spawns and then delivers gets genuine retirement without its author
+   * having to think about causation at all.
+   *
+   * Modelled as "every directive dispatched so far", which matches the
+   * single-persistent-reasoner topology (D3): both a spawn and a steer parked
+   * behind it land in the same loop's queue and are consumed by the same run.
+   * Tests needing finer control set the override explicitly.
+   */
+  function derivedReasonerCauseTags(): readonly CauseTag[] {
+    return dispatchedCauseSeqs.map((seq) => ({ kind: 'directive', seq } as CauseTag));
+  }
 
   const ports: DuplexRouterPorts = {
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
@@ -77,6 +106,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     dispatchToReasoner: (message, causeSeq) => {
       if (dispatchError) throw dispatchError;
       reasonerDispatches.push({ message, causeSeq });
+      if (causeSeq !== null) dispatchedCauseSeqs.push(causeSeq);
     },
     appendLog: (input) => {
       const seq = nextSeq++;
@@ -85,8 +115,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     },
     currentTalkerCauseSeq: () => options?.talkerCauseSeq ?? null,
     currentTalkerCauseTags: () => talkerCauseTags,
-    currentReasonerCauseSeq: () => reasonerCauseSeq,
-    currentReasonerCauseTags: () => reasonerCauseTags,
+    currentReasonerCauseTags: () => reasonerCauseTagsOverride ?? derivedReasonerCauseTags(),
     get idleSignal() {
       return idleSignal;
     },
@@ -112,9 +141,8 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     setTalkerIdle: (idle) => { talkerIdle = idle; },
     setIdleSignal: (signal) => { idleSignal = signal; },
     setDispatchError: (error) => { dispatchError = error; },
-    setReasonerCauseSeq: (seq) => { reasonerCauseSeq = seq; },
     setTalkerCauseTags: (tags) => { talkerCauseTags = tags; },
-    setReasonerCauseTags: (tags) => { reasonerCauseTags = tags; },
+    setReasonerCauseTags: (tags) => { reasonerCauseTagsOverride = tags; },
     advance: (ms) => { clock += ms; },
     now: () => clock,
   };
@@ -260,7 +288,7 @@ describe('backpressure', () => {
   });
 
   it('a deduped delivery leaves a delivery_absorbed lifecycle trace (S3)', () => {
-    const h = createHarness({ reasonerCauseSeq: 7 });
+    const h = createHarness({ reasonerCauseTags: [{ kind: 'directive', seq: 7 }] });
     expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(true);
     const duplicate = h.router.deliverFromReasoner('same text', 'silent', { implicit: true });
     expect(duplicate.delivered).toBe(false);
@@ -297,10 +325,10 @@ describe('backpressure', () => {
   });
 
   it('identical content under a new causing directive is delivered, not absorbed (S3)', () => {
-    const h = createHarness({ reasonerCauseSeq: 7 });
+    const h = createHarness({ reasonerCauseTags: [{ kind: 'directive', seq: 7 }] });
     expect(h.router.deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
     // "Run it again": a new directive, byte-identical result.
-    h.setReasonerCauseSeq(11);
+    h.setReasonerCauseTags([{ kind: 'directive', seq: 11 }]);
     expect(h.router.deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
     expect(h.log.filter((entry) => entry.type === 'delivery')).toHaveLength(2);
     expect(h.talkerDeliveries).toHaveLength(2);
@@ -655,17 +683,21 @@ describe('control-tool dispatch', () => {
     // session, and activeAliases() kept naming it to the watchdog.
     const h = createHarness();
     await callTool(h, 'spawn_task', { instructions: 'build the release' });
-    const spawnSeq = h.log.find((entry) => entry.type === 'directive')!.seq;
     expect(h.router.getDelegations()[0]).toMatchObject({
       alias: 'task-1',
       completedAt: null,
     });
 
-    // The reasoner run that consumed that directive delivers its result.
-    h.setReasonerCauseTags([{ kind: 'directive', seq: spawnSeq }]);
+    // No explicit cause set here on purpose: the harness derives the
+    // reasoner's live-run causation from the directive the spawn actually
+    // dispatched, so this is the whole real path (dispatch, consume, deliver)
+    // rather than a hand-placed tag that only this test knows to supply.
     h.router.deliverFromReasoner('the release is built', 'when_idle');
 
     expect(h.router.getDelegations()[0]!.completedAt).toBe(h.now());
+    // And the same set produced the log stamp, from one port.
+    expect(h.log.find((entry) => entry.type === 'delivery')!.causedBy)
+      .toBe(h.reasonerDispatches[0]!.causeSeq);
   });
 
   it('matches the result against the FULL reasoner cause set, not the collapsed seq', async () => {

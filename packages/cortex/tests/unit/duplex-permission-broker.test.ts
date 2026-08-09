@@ -48,6 +48,8 @@ interface Harness {
 function createHarness(options?: DuplexRouterOptions): Harness {
   let clock = 1_000_000;
   let rawTalkerCauseTags: readonly unknown[] = [];
+  /** Directive seqs actually dispatched to the reasoner, in order. */
+  const dispatchedCauseSeqs: number[] = [];
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const askVoicings: Array<{ content: string; causeTag: CauseTag }> = [];
@@ -63,7 +65,9 @@ function createHarness(options?: DuplexRouterOptions): Harness {
     },
     markAskVoiced: (askId) => voicedRegistryIds.push(askId),
     talkerIdle: () => true,
-    dispatchToReasoner: () => {},
+    dispatchToReasoner: (_message, causeSeq) => {
+      if (causeSeq !== null) dispatchedCauseSeqs.push(causeSeq);
+    },
     appendLog: (input) => {
       const seq = nextSeq++;
       log.push({ ...input, seq });
@@ -73,8 +77,15 @@ function createHarness(options?: DuplexRouterOptions): Harness {
     // The facade's own wiring: the loop's tag slot is `unknown`, so
     // collectCauseTags is the only validator ahead of the consent decision.
     currentTalkerCauseTags: () => collectCauseTags(rawTalkerCauseTags),
-    currentReasonerCauseSeq: () => null,
-    currentReasonerCauseTags: () => [],
+    // Derived from real dispatches, not a neutral `() => []`. An empty set
+    // means "this delivery concludes no delegation", which is the
+    // never-retires behavior delegation retirement exists to remove, so a
+    // neutral stub here would let any future test in this file assert the old
+    // bug without noticing. Broker tests raise asks rather than dispatching
+    // work, so in practice this stays empty; the point is that it stays empty
+    // because nothing was dispatched, not because the stub says so.
+    currentReasonerCauseTags: () =>
+      dispatchedCauseSeqs.map((seq) => ({ kind: 'directive', seq } as CauseTag)),
   };
 
   const router = new DuplexRouter(ports, {

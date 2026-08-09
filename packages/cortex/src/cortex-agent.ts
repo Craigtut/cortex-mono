@@ -1525,7 +1525,9 @@ export class CortexAgent {
       // live run keeps its utterance seq through the sweep run (B1).
       currentTalkerCauseSeq: () => latestCauseSeq(talker.activeRunCauseTags),
       currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
-      currentReasonerCauseSeq: () => latestCauseSeq(this.reasoner.activeRunCauseTags),
+      // One reasoner causation port: the router derives its own log-stamping
+      // collapse from this set, so there is no second port to fall out of
+      // step with it.
       currentReasonerCauseTags: () => collectCauseTags(this.reasoner.activeRunCauseTags),
       // The broker's ask lane: a real wake delivery carrying the ask-kind
       // cause tag, so the run that voices the request is identifiable to

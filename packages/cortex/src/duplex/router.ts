@@ -91,15 +91,20 @@ export interface DuplexRouterPorts {
    * mixed-kind set in both directions.
    */
   currentTalkerCauseTags(): readonly CauseTag[];
-  /** Latest cause seq on the reasoner's live run, or null (log stamping). */
-  currentReasonerCauseSeq(): number | null;
   /**
    * The FULL discriminated cause set of the reasoner's live run, with the
    * same no-ordering contract as {@link currentTalkerCauseTags}. Delegation
-   * retirement reads this rather than the collapsing helper above: a run
-   * routinely consumes several directives (a spawn with a steer parked behind
-   * it), and the collapse keeps only the newest, which would leave the
-   * delegation the result actually answers listed as live forever.
+   * retirement reads it: a run routinely consumes several directives (a spawn
+   * with a steer parked behind it), and a collapse to the newest would leave
+   * the delegation the result actually answers listed as live forever.
+   *
+   * There is deliberately NO `currentReasonerCauseSeq` beside this. The
+   * reasoner's log-stamping collapse is computed from this same set inside
+   * the router ({@link DuplexRouter.reasonerCause}), so the pair cannot
+   * disagree and a port implementation cannot supply a stamping seq while
+   * reporting no tags. The talker keeps both ports because two different
+   * consumers read them for two different purposes, with the D16 warning
+   * attached; here there is one array and one reader of each derivation.
    */
   currentReasonerCauseTags(): readonly CauseTag[];
   /**
@@ -1278,9 +1283,18 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     return seq !== null ? { causedBy: seq } : {};
   }
 
+  /**
+   * The reasoner's log-stamping collapse, derived from the same tag set
+   * retirement reads. Identical to the loop-side `latestCauseSeq` helper
+   * (max seq over the validated tags), computed here so the stamp and the
+   * retirement can never be told different stories by a port.
+   */
   private reasonerCause(): { causedBy?: number } {
-    const seq = this.ports.currentReasonerCauseSeq();
-    return seq !== null ? { causedBy: seq } : {};
+    let latest: number | null = null;
+    for (const tag of this.ports.currentReasonerCauseTags()) {
+      if (latest === null || tag.seq > latest) latest = tag.seq;
+    }
+    return latest !== null ? { causedBy: latest } : {};
   }
 }
 
