@@ -16,7 +16,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { Type } from 'typebox';
 import type { CortexTool } from '../../src/tool-contract.js';
-import type { SubAgentResult } from '../../src/types.js';
+import type { AgentLoopConfig, SubAgentResult } from '../../src/types.js';
 import { buildBrokeredPermissionResolver } from '../../src/duplex/permission-broker.js';
 import {
   REASONER_ROLE_PROMPT,
@@ -238,7 +238,19 @@ describe('adversarial: two pending asks, one bare yes', () => {
     await waitUntil(() => spawned.children.length === 1, 2000, 'child created');
     const child = spawned.children[0]!;
     child.loop.addConsumerTool(gatedTool('Wipe', ran));
-    installPermissionGate(child.loop, child.pi, resolver);
+    // Through the PARENT'S child-resolver wrapper, which is how a real child
+    // gets its resolver. The wrapper mirrors the child's ask into the
+    // reasoner's registry, and that registry is what every facade pending-ask
+    // surface reads (getPendingAsks, and through it the headline block).
+    // Installing the bare resolver leaves the child's ask visible only inside
+    // the broker, which hides exactly the ask this scenario is about.
+    const childTaskId = child.loop.loopPath.split('/').pop()!;
+    installPermissionGate(child.loop, child.pi, (h.reasonerLoop as unknown as {
+      wrapChildPermissionResolver: (
+        parent: NonNullable<AgentLoopConfig['resolvePermission']>,
+        taskId: string,
+      ) => NonNullable<AgentLoopConfig['resolvePermission']>;
+    }).wrapChildPermissionResolver(resolver, childTaskId));
     child.pi.releaseRun();
     await waitUntil(() => entriesOfType(h.facade, 'ask').length === 2, 2000, 'second ask raised');
 
@@ -274,6 +286,30 @@ describe('adversarial: two pending asks, one bare yes', () => {
     expect(receipt.text).toContain('only the request most recently read to the user');
     expect(ran).not.toContain('rm -rf ~/work');
     expect(getBroker(h.facade).pendingAskCount).toBe(2);
+  });
+
+  /**
+   * Pins: the headline block's voiced-only ask rendering. The two tests above
+   * exercise the ROUTER, which is sound; this one exercises the MATERIAL the
+   * talker answers "what is it waiting on?" from. With both requests rendered
+   * verbatim in the block, a talker reading them out and taking "yes, the npm
+   * one" has no id to bind with (the block carried none), and a bare
+   * answer_ask binds to whatever the broker voiced first. Verified failing
+   * against the pre-fix block, which listed both request texts.
+   */
+  it('the status block never carries the request text of an ask queued behind the voiced one', async () => {
+    const ran: string[] = [];
+    const { h, voicedAskId } = await twoPendingAsks(ran);
+
+    const block = talkerHeadline(h.talkerLoop)!;
+    expect(block).toContain('npm install');
+    // The destructive request is not readable from the block, so the talker
+    // cannot voice it, and no answer can be collected against it here.
+    expect(block).not.toContain('rm -rf ~/work');
+    expect(block).toContain('count="1"');
+    // What IS answerable is identified, so the answer does not have to fall
+    // through to the broker's bare-answer binding.
+    expect(block).toContain(`id="${voicedAskId}"`);
   });
 
   it('a bare yes with no id binds to the voiced ask and nothing else', async () => {

@@ -218,16 +218,42 @@ export class DuplexHeadlines {
       );
     }
 
-    for (const ask of asks) {
+    // Asks: the VOICED one verbatim with its id, everything queued behind it
+    // as a bare count.
+    //
+    // Rendering every pending ask with its request text re-opens F2
+    // mis-binding through a surface the D16 router rules never see. Two asks
+    // pending is a multi-loop situation (the reasoner's `npm install` voiced,
+    // a sub-agent's `rm -rf ~/work` queued behind it), and a block listing
+    // both hands the talker two readable requests with nothing distinguishing
+    // which one the user was asked about. It reads both out, the user says
+    // "yes, the npm one", and a bare answer_ask binds to whichever the broker
+    // voiced first. The consent would be genuine and the audit trail clean.
+    //
+    // So the block carries only what the user could actually have heard. The
+    // id rides along because an answer needs one and the voicing message that
+    // carried it can be arbitrarily far back in the transcript; it is the
+    // same id already spoken to this loop, and the block reaches the talker
+    // alone.
+    const voicedAsks = asks.filter((ask) => ask.voiced);
+    const queuedCount = asks.length - voicedAsks.length;
+    for (const ask of voicedAsks) {
       // The verbatim rendering, escaped: the talker's answer to "what is
       // it waiting on" must carry the actual command or path (F14), and a
       // hostile rendering must not fabricate block structure. Over-cap
       // renderings keep their tail, matching the producer's rule.
       sections.push(
-        `<pending-ask voiced="${ask.voiced}" ` +
+        `<pending-ask id="${escapeAttribute(ask.askId)}" voiced="true" ` +
         `age="${ageSeconds(now, ask.requestedAt)}s">` +
         `${escapeText(clipHeadTail(ask.renderedRequest, MAX_ASK_CHARS, ASK_HEAD_CHARS, ASK_TAIL_CHARS))}` +
         '</pending-ask>',
+      );
+    }
+    if (queuedCount > 0) {
+      sections.push(
+        `<queued-asks count="${queuedCount}">Not read out yet; ` +
+        'one request is answered at a time. Do not describe or answer these.' +
+        '</queued-asks>',
       );
     }
 
