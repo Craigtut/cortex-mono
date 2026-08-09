@@ -12,7 +12,8 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { DuplexRouter, DUPLEX_ROUTER_DEFAULTS } from '../../src/duplex/router.js';
-import type { DuplexRouterPorts, RouterLogInput } from '../../src/duplex/router.js';
+import type { RouterLogInput } from '../../src/duplex/router.js';
+import { makeTestRouterPorts } from './duplex-test-ports.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
 import {
@@ -94,7 +95,11 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     return dispatchedCauseSeqs.map((seq) => ({ kind: 'directive', seq } as CauseTag));
   }
 
-  const ports: DuplexRouterPorts = {
+  // Built from the shared factory: any port this file does not stub
+  // throws when called, so a test cannot pass on an answer it never
+  // asked for. This harness drives the whole router, so it stubs
+  // everything; the guarantee is for the next port added upstream.
+  const ports = makeTestRouterPorts({
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
     voiceAskToTalker: (content, causeTag) => askVoicings.push({ content, causeTag }),
     talkerIdle: () => talkerIdle,
@@ -119,7 +124,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     get idleSignal() {
       return idleSignal;
     },
-  };
+  });
 
   const router = new DuplexRouter(ports, {
     // Fast defaults so tests poll real timers briefly instead of sleeping.

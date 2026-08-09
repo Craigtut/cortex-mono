@@ -13,7 +13,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { DUPLEX_ROUTER_DEFAULTS, DuplexRouter } from '../../src/duplex/router.js';
-import type { DuplexRouterOptions, DuplexRouterPorts, RouterLogInput } from '../../src/duplex/router.js';
+import type { DuplexRouterOptions, RouterLogInput } from '../../src/duplex/router.js';
+import { makeTestRouterPorts } from './duplex-test-ports.js';
 import { collectCauseTags } from '../../src/duplex/cause-tags.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
@@ -57,7 +58,11 @@ function createHarness(options?: DuplexRouterOptions): Harness {
   let nextSeq = 1;
   let voicingFails = false;
 
-  const ports: DuplexRouterPorts = {
+  // Built from the shared factory, so the ports this file does not stub
+  // throw when called rather than answering. That is how the required
+  // `spawnLookup` came to be missing here for several router changes: the
+  // annotation looked like a check and nothing typechecks test files.
+  const ports = makeTestRouterPorts({
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
     voiceAskToTalker: (content, causeTag) => {
       if (voicingFails) throw new Error('talker is shutting down');
@@ -86,19 +91,9 @@ function createHarness(options?: DuplexRouterOptions): Harness {
     // because nothing was dispatched, not because the stub says so.
     currentReasonerCauseTags: () =>
       dispatchedCauseSeqs.map((seq) => ({ kind: 'directive', seq } as CauseTag)),
-    // Required by the port contract and genuinely unused here: no broker
-    // test spawns a lookup. It throws rather than returning a plausible
-    // verdict, for the same reason currentReasonerCauseTags derives from
-    // real dispatches: a stub that answers is a stub that can make a
-    // future test pass on a fabricated one. This was missing entirely
-    // until an audit typechecked the tests, which the package tsconfig
-    // does not (`exclude: ["tests"]`), so the annotation on this object
-    // was decorative and the router could grow a port this harness never
-    // supplied.
-    spawnLookup: () => {
-      throw new Error('broker harness: no test here should be spawning a lookup');
-    },
-  };
+    // spawnLookup is deliberately absent: no broker test spawns a lookup,
+    // and the factory's throwing default says so if one ever does.
+  });
 
   const router = new DuplexRouter(ports, {
     minDeliverySpacingMs: 0,
