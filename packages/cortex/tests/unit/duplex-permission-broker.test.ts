@@ -714,6 +714,151 @@ describe('D16 consent binding', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The settle-to-voice coalescing window (settleVoiceDelayMs)
+// ---------------------------------------------------------------------------
+
+describe('the settle-to-voice coalescing window', () => {
+  it('leaves a same-turn bare allow nothing to bind to, because no successor is voiced yet', async () => {
+    // The snipe: two asks pending, the user denies the voiced one, and the
+    // talker fires a bare allow in the SAME turn hoping to catch whatever
+    // gets voiced next. Voicing the successor inline with the settlement
+    // would hand that call a freshly voiced ask to bind against; the
+    // coalescing window means there is nothing voiced at all, so the answer
+    // is unbindable rather than bound to a request the user never heard.
+    const h = createHarness();
+    const first = requestAsk(h, { askId: 'ask-1', renderedRequest: 'Bash: a' });
+    const second = requestAsk(h, { askId: 'ask-2', renderedRequest: 'Bash: b' });
+    const voicedSeq = h.lastVoicedSeq();
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: voicedSeq + 1 }]);
+
+    // An answer arriving BEFORE the window is the ordinary path: the user
+    // heard ask-1 and said no. It binds to the voiced ask.
+    const denied = await callAnswerAsk(h, { decision: 'deny' });
+    expect(denied.content[0]!.text).toBe('Denial passed along.');
+
+    // An answer arriving INSIDE the window binds to nothing.
+    expect(h.askVoicings).toHaveLength(1);
+    const sniped = await callAnswerAsk(h, { decision: 'allow' });
+    expect(sniped.content[0]!.text).toContain('Could not tell which pending request');
+    expect(second.decisions).toHaveLength(0);
+
+    await waitUntil(() => first.decisions.length === 1);
+    expect(first.decisions).toEqual([{ decision: 'deny' }]);
+
+    // After the window the successor is read out, once, and is still
+    // pending: the snipe cost the attacker a refusal, not a grant.
+    await waitUntil(() => h.askVoicings.length === 2);
+    expect(h.askVoicings[1]!.content).toContain('Bash: b');
+    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+      { askId: 'ask-2', voiced: true },
+    ]);
+  });
+
+  it('a refusal landing inside the window does not read the successor out early', async () => {
+    // A settle and a re-voice racing inside one talker turn. The refusal
+    // path re-reads "the voiced ask", and during the window there is no
+    // voiced ask: re-reading the queue head instead would put the successor
+    // in the talker's batch twice, which is the two-requests-in-one-breath
+    // confusion the window exists to prevent.
+    const h = createHarness();
+    requestAsk(h, { askId: 'ask-1', renderedRequest: 'Bash: a' });
+    const second = requestAsk(h, { askId: 'ask-2', renderedRequest: 'Bash: b' });
+    h.setTalkerCauseTags([]);
+
+    await callAnswerAsk(h, { decision: 'deny' });
+    // Fast-tier fumble on the follow-up call: an unreadable decision, which
+    // refuses and asks for the pending request to be read out again.
+    const fumbled = await callAnswerAsk(h, { decision: 'yes please' });
+    expect(fumbled.content[0]!.text).toContain('allow or deny');
+    expect(h.askVoicings).toHaveLength(1);
+
+    await waitUntil(() => h.askVoicings.length === 2);
+    expect(h.askVoicings[1]!.content).toContain('Bash: b');
+    // One voicing of ask-2, not two: the refusal did not mint an extra.
+    const voicedTwo = h.log.filter((entry) =>
+      entry.data?.['event'] === 'ask_voiced' && entry.data?.['askId'] === 'ask-2');
+    expect(voicedTwo).toHaveLength(1);
+    expect(second.decisions).toHaveLength(0);
+  });
+
+  it('the successor becomes answerable only from its own voicing, not from the seq it was queued at', async () => {
+    // D16: anchor on voicing, not on the ask. A yes spoken while ask-2 sat
+    // queued behind ask-1's voicing is newer than ask-2's own log entry but
+    // older than the reading the user actually heard. Comparing against the
+    // ask entry would let that yes carry over the moment the window elapses
+    // and the successor is read out.
+    const h = createHarness();
+    requestAsk(h, { askId: 'ask-1', renderedRequest: 'Bash: a' });
+    const second = requestAsk(h, { askId: 'ask-2', renderedRequest: 'Bash: b' });
+    const queuedAtSeq = h.askEntrySeq('ask-2');
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: queuedAtSeq + 1 }]);
+
+    await callAnswerAsk(h, { decision: 'deny' });
+    await waitUntil(() => h.askVoicings.length === 2);
+    const anchor = h.lastVoicedSeq();
+    expect(anchor).toBeGreaterThan(queuedAtSeq + 1);
+
+    const early = await callAnswerAsk(h, { decision: 'allow' });
+    expect(early.content[0]!.text).toContain('Not accepted');
+    expect(second.decisions).toHaveLength(0);
+
+    // Past that boundary the same shape binds: the rule is "after the user
+    // could have heard it", not "never".
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: anchor + 1 }]);
+    const allowed = await callAnswerAsk(h, { decision: 'allow' });
+    expect(allowed.content[0]!.text).toBe('Approval passed along.');
+    await waitUntil(() => second.decisions.length === 1);
+    expect(second.decisions).toEqual([{ decision: 'allow' }]);
+  });
+
+  it('a run of settlements cannot extend the window: the successor voices while they still arrive', async () => {
+    // Every settlement schedules the next voicing, so a window re-armed per
+    // settlement stays open for as long as settlements keep arriving: the
+    // voice channel goes quiet while a pending request nobody reads out
+    // waits behind it, and the asking loops stay blocked. The window is
+    // armed once and not re-armed while it runs.
+    //
+    // The settlements are id-addressed because that is the only way to
+    // settle an ask nobody voiced, and unvoiced asks are what a run of
+    // settlements is made of. The talker cannot address one (answer_ask has
+    // no id); timeouts, abort races, and the facade's own dispatches can,
+    // and each of them lands on the same scheduling path.
+    const windowMs = 40;
+    const sprayStepMs = 30;
+    const h = createHarness({ settleVoiceDelayMs: windowMs });
+    const asks = new Map<string, { decisions: BrokeredAskDecision[] }>();
+    for (let i = 1; i <= 12; i++) {
+      asks.set(`ask-${i}`, requestAsk(h, { askId: `ask-${i}`, renderedRequest: `Bash: ${i}` }));
+    }
+    expect(h.askVoicings).toHaveLength(1);
+    h.setTalkerCauseTags([]);
+
+    // Settle the voiced ask, then keep settling from the BACK of the queue
+    // so ask-2 stays at the head and is the successor throughout.
+    await callAnswerAsk(h, { decision: 'deny' });
+    let voicedAtStep: number | null = null;
+    for (let step = 0, id = 12; id >= 3; step++, id--) {
+      // Spray pacing, not a wait for a condition: the settlements have to
+      // be spread across real time for a re-arming window to show up.
+      await new Promise((resolve) => setTimeout(resolve, sprayStepMs));
+      await answerAskById(h, `ask-${id}`, 'deny');
+      if (voicedAtStep === null && h.askVoicings.length >= 2) voicedAtStep = step;
+    }
+
+    // Ten settlements spread over ~300ms against a 40ms window: armed once,
+    // the successor is read out within the first couple of steps; re-armed
+    // per settlement it would wait for the run of settlements to stop.
+    expect(voicedAtStep).not.toBeNull();
+    expect(voicedAtStep!).toBeLessThan(4);
+    expect(h.askVoicings[1]!.content).toContain('Bash: 2');
+    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+      { askId: 'ask-2', voiced: true },
+    ]);
+    expect(asks.get('ask-2')!.decisions).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Timeouts, aborts, teardown
 // ---------------------------------------------------------------------------
 

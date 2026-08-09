@@ -167,6 +167,58 @@ describe('duplex settlement predicates and broker-minted asks', () => {
 });
 
 // ---------------------------------------------------------------------------
+// isAutoApprove has to reach the network resolver through the facade
+//
+// The broker suite covers the resolver by handing it the callback directly,
+// which passes whether or not anything wires it. This drives the wiring:
+// config in, CortexAgent.create() assembling, the resolver the facade
+// actually enforces coming back out of getNetworkAccessResolver().
+// ---------------------------------------------------------------------------
+
+describe('duplex auto-approve and network egress', () => {
+  it('does not voice an egress ask at a consumer that asked not to be interrupted', async () => {
+    const { facade, talkerPi } = await createRealDuplexScenario({
+      ...ASKING_NETWORK,
+      isAutoApprove: () => true,
+      // Bounds the pre-change shape: unwired, this brokers a real ask, and
+      // the assertions below should fail rather than hang to a default
+      // two-minute timeout.
+      duplex: { askTimeoutMs: 50 },
+    });
+    const resolver = facade.getNetworkAccessResolver();
+    if (!resolver) throw new Error('duplex did not wire a network resolver');
+
+    const decision = resolver(EGRESS);
+    await settle();
+
+    // The symptom: nothing is minted and nothing is read out.
+    expect(facade.getPendingAsks()).toEqual([]);
+    expect(promptTexts(talkerPi).join('\n')).not.toContain('<permission-request');
+    await expect(decision).resolves.toEqual({ decision: 'allow' });
+
+    // Passing for the right reason: the auto-approve branch ran, and left
+    // the audit entry that is the only record of a decision the user never
+    // saw. Without this the test would also pass if egress were denied.
+    const audit = lifecycleEvents(facade, 'ask_auto_approved');
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.content).toContain('example.com');
+  });
+
+  it('still brokers the ask when the callback reads false', async () => {
+    const { facade } = await createRealDuplexScenario({
+      ...ASKING_NETWORK,
+      isAutoApprove: () => false,
+    });
+    const resolver = facade.getNetworkAccessResolver();
+    if (!resolver) throw new Error('duplex did not wire a network resolver');
+
+    void resolver(EGRESS);
+    await waitUntil(() => facade.getPendingAsks().length === 1, 2000, 'ask brokered');
+    expect(lifecycleEvents(facade, 'ask_auto_approved')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // S6: getConversationHistory() must be the conversation
 // ---------------------------------------------------------------------------
 

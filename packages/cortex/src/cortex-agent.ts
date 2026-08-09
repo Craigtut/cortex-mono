@@ -683,6 +683,12 @@ export function withBrokeredPermissions(
     brokered.resolveNetworkAccess = buildBrokeredNetworkResolver(
       config.resolveNetworkAccess,
       getBroker,
+      // Third argument, unlike the tool resolver's second. Both pipelines
+      // must agree about what auto-approve means: a consumer that asked not
+      // to be interrupted should not have egress asks voiced at it and then
+      // time out to deny. The resolver consults this only AFTER the broker
+      // lookup, so an unbound broker still fails closed.
+      config.isAutoApprove,
     );
   }
   return brokered;
