@@ -200,6 +200,18 @@ export class Session {
   private titleManager: TitleManager | null = null;
 
   private readonly config: CortexCodeConfig;
+  /**
+   * The Cortex facade mode this CLI runs, declared once so the pin in
+   * {@link buildAgentConfig} and every mode-dependent routing decision in
+   * this file cannot drift apart.
+   *
+   * Pinned to passthrough rather than left to the facade default, which is
+   * duplex: a coding CLI is a typed, single-surface client with no talker to
+   * speak for it, and passthrough routes straight to the reasoner, so
+   * behavior matches the single loop this session drove before the facade.
+   * Turning cortex-code duplex is its own change, not a default it inherits.
+   */
+  private readonly agentMode: NonNullable<CortexAgentConfig['mode']> = 'passthrough';
   private readonly mode: Mode;
   private readonly model: CortexModel;
   private provider: string;
@@ -923,6 +935,21 @@ export class Session {
     }
   }
 
+  /**
+   * The loop whose streamed text is the user-visible reply: the reasoner in
+   * passthrough, the talker in duplex. Passthrough hands back the reasoner's
+   * own bridge verbatim, so its events carry no `loopPath` at all; the duplex
+   * merged bridge stamps every event with one.
+   */
+  private get conversationLoopPath(): string {
+    return this.agentMode === 'duplex' ? 'talker' : 'reasoner';
+  }
+
+  /** True when an event came from the loop the user is actually talking to. */
+  private isConversationEvent(event: CortexEvent): boolean {
+    return event.loopPath === undefined || event.loopPath === this.conversationLoopPath;
+  }
+
   /** Wire all agent events to the TUI. */
   private wireEvents(): void {
     if (!this.agent || !this.app) return;
@@ -936,6 +963,7 @@ export class Session {
 
     bridge.on('response_start', (event: CortexEvent) => {
       if (event.childTaskId) return;
+      if (!this.isConversationEvent(event)) return;
       assistantStarted = false;
       rawStreamText = '';
       workingTagOpen = false;
@@ -945,6 +973,11 @@ export class Session {
     bridge.on('response_chunk', (event: CortexEvent) => {
       // Skip child agent streaming; only parent text goes to transcript
       if (event.childTaskId) return;
+      // Skip the work loop's streaming too. The merged duplex bridge carries
+      // both resident loops and neither sets childTaskId, so without this
+      // the reasoner's private working prose streams into the assistant
+      // bubble and is then replaced by the talker's actual reply.
+      if (!this.isConversationEvent(event)) return;
 
       // Text flowing again means a pending retry reconnected.
       this.noteProgressAfterRetry();
@@ -2128,15 +2161,13 @@ export class Session {
    * mode is assertable without standing up a TUI and a sandbox.
    *
    * `mode` is passed explicitly rather than left to the facade default, which
-   * is duplex: a coding CLI is a typed, single-surface client with no talker
-   * to speak for it, and passthrough routes straight to the reasoner, so
-   * behavior matches the single loop this session drove before the facade.
-   * Turning cortex-code duplex is its own change, not a default it inherits.
+   * is duplex. See {@link agentMode} for why, and for the single place that
+   * decision is written down.
    */
   private buildAgentConfig(): CortexAgentConfig {
     const diagnostics = this.buildDiagnosticsConfig();
     return {
-      mode: 'passthrough',
+      mode: this.agentMode,
       model: this.model,
       utilityModel: 'default',
       workingDirectory: this.cwd,
