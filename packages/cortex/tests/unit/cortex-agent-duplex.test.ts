@@ -1939,12 +1939,12 @@ describe('duplex permission broker', () => {
     const turn = facade.prompt('yes, go ahead');
     await waitUntil(() => talkerPi.promptCalls.length === 2);
     const answerAsk = getPiTool(talkerPi, 'answer_ask');
-    const receipt = await answerAsk.execute('c1', { askId: 'ask-e2e', decision: 'allow' }) as {
+    const receipt = await answerAsk.execute('c1', { decision: 'allow' }) as {
       content: Array<{ text: string }>;
     };
     expect(receipt.content[0]!.text).toBe('Approval passed along.');
     // A replay in the same run takes no second effect.
-    const replay = await answerAsk.execute('c2', { askId: 'ask-e2e', decision: 'allow' }) as {
+    const replay = await answerAsk.execute('c2', { decision: 'allow' }) as {
       content: Array<{ text: string }>;
     };
     expect(replay.content[0]!.text).toBe('There are no pending permission requests to answer.');

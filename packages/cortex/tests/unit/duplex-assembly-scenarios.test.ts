@@ -202,12 +202,12 @@ describe('assembled duplex: the brokered resolver is the one a tool call hits', 
     expect(deployed).toHaveLength(0);
     await waitUntil(() => !h.talkerLoop.isLoopActive, 2000, 'talker idle');
 
-    const askId = String(
-      (entriesOfType(h.facade, 'ask').at(-1)!.data as { askId: string }).askId,
-    );
+    // No askId: the tool does not take one, and the answer binds to the ask
+    // that was voiced. Passing one here would read as if it selected the
+    // target when nothing would be reading it.
     h.talkerPi.script = [{
       text: 'Approving.',
-      calls: [{ name: 'answer_ask', args: { askId, decision: 'allow' } }],
+      calls: [{ name: 'answer_ask', args: { decision: 'allow' } }],
     }];
     await h.facade.prompt('yes, go ahead');
 
@@ -318,6 +318,22 @@ describe('assembled duplex: the wiring create() does after construction', () => 
     expect(talkerTools).not.toContain('Bash');
     expect(talkerTools).not.toContain('Read');
     expect(talkerTools).not.toContain('SubAgent');
+
+    // The nonce never reaches the talker through a tool schema either, and
+    // this reads the schema the talker was ACTUALLY given rather than one
+    // built for the occasion: buildControlTools() output proves what the
+    // builder makes, not what create() registered, and the two are only the
+    // same until someone wires a different toolset.
+    const registeredAnswerAsk = (h.talkerPi.state.tools as Array<{ name: string }>)
+      .find((tool) => tool.name === 'answer_ask')!;
+    expect(registeredAnswerAsk).toBeDefined();
+    const answerAskSchema = JSON.stringify(registeredAnswerAsk);
+    expect(answerAskSchema).not.toContain('askId');
+    expect(answerAskSchema).not.toContain('ask id');
+    // Passing for the right reason: the parameters it does take are here,
+    // so an empty or renamed schema fails instead of satisfying the above.
+    expect(answerAskSchema).toContain('decision');
+    expect(answerAskSchema).toContain('reason');
 
     // The reasoner keeps the working surface plus the duplex tools.
     const reasonerTools = (h.reasonerPi.state.tools as Array<{ name: string }>).map((t) => t.name);
