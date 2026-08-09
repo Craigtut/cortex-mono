@@ -1007,3 +1007,124 @@ describe('scenario: grounding material under repeated pressure', () => {
     h.reasonerPi.releaseRun();
   });
 });
+
+// ---------------------------------------------------------------------------
+// The work fails: the one thing the system could never say
+// ---------------------------------------------------------------------------
+
+describe('scenario: the reasoner fails', () => {
+  /**
+   * The consumer symptom, not the internal state change: after a failed
+   * reasoner run the user hears NOTHING, and the status block still lists the
+   * work as live, so the grounding rules have the talker honestly answer
+   * "still working on it" for the rest of the session. Verified failing
+   * against the pre-fix facade, which produced zero deliveries here.
+   */
+  async function failedWork(
+    h: ReturnType<typeof createDuplexScenario>,
+  ): Promise<void> {
+    h.talkerPi.script = [{
+      text: 'On it.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'build the release' } }],
+    }];
+    await h.facade.prompt('build the release');
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'work dispatched');
+  }
+
+  /** Talker-facing text of every delivery the router handed over. */
+  function deliveredToTalker(h: ReturnType<typeof createDuplexScenario>): string {
+    return JSON.stringify(h.talkerPi.state.messages);
+  }
+
+  it('speaks up when a run ends on an error instead of leaving the user waiting', async () => {
+    const h = createDuplexScenario();
+    // pi's failure stub: the run ends, but its last assistant message carries
+    // an error stop reason and no result.
+    h.reasonerPi.script = [{ text: '', stopReason: 'error' }];
+    await failedWork(h);
+
+    await waitUntil(
+      () => entriesOfType(h.facade, 'delivery').length === 1,
+      2000, 'the failure was delivered',
+    );
+    const delivery = entriesOfType(h.facade, 'delivery')[0]!;
+    expect(delivery.content).toContain('stopped with an error');
+    expect(delivery.wake).toBe('interrupt');
+    // And it actually reached the conversation surface, fenced as an update.
+    await waitUntil(
+      () => deliveredToTalker(h).includes('stopped with an error'),
+      2000, 'the talker was told',
+    );
+    expect(deliveredToTalker(h)).toContain('background-update');
+  });
+
+  it('speaks up on a fatal error the ladder will never retry', async () => {
+    const h = createDuplexScenario();
+    // A real classification path: authentication is the one fatal category,
+    // and a fatal failure throws out of the run without a loop_end at all,
+    // so nothing downstream of the run boundary can notice it.
+    h.reasonerPi.failWith = new Error('401 Unauthorized: invalid x-api-key');
+    await failedWork(h);
+
+    await waitUntil(
+      () => entriesOfType(h.facade, 'delivery').length === 1,
+      2000, 'the fatal failure was delivered',
+    );
+    const delivery = entriesOfType(h.facade, 'delivery')[0]!;
+    expect(delivery.content).toContain('cannot recover from');
+    expect(delivery.content).toContain('invalid x-api-key');
+    expect(delivery.content).toContain('will not retry');
+  });
+
+  it('speaks up when the retry ladder gives up, and stops claiming to be retrying', async () => {
+    const h = createDuplexScenario();
+    h.reasonerPi.hold = true;
+    await failedWork(h);
+
+    // The ladder itself is the loop's, tested there; what is wired here is
+    // what the facade does with its signals, so they are fired through the
+    // loop's own notifiers.
+    const loop = h.reasonerLoop as unknown as {
+      fireRetryScheduled: (info: Record<string, unknown>) => void;
+      fireRetryExhausted: (info: Record<string, unknown>) => void;
+    };
+    loop.fireRetryScheduled({
+      category: 'server_error',
+      attempt: 3,
+      maxAttempts: 5,
+      delayMs: 1000,
+      nextAttemptAt: Date.now() + 1000,
+      originalMessage: '500 internal server error',
+    });
+
+    // Mid-ladder the block says retrying, not working: "still working on it"
+    // is the answer that makes the user wait through a failing session.
+    const retryingBlock = talkerHeadline(h.talkerLoop)!;
+    expect(retryingBlock).toMatch(
+      /Retrying after a server_error failure: attempt 3 of 5 \(as of \d+s ago\)/,
+    );
+
+    loop.fireRetryExhausted({ attempts: 5, category: 'server_error' });
+    await waitUntil(
+      () => entriesOfType(h.facade, 'delivery').length === 1,
+      2000, 'the exhausted ladder was delivered',
+    );
+    expect(entriesOfType(h.facade, 'delivery')[0]!.content)
+      .toContain('given up retrying');
+    // And the block stops claiming a retry is coming.
+    expect(talkerHeadline(h.talkerLoop)!).not.toContain('Retrying after');
+
+    h.reasonerPi.releaseRun();
+  });
+
+  it('says nothing extra when the user aborted the work themselves', async () => {
+    const h = createDuplexScenario();
+    h.reasonerPi.script = [{ text: '', stopReason: 'aborted' }];
+    await failedWork(h);
+    await settle();
+
+    // An abort is the user's own doing and already acknowledged on the
+    // conversation surface; reporting it back is noise, not surfacing.
+    expect(entriesOfType(h.facade, 'delivery')).toHaveLength(0);
+  });
+});

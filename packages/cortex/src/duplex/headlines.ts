@@ -112,6 +112,12 @@ export class DuplexHeadlines {
   private lastRunEndedAt: number | null = null;
   private lastOutputLines: string[] = [];
   private lastOutputAt: number | null = null;
+  private retry: {
+    category: string;
+    attempt: number;
+    maxAttempts: number;
+    at: number;
+  } | null = null;
 
   constructor(ports: DuplexHeadlinePorts) {
     this.ports = ports;
@@ -122,6 +128,7 @@ export class DuplexHeadlines {
   noteRunStart(): void {
     this.runStartedAt = this.now();
     this.currentTool = null;
+    this.retry = null;
   }
 
   /** The reasoner's main loop finished its run. */
@@ -129,6 +136,26 @@ export class DuplexHeadlines {
     this.runStartedAt = null;
     this.currentTool = null;
     this.lastRunEndedAt = this.now();
+    this.retry = null;
+  }
+
+  /**
+   * The reasoner is waiting out a retry backoff.
+   *
+   * Without this the block says `state="working"` for the whole ladder, and
+   * on the default policy that can be hours. The talker's grounding rules
+   * then have it honestly answer "still working on it" to a session that is
+   * failing over and over, which is the one answer that makes the user wait
+   * instead of intervening. Retrying is a different fact from working and
+   * the block has to be able to say it.
+   */
+  noteRetry(info: { category: string; attempt: number; maxAttempts: number }): void {
+    this.retry = { ...info, at: this.now() };
+  }
+
+  /** The retry ladder ended (succeeded, gave up, or the run finished). */
+  clearRetry(): void {
+    this.retry = null;
   }
 
   /** A tool started on the reasoner's main loop. */
@@ -166,7 +193,7 @@ export class DuplexHeadlines {
     const subAgents = this.ports.activeSubAgents();
     const asks = this.ports.pendingAsks();
 
-    if (running || this.lastOutputLines.length > 0) {
+    if (running || this.retry !== null || this.lastOutputLines.length > 0) {
       const usage = this.ports.reasonerUsage();
       const attrs: string[] = [`state="${running ? 'working' : 'idle'}"`];
       if (running && this.runStartedAt !== null) {
@@ -177,6 +204,13 @@ export class DuplexHeadlines {
       }
       attrs.push(`turns="${usage.totalTurns}"`, `cost="$${usage.totalCost.toFixed(4)}"`);
       const lines: string[] = [];
+      if (this.retry !== null) {
+        lines.push(
+          `  Retrying after a ${escapeText(this.retry.category)} failure: ` +
+          `attempt ${this.retry.attempt} of ${this.retry.maxAttempts} ` +
+          `(as of ${ageSeconds(now, this.retry.at)}s ago)`,
+        );
+      }
       if (running && this.currentTool) {
         const summary = this.currentTool.summary
           ? ` ${escapeText(clip(this.currentTool.summary, MAX_TOOL_SUMMARY_CHARS))}`

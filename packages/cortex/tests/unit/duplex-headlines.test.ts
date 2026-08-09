@@ -89,6 +89,33 @@ describe('DuplexHeadlines', () => {
     expect(block).toContain('All tests passed.');
   });
 
+  it('reports a retry ladder as retrying, not as plain working', () => {
+    // "still working on it" through a failing retry ladder is the answer that
+    // makes a user wait instead of intervening, and on the default policy the
+    // ladder can run for hours. Retrying is a separate fact.
+    const { headlines, state } = createHeadlines({ running: true });
+    headlines.noteRunStart();
+    headlines.noteRetry({ category: 'server_error', attempt: 3, maxAttempts: 5 });
+    state.now += 8_000;
+
+    const block = headlines.build()!;
+    expect(block).toContain(
+      'Retrying after a server_error failure: attempt 3 of 5 (as of 8s ago)',
+    );
+
+    headlines.clearRetry();
+    expect(headlines.build()!).not.toContain('Retrying after');
+  });
+
+  it('clears the retry line when the run ends', () => {
+    const { headlines, state } = createHeadlines({ running: true });
+    headlines.noteRunStart();
+    headlines.noteRetry({ category: 'network', attempt: 1, maxAttempts: 3 });
+    state.running = false;
+    headlines.noteRunEnd();
+    expect(headlines.build() ?? '').not.toContain('Retrying after');
+  });
+
   it('keeps only the last three output lines', () => {
     const { headlines } = createHeadlines({ running: true });
     headlines.noteOutput('one\ntwo\nthree\nfour\nfive');

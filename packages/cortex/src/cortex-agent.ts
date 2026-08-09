@@ -1183,6 +1183,24 @@ function extractSpokenText(assistantMessage: unknown): string {
   return stripWorkingTags(raw).trim();
 }
 
+/** Chars of a provider error message carried into a failure delivery. */
+const MAX_FAILURE_DETAIL_CHARS = 300;
+
+/**
+ * Bound a provider error message before it rides a failure delivery into the
+ * talker's transcript. Provider text is arbitrary length and not ours; the
+ * delivery wrapper already fences it as information rather than instruction,
+ * so all that is left to do is stop a multi-kilobyte body from crowding out
+ * the conversation.
+ */
+function clipFailureDetail(message: string): string {
+  const trimmed = message.trim();
+  if (trimmed.length === 0) return 'no detail reported';
+  return trimmed.length > MAX_FAILURE_DETAIL_CHARS
+    ? `${trimmed.slice(0, MAX_FAILURE_DETAIL_CHARS)}…`
+    : trimmed;
+}
+
 /** Append the D17 speak-now appendix to a control-tool receipt. */
 function appendSpeakNudge(content: unknown): unknown {
   const nudge = `\n\n${SPEAK_NOW_APPENDIX}`;
@@ -1215,6 +1233,13 @@ export class CortexAgent {
   private aggregateBreachLogged = false;
   /** Whether the current reasoner run called Deliver (implicit-delivery guard). */
   private reasonerDeliverCalledThisRun = false;
+  /**
+   * Whether this reasoner run's failure already produced a delivery. A
+   * terminal failure can surface twice (onRetryExhausted before the throw,
+   * then an error-stopped loop_end), and the user needs to hear about it
+   * once.
+   */
+  private reasonerFailureDeliveredThisRun = false;
   /** One truncation repair per streak (D17 stop-reason audit). */
   private talkerRepairPending = false;
   /** The consumer's base prompt without the appended role prompts. */
@@ -1558,6 +1583,7 @@ export class CortexAgent {
     talker.setHeadlineProvider(() => headlines.build(), {
       maxTokens: TALKER_HEADLINE_MAX_TOKENS,
     });
+    this.wireReasonerFailureSurfacing(headlines);
 
     // Run tracking: implicit deliveries, the liveness watchdog, the
     // per-turn dispatch cap, the stop-reason audit, and the headline feed.
@@ -1565,6 +1591,7 @@ export class CortexAgent {
     reasonerBridge.on('loop_start', (event) => {
       if (event.childTaskId) return;
       this.reasonerDeliverCalledThisRun = false;
+      this.reasonerFailureDeliveredThisRun = false;
       router.noteReasonerRunStart();
       headlines.noteRunStart();
     });
@@ -1779,10 +1806,91 @@ export class CortexAgent {
       }
     }
     if (!last) return;
-    if (last.stopReason === 'error' || last.stopReason === 'aborted') return;
+    if (last.stopReason === 'error') {
+      // A run that ended on pi's failure stub produced no result and there is
+      // nothing else in the system that will say so: the log gains an error
+      // entry, and every other delivery producer (Deliver, this implicit
+      // path, the watchdog) is either not called or returns early. Left here
+      // the delegation stays listed as live work and the grounding rules have
+      // the talker honestly answer "still working on it" forever.
+      this.deliverReasonerFailure(
+        'The background work stopped with an error before producing a result. ' +
+        'Tell the user plainly and offer to try again.',
+      );
+      return;
+    }
+    // An abort is the user's own doing, already acknowledged on the
+    // conversation surface; announcing it back to them is noise.
+    if (last.stopReason === 'aborted') return;
     const spoken = extractSpokenText(last);
     if (spoken.length === 0) return;
     this.router?.deliverFromReasoner(spoken, 'when_idle', { implicit: true });
+  }
+
+  /**
+   * Surface a reasoner failure to the user, as an interrupt delivery.
+   *
+   * The fourth delivery producer, beside the Deliver tool, the implicit
+   * final-text delivery, and the watchdog. The other three all describe work
+   * that got somewhere; none of them fires on the path where a run dies, and
+   * the watchdog stops the moment the run does, so before this a failed
+   * reasoner was indistinguishable from a working one for as long as the
+   * session lasted.
+   *
+   * Once per run: a terminal failure can reach here twice (onRetryExhausted
+   * fires before the throw, and an error-stopped run also ends in a loop_end
+   * carrying the failure stub).
+   */
+  private deliverReasonerFailure(text: string): void {
+    if (this.destroyed || !this.router) return;
+    if (this.reasonerFailureDeliveredThisRun) return;
+    this.reasonerFailureDeliveredThisRun = true;
+    // interrupt: a user waiting on work that is never coming is exactly the
+    // case the class exists for. The router may still demote it under
+    // backpressure, which is the intended tradeoff.
+    this.router.deliverFromReasoner(text, 'interrupt', { synthetic: true });
+  }
+
+  /**
+   * Wire the reasoner's failure and retry signals into the talker's two
+   * surfaces: the headline block (retrying is a different fact from working,
+   * and the block could only say "working") and an interrupt delivery when
+   * the ladder gives up or a fatal error lands.
+   *
+   * Reasoner-only. The talker's own failures are the consumer's to see
+   * through onError; delivering them to the talker would ask a loop that
+   * just failed to perform an update about itself.
+   */
+  private wireReasonerFailureSurfacing(headlines: DuplexHeadlines): void {
+    this.reasoner.onRetryScheduled((info: RetryScheduledInfo) => {
+      headlines.noteRetry({
+        category: info.category,
+        attempt: info.attempt,
+        maxAttempts: info.maxAttempts,
+      });
+    });
+    this.reasoner.onRetrySucceeded(() => {
+      headlines.clearRetry();
+    });
+    this.reasoner.onRetryExhausted((info: RetryExhaustedInfo) => {
+      headlines.clearRetry();
+      this.deliverReasonerFailure(
+        `The background work failed and has given up retrying (${info.category}, ` +
+        `${info.attempts} attempts). It produced no result. Tell the user plainly ` +
+        'and offer to try again.',
+      );
+    });
+    this.reasoner.onError((error: ClassifiedError) => {
+      // Retryable and recoverable failures are handled elsewhere (the ladder,
+      // compaction, the abort path); a fatal one means the run is over and no
+      // retry is coming.
+      if (error.severity !== 'fatal') return;
+      this.deliverReasonerFailure(
+        'The background work stopped with an error it cannot recover from: ' +
+        `${clipFailureDetail(error.originalMessage)}. Tell the user plainly; ` +
+        'it will not retry on its own.',
+      );
+    });
   }
 
   /**
