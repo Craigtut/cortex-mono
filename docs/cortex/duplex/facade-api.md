@@ -57,6 +57,7 @@ Known cleanup folded into this work: `webFetch.maxPerLoop` and `bash.autoYieldTh
 - `abort(scope?)`: `'conversation'`, `'work'`, or `'all'` (default). Semantics per scope below.
 - `getLog(fromSeq?)`: a snapshot copy (never a live reference) of entries from a sequence number onward.
 - `subscribeLog(cb, fromSeq?)`: push callback with replay from a sequence number, so a reconnecting UI can ask for everything since it last saw. Slow subscribers are buffered to a bound and then dropped with a gap marker rather than applying backpressure to the loops.
+- `getResolutionReport()`: what assembly resolved to where it differs from what was asked for (a talker on the primary model, a skipped `utilityModel`, an unwired egress resolver, an uncapped session). Computed once at assembly; the `logger.warn` lines and the `lifecycle` log entries are derived from it. See cortex-agent.md.
 
 Entries carry a monotonic `seq`, a `loopPath`, a wake class, timestamps, and a `causedBy` seq when the entry belongs to a router-initiated run. The ordering rule is append-then-emit: a log entry is appended before the events of the run it triggers, so a consumer merging the two streams never sees events for an entry it has not received. A `reply` entry carries the same run identity as the response deltas that streamed it, so a UI can dedupe rather than rendering the text twice.
 

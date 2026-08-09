@@ -36,7 +36,7 @@ const agent = await CortexAgent.create({
 
 Config is routed per the table in `src/cortex-agent.ts` (`CONFIG_ROUTING`). The table is compile-time exhaustive: adding a config key without a routing destination is a type error. In passthrough every non-facade key flows to the reasoner unchanged, so behavior matches direct `AgentLoop` construction exactly.
 
-One routing caveat in duplex. There is no unresolvable-talker-model case: model resolution falls back to the primary model rather than failing, so on a provider whose model list cannot be enumerated (Ollama, custom OpenAI-compatible endpoints) duplex assembles with **talker = reasoner**. That configuration is healthy-looking and passes every test while delivering none of the latency benefit, so the facade warns once at assembly when it happens.
+One routing caveat in duplex. There is no unresolvable-talker-model case: model resolution falls back to the primary model rather than failing, so on a provider whose model list cannot be enumerated (Ollama, custom OpenAI-compatible endpoints) duplex assembles with **talker = reasoner**. That configuration is healthy-looking and passes every test while delivering none of the latency benefit, so it is reported as a `talker-model-fallback` note in [the resolution report](#the-resolution-report).
 
 ## What changes when duplex is the default
 
@@ -44,7 +44,39 @@ These are the surfaces a consumer hits on day one of an upgrade. All three keep 
 
 - **Event and callback surfaces carry two loops.** The event bridge returned by `getEventBridge()` is a merged bridge forwarding `response_start`, `response_chunk` and `turn_end` from both the talker and the reasoner, and the existing `if (event.childTaskId) return;` idiom does not filter them apart because neither resident loop sets `childTaskId`. Filter on `loopPath` instead. A UI that streams every `response_chunk` into one bubble will interleave the reasoner's internal working prose with the talker's speech; a voice pipeline wired off `turn_end` rather than the talker's deltas will speak the reasoner's private reasoning aloud.
 - **`getConversationHistory()` returns the dialogue**, which in duplex is the talker's transcript, not the reasoner's work log. This changed during the restructure: it forwarded unconditionally to the reasoner at first, so a consumer rendering "the conversation" got dispatch scaffolding. The reasoner's work transcript is reachable through `getState()`.
-- **There is no session-level cost cap by default.** `getBudgetGuard()` hands back the guard you configured, so `isBreached()` and `getMaxCost()` mean what you set them to. But `budgetGuard.maxCost` keeps its **per-prompt** meaning on the reasoner, and the facade's aggregate guard is uncapped unless `duplex.maxTotalCost` is supplied. A default duplex session runs two resident loops, sub-agents, quick lookups and doubled observational spend against no session ceiling, so the facade warns once at assembly. Set `duplex.maxTotalCost` if you want one.
+- **There is no session-level cost cap by default.** `getBudgetGuard()` hands back the guard you configured, so `isBreached()` and `getMaxCost()` mean what you set them to. But `budgetGuard.maxCost` keeps its **per-prompt** meaning on the reasoner, and the facade's aggregate guard is uncapped unless `duplex.maxTotalCost` is supplied. A default duplex session runs two resident loops, sub-agents, quick lookups and doubled observational spend against no session ceiling, which is reported as a `duplex-cost-cap-unset` note in [the resolution report](#the-resolution-report). Set `duplex.maxTotalCost` if you want one.
+
+## The resolution report
+
+```typescript
+agent.getResolutionReport(): ResolutionNote[]
+
+interface ResolutionNote {
+  code: ResolutionNoteCode;          // stable, machine-readable
+  severity: 'degraded' | 'info';
+  summary: string;                   // one line, fits a status bar
+  detail: string;                    // what was resolved, and what it costs
+  remedy: string;                    // what to set to fix it
+  data: Record<string, unknown>;     // the same facts structurally
+}
+```
+
+Assembly resolves a configuration that can quietly differ from what the consumer asked for. The report is the queryable record of every such difference, in both modes.
+
+`degraded` means the consumer asked for something and is not getting it, or the architecture is not delivering its premise. `info` means a default is in force that they may want to change. Nothing is a `degraded` note merely because it is unusual.
+
+| Code | Severity | Condition |
+|---|---|---|
+| `talker-model-fallback` | degraded | No `talker.model` was set and no fast tier resolved, so duplex assembled with talker = reasoner. |
+| `talker-utility-model-skipped` | degraded | A configured `utilityModel` is from a different provider than the talker's model, so the talker runs its observational memory on its own auto-resolved model. |
+| `network-resolver-unwired` | degraded | A sandbox and `resolveNetworkAccess` are configured but nobody took `getNetworkAccessResolver()`, so shell egress asks fail closed with nothing voiced. |
+| `duplex-cost-cap-unset` | info | Duplex assembled with no `duplex.maxTotalCost`, so there is no session-level cost ceiling. |
+
+**The notes are the source; the other surfaces derive from them.** Each note also produces one `logger.warn` (the text is `detail` plus `remedy`) and one `lifecycle` session-log entry carrying the whole note under `data.note`, both generated from the note rather than written beside it. This is deliberate: the same fact described in two hand-written places is the bug class that produced several of the divergences in the delegation table above. The log entry puts the report in the persistence artifact, so an audit of "why was this session slow or expensive" can find it after the fact.
+
+The report is computed **eagerly at assembly**, not lazily on first read, so it cannot observe a later `setModel()` and present it as an assembly fact. The one exception is `network-resolver-unwired`, which is not an assembly fact and cannot be: a consumer wires the resolver on the line after `create()` returns, so the check runs at the first `prompt()` and the note joins the report then, through the same pathway.
+
+`getResolutionReport()` is facade-owned, like `getLog()`, so it has no `AGENT_LOOP_DELEGATION` entry. That table is exhaustive over `keyof AgentLoop` in both directions, which means it constrains nothing about facade-only members: no compile-time check exists that a new facade surface is documented anywhere.
 
 ## Interaction surface
 
@@ -83,7 +115,7 @@ The rule is: **forward everything that is pure delegation, and withhold only wha
 
 The facade keeps an append-only session log: the routing bus and audit trail of the session, and part of the persistence artifact. It is not a context surface; no prompt is ever built from it.
 
-Entry types: `utterance`, `reply`, `directive`, `delivery`, `error`, `retrying`, `lifecycle`, `ask`, `ask_answer`, `lookup_result`. Passthrough produces a subset: `utterance` (consumer input), `reply` (user-facing turn text), `error` and `retrying` (from the error and retry handlers), and `lifecycle` (sub-agent spawns, completions, failures, dead-lettered deliveries, aborts). Duplex adds `directive`, `delivery`, `ask`, `ask_answer` and `lookup_result` from the control tools, the permission broker and quick lookups. In duplex, `reply` entries are taken from the talker only, since the reasoner's final text is internal working prose rather than something the user was told.
+Entry types: `utterance`, `reply`, `directive`, `delivery`, `error`, `retrying`, `lifecycle`, `ask`, `ask_answer`, `lookup_result`. Passthrough produces a subset: `utterance` (consumer input), `reply` (user-facing turn text), `error` and `retrying` (from the error and retry handlers), and `lifecycle` (sub-agent spawns, completions, failures, dead-lettered deliveries, aborts, and resolution notes). Duplex adds `directive`, `delivery`, `ask`, `ask_answer` and `lookup_result` from the control tools, the permission broker and quick lookups. In duplex, `reply` entries are taken from the talker only, since the reasoner's final text is internal working prose rather than something the user was told.
 
 Entries carry:
 

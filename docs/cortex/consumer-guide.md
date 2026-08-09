@@ -64,7 +64,7 @@ What changes for you, in practice:
 - **Permission asks arrive as conversation** rather than as a frozen loop, when a `resolvePermission` callback is configured.
 - **There is a second, cheap model call per exchange**, and time-to-final-answer is slightly longer than a single loop's, in exchange for a much better time-to-first-feedback.
 
-Set `talker: { model }` to pick the talker's model. The default is the fast tier auto-resolved from your primary provider (the same resolution the utility model uses). For a provider Cortex cannot enumerate (Ollama, custom OpenAI-compatible endpoints) that resolution falls back to your primary model: duplex still works, but the talker is as slow as the reasoner, so Cortex logs a warning and you should name a fast model yourself.
+Set `talker: { model }` to pick the talker's model. The default is the fast tier auto-resolved from your primary provider (the same resolution the utility model uses). For a provider Cortex cannot enumerate (Ollama, custom OpenAI-compatible endpoints) that resolution falls back to your primary model: duplex still works, but the talker is as slow as the reasoner, so you should name a fast model yourself. `getResolutionReport()` tells you whether that happened (see [What you actually got](#what-you-actually-got)).
 
 The design lives in [`duplex/`](./duplex/README.md): [architecture](./duplex/architecture.md), [the facade API contract](./duplex/facade-api.md), [communication and the permission broker](./duplex/communication.md), and [the decision record](./duplex/decisions.md).
 
@@ -82,6 +82,26 @@ const agent = await CortexAgent.create({
 `passthrough` is a single reasoner loop and exactly the old single-loop behavior, verified by a side-by-side parity suite against a bare `AgentLoop`. Use it when you do not want a second model in the path: a batch or non-interactive job, a CLI where there is nobody waiting on first feedback, or a provider with no usable fast tier.
 
 Two facade behaviors still apply in passthrough, and both are deliberate: `prompt()` never throws on a busy loop (a direct `AgentLoop.prompt()` does), and `abort()` clears queued content that a direct `AgentLoop.abort()` retains.
+
+### What you actually got
+
+Assembly resolves a configuration that can differ from the one you passed, and every case is quiet by construction: the agent runs, the suite is green, and the difference shows up later as unexplained latency or an unexplained bill. `getResolutionReport()` is the answer to "did I get what I configured?", in both modes:
+
+```typescript
+const agent = await CortexAgent.create({ model, workingDirectory, initialBasePrompt });
+
+for (const note of agent.getResolutionReport()) {
+  // note.severity: 'degraded' | 'info'
+  // note.code:     'talker-model-fallback' | 'talker-utility-model-skipped' | ...
+  // note.summary / note.detail / note.remedy: three lengths of the same statement
+  // note.data:     the same facts structurally, if you want your own wording
+  ui.showConfigNotice(note);
+}
+```
+
+`degraded` means you asked for something and are not getting it, or duplex is not delivering its premise (a talker on the primary model, a `utilityModel` the talker could not take, an unwired sandbox egress resolver). `info` means a default is in force you may want to change (no `duplex.maxTotalCost`, so no session cost ceiling).
+
+Read it once after `create()` and render it wherever your configuration lives. Cortex also logs each note through your `logger` and writes it into the session log as a `lifecycle` entry, so it survives into your persistence artifact; both are generated from the report, so they cannot disagree with it. If you never wire a `logger`, the report is the only place these appear. One code, `network-resolver-unwired`, cannot be known at assembly and lands after the first `prompt()`.
 
 ### When to use AgentLoop directly
 
@@ -573,7 +593,7 @@ const agent = await CortexAgent.create({
 
 `getSessionUsage()` returns one aggregate across both loops, every sub-agent, every quick lookup, and utility spend (observer, reflector, summarization, WebFetch, Bash utility calls). Children are counted exactly once, so do not add `SubAgentResult.usage` on top of it. The v2 persistence artifact keeps per-loop attribution alongside the total, so a restore does not flatten it.
 
-`budgetGuard.maxCost` keeps its per-prompt meaning on the reasoner. For a whole-session ceiling across everything, set `duplex.maxTotalCost`. Leave it unset and the aggregate is uncapped; Cortex logs a warning at construction rather than inventing a number for you.
+`budgetGuard.maxCost` keeps its per-prompt meaning on the reasoner. For a whole-session ceiling across everything, set `duplex.maxTotalCost`. Leave it unset and the aggregate is uncapped; Cortex records a `duplex-cost-cap-unset` note in [the resolution report](#what-you-actually-got) rather than inventing a number for you.
 
 There are two guards, and reading the wrong one is easy:
 

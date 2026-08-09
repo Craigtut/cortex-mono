@@ -30,7 +30,8 @@ import { NOOP_LOGGER } from './noop-logger.js';
  * - `error`: a classified error surfaced by a loop's error handler.
  * - `retrying`: a scheduled background retry (transient failure).
  * - `lifecycle`: durable milestones: sub-agent spawns, completions,
- *   cancellations, dead-lettered deliveries, aborts.
+ *   cancellations, dead-lettered deliveries, aborts, and the assembly's
+ *   resolution notes (`data.event === 'resolution_note'`).
  * - `ask` / `ask_answer`: permission asks brokered through conversation
  *   (produced in duplex mode; the types are part of the artifact contract).
  * - `lookup_result`: a quick-lookup sub-agent's result (duplex).

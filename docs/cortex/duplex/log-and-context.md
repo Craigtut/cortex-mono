@@ -76,7 +76,7 @@ Rules for the headline block, from the audit:
 | `error` / `retrying` | error and retry handlers | talker (retrying: headline; fatal: interrupt delivery) | mixed |
 | `directive` | talker control tools | facade router, then reasoner or target sub-agent | real message (steer) |
 | `delivery` | reasoner | talker, per wake policy | real message |
-| `lifecycle` | facade | log (durable: spawns, completions, cancels, dispatch failures) | none |
+| `lifecycle` | facade | log (durable: spawns, completions, cancels, dispatch failures, resolution notes) | none |
 | `ask` / `ask_answer` | permission broker | talker / originating resolver | real message / promise settle |
 | `lookup_result` | quick-lookup sub-agent | talker (wake) and reasoner (delta at next turn) | real message |
 
