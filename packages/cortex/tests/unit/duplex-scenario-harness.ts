@@ -45,6 +45,18 @@ export interface ScriptedTurn {
   calls?: Array<{ id?: string; name: string; args?: Record<string, unknown> }>;
   /** Assistant stop reason ('length' drives the truncation audit). */
   stopReason?: string;
+  /**
+   * Record a run failure on this turn, the way pi does: the assistant
+   * message carries `errorMessage`, pi mirrors it into `state.errorMessage`
+   * (pi-agent-core agent.js:394), the run ENDS (agent_end still fires, so
+   * loop_end still reaches Cortex), and Cortex's runTurnWithRetry turns the
+   * recorded state error into a throw. Implies an 'error' stop reason.
+   *
+   * This is the shape a transient provider failure actually has, and it is
+   * the only way to exercise a retry ladder here: `failWith` models a
+   * throw from prompt() itself, which emits no agent_end at all.
+   */
+  runErrorMessage?: string;
   /** Cost attributed to the turn's usage payload. */
   cost?: number;
 }
@@ -68,6 +80,8 @@ export interface ScriptedPiAgent extends PiAgent {
   toolResults: Array<{ name: string; text: string; terminate: boolean }>;
   /** Model calls made across all runs (one per scripted turn played). */
   modelCalls: number;
+  /** continue() invocations, i.e. retry attempts after the first. */
+  continueCalls: number;
   /** The real Cortex afterToolCall hook, installed by the harness. */
   afterToolCall?: AfterToolCallHook;
   /**
@@ -130,39 +144,23 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
   let running = false;
   let callCounter = 0;
 
-  const agent: ScriptedPiAgent = {
-    state: { messages: [], systemPrompt: '', tools: [] },
-    promptCalls: [],
-    steeringQueue: [],
-    followUpQueue: [],
-    script: [],
-    defaultText: 'ok',
-    hold: false,
-    toolResults: [],
-    modelCalls: 0,
-    failWith: null,
-    runSignal: null,
-
-    subscribe(handler: (event: PiEvent) => void): () => void {
-      eventHandler = handler;
-      return () => { eventHandler = null; };
-    },
-
-    emitEvent(event: PiEvent): void {
-      eventHandler?.(event);
-    },
-
-    async prompt(input: string | AgentMessage[]): Promise<unknown> {
-      agent.promptCalls.push(input);
+  /**
+   * One run of the scripted loop, shared by prompt() and continue().
+   * `input` is null for a continue, which resumes the same logical turn
+   * without pushing new user input, exactly like pi's retry path.
+   */
+  async function runBody(input: string | AgentMessage[] | null): Promise<unknown> {
       running = true;
       const controller = new AbortController();
       abortController = controller;
       agent.runSignal = controller.signal;
       try {
         agent.emitEvent({ type: 'agent_start' });
-        const runMessages: AgentMessage[] = Array.isArray(input)
-          ? [...input]
-          : [{ role: 'user', content: input, timestamp: Date.now() }];
+        const runMessages: AgentMessage[] = input === null
+          ? []
+          : Array.isArray(input)
+            ? [...input]
+            : [{ role: 'user', content: input, timestamp: Date.now() }];
         agent.state.messages.push(...runMessages);
         agent.state.messages.push(...(agent.steeringQueue.splice(0) as AgentMessage[]));
 
@@ -211,13 +209,31 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
           const assistant = {
             role: 'assistant',
             content,
-            stopReason: scripted.stopReason
-              ?? (calls.length > 0 ? 'toolUse' : 'stop'),
+            stopReason: scripted.runErrorMessage !== undefined
+              ? 'error'
+              : scripted.stopReason ?? (calls.length > 0 ? 'toolUse' : 'stop'),
+            ...(scripted.runErrorMessage !== undefined
+              ? { errorMessage: scripted.runErrorMessage }
+              : {}),
             usage: usagePayload(scripted.cost ?? 0.003),
             timestamp: Date.now(),
           } as unknown as AgentMessage;
           agent.state.messages.push(assistant);
           runMessages.push(assistant);
+
+          // pi's recorded-failure shape: mirror the message's errorMessage
+          // into state, end the run, and still emit agent_end. Cortex reads
+          // the state error after prompt() resolves and throws, which is
+          // what hands the failure to the retry ladder.
+          if (scripted.runErrorMessage !== undefined) {
+            (agent.state as Record<string, unknown>)['errorMessage'] =
+              scripted.runErrorMessage;
+            agent.emitEvent({
+              type: 'turn_end', message: assistant, toolResults: [],
+            } as unknown as PiEvent);
+            agent.emitEvent({ type: 'agent_end', messages: runMessages } as unknown as PiEvent);
+            return { content: text };
+          }
 
           // Tool batch: pi executes every call, appends one toolResult
           // message per call, and only then emits turn_end.
@@ -320,16 +336,50 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
         idleResolve?.();
         idleResolve = null;
       }
+      }
+
+  const agent: ScriptedPiAgent = {
+    state: { messages: [], systemPrompt: '', tools: [] },
+    promptCalls: [],
+    steeringQueue: [],
+    followUpQueue: [],
+    script: [],
+    defaultText: 'ok',
+    hold: false,
+    toolResults: [],
+    modelCalls: 0,
+    continueCalls: 0,
+    failWith: null,
+    runSignal: null,
+
+    subscribe(handler: (event: PiEvent) => void): () => void {
+      eventHandler = handler;
+      return () => { eventHandler = null; };
+    },
+
+    emitEvent(event: PiEvent): void {
+      eventHandler?.(event);
+    },
+
+    async prompt(input: string | AgentMessage[]): Promise<unknown> {
+      agent.promptCalls.push(input);
+      return runBody(input);
+    },
+
+    /**
+     * The retry path. Cortex's runTurnWithRetry calls continue() for every
+     * attempt after the first, so a scripted ladder needs this to really run
+     * rather than throw.
+     */
+    async continue(): Promise<unknown> {
+      agent.continueCalls += 1;
+      return runBody(null);
     },
 
     releaseRun(): void {
       releaseRun?.();
       releaseRun = null;
       rejectRun = null;
-    },
-
-    async continue(): Promise<unknown> {
-      throw new Error('continue() is not used by the scenario suites');
     },
 
     abort(): void {
@@ -523,6 +573,10 @@ export function createDuplexScenario(
     initialBasePrompt: 'Test base prompt',
     slots: loopSlots,
     loopPath: 'reasoner',
+    // The real ladder's first backoff is two minutes, which no test can wait
+    // out; scenarios that exercise retries override this with something
+    // short. Left at the default a scripted ladder simply never runs.
+    ...(overrides?.retryPolicy !== undefined ? { retryPolicy: overrides.retryPolicy } : {}),
   });
   const talkerLoop = new AgentLoopCtor(talkerPi, {
     model: testModel(),
