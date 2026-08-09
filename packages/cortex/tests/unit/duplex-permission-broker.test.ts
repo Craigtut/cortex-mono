@@ -86,6 +86,18 @@ function createHarness(options?: DuplexRouterOptions): Harness {
     // because nothing was dispatched, not because the stub says so.
     currentReasonerCauseTags: () =>
       dispatchedCauseSeqs.map((seq) => ({ kind: 'directive', seq } as CauseTag)),
+    // Required by the port contract and genuinely unused here: no broker
+    // test spawns a lookup. It throws rather than returning a plausible
+    // verdict, for the same reason currentReasonerCauseTags derives from
+    // real dispatches: a stub that answers is a stub that can make a
+    // future test pass on a fabricated one. This was missing entirely
+    // until an audit typechecked the tests, which the package tsconfig
+    // does not (`exclude: ["tests"]`), so the annotation on this object
+    // was decorative and the router could grow a port this harness never
+    // supplied.
+    spawnLookup: () => {
+      throw new Error('broker harness: no test here should be spawning a lookup');
+    },
   };
 
   const router = new DuplexRouter(ports, {
