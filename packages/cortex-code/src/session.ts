@@ -1978,10 +1978,18 @@ export class Session {
     this.updateFooterContextUsage();
   }
 
-  /** Abort the current agent loop without destroying. */
+  /**
+   * Abort the current agent loop without destroying.
+   *
+   * Skipped once teardown has begun: the editor discards the promise this
+   * returns (Ctrl+C is fire-and-forget), and CortexAgent.abort() throws on a
+   * destroyed agent where the loop's abort() was a no-op, so a Ctrl+C landing
+   * inside shutdown()'s destroy await would otherwise reject unhandled.
+   */
   async abort(): Promise<void> {
     this.freezeDiagnostics.recordAbortRequested('session.abort');
-    if (this.agent && this.isRunning) {
+    const tearingDown = this.agent?.state === 'destroying' || this.agent?.state === 'destroyed';
+    if (this.agent && this.isRunning && !tearingDown) {
       await this.agent.abort();
       void this.activity.recordError({
         category: 'cancelled',
