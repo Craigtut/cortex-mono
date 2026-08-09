@@ -295,7 +295,13 @@ export const CONFIG_ROUTING: { [K in keyof Required<CortexAgentConfig>]: ConfigD
   // Both loops (the talker uses working tags to separate thinking from
   // speech in 2b).
   workingTags: 'both-loops',
-  // Per loop, derived from each loop's model in 2b.
+  // Per loop: the same consumer number on each loop, clamped separately
+  // against each loop's own model window and floor. The limit is a
+  // compaction budget, and the talker holds the real conversation, so a
+  // reasoner-only limit lets the surface that grows fastest ignore the cap
+  // the consumer set. D6's rule (the consumer never routes per loop)
+  // applies here too: a knob that silently reaches one loop is the
+  // divergence that rule exists to prevent.
   contextWindowLimit: 'per-loop',
   // Per loop in 2b (the same-provider constraint is enforced per loop).
   utilityModel: 'per-loop',
@@ -564,6 +570,14 @@ export function buildTalkerConfig(
   const basePrompt = appendRolePrompt(config.initialBasePrompt, TALKER_ROLE_PROMPT);
   if (basePrompt !== undefined) talker.initialBasePrompt = basePrompt;
   if (config.workingTags) talker.workingTags = config.workingTags;
+  // Per-loop, not reasoner-only (CONFIG_ROUTING contextWindowLimit): the
+  // same consumer number, clamped inside each loop against its own model
+  // window and the safe floor. The talker's context IS the conversation, so
+  // leaving it uncapped means the surface that grows fastest is the one the
+  // consumer's compaction budget never reaches.
+  if (config.contextWindowLimit !== undefined) {
+    talker.contextWindowLimit = config.contextWindowLimit;
+  }
 
   // Shared environment-level wiring.
   if (config.getApiKey) talker.getApiKey = config.getApiKey;
@@ -3254,10 +3268,19 @@ export class CortexAgent {
     return this.reasoner.getSessionId();
   }
 
+  /**
+   * Set the consumer's context-window limit on every resident loop
+   * (CONFIG_ROUTING contextWindowLimit: per-loop). Each loop clamps the same
+   * number against its own model window and the safe floor, so the talker's
+   * smaller fast-tier window is respected without the consumer knowing the
+   * split exists.
+   */
   setContextWindowLimit(limit: number | null): void {
     this.reasoner.setContextWindowLimit(limit);
+    this.talker?.setContextWindowLimit(limit);
   }
 
+  /** The configured limit. Identical on both loops; the clamp is per loop. */
   get contextWindowLimit(): number | null {
     return this.reasoner.contextWindowLimit;
   }
