@@ -29,6 +29,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Compiles the fenced TypeScript blocks in docs/cortex/consumer-guide.md
+      # against framework source. Deliberately not part of `npm run typecheck`,
+      # which the pre-commit hook runs: coupling every commit in every package
+      # to the guide compiling is a blast radius that gets the check disabled.
+      - name: Docs examples
+        run: npm run typecheck:docs
+
       - name: Test
         run: npm run test:run
 
