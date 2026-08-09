@@ -56,6 +56,7 @@ import type { WakeClass } from '../session-log.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
 import { BASH_ESCALATION_PERMISSION_NAME } from '../tools/bash/index.js';
 import type { CauseTag } from './cause-tags.js';
+import { stripAskFence } from './ask-fence.js';
 import { buildAskVoicing } from './prompts.js';
 
 // ---------------------------------------------------------------------------
@@ -273,6 +274,11 @@ function asTrimmedString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+/** Fence-strip an unvalidated tool argument, leaving non-strings alone. */
+function stripAskFenceFromReason(value: unknown): unknown {
+  return typeof value === 'string' ? stripAskFence(value) : value;
+}
+
 // ---------------------------------------------------------------------------
 // Broker
 // ---------------------------------------------------------------------------
@@ -461,7 +467,13 @@ export class PermissionBroker {
     }
     const askId = asTrimmedString(askIdRaw);
     const decisionText = asTrimmedString(decisionRaw)?.toLowerCase() ?? null;
-    const rawReason = asTrimmedString(reasonRaw);
+    // The reason is talker-authored and reaches the reasoner verbatim as the
+    // resolver's block reason, so it is a fence leak path. Sanitized once
+    // here at intake rather than at each use: the same string goes to the
+    // log and to the resolver, and a second copy of this rule is a second
+    // place for it to be forgotten. Strip before the cap, so the cap
+    // measures what is actually relayed.
+    const rawReason = asTrimmedString(stripAskFenceFromReason(reasonRaw));
     const reason = rawReason !== null && rawReason.length > MAX_REASON_CHARS
       ? rawReason.slice(0, MAX_REASON_CHARS)
       : rawReason;

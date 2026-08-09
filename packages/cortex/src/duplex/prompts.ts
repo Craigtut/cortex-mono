@@ -11,6 +11,8 @@
  * No em dashes in any copy (project writing style).
  */
 
+import { PERMISSION_REQUEST_TAG, stripAskFence } from './ask-fence.js';
+
 // ---------------------------------------------------------------------------
 // Talker role prompt
 // ---------------------------------------------------------------------------
@@ -192,16 +194,23 @@ export function composeDispatchMessage(
   return conversationBlock ? `${conversationBlock}\n\n${directive}` : directive;
 }
 
-/** Directive line for a spawn dispatch. */
+/**
+ * Directive line for a spawn dispatch. `instructions` is talker-authored
+ * and lands verbatim in the reasoner's context, so it is fence-stripped
+ * here at the builder rather than at the router call site: the builder is
+ * the point where talker text becomes reasoner-bound text, and every
+ * future dispatch path goes through it. `alias` is router-minted.
+ */
 export function buildSpawnDirective(alias: string, instructions: string): string {
-  return `[Directive] New task "${alias}": ${instructions}`;
+  return `[Directive] New task "${alias}": ${stripAskFence(instructions)}`;
 }
 
-/** Directive line for a steer dispatch. */
+/** Directive line for a steer dispatch. `message` is talker-authored. */
 export function buildSteerDirective(alias: string | null, message: string): string {
+  const safe = stripAskFence(message);
   return alias
-    ? `[Directive] Redirect for task "${alias}": ${message}`
-    : `[Directive] Redirect for the work in progress: ${message}`;
+    ? `[Directive] Redirect for task "${alias}": ${safe}`
+    : `[Directive] Redirect for the work in progress: ${safe}`;
 }
 
 /** Directive line for a cancel dispatch. */
@@ -353,8 +362,11 @@ export interface AskVoicingInput {
  * does with this text.
  */
 export function buildAskVoicing(input: AskVoicingInput): string {
-  const open = `<permission-request ask="${input.askId}">`;
-  const close = `</permission-request ask="${input.askId}">`;
+  // Tag name from ask-fence.ts, which also owns the stripper: a format
+  // change that reached only one of the two would leave a fence that still
+  // renders and no longer contains.
+  const open = `<${PERMISSION_REQUEST_TAG} ask="${input.askId}">`;
+  const close = `</${PERMISSION_REQUEST_TAG} ask="${input.askId}">`;
   const lines: string[] = [];
   if (input.revoiced) {
     lines.push('This permission request is still waiting on the user.');
