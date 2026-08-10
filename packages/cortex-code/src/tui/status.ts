@@ -6,6 +6,14 @@ export interface StatusBarState {
   mode: string;
   /** Number of modes the agent can run as. The mode badge is hidden while <= 1. */
   modeCount: number;
+  /**
+   * The Cortex facade mode in force ('passthrough' | 'duplex'). Badged only
+   * while duplex, because passthrough is what this CLI does unless asked
+   * otherwise, and a badge for the default state is noise. The badge's job is
+   * to let someone who passed `--duplex` (or set the config key months ago)
+   * see that it took.
+   */
+  agentMode: string;
   provider: string;
   model: string;
   contextTokenCount: number;
@@ -107,6 +115,7 @@ export class StatusBar implements Component {
   private state: StatusBarState = {
     mode: 'build',
     modeCount: 1,
+    agentMode: 'passthrough',
     provider: '',
     model: '',
     contextTokenCount: 0,
@@ -180,6 +189,7 @@ export class StatusBar implements Component {
     // exists, since there is nothing to choose between.
     const modeIcon = MODE_ICONS[s.mode] ?? DEFAULT_MODE_ICON;
     const modeBadge = s.modeCount > 1 ? `${modeIcon} ${s.mode}` : '';
+    const duplexBadge = s.agentMode === 'duplex' ? 'duplex' : '';
     const yoloBadge = s.yoloMode ? `${YOLO_ICON} YOLO` : '';
     const effortBadge = s.effortLevel && s.effortLevel !== 'off'
       ? `E:${s.effortLevel.charAt(0).toUpperCase() + s.effortLevel.slice(1)}`
@@ -198,20 +208,22 @@ export class StatusBar implements Component {
     // Try layouts from most detailed to most minimal. The sandbox badge is the
     // honesty surface ("am I contained right now"), so it outlives the effort,
     // branch, and mem segments and is only dropped just before the minimal
-    // layout on very narrow terminals.
+    // layout on very narrow terminals. The duplex badge goes with the effort
+    // badge: both describe how the session was configured, and neither is
+    // worth the width once the terminal is squeezed.
     const layouts = [
-      // Full: mode [YOLO] [effort] [sandbox] | provider/model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, sandboxBadge, modelStr, tokenStr, memStr, branchStr, width, mark),
-      // No provider: mode [YOLO] [effort] [sandbox] | model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, sandboxBadge, s.model, tokenStr, memStr, branchStr, width, mark),
-      // No effort badge: mode [YOLO] [sandbox] | model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, branchStr, width, mark),
+      // Full: mode [duplex] [YOLO] [effort] [sandbox] | provider/model    tokens  mem Xk ●    branch
+      () => this.layoutFull(modeBadge, duplexBadge, yoloBadge, effortBadge, sandboxBadge, modelStr, tokenStr, memStr, branchStr, width, mark),
+      // No provider: mode [duplex] [YOLO] [effort] [sandbox] | model    tokens  mem Xk ●    branch
+      () => this.layoutFull(modeBadge, duplexBadge, yoloBadge, effortBadge, sandboxBadge, s.model, tokenStr, memStr, branchStr, width, mark),
+      // No effort or duplex badge: mode [YOLO] [sandbox] | model    tokens  mem Xk ●    branch
+      () => this.layoutFull(modeBadge, '', yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, branchStr, width, mark),
       // No branch: mode [YOLO] [sandbox] | model    tokens  mem Xk ●
-      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, '', width, mark),
+      () => this.layoutFull(modeBadge, '', yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, '', width, mark),
       // No mem: mode [YOLO] [sandbox] | model    tokens
-      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, '', '', width, mark),
+      () => this.layoutFull(modeBadge, '', yoloBadge, '', sandboxBadge, s.model, tokenStr, '', '', width, mark),
       // No sandbox: mode [YOLO] | model    tokens
-      () => this.layoutFull(modeBadge, yoloBadge, '', '', s.model, tokenStr, '', '', width, mark),
+      () => this.layoutFull(modeBadge, '', yoloBadge, '', '', s.model, tokenStr, '', '', width, mark),
       // Minimal: mode    tokens
       () => this.layoutMinimal(modeBadge, tokenStr, width),
     ];
@@ -231,6 +243,7 @@ export class StatusBar implements Component {
 
   private layoutFull(
     modeBadge: string,
+    duplexBadge: string,
     yoloBadge: string,
     effortBadge: string,
     sandboxBadge: string,
@@ -244,6 +257,8 @@ export class StatusBar implements Component {
   ): string | null {
     const flags: string[] = [];
     if (modeBadge) flags.push(colors.bold(colors.primary(modeBadge)));
+    // Muted, like the effort badge: a fact about the session, not a warning.
+    if (duplexBadge) flags.push(colors.muted(duplexBadge));
     if (yoloBadge) flags.push(colors.bold(colors.accent(yoloBadge)));
     if (effortBadge) flags.push(colors.muted(effortBadge));
     if (sandboxBadge) flags.push(sandboxBadge); // pre-colored (state-dependent)

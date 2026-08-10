@@ -392,7 +392,11 @@ export async function createDuplexAgent(
     workingDirectory: '/tmp/cortex-code-duplex',
     initialBasePrompt: 'Test base prompt',
     ...config,
-    mode: 'duplex',
+    // Duplex unless the caller's own config already says so. A session that
+    // resolved its mode from the flag must reach create() carrying that mode,
+    // not have it substituted here; the throw below turns a session that
+    // resolved to passthrough into a loud failure rather than a silent pass.
+    mode: config.mode ?? 'duplex',
     duplex: {
       minDeliverySpacingMs: 0,
       idlePollMs: 5,
@@ -474,10 +478,11 @@ export async function createDuplexSession(
   overrides: Record<string, unknown> = {},
   agentConfig: Partial<CortexAgentConfig> = {},
 ): Promise<DuplexSession> {
-  const { session, internals } = makeSession(cwd, overrides);
-  // Readonly in TypeScript; what is under test is the behavior the flip would
-  // produce, not that the flip itself is currently allowed.
-  (internals as { agentMode: string }).agentMode = 'duplex';
+  // The `--duplex` flag, through the session's own resolution, rather than a
+  // write to the private field: the mode these tests run under is then the
+  // one a user gets, and the plumbing is under test on every duplex case in
+  // the suite rather than only in the one file that asserts on the flag.
+  const { session, internals } = makeSession(cwd, { duplex: true, ...overrides });
   const harness = await createDuplexAgent({
     ...internals.buildAgentConfig(),
     model: testModel(),

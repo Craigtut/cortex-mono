@@ -46,7 +46,7 @@ import { App, type AppCallbacks } from './tui/app.js';
 import { randomThinkingLabel } from './tui/spinner.js';
 import { selectListTheme } from './tui/theme.js';
 import { OverlayBox } from './tui/overlay-box.js';
-import { type CortexCodeConfig } from './config/config.js';
+import { resolveAgentMode, type CortexCodeConfig } from './config/config.js';
 import { CredentialStore, type CredentialEntry } from './config/credentials.js';
 import { singleFlight } from './utils/single-flight.js';
 import { resolveStoredOAuthApiKey } from './utils/oauth-credentials.js';
@@ -129,6 +129,11 @@ export interface SessionOptions {
   credentialStore: CredentialStore;
   cwd: string;
   yoloMode: boolean;
+  /**
+   * The `--duplex` / `--no-duplex` flag, or undefined when neither was passed.
+   * Undefined hands the decision to the `agentMode` config key.
+   */
+  duplex?: boolean | undefined;
   initialEffort: ThinkingLevel;
   initialUtilityModelId?: string | undefined;
   resumeSessionId: string | undefined;
@@ -252,17 +257,27 @@ export class Session {
 
   private readonly config: CortexCodeConfig;
   /**
-   * The Cortex facade mode this CLI runs, declared once so the pin in
-   * {@link buildAgentConfig} and every mode-dependent routing decision in
-   * this file cannot drift apart.
+   * The Cortex facade mode this session runs, resolved once at construction so
+   * the value handed to {@link buildAgentConfig} and every mode-dependent
+   * routing decision in this file cannot drift apart. Resolved once and never
+   * reassigned: the loops are assembled from it, so a mid-session change would
+   * leave the routing describing an agent that does not exist.
    *
-   * Pinned to passthrough rather than left to the facade default, which is
-   * duplex: a coding CLI is a typed, single-surface client with no talker to
-   * speak for it, and passthrough routes straight to the reasoner, so
-   * behavior matches the single loop this session drove before the facade.
-   * Turning cortex-code duplex is its own change, not a default it inherits.
+   * Defaults to passthrough rather than to the facade default, which is
+   * duplex. A coding CLI is a typed, single-surface client that streams the
+   * reasoner's tool calls live, so there is no dead air for a talker to fill,
+   * and duplex puts a second model and a paraphrase layer between a precisely
+   * typed instruction and the loop holding the tools. Passthrough routes
+   * straight to the reasoner and matches the single loop this session drove
+   * before the facade.
+   *
+   * Opting in (`--duplex`, or `"agentMode": "duplex"`) buys the thing that
+   * default costs: a session that can answer a question or take a correction
+   * while the reasoner is still working, rather than queueing it behind the
+   * task. That is a real trade, so it is a choice rather than a default, and
+   * a `--duplex` run is not a mistake. See `resolveAgentMode`.
    */
-  private readonly agentMode: NonNullable<CortexAgentConfig['mode']> = 'passthrough';
+  private readonly agentMode: NonNullable<CortexAgentConfig['mode']>;
   private readonly mode: Mode;
   private readonly model: CortexModel;
   private provider: string;
@@ -278,6 +293,7 @@ export class Session {
 
   constructor(options: SessionOptions) {
     this.config = options.config;
+    this.agentMode = resolveAgentMode(options.duplex, options.config.agentMode);
     this.mode = options.mode;
     this.model = options.model;
     this.provider = options.provider;
@@ -2414,14 +2430,17 @@ export class Session {
     return {
       // No `duplex.maxTotalCost`, and that is a decision rather than an
       // omission. The facade's aggregate guard is uncapped without it, so a
-      // duplex session would run two resident loops, sub-agents, lookups and
-      // doubled observational spend with no session ceiling. A ceiling is
-      // still the wrong answer here: this CLI sets no `budgetGuard.maxCost`
-      // either, so a session cap would be the only cost limit in the product
-      // and its effect would be a long coding session hard-stopping mid-task
-      // with no prior warning. Cost limits for a coding CLI want a warning
-      // tier before a stop, and that is a product decision, not a constant.
-      // Inert while the mode below is passthrough; revisit together with it.
+      // duplex session runs two resident loops, sub-agents, lookups and
+      // doubled observational spend with no session ceiling. Re-taken now
+      // that `--duplex` makes this reachable, and the answer did not change:
+      // this CLI sets no `budgetGuard.maxCost` either, so a session cap would
+      // be the only cost limit in the product, and its observable behavior
+      // would be a long coding session hard-stopping mid-task with no prior
+      // warning. Cost limits for a coding CLI want a warning tier before a
+      // stop, and that is a product decision, not a constant to pick here.
+      // The framework says so instead: `duplex-cost-cap-unset` is in the
+      // resolution report `/status` prints, so the ceiling's absence is
+      // visible without being enforced at a number nobody chose.
       mode: this.agentMode,
       model: this.model,
       utilityModel: 'default',
@@ -2464,6 +2483,7 @@ export class Session {
     this.app.updateStatus({
       mode: this.mode.name,
       modeCount: AVAILABLE_MODES.length,
+      agentMode: this.agentMode,
       provider: this.provider,
       model: this.modelId,
       contextTokenCount: this.getDisplayedCurrentContextTokens(),
@@ -2959,6 +2979,8 @@ export class Session {
     return this.agent?.getResolutionReport() ?? [];
   }
   getYoloMode(): boolean { return this.yoloMode; }
+  /** The facade mode in force, resolved at construction. See {@link agentMode}. */
+  getAgentMode(): NonNullable<CortexAgentConfig['mode']> { return this.agentMode; }
   getCompactionStrategy(): 'observational' | 'classic' { return this.compactionStrategy; }
   setYoloMode(enabled: boolean): void {
     this.yoloMode = enabled;

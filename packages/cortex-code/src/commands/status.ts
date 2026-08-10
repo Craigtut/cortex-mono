@@ -20,17 +20,30 @@ export const statusCommand: Command = {
     if (!app) return;
 
     const notes = session.getResolutionReport() as ResolutionNote[];
-    if (notes.length === 0) {
-      app.transcript.addNotification(
-        'Session Status',
-        'Everything resolved as configured.',
-      );
-      return;
-    }
+    const body = notes.length === 0
+      ? 'Everything resolved as configured.'
+      : notes.map(renderNote).join('\n\n');
 
-    app.transcript.addNotification('Session Status', notes.map(renderNote).join('\n\n'));
+    app.transcript.addNotification(
+      'Session Status',
+      `${renderAgentMode(session.getAgentMode())}\n\n${body}`,
+    );
   },
 };
+
+/**
+ * The shape of the session, stated plainly and always.
+ *
+ * The footer badges duplex and says nothing about passthrough, which is right
+ * for a persistent surface but leaves "did --duplex take?" answerable only by
+ * noticing an absence. Here it is answered outright, in both directions, and
+ * it doubles as the tell for an `agentMode` config value that did not parse.
+ */
+function renderAgentMode(mode: 'passthrough' | 'duplex'): string {
+  return mode === 'duplex'
+    ? 'Agent: duplex (talker fronting a persistent reasoner)'
+    : 'Agent: passthrough (single reasoner loop)';
+}
 
 /**
  * One note as three lines: what, why it matters, what to set. The framework

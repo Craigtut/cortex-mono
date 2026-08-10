@@ -14,88 +14,15 @@ const { version: PKG_VERSION } = require('../package.json');
  *   cortex --resume [session-id]    Resume last (or specific) session
  *   cortex --model <model>          Override default model
  *   cortex --yolo                   Start in YOLO mode (bypass permissions)
+ *   cortex --duplex                 Run the talker/reasoner duplex agent
  */
 
 import { PRIMARY_MODEL_DEFAULTS, ProviderManager, type ThinkingLevel } from '@animus-labs/cortex';
+import { parseArgs } from './cli-args.js';
 import { loadConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { runComplete } from './complete.js';
 import type { Session as CortexCodeSession } from './session.js';
-
-interface CliArgs {
-  resume: string | true | undefined;
-  model: string | undefined;
-  yolo: boolean;
-  compaction: 'observational' | 'classic' | undefined;
-  updateCheck: boolean;
-}
-
-function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { resume: undefined, model: undefined, yolo: false, compaction: undefined, updateCheck: true };
-
-  for (let i = 2; i < argv.length; i++) {
-    const arg = argv[i];
-    switch (arg) {
-      case '--resume':
-        args.resume = argv[i + 1] && !argv[i + 1]!.startsWith('--')
-          ? argv[++i]
-          : true;
-        break;
-      case '--model':
-        args.model = argv[++i];
-        break;
-      case '--compaction': {
-        const value = argv[++i];
-        if (value !== 'observational' && value !== 'classic') {
-          console.error(`Invalid compaction strategy: ${value}. Must be 'observational' or 'classic'.`);
-          process.exit(1);
-        }
-        args.compaction = value;
-        break;
-      }
-      case '--yolo':
-        args.yolo = true;
-        break;
-      case '--no-update-check':
-        args.updateCheck = false;
-        break;
-      case '--help':
-      case '-h':
-        printUsage();
-        process.exit(0);
-        break;
-      case '--version':
-      case '-v':
-        console.log(`cortex v${PKG_VERSION}`);
-        process.exit(0);
-        break;
-      default:
-        console.error(`Unknown argument: ${arg}`);
-        printUsage();
-        process.exit(1);
-    }
-  }
-
-  return args;
-}
-
-function printUsage(): void {
-  console.log(`
-cortex v${PKG_VERSION} - Terminal-based coding agent
-
-Usage:
-  cortex                                    Start interactive session
-  cortex-code                               Start interactive session
-  cortex complete [options] <prompt>        Run one lightweight completion
-  cortex --resume [session-id]              Resume last (or specific) session
-  cortex --model <model>                    Override default model
-  cortex --compaction <observational|classic>  Compaction strategy (default: observational)
-  cortex --yolo                             Start in YOLO mode
-  cortex --no-update-check                  Skip the startup check for newer versions
-  cortex --help                             Show this help
-  cortex --version                          Show version
-`.trim());
-}
 
 /**
  * Set once the interactive session exists, so the process-level crash and
@@ -110,7 +37,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const args = parseArgs(process.argv);
+  const args = parseArgs(process.argv, PKG_VERSION);
   const cwd = process.cwd();
 
   // Load config
@@ -226,6 +153,7 @@ async function main(): Promise<void> {
       credentialStore,
       cwd,
       yoloMode: args.yolo,
+      duplex: args.duplex,
       initialEffort,
       initialUtilityModelId,
       resumeSessionId,

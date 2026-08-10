@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import type { SandboxRung } from '@animus-labs/cortex';
+import type { CortexAgentMode, SandboxRung } from '@animus-labs/cortex';
 
 export interface CortexCodeConfig {
   /** Default model override. */
@@ -27,6 +27,12 @@ export interface CortexCodeConfig {
    * - 'off': never change the terminal title.
    */
   terminalTitle?: 'dynamic' | 'static' | 'off';
+  /**
+   * Cortex facade mode. Default: 'passthrough'. See {@link resolveAgentMode}
+   * for what each mode buys and why the default is not the framework's.
+   * Overridden for one session by `--duplex` / `--no-duplex`.
+   */
+  agentMode?: CortexAgentMode;
   /** Optional diagnostics for investigating TUI or prompt freezes. */
   diagnostics?: CortexCodeDiagnosticsConfig;
   /**
@@ -130,4 +136,28 @@ export async function loadConfig(cwd: string): Promise<CortexCodeConfig> {
     ...projectRest,
     ...(diagnostics ? { diagnostics } : {}),
   };
+}
+
+/**
+ * The Cortex facade mode one session runs: the `--duplex` / `--no-duplex`
+ * flag, else the `agentMode` config key, else passthrough.
+ *
+ * The default is deliberately not the framework's (duplex). A coding CLI
+ * streams the reasoner's tool calls live, so there is no dead air for a talker
+ * to fill, and duplex puts a second model and a paraphrase layer between a
+ * precisely typed instruction and the loop holding the tools. Duplex buys
+ * responsiveness while the reasoner is busy: a session that can answer a
+ * question or take a correction mid-task instead of queueing it. Worth opting
+ * into, not worth inheriting.
+ *
+ * Total by construction: an unrecognized config value resolves to the default
+ * rather than throwing at startup. `/status` names the mode actually in force,
+ * so a typo shows up there rather than as a silent surprise.
+ */
+export function resolveAgentMode(
+  flag: boolean | undefined,
+  configured: CortexCodeConfig['agentMode'],
+): CortexAgentMode {
+  if (flag !== undefined) return flag ? 'duplex' : 'passthrough';
+  return configured === 'duplex' ? 'duplex' : 'passthrough';
 }
