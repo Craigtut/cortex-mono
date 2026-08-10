@@ -34,7 +34,7 @@ export const EVAL_PROVIDER = defaultConfig.provider;
 export const EVAL_MODEL_ID = defaultConfig.modelId;
 
 // ---------------------------------------------------------------------------
-// Pi-ai dynamic imports (mirrors CortexAgent pattern)
+// Pi-ai dynamic imports (mirrors AgentLoop pattern)
 // ---------------------------------------------------------------------------
 
 interface PiAiModule {
@@ -76,7 +76,7 @@ export async function getEvalModel(providerName: string = DEFAULT_EVAL_PROVIDER)
 }
 
 // ---------------------------------------------------------------------------
-// Usage extraction (mirrors CortexAgent.extractUsageFromAssistantMessage)
+// Usage extraction (mirrors AgentLoop.extractUsageFromAssistantMessage)
 // ---------------------------------------------------------------------------
 
 function extractUsage(result: unknown): CortexUsage | null {

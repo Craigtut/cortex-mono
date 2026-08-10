@@ -28,10 +28,11 @@ Production-grade agent infrastructure built on `pi-agent-core`. Cortex wraps `@e
 
 ## The Cortex Package (`@animus-labs/cortex`)
 
-Two main exports, fully independent:
+Three main exports:
 
-- **`CortexAgent`**: The agentic loop, tools, context management, compaction, skills. Always-warm session, no cold/warm state machine.
-- **`ProviderManager`**: Provider discovery, OAuth flows, API key validation, model resolution. Wraps pi-ai's multi-provider ecosystem.
+- **`CortexAgent`**: The composite agent consumers interact with, and the entry point most consumers want. Owns the session log, persistence, and settlement, and routes to one or more `AgentLoop` instances. Defaults to duplex: a fast talker loop fronting a persistent reasoner. `mode: 'passthrough'` is the single-loop opt-out and the parity baseline. See `docs/cortex/cortex-agent.md` for the consumer surface and `docs/cortex/duplex/` for the design.
+- **`AgentLoop`**: The loop primitive. The agentic loop, tools, context management, compaction, skills. Always-warm session, no cold/warm state machine. Role-neutral by design: the same class runs as talker, reasoner, and sub-agent.
+- **`ProviderManager`**: Provider discovery, OAuth flows, API key validation, model resolution. Wraps pi-ai's multi-provider ecosystem. Independent of the other two.
 
 ### Key Design Patterns
 
@@ -125,6 +126,24 @@ refactor(cortex): extract provider registry into separate module
 - Keep the first line under 100 characters.
 - Always use `git commit -m "..."` with a single-line message.
 - Do not use branches. Commit directly to the working branch; never create feature branches.
+
+**Git safety:**
+- Never run a bare `git stash pop` or `git stash drop`. The stash may hold unrelated work-in-progress that is not yours, and a bare pop takes whichever entry happens to be on top. To set your own changes aside temporarily, copy the file instead, or use `git stash push -- <paths>` and pop that specific entry by name.
+- To check whether a test genuinely fails against pre-change code, revert only the source file (keep the test) with `git show HEAD:<path> > <path>` and restore it afterwards. Do not stash. **Only when the file is clean, and gate on it rather than eyeballing it.** Put `git diff --quiet -- <path> || { echo "dirty, use a worktree"; exit 1; }` in front of any mutate-then-restore sequence: if anything else is already modified there, the restore discards it. A printed warning is not enough, because the evidence arrives as one routine line in a wall of output and nobody reads those adversarially; two incidents on this branch happened with the tell already on screen. On a dirty file use a detached worktree (`git worktree add --detach <dir> HEAD`) and mutate there, so the shared tree is never touched. Note a stray file inside a worktree produces `TS2307` walls in worktree typechecks that look like branch failures.
+- **When more than one agent is working the repo, commit through a private index.** The shared index is global mutable state and the pre-commit hook holds it for the length of a full typecheck, so even `git add … && git commit` in one shell invocation leaves your content exposed for twenty-odd seconds, and any concurrent commit takes it. Both ordinary forms fail, differently: `git commit -- <path>` bypasses the index but commits the *worktree* content of that path, sweeping up another agent's in-flight edit to the same file; `git add` + `git commit` snapshots your file safely but exposes you to the shared index. Neither is safe alone. Instead:
+
+  ```bash
+  export GIT_INDEX_FILE=$(mktemp)
+  git read-tree HEAD && git add -- <paths>
+  tree=$(git write-tree)
+  commit=$(git commit-tree "$tree" -p HEAD -m "message")
+  git update-ref refs/heads/<branch> "$commit" HEAD   # compare-and-swap: fails if the branch moved
+  ```
+
+  The expected-old-value on `update-ref` is the load-bearing part: it fails loudly instead of racing. Two caveats: this bypasses the pre-commit hook, so run `npm run typecheck` and the affected tests yourself first; and it leaves the *shared* index still holding the pre-commit entry for those paths, so finish with `git reset -q HEAD -- <paths>` or they keep showing as modified and another agent's commit can revert them.
+- After every commit, check `git show --stat HEAD` against the size of the change you actually made. A commit that swept up a foreign hunk almost always has exactly the filenames you expected; the line counts are what give it away.
+- **Do not rewrite a commit once anything is on top of it.** A mislabeled commit is a documentation problem; the repair's blast radius is other people's commits. Record the correction instead. If a rewrite is genuinely necessary, it belongs to whoever can pause the branch.
+- **Never compute a parent as `HEAD^` on a shared branch.** Capture the full SHA you inspected and pass it explicitly. An agent doing surgery here read `HEAD^` moments after another commit landed, so the parent was one commit too new and the rewrite dropped an unrelated commit off the branch. The `update-ref` compare-and-swap passed, because the *old value* was current; it was the parent that was stale.
 
 ## Documentation
 

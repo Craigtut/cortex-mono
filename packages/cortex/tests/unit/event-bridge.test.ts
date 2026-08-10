@@ -634,6 +634,37 @@ describe('EventBridge', () => {
       expect(listener).toHaveBeenCalledTimes(1); // Not called again
     });
 
+    it('double unsubscribe is idempotent and scoped to its own forwarding', () => {
+      // The background completion continuation calls unsubForward in both
+      // its .then and .catch; a settled-then-failed delivery path can invoke
+      // it twice. The second call must be a no-op that cannot detach another
+      // task's forwarding.
+      const childA = new EventBridge(false);
+      const childASource = createMockSource();
+      childA.wire(childASource);
+      const childB = new EventBridge(false);
+      const childBSource = createMockSource();
+      childB.wire(childBSource);
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      const unsubA = bridge.forwardFrom(childA, 'sub-a');
+      bridge.forwardFrom(childB, 'sub-b');
+
+      unsubA();
+      expect(() => unsubA()).not.toThrow();
+
+      // sub-b's forwarding survives sub-a's double unsubscribe.
+      childBSource.emit({ type: 'tool_execution_start', toolCallId: 'b1', toolName: 'Y', args: {} });
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0][0].childTaskId).toBe('sub-b');
+
+      // And sub-a stays detached.
+      childASource.emit({ type: 'tool_execution_start', toolCallId: 'a1', toolName: 'X', args: {} });
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+
     it('forwards all event types from child', () => {
       const childBridge = new EventBridge(false);
       const childSource = createMockSource();
@@ -652,6 +683,85 @@ describe('EventBridge', () => {
       for (const call of allListener.mock.calls) {
         expect(call[0].childTaskId).toBe('sub-2');
       }
+    });
+
+    it('preserves a nested child origin as a path instead of overwriting it', () => {
+      // grandchild -> child -> this bridge. Before the path form, the second
+      // forward overwrote childTaskId and the inner origin was lost.
+      const childBridge = new EventBridge(false);
+      const grandchildBridge = new EventBridge(false);
+      const grandchildSource = createMockSource();
+      grandchildBridge.wire(grandchildSource);
+
+      childBridge.forwardFrom(grandchildBridge, 'task-42');
+      bridge.forwardFrom(childBridge, 'task-7');
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      grandchildSource.emit({
+        type: 'tool_execution_start',
+        toolCallId: 'gc-tc',
+        toolName: 'Read',
+        args: {},
+      });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0][0].childTaskId).toBe('task-7/task-42');
+    });
+
+    it('keeps a direct child origin as the bare task ID', () => {
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+      bridge.forwardFrom(childBridge, 'task-7');
+
+      childSource.emit({ type: 'tool_execution_start', toolCallId: 'c', toolName: 'A', args: {} });
+
+      expect(listener.mock.calls[0][0].childTaskId).toBe('task-7');
+    });
+  });
+
+  describe('forwardLoopFrom', () => {
+    it('labels a main-loop event with loopPath and leaves childTaskId unset', () => {
+      const loopBridge = new EventBridge(false);
+      const loopSource = createMockSource();
+      loopBridge.wire(loopSource);
+
+      const listener = vi.fn();
+      bridge.on('turn_start', listener);
+      bridge.forwardLoopFrom(loopBridge, 'talker');
+
+      loopSource.emit({ type: 'turn_start' });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.loopPath).toBe('talker');
+      // The child slot keeps meaning "came from a sub-agent"; a main-loop
+      // event must survive the `if (event.childTaskId) return;` idiom.
+      expect(event.childTaskId).toBeUndefined();
+    });
+
+    it('prefixes a child origin into loopPath while childTaskId keeps the bare id', () => {
+      const loopBridge = new EventBridge(false);
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+
+      loopBridge.forwardFrom(childBridge, 'task-7');
+      bridge.forwardLoopFrom(loopBridge, 'reasoner');
+
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+
+      childSource.emit({ type: 'tool_execution_start', toolCallId: 'c', toolName: 'A', args: {} });
+
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(event.loopPath).toBe('reasoner/task-7');
+      expect(event.childTaskId).toBe('task-7');
     });
   });
 });

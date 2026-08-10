@@ -21,7 +21,7 @@
  *   slots+history prefix; per-call ephemeral content stays after BP3.
  *
  * Shared by the agentic loop (transformContext + onPayload hooks in
- * cortex-agent.ts) and the direct completion endpoints (directComplete,
+ * agent-loop.ts) and the direct completion endpoints (directComplete,
  * structuredComplete, utilityComplete).
  *
  * Reference: context-manager.md

@@ -146,8 +146,8 @@ describe('McpClientManager', () => {
     mockClientClose.mockResolvedValue(undefined);
 
     manager = new McpClientManager();
-    manager.onSubprocessSpawned = (pid) => spawnedPids.push(pid);
-    manager.onSubprocessExited = (pid) => exitedPids.push(pid);
+    manager.addSubprocessSpawnedListener((pid) => spawnedPids.push(pid));
+    manager.addSubprocessExitedListener((pid) => exitedPids.push(pid));
   });
 
   afterEach(async () => {
@@ -1020,11 +1020,11 @@ describe('McpClientManager', () => {
       });
     });
 
-    it('forwards progress notifications to onToolCallProgress with serverName and toolName', async () => {
+    it('forwards progress notifications to progress listeners with serverName and toolName', async () => {
       const events: Array<{ serverName: string; toolName: string; progress: number; total?: number; message?: string }> = [];
-      manager.onToolCallProgress = (info) => {
+      manager.addToolCallProgressListener((info) => {
         events.push(info);
-      };
+      });
 
       // Capture the onprogress passed into callTool and invoke it manually
       // to simulate the SDK firing a progress notification.
@@ -1053,9 +1053,9 @@ describe('McpClientManager', () => {
     });
 
     it('does not propagate callback exceptions back into the tool call', async () => {
-      manager.onToolCallProgress = () => {
+      manager.addToolCallProgressListener(() => {
         throw new Error('consumer crashed');
-      };
+      });
 
       let capturedOnprogress: ((p: { progress: number }) => void) | undefined;
       mockCallTool.mockImplementationOnce(async (_params: unknown, _schema: unknown, options: { onprogress?: (p: { progress: number }) => void }) => {

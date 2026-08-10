@@ -111,6 +111,10 @@ export function buildCompactionConfig(
     config.strategy = partial.strategy;
   }
 
+  if (partial.nonBlocking !== undefined) {
+    config.nonBlocking = partial.nonBlocking;
+  }
+
   if (partial.observational !== undefined) {
     config.observational = partial.observational;
   }
@@ -172,7 +176,7 @@ export function computeAdaptiveThreshold(
  * CompactionManager orchestrates all three compaction layers.
  *
  * It is stateful: it tracks the current token count and the microcompaction
- * cache. The CortexAgent creates one instance and delegates all compaction
+ * cache. The AgentLoop creates one instance and delegates all compaction
  * decisions to it. Compaction is fully autonomous: all three layers run
  * inside applyInTransformContext(), which fires before every LLM call.
  */
@@ -215,7 +219,17 @@ export class CompactionManager {
    */
   private _providerCacheTtlMs = 0;
 
-  /** Consumer handlers for compaction lifecycle events. */
+  /**
+   * Consumer handlers for compaction lifecycle events. **These are the live
+   * ones.** `AgentLoop` used to declare four fields with identical names that
+   * were pushed to, reset, and never fired, because its `onBeforeCompaction`
+   * and friends register here and this is where they run. Those namesakes
+   * were deleted as dead storage; do not read a stale memory of that deletion
+   * as covering these. Grepping the names is what makes this confusable in
+   * both directions: it used to return a wall of live hits that made the dead
+   * fields look load-bearing, and it can now return these and make them look
+   * like leftovers.
+   */
   private beforeCompactionHandlers: BeforeCompactionHandler[] = [];
   private postCompactionHandlers: PostCompactionHandler[] = [];
   private compactionErrorHandlers: CompactionErrorHandler[] = [];
@@ -226,7 +240,7 @@ export class CompactionManager {
   /** Consecutive Layer 2 failure count for circuit breaker. Reset on success. */
   private _consecutiveLayer2Failures = 0;
 
-  /** LLM completion function, set by CortexAgent. */
+  /** LLM completion function, set by AgentLoop. */
   private completeFn: CompleteFn | null = null;
 
   /** Logger for compaction diagnostics. */
@@ -329,7 +343,7 @@ export class CompactionManager {
   /**
    * Set the active provider and cache retention. Resolves the effective
    * cache TTL from PROVIDER_CACHE_CONFIG and stores it for L1's cache-aware
-   * gating. Called by CortexAgent at construction, on provider changes, and
+   * gating. Called by AgentLoop at construction, on provider changes, and
    * on cache retention changes.
    *
    * @param provider - The active provider name (e.g., "anthropic", "openai")
@@ -487,7 +501,7 @@ export class CompactionManager {
   }
 
   /**
-   * Register a handler that receives the CompactionResult (for CortexAgent event emission).
+   * Register a handler that receives the CompactionResult (for AgentLoop event emission).
    */
   onCompactionResult(handler: (result: CompactionResult) => void): void {
     this.compactionResultHandlers.push(handler);
@@ -516,6 +530,20 @@ export class CompactionManager {
    */
   onTurnEnd(totalTokens: number, contextWindow: number, messages: AgentMessage[], slotCount: number): void {
     this.observationalEngine?.onTurnEnd(totalTokens, contextWindow, messages, slotCount);
+  }
+
+  /**
+   * Reconcile the observational buffer after the tail of the post-slot
+   * source history was trimmed (an aborted or failed run's stub, or a
+   * failed background delivery being unwound). Clamps the buffer watermark
+   * and any in-flight observer end index to the surviving source length so
+   * the next activation cannot slice away unobserved messages. No-op for
+   * the classic strategy.
+   *
+   * @param postSlotLength - post-slot source history length after the trim
+   */
+  onSourceHistoryTailTrimmed(postSlotLength: number): void {
+    this.observationalEngine?.onSourceHistoryTailTrimmed(postSlotLength);
   }
 
   /**
@@ -555,6 +583,22 @@ export class CompactionManager {
    */
   async triggerObservation(messages: AgentMessage[], slotCount: number): Promise<void> {
     await this.observationalEngine?.triggerObservation(messages, slotCount);
+  }
+
+  /**
+   * Run pending observation buffering outside a prompt (see
+   * ObservationalMemoryEngine.digestPendingBuffers). No-op under the
+   * classic strategy. Returns true when an observer call ran to completion;
+   * false also covers a wait that hit `observerTimeoutMs` (the digestion
+   * gives the gate back rather than blocking on a hung utility request).
+   */
+  async digestPendingObservationBuffers(
+    messages: AgentMessage[],
+    slotCount: number,
+    observerTimeoutMs?: number,
+  ): Promise<boolean> {
+    return this.observationalEngine?.digestPendingBuffers(messages, slotCount, observerTimeoutMs)
+      ?? false;
   }
 
   /**
@@ -639,8 +683,17 @@ export class CompactionManager {
    *
    * @param messages - The source messages array (mutated in place)
    * @param slotCount - Number of slot messages to skip at the start
+   * @param isStale - When provided and true, the pass has been abandoned
+   *   (digestIdle timed out and advanced the generation) and no further
+   *   mutation may land: the aggregate phase awaits a consumer
+   *   persistResult, and a pass hanging there could otherwise write a
+   *   stale message back at an index a later splice has changed.
    */
-  async applyInsertionCap(messages: AgentMessage[], slotCount: number): Promise<void> {
+  async applyInsertionCap(
+    messages: AgentMessage[],
+    slotCount: number,
+    isStale?: () => boolean,
+  ): Promise<void> {
     const config = this.microcompaction.getConfig();
 
     // Phase 1: Individual per-result cap
@@ -729,6 +782,10 @@ export class CompactionManager {
           } catch {
             replacement = applyBookend(info.text, config.bookendMaxChars, config.bookendMaxChars, info.tokens);
           }
+          // The await above is the pass's only suspension point: an
+          // abandoned pass settling here must not mutate live history it
+          // no longer owns.
+          if (isStale?.()) return;
         } else {
           replacement = applyBookend(info.text, config.bookendMaxChars, config.bookendMaxChars, info.tokens);
         }
@@ -738,6 +795,11 @@ export class CompactionManager {
         newParts[info.index] = { ...part, text: replacement };
       }
 
+      // Identity check before the write-back: if the slot no longer holds
+      // the message this pass read (a splice landed during the awaited
+      // persist), writing the capped copy would resurrect stale content at
+      // an unrelated index. Skipping is safe; the cap is an optimization.
+      if (messages[i] !== msg) continue;
       messages[i] = { ...msg, content: newParts };
     }
   }
@@ -749,7 +811,7 @@ export class CompactionManager {
   /**
    * Apply compaction layers to the context in transformContext.
    *
-   * This is the main entry point called from CortexAgent.getTransformContextHook().
+   * This is the main entry point called from AgentLoop.getTransformContextHook().
    * It is fully self-contained: all three compaction layers are integrated here,
    * triggered autonomously based on token thresholds. No external calls from
    * the backend are needed to trigger compaction.
@@ -767,6 +829,14 @@ export class CompactionManager {
    * @param setHistory - Function to set conversation history in the context
    * @param getSourceHistory - Function to get the original source transcript history (post-slot)
    * @param setSourceHistory - Function to replace the original source transcript history
+   * @param options - allowBlocking overrides the configured nonBlocking
+   *   posture for this call (an idle-digestion entry point runs the
+   *   synchronous work deliberately). Omitted: the config decides.
+   *   isStale reports whether the pass has been abandoned (a timed-out
+   *   digestIdle advanced the generation): a stale pass's history rewrite
+   *   is discarded by the owner's setSourceHistory guard, and this hook
+   *   suppresses the matching event dispatch, so a consumer never sees a
+   *   compaction or observation reported for a rewrite that never landed.
    * @returns Modified context with compacted history
    */
   async applyInTransformContext(
@@ -775,11 +845,18 @@ export class CompactionManager {
     setHistory: (ctx: AgentContext, history: AgentMessage[]) => AgentContext,
     getSourceHistory?: () => AgentMessage[],
     setSourceHistory?: (history: AgentMessage[]) => void,
+    options?: { allowBlocking?: boolean; isStale?: () => boolean },
   ): Promise<AgentContext> {
     if (this._contextWindow <= 0) {
       // contextWindow not set, skip compaction
       return context;
     }
+
+    // Non-blocking posture: no synchronous LLM call may run in-band. Only
+    // mechanical work (chunk activation, L1 trimming, L3 truncation) is
+    // allowed unless the caller explicitly re-enables blocking work.
+    const allowBlocking = options?.allowBlocking ?? !(this.config.nonBlocking ?? false);
+    const isStale = options?.isStale;
 
     let history = getHistory(context);
     if (history.length === 0) {
@@ -818,6 +895,7 @@ export class CompactionManager {
       // before they hit the LLM.
       context = await this.observationalEngine.applyInTransformContext(
         context, utilization, this.slotCount, getHistory, setHistory, getSourceHistory, setSourceHistory,
+        { allowSync: allowBlocking, ...(isStale ? { isStale } : {}) },
       );
       history = getHistory(context);
 
@@ -862,6 +940,7 @@ export class CompactionManager {
       });
 
       if (
+        allowBlocking &&
         this.completeFn &&
         getSourceHistory &&
         setSourceHistory &&
@@ -882,11 +961,26 @@ export class CompactionManager {
               this.completeFn,
               {
                 onBeforeCompaction: this.beforeCompactionHandlers,
-                onPostCompaction: this.postCompactionHandlers,
-                onCompactionError: this.compactionErrorHandlers,
+                // Post and error handlers are stale-guarded AT DISPATCH
+                // TIME: runCompaction fires them internally after its LLM
+                // call settles, which for an abandoned pass can be minutes
+                // after the owner discarded the rewrite, and a consumer
+                // must never see a compaction reported for a rewrite that
+                // never landed. onBeforeCompaction stays unguarded: it
+                // fires before the summarizer call, when the pass still
+                // owns the generation.
+                onPostCompaction: staleGuardHandlers(this.postCompactionHandlers, isStale),
+                onCompactionError: staleGuardHandlers(this.compactionErrorHandlers, isStale),
               },
               currentTokens, // pass actual full-context token count for accurate reporting
             );
+
+            // An abandoned pass settling late: its rewrite would be
+            // discarded by the owner's setSourceHistory guard anyway, so
+            // none of the success-path state (failure counters, the token
+            // count, the microcompaction cache, the result events) may be
+            // updated as if it landed.
+            if (isStale?.()) return context;
 
             // Success: update state and reset failure counter
             setSourceHistory(compactedSource);
@@ -923,6 +1017,10 @@ export class CompactionManager {
             succeeded = true;
             break;
           } catch (err) {
+            // A stale pass's failure is not the live loop's failure: it
+            // must not advance the failure ladder, trigger the L3 fallback
+            // events below, or burn retry waits inside an abandoned pass.
+            if (isStale?.()) return context;
             this._consecutiveLayer2Failures++;
             lastLayer2Error = err instanceof Error ? err : new Error(String(err));
             this.logger.warn('[Compaction] Layer2 retry failed', {
@@ -958,8 +1056,15 @@ export class CompactionManager {
       if (shouldTruncate(totalNow, failsafeWindow, this.config.failsafe.threshold)) {
         // Force sync observation before L3 truncation to capture unobserved
         // content before it is dropped. The source history from getSourceHistory
-        // is already post-slot, so pass 0 as slotCount.
-        if (this._strategy === 'observational' && this.observationalEngine && getSourceHistory) {
+        // is already post-slot, so pass 0 as slotCount. Skipped under the
+        // non-blocking posture: truncation must be the ONLY in-band path
+        // there, even at the cost of dropping unobserved content.
+        if (
+          allowBlocking &&
+          this._strategy === 'observational' &&
+          this.observationalEngine &&
+          getSourceHistory
+        ) {
           const sourceHistory = getSourceHistory();
           await this.observationalEngine.triggerObservation(sourceHistory, 0);
         }
@@ -1200,4 +1305,22 @@ export class CompactionManager {
     }
     return total;
   }
+}
+
+/**
+ * Wrap handler arrays so each handler checks pass staleness at DISPATCH
+ * time. runCompaction fires its handlers internally, after an LLM call that
+ * an abandoned digestion pass cannot cancel, so the guard must live inside
+ * the handler rather than around the call. Identity is preserved when no
+ * staleness source exists.
+ */
+function staleGuardHandlers<Args extends unknown[], R>(
+  handlers: Array<(...args: Args) => R>,
+  isStale: (() => boolean) | undefined,
+): Array<(...args: Args) => R | undefined> {
+  if (!isStale) return handlers;
+  return handlers.map((handler) => (...args: Args): R | undefined => {
+    if (isStale()) return undefined;
+    return handler(...args);
+  });
 }

@@ -15,12 +15,12 @@ Requires Node.js 24+.
 ## Quick Start
 
 ```typescript
-import { CortexAgent, ProviderManager } from '@animus-labs/cortex';
+import { AgentLoop, ProviderManager } from '@animus-labs/cortex';
 
 const providers = new ProviderManager();
 const model = await providers.resolveModel('anthropic', 'claude-sonnet-4-20250514');
 
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory: process.cwd(),
   initialBasePrompt: 'You are a helpful assistant.',
@@ -55,7 +55,7 @@ await agent.destroy();
 
 ## Main Exports
 
-- `CortexAgent` - Core agentic loop with context management
+- `AgentLoop` - Core agentic loop with context management
 - `ProviderManager` - Provider discovery, OAuth, and model resolution
 
 ## Design Principles

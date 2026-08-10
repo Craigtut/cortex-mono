@@ -64,7 +64,7 @@ export interface ToolSearchDetails {
 // ---------------------------------------------------------------------------
 
 export interface ToolSearchToolConfig {
-  /** The deferred tool registry shared with CortexAgent. */
+  /** The deferred tool registry shared with AgentLoop. */
   registry: DeferredToolRegistry;
   /**
    * Called after the registry is updated. The agent uses this to refresh

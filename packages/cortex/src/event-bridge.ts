@@ -29,10 +29,12 @@ import type {
   AgentTextOutput,
   CortexLogger,
   CortexUsage,
+  TalkerDeltaPayload,
   ToolCallStartPayload,
   ToolCallUpdatePayload,
   ToolCallEndPayload,
   ToolContentDetails,
+  UtilityUsagePayload,
 } from './types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { parseWorkingTags } from './working-tags.js';
@@ -51,7 +53,9 @@ export type CortexEventType =
   | 'response_end'
   | 'tool_call_start'
   | 'tool_call_update'
-  | 'tool_call_end';
+  | 'tool_call_end'
+  | 'utility_usage'
+  | 'talker_delta';
 
 /**
  * Normalized event data emitted by the event bridge.
@@ -63,23 +67,44 @@ export interface CortexEvent {
   /** Parsed text output, present only for turn_end events. */
   textOutput?: AgentTextOutput;
   /**
-   * Typed payload for tool events (tool_call_start, tool_call_update, tool_call_end).
-   * Provides typed access to tool event data without casting `data`.
+   * Typed payload for tool events (tool_call_start, tool_call_update,
+   * tool_call_end), utility_usage events, and the duplex facade's
+   * talker_delta events. Provides typed access without casting `data`.
    */
-  payload?: ToolCallStartPayload | ToolCallUpdatePayload | ToolCallEndPayload;
+  payload?:
+    | ToolCallStartPayload
+    | ToolCallUpdatePayload
+    | ToolCallEndPayload
+    | UtilityUsagePayload
+    | TalkerDeltaPayload;
   /**
-   * Extracted usage data from the LLM response, present on turn_end events.
-   * Centralizes extraction from pi-ai's AssistantMessage.usage structure so
-   * subscribers (BudgetGuard, CortexAgent, consumers) read typed data instead
+   * Extracted usage data from the LLM response, present on turn_end events
+   * (from pi-ai's AssistantMessage.usage) and on utility_usage events (from
+   * the direct/utility completion that was just recorded). Centralized so
+   * subscribers (BudgetGuard, AgentLoop, consumers) read typed data instead
    * of parsing the opaque `data` field themselves.
    */
   usage?: CortexUsage;
   /**
    * Present when this event originates from a child (sub-agent) event bridge.
-   * The value is the sub-agent's task ID, allowing consumers to route events
-   * to the correct UI component. Absent for parent agent events.
+   * For a direct child this is the sub-agent's task ID; for an event that was
+   * re-forwarded through intermediate bridges it is the path of IDs from this
+   * bridge down to the originating loop (e.g. 'task-7/task-42'), so nested
+   * origins are preserved instead of overwritten. Absent for parent agent
+   * events. Consumers routing per child should use the first path segment.
+   *
+   * This means "came from a sub-agent" and nothing else: a composite
+   * facade's merged stream labels resident-loop origin in `loopPath`, never
+   * here, so the long-standing `if (event.childTaskId) return;` consumer
+   * idiom keeps working against a duplex facade.
    */
   childTaskId?: string;
+  /**
+   * Loop-path label on a composite facade's merged stream ('talker',
+   * 'reasoner', 'reasoner/task-7' for a sub-agent of the reasoner). Absent
+   * on a loop's own bridge; set by {@link forwardLoopFrom}.
+   */
+  loopPath?: string;
 }
 
 /**
@@ -119,6 +144,31 @@ export interface PiEventSource {
 // ---------------------------------------------------------------------------
 // Event type mapping
 // ---------------------------------------------------------------------------
+
+/**
+ * Extract the streaming text delta from a response_chunk event's raw pi
+ * data. Pi-agent-core message_update events carry the delta inside
+ * `assistantMessageEvent` (type 'text_delta'); the fallbacks cover other
+ * provider shapes. Shared by the duplex facade's sanitized delta stream and
+ * available to consumers rendering raw chunks.
+ */
+export function extractResponseChunkText(data: unknown): string | null {
+  if (!data || typeof data !== 'object') return null;
+  const record = data as Record<string, unknown>;
+
+  const assistantEvent = record['assistantMessageEvent'] as Record<string, unknown> | undefined;
+  if (assistantEvent && assistantEvent['type'] === 'text_delta') {
+    const delta = assistantEvent['delta'];
+    if (typeof delta === 'string') return delta;
+  }
+
+  if (typeof record['text'] === 'string') return record['text'];
+  if (typeof record['delta'] === 'string') return record['delta'];
+  if (typeof record['content'] === 'string') return record['content'];
+  const delta = record['delta'] as Record<string, unknown> | undefined;
+  if (delta && typeof delta['text'] === 'string') return delta['text'];
+  return null;
+}
 
 const PI_TO_CORTEX_MAP: Partial<Record<PiEventType, CortexEventType>> = {
   agent_start: 'loop_start',
@@ -217,8 +267,12 @@ export class EventBridge {
    * Forward all events from a child agent's event bridge onto this bridge.
    *
    * Each forwarded event gets `childTaskId` set so consumers can distinguish
-   * parent events from child events. Returns an unsubscribe function that
-   * stops forwarding (call when the child agent completes or is destroyed).
+   * parent events from child events. An event that already carries a
+   * `childTaskId` (the child forwarded it from its own descendant) keeps it,
+   * prefixed with this child's ID, so the origin arrives as a path
+   * ('task-7/task-42') instead of being overwritten. Returns an unsubscribe
+   * function that stops forwarding (call when the child agent completes or
+   * is destroyed).
    *
    * @param childBridge - The child agent's EventBridge
    * @param childTaskId - The sub-agent task ID to tag forwarded events with
@@ -228,8 +282,63 @@ export class EventBridge {
     return childBridge.onAll((event) => {
       this.emit({
         ...event,
-        childTaskId,
+        childTaskId: event.childTaskId
+          ? `${childTaskId}/${event.childTaskId}`
+          : childTaskId,
       });
+    });
+  }
+
+  /**
+   * Forward all events from a resident loop's bridge onto this (merged
+   * facade) bridge, labeled with the loop's path in the event's own
+   * `loopPath` field. `childTaskId` is passed through untouched: it keeps
+   * meaning "this event came from a sub-agent", so a main-loop event
+   * arrives with `loopPath: 'reasoner'` and no childTaskId, while a
+   * sub-agent's arrives with `loopPath: 'reasoner/task-7'` and
+   * `childTaskId: 'task-7'`. Reusing the child slot for loop labels would
+   * silently kill the `if (event.childTaskId) return;` consumer idiom.
+   *
+   * @param loopBridge - The resident loop's EventBridge
+   * @param loopPath - The loop's path label ('talker', 'reasoner')
+   * @returns An unsubscribe function
+   */
+  forwardLoopFrom(loopBridge: EventBridge, loopPath: string): () => void {
+    return loopBridge.onAll((event) => {
+      this.emit({
+        ...event,
+        loopPath: event.childTaskId
+          ? `${loopPath}/${event.childTaskId}`
+          : loopPath,
+      });
+    });
+  }
+
+  /**
+   * Emit a utility_usage event for one direct/utility completion. Cortex
+   * calls this once per recorded completion; it also propagates to parent
+   * bridges through forwardFrom (with childTaskId set), exactly like pi
+   * events, so an aggregate consumer sees a subtree's utility spend.
+   */
+  emitUtilityUsage(category: string, usage: CortexUsage): void {
+    this.emit({
+      type: 'utility_usage',
+      usage,
+      payload: { category } satisfies UtilityUsagePayload,
+    });
+  }
+
+  /**
+   * Emit a sanitized talker-delta event (the duplex facade's voice-safe
+   * stream): text with working-tag content removed by holdback buffering,
+   * labeled with the conversation loop's path. Voice consumers subscribe to
+   * 'talker_delta' instead of routing raw response_chunk to TTS.
+   */
+  emitTalkerDelta(text: string, loopPath: string): void {
+    this.emit({
+      type: 'talker_delta',
+      loopPath,
+      payload: { text } satisfies TalkerDeltaPayload,
     });
   }
 

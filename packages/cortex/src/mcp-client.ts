@@ -148,6 +148,15 @@ function stringRecordEqual(a: Record<string, string>, b: Record<string, string>)
   return true;
 }
 
+/** Append a listener; the returned unsubscribe is idempotent. */
+function addListener<T>(listeners: T[], listener: T): () => void {
+  listeners.push(listener);
+  return () => {
+    const index = listeners.indexOf(listener);
+    if (index >= 0) listeners.splice(index, 1);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // McpClientManager
 // ---------------------------------------------------------------------------
@@ -155,22 +164,16 @@ function stringRecordEqual(a: Record<string, string>, b: Record<string, string>)
 export class McpClientManager {
   private connections = new Map<string, McpConnection>();
 
-  /**
-   * Callback invoked whenever the aggregate tool set changes.
-   * CortexAgent uses this to resync live tools after connect/disconnect/reconnect.
-   */
-  onToolsChanged?: () => void;
-
-  /**
-   * Callback invoked when a subprocess is spawned (for PID tracking).
-   * The consumer (CortexAgent) uses this to track PIDs for exit cleanup.
-   */
-  onSubprocessSpawned?: (pid: number) => void;
-
-  /**
-   * Callback invoked when a subprocess exits (for PID tracking).
-   */
-  onSubprocessExited?: (pid: number) => void;
+  // Listener ARRAYS, not single-slot callback fields: one manager (and its
+  // stdio subprocesses) can be shared across several loops plus a facade
+  // (docs/cortex/duplex/sub-agents.md "MCP and Shared Services"). With a
+  // single assignable field, the last loop to wire itself silently
+  // disconnects every other observer; with arrays, registration is additive
+  // and each registrant unsubscribes its own listener.
+  private readonly toolsChangedListeners: Array<() => void> = [];
+  private readonly subprocessSpawnedListeners: Array<(pid: number) => void> = [];
+  private readonly subprocessExitedListeners: Array<(pid: number) => void> = [];
+  private readonly toolCallProgressListeners: Array<(progress: McpToolCallProgress) => void> = [];
 
   /**
    * Consumer-set environment variable overrides that bypass the security blocklist.
@@ -183,26 +186,87 @@ export class McpClientManager {
    * Optional OS-level sandbox. When present and it implements wrapExec, each
    * stdio MCP server subprocess is wrapped so it runs inside the same OS
    * boundary as shell commands, enforcing denyRead over secrets. Without it a
-   * stdio server spawns uncontained and bypasses the sandbox. Set by CortexAgent
-   * from its config. HTTP transports are unaffected (no subprocess to contain).
+   * stdio server spawns uncontained and bypasses the sandbox. Set by the
+   * manager's owner (AgentLoop, or the facade for a shared manager). HTTP
+   * transports are unaffected (no subprocess to contain).
    */
   sandbox?: SandboxProvider;
 
+  /** Logger for MCP diagnostics. Set by the manager's owner. */
+  logger: CortexLogger = NOOP_LOGGER;
+
   /**
-   * Optional callback fired when an MCP server emits a
+   * Register a listener fired whenever the aggregate tool set changes.
+   * Loops use this to resync live tools after connect/disconnect/reconnect.
+   * Returns an unsubscribe function.
+   */
+  addToolsChangedListener(listener: () => void): () => void {
+    return addListener(this.toolsChangedListeners, listener);
+  }
+
+  /**
+   * Register a listener for subprocess spawns (PID tracking, so an owner's
+   * force-kill deadline and exit safety net cover MCP subprocesses).
+   * Returns an unsubscribe function.
+   */
+  addSubprocessSpawnedListener(listener: (pid: number) => void): () => void {
+    return addListener(this.subprocessSpawnedListeners, listener);
+  }
+
+  /** Register a listener for subprocess exits. Returns an unsubscribe. */
+  addSubprocessExitedListener(listener: (pid: number) => void): () => void {
+    return addListener(this.subprocessExitedListeners, listener);
+  }
+
+  /**
+   * Register a listener fired when an MCP server emits
    * `notifications/progress` during a long-running `tools/call`. The MCP
    * SDK's `resetTimeoutOnProgress` is enabled whenever a per-tool timeout is
    * configured, so a server that keeps emitting progress can stay alive past
    * the wall-clock window. Consumers wire this to whatever UI affordance
-   * they have ("still waiting…" banners, log lines).
-   *
-   * Failures inside the callback are swallowed so a buggy consumer cannot
-   * tear down an in-flight tool call.
+   * they have ("still waiting…" banners, log lines). Listener failures are
+   * swallowed so a buggy consumer cannot tear down an in-flight tool call.
+   * Returns an unsubscribe function.
    */
-  onToolCallProgress?: (progress: McpToolCallProgress) => void;
+  addToolCallProgressListener(listener: (progress: McpToolCallProgress) => void): () => void {
+    return addListener(this.toolCallProgressListeners, listener);
+  }
 
-  /** Logger for MCP diagnostics. Set by CortexAgent after construction. */
-  logger: CortexLogger = NOOP_LOGGER;
+  private emitToolsChanged(): void {
+    for (const listener of [...this.toolsChangedListeners]) {
+      try {
+        listener();
+      } catch (err) {
+        this.logger.warn('[MCP] toolsChanged listener threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  private emitSubprocessSpawned(pid: number): void {
+    for (const listener of [...this.subprocessSpawnedListeners]) {
+      try {
+        listener(pid);
+      } catch (err) {
+        this.logger.warn('[MCP] subprocessSpawned listener threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  private emitSubprocessExited(pid: number): void {
+    for (const listener of [...this.subprocessExitedListeners]) {
+      try {
+        listener(pid);
+      } catch (err) {
+        this.logger.warn('[MCP] subprocessExited listener threw', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
 
   /**
    * Connect to an MCP server and discover its tools.
@@ -241,7 +305,7 @@ export class McpClientManager {
     if (transport instanceof StdioClientTransport) {
       pid = transport.pid;
       if (pid != null) {
-        this.onSubprocessSpawned?.(pid);
+        this.emitSubprocessSpawned(pid);
       }
     }
 
@@ -258,7 +322,7 @@ export class McpClientManager {
         // Best-effort cleanup
       }
       if (pid != null) {
-        this.onSubprocessExited?.(pid);
+        this.emitSubprocessExited(pid);
       }
       throw new Error(`MCP tool discovery failed for "${serverName}": ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -281,7 +345,7 @@ export class McpClientManager {
 
     this.connections.set(serverName, connection);
     this.logger.info('[MCP] connected', { serverName, toolCount: tools.length, tools: tools.map(t => t.name) });
-    this.onToolsChanged?.();
+    this.emitToolsChanged();
   }
 
   /**
@@ -304,11 +368,11 @@ export class McpClientManager {
     }
 
     if (conn.pid != null) {
-      this.onSubprocessExited?.(conn.pid);
+      this.emitSubprocessExited(conn.pid);
     }
 
     this.connections.delete(serverName);
-    this.onToolsChanged?.();
+    this.emitToolsChanged();
   }
 
   /**
@@ -610,21 +674,21 @@ export class McpClientManager {
     // Capture the per-server timeout (if any). `resetTimeoutOnProgress` is
     // enabled whenever a timeout is configured so a server that emits regular
     // progress can outlive its wall-clock window. The execute closure below is
-    // an arrow function, so reads of `this.onToolCallProgress` stay in sync
-    // with whatever the consumer wires up after this wrapper is created.
+    // an arrow function, so reads of the progress listener array stay in sync
+    // with whatever consumers register after this wrapper is created.
     const toolTimeoutMs = serverConfig.toolTimeoutMs;
 
     return {
       name: namespacedName,
       description: mcpTool.description ?? '',
       parameters,
-      // Marks this tool as MCP-sourced so CortexAgent's deferred-tool
+      // Marks this tool as MCP-sourced so AgentLoop's deferred-tool
       // partitioning can identify it without rechecking by name prefix.
       isMcp: true,
       execute: async (args: unknown): Promise<unknown> => {
         try {
           const hasTimeout = typeof toolTimeoutMs === 'number' && toolTimeoutMs > 0;
-          const hasProgressCallback = this.onToolCallProgress !== undefined;
+          const hasProgressCallback = this.toolCallProgressListeners.length > 0;
           let result;
           if (hasTimeout || hasProgressCallback) {
             const callOptions: Parameters<typeof client.callTool>[2] = {};
@@ -641,13 +705,15 @@ export class McpClientManager {
                 };
                 if (progress.total !== undefined) payload.total = progress.total;
                 if (progress.message !== undefined) payload.message = progress.message;
-                try {
-                  this.onToolCallProgress?.(payload);
-                } catch (err) {
-                  this.logger.warn?.(
-                    `onToolCallProgress threw for ${namespacedName}`,
-                    { error: err instanceof Error ? err.message : String(err) },
-                  );
+                for (const listener of [...this.toolCallProgressListeners]) {
+                  try {
+                    listener(payload);
+                  } catch (err) {
+                    this.logger.warn?.(
+                      `onToolCallProgress listener threw for ${namespacedName}`,
+                      { error: err instanceof Error ? err.message : String(err) },
+                    );
+                  }
                 }
               };
             }
@@ -766,7 +832,7 @@ export class McpClientManager {
     conn.reconnectAttempts++;
 
     if (conn.pid != null) {
-      this.onSubprocessExited?.(conn.pid);
+      this.emitSubprocessExited(conn.pid);
       conn.pid = null;
     }
 
@@ -775,7 +841,7 @@ export class McpClientManager {
     if (conn.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       this.logger.error('[MCP] reconnect exhausted, deregistering', { serverName, maxAttempts: MAX_RECONNECT_ATTEMPTS });
       this.connections.delete(serverName);
-      this.onToolsChanged?.();
+      this.emitToolsChanged();
       return;
     }
 
@@ -812,7 +878,7 @@ export class McpClientManager {
       if (transport instanceof StdioClientTransport) {
         pid = transport.pid;
         if (pid != null) {
-          this.onSubprocessSpawned?.(pid);
+          this.emitSubprocessSpawned(pid);
         }
       }
 
@@ -834,14 +900,14 @@ export class McpClientManager {
       // Keep reconnectAttempts as-is (reset only on fresh connect)
 
       this.logger.info('[MCP] reconnected', { serverName, toolCount: tools.length });
-      this.onToolsChanged?.();
+      this.emitToolsChanged();
     } catch (err) {
       // Clean up resources from partial connection
       if (client) {
         try { await client.close(); } catch { /* best-effort */ }
       }
       if (pid != null) {
-        this.onSubprocessExited?.(pid);
+        this.emitSubprocessExited(pid);
       }
 
       this.logger.warn('[MCP] reconnect failed', { serverName, error: err instanceof Error ? err.message : String(err) });
@@ -849,7 +915,7 @@ export class McpClientManager {
       if (existing.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
         this.logger.error('[MCP] max reconnect attempts exceeded, deregistering', { serverName });
         this.connections.delete(serverName);
-        this.onToolsChanged?.();
+        this.emitToolsChanged();
       } else {
         // Schedule another attempt since transport.onclose may not fire
         this.attemptReconnect(serverName, config).catch((retryErr) => {

@@ -103,7 +103,7 @@ export function extractWorkingContent(text: string): string | null {
 /**
  * Parse text into structured AgentTextOutput with user-facing and working segments.
  *
- * This is the primary parsing function used by CortexAgent at turn completion.
+ * This is the primary parsing function used by AgentLoop at turn completion.
  * It combines stripWorkingTags and extractWorkingContent into a single result.
  *
  * @param text - Raw agent text potentially containing <working> tags
@@ -115,4 +115,116 @@ export function parseWorkingTags(text: string): AgentTextOutput {
     working: extractWorkingContent(text),
     raw: text,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Streaming filter (voice-safe deltas)
+// ---------------------------------------------------------------------------
+
+const OPEN_TAG = '<working>';
+const CLOSE_TAG = '</working>';
+
+/**
+ * Streaming working-tag filter with holdback buffering, for the duplex
+ * facade's sanitized talker-delta stream (review-findings F6): raw
+ * `response_chunk` deltas carry `<working>` content that TTS would speak
+ * aloud, and tags split across chunks at arbitrary positions, so consumers
+ * cannot strip them chunk-by-chunk themselves.
+ *
+ * Contract per assistant message (reset between messages):
+ * - `push(chunk)` returns the text safe to emit now. Text from any `<` is
+ *   HELD until disambiguated: released verbatim once it provably is not a
+ *   working tag, swallowed if it opens one.
+ * - Inside a working block, content is suppressed until `</working>`
+ *   closes it (a completed block emits one newline, matching
+ *   stripWorkingTags' sentinel so words on either side never jam together).
+ * - `flush()` at stream end releases a held prefix that never became a tag
+ *   (a trailing `<` IS emitted) and drops unterminated working content
+ *   (matching stripWorkingTags' unclosed-tag rule). flush() is synchronous
+ *   and unconditional: there is nothing to deadlock on when a close tag
+ *   never arrives, because nothing ever waits; text is merely held until
+ *   the next push or the flush.
+ *
+ * Whitespace differs slightly from the batch stripWorkingTags (which
+ * normalizes and trims whole messages); the invariants that matter for
+ * voice hold exactly: no working content is ever emitted, and all
+ * user-facing content is emitted by flush() time.
+ */
+export class WorkingTagStreamFilter {
+  private mode: 'text' | 'working' = 'text';
+  /**
+   * Held text. In text mode: an ambiguous prefix of `<working>` starting at
+   * its `<`. In working mode: an ambiguous prefix of `</working>` (kept
+   * only for matching; never emitted unless the close completes... it never
+   * is: close-tag prefixes are suppressed content if they diverge).
+   */
+  private hold = '';
+
+  /** Filter one raw delta; returns the text safe to emit now. */
+  push(chunk: string): string {
+    const input = this.hold + chunk;
+    this.hold = '';
+    let out = '';
+    let i = 0;
+    while (i < input.length) {
+      if (this.mode === 'text') {
+        const lt = input.indexOf('<', i);
+        if (lt === -1) {
+          out += input.slice(i);
+          break;
+        }
+        out += input.slice(i, lt);
+        const rest = input.slice(lt);
+        if (rest.startsWith(OPEN_TAG)) {
+          this.mode = 'working';
+          i = lt + OPEN_TAG.length;
+          continue;
+        }
+        if (OPEN_TAG.startsWith(rest)) {
+          // Ambiguous prefix at chunk end: hold until the next push or
+          // flush decides.
+          this.hold = rest;
+          break;
+        }
+        // Provably not the open tag: the '<' is literal text.
+        out += '<';
+        i = lt + 1;
+      } else {
+        const lt = input.indexOf('<', i);
+        if (lt === -1) break; // all suppressed
+        const rest = input.slice(lt);
+        if (rest.startsWith(CLOSE_TAG)) {
+          this.mode = 'text';
+          // The completed block collapses to one newline, matching
+          // stripWorkingTags' sentinel, so surrounding words stay separated.
+          out += '\n';
+          i = lt + CLOSE_TAG.length;
+          continue;
+        }
+        if (CLOSE_TAG.startsWith(rest)) {
+          this.hold = rest;
+          break;
+        }
+        i = lt + 1; // a literal '<' inside working content: suppressed
+      }
+    }
+    return out;
+  }
+
+  /**
+   * End of stream: release a held text-mode prefix that never became a tag
+   * (working-mode holds are suppressed content and are dropped, exactly as
+   * stripWorkingTags drops an unclosed block).
+   */
+  flush(): string {
+    const held = this.mode === 'text' ? this.hold : '';
+    this.hold = '';
+    return held;
+  }
+
+  /** Reset for the next assistant message. */
+  reset(): void {
+    this.mode = 'text';
+    this.hold = '';
+  }
 }

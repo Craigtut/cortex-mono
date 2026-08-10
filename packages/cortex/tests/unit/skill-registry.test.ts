@@ -399,4 +399,44 @@ Body.`);
       expect(all.map(e => e.name).sort()).toEqual(['skill-a', 'skill-b']);
     });
   });
+
+  describe('change listeners', () => {
+    it('fires every registered listener on add and remove (no last-writer-wins)', () => {
+      const fp = writeSkillFile('observed', `---
+name: observed
+description: X
+---
+Body.`);
+      const calls: string[] = [];
+      registry.addChangeListener(() => calls.push('a'));
+      registry.addChangeListener(() => calls.push('b'));
+
+      registry.addSkill({ path: fp, source: 'user' });
+      expect(calls).toEqual(['a', 'b']);
+
+      registry.removeSkill('observed');
+      expect(calls).toEqual(['a', 'b', 'a', 'b']);
+    });
+
+    it('unsubscribe removes only its own listener; a throwing listener does not silence others', () => {
+      const fp = writeSkillFile('observed-2', `---
+name: observed-2
+description: X
+---
+Body.`);
+      const calls: string[] = [];
+      const unsubThrower = registry.addChangeListener(() => {
+        throw new Error('observer bug');
+      });
+      registry.addChangeListener(() => calls.push('survivor'));
+
+      registry.addSkill({ path: fp, source: 'user' });
+      expect(calls).toEqual(['survivor']);
+
+      unsubThrower();
+      unsubThrower(); // idempotent
+      registry.removeSkill('observed-2');
+      expect(calls).toEqual(['survivor', 'survivor']);
+    });
+  });
 });

@@ -1,6 +1,6 @@
 # Duplex Architecture
 
-> **STATUS: DESIGN, NOT IMPLEMENTED**
+> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode (D14); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
 
 This folder documents the duplex restructure of Cortex: the migration from a single agentic loop to a composite agent with a fast conversational loop (the talker) fronting a persistent deep-work loop (the reasoner). The goal is sub-second first feedback to the user at all times, including while long-running agentic work is in flight, without losing any reasoning power underneath.
 
@@ -21,6 +21,7 @@ Consumers interact with one `CortexAgent`. Internally it runs two instances of t
 | [sub-agents.md](sub-agents.md) | Tier rules, quick lookups, parent-to-child steering, lifecycle and budgets |
 | [facade-api.md](facade-api.md) | Consumer-facing API: config, slots, tools, events, persistence, modes |
 | [migration-plan.md](migration-plan.md) | Phased build plan (P0 through P3), rollout, and the rename |
+| [review-findings.md](review-findings.md) | Pre-implementation review register: what two independent reviews found and how each is resolved |
 
 ## Design Anchors
 
@@ -32,4 +33,6 @@ The architecture follows the pattern the industry converged on during 2025-2026:
 - **Gemini Live API**: the `INTERRUPT` / `WHEN_IDLE` / `SILENT` result-scheduling vocabulary, adopted here as the wake policy.
 - **OpenAI Realtime API**: the documented pending-result hallucination failure mode, addressed here by grounding rules on the talker.
 
-Three internal audits of the existing codebase (public API surface, context pipeline, sub-agent coordination) shaped the mechanics; their constraints are folded into the relevant documents.
+Three internal audits of the existing codebase (public API surface, context pipeline, sub-agent coordination) shaped the mechanics; their constraints are folded into the relevant documents. Two further reviews (design-versus-code consistency, and an adversarial red-team) ran against the completed design before implementation; see review-findings.md.
+
+Work happens on the `duplex-restructure` branch.

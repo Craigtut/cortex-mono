@@ -169,7 +169,7 @@ Cortex reads the active cache TTL from `PROVIDER_CACHE_CONFIG` based on the curr
 | OpenAI | 10 minutes | 24 hours |
 | Google / Mistral / Azure | no caching (L1 runs freely) | no caching |
 
-The consumer's `CacheRetention` setting is set via `setCacheRetention()` on `CortexAgent` for the default retention level. For per-call overrides, `prompt()`, `directComplete()`, and `structuredComplete()` all accept `{ cacheRetention }` in their options parameter. This lets consumers use different retention levels for different call types (e.g., short retention for cheap thought-generation calls, long retention for expensive multi-turn agentic loops). CortexAgent automatically wires the effective retention (and the active provider) into `CompactionManager.setCacheInfo()`. The CompactionManager records `lastLlmCallTimestamp` automatically inside `updateCurrentContextTokenCount()`, so cache-coldness is computed without any consumer-side bookkeeping.
+The consumer's `CacheRetention` setting is set via `setCacheRetention()` on `AgentLoop` for the default retention level. For per-call overrides, `prompt()`, `directComplete()`, and `structuredComplete()` all accept `{ cacheRetention }` in their options parameter. This lets consumers use different retention levels for different call types (e.g., short retention for cheap thought-generation calls, long retention for expensive multi-turn agentic loops). AgentLoop automatically wires the effective retention (and the active provider) into `CompactionManager.setCacheInfo()`. The CompactionManager records `lastLlmCallTimestamp` automatically inside `updateCurrentContextTokenCount()`, so cache-coldness is computed without any consumer-side bookkeeping.
 
 **Result**:
 - During rapid tool calls (cache warm): L1 stays dormant. Tool results stay full. Cache hit rates maximized.
@@ -182,7 +182,7 @@ L1 caches trim decisions across consecutive calls when `(historyLength, utilizat
 
 #### Persistence model
 
-When a `persistResult` callback is configured (typically via the top-level `CortexAgentConfig.persistResult`, which propagates into `MicrocompactionConfig`), L1 saves the **full original content to disk** before any destructive trim action (bookend, placeholder, clear) for non-reproducible and computational tools. The in-context replacement includes the disk path so the agent can `Read` it back if needed.
+When a `persistResult` callback is configured (typically via the top-level `AgentLoopConfig.persistResult`, which propagates into `MicrocompactionConfig`), L1 saves the **full original content to disk** before any destructive trim action (bookend, placeholder, clear) for non-reproducible and computational tools. The in-context replacement includes the disk path so the agent can `Read` it back if needed.
 
 - `rereadable` tools: no persistence (agent can re-read source files directly)
 - `ephemeral` tools: no persistence (re-running is trivial)
@@ -212,7 +212,7 @@ interface MicrocompactionConfig {
   // Tool categorization
   toolCategories?: Record<string, 'rereadable' | 'non-reproducible' | 'ephemeral' | 'computational'>;
 
-  // Persistence (typically set at top-level CortexAgentConfig.persistResult)
+  // Persistence (typically set at top-level AgentLoopConfig.persistResult)
   persistResult?: PersistResultFn;
 
   // Aggregate budget enforcement
@@ -658,7 +658,7 @@ A successful Layer 2 compaction resets the consecutive failure counter.
 - `maxRetries`: number (default 3)
 - `retryDelayMs`: number (default 2000)
 
-**Events** (registered via `CortexAgent.onCompactionDegraded()` / `onCompactionExhausted()`):
+**Events** (registered via `AgentLoop.onCompactionDegraded()` / `onCompactionExhausted()`):
 - `onCompactionDegraded`: Layer 2 failed, Layer 3 was used as fallback
 - `onCompactionExhausted`: all compaction layers failed
 
@@ -670,7 +670,7 @@ The same `PersistResultFn` callback drives disk persistence in three places: the
 
 **Motivation:** Non-reproducible results (WebFetch, Bash, SubAgent) cannot be re-fetched. Truncating loses information; persistence to disk lets the agent Read the content back if it needs to reference it later in the same long-lived session. The persisted files also survive Layer 2 compaction, which replaces the source transcript entirely.
 
-**Recommended configuration** (top-level on `CortexAgentConfig`):
+**Recommended configuration** (top-level on `AgentLoopConfig`):
 - `persistResult`: `PersistResultFn` callback. The consumer implements the I/O and returns the file path. Cortex propagates this to the proactive interceptor and to `MicrocompactionConfig.persistResult` automatically.
 
 **Legacy configuration** (`MicrocompactionConfig.persistResult`):

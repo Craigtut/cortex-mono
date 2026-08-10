@@ -7,7 +7,7 @@
  *
  * The consumer can read provider, modelId, and contextWindow for
  * display and configuration. The underlying pi-ai Model object is
- * accessed internally by CortexAgent when constructing the
+ * accessed internally by AgentLoop when constructing the
  * pi-agent-core Agent.
  *
  * Reference: provider-manager.md
@@ -19,7 +19,7 @@
 
 /**
  * Opaque model handle. The consumer receives this from ProviderManager
- * and passes it to CortexAgent. The consumer never inspects its internals
+ * and passes it to AgentLoop. The consumer never inspects its internals
  * beyond the declared fields.
  *
  * Internally, this wraps pi-ai's Model<T> type.

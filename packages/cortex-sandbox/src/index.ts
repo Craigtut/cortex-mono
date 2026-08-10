@@ -11,7 +11,7 @@
  * Usage (platform-agnostic, recommended):
  *   const provider = createSandboxProvider({ onNetworkRequest });
  *   await provider.initialize(buildDefaultPolicy('workspace', { workspaceRoots: [cwd] }));
- *   const agent = await CortexAgent.create({ ..., sandbox: provider });
+ *   const agent = await AgentLoop.create({ ..., sandbox: provider });
  */
 export { SandboxRuntimeProvider } from './provider.js';
 export type { SandboxRuntimeProviderOptions } from './provider.js';

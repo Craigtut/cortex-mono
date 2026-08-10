@@ -51,9 +51,10 @@ function writeHooks(): void {
 
 /**
  * Build a Session with just enough injected state to run the trust gates.
- * Collaborators the constructor only stores are stubbed; `agent` exposes a real
- * SkillRegistry and `app` exposes the transcript/notification surface the gates
- * touch.
+ * Collaborators the constructor only stores are stubbed; `agent` exposes the
+ * facade's addSkill() over a real SkillRegistry (the session registers through
+ * the facade, not past it, so the fan-out set stays the facade's business) and
+ * `app` exposes the transcript/notification surface the gates touch.
  */
 function makeSession(): { session: Session; registry: SkillRegistry } {
   const registry = new SkillRegistry();
@@ -71,6 +72,7 @@ function makeSession(): { session: Session; registry: SkillRegistry } {
     resumeSessionId: undefined,
   });
   (session as unknown as { agent: unknown }).agent = {
+    addSkill: (config: Parameters<SkillRegistry['addSkill']>[0]) => registry.addSkill(config),
     getSkillRegistry: () => registry,
   };
   (session as unknown as { app: unknown }).app = {

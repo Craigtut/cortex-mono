@@ -35,7 +35,7 @@ The main agent never sees the raw page content. It only sees the summarization m
 
 ### Model Selection
 
-The summarization call uses the cortex **utility model** (see `model-tiers.md`). This is the cheap/fast model configured for internal operations. The consumer sets this at the `CortexAgent` level; WebFetch does not have its own model configuration.
+The summarization call uses the cortex **utility model** (see `model-tiers.md`). This is the cheap/fast model configured for internal operations. The consumer sets this at the `AgentLoop` level; WebFetch does not have its own model configuration.
 
 ### Caching
 
@@ -64,7 +64,7 @@ When a URL redirects to a different host, the tool returns the redirect URL and 
 ### Security
 
 - Validate URLs: reject `file://`, `data://`, and private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-- Network policy gate: when the consumer configures `CortexAgentConfig.resolveNetworkAccess`, every fetch first asks that single egress decision function (the same one the OS sandbox proxy consults for shell commands; see [sandboxing](../sandboxing.md)). A deny returns "Blocked by network policy: {host} is not allowed" without touching the network; a resolver failure also fails closed. The SSRF/private-IP guard above is separate and always on: a private target stays blocked even when the host is allowed. Without the callback, behavior is unchanged.
+- Network policy gate: when the consumer configures `AgentLoopConfig.resolveNetworkAccess`, every fetch first asks that single egress decision function (the same one the OS sandbox proxy consults for shell commands; see [sandboxing](../sandboxing.md)). A deny returns "Blocked by network policy: {host} is not allowed" without touching the network; a resolver failure also fails closed. The SSRF/private-IP guard above is separate and always on: a private target stays blocked even when the host is allowed. Without the callback, behavior is unchanged.
 - Set a reasonable request timeout (30 seconds)
 - Set a User-Agent header identifying the bot
 - Will fail for authenticated/private URLs (Google Docs, Confluence, Jira). The system prompt should direct the model to use MCP tools for authenticated services if available.
@@ -72,8 +72,8 @@ When a URL redirects to a different host, the tool returns the redirect URL and 
 ### Rate Limiting
 
 Cortex enforces a per-loop rate limit on WebFetch calls to prevent the agent from hammering sites:
-- Default: 20 fetches per agentic loop
-- Configurable via `CortexAgentConfig.webFetch.maxPerLoop`
+- Default: 300 fetches per agentic loop
+- Configurable via `AgentLoopConfig.webFetch.maxPerLoop`
 - Cached responses do not count against the limit
 
 ### Error Handling

@@ -6,13 +6,17 @@
 
 It does NOT contain application-specific logic (thoughts, emotions, decisions, persona). Those are concerns of the consumer (e.g., a heartbeat system or application-specific pipeline). Think of it as: pi-agent-core provides the bare agentic loop; cortex provides everything needed to wire that loop into real applications.
 
+Two agent surfaces are exported. `AgentLoop` is the loop primitive this document describes. `CortexAgent` is the composite facade over it (session log, composite persistence, settlement predicates) and the entry point most consumers want: it defaults to a duplex talker/reasoner pair, with `mode: 'passthrough'` as the single-loop opt-out. See [cortex-agent.md](cortex-agent.md) and [consumer-guide.md](consumer-guide.md).
+
 ## Package Structure
 
 ```
 packages/cortex/
   src/
     index.ts                    # Public API
-    cortex-agent.ts             # Wraps pi-agent-core Agent with production concerns
+    agent-loop.ts             # Wraps pi-agent-core Agent with production concerns
+    cortex-agent.ts             # Composite facade over AgentLoop (see cortex-agent.md)
+    session-log.ts              # Append-only session log owned by the facade
     context-manager.ts          # Slot-based context management
     provider-manager.ts         # Provider discovery, OAuth login/refresh, API key validation
     provider-registry.ts        # Static provider metadata and utility model defaults
@@ -66,7 +70,19 @@ These terms are intentionally not interchangeable. Session persistence is a cons
 There is no cold/warm/active state machine. A single `Agent` instance persists for the lifetime of the process. The system prompt is set once and rarely changes. Context is managed through two complementary mechanisms:
 
 1. **`ContextManager.setSlot()`**: Updates persistent context slots in `agent.state.messages`. Used for content that changes infrequently. Consumers define how many slots exist and what they contain.
-2. **`transformContext` hook**: Injects ephemeral per-call context that should NOT persist in `agent.state.messages`. In a managed `CortexAgent`, Cortex inserts consumer ephemeral content, background task state, and loaded skill instructions at the pre-prompt boundary. This keeps old history cacheable while keeping the current prompt as the final message.
+2. **`transformContext` hook**: Injects ephemeral per-call context that should NOT persist in `agent.state.messages`. In a managed `AgentLoop`, Cortex inserts consumer ephemeral content, background task state, loaded skill instructions, and an optional consumer-fed headline block at the pre-prompt boundary. This keeps old history cacheable while keeping the current prompt as the final message.
+
+By default, per-loop tool runtime state (working directory, read-before-edit registry, undo history) resets at every prompt. A long-lived loop that is woken repeatedly by deliveries can opt into `persistentRuntime: true` to keep that workspace state across prompts; transient per-loop state (the file mutation lock and the WebFetch rate-limit counter) still resets every prompt.
+
+### Delivery and Steering
+
+`prompt()` throws while a turn is running or queued, and `steer()` silently no-ops while the loop is idle. `deliver(content, { wake? })` closes that gap: it is a small state machine over the loop's run state that accepts a message in every state.
+
+- **Wake wanted (default), loop busy** (running, queued, in retry backoff, or in the end-of-cycle drain window): the content is **parked** on a loop-owned wake queue (`outcome: 'parked'`, no promise) and a sweep task is enqueued behind every gate task present at park time. The content opens the NEXT run, never the one in flight: a prompt that dequeues ahead of the sweep splices the parked list to the front of its message batch, and the sweep delivers whatever is still parked when it fires with a run of its own (so a parked delivery always ends in a run, even when every task ahead of it is a non-run task such as an idle digestion pass or an empty drain). Cortex owns wake parking end to end; the content never enters pi's steering queue, which belongs to the public `steer()` API alone and cannot be inspected or selectively drained. The cost is a bounded one-run delay for content arriving during a live run; the gain is exact delivery: nothing is duplicated and nothing is destroyed, on any interleaving. A carrying run that fails is unwound: whether the parked content rode a sweep run or the leading batch of a consumer prompt, a terminal failure that never progressed past the content splices it back out of the transcript and re-parks it for a sweep run of its own, so a delivery reported as `'parked'` always ends in a run that answers it (never silently demoted to inert context by a failed prompt). Re-parked content is bounded twice like the background drain's deliveries: an attempt cap, and an elapsed delivery budget that also caps each attempt's in-run retry ladder, so a sustained outage cannot hold the loop gate for retry ladders back-to-back. Content a failed run DID progress past stays as durable history the next successful run sees; re-parking it would duplicate it. Parked content is dropped by `abort()` (cancelled like the aborted turn) and by `destroy()`; inspect it via `pendingWakeDeliveryCount`. The abort drop is epoch-gated rather than tied to the live abort controller, so it also covers a delivery that parks while the abort itself is completing: even when pending background deliveries make `abort()` skip its gate wait, or a mid-abort drain replaces the aborted controller, content parked before the abort finished is dropped at its next take instead of riding a post-abort run.
+- **Wake wanted, loop idle**: a turn starts with the content as its prompt; `DeliverResult.turn` carries that turn's promise.
+- **`wake: false` (silent), any state**: the content is queued on the `AgentLoop` itself and flushed as leading user messages into the next real prompt's message batch. It never touches pi's steering queue (which drains into whatever run starts next, surfacing "silent" content as an unprompted response) and never flushes into a background-completion delivery run. Inspect and clear the queue via `queuedDeliveryCount` / `clearQueuedDeliveries()`; queued content is dropped at `destroy()`.
+
+Alongside `deliver()`, the loop surfaces pi's queue controls directly: `followUp(message)` (queued until a would-stop point: after the model produces what would otherwise be the run's final answer), `setSteeringQueueMode` / `setFollowUpQueueMode` (`'all' | 'one-at-a-time'`), and `clearSteeringQueue` / `clearFollowUpQueue` / `clearAllQueues` (the last also drops the silent delivery queue and parked wake deliveries, returning their content).
 
 ### The ContextManager
 
@@ -120,10 +136,10 @@ Built-in tools are native Cortex tools defined directly in Cortex. These run in-
 
 Mutable built-in tool state is scoped per agent runtime. That includes cwd tracking, read tracking, WebFetch loop counters/cache ownership, and background task ownership. Parent and child agents get fresh built-in tool instances so they do not share mutable closures.
 
-Built-in tools are registered automatically when `CortexAgent.create()` is called, using the `workingDirectory` from the agent config. The consumer does not need to create or pass tool instances. To exclude specific built-in tools, use the `disableTools` config option:
+Built-in tools are registered automatically when `AgentLoop.create()` is called, using the `workingDirectory` from the agent config. The consumer does not need to create or pass tool instances. To exclude specific built-in tools, use the `disableTools` config option:
 
 ```typescript
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   model,
   workingDirectory: cwd,
   disableTools: ['WebFetch', 'Bash'], // Exclude specific tools
@@ -134,7 +150,7 @@ Permissions are enforced through the `beforeToolCall` hook used for both built-i
 
 #### Dynamic Consumer Tool Management
 
-Consumer-provided tools (passed via `tools` in `CortexAgent.create()`) can be added and removed at runtime without restarting the agent:
+Consumer-provided tools (passed via `tools` in `AgentLoop.create()`) can be added and removed at runtime without restarting the agent:
 
 ```typescript
 // Add a tool dynamically (e.g., after a permission change enables it)
@@ -150,7 +166,7 @@ This complements the existing MCP dynamic lifecycle (connect/disconnect servers)
 
 #### Tool Result Persistence
 
-Every tool's output flows through a result-size interceptor at the registration boundary in `refreshTools()`. Oversized results (>25K tokens) are bookended (head + tail preview) and, when a `persistResult` callback is configured on `CortexAgentConfig`, persisted to disk with a file reference the agent can Read for the full content. This applies uniformly to built-in tools, MCP tools, and consumer-provided tools, with a small skip set (Read, Edit, Write, Glob) for tools that produce inherently bounded output. See [tool-result-persistence.md](tool-result-persistence.md) for the full design.
+Every tool's output flows through a result-size interceptor at the registration boundary in `refreshTools()`. Oversized results (>25K tokens) are bookended (head + tail preview) and, when a `persistResult` callback is configured on `AgentLoopConfig`, persisted to disk with a file reference the agent can Read for the full content. This applies uniformly to built-in tools, MCP tools, and consumer-provided tools, with a small skip set (Read, Edit, Write, Glob) for tools that produce inherently bounded output. See [tool-result-persistence.md](tool-result-persistence.md) for the full design.
 
 ### Schema Conversion (Zod -> TypeBox)
 
@@ -177,6 +193,10 @@ Pi-agent-core has no permission system. Cortex implements permissions via the `b
 
 The consumer provides the resolver; cortex provides the hook integration.
 
+Every resolver invocation receives a `ToolPermissionRequestContext` carrying the run's abort `signal` (dismiss the prompt when it fires; the answer is no longer consulted), a per-ask `askId` nonce (crypto-random, never reused), the asking loop's `loopPath`, and a verbatim `renderedRequest`: the permission name plus the actual command, path, pattern, or URL. Requests over a fixed cap keep their head and tail verbatim with an explicit `…[N chars elided]…` marker between them, never a summary, so a destructive suffix cannot hide behind a long benign prefix. The elided middle is still concealed, though: an over-cap rendering is not a full transcript of what will run, and a destructive segment can sit inside the elision. Surfaces presenting the ask to a human should show this text, and a surface that needs certainty about an over-cap request must read the tool call's own args rather than rely on the rendering.
+
+While a resolver call is pending, the ask is queryable: `getPendingAsks()` snapshots every ask currently blocked on a decision, for the loop and (mirrored) its spawned children, and `markAskVoiced(askId)` records that an ask was actually presented to the human. Entries disappear the moment an ask settles, however it settles (answered, blocked, or aborted). A consent broker should treat ask ids as security-relevant: bind an approval to the exact `askId` it was voiced for.
+
 ### Budget Guards
 
 Pi-agent-core has no limits on turns or cost.
@@ -185,6 +205,8 @@ Cortex provides optional, configurable guards. All default to unlimited (no enfo
 
 - **Max turns**: Count LLM turns via `turn_end` events. Default: `Infinity`. On breach, force-stop the loop.
 - **Max cost**: Track via `AssistantMessage.usage.cost.total`. Default: `Infinity`. On breach, force-stop the loop.
+- **Scope** (`budgetGuard.scope`): `'prompt'` (default) resets the counters at each prompt, so limits bound one logical turn. `'lifetime'` never resets them, so limits bound the loop's whole life; once breached, a lifetime guard aborts every further turn, including turns of later prompts. The mode for a resident loop prompted many times per session, where a per-prompt `maxCost` would never trip.
+- **Child usage** (`budgetGuard.includeChildUsage`): by default a loop's guard counts only its own turns; forwarded sub-agent events are skipped (each child has its own guard). Setting it true counts forwarded child turn usage too, which is the plumbing an aggregate guard needs to bound a loop plus everything it spawns.
 
 These are safety rails for runaway loops, not user-facing budget enforcement. Application-level budgeting (weekly/monthly spend limits, user-configurable caps) is the consumer's responsibility.
 
@@ -198,6 +220,11 @@ Cortex implements compaction in `transformContext` with two selectable strategie
 - **Classic** (`strategy: 'classic'`): Three-layer system with microcompaction (tool result trimming), LLM-based conversation summarization, and emergency truncation. See [compaction-strategy.md](./compaction-strategy.md).
 
 Both strategies preserve context slots untouched and use Layer 3 emergency truncation as a safety valve. The consumer selects the strategy via `compaction.strategy` in the agent config.
+
+Two controls exist for latency-sensitive loops:
+
+- **Non-blocking posture** (`compaction.nonBlocking: true`): no synchronous LLM call may run inside `transformContext`. Observational activation still consumes already-buffered chunks (instant), but the forced synchronous observer, the pre-truncation catch-up observation, and inline reflection are skipped (reflection swaps in a buffered result or launches asynchronously); under the classic strategy, in-band L2 summarization is skipped. Emergency truncation remains the only blocking in-band path.
+- **Idle digestion** (`digestIdle()`): runs pending observation buffering plus the threshold pass (activation, reflection, and classic summarization) OUTSIDE a prompt, with blocking work explicitly allowed even under the non-blocking posture. Serialized through the loop gate, so it can never race a running turn; an owner schedules it during idle windows so the multi-second calls happen while nobody is waiting. Both phases are bounded by `observerTimeoutMs` (default 60s): the observer catch-up waits time out (`observerRan: false`, the observer left in flight), and the blocking threshold pass (reflection, classic summarization) is raced against the same deadline, so a hung utility request in either phase times the digestion out instead of wedging the gate, which would otherwise make `prompt()` throw indefinitely and strand parked deliveries. A timed-out threshold pass is invalidated, not merely abandoned: nothing can cancel the hung call, so if it settles later (after the gate released and a real prompt appended messages), its history rewrite and its blocking-posture cleanup are discarded rather than applied over live state.
 
 ### Skill System
 
@@ -217,9 +244,9 @@ See **`skill-system.md`** for the full design: SKILL.md format, SkillRegistry, l
 
 When an agent runs multi-turn agentic loops, it generates intermediate text (reasoning, analysis, planning) mixed with user-facing text (acknowledgments, progress updates, final answers). Working tags let the agent wrap internal content in `<working>` XML tags. Text outside these tags is direct communication for the user. Both stay in conversation history; the difference is only in delivery.
 
-This feature is enabled by default and configurable via `CortexAgentConfig.workingTags.enabled`. When enabled, Cortex appends a "Response Delivery" section to its operational rules in the system prompt.
+This feature is enabled by default and configurable via `AgentLoopConfig.workingTags.enabled`. When enabled, Cortex appends a "Response Delivery" section to its operational rules in the system prompt. When disabled, the prompt stops mentioning the tags entirely: the Response Delivery section is dropped, the tool result reminder is not appended, and the Tool Usage section swaps to a variant that tells the model to withhold its reasoning rather than tag it.
 
-At the streaming level, Cortex passes raw text through with zero buffering. At turn completion, Cortex parses the complete text into a structured `AgentTextOutput` object with `userFacing`, `working`, and `raw` properties. The consumer decides per-channel what to deliver (e.g., SMS sends `userFacing` only; the frontend renders everything with working content dimmed).
+At the streaming level, Cortex passes raw text through with zero buffering. At turn completion, Cortex parses the complete text into a structured `AgentTextOutput` object with `userFacing`, `working`, and `raw` properties. Parsing only runs when the feature is enabled, so with it disabled `turn_end.textOutput` is left undefined and consumers must read the turn text themselves. The consumer decides per-channel what to deliver (e.g., SMS sends `userFacing` only; the frontend renders everything with working content dimmed).
 
 See **`working-tags.md`** for the full design: tag rules, system prompt guidance, event model, parsing utilities, consumer integration, and multi-layer response delivery framework.
 
@@ -277,6 +304,7 @@ Pi-agent-core emits 10 events across 4 scopes. Cortex normalizes these into a co
 
 **Additional notes:**
 
+- Cortex additionally emits one synthetic event of its own: `utility_usage`, fired once per direct/utility completion with the typed usage and a category tag (see Token Tracking below). It propagates through `forwardFrom` with `childTaskId` set, exactly like pi events.
 - Each pipeline phase (THOUGHT, AGENTIC LOOP, REFLECT) creates its own event session/scope for traceability. This allows log consumers to correlate events to a specific phase of the tick.
 - `thinking_start`/`thinking_end` are dropped. These were Claude SDK-specific events not present in pi-agent-core.
 - `turn_start` is available as a new event type (mapped from pi-agent-core's `turn_start` event).
@@ -302,13 +330,15 @@ Cortex tracks tokens through two complementary mechanisms:
 
 The heuristic is a duplicate of the same utility in `@animus-labs/shared` (4 lines), kept inline to avoid a dependency.
 
+**Utility usage accounting.** Direct and utility completions (observer, reflector, L2 summarization, WebFetch summarization, Bash safety classification, and consumer `directComplete` / `structuredComplete` / `utilityComplete` calls) are accounted per loop, not just stashed for `getLastDirectUsage()`. Each completion is recorded under a category tag: Cortex tags its internal calls (`observer`, `reflector`, `summarization`, `webfetch`, `bash_utility`); consumer calls default to their entry point (`direct`, `structured`, `utility`) or pass `usageCategory` explicitly. The spend rolls into `getSessionUsage()` (top-level totals plus a per-category `utility` breakdown, persisted and restored with the rest of session usage) and each completion emits a `utility_usage` event on the event bridge, carrying the typed usage and its category. Forwarded child events roll into the parent's totals exactly like child turn usage, so an aggregate consumer sees a subtree's whole spend.
+
 ## Lifecycle
 
 Pi-agent-core's `Agent` class has no `destroy()` or `dispose()` method. It provides `abort()` (cancels the running loop via AbortController), `waitForIdle()` (resolves when the loop finishes), and `reset()` (clears message history and queues). But there is no instance-level cleanup: event listeners are never auto-removed, and the Agent holds references to callbacks and message arrays indefinitely.
 
 Cortex wraps this with explicit lifecycle management.
 
-### `CortexAgent.destroy()`
+### `AgentLoop.destroy()`
 
 Ordered cleanup of all resources. Called by the consumer when the agent is no longer needed (e.g., during application shutdown or pipeline teardown).
 
@@ -353,7 +383,7 @@ async destroy(): Promise<void> {
 }
 ```
 
-### `CortexAgent.abort()`
+### `AgentLoop.abort()`
 
 Cancel the current agentic loop without destroying the agent. The agent remains usable for subsequent prompts.
 
@@ -398,7 +428,7 @@ CREATED → ACTIVE → DESTROYED
                 └── abort() returns to ACTIVE (agent still usable)
 ```
 
-- **CREATED**: After `await CortexAgent.create(config)`. Slots can be set, but no loops have run.
+- **CREATED**: After `await AgentLoop.create(config)`. Slots can be set, but no loops have run.
 - **ACTIVE**: After the first `prompt()` call. The agent is running or idle between prompts.
 - **DESTROYED**: After `destroy()`. All resources released. Any `prompt()` call throws.
 

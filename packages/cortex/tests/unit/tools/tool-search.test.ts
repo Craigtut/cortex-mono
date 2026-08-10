@@ -6,9 +6,9 @@ import {
   TOOL_SEARCH_TOOL_NAME,
 } from '../../../src/tools/tool-search/index.js';
 import type { CortexTool } from '../../../src/tool-contract.js';
-import { CortexAgent } from '../../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../../src/cortex-agent.js';
-import type { CortexAgentConfig } from '../../../src/types.js';
+import { AgentLoop } from '../../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../../src/agent-loop.js';
+import type { AgentLoopConfig } from '../../../src/types.js';
 import { wrapModel } from '../../../src/model-wrapper.js';
 
 // ---------------------------------------------------------------------------
@@ -298,7 +298,7 @@ describe('createToolSearchTool', () => {
 });
 
 // ---------------------------------------------------------------------------
-// CortexAgent integration
+// AgentLoop integration
 // ---------------------------------------------------------------------------
 
 function createMinimalPiAgent(): PiAgent {
@@ -318,7 +318,7 @@ function createMinimalPiAgent(): PiAgent {
   return agent as unknown as PiAgent;
 }
 
-function buildConfig(overrides: Partial<CortexAgentConfig> = {}): CortexAgentConfig {
+function buildConfig(overrides: Partial<AgentLoopConfig> = {}): AgentLoopConfig {
   const rawModel = { provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel;
   return {
     model: wrapModel(rawModel, rawModel.provider, rawModel.name, 200_000),
@@ -333,19 +333,19 @@ function buildConfig(overrides: Partial<CortexAgentConfig> = {}): CortexAgentCon
 
 function constructAgent(
   pi: PiAgent,
-  config: CortexAgentConfig,
+  config: AgentLoopConfig,
   tools: CortexTool[] = [],
-): CortexAgent {
-  const Ctor = CortexAgent as unknown as new (
+): AgentLoop {
+  const Ctor = AgentLoop as unknown as new (
     a: PiAgent,
-    c: CortexAgentConfig,
+    c: AgentLoopConfig,
     t: CortexTool[] | undefined,
     o: { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean },
-  ) => CortexAgent;
+  ) => AgentLoop;
   return new Ctor(pi, config, tools, { enableSubAgentTool: false, enableLoadSkillTool: false });
 }
 
-describe('CortexAgent integration with deferred tools', () => {
+describe('AgentLoop integration with deferred tools', () => {
   it('does not register ToolSearch when deferredTools.enabled is false', () => {
     const pi = createMinimalPiAgent();
     constructAgent(pi, buildConfig());

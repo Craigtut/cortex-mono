@@ -1,50 +1,66 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
+/**
+ * CortexAgent facade skeleton (docs/cortex/duplex/facade-api.md):
+ * passthrough mode routing, the duplex not-implemented guard, config
+ * routing completeness, session log wiring with causation stamps,
+ * append-then-emit ordering, abort scope semantics, and the settlement
+ * predicates built on loop-gate depth.
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
-import type { CortexAgentConfig } from '../../src/types.js';
+import type { AgentLoopConfig, SubAgentResult, TrackedSubAgent } from '../../src/types.js';
+import type { AgentMessage } from '../../src/context-manager.js';
+import type { CortexTool } from '../../src/tool-contract.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
-import { DEFAULT_TOOL_THRESHOLDS, MAX_RESULT_TOKENS } from '../../src/tool-result-persistence.js';
-import { fromPiAgentTool } from '../../src/tool-contract.js';
-import type { CortexTool } from '../../src/tool-contract.js';
+import {
+  CortexAgent,
+  CONFIG_ROUTING,
+  AGENT_LOOP_DELEGATION,
+  buildReasonerConfig,
+} from '../../src/cortex-agent.js';
+import type { CortexAgentConfig, ForwardedLoopMember } from '../../src/cortex-agent.js';
 
 // ---------------------------------------------------------------------------
-// Mock PiAgent factory
+// Mock PiAgent (holdable runs, steering/follow-up queues), the shared shape
+// used across agent-loop unit tests.
 // ---------------------------------------------------------------------------
 
-interface MockPiAgent extends PiAgent {
-  /** Manually emit a pi-agent-core event */
+interface FacadeMockPiAgent extends PiAgent {
   emitEvent: (event: PiEvent) => void;
-  /** Track whether abort was called */
-  abortCalled: boolean;
-  /** Track whether reset was called */
-  resetCalled: boolean;
-  /** Control what agent.prompt() returns or throws */
-  promptResult: unknown;
-  promptError: Error | null;
+  promptCalls: Array<string | AgentMessage[]>;
+  steeringQueue: Array<{ role: string; content: string }>;
+  followUpQueue: Array<{ role: string; content: string }>;
+  clearSteeringQueueCalls: number;
+  clearFollowUpQueueCalls: number;
+  /** When true, the next run pauses until releaseRun() is called. */
+  hold: boolean;
+  /** When set, the next run throws this error after starting. */
+  failWith: Error | null;
+  releaseRun: () => void;
 }
 
-function createMockPiAgent(options?: {
-  runResult?: unknown;
-  runError?: Error | null;
-}): MockPiAgent {
+function createMockPiAgent(): FacadeMockPiAgent {
   let eventHandler: ((event: PiEvent) => void) | null = null;
+  let releaseRun: (() => void) | null = null;
+  let rejectRun: ((err: Error) => void) | null = null;
   let idleResolve: (() => void) | null = null;
-  // Mirrors pi-agent-core: waitForIdle() resolves immediately when no run is
-  // active, and only pends (until the run finishes or aborts) while one is.
   let running = false;
 
-  const agent: MockPiAgent = {
+  const agent: FacadeMockPiAgent = {
     state: {
       messages: [],
       systemPrompt: '',
       tools: [],
     },
-    abortCalled: false,
-    resetCalled: false,
-    promptResult: options?.runResult ?? { content: 'Mock response' },
-    promptError: options?.runError ?? null,
+    promptCalls: [],
+    steeringQueue: [],
+    followUpQueue: [],
+    clearSteeringQueueCalls: 0,
+    clearFollowUpQueueCalls: 0,
+    hold: false,
+    failWith: null,
 
     subscribe(handler: (event: PiEvent) => void): () => void {
       eventHandler = handler;
@@ -54,36 +70,57 @@ function createMockPiAgent(options?: {
     },
 
     emitEvent(event: PiEvent): void {
-      if (eventHandler) {
-        eventHandler(event);
-      }
+      eventHandler?.(event);
     },
 
-    async prompt(input: string): Promise<unknown> {
+    async prompt(input: string | AgentMessage[]): Promise<unknown> {
+      agent.promptCalls.push(input);
       running = true;
       try {
-        // Emit agent_start
         agent.emitEvent({ type: 'agent_start' });
+        const messages: AgentMessage[] = Array.isArray(input)
+          ? input
+          : [{ role: 'user', content: input, timestamp: Date.now() }];
+        agent.state.messages.push(...messages);
+        agent.state.messages.push(...(agent.steeringQueue.splice(0) as AgentMessage[]));
 
-        if (agent.promptError) {
-          // Emit agent_end before throwing
-          agent.emitEvent({ type: 'agent_end' });
-          throw agent.promptError;
+        if (agent.hold) {
+          agent.hold = false;
+          await new Promise<void>((resolve, reject) => {
+            releaseRun = resolve;
+            rejectRun = reject;
+          });
         }
 
-        // Simulate a turn
-        agent.emitEvent({ type: 'turn_start' });
+        if (agent.failWith) {
+          const err = agent.failWith;
+          agent.failWith = null;
+          (agent.state as Record<string, unknown>)['errorMessage'] = err.message;
+          throw err;
+        }
+        delete (agent.state as Record<string, unknown>)['errorMessage'];
+
+        agent.state.messages.push(...(agent.followUpQueue.splice(0) as AgentMessage[]));
+
         agent.emitEvent({
           type: 'turn_end',
-          text: typeof agent.promptResult === 'string'
-            ? agent.promptResult
-            : 'Mock response text',
+          text: 'ok',
+          usage: {
+            input: 100,
+            output: 20,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 120,
+            cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
+          },
         });
-
-        // Emit agent_end
+        agent.state.messages.push({
+          role: 'assistant',
+          content: 'ok',
+          timestamp: Date.now(),
+        });
         agent.emitEvent({ type: 'agent_end' });
-
-        return agent.promptResult;
+        return { content: 'ok' };
       } finally {
         running = false;
         idleResolve?.();
@@ -91,16 +128,28 @@ function createMockPiAgent(options?: {
       }
     },
 
+    releaseRun(): void {
+      releaseRun?.();
+      releaseRun = null;
+      rejectRun = null;
+    },
+
+    async continue(): Promise<unknown> {
+      throw new Error('not used in these tests');
+    },
+
     abort(): void {
-      agent.abortCalled = true;
-      if (idleResolve) {
-        idleResolve();
-        idleResolve = null;
+      // Like real pi: aborting a held run fails it.
+      if (rejectRun) {
+        const err = new Error('Request was aborted.');
+        err.name = 'AbortError';
+        rejectRun(err);
       }
+      releaseRun = null;
+      rejectRun = null;
     },
 
     async waitForIdle(): Promise<void> {
-      // Resolve immediately when idle (matches pi's activeRun == null path).
       if (!running) return;
       return new Promise<void>((resolve) => {
         idleResolve = resolve;
@@ -108,1872 +157,1050 @@ function createMockPiAgent(options?: {
     },
 
     reset(): void {
-      agent.resetCalled = true;
       agent.state.messages = [];
+    },
+
+    steer(message: { role: string; content: string }): void {
+      agent.steeringQueue.push(message);
+    },
+
+    followUp(message: { role: string; content: string }): void {
+      agent.followUpQueue.push(message);
+    },
+
+    clearSteeringQueue(): void {
+      agent.clearSteeringQueueCalls += 1;
+      agent.steeringQueue = [];
+    },
+
+    clearFollowUpQueue(): void {
+      agent.clearFollowUpQueueCalls += 1;
+      agent.followUpQueue = [];
+    },
+
+    hasQueuedMessages(): boolean {
+      return agent.steeringQueue.length > 0 || agent.followUpQueue.length > 0;
     },
   };
 
   return agent;
 }
 
-type TestCortexAgentConstructor = new (
+type TestAgentLoopConstructor = new (
   agent: PiAgent,
+  config: AgentLoopConfig,
+) => AgentLoop;
+
+type TestCortexAgentConstructor = new (
+  reasoner: AgentLoop,
   config: CortexAgentConfig,
-  tools?: CortexTool[],
-  options?: {
-    enableSubAgentTool?: boolean;
-    enableLoadSkillTool?: boolean;
-  },
 ) => CortexAgent;
 
-function createTestCortexAgent(
-  agent: PiAgent,
-  config: CortexAgentConfig,
-  tools?: CortexTool[],
-  options?: {
-    enableSubAgentTool?: boolean;
-    enableLoadSkillTool?: boolean;
-  },
-): CortexAgent {
-  const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
-  return new CortexAgentCtor(agent, config, tools, options);
+function testModel(): CortexModel {
+  return wrapModel(
+    { provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel,
+    'anthropic',
+    'claude-sonnet-4-20250514',
+  );
 }
 
-function makeModel(raw: PiModel): CortexModel {
-  const rawRecord = raw as Record<string, unknown>;
-  const modelId = typeof rawRecord['id'] === 'string'
-    ? rawRecord['id']
-    : typeof raw.name === 'string'
-      ? raw.name
-      : 'test-model';
-  const contextWindow = typeof raw.contextWindow === 'number' ? raw.contextWindow : undefined;
-  return wrapModel(raw, raw.provider, modelId, contextWindow);
-}
-
-function normalizeModel(model: PiModel | CortexModel): CortexModel {
-  const asRecord = model as Record<string, unknown>;
-  return asRecord['__brand'] === 'CortexModel'
-    ? model as CortexModel
-    : makeModel(model as PiModel);
-}
-
-function createDefaultConfig(
-  overrides?: Partial<CortexAgentConfig> & {
-    model?: PiModel | CortexModel;
-    utilityModel?: PiModel | CortexModel | 'default';
-  },
-): CortexAgentConfig {
-  const { model, utilityModel, ...rest } = overrides ?? {};
-  return {
-    model: model
-      ? normalizeModel(model)
-      : makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel),
+function createLoop(agent: PiAgent, overrides?: Partial<AgentLoopConfig>): AgentLoop {
+  const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+  return new AgentLoopCtor(agent, {
+    model: testModel(),
     workingDirectory: '/tmp/test-workspace',
     initialBasePrompt: 'Test base prompt',
     slots: [],
-    ...(utilityModel !== undefined
-      ? {
-          utilityModel: utilityModel === 'default'
-            ? 'default'
-            : normalizeModel(utilityModel),
-        }
-      : {}),
-    ...rest,
-  };
+    ...overrides,
+  });
 }
 
-describe('CortexAgent', () => {
-  let piAgent: MockPiAgent;
-  let config: ReturnType<typeof createDefaultConfig>;
-
-  beforeEach(() => {
-    piAgent = createMockPiAgent();
-    config = createDefaultConfig();
+function createFacade(overrides?: Partial<CortexAgentConfig>): {
+  facade: CortexAgent;
+  loop: AgentLoop;
+  piAgent: FacadeMockPiAgent;
+} {
+  const piAgent = createMockPiAgent();
+  const loop = createLoop(piAgent, overrides as Partial<AgentLoopConfig>);
+  const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
+  const facade = new CortexAgentCtor(loop, {
+    model: testModel(),
+    workingDirectory: '/tmp/test-workspace',
+    initialBasePrompt: 'Test base prompt',
+    // Explicit since duplex became the default (D14): this suite drives a
+    // single mock loop through the private constructor, so passthrough is
+    // the mode under test, not the mode that happened to be the default.
+    mode: 'passthrough',
+    ...overrides,
   });
+  return { facade, loop, piAgent };
+}
 
-  afterEach(() => {
-    vi.restoreAllMocks();
+/** Poll until `predicate` holds; fails the test after `timeoutMs`. */
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('waitUntil timed out');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** Register a fake tracked sub-agent on the loop's manager. */
+function trackFakeSubAgent(
+  loop: AgentLoop,
+  taskId: string,
+  options?: { background?: boolean },
+): { resolve: (result: SubAgentResult) => void; entry: TrackedSubAgent } {
+  let resolveCompletion!: (result: SubAgentResult) => void;
+  const completion = new Promise<SubAgentResult>((resolve) => {
+    resolveCompletion = resolve;
   });
+  const entry: TrackedSubAgent = {
+    taskId,
+    agent: {
+      loopPath: `main/${taskId}`,
+      currentContextTokenCount: 0,
+      isLoopActive: false,
+      isPrompting: false,
+      deliver: () => ({ outcome: 'queued' as const }),
+      steer: () => {},
+      abort: async () => {},
+      destroy: async () => {},
+      getBudgetGuard: () => ({
+        getTurnCount: () => 0,
+        getTotalCost: () => 0,
+        getMaxTurns: () => Infinity,
+        getMaxCost: () => Infinity,
+      }),
+    },
+    instructions: `instructions for ${taskId}`,
+    background: options?.background ?? true,
+    spawnedAt: Date.now(),
+    completion,
+    resolve: resolveCompletion,
+    toolCount: 0,
+    lastToolName: null,
+    lastToolSummary: null,
+    lastToolStartedAt: null,
+    pendingPermission: null,
+  };
+  expect(loop.getSubAgentManager().track(entry)).toBe(true);
+  return { resolve: resolveCompletion, entry };
+}
 
-  // -----------------------------------------------------------------------
-  // Construction
-  // -----------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Modes
+// ---------------------------------------------------------------------------
 
-  describe('construction', () => {
-    it('creates with valid config', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      expect(agent.state).toBe('created');
-    });
-
-    it('exposes the context manager', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        slots: ['a', 'b'],
-        compaction: { strategy: 'classic' },
-      });
-
-      const cm = agent.getContextManager();
-      expect(cm.slotCount).toBe(2);
-    });
-
-    it('infers utility model dynamically for anthropic', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const utilityModel = agent.getUtilityModel();
-      expect(utilityModel.provider).toBe('anthropic');
-      expect(utilityModel.modelId).toBe('claude-haiku-4-5-20251001');
-    });
-
-    it('infers utility model dynamically for openai', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        model: makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel),
-      });
-      const utilityModel = agent.getUtilityModel();
-      expect(utilityModel.provider).toBe('openai');
-      expect(utilityModel.modelId).toBe('gpt-5.4-nano');
-    });
-
-    it('uses primary model when no default mapping exists', () => {
-      const customModel = makeModel({ provider: 'custom-provider', name: 'custom-model' } as PiModel);
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        model: customModel,
-      });
-      const utilityModel = agent.getUtilityModel();
-      expect(utilityModel).toBe(customModel);
-    });
-
-    it('uses explicit utility model when provided', () => {
-      const explicitUtility = makeModel({ provider: 'anthropic', name: 'claude-haiku-3' } as PiModel);
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        utilityModel: explicitUtility,
-      });
-      const utilityModel = agent.getUtilityModel();
-      expect(utilityModel).toBe(explicitUtility);
-    });
-
-    it('throws on same-provider constraint violation', () => {
-      expect(() => {
-        createTestCortexAgent(piAgent, {
-          ...config,
-          model: makeModel({ provider: 'anthropic', name: 'claude-sonnet' } as PiModel),
-          utilityModel: makeModel({ provider: 'openai', name: 'gpt-4o-mini' } as PiModel),
-        });
-      }).toThrow('does not match primary model provider');
-    });
-
-    it('allows utilityModel: "default" explicitly', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        utilityModel: 'default',
-      });
-      const utilityModel = agent.getUtilityModel();
-      expect(utilityModel.provider).toBe('anthropic');
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // getAutoResolvedUtilityModel (pure peek for UI labelling)
-  // -----------------------------------------------------------------------
-
-  describe('getAutoResolvedUtilityModel', () => {
-    it('returns the inferred utility model for an enumerable provider', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const auto = agent.getAutoResolvedUtilityModel();
-      expect(auto.provider).toBe('anthropic');
-      expect(auto.modelId).toBe('claude-haiku-4-5-20251001');
-    });
-
-    it('returns the primary model for providers Cortex cannot enumerate (Ollama/custom)', () => {
-      // Ollama and custom OpenAI-compatible endpoints surface as a provider
-      // with no pi-ai registry, so auto-resolution falls back to the primary.
-      const customModel = makeModel({ provider: 'custom', name: 'llama3.3:70b' } as PiModel);
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        model: customModel,
-      });
-      expect(agent.getAutoResolvedUtilityModel()).toBe(customModel);
-    });
-
-    it('reflects auto-resolution even while a manual override is active, without clearing it', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const override = makeModel({ provider: 'anthropic', name: 'claude-haiku-3' } as PiModel);
-      agent.setUtilityModel(override);
-
-      // The active utility model is the override...
-      expect(agent.getUtilityModel()).toBe(override);
-      expect(agent.isUtilityModelOverridden()).toBe(true);
-
-      // ...but the peek still reports what Auto would resolve to, and does not
-      // mutate the override state.
-      const auto = agent.getAutoResolvedUtilityModel();
-      expect(auto.modelId).toBe('claude-haiku-4-5-20251001');
-      expect(agent.getUtilityModel()).toBe(override);
-      expect(agent.isUtilityModelOverridden()).toBe(true);
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // envOverrides
-  // -----------------------------------------------------------------------
-
-  describe('envOverrides', () => {
-    it('stores envOverrides from config', () => {
-      const overrides = {
-        DYLD_INSERT_LIBRARIES: '/app/dock.dylib',
-        ANIMUS_DOCK_SUPPRESS_ADDON: '/app/addon.node',
-      };
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        envOverrides: overrides,
-      });
-
-      expect(agent.getEnvOverrides()).toBe(overrides);
-    });
-
-    it('returns undefined when no envOverrides configured', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      expect(agent.getEnvOverrides()).toBeUndefined();
-    });
-
-    it('passes envOverrides to McpClientManager', () => {
-      const overrides = { DYLD_INSERT_LIBRARIES: '/app/dock.dylib' };
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        envOverrides: overrides,
-      });
-
-      const mcpManager = agent.getMcpClientManager();
-      expect(mcpManager.envOverrides).toBe(overrides);
-    });
-
-    it('does not set McpClientManager envOverrides when not configured', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-
-      const mcpManager = agent.getMcpClientManager();
-      expect(mcpManager.envOverrides).toBeUndefined();
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // prompt()
-  // -----------------------------------------------------------------------
-
-  describe('prompt', () => {
-    it('runs the agent and returns a result', async () => {
-      piAgent.promptResult = { content: 'Hello world' };
-      const agent = createTestCortexAgent(piAgent, config);
-
-      const result = await agent.prompt('Say hello');
-      expect(result).toEqual({ content: 'Hello world' });
-    });
-
-    it('transitions from CREATED to ACTIVE on first prompt', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      expect(agent.state).toBe('created');
-
-      await agent.prompt('Hello');
-      expect(agent.state).toBe('active');
-    });
-
-    it('remains ACTIVE on subsequent prompts', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-
-      await agent.prompt('First');
-      expect(agent.state).toBe('active');
-
-      await agent.prompt('Second');
-      expect(agent.state).toBe('active');
-    });
-
-    it('throws when destroyed', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.destroy();
-
-      await expect(agent.prompt('Hello')).rejects.toThrow('Agent has been destroyed');
-    });
-
-    it('classifies and emits errors on failure', async () => {
-      piAgent.promptError = new Error('invalid api key');
-      const agent = createTestCortexAgent(piAgent, config);
-
-      const errorHandler = vi.fn();
-      agent.onError(errorHandler);
-
-      await expect(agent.prompt('Hello')).rejects.toThrow('invalid api key');
-
-      expect(errorHandler).toHaveBeenCalledTimes(1);
-      expect(errorHandler).toHaveBeenCalledWith(
-        expect.objectContaining({
-          category: 'authentication',
-          severity: 'fatal',
-          originalMessage: 'invalid api key',
+describe('CortexAgent modes', () => {
+  it('duplex without a talker loop throws rather than silently degrading', () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
+    expect(
+      () =>
+        new CortexAgentCtor(loop, {
+          model: testModel(),
+          workingDirectory: '/tmp/test-workspace',
+          mode: 'duplex',
         }),
-      );
-    });
-
-    it('classifies rate limit errors', async () => {
-      piAgent.promptError = new Error('Rate limit exceeded');
-      const agent = createTestCortexAgent(piAgent, config);
-
-      const errorHandler = vi.fn();
-      agent.onError(errorHandler);
-
-      await expect(agent.prompt('Hello')).rejects.toThrow();
-
-      expect(errorHandler.mock.calls[0][0].category).toBe('rate_limit');
-    });
-
-    it('classifies network errors', async () => {
-      piAgent.promptError = new Error('ECONNREFUSED');
-      const agent = createTestCortexAgent(piAgent, config);
-
-      const errorHandler = vi.fn();
-      agent.onError(errorHandler);
-
-      await expect(agent.prompt('Hello')).rejects.toThrow();
-
-      expect(errorHandler.mock.calls[0][0].category).toBe('network');
-    });
-
-    it('swallows error handler exceptions', async () => {
-      piAgent.promptError = new Error('Rate limit exceeded');
-      const agent = createTestCortexAgent(piAgent, config);
-
-      agent.onError(() => {
-        throw new Error('Handler blew up');
-      });
-
-      // Should still throw the original error, not the handler error
-      await expect(agent.prompt('Hello')).rejects.toThrow('Rate limit exceeded');
-    });
-
-    it('emits prompt watchdog lifecycle logs when diagnostics are enabled', async () => {
-      const logger = {
-        debug: vi.fn(),
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-      };
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        logger,
-        diagnostics: {
-          promptWatchdog: {
-            enabled: true,
-            heartbeatIntervalMs: 1000,
-          },
-        },
-      });
-
-      await agent.prompt('Hello');
-
-      expect(logger.info).toHaveBeenCalledWith(
-        '[Diagnostics] prompt_started',
-        expect.objectContaining({
-          inputLength: 5,
-          provider: 'anthropic',
-        }),
-      );
-      expect(logger.info).toHaveBeenCalledWith(
-        '[Diagnostics] prompt_finished',
-        expect.objectContaining({
-          status: 'resolved',
-        }),
-      );
-    });
-
-    it('emits abort watchdog logs when diagnostics are enabled', async () => {
-      const logger = {
-        debug: vi.fn(),
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-      };
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        logger,
-        diagnostics: {
-          promptWatchdog: {
-            enabled: true,
-            abortWaitWarningMs: 1000,
-          },
-        },
-      });
-
-      await agent.abort();
-
-      expect(logger.info).toHaveBeenCalledWith(
-        '[Diagnostics] abort_requested',
-        expect.objectContaining({
-          isPrompting: false,
-        }),
-      );
-      expect(logger.info).toHaveBeenCalledWith(
-        '[Diagnostics] abort_wait_finished',
-        expect.objectContaining({
-          elapsedMs: expect.any(Number),
-        }),
-      );
-    });
+    ).toThrow(/requires a talker loop/);
   });
 
-  // -----------------------------------------------------------------------
-  // System prompt
-  // -----------------------------------------------------------------------
+  it('defaults to passthrough and runs prompts through the reasoner', async () => {
+    const { facade, piAgent } = createFacade();
+    const result = await facade.prompt('hello');
+    expect(result).toEqual({ content: 'ok' });
+    expect(piAgent.promptCalls).toEqual(['hello']);
+  });
+});
 
-  describe('buildSystemPrompt', () => {
-    it('puts consumer content first', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const prompt = agent.buildSystemPrompt('You are a helpful assistant.');
+// ---------------------------------------------------------------------------
+// Config routing
+// ---------------------------------------------------------------------------
 
-      expect(prompt.startsWith('You are a helpful assistant.')).toBe(true);
-    });
-
-    it('includes Response Delivery when working tags enabled (default)', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer content');
-
-      expect(prompt).toContain('# Response Delivery');
-      expect(prompt).toContain('<working>');
-    });
-
-    it('omits Response Delivery when working tags disabled', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        workingTags: { enabled: false },
-      });
-      const prompt = agent.buildSystemPrompt('Consumer content');
-
-      expect(prompt).not.toContain('# Response Delivery');
-    });
-
-    it('includes System Rules section', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
-
-      expect(prompt).toContain('# System Rules');
-    });
-
-    it('includes Taking Action section', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
-
-      expect(prompt).toContain('# Taking Action');
-    });
-
-    it('includes Tool Usage section', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
-
-      expect(prompt).toContain('# Tool Usage');
-    });
-
-    it('includes Executing with Care section', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
-
-      expect(prompt).toContain('# Executing with Care');
-    });
-
-    it('includes Environment section with platform info', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
-
-      expect(prompt).toContain('# Environment');
-      expect(prompt).toContain('Platform:');
-      expect(prompt).toContain('Shell:');
-      expect(prompt).toContain('Working Directory: /tmp/test-workspace');
-    });
-
-    it('preserves consumer content exactly', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const consumerContent = `You are Animus.
-Your personality is warm and curious.
-You have 12 emotions.`;
-      const prompt = agent.buildSystemPrompt(consumerContent);
-
-      expect(prompt.startsWith(consumerContent)).toBe(true);
-    });
-
-    it('does not mutate the live system prompt', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const prompt = agent.buildSystemPrompt('Consumer');
-
-      expect(prompt).toContain('Consumer');
-      expect(agent.getCurrentSystemPrompt()).toContain('Test base prompt');
-      expect(agent.getCurrentSystemPrompt()).not.toContain('Consumer');
-    });
+describe('CortexAgent config routing', () => {
+  it('routes every key: the table covers exactly the config surface', () => {
+    // Compile-time exhaustiveness is enforced by the mapped type; this
+    // guards the runtime shape (no key routed twice, none dangling).
+    const tableKeys = Object.keys(CONFIG_ROUTING).sort();
+    expect(new Set(tableKeys).size).toBe(tableKeys.length);
+    expect(tableKeys).toContain('model');
+    expect(tableKeys).toContain('mode');
+    expect(tableKeys).toContain('tools');
   });
 
-  describe('setBasePrompt', () => {
-    it('updates the live system prompt and tracks the base prompt', () => {
-      const agent = createTestCortexAgent(piAgent, config);
+  it('strips facade-owned keys and passes everything else through unchanged', () => {
+    const resolvePermission = vi.fn();
+    const config: CortexAgentConfig = {
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      initialBasePrompt: 'base',
+      slots: ['profile'],
+      thinkingLevel: 'high',
+      budgetGuard: { maxTurns: 5 },
+      retryPolicy: { enabled: false },
+      resolvePermission,
+      sessionId: 'session-1',
+      loopPath: 'custom-path',
+      mode: 'passthrough',
+      talker: {},
+      idleSignal: () => true,
+      sessionLog: { maxEntries: 10 },
+      stateChangeDebounceMs: 5,
+    };
 
-      const prompt = agent.setBasePrompt('Base prompt');
+    const routed = buildReasonerConfig(config) as unknown as Record<string, unknown>;
 
-      expect(prompt).toContain('Base prompt');
-      expect(agent.getBasePrompt()).toBe('Base prompt');
-      expect(agent.getCurrentSystemPrompt()).toContain('Base prompt');
-      expect(piAgent.state.systemPrompt).toContain('Base prompt');
-    });
+    // Facade keys never reach the loop config.
+    for (const facadeKey of ['mode', 'talker', 'idleSignal', 'sessionLog', 'stateChangeDebounceMs']) {
+      expect(facadeKey in routed).toBe(false);
+    }
+
+    // Routed keys arrive unchanged (same references, same values).
+    expect(routed['model']).toBe(config.model);
+    expect(routed['workingDirectory']).toBe('/tmp/test-workspace');
+    expect(routed['initialBasePrompt']).toBe('base');
+    expect(routed['slots']).toBe(config.slots);
+    expect(routed['thinkingLevel']).toBe('high');
+    expect(routed['budgetGuard']).toBe(config.budgetGuard);
+    expect(routed['retryPolicy']).toBe(config.retryPolicy);
+    expect(routed['resolvePermission']).toBe(resolvePermission);
+    expect(routed['sessionId']).toBe('session-1');
+    expect(routed['loopPath']).toBe('custom-path');
   });
 
-  describe('rebuildSystemPrompt', () => {
-    it('updates the system prompt without losing conversation history', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
+  it('keys absent from consumer config stay absent (no key materializes as undefined)', () => {
+    const routed = buildReasonerConfig({
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+    }) as unknown as Record<string, unknown>;
+    expect('slots' in routed).toBe(false);
+    expect('budgetGuard' in routed).toBe(false);
+    expect('sessionId' in routed).toBe(false);
+  });
+});
 
-      // Build initial prompt
-      agent.setBasePrompt('Original persona');
+// ---------------------------------------------------------------------------
+// prompt() serialization
+// ---------------------------------------------------------------------------
 
-      // Simulate some conversation history
-      piAgent.state.messages.push(
-        { role: 'user', content: 'Hello' },
-        { role: 'assistant', content: 'Hi there!' },
-      );
+describe('CortexAgent.prompt', () => {
+  it('never throws on a busy loop: concurrent prompts serialize in order', async () => {
+    const { facade, piAgent } = createFacade();
 
-      // Rebuild with new content
-      agent.rebuildSystemPrompt('Updated persona');
+    piAgent.hold = true;
+    const first = facade.prompt('first');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
 
-      // Conversation should still be there
-      const history = agent.getConversationHistory();
-      expect(history.length).toBe(2);
-      expect(history[0]!.content).toBe('Hello');
+    // Direct AgentLoop.prompt() would throw here; the facade queues.
+    const second = facade.prompt('second');
 
-      // New prompt should contain updated content
-      const currentPrompt = agent.getCurrentSystemPrompt();
-      expect(currentPrompt).toContain('Updated persona');
-      expect(currentPrompt).not.toContain('Original persona');
-    });
+    piAgent.releaseRun();
+    await expect(first).resolves.toEqual({ content: 'ok' });
+    await expect(second).resolves.toEqual({ content: 'ok' });
+    expect(piAgent.promptCalls).toEqual(['first', 'second']);
   });
 
-  // -----------------------------------------------------------------------
-  // Conversation history persistence
-  // -----------------------------------------------------------------------
+  it('each serialized prompt resolves against the turn that carried its input', async () => {
+    const { facade, piAgent } = createFacade();
 
-  describe('conversation history', () => {
-    it('getConversationHistory excludes slot region', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        slots: ['slot1', 'slot2'],
-      });
+    piAgent.hold = true;
+    const first = facade.prompt('first');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    piAgent.failWith = new Error('boom');
+    const second = facade.prompt('second');
+    piAgent.releaseRun();
 
-      const cm = agent.getContextManager();
-      cm.setSlot('slot1', 'Slot content 1');
-      cm.setSlot('slot2', 'Slot content 2');
-
-      // Simulate conversation history after slots
-      piAgent.state.messages.push(
-        { role: 'user', content: 'Hello' },
-        { role: 'assistant', content: 'Hi!' },
-      );
-
-      const history = agent.getConversationHistory();
-
-      expect(history.length).toBe(2);
-      expect(history[0]!.content).toBe('Hello');
-      expect(history[1]!.content).toBe('Hi!');
-    });
-
-    it('getConversationHistory returns empty when only slots exist', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        slots: ['slot1'],
-      });
-
-      const cm = agent.getContextManager();
-      cm.setSlot('slot1', 'Content');
-
-      const history = agent.getConversationHistory();
-      expect(history.length).toBe(0);
-    });
-
-    it('restoreConversationHistory injects after slots', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        slots: ['slot1', 'slot2'],
-        compaction: { strategy: 'classic' },
-      });
-
-      const cm = agent.getContextManager();
-      cm.setSlot('slot1', 'Slot 1');
-      cm.setSlot('slot2', 'Slot 2');
-
-      // Restore some saved conversation
-      agent.restoreConversationHistory([
-        { role: 'user', content: 'Restored message 1' },
-        { role: 'assistant', content: 'Restored response 1' },
-        { role: 'user', content: 'Restored message 2' },
-      ]);
-
-      // Slots should be intact
-      expect(piAgent.state.messages[0]!.content).toBe('Slot 1');
-      expect(piAgent.state.messages[1]!.content).toBe('Slot 2');
-
-      // Conversation should be after slots
-      expect(piAgent.state.messages[2]!.content).toBe('Restored message 1');
-      expect(piAgent.state.messages[3]!.content).toBe('Restored response 1');
-      expect(piAgent.state.messages[4]!.content).toBe('Restored message 2');
-    });
-
-    it('restoreConversationHistory replaces existing conversation', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        slots: ['slot1'],
-      });
-
-      const cm = agent.getContextManager();
-      cm.setSlot('slot1', 'Slot content');
-
-      // Add some existing conversation
-      piAgent.state.messages.push(
-        { role: 'user', content: 'Old message' },
-      );
-
-      // Restore should replace
-      agent.restoreConversationHistory([
-        { role: 'user', content: 'New message' },
-      ]);
-
-      const history = agent.getConversationHistory();
-      expect(history.length).toBe(1);
-      expect(history[0]!.content).toBe('New message');
-    });
+    // The first turn fails; the second still runs and succeeds.
+    await expect(first).rejects.toThrow('boom');
+    await expect(second).resolves.toEqual({ content: 'ok' });
+    expect(piAgent.promptCalls).toEqual(['first', 'second']);
   });
 
-  // -----------------------------------------------------------------------
-  // Observational memory restore
-  // -----------------------------------------------------------------------
-
-  describe('restoreObservationalMemoryState slot population', () => {
-    it('leaves the observation slot empty when restored observations are empty', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        compaction: { strategy: 'observational' },
-      });
-      const cm = agent.getContextManager();
-
-      agent.restoreObservationalMemoryState({
-        observations: '',
-        continuationHint: null,
-        observationTokenCount: 0,
-        generationCount: 0,
-        bufferedChunks: [],
-        bufferWatermark: 0,
-      });
-
-      // A resumed-but-never-observed session must look like a fresh one: no
-      // observation preamble injected around an empty <observations> block.
-      expect(cm.getSlot('_observations')).toBe('');
-    });
-
-    it('populates the observation slot when restored observations are present', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        compaction: { strategy: 'observational' },
-      });
-      const cm = agent.getContextManager();
-
-      agent.restoreObservationalMemoryState({
-        observations: 'User prefers TypeScript.',
-        continuationHint: null,
-        observationTokenCount: 6,
-        generationCount: 1,
-        bufferedChunks: [],
-        bufferWatermark: 0,
-      });
-
-      expect(cm.getSlot('_observations')).toContain('User prefers TypeScript.');
-    });
+  it('threads DirectCompletionOptions through to the loop', async () => {
+    const { facade, loop, piAgent } = createFacade();
+    const promptSpy = vi.spyOn(loop, 'prompt');
+    const options = { sessionId: 'per-call-affinity' };
+    await facade.prompt('hello', options);
+    expect(promptSpy).toHaveBeenCalledWith('hello', options);
+    expect(piAgent.promptCalls).toEqual(['hello']);
   });
 
-  // -----------------------------------------------------------------------
-  // Lifecycle
-  // -----------------------------------------------------------------------
-
-  describe('lifecycle', () => {
-    it('starts in CREATED state', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      expect(agent.state).toBe('created');
-    });
-
-    it('transitions to ACTIVE after first prompt', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.prompt('Hello');
-      expect(agent.state).toBe('active');
-    });
-
-    it('transitions to DESTROYED after destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.destroy();
-      expect(agent.state).toBe('destroyed');
-    });
-
-    it('destroy is idempotent', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.destroy();
-      await agent.destroy(); // Should not throw
-      expect(agent.state).toBe('destroyed');
-    });
-
-    it('abort calls agent.abort() and waitForIdle()', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.prompt('Hello');
-
-      await agent.abort();
-
-      expect(piAgent.abortCalled).toBe(true);
-    });
-
-    it('abort keeps the agent in ACTIVE state', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.prompt('Hello');
-
-      await agent.abort();
-
-      expect(agent.state).toBe('active');
-    });
-
-    it('prompt() issued right after abort() resolves does not fail fast on a stale gate', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-
-      // Hold a turn open; release it when abort() reaches pi (as a real
-      // abort would settle the in-flight run).
-      let release!: () => void;
-      const originalPrompt = piAgent.prompt.bind(piAgent);
-      const calls: string[] = [];
-      piAgent.prompt = async (input: string): Promise<unknown> => {
-        calls.push(input);
-        if (calls.length === 1) {
-          await new Promise<void>((resolve) => { release = resolve; });
-        }
-        return originalPrompt(input);
-      };
-      const originalAbort = piAgent.abort.bind(piAgent);
-      piAgent.abort = (): void => {
-        originalAbort();
-        release();
-      };
-
-      const first = agent.prompt('one');
-      await new Promise((resolve) => setImmediate(resolve));
-
-      await agent.abort();
-      await first;
-
-      // The gate has fully released the aborted cycle by the time abort()
-      // resolves, so a follow-up prompt starts a fresh, non-cancelled turn.
-      await expect(agent.prompt('two')).resolves.toBeDefined();
-      expect(calls).toEqual(['one', 'two']);
-    });
-
-    it('does not add an exit listener per agent instance', async () => {
-      const before = process.listenerCount('exit');
-
-      const first = createTestCortexAgent(createMockPiAgent(), config);
-      const second = createTestCortexAgent(createMockPiAgent(), config);
-      const third = createTestCortexAgent(createMockPiAgent(), config);
-
-      const after = process.listenerCount('exit');
-      expect(after - before).toBeLessThanOrEqual(1);
-
-      await first.destroy();
-      await second.destroy();
-      await third.destroy();
-    });
+  it('rejects after destroy', async () => {
+    const { facade } = createFacade();
+    await facade.destroy();
+    await expect(facade.prompt('late')).rejects.toThrow('CortexAgent has been destroyed');
   });
 
-  // -----------------------------------------------------------------------
-  // Events
-  // -----------------------------------------------------------------------
-
-  describe('events', () => {
-    it('onLoopComplete fires on loop_end (agent_end)', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const handler = vi.fn();
-      agent.onLoopComplete(handler);
-
-      await agent.prompt('Hello');
-
-      // agent.run() emits agent_end which maps to loop_end -> onLoopComplete
-      expect(handler).toHaveBeenCalled();
+  it('rejects unconfigured input without logging a phantom utterance', async () => {
+    const piAgent = createMockPiAgent();
+    const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+    const loop = new AgentLoopCtor(piAgent, {
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      slots: [],
+    });
+    const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
+    const facade = new CortexAgentCtor(loop, {
+      model: testModel(),
+      workingDirectory: '/tmp/test-workspace',
+      mode: 'passthrough',
     });
 
-    it('suppresses onLoopComplete for a run that ended in error (retry may follow)', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const handler = vi.fn();
-      agent.onLoopComplete(handler);
+    await expect(facade.prompt('never ran')).rejects.toThrow(/not configured/);
+    expect(() => facade.deliver('never ran either')).toThrow(/not configured/);
+    expect(facade.getLog()).toEqual([]);
+    expect(piAgent.promptCalls).toEqual([]);
+  });
 
-      // pi-agent-core emits agent_end even when a run fails, leaving the failure
-      // in state.errorMessage. With background retry that agent_end belongs to an
-      // intermediate attempt, not the logical turn boundary, so onLoopComplete
-      // must NOT fire (firing it would let a consumer mark the turn idle while a
-      // retry is still pending, desyncing its run-state).
-      piAgent.state.errorMessage = 'Connection error.';
+  it('rejects on a directly destroyed loop without logging a phantom utterance', async () => {
+    const { facade, loop } = createFacade();
+    await loop.destroy();
+    await expect(facade.prompt('too late')).rejects.toThrow(/destroyed/);
+    expect(facade.getLog().filter((e) => e.type === 'utterance')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session log wiring
+// ---------------------------------------------------------------------------
+
+describe('CortexAgent session log', () => {
+  it('logs the utterance before the run and the reply with a causation stamp', async () => {
+    const { facade } = createFacade();
+    await facade.prompt('do the thing');
+
+    const entries = facade.getLog();
+    expect(entries.map((e) => e.type)).toEqual(['utterance', 'reply']);
+    const [utterance, reply] = entries;
+    expect(utterance!.content).toBe('do the thing');
+    expect(utterance!.causedBy).toBeUndefined();
+    expect(reply!.content).toBe('ok');
+    expect(reply!.causedBy).toBe(utterance!.seq);
+    expect(reply!.loopPath).toBe('main');
+  });
+
+  it('append-then-emit: subscribers see the utterance before pi sees the run', async () => {
+    const { facade, piAgent } = createFacade();
+    const order: string[] = [];
+    facade.subscribeLog((event) => {
+      if (event.kind === 'entry') order.push(`log:${event.entry.type}`);
+    });
+    const originalPrompt = piAgent.prompt.bind(piAgent);
+    piAgent.prompt = async (input) => {
+      order.push('pi:prompt');
+      return originalPrompt(input);
+    };
+
+    await facade.prompt('hello');
+    expect(order[0]).toBe('log:utterance');
+    expect(order.indexOf('pi:prompt')).toBeGreaterThan(order.indexOf('log:utterance'));
+  });
+
+  it('a prompted deliver() logs the utterance and stamps the reply causation', async () => {
+    const { facade } = createFacade();
+    const result = facade.deliver('delivered input');
+    expect(result.outcome).toBe('prompted');
+    await result.turn;
+
+    const entries = facade.getLog();
+    expect(entries.map((e) => e.type)).toEqual(['utterance', 'reply']);
+    expect(entries[1]!.causedBy).toBe(entries[0]!.seq);
+  });
+
+  it('a silent deliver() logs the utterance without starting a run', () => {
+    const { facade, piAgent } = createFacade();
+    const result = facade.deliver('background fact', { wake: false, target: 'work' });
+    expect(result.outcome).toBe('queued');
+    expect(piAgent.promptCalls).toEqual([]);
+
+    const entries = facade.getLog();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.type).toBe('utterance');
+    expect(entries[0]!.data).toEqual({ target: 'work' });
+  });
+
+  it('a failed run logs an error entry stamped with the utterance causation', async () => {
+    const { facade, piAgent } = createFacade({ retryPolicy: { enabled: false } });
+    piAgent.failWith = new Error('provider exploded');
+
+    await expect(facade.prompt('doomed')).rejects.toThrow('provider exploded');
+
+    const entries = facade.getLog();
+    const utterance = entries.find((e) => e.type === 'utterance')!;
+    const error = entries.find((e) => e.type === 'error')!;
+    expect(error.content).toContain('provider exploded');
+    expect(error.causedBy).toBe(utterance.seq);
+    expect(error.data).toMatchObject({ severity: expect.any(String) });
+  });
+
+  it('a scheduled retry logs a retrying entry', async () => {
+    const { facade, piAgent } = createFacade({
+      retryPolicy: { backoffMs: [1], maxAttempts: 1 },
+    });
+    piAgent.failWith = new Error('socket hang up');
+    // continue() resumes the failed turn on retry.
+    piAgent.continue = async () => {
+      delete (piAgent.state as Record<string, unknown>)['errorMessage'];
+      piAgent.emitEvent({ type: 'turn_end', text: 'recovered' });
       piAgent.emitEvent({ type: 'agent_end' });
-      expect(handler).not.toHaveBeenCalled();
+      return { content: 'recovered' };
+    };
 
-      // The run that finally succeeds clears errorMessage; onLoopComplete fires once.
-      piAgent.state.errorMessage = undefined;
-      piAgent.emitEvent({ type: 'agent_end' });
-      expect(handler).toHaveBeenCalledTimes(1);
-    });
+    await facade.prompt('flaky');
 
-    it('onTurnComplete fires with AgentTextOutput', async () => {
-      piAgent.promptResult = 'Hello <working>internal</working> world';
-      const agent = createTestCortexAgent(piAgent, config);
-
-      const handler = vi.fn();
-      agent.onTurnComplete(handler);
-
-      await agent.prompt('Hello');
-
-      expect(handler).toHaveBeenCalled();
-      const output = handler.mock.calls[0][0];
-      expect(output.raw).toBe('Hello <working>internal</working> world');
-    });
-
-    it('onError fires for classified errors', async () => {
-      piAgent.promptError = new Error('Rate limit exceeded');
-      const agent = createTestCortexAgent(piAgent, config);
-
-      const handler = vi.fn();
-      agent.onError(handler);
-
-      await expect(agent.prompt('Hello')).rejects.toThrow();
-
-      expect(handler).toHaveBeenCalledTimes(1);
-      expect(handler.mock.calls[0][0].category).toBe('rate_limit');
-    });
-
-    it('multiple handlers can be registered for the same event', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const handler1 = vi.fn();
-      const handler2 = vi.fn();
-      agent.onLoopComplete(handler1);
-      agent.onLoopComplete(handler2);
-
-      await agent.prompt('Hello');
-
-      expect(handler1).toHaveBeenCalled();
-      expect(handler2).toHaveBeenCalled();
-    });
-
-    it('auto-wires current-context token tracking from turn_end usage data', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
-      });
-
-      expect(agent.currentContextTokenCount).toBe(0);
-
-      // Emit a turn_end event with usage data (pattern: event.usage.input)
-      piAgent.emitEvent({
-        type: 'turn_end',
-        text: 'response text',
-        usage: { input: 85_000 },
-      });
-
-      expect(agent.currentContextTokenCount).toBe(85_000);
-    });
-
-    it('auto-wires current-context token tracking from message.usage.input pattern', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
-      });
-
-      piAgent.emitEvent({
-        type: 'turn_end',
-        message: {
-          content: 'response text',
-          usage: { input: 42_000 },
-        },
-      });
-
-      expect(agent.currentContextTokenCount).toBe(42_000);
-    });
-
-    it('does not update token count when turn_end has no usage data', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel),
-      });
-
-      // Manually set a known value
-      agent.updateCurrentContextTokenCount(50_000);
-
-      // Emit a turn_end with no usage data
-      piAgent.emitEvent({
-        type: 'turn_end',
-        text: 'response without usage',
-      });
-
-      // Should remain unchanged since no usage data was available
-      expect(agent.currentContextTokenCount).toBe(50_000);
-    });
-
-    it('estimates current context tokens from the live agent snapshot', () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        slots: ['project-context'],
-      });
-
-      agent.getContextManager().setSlot('project-context', 'Project context goes here');
-      agent.getContextManager().setEphemeral('Ephemeral context');
-
-      const estimate = agent.estimateCurrentContextTokens();
-
-      expect(estimate).toBeGreaterThan(0);
-    });
-
-    it('uses the larger of the post-hoc count and heuristic estimate', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      agent.updateCurrentContextTokenCount(50_000);
-
-      expect(agent.estimateCurrentContextTokens()).toBe(50_000);
-    });
+    const retrying = facade.getLog().filter((e) => e.type === 'retrying');
+    expect(retrying).toHaveLength(1);
+    expect(retrying[0]!.data).toMatchObject({ attempt: 1, category: 'network' });
+    expect(retrying[0]!.causedBy).toBe(facade.getLog()[0]!.seq);
   });
 
-  // -----------------------------------------------------------------------
-  // Destroy cleanup
-  // -----------------------------------------------------------------------
+  it('sub-agent lifecycle entries chain causation: spawn during a run, completion to the spawn', async () => {
+    const { facade, loop } = createFacade();
 
-  describe('destroy cleanup', () => {
-    it('calls agent.abort() during destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.destroy();
-
-      expect(piAgent.abortCalled).toBe(true);
-    });
-
-    it('calls agent.reset() during destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.destroy();
-
-      expect(piAgent.resetCalled).toBe(true);
-    });
-
-    it('emits onLoopComplete during destroy for final checkpoint', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const handler = vi.fn();
-      agent.onLoopComplete(handler);
-
-      await agent.destroy();
-
-      // onLoopComplete should fire once during destroy (the checkpoint emission)
-      expect(handler).toHaveBeenCalled();
-    });
-
-    it('clears handlers after destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const errorHandler = vi.fn();
-      agent.onError(errorHandler);
-
-      await agent.destroy();
-
-      // After destroy, handlers should be cleared
-      // Attempting to prompt should throw "destroyed" not trigger error handlers
-      await expect(agent.prompt('Hello')).rejects.toThrow('Agent has been destroyed');
-      expect(errorHandler).not.toHaveBeenCalled();
-    });
-
-    it('respects destroy timeout', async () => {
-      // Create an agent where waitForIdle never resolves quickly
-      const slowAgent = createMockPiAgent();
-      const originalWaitForIdle = slowAgent.waitForIdle;
-      slowAgent.waitForIdle = () => new Promise((resolve) => {
-        setTimeout(resolve, 60000); // Very slow
-      });
-
-      const agent = createTestCortexAgent(slowAgent, config);
-
-      // Destroy with a short timeout
-      const startTime = Date.now();
-      await agent.destroy(100);
-      const elapsed = Date.now() - startTime;
-
-      // Should complete within the timeout (plus some margin)
-      expect(elapsed).toBeLessThan(500);
-      expect(agent.state).toBe('destroyed');
-    });
-
-    it('concurrent destroy() calls share one teardown', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const resetSpy = vi.spyOn(piAgent, 'reset');
-
-      await Promise.all([agent.destroy(), agent.destroy()]);
-
-      expect(resetSpy).toHaveBeenCalledTimes(1);
-      expect(agent.state).toBe('destroyed');
-    });
-
-    it('rejects prompt() issued while destroy is in progress', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-
-      const teardown = agent.destroy();
-      expect(agent.state).toBe('destroying');
-      await expect(agent.prompt('Hello')).rejects.toThrow('Agent is being destroyed');
-
-      await teardown;
-      expect(agent.state).toBe('destroyed');
-    });
-
-    it('kills a background bash process and untracks its pid on destroy', async () => {
-      const isAlive = (pid: number): boolean => {
-        try {
-          process.kill(pid, 0);
-          return true;
-        } catch {
-          return false;
-        }
-      };
-
-      const agent = createTestCortexAgent(
-        piAgent,
-        createDefaultConfig({ workingDirectory: process.cwd() }),
-        [],
-        { enableSubAgentTool: false, enableLoadSkillTool: false },
-      );
-      agent.refreshTools();
-
-      const allTools = piAgent.state.tools as Array<{
-        name: string;
-        execute: (toolCallId: string, params: unknown) => Promise<{
-          details: { taskId: string | null };
-        }>;
-      }>;
-      const bashTool = allTools.find((tool) => tool.name === 'Bash');
-      expect(bashTool).toBeDefined();
-
-      const result = await bashTool!.execute('tc-bash-bg', { command: 'sleep 30', background: true });
-      const taskId = result.details.taskId as string;
-
-      const internal = agent as unknown as {
-        toolRuntime: { backgroundTasks: { get: (id: string) => { process: { pid?: number } } | undefined } };
-        trackedPids: Set<number>;
-      };
-      const pid = internal.toolRuntime.backgroundTasks.get(taskId)?.process.pid;
-      expect(pid).toBeGreaterThan(0);
-      // The spawned shell entered PID tracking (destroy/exit safety nets).
-      expect(internal.trackedPids.has(pid!)).toBe(true);
-      expect(isAlive(pid!)).toBe(true);
-
-      await agent.destroy();
-
-      // SIGKILL delivery, reaping, and the close-event untrack are async.
-      const deadline = Date.now() + 3000;
-      while ((isAlive(pid!) || internal.trackedPids.has(pid!)) && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 25));
+    // Spawn a fake child while the facade-initiated run is live (from the
+    // turn-complete handler), so the spawn lifecycle entry picks up the
+    // utterance causation.
+    let spawned = false;
+    loop.onTurnComplete(() => {
+      if (!spawned) {
+        spawned = true;
+        trackFakeSubAgent(loop, 'task-1');
       }
-      expect(isAlive(pid!)).toBe(false);
-      expect(internal.trackedPids.has(pid!)).toBe(false);
-    }, 10000);
-
-    it('does not start a new loop for a background completion pending at destroy', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const internal = agent as unknown as {
-        toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
-        deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-        pendingBackgroundResults: unknown[];
-      };
-      internal.toolRuntime.backgroundTasks.set({
-        id: 'task_d',
-        command: 'sleep 1',
-        process: {},
-        stdout: 'late result',
-        stderr: '',
-        exitCode: 0,
-        completed: true,
-        notified: false,
-        startTime: Date.now() - 1000,
-      });
-
-      // Hold a turn open so the completion is queued behind a live loop.
-      let release!: () => void;
-      const originalPrompt = piAgent.prompt.bind(piAgent);
-      const promptCalls: string[] = [];
-      piAgent.prompt = async (input: string): Promise<unknown> => {
-        promptCalls.push(input);
-        if (promptCalls.length === 1) {
-          await new Promise<void>((resolve) => { release = resolve; });
-        }
-        return originalPrompt(input);
-      };
-
-      const turn = agent.prompt('long turn');
-      await new Promise((resolve) => setImmediate(resolve));
-      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_d' });
-
-      const teardown = agent.destroy();
-      release();
-      await turn;
-      await delivery;
-      await teardown;
-
-      // The pending completion never restarted the loop mid-teardown.
-      expect(promptCalls).toHaveLength(1);
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
-      expect(agent.state).toBe('destroyed');
     });
+    await facade.prompt('spawn something');
+
+    const spawn = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_spawned')!;
+    const utterance = facade.getLog().find((e) => e.type === 'utterance')!;
+    expect(spawn.causedBy).toBe(utterance.seq);
+    expect(spawn.data).toMatchObject({ taskId: 'task-1', background: true });
+
+    // Completion entry is caused by the spawn entry.
+    loop.getSubAgentManager().complete('task-1', {
+      output: 'done',
+      status: 'completed',
+      usage: { turns: 1, cost: 0.01, durationMs: 5, contextTokens: 100 },
+    });
+
+    const completed = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_completed')!;
+    expect(completed.causedBy).toBe(spawn.seq);
+    expect(completed.data).toMatchObject({ taskId: 'task-1', status: 'completed' });
   });
 
-  // -----------------------------------------------------------------------
-  // transformContext hook
-  // -----------------------------------------------------------------------
+  it('logs a cancelled sub-agent as a cancellation milestone, not a failure', async () => {
+    const { facade, loop } = createFacade();
+    trackFakeSubAgent(loop, 'task-cancel');
+    const spawn = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_spawned')!;
 
-  describe('transformContext', () => {
-    it('returns a composable hook function', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const hook = agent.getTransformContextHook();
-      expect(typeof hook).toBe('function');
-    });
+    await facade.abort('work');
 
-    it('the hook passes through context when no ephemeral content', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const hook = agent.getTransformContextHook();
+    const entries = facade.getLog();
+    const cancelled = entries.find((e) => e.data?.['event'] === 'sub_agent_cancelled')!;
+    expect(cancelled).toBeDefined();
+    expect(cancelled.type).toBe('lifecycle');
+    expect(cancelled.content).toBe('Sub-agent task-cancel cancelled');
+    expect(cancelled.causedBy).toBe(spawn.seq);
+    // An explicit cancel carries its reason, distinct from a shutdown
+    // teardown (next test); 2b's delivery router keys on it.
+    expect(cancelled.data).toMatchObject({ taskId: 'task-cancel', reason: 'cancel' });
+    expect(entries.find((e) => e.data?.['event'] === 'sub_agent_failed')).toBeUndefined();
 
-      const context = {
-        systemPrompt: 'test',
-        model: {},
-        messages: [{ role: 'user' as const, content: 'Hello' }],
-        tools: [],
-        thinkingLevel: 'medium',
-      };
-
-      const result = await hook(context);
-      // With no ephemeral, compaction stub, and skill stub are all no-ops
-      expect(result.messages.length).toBe(1);
-    });
-
-    it('the hook injects ephemeral content', async () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        slots: [],
-      });
-
-      const cm = agent.getContextManager();
-      cm.setEphemeral('Ephemeral data');
-
-      const hook = agent.getTransformContextHook();
-      const context = {
-        systemPrompt: 'test',
-        model: {},
-        messages: [{ role: 'user' as const, content: 'Hello' }],
-        tools: [],
-        thinkingLevel: 'medium',
-      };
-
-      const result = await hook(context);
-      expect(result.messages.length).toBe(2);
-      expect(result.messages[0]!.content).toBe('Ephemeral data');
-      expect(result.messages[1]!.content).toBe('Hello');
-    });
-
-    it('persists compaction source mutations into the active transform context', async () => {
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        slots: [],
-        compaction: { strategy: 'classic' },
-      });
-
-      const sourceMessages = [
-        { role: 'user' as const, content: 'old message' },
-        { role: 'assistant' as const, content: 'old response' },
-      ];
-      piAgent.state.messages = [...sourceMessages];
-
-      const compacted = [{ role: 'assistant' as const, content: 'summary' }];
-      const manager = agent.getCompactionManager();
-      vi.spyOn(manager, 'applyInsertionCap').mockResolvedValue();
-      vi.spyOn(manager, 'applyInTransformContext').mockImplementation(async (
-        ctx,
-        getHistory,
-        setHistory,
-        getSourceHistory,
-        setSourceHistory,
-      ) => {
-        expect(getSourceHistory?.()).toEqual(sourceMessages);
-        setSourceHistory?.(compacted);
-        return setHistory(ctx, compacted);
-      });
-
-      const hook = agent.getTransformContextHook();
-      const result = await hook({
-        systemPrompt: 'test',
-        model: {},
-        messages: sourceMessages,
-        tools: [],
-        thinkingLevel: 'medium',
-      });
-
-      expect(sourceMessages).toEqual(compacted);
-      expect(piAgent.state.messages).toEqual(compacted);
-      expect(result.messages).toEqual(compacted);
-    });
+    // A genuine failure still logs as one.
+    trackFakeSubAgent(loop, 'task-fail');
+    loop.getSubAgentManager().fail('task-fail', 'child exploded');
+    const failed = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_failed')!;
+    expect(failed.content).toBe('Sub-agent task-fail failed: child exploded');
+    expect(failed.data).toMatchObject({ taskId: 'task-fail', error: 'child exploded' });
   });
 
-  // -----------------------------------------------------------------------
-  // Model access
-  // -----------------------------------------------------------------------
+  it('a shutdown teardown logs the cancellation with reason shutdown', async () => {
+    const { facade, loop } = createFacade();
+    trackFakeSubAgent(loop, 'task-teardown');
 
-  describe('model access', () => {
-    it('getModel returns the primary model', () => {
-      const model = makeModel({ provider: 'anthropic', name: 'claude-sonnet-4' } as PiModel);
-      const agent = createTestCortexAgent(piAgent, {
-        ...config,
-        model,
-      });
+    // Direct loop destroy: the cancelAll sweep, not an explicit cancel.
+    await loop.destroy();
 
-      expect(agent.getModel()).toBe(model);
-    });
-
-    it('getUtilityModel returns resolved utility model', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const utility = agent.getUtilityModel();
-
-      expect(utility.provider).toBe('anthropic');
-      expect(utility.modelId).toBeDefined();
-    });
-
-    it('utilityComplete uses utility model for completion', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      // utilityComplete requires a real pi-ai complete() call which needs a valid model
-      // Just verify the method exists and is callable
-      expect(typeof agent.utilityComplete).toBe('function');
-    });
+    const cancelled = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_cancelled')!;
+    expect(cancelled).toBeDefined();
+    expect(cancelled.data).toMatchObject({ taskId: 'task-teardown', reason: 'shutdown' });
   });
 
-  // -----------------------------------------------------------------------
-  // setModel / setThinkingLevel / refreshTools
-  // -----------------------------------------------------------------------
-
-  describe('setModel', () => {
-    it('updates the primary model', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const newModel = makeModel({ provider: 'openai', name: 'gpt-4o', contextWindow: 128_000 } as PiModel);
-
-      agent.setModel(newModel);
-
-      expect(agent.getModel()).toBe(newModel);
-    });
-
-    it('updates agent.state.model', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const newModel = makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel);
-
-      agent.setModel(newModel);
-
-      expect(piAgent.state.model).toEqual(
-        expect.objectContaining({ provider: 'openai', name: 'gpt-4o' }),
-      );
-    });
-
-    it('does not throw when agent lacks setModel', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const newModel = makeModel({ provider: 'openai', name: 'gpt-4o' } as PiModel);
-
-      // Should not throw even though piAgent has no setModel
-      expect(() => agent.setModel(newModel)).not.toThrow();
-    });
+  it('entries produced outside any facade-initiated run carry no causation stamp', () => {
+    const { facade, loop } = createFacade();
+    trackFakeSubAgent(loop, 'task-idle');
+    const spawn = facade.getLog().find((e) => e.data?.['event'] === 'sub_agent_spawned')!;
+    expect(spawn.causedBy).toBeUndefined();
   });
 
-  describe('setThinkingLevel', () => {
-    it('updates agent.state.thinkingLevel', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      agent.setThinkingLevel('high');
+  it('getLog(fromSeq) and subscribeLog replay delegate to the log', async () => {
+    const { facade } = createFacade();
+    await facade.prompt('one');
+    await facade.prompt('two');
 
-      expect(piAgent.state.thinkingLevel).toBe('high');
-    });
+    const all = facade.getLog();
+    expect(all.length).toBeGreaterThanOrEqual(4);
+    const tail = facade.getLog(all[2]!.seq);
+    expect(tail.map((e) => e.seq)).toEqual(all.slice(2).map((e) => e.seq));
 
-    it('maps max to xhigh in agent state', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-
-      agent.setThinkingLevel('max');
-
-      expect(piAgent.state.thinkingLevel).toBe('xhigh');
-    });
+    const replayed: number[] = [];
+    const unsubscribe = facade.subscribeLog((event) => {
+      if (event.kind === 'entry') replayed.push(event.entry.seq);
+    }, all[2]!.seq);
+    expect(replayed).toEqual(all.slice(2).map((e) => e.seq));
+    unsubscribe();
+    unsubscribe();
   });
 
-  describe('refreshTools', () => {
-    it('updates agent.state.tools with registered + MCP tools', () => {
-      const agent = createTestCortexAgent(
-        piAgent,
-        config,
-        [], // No additional tools; built-in tools auto-register
-        { enableSubAgentTool: false, enableLoadSkillTool: false },
-      );
-
-      // refreshTools merges auto-registered built-in tools with MCP tools (empty in this test)
-      agent.refreshTools();
-
-      const allTools = piAgent.state.tools as Array<{ name: string }>;
-      // 9 built-in tools auto-registered: Read, Write, Edit, UndoEdit,
-      // Glob, Grep, Bash, TaskOutput, WebFetch
-      expect(allTools.length).toBe(9);
-      const toolNames = allTools.map((t: { name: string }) => t.name);
-      expect(toolNames).toContain('Read');
-      expect(toolNames).toContain('UndoEdit');
-      expect(toolNames).toContain('Bash');
-      expect(toolNames).toContain('Glob');
-    });
-
-    it('adapts Bash using the canonical Cortex tool contract', async () => {
-      const agent = createTestCortexAgent(
-        piAgent,
-        createDefaultConfig({ workingDirectory: process.cwd() }),
-        [],
-        { enableSubAgentTool: false, enableLoadSkillTool: false },
-      );
-
-      agent.refreshTools();
-
-      const allTools = piAgent.state.tools as Array<{
-        name: string;
-        execute: (toolCallId: string, params: unknown) => Promise<{
-          content: Array<{ type: string; text?: string }>;
-        }>;
-      }>;
-      const bashTool = allTools.find((tool) => tool.name === 'Bash');
-
-      expect(bashTool).toBeDefined();
-
-      const result = await bashTool!.execute('tc-bash', { command: 'echo "adapter ok"' });
-      expect(result.content[0]?.text).toContain('adapter ok');
-    });
-
-    it('persists oversized Bash output before it reaches conversation history', async () => {
-      const persistResult = vi.fn().mockResolvedValue('/tmp/bash-oversized.txt');
-
-      const agent = createTestCortexAgent(
-        piAgent,
-        createDefaultConfig({
-          workingDirectory: process.cwd(),
-          persistResult,
-        }),
-        [],
-        { enableSubAgentTool: false, enableLoadSkillTool: false },
-      );
-
-      agent.refreshTools();
-
-      const allTools = piAgent.state.tools as Array<{
-        name: string;
-        execute: (toolCallId: string, params: unknown) => Promise<{
-          content: Array<{ type: string; text?: string }>;
-        }>;
-      }>;
-      const bashTool = allTools.find((tool) => tool.name === 'Bash');
-
-      expect(bashTool).toBeDefined();
-
-      const result = await bashTool!.execute('tc-bash-oversized', {
-        command: `node -e "process.stdout.write('x'.repeat(${DEFAULT_TOOL_THRESHOLDS.Bash * 4 + 5_000}))"`,
-      });
-      const text = result.content[0]?.text ?? '';
-
-      expect(persistResult).toHaveBeenCalledOnce();
-      expect(persistResult).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          toolName: 'Bash',
-          toolCallId: 'tc-bash-oversized',
-        }),
-      );
-      expect(text).toContain('[Result persisted: /tmp/bash-oversized.txt');
-      expect(text).toContain('Use the Read tool with offset/limit');
-      expect(text).toContain('tokens trimmed');
-
-      piAgent.state.messages.push({
-        role: 'tool',
-        content: [{ type: 'tool_result', name: 'Bash', toolCallId: 'tc-bash-oversized', text }],
-      });
-
-      const history = agent.getConversationHistory();
-      expect(history).toHaveLength(1);
-      expect(((history[0]!.content as Array<{ text?: string }>)[0]?.text) ?? '').toContain(
-        '[Result persisted: /tmp/bash-oversized.txt',
-      );
-      expect(((history[0]!.content as Array<{ text?: string }>)[0]?.text) ?? '').toContain('tokens trimmed');
-    });
-
-    it('persists oversized WebFetch output before returning from the wrapped tool', async () => {
-      const persistResult = vi.fn().mockResolvedValue('/tmp/webfetch-oversized.txt');
-
-      const agent = createTestCortexAgent(
-        piAgent,
-        createDefaultConfig({
-          workingDirectory: process.cwd(),
-          persistResult,
-        }),
-        [],
-        { enableSubAgentTool: false, enableLoadSkillTool: false },
-      );
-      vi.spyOn(agent, 'utilityComplete').mockResolvedValue('y'.repeat(MAX_RESULT_TOKENS * 4 + 5_000));
-      vi.spyOn(globalThis, 'fetch').mockResolvedValue({
-        status: 200,
-        headers: {
-          get(name: string) {
-            return name.toLowerCase() === 'content-type' ? 'text/plain' : null;
-          },
-        },
-        text: async () => 'small page body',
-      } as unknown as Response);
-
-      agent.refreshTools();
-
-      const allTools = piAgent.state.tools as Array<{
-        name: string;
-        execute: (toolCallId: string, params: unknown) => Promise<{
-          content: Array<{ type: string; text?: string }>;
-        }>;
-      }>;
-      const webFetchTool = allTools.find((tool) => tool.name === 'WebFetch');
-
-      expect(webFetchTool).toBeDefined();
-
-      const result = await webFetchTool!.execute('tc-webfetch-oversized', {
-        url: 'https://1.1.1.1/test',
-        prompt: 'Summarize the page',
-      });
-      const text = result.content[0]?.text ?? '';
-
-      expect(persistResult).toHaveBeenCalledOnce();
-      expect(persistResult).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.objectContaining({
-          toolName: 'WebFetch',
-          toolCallId: 'tc-webfetch-oversized',
-        }),
-      );
-      expect(text).toContain('[Result persisted: /tmp/webfetch-oversized.txt');
-      expect(text).toContain('Use the Read tool with offset/limit');
-      expect(text).toContain('tokens trimmed');
-    });
-
-    it('supports raw pi-agent-core tools when explicitly wrapped', async () => {
-      const legacyTool = fromPiAgentTool({
-        name: 'LegacyTool',
-        description: 'Legacy execution contract',
-        parameters: {},
-        execute: vi.fn(async (toolCallId: string, params: unknown) => ({
-          content: [{ type: 'text', text: `${toolCallId}:${String((params as { value: string }).value)}` }],
-          details: {},
-        })),
-      });
-
-      const agent = createTestCortexAgent(
-        piAgent,
-        config,
-        [legacyTool],
-        { enableSubAgentTool: false, enableLoadSkillTool: false },
-      );
-
-      agent.refreshTools();
-
-      const allTools = piAgent.state.tools as Array<{
-        name: string;
-        execute: (toolCallId: string, params: unknown) => Promise<{
-          content: Array<{ type: string; text?: string }>;
-        }>;
-      }>;
-      const tool = allTools.find((entry) => entry.name === 'LegacyTool');
-
-      expect(tool).toBeDefined();
-
-      const result = await tool!.execute('legacy-call', { value: 'ok' });
-      expect(result.content[0]?.text).toBe('legacy-call:ok');
-    });
-
-    it('rejects raw pi-agent-core tools unless explicitly wrapped', () => {
-      const legacyTool = {
-        name: 'LegacyTool',
-        description: 'Legacy execution contract',
-        parameters: {},
-        execute: async (
-          toolCallId: string,
-          params: unknown,
-          _signal?: AbortSignal,
-          _onUpdate?: (partialResult: unknown) => void,
-        ) => ({
-          content: [{ type: 'text', text: `${toolCallId}:${String(params)}` }],
-          details: {},
-        }),
-      };
-
-      expect(() => createTestCortexAgent(
-        piAgent,
-        config,
-        [legacyTool as unknown as CortexTool],
-        { enableSubAgentTool: false, enableLoadSkillTool: false },
-      )).toThrow(/fromPiAgentTool/);
-    });
-
-    it('does not throw when agent lacks setTools', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-
-      expect(() => agent.refreshTools()).not.toThrow();
-    });
+  it('whitespace deliver() throws without logging an utterance', () => {
+    const { facade } = createFacade();
+    expect(() => facade.deliver('   ')).toThrow('non-whitespace');
+    expect(facade.getLog()).toEqual([]);
   });
 
-  // -----------------------------------------------------------------------
-  // Event bridge access
-  // -----------------------------------------------------------------------
+  it('log order matches execution order when a same-tick deliver() runs first', async () => {
+    const { facade, piAgent } = createFacade();
 
-  describe('event bridge access', () => {
-    it('exposes the event bridge', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const bridge = agent.getEventBridge();
-      expect(bridge).toBeDefined();
-    });
+    // The prompt is accepted first but its run is chained; the deliver sees
+    // an empty gate in the same tick and starts its run immediately. The
+    // log (the ordering authority) must record them in execution order.
+    const turn = facade.prompt('queued input');
+    const result = facade.deliver('barged-in input');
+    expect(result.outcome).toBe('prompted');
+    await Promise.all([turn, result.turn]);
 
-    it('exposes the budget guard', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const guard = agent.getBudgetGuard();
-      expect(guard).toBeDefined();
-    });
-  });
+    expect(piAgent.promptCalls).toEqual(['barged-in input', 'queued input']);
+    const utterances = facade
+      .getLog()
+      .filter((e) => e.type === 'utterance')
+      .map((e) => e.content);
+    expect(utterances).toEqual(['barged-in input', 'queued input']);
 
-  // -----------------------------------------------------------------------
-  // steer()
-  // -----------------------------------------------------------------------
-
-  describe('steer', () => {
-    it('calls agent.steer() with user role message when prompting', async () => {
-      const steerCalls: Array<{ role: string; content: string }> = [];
-      piAgent.steer = (msg: { role: string; content: string }) => {
-        steerCalls.push(msg);
-      };
-
-      const agent = createTestCortexAgent(piAgent, config);
-
-      // Override run to hold open the prompting state so we can steer
-      const originalPrompt = piAgent.prompt.bind(piAgent);
-      piAgent.prompt = async (input: string): Promise<unknown> => {
-        // Agent is now "prompting". Steer during this window.
-        agent.steer('New context from user');
-        return originalPrompt(input);
-      };
-
-      await agent.prompt('Hello');
-
-      expect(steerCalls.length).toBe(1);
-      expect(steerCalls[0]!.role).toBe('user');
-      expect(steerCalls[0]!.content).toBe('New context from user');
-    });
-
-    it('is a no-op when not prompting', () => {
-      const steerCalls: Array<{ role: string; content: string }> = [];
-      piAgent.steer = (msg: { role: string; content: string }) => {
-        steerCalls.push(msg);
-      };
-
-      const agent = createTestCortexAgent(piAgent, config);
-
-      // Not prompting, should be a no-op
-      agent.steer('This should be ignored');
-
-      expect(steerCalls.length).toBe(0);
-    });
-
-    it('is a no-op after prompt completes', async () => {
-      const steerCalls: Array<{ role: string; content: string }> = [];
-      piAgent.steer = (msg: { role: string; content: string }) => {
-        steerCalls.push(msg);
-      };
-
-      const agent = createTestCortexAgent(piAgent, config);
-      await agent.prompt('Hello');
-
-      // Prompt is done, should be a no-op
-      agent.steer('Late message');
-
-      expect(steerCalls.length).toBe(0);
-    });
-
-    it('delivers a steer issued in the same frame as prompt()', async () => {
-      const steerCalls: Array<{ role: string; content: string }> = [];
-      piAgent.steer = (msg: { role: string; content: string }) => {
-        steerCalls.push(msg);
-      };
-
-      const agent = createTestCortexAgent(piAgent, config);
-
-      // The turn is deferred one microtask (it dequeues from the loop gate),
-      // so _isPrompting is still false here. steer() must treat the non-empty
-      // gate as "prompting" and forward to pi instead of dropping the message.
-      const turn = agent.prompt('Hello');
-      agent.steer('same-frame steer');
-      await turn;
-
-      expect(steerCalls).toHaveLength(1);
-      expect(steerCalls[0]!.content).toBe('same-frame steer');
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // Prompt serialization (loop gate)
-  // -----------------------------------------------------------------------
-
-  describe('prompt serialization', () => {
-    interface GateInternals {
-      _prePromptMessageCount: number;
-      _isPrompting: boolean;
-      toolRuntime: { resetForLoop: () => void };
+    // Causation still binds each reply to its own utterance.
+    const entries = facade.getLog();
+    for (const reply of entries.filter((e) => e.type === 'reply')) {
+      const cause = entries.find((e) => e.seq === reply.causedBy);
+      expect(cause?.type).toBe('utterance');
     }
+  });
+});
 
-    function holdPromptOpen(mock: MockPiAgent): { release: () => void; calls: string[] } {
-      const originalPrompt = mock.prompt.bind(mock);
-      const calls: string[] = [];
-      let release!: () => void;
-      mock.prompt = async (input: string): Promise<unknown> => {
-        calls.push(input);
-        if (calls.length === 1) {
-          await new Promise<void>((resolve) => { release = resolve; });
-        }
-        return originalPrompt(input);
-      };
-      return { release: () => release(), calls };
-    }
+// ---------------------------------------------------------------------------
+// Abort scopes
+// ---------------------------------------------------------------------------
 
-    it('a concurrent prompt() fails fast without touching the running loop', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const internal = agent as unknown as GateInternals;
-      const { release, calls } = holdPromptOpen(piAgent);
+describe('CortexAgent.abort', () => {
+  it("abort('all') aborts the in-flight turn, clears queues, and cancels children", async () => {
+    const { facade, loop, piAgent } = createFacade();
+    trackFakeSubAgent(loop, 'task-1');
 
-      const first = agent.prompt('first turn');
-      await new Promise((resolve) => setImmediate(resolve));
-      expect(calls).toHaveLength(1);
+    piAgent.hold = true;
+    const turn = facade.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    facade.deliver('queued silent', { wake: false });
+    facade.steer('steered');
 
-      const boundaryDuringLoop = internal._prePromptMessageCount;
-      const resetSpy = vi.spyOn(internal.toolRuntime, 'resetForLoop');
+    await facade.abort();
+    await expect(turn).rejects.toThrow();
 
-      await expect(agent.prompt('second turn')).rejects.toThrow(/already processing/i);
+    expect(facade.queuedDeliveryCount).toBe(0);
+    expect(piAgent.clearSteeringQueueCalls).toBeGreaterThan(0);
+    expect(piAgent.clearFollowUpQueueCalls).toBeGreaterThan(0);
+    expect(loop.getSubAgentManager().activeCount).toBe(0);
+    expect(loop.getSubAgentManager().isCancelled('task-1')).toBe(true);
 
-      // The loser never reset the live loop's tool runtime, never moved its
-      // history boundary, and never reached pi-agent-core.
-      expect(resetSpy).not.toHaveBeenCalled();
-      expect(internal._prePromptMessageCount).toBe(boundaryDuringLoop);
-      expect(calls).toHaveLength(1);
+    const lifecycle = facade.getLog().find((e) => e.data?.['event'] === 'abort')!;
+    expect(lifecycle.data).toMatchObject({ scope: 'all' });
 
-      // The running loop is still live: steer() reaches it.
-      const steerCalls: Array<{ role: string; content: string }> = [];
-      piAgent.steer = (msg: { role: string; content: string }) => {
-        steerCalls.push(msg);
-      };
-      expect(internal._isPrompting).toBe(true);
-      agent.steer('mid-loop steer');
-      expect(steerCalls).toHaveLength(1);
-
-      // And the first loop completes normally.
-      release();
-      await expect(first).resolves.toBeDefined();
-    });
-
-    it('a background completion arriving while idle does not race a consumer prompt()', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const internal = agent as unknown as GateInternals & {
-        toolRuntime: { resetForLoop: () => void; backgroundTasks: { set: (t: unknown) => void } };
-        deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-      };
-      internal.toolRuntime.backgroundTasks.set({
-        id: 'task_9',
-        command: 'sleep 1',
-        process: {},
-        stdout: 'done',
-        stderr: '',
-        exitCode: 0,
-        completed: true,
-        notified: false,
-        startTime: Date.now() - 1000,
-      });
-      const promptSpy = vi.spyOn(piAgent, 'prompt');
-
-      // Delivery is scheduled (gate becomes busy synchronously), so a
-      // consumer prompt in the same tick fails fast instead of interleaving.
-      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_9' });
-      await expect(agent.prompt('user turn')).rejects.toThrow(/already processing/i);
-
-      await delivery;
-      expect(promptSpy).toHaveBeenCalledTimes(1);
-      expect(promptSpy.mock.calls[0][0] as string).toContain('task_9');
-    });
-
-    it('a same-frame prompt() + abort() cancels the queued turn without running pi', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const promptSpy = vi.spyOn(piAgent, 'prompt');
-      const errored = vi.fn();
-      agent.onError(errored);
-
-      // prompt() only enqueues; the cycle dequeues next microtask. A same-
-      // frame abort() must be visible to that not-yet-started cycle, which
-      // cancels it before it ever calls pi (matching main, which cancels in
-      // ~1ms rather than running the whole turn un-aborted).
-      const turn = agent.prompt('do work');
-      const settled = turn.then(
-        () => 'resolved',
-        (e: Error) => e.name,
-      );
-      const aborting = agent.abort();
-
-      const [outcome] = await Promise.all([settled, aborting]);
-
-      expect(outcome).toBe('AbortError');
-      expect(promptSpy).not.toHaveBeenCalled();
-      expect(agent.state).toBe('active');
-      expect(errored).toHaveBeenCalledTimes(1);
-      expect(errored.mock.calls[0][0].category).toBe('cancelled');
-
-      // The agent stays usable: a fresh prompt runs normally afterward.
-      await expect(agent.prompt('next')).resolves.toBeDefined();
-      expect(promptSpy).toHaveBeenCalledTimes(1);
-      expect(promptSpy.mock.calls[0][0] as string).toBe('next');
-    });
+    // The loop remains usable after abort.
+    await facade.prompt('after abort');
+    expect(piAgent.promptCalls.at(-1)).toBe('after abort');
   });
 
-  // -----------------------------------------------------------------------
-  // directComplete()
-  // -----------------------------------------------------------------------
+  it("abort('conversation') leaves children running", async () => {
+    const { facade, loop } = createFacade();
+    trackFakeSubAgent(loop, 'task-keep');
 
-  describe('directComplete', () => {
-    it('directComplete method exists and is callable', () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      expect(typeof agent.directComplete).toBe('function');
-    });
+    await facade.abort('conversation');
+
+    expect(loop.getSubAgentManager().activeCount).toBe(1);
+    expect(loop.getSubAgentManager().isCancelled('task-keep')).toBe(false);
   });
 
-  // -----------------------------------------------------------------------
-  // CortexAgent.create() factory
-  // -----------------------------------------------------------------------
+  it("abort('work') cancels children", async () => {
+    const { facade, loop } = createFacade();
+    trackFakeSubAgent(loop, 'task-work');
 
-  describe('create factory', () => {
-    it('create factory method exists', () => {
-      expect(typeof CortexAgent.create).toBe('function');
-    });
+    await facade.abort('work');
+
+    expect(loop.getSubAgentManager().activeCount).toBe(0);
+    expect(loop.getSubAgentManager().isCancelled('task-work')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Settlement predicates
+// ---------------------------------------------------------------------------
+
+describe('CortexAgent settlement', () => {
+  it('conversationIdle keys on gate depth and facade prompt queue', async () => {
+    const { facade, piAgent } = createFacade();
+    expect(facade.conversationIdle).toBe(true);
+
+    piAgent.hold = true;
+    const turn = facade.prompt('busy');
+    expect(facade.conversationIdle).toBe(false);
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+
+    piAgent.releaseRun();
+    await turn;
+    await facade.waitForConversationIdle();
+    expect(facade.conversationIdle).toBe(true);
   });
 
-  // -----------------------------------------------------------------------
-  // Background bash task completion wake-up
-  // -----------------------------------------------------------------------
+  it('waitForConversationIdle covers serialized facade prompts still queued', async () => {
+    const { facade, piAgent } = createFacade();
+    piAgent.hold = true;
+    const first = facade.prompt('first');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    const second = facade.prompt('second');
 
-  describe('background bash task completion', () => {
-    interface InternalAgent {
-      toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-      drainPendingBackgroundResults: () => Promise<void>;
-      pendingBackgroundResults: unknown[];
-      _isPrompting: boolean;
+    let settled = false;
+    const wait = facade.waitForConversationIdle().then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    piAgent.releaseRun();
+    await Promise.all([first, second, wait]);
+    expect(settled).toBe(true);
+    expect(piAgent.promptCalls).toEqual(['first', 'second']);
+  });
+
+  it('workSettled is false while a sub-agent is active and true after it completes', async () => {
+    const { facade, loop } = createFacade();
+    expect(facade.workSettled).toBe(true);
+
+    trackFakeSubAgent(loop, 'task-settle');
+    expect(facade.workSettled).toBe(false);
+
+    let settled = false;
+    const wait = facade.waitForWorkSettled().then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    loop.getSubAgentManager().complete('task-settle', {
+      output: 'done',
+      status: 'completed',
+      usage: { turns: 1, cost: 0, durationMs: 1, contextTokens: 0 },
+    });
+    await wait;
+    expect(settled).toBe(true);
+    expect(facade.workSettled).toBe(true);
+  });
+
+  it('waitForWorkSettled blocks on ask settlement without hot-polling', async () => {
+    const { facade, loop } = createFacade();
+    const registry = loop as unknown as {
+      registerPendingAsk(ask: {
+        askId: string;
+        loopPath: string;
+        toolName: string;
+        renderedRequest: string;
+        requestedAt: number;
+        voiced: boolean;
+      }): void;
+      settlePendingAsk(askId: string): void;
+    };
+    registry.registerPendingAsk({
+      askId: 'ask-outlives-child',
+      loopPath: 'main',
+      toolName: 'Bash',
+      renderedRequest: 'Bash: make deploy',
+      requestedAt: Date.now(),
+      voiced: false,
+    });
+    expect(facade.workSettled).toBe(false);
+
+    // Fixed observation window for a negative assertion: while the ask is
+    // pending the wait must neither resolve nor spin. A setImmediate poll
+    // re-evaluates the predicate hundreds of times in this window; the
+    // event-driven wait checks a handful of times then blocks.
+    const pendingAsksSpy = vi.spyOn(loop, 'getPendingAsks');
+    let settled = false;
+    const wait = facade.waitForWorkSettled().then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+    expect(pendingAsksSpy.mock.calls.length).toBeLessThan(20);
+
+    registry.settlePendingAsk('ask-outlives-child');
+    await wait;
+    expect(settled).toBe(true);
+    expect(facade.workSettled).toBe(true);
+  });
+
+  it('workSettled counts parked wake deliveries (and settles once they deliver)', async () => {
+    const { facade, piAgent } = createFacade();
+
+    piAgent.hold = true;
+    const turn = facade.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    const result = facade.deliver('mid-run redirect');
+    expect(result.outcome).toBe('parked');
+    expect(facade.workSettled).toBe(false);
+
+    piAgent.releaseRun();
+    await turn;
+    await facade.waitForWorkSettled();
+    expect(facade.workSettled).toBe(true);
+    // The sweep delivered the parked content before settlement.
+    expect(piAgent.promptCalls).toContain('mid-run redirect');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delegated surface
+// ---------------------------------------------------------------------------
+
+describe('CortexAgent delegation', () => {
+  it('structurally exposes every non-withheld public AgentLoop member', () => {
+    // The delegation table in src/cortex-agent.ts is compile-time exhaustive
+    // over AgentLoop's public surface (a new member is a type error until
+    // routed). This asserts the runtime facade matches every disposition,
+    // so a forwarding gap (or an accidental exposure of a withheld member)
+    // cannot silently reappear.
+    const { facade } = createFacade();
+    for (const [member, disposition] of Object.entries(AGENT_LOOP_DELEGATION)) {
+      if (disposition === 'forwarded') {
+        expect(member in facade, `AgentLoop.${member} is marked forwarded but missing on CortexAgent`).toBe(true);
+      } else {
+        expect(
+          member in facade,
+          `AgentLoop.${member} is marked ${disposition} but exposed on CortexAgent; update the table if intended`,
+        ).toBe(false);
+      }
     }
+  });
 
-    function seedCompletedTask(
-      agent: CortexAgent,
-      overrides?: { exitCode?: number; stdout?: string; notified?: boolean; id?: string },
-    ): string {
-      const id = overrides?.id ?? 'task_1';
-      (agent as unknown as InternalAgent).toolRuntime.backgroundTasks.set({
-        id,
-        command: 'npm run check',
-        process: {},
-        stdout: overrides?.stdout ?? 'all tests green',
-        stderr: '',
-        exitCode: overrides?.exitCode ?? 0,
-        completed: true,
-        notified: overrides?.notified ?? false,
-        startTime: Date.now() - 1000,
-      });
-      return id;
+  it('exposes the reasoner event bridge, context manager, and usage verbatim', async () => {
+    const { facade, loop } = createFacade();
+    expect(facade.getEventBridge()).toBe(loop.getEventBridge());
+    expect(facade.getContextManager()).toBe(loop.getContextManager());
+    expect(facade.getBudgetGuard()).toBe(loop.getBudgetGuard());
+
+    await facade.prompt('hello');
+    expect(facade.getSessionUsage()).toEqual(loop.getSessionUsage());
+    expect(facade.getConversationHistory()).toEqual(loop.getConversationHistory());
+  });
+
+  it('destroy is idempotent and tears down the loop', async () => {
+    const { facade, loop } = createFacade();
+    await facade.destroy();
+    await facade.destroy();
+    expect(loop.state).toBe('destroyed');
+  });
+
+  it('the state and log surfaces reject after destroy', async () => {
+    const { facade } = createFacade();
+    await facade.prompt('before destroy');
+    await facade.destroy();
+
+    await expect(facade.getState()).rejects.toThrow('CortexAgent has been destroyed');
+    expect(() => facade.getLog()).toThrow('CortexAgent has been destroyed');
+    expect(() => facade.subscribeLog(() => {})).toThrow('CortexAgent has been destroyed');
+    // restore() rejects rather than throwing synchronously: the docs
+    // describe it as "rejected while running", and a consumer writing
+    // `await agent.restore(x).catch(...)` next to the async getState()
+    // caught nothing while the guard threw.
+    await expect(facade.restore([])).rejects.toThrow('CortexAgent has been destroyed');
+  });
+
+  it('a directly destroyed loop never schedules a state emission timer', async () => {
+    const { facade, loop } = createFacade({ stateChangeDebounceMs: 60_000 });
+    facade.onStateChanged(() => {});
+
+    // Direct AgentLoop.destroy(): the facade is not told, but its final
+    // onLoopComplete checkpoint must not schedule a debounce timer that
+    // holds its handle for the window and then snapshots a dead loop.
+    await loop.destroy();
+    expect((facade as unknown as { stateTimer: unknown }).stateTimer).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Forwarded semantics on the lifecycle edge
+//
+// The structural test above sees only that a forwarded member EXISTS on the
+// facade. It cannot see that a forwarded member's BEHAVIOUR diverges, which
+// is how steer() and abort() shipped throwing after destroy where the loop
+// no-ops: a consumer wiring abort to Ctrl+C fire-and-forget turned the throw
+// into an unhandled rejection that killed its shutdown mid-flight.
+// ---------------------------------------------------------------------------
+
+type PostDestroyTarget = CortexAgent | AgentLoop;
+
+/**
+ * How to exercise one forwarded member on a torn-down target, or why it is
+ * not exercised. Keyed by ForwardedLoopMember, so a newly forwarded member
+ * is a type error until it carries a probe or an explicit reason.
+ */
+type PostDestroyProbe =
+  | { readonly call: (target: PostDestroyTarget) => unknown }
+  | { readonly skip: string };
+
+/**
+ * A minimal consumer tool, only ever registered on a destroyed target.
+ * Annotated rather than asserted: the literal satisfies CortexTool on its
+ * own, so the `as unknown as` this used to carry bought nothing and would
+ * have hidden the shape drifting later.
+ */
+const probeTool: CortexTool = {
+  name: 'post_destroy_probe',
+  description: 'probe',
+  parameters: { type: 'object', properties: {} },
+  execute: async () => 'probe',
+};
+
+const POST_DESTROY_PROBES: Record<ForwardedLoopMember, PostDestroyProbe> = {
+  // Interaction surface.
+  prompt: { call: (t) => t.prompt('post-destroy') },
+  deliver: { call: (t) => t.deliver('post-destroy') },
+  steer: { call: (t) => t.steer('post-destroy') },
+  abort: { call: (t) => t.abort() },
+  destroy: { call: (t) => t.destroy() },
+  followUp: { call: (t) => t.followUp('post-destroy') },
+  isPrompting: { call: (t) => t.isPrompting },
+  // Queues.
+  setSteeringQueueMode: { call: (t) => t.setSteeringQueueMode('all') },
+  setFollowUpQueueMode: { call: (t) => t.setFollowUpQueueMode('all') },
+  clearSteeringQueue: { call: (t) => t.clearSteeringQueue() },
+  clearFollowUpQueue: { call: (t) => t.clearFollowUpQueue() },
+  clearQueuedDeliveries: { call: (t) => t.clearQueuedDeliveries() },
+  queuedDeliveryCount: { call: (t) => t.queuedDeliveryCount },
+  pendingWakeDeliveryCount: { call: (t) => t.pendingWakeDeliveryCount },
+  // Asks and headlines.
+  getPendingAsks: { call: (t) => t.getPendingAsks() },
+  markAskVoiced: { call: (t) => t.markAskVoiced('no-such-ask') },
+  setHeadlineProvider: { call: (t) => t.setHeadlineProvider(null) },
+  // Prompt and model surface.
+  setBasePrompt: { call: (t) => t.setBasePrompt('Test base prompt') },
+  getBasePrompt: { call: (t) => t.getBasePrompt() },
+  getCurrentSystemPrompt: { call: (t) => t.getCurrentSystemPrompt() },
+  composeSystemPrompt: { call: (t) => t.composeSystemPrompt('Test base prompt') },
+  getSystemPromptSections: { call: (t) => t.getSystemPromptSections() },
+  getModel: { call: (t) => t.getModel() },
+  setModel: { call: (t) => t.setModel(testModel()) },
+  getUtilityModel: { call: (t) => t.getUtilityModel() },
+  setUtilityModel: { call: (t) => t.setUtilityModel(testModel()) },
+  resetUtilityModel: { call: (t) => t.resetUtilityModel() },
+  getAutoResolvedUtilityModel: { call: (t) => t.getAutoResolvedUtilityModel() },
+  isUtilityModelOverridden: { call: (t) => t.isUtilityModelOverridden() },
+  getThinkingLevel: { call: (t) => t.getThinkingLevel() },
+  setThinkingLevel: { call: (t) => t.setThinkingLevel('off') },
+  getModelThinkingCapabilities: { call: (t) => t.getModelThinkingCapabilities() },
+  clampThinkingLevel: { call: (t) => t.clampThinkingLevel('off') },
+  setCacheRetention: { call: (t) => t.setCacheRetention('none') },
+  getCacheRetention: { call: (t) => t.getCacheRetention() },
+  setSessionId: { call: (t) => t.setSessionId(null) },
+  getSessionId: { call: (t) => t.getSessionId() },
+  // Context window and token accounting.
+  setContextWindow: { call: (t) => t.setContextWindow(200_000) },
+  setContextWindowLimit: { call: (t) => t.setContextWindowLimit(null) },
+  contextWindowLimit: { call: (t) => t.contextWindowLimit },
+  effectiveContextWindow: { call: (t) => t.effectiveContextWindow },
+  modelContextWindow: { call: (t) => t.modelContextWindow },
+  currentContextTokenCount: { call: (t) => t.currentContextTokenCount },
+  updateCurrentContextTokenCount: { call: (t) => t.updateCurrentContextTokenCount(0) },
+  estimateCurrentContextTokens: { call: (t) => t.estimateCurrentContextTokens() },
+  capToolResult: { call: (t) => t.capToolResult('probe') },
+  // Direct completions and usage.
+  directComplete: { skip: 'issues a real model completion' },
+  structuredComplete: { skip: 'issues a real model completion' },
+  utilityComplete: { skip: 'issues a real model completion' },
+  getLastDirectUsage: { call: (t) => t.getLastDirectUsage() },
+  getSessionUsage: { call: (t) => t.getSessionUsage() },
+  // History, memory, digestion, compaction.
+  getConversationHistory: { call: (t) => t.getConversationHistory() },
+  getObservationalMemoryState: { call: (t) => t.getObservationalMemoryState() },
+  digestIdle: { skip: 'runs the observer/reflector against a real model' },
+  checkAndRunCompaction: { skip: 'can run real summarization completions' },
+  triggerObservation: { skip: 'runs the observer against a real model' },
+  getCompactionManager: { call: (t) => t.getCompactionManager() },
+  // Tools, MCP, skills.
+  addConsumerTool: { call: (t) => t.addConsumerTool(probeTool) },
+  removeConsumerTool: { call: (t) => t.removeConsumerTool('post_destroy_probe') },
+  refreshTools: { call: (t) => t.refreshTools() },
+  connectMcpServer: { skip: 'opens a real transport (subprocess or socket)' },
+  disconnectMcpServer: { call: (t) => t.disconnectMcpServer('no-such-server') },
+  getMcpServerStates: { call: (t) => t.getMcpServerStates() },
+  mcpConfigMatches: {
+    // `transport`, not `type`. Written unasserted so the shape is checked
+    // against McpStdioConfig rather than waved through by a cast.
+    call: (t) => t.mcpConfigMatches('no-such-server', { transport: 'stdio', command: 'true' }),
+  },
+  setMcpToolCallProgressHandler: { call: (t) => t.setMcpToolCallProgressHandler(undefined) },
+  getMcpClientManager: { call: (t) => t.getMcpClientManager() },
+  getMcpTools: { call: (t) => t.getMcpTools() },
+  getSkillRegistry: { call: (t) => t.getSkillRegistry() },
+  loadSkill: { call: (t) => t.loadSkill('no-such-skill') },
+  clearSkillBuffer: { call: (t) => t.clearSkillBuffer() },
+  getSkillBuffer: { call: (t) => t.getSkillBuffer() },
+  setPreprocessorVariables: { call: (t) => t.setPreprocessorVariables({}) },
+  setScriptContext: { call: (t) => t.setScriptContext({}) },
+  // Sub-agents.
+  spawnBackgroundSubAgent: { skip: 'spawns a real child loop against a real model' },
+  cancelSubAgent: { call: (t) => t.cancelSubAgent('no-such-task') },
+  steerSubAgent: { call: (t) => t.steerSubAgent('no-such-task', 'probe') },
+  getActiveSubAgents: { call: (t) => t.getActiveSubAgents() },
+  getDeadLetteredBackgroundResults: { call: (t) => t.getDeadLetteredBackgroundResults() },
+  // State reads and misc.
+  isRunning: { call: (t) => t.isRunning },
+  state: { call: (t) => t.state },
+  isWorkingTagsEnabled: { call: (t) => t.isWorkingTagsEnabled },
+  setWorkingTagsEnabled: { call: (t) => t.setWorkingTagsEnabled(true) },
+  setLastInteractionTime: { call: (t) => t.setLastInteractionTime(Date.now()) },
+  getEnvOverrides: { call: (t) => t.getEnvOverrides() },
+  getEventBridge: { call: (t) => t.getEventBridge() },
+  getBudgetGuard: { call: (t) => t.getBudgetGuard() },
+  getContextManager: { call: (t) => t.getContextManager() },
+  // Callback registration.
+  onLoopComplete: { call: (t) => t.onLoopComplete(() => {}) },
+  onError: { call: (t) => t.onError(() => {}) },
+  onTurnComplete: { call: (t) => t.onTurnComplete(() => {}) },
+  onRetryScheduled: { call: (t) => t.onRetryScheduled(() => {}) },
+  onRetrySucceeded: { call: (t) => t.onRetrySucceeded(() => {}) },
+  onRetryExhausted: { call: (t) => t.onRetryExhausted(() => {}) },
+  onBeforeCompaction: { call: (t) => t.onBeforeCompaction(async () => {}) },
+  onPostCompaction: { call: (t) => t.onPostCompaction(() => {}) },
+  onCompactionError: { call: (t) => t.onCompactionError(() => {}) },
+  onCompactionDegraded: { call: (t) => t.onCompactionDegraded(() => {}) },
+  onCompactionExhausted: { call: (t) => t.onCompactionExhausted(() => {}) },
+  onSubAgentSpawned: { call: (t) => t.onSubAgentSpawned(() => {}) },
+  onSubAgentCompleted: { call: (t) => t.onSubAgentCompleted(() => {}) },
+  onSubAgentFailed: { call: (t) => t.onSubAgentFailed(() => {}) },
+  onBackgroundResultDelivery: { call: (t) => t.onBackgroundResultDelivery(() => {}) },
+  onBackgroundResultDeadLettered: { call: (t) => t.onBackgroundResultDeadLettered(() => {}) },
+  onObservation: { call: (t) => t.onObservation(() => {}) },
+  onReflection: { call: (t) => t.onReflection(() => {}) },
+};
+
+/**
+ * The outcome class a consumer can observe. 'threw' and 'rejected' are kept
+ * apart deliberately: a synchronous throw where the consumer awaits (or
+ * discards) a promise is a different bug from a rejection.
+ */
+type Outcome = 'ok' | 'threw' | 'rejected';
+
+async function observe(invoke: () => unknown): Promise<Outcome> {
+  let value: unknown;
+  try {
+    value = invoke();
+  } catch {
+    return 'threw';
+  }
+  if (value instanceof Promise) {
+    try {
+      await value;
+    } catch {
+      return 'rejected';
     }
+  }
+  return 'ok';
+}
 
-    it('wakes the loop when a bash task completes while idle', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
-      const id = seedCompletedTask(agent, { stdout: 'all tests green' });
-      const promptSpy = vi.spyOn(piAgent, 'prompt');
+describe('CortexAgent forwarded lifecycle semantics', () => {
+  it('carries a probe for every forwarded member', () => {
+    // The Record<ForwardedLoopMember, ...> type above says the same thing,
+    // but tests are outside the tsc project (tsconfig excludes them), so
+    // the exhaustiveness has to be asserted at runtime to actually bite.
+    const forwarded = Object.entries(AGENT_LOOP_DELEGATION)
+      .filter(([, disposition]) => disposition === 'forwarded')
+      .map(([member]) => member)
+      .sort();
+    expect(Object.keys(POST_DESTROY_PROBES).sort()).toEqual(forwarded);
+  });
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+  it('every practically callable forwarded member behaves as the loop does after destroy', async () => {
+    const { facade, loop } = createFacade();
+    await facade.prompt('before destroy');
+    await facade.destroy();
 
-      expect(promptSpy).toHaveBeenCalledTimes(1);
-      const delivered = promptSpy.mock.calls[0][0] as string;
-      expect(delivered).toContain(id);
-      expect(delivered).toContain('completed');
-      expect(delivered).toContain('exit code: 0');
-      expect(delivered).toContain('all tests green');
-    });
+    const divergences: string[] = [];
+    for (const [member, probe] of Object.entries(POST_DESTROY_PROBES)) {
+      if ('skip' in probe) continue;
+      // The facade first, then the loop it forwards to: same underlying
+      // teardown state, so any difference is the facade's own guard.
+      const viaFacade = await observe(() => probe.call(facade));
+      const viaLoop = await observe(() => probe.call(loop));
+      if (viaFacade !== viaLoop) {
+        divergences.push(`${member}: facade ${viaFacade}, loop ${viaLoop}`);
+      }
+    }
+    expect(divergences).toEqual([]);
+  });
 
-    it('marks a failed task and reports the exit code', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
-      const id = seedCompletedTask(agent, { exitCode: 2, stdout: 'boom' });
-      const promptSpy = vi.spyOn(piAgent, 'prompt');
+  it('names every forwarded member it cannot probe, and why', () => {
+    // Not silence: the members below run real model completions, spawn real
+    // child loops, or open real transports, so their post-destroy behaviour
+    // is verified by review rather than by this loop.
+    const skipped = Object.entries(POST_DESTROY_PROBES)
+      .filter(([, probe]) => 'skip' in probe)
+      .map(([member]) => member)
+      .sort();
+    expect(skipped).toEqual([
+      'checkAndRunCompaction',
+      'connectMcpServer',
+      'digestIdle',
+      'directComplete',
+      'spawnBackgroundSubAgent',
+      'structuredComplete',
+      'triggerObservation',
+      'utilityComplete',
+    ]);
+  });
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+  it('steer() after destroy is a silent no-op, like the loop', async () => {
+    const { facade, piAgent } = createFacade();
+    await facade.destroy();
 
-      const delivered = promptSpy.mock.calls[0][0] as string;
-      expect(delivered).toContain('failed');
-      expect(delivered).toContain('exit code: 2');
-    });
+    expect(() => facade.steer('late keystroke')).not.toThrow();
+    expect(piAgent.steeringQueue).toEqual([]);
+  });
 
-    it('queues the completion while prompting and delivers it on drain', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
-      const id = seedCompletedTask(agent);
+  it('abort() after destroy resolves instead of rejecting', async () => {
+    const { facade } = createFacade();
+    await facade.destroy();
 
-      // Hold the first loop open so the completion arrives mid-prompt.
-      let releaseFirst!: () => void;
-      const originalPrompt = piAgent.prompt.bind(piAgent);
-      const promptCalls: string[] = [];
-      piAgent.prompt = async (input: string): Promise<unknown> => {
-        promptCalls.push(input);
-        if (promptCalls.length === 1) {
-          await new Promise<void>((resolve) => { releaseFirst = resolve; });
-        }
-        return originalPrompt(input);
-      };
+    await expect(facade.abort()).resolves.toBeUndefined();
+    await expect(facade.abort('conversation')).resolves.toBeUndefined();
+    await expect(facade.abort('work')).resolves.toBeUndefined();
+  });
 
-      const firstTurn = agent.prompt('kick off a long turn');
-      await new Promise((resolve) => setImmediate(resolve));
-      expect(promptCalls).toHaveLength(1);
+  it('a fire-and-forget abort during teardown never becomes an unhandled rejection', async () => {
+    const { facade, piAgent } = createFacade();
+    piAgent.hold = true;
+    const turn = facade.prompt('long turn').catch(() => undefined);
+    await waitUntil(() => piAgent.promptCalls.length === 1);
 
-      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
-      // The completion is queued while the loop runs, not delivered
-      // immediately with a competing loop start.
-      expect(internal.pendingBackgroundResults).toHaveLength(1);
-      expect(promptCalls).toHaveLength(1);
+    // The consumer symptom: a TUI wires abort to Ctrl+C and Escape and
+    // discards the promise, so a quit races its own teardown. destroy()
+    // marks the facade destroyed synchronously, so this abort lands
+    // mid-teardown, exactly where the throw used to escape uncaught.
+    const teardown = facade.destroy();
+    const rejections: unknown[] = [];
+    process.once('unhandledRejection', (err) => rejections.push(err));
+    void facade.abort();
+    facade.steer('escape during teardown');
 
-      // Loop ends; the end-of-cycle drain delivers the queued completion
-      // before the consumer's await resolves.
-      releaseFirst();
-      await firstTurn;
-      await delivery;
-
-      expect(promptCalls).toHaveLength(2);
-      expect(promptCalls[1]).toContain(id);
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
-    });
-
-    it('does not deliver a task already observed via poll/kill (notified)', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
-      const id = seedCompletedTask(agent, { notified: true });
-      const promptSpy = vi.spyOn(piAgent, 'prompt');
-
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
-
-      expect(promptSpy).not.toHaveBeenCalled();
-    });
-
-    it('does not re-deliver the same completion twice', async () => {
-      const agent = createTestCortexAgent(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
-      const id = seedCompletedTask(agent);
-      const promptSpy = vi.spyOn(piAgent, 'prompt');
-
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
-
-      // Second delivery is suppressed because the task is now notified
-      expect(promptSpy).toHaveBeenCalledTimes(1);
-    });
+    await teardown;
+    await turn;
+    // Let any queued microtask rejection surface before asserting.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(rejections).toEqual([]);
   });
 });

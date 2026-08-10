@@ -1,7 +1,7 @@
 /**
- * Tests for CortexUsage type and CortexAgent usage extraction.
+ * Tests for CortexUsage type and AgentLoop usage extraction.
  *
- * Since CortexAgent.extractUsageFromAssistantMessage() is private,
+ * Since AgentLoop.extractUsageFromAssistantMessage() is private,
  * we test it indirectly through the public getLastDirectUsage() API
  * using mock pi-ai responses.
  */
@@ -59,7 +59,7 @@ describe('CortexUsage', () => {
 
 describe('Usage extraction patterns', () => {
   /**
-   * Simulate the extraction logic that CortexAgent.extractUsageFromAssistantMessage
+   * Simulate the extraction logic that AgentLoop.extractUsageFromAssistantMessage
    * uses. This mirrors the private method for direct testing.
    */
   function extractUsage(result: unknown): CortexUsage | null {

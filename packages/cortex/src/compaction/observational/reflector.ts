@@ -201,7 +201,7 @@ export async function runReflector(
   while (true) {
     const systemPrompt = buildReflectorPrompt(level, config.reflectorInstruction);
     const messages = buildReflectorMessages(observations);
-    const raw = await complete({ systemPrompt, messages });
+    const raw = await complete({ systemPrompt, messages }, { purpose: 'reflector' });
 
     parsedOutput = parseReflectorOutput(raw);
 

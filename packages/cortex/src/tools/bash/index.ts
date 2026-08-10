@@ -70,7 +70,7 @@ export function isWrapperLaunchErrorCode(code: string | undefined): boolean {
 /**
  * True when a tool call is a Bash escalation request: the Bash tool invoked
  * with `escalateOutsideSandbox: true`. Shared by the permission adaptation in
- * CortexAgent and by consumers that need to recognize the same shape.
+ * AgentLoop and by consumers that need to recognize the same shape.
  */
 export function isBashEscalationRequest(toolName: string, toolArgs: unknown): boolean {
   if (toolName !== 'Bash') return false;
@@ -154,7 +154,7 @@ export interface BashToolConfig {
   sandbox?: SandboxProvider | undefined;
   /**
    * Assert that a permission gate screens calls BEFORE they reach execute()
-   * (CortexAgent sets this when the consumer configured resolvePermission,
+   * (AgentLoop sets this when the consumer configured resolvePermission,
    * which runs via beforeToolCall and can block the call). Security-relevant
    * for escalation: `escalateOutsideSandbox` is honored only when true, because
    * reaching execute() then means the gate approved the escalation. When

@@ -138,12 +138,23 @@ export class CortexToolRuntime {
     this.webFetch = new WebFetchRuntimeState();
   }
 
-  resetForLoop(): void {
+  /**
+   * Reset per-loop state at prompt start.
+   *
+   * `preserveWorkspaceState` is the long-lived (persistent runtime) mode: a
+   * loop woken repeatedly by deliveries keeps its working directory,
+   * read-before-edit registry, and undo history across prompts. Transient
+   * per-loop state always resets regardless: the mutation lock is a safety
+   * net against a crashed tool holding a lock forever, and the WebFetch
+   * counter implements a per-loop rate limit, not workspace state.
+   */
+  resetForLoop(options?: { preserveWorkspaceState?: boolean }): void {
+    this.fileMutationLock.clear();
+    this.webFetch.resetLoop();
+    if (options?.preserveWorkspaceState) return;
     this.cwdTracker.reset();
     this.readRegistry.clear();
-    this.fileMutationLock.clear();
     this.editHistory.clear();
-    this.webFetch.resetLoop();
   }
 
   destroy(): void {

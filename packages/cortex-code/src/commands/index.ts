@@ -15,6 +15,7 @@ import { debugCommand } from './debug.js';
 import { updateCommand } from './update.js';
 import { mcpReloadCommand } from './mcp-reload.js';
 import { sandboxCommand } from './sandbox.js';
+import { statusCommand } from './status.js';
 
 // Handler type uses `any` for the session parameter to avoid circular
 // dependency with session.ts. Type safety is enforced at the call site.
@@ -66,6 +67,7 @@ export function registerBuiltinCommands(): void {
   registerCommand(providerCommand);
   registerCommand(utilityModelCommand);
   registerCommand(costCommand);
+  registerCommand(statusCommand);
   registerCommand(contextWindowCommand);
   registerCommand(resumeCommand);
   registerCommand(resumeAllCommand);

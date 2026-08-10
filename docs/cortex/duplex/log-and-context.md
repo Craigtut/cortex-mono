@@ -1,6 +1,6 @@
 # The Session Log and Context Mechanics
 
-> **STATUS: DESIGN, NOT IMPLEMENTED**
+> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode (D14); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
 
 ## What the Log Is
 
@@ -25,7 +25,29 @@ Content reaches a model through exactly two mechanisms, chosen by durability:
 
 ### Durable Content: Real Messages
 
-Deliverables, directives, conversation deltas, permission asks: anything a loop must remember becomes a real message in that loop's transcript, delivered at a turn boundary via the loop's `deliver()` primitive (prompt-if-idle, steer-if-running, queue otherwise; built in P0). This is the same path background sub-agent results use today (`drainPendingBackgroundResults`, hardened in P0 for re-queue-on-failure).
+Deliverables, directives, conversation deltas, permission asks: anything a loop must remember becomes a real message in that loop's transcript, delivered at a turn boundary via the loop's `deliver()` primitive. This is the same path background sub-agent results use today (`drainPendingBackgroundResults`, hardened in P0 for capped re-queue-on-failure).
+
+`deliver()` is a state machine over (loop-gate depth, wake class, abort state) with three outcomes (`prompted`, `parked`, `queued`), specified in P1 rather than P0 because the semantics are subtle:
+
+Wake class is the primary axis, loop state the secondary one. Silent never steers, in any state:
+
+| Wake | Loop state | Action |
+|---|---|---|
+| wake | idle | prompt (starts a turn; the caller's promise is that turn) |
+| wake | gate held (any holder) | append to the loop-owned wake queue and enqueue a sweep task that starts a run if the content is still parked when it fires |
+| `silent` | any | loop-owned silent queue, flushed as leading messages of the next real prompt |
+
+**Cortex owns wake parking; pi's steering queue is only ever used by the public `steer()` API.** The obvious implementation hands wake content to pi's steering queue and reconciles afterwards, on the premise that some run will drain it. Two things defeat that. First, not every gate holder starts a run: `digestIdle` holds the gate and calls the transform hook directly, so content parked there waits for an unrelated later run, possibly a background drain. Second, and worse, pi's queue is opaque: you cannot inspect it, remove a single entry, or learn that one particular item was drained. Any after-the-fact reconciliation has to approximate, and every approximation leaks. A "was anything left queued" check duplicates already-drained content whenever a second delivery parks behind it, and clearing the queue to avoid that destroys content the public `steer()` API parked.
+
+So both wake and silent content live in loop-owned queues and are spliced into the front of the next run's message batch, which is exact by construction. They differ in one respect only: wake content enqueues a sweep so a run happens even if nothing else would start one; silent content waits for a real prompt.
+
+The accepted cost is that a wake delivery arriving during a live run lands at the start of the next run rather than at the current run's next turn boundary. That is a bounded one-turn delay, and the talker's turns are short by design (capped output, no blocking tools). Exactness is worth more than the latency here, because the failure it removes is duplicated or destroyed conversation content.
+
+**Silent must never reach pi's steering queue, including while a run is live.** After a terminated tool batch, `runLoop` still polls `getSteeringMessages()` and continues the inner loop if anything is queued. A silent delivery parked there during a talker turn would drain immediately after the control-tool batch and produce an unprompted spoken response to content that was supposed to surface only when relevant. Steering silent content into a running turn is the same mistake wearing a different hat: it lands at that run's next turn boundary and gets acted on, which is a wake by another name.
+
+The silent queue flushes into real prompts only, never into drain-started background-completion runs, because those runs depend on the pre-delivery message count for the unwind accounting added in Phase 0.
+
+A message delivered into a running turn extends that turn, so it inherits its budget window, retry window, and consumer promise. The implementation lives inside the loop gate; a check-then-call version has a time-of-check race against `prompt()`, which throws whenever the gate is held.
 
 Real messages are append-only source content, which makes them:
 
@@ -37,7 +59,7 @@ Message shape constraints from the audit: user-role, non-whitespace string conte
 
 ### Churn: View Injection Outside BP3
 
-Task headlines and live activity (current tool, duration, token count, last output lines) change every tick and must never enter a transcript or the cached prefix. They use the existing `<background-tasks>` mechanism: view-injected in `transformContext` after the BP3 boundary (`cortex-agent.ts:3340-3350`), rebuilt every call, absent on compaction turns by design, never observed, never persisted.
+Task headlines and live activity (current tool, duration, token count, last output lines) change every tick and must never enter a transcript or the cached prefix. They use the existing `<background-tasks>` mechanism: view-injected in `transformContext` after the BP3 boundary (`agent-loop.ts:3340-3350`), rebuilt every call, absent on compaction turns by design, never observed, never persisted.
 
 Rules for the headline block, from the audit:
 
@@ -49,27 +71,35 @@ Rules for the headline block, from the audit:
 
 | Entry | Producer | Routed to | Channel |
 |---|---|---|---|
-| `utterance` | consumer via facade | talker (its prompt), reasoner (delivered delta) | real message |
-| `reply` | talker | log only (record of what was said) | none (talker authored it) |
+| `utterance` | consumer via facade | talker (its prompt), reasoner (silent delta, D18) | real message |
+| `reply` | talker | log; reasoner (silent delta, batched with the utterance it answers) | real message |
+| `error` / `retrying` | error and retry handlers | talker (retrying: headline; fatal: interrupt delivery) | mixed |
 | `directive` | talker control tools | facade router, then reasoner or target sub-agent | real message (steer) |
 | `delivery` | reasoner | talker, per wake policy | real message |
-| `headline` | event bridges, task registry | talker (and reasoner for its children) | view injection |
+| `lifecycle` | facade | log (durable: spawns, completions, cancels, dispatch failures, resolution notes) | none |
 | `ask` / `ask_answer` | permission broker | talker / originating resolver | real message / promise settle |
 | `lookup_result` | quick-lookup sub-agent | talker (wake) and reasoner (delta at next turn) | real message |
-| `lifecycle` | facade | log only | none |
 
 `lookup_result` routing is the shared-context guarantee of decisions.md D13: the reasoner sees everything the talker learned, so context never forks.
 
+**Headlines are not log entries.** The live status block is facade state rebuilt from event-bridge activity and injected per turn; it never appends to the log. Making every headline tick an entry would grow the log at tool-call frequency and bloat the persistence artifact with exactly the churn the two-channel split exists to keep out of durable state. Durable milestones (a task started, finished, was cancelled, or a dispatch failed) are `lifecycle` entries; the moment-to-moment "currently running Grep" is not.
+
+Every entry carries a monotonic sequence number (timestamps collide under burst), and entries produced by a router-initiated run carry the sequence number of the entry that caused it. Causation is not only for observability: D16 uses it to bind consent.
+
+**The cause travels with the content, not in a facade field.** A delivery carries its cause tag from the moment it is parked; the loop surfaces the tags of whatever content the current run actually consumed, set in the same synchronous frame the run takes its batch and cleared in that run's own `finally`. This matters because the obvious implementation, a facade field set when a run is started, silently fails for the most common voice interaction there is: a user answering while the talker is still speaking parks behind the live run, so the field is never set and the resulting turn has an empty chain. It also races, since the field's clear is not synchronized with the loop gate, so a swept run can begin while the previous utterance's stamp still stands. Binding the cause to the content makes both impossible by construction, and as a side effect gives a dispatch parked behind a busy reasoner the directive causation an earlier draft of this document called unbindable.
+
 ## Cache Discipline Per Loop
 
-Each loop keeps its own transcript, its own stable session ID (`sessionId` per instance for prefix-cache routing; children already use taskId, `cortex-agent.ts:4917-4918`), and its own cache breakpoints. The composite adds no cross-loop cache coupling:
+Each loop keeps its own transcript, its own stable session ID (`sessionId` per instance for prefix-cache routing; children already use taskId, `agent-loop.ts:4917-4918`), and its own cache breakpoints. The composite adds no cross-loop cache coupling:
 
 - Talker prefix: system prompt + slots + compacted history. Deliveries append; headlines stay outside BP3. Target: near-total cache reads per utterance.
 - Reasoner prefix: unchanged from today.
-- The step-0 mirror rule holds everywhere: mid-loop writes to `agent.state.messages` (including `setSlot`) are clobbered by the next `transformContext` mirror (`cortex-agent.ts:3275`) and never reach pi's loop array. The facade therefore writes slots only between prompts, or uses the per-call re-patch pattern (`cortex-agent.ts:3319-3333`) if a mid-loop surface ever becomes necessary.
+- The step-0 mirror rule holds everywhere: mid-loop writes to `agent.state.messages` (including `setSlot`) are clobbered by the next `transformContext` mirror (`agent-loop.ts:3275`) and never reach pi's loop array. The facade therefore writes slots only between prompts, or uses the per-call re-patch pattern (`agent-loop.ts:3319-3333`) if a mid-loop surface ever becomes necessary.
 
 ## Compaction Interactions
 
 - Every loop runs its own compaction manager. The talker compacts (infinite conversation is a consumer expectation); observational is the default strategy on both resident loops, with classic as a talker tuning option if duplicate observation cost across overlapping content proves material (decisions.md D4).
-- Compaction cliffs should be staggered: both resident loops receiving the conversation means both cross activation thresholds around the same time, and the sync-observer fallback paths block inside `transformContext` (`compaction/observational/index.ts:249-285`). The facade offsets their thresholds so blocking observation never hits both loops in the same window.
+- **The talker runs a non-blocking compaction posture.** Its synchronous observer fallback is disabled, leaving emergency truncation as the only in-band path, because a blocking observer call inside `transformContext` is multi-second dead air on the presence loop and would recur at every activation for the whole session. Staggering thresholds between loops does not help the user who is mid-conversation when the talker crosses its own.
+- The facade schedules deferred digestion (pending observation buffers, threshold compaction) during idle-signal windows for both loops, and staggers their thresholds so blocking work on the reasoner never coincides with a talker activation.
+- The log itself never compacts. Since it is also the persistence artifact, it carries a retention policy, and that policy is now scoped by entry type rather than a flat FIFO. `maxEntries` still bounds the whole log; what it no longer does is decide *which* entries pay for the overflow. `applyRetention` evicts churn first, oldest-first (`lifecycle`, `delivery`, `directive`, `lookup_result`, `retrying`, all produced at machine frequency), and reaches conversational history (`utterance`, `reply`, `ask`, `ask_answer`, plus `error`) only once no churn is left, at which point it degrades to the old oldest-first behavior. `error` sits with the durable set because it is rare enough to crowd out nothing and is what a consumer most needs when reconstructing a failure. An over-cap restore applies the same selection, so the two paths cannot drift. One consequence to know: the retained set is no longer a contiguous seq suffix, so `firstRetainedSeq` bounds it from below but guarantees nothing above, and `subscribeLog` replay announces every hole in the requested range rather than only the leading one.
 - Persisted-result breadcrumbs (`[Result persisted: <path>]`) inside delivered content assume a shared filesystem; both resident loops share `workingDirectory` and the persist layout, so a delivered breadcrumb remains resolvable by the reasoner. The talker has no Read tool and simply speaks around them.

@@ -6,7 +6,7 @@
  * budget guards, compaction, skill system, and event logging.
  *
  * Phase 1A exports: types and pure utility modules.
- * Phase 1B exports: CortexAgent, ContextManager, EventBridge, BudgetGuard.
+ * Phase 1B exports: AgentLoop, ContextManager, EventBridge, BudgetGuard.
  * Phase 1C exports: Built-in tools (Read, Write, Edit, Glob, Grep, Bash, TaskOutput, WebFetch).
  * Phase 1D exports: ProviderManager, model wrapper, provider registry.
  */
@@ -16,10 +16,16 @@ export type {
   CortexLogger,
   CortexUsage,
   SessionUsage,
+  UtilityUsageBucket,
+  UtilityUsagePayload,
+  TalkerDeltaPayload,
   CortexLifecycleState,
   CortexToolPermissionDecision,
   CortexToolPermissionResult,
-  CortexAgentConfig,
+  ToolPermissionRequestContext,
+  PendingAsk,
+  LoopOriginContext,
+  AgentLoopConfig,
   CortexDiagnosticsConfig,
   ContextManagerConfig,
   ErrorCategory,
@@ -32,6 +38,7 @@ export type {
   AgentTextOutput,
   ToolContentDetails,
   BudgetGuardConfig,
+  BudgetScope,
   ToolCategory,
   MicrocompactionConfig,
   CompactionConfig,
@@ -62,6 +69,9 @@ export type {
   SubAgentSpawnAugmentation,
   SubAgentSnapshot,
   SubAgentResult,
+  SubAgentHandle,
+  SubAgentBudgetView,
+  DeadLetteredBackgroundResult,
   TrackedSubAgent,
   ThinkingLevel,
   ModelThinkingCapabilities,
@@ -86,6 +96,7 @@ export {
   stripWorkingTags,
   extractWorkingContent,
   parseWorkingTags,
+  WorkingTagStreamFilter,
 } from './working-tags.js';
 
 // Error Classifier
@@ -127,7 +138,7 @@ export type {
 } from './cache-breakpoints.js';
 
 // Event Bridge (Phase 1B)
-export { EventBridge } from './event-bridge.js';
+export { EventBridge, extractResponseChunkText } from './event-bridge.js';
 export type {
   CortexEventType,
   CortexEvent,
@@ -140,9 +151,63 @@ export type {
 // Budget Guard (Phase 1B)
 export { BudgetGuard } from './budget-guard.js';
 
-// CortexAgent (Phase 1B)
-export { CortexAgent, MINIMUM_CONTEXT_WINDOW, TOOL_RESULT_WORKING_TAGS_REMINDER } from './cortex-agent.js';
-export type { PiAgent, PiModel, DirectCompletionOptions } from './cortex-agent.js';
+// AgentLoop (Phase 1B)
+export { AgentLoop, MINIMUM_CONTEXT_WINDOW, TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop.js';
+export type {
+  PiAgent,
+  PiModel,
+  DirectCompletionOptions,
+  DeliverOptions,
+  DeliverOutcome,
+  DeliverResult,
+  IdleDigestionResult,
+  QueueDrainMode,
+  ToolResultInterceptor,
+  ToolResultInterceptorInfo,
+  ToolResultInterceptorResult,
+} from './agent-loop.js';
+
+// CortexAgent (the composite facade over AgentLoop: passthrough and duplex
+// modes). AgentLoop remains the loop primitive and the package's primary
+// agent surface until the duplex default flips (Phase 3).
+export { CortexAgent, CONFIG_ROUTING, buildReasonerConfig } from './cortex-agent.js';
+export type {
+  CortexAgentMode,
+  CortexAgentConfig,
+  CortexAbortScope,
+  CortexDeliverOptions,
+  CortexSessionLogConfig,
+  TalkerConfig,
+  DuplexTuningConfig,
+  ConfigDestination,
+  CortexAgentStateV1,
+  CortexAgentStateV2,
+  CortexAgentPersistedState,
+  CortexAgentUsageBreakdown,
+} from './cortex-agent.js';
+
+// Resolution report (what a CortexAgent assembly resolved to, where that
+// differs from what the consumer asked for)
+export { RESOLUTION_NOTE_CODES } from './resolution-report.js';
+export type {
+  ResolutionNote,
+  ResolutionNoteCode,
+  ResolutionSeverity,
+} from './resolution-report.js';
+
+// Session Log (the CortexAgent composite's append-only session record)
+export { SessionLog } from './session-log.js';
+export type {
+  SessionLogEntry,
+  SessionLogEntryType,
+  SessionLogAppendInput,
+  SessionLogEvent,
+  SessionLogGap,
+  SessionLogReset,
+  SessionLogSubscriber,
+  SessionLogOptions,
+  WakeClass,
+} from './session-log.js';
 
 // Tool Contracts
 export { fromPiAgentTool, assertValidCortexTool } from './tool-contract.js';

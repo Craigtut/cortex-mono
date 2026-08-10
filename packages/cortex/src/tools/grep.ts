@@ -24,6 +24,8 @@ import {
 } from './shared/gitignore.js';
 import { compileGlob } from './shared/glob-matcher.js';
 import { buildSafeEnv } from './shared/safe-env.js';
+import { createPathAllowlist } from './shared/path-allowlist.js';
+import type { PathAllowlist } from './shared/path-allowlist.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -136,6 +138,13 @@ export interface GrepToolConfig {
    * runs exactly as before. See docs/cortex/sandboxing.md.
    */
   sandbox?: SandboxProvider | undefined;
+  /**
+   * Restrict searches to paths under these roots. Enforced in-tool with
+   * symlink resolution; a search path outside the roots is refused with a
+   * visible message. Complements (does not replace) the sandbox: it also
+   * holds when no sandbox is configured. Undefined or empty = unrestricted.
+   */
+  allowedRoots?: readonly string[] | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +833,10 @@ export function createGrepTool(config: GrepToolConfig): {
   execute: (params: GrepParamsType) => Promise<ToolContentDetails<GrepDetails>>;
 } {
   const respectGitignore = config.respectGitignore ?? true;
+  const allowlist: PathAllowlist | null =
+    config.allowedRoots && config.allowedRoots.length > 0
+      ? createPathAllowlist(config.allowedRoots)
+      : null;
 
   return {
     name: 'Grep',
@@ -832,6 +845,23 @@ export function createGrepTool(config: GrepToolConfig): {
 
     async execute(params: GrepParamsType): Promise<ToolContentDetails<GrepDetails>> {
       const searchPath = params.path ? path.resolve(params.path) : path.resolve(config.defaultCwd);
+
+      // Allowlist gate (symlink-resolved) before any search engine runs.
+      if (allowlist) {
+        const verdict = await allowlist.check(searchPath);
+        if (!verdict.allowed) {
+          return {
+            content: [{ type: 'text', text: verdict.refusal! }],
+            details: {
+              totalFiles: 0,
+              totalMatches: 0,
+              durationMs: 0,
+              truncated: false,
+              usingFallback: false,
+            },
+          };
+        }
+      }
 
       // The JS fallback (searchWithFallback -> fs.readFile) reads in-process and
       // bypasses the OS sandbox. When the sandbox enforces filesystem

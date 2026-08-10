@@ -239,7 +239,7 @@ Placing the skills list in the `load_skill` tool description rather than the sys
 
 A native `AgentTool` registered on the pi-agent-core Agent. This is the primary mechanism for getting skill content into context.
 
-Registration is automatic for parent agents created with `CortexAgent.create()`. The public `CortexAgentConfig` does not expose a disable flag for `load_skill`; consumers that do not use skills can leave the registry empty. Child agents created by the SubAgent tool disable `load_skill` internally so skills do not recurse into delegated workers.
+Registration is automatic for parent agents created with `AgentLoop.create()`. The public `AgentLoopConfig` does not expose a disable flag for `load_skill`; consumers that do not use skills can leave the registry empty. Child agents created by the SubAgent tool disable `load_skill` internally so skills do not recurse into delegated workers.
 
 ```typescript
 const loadSkillTool: AgentTool = {
@@ -281,7 +281,7 @@ ${registry.getAvailableSkillsSummary()}`,
 
 ### The Skill Buffer
 
-The `skillBuffer` is an array of loaded skill content maintained by the CortexAgent:
+The `skillBuffer` is an array of loaded skill content maintained by the AgentLoop:
 
 ```typescript
 interface LoadedSkill {
@@ -289,7 +289,7 @@ interface LoadedSkill {
   content: string;  // Preprocessed SKILL.md body
 }
 
-// Maintained on CortexAgent
+// Maintained on AgentLoop
 private skillBuffer: LoadedSkill[] = [];
 ```
 
@@ -308,7 +308,7 @@ Skill content is injected via a dedicated step in the `transformContext` composi
 - `setEphemeral()` is set once during GATHER and is static for the loop. The skillBuffer mutates mid-loop as the agent loads skills.
 - If skills went through `setEphemeral()`, Cortex would need to rebuild the consumer's ephemeral content every time a skill loads, violating separation of concerns.
 
-**Composition order** (Cortex composes these internally via `CortexAgent.getTransformContextHook()`):
+**Composition order** (Cortex composes these internally via `AgentLoop.getTransformContextHook()`):
 
 ```
 transformContext fires:
@@ -356,7 +356,7 @@ Consumer pre-loading (`cortexAgent.loadSkill()`) happens during GATHER (Phase 1)
 The consumer can pre-load skills during the GATHER phase, before the agentic loop starts:
 
 ```typescript
-// CortexAgent API
+// AgentLoop API
 loadSkill(name: string, args?: string): Promise<void>;
 ```
 
@@ -530,8 +530,8 @@ interface CortexScriptContext {
 ```
 
 ```typescript
-// CortexAgent API
-class CortexAgent {
+// AgentLoop API
+class AgentLoop {
   /** Access the skill registry for add/remove/query operations. */
   getSkillRegistry(): SkillRegistry;
 

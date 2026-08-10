@@ -2,9 +2,9 @@ import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
-import type { CortexAgentConfig } from '../../src/types.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
+import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import { createBashTool } from '../../src/tools/bash/index.js';
 import { createReadTool } from '../../src/tools/read.js';
@@ -19,15 +19,15 @@ type RegisteredTool = {
   execute: (...args: any[]) => Promise<unknown>;
 };
 
-type TestCortexAgentConstructor = new (
+type TestAgentLoopConstructor = new (
   agent: PiAgent,
-  config: CortexAgentConfig,
+  config: AgentLoopConfig,
   tools?: RegisteredTool[],
   options?: {
     enableSubAgentTool?: boolean;
     enableLoadSkillTool?: boolean;
   },
-) => CortexAgent;
+) => AgentLoop;
 
 function makeModel(raw: PiModel) {
   return wrapModel(raw, raw.provider, raw.name, raw.contextWindow);
@@ -55,20 +55,20 @@ function createMockPiAgent(): PiAgent {
   };
 }
 
-function createTestCortexAgent(
+function createTestAgentLoop(
   agent: PiAgent,
-  config: CortexAgentConfig,
+  config: AgentLoopConfig,
   tools?: RegisteredTool[],
   options?: {
     enableSubAgentTool?: boolean;
     enableLoadSkillTool?: boolean;
   },
-): CortexAgent {
-  const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
-  return new CortexAgentCtor(agent, config, tools, options);
+): AgentLoop {
+  const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+  return new AgentLoopCtor(agent, config, tools, options);
 }
 
-function createConfig(workingDirectory: string): CortexAgentConfig {
+function createConfig(workingDirectory: string): AgentLoopConfig {
   return {
     model: makeModel({
       provider: 'anthropic',
@@ -81,7 +81,7 @@ function createConfig(workingDirectory: string): CortexAgentConfig {
   };
 }
 
-describe('CortexAgent child tool hardening', () => {
+describe('AgentLoop child tool hardening', () => {
   it('clones runtime-aware built-ins for child agents instead of reusing parent state', async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-child-tools-'));
     const filePath = path.join(tmpDir, 'existing.txt');
@@ -96,7 +96,7 @@ describe('CortexAgent child tool hardening', () => {
         createWriteTool({ readRegistry: new ReadRegistry() }) as RegisteredTool,
       ];
 
-      const parent = createTestCortexAgent(
+      const parent = createTestAgentLoop(
         createMockPiAgent(),
         createConfig(tmpDir),
         parentTools,
@@ -104,7 +104,7 @@ describe('CortexAgent child tool hardening', () => {
       );
 
       const childTools = (parent as any).buildChildToolSet() as RegisteredTool[];
-      const child = createTestCortexAgent(
+      const child = createTestAgentLoop(
         createMockPiAgent(),
         createConfig(tmpDir),
         childTools,
@@ -137,7 +137,7 @@ describe('CortexAgent child tool hardening', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-child-mcp-'));
 
     try {
-      const parent = createTestCortexAgent(
+      const parent = createTestAgentLoop(
         createMockPiAgent(),
         createConfig(tmpDir),
         [],

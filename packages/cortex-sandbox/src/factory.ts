@@ -7,7 +7,7 @@
  *   - other  -> SandboxRuntimeProvider, which itself reports honest `none`
  *
  * Both implement the same @animus-labs/cortex SandboxProvider interface, so the
- * consumer constructs one of these and wires it into CortexAgent identically.
+ * consumer constructs one of these and wires it into AgentLoop identically.
  * Each provider still reports honest status (Windows Tier 1: filesystem
  * `partial` because writes are confined but secret reads are not denied, and
  * network `none`; POSIX: enforced or a degraded `none` with reasons), so the

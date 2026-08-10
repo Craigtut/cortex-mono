@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
-import type { CortexAgentConfig, ThinkingLevel } from '../../src/types.js';
+import type { AgentLoopConfig, ThinkingLevel } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 
@@ -18,7 +18,7 @@ vi.mock('@earendil-works/pi-ai', () => ({
   clampThinkingLevel: (...args: unknown[]) => mockClampThinkingLevel(...args),
 }));
 
-// cortex-agent's static catalog import now resolves from providers/all (pi-ai
+// agent-loop's static catalog import now resolves from providers/all (pi-ai
 // 0.80). Stub it so agent construction stays hermetic instead of hitting the
 // real model catalog; the utility-model inference guards against undefined.
 vi.mock('@earendil-works/pi-ai/providers/all', () => ({
@@ -74,14 +74,14 @@ function createMockPiAgent(): MockPiAgent {
 // Helpers
 // ---------------------------------------------------------------------------
 
-type TestCortexAgentConstructor = new (
+type TestAgentLoopConstructor = new (
   agent: PiAgent,
-  config: CortexAgentConfig,
-) => CortexAgent;
+  config: AgentLoopConfig,
+) => AgentLoop;
 
-function createTestCortexAgent(agent: PiAgent, config: CortexAgentConfig): CortexAgent {
-  const CortexAgentCtor = CortexAgent as unknown as TestCortexAgentConstructor;
-  return new CortexAgentCtor(agent, config);
+function createTestAgentLoop(agent: PiAgent, config: AgentLoopConfig): AgentLoop {
+  const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
+  return new AgentLoopCtor(agent, config);
 }
 
 function makeModel(raw: PiModel): CortexModel {
@@ -95,7 +95,7 @@ function makeModel(raw: PiModel): CortexModel {
   return wrapModel(raw, raw.provider, modelId, contextWindow);
 }
 
-function createDefaultConfig(overrides?: Partial<CortexAgentConfig>): CortexAgentConfig {
+function createDefaultConfig(overrides?: Partial<AgentLoopConfig>): AgentLoopConfig {
   return {
     model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel),
     workingDirectory: '/tmp/test-workspace',
@@ -111,11 +111,11 @@ function createDefaultConfig(overrides?: Partial<CortexAgentConfig>): CortexAgen
 
 describe('ThinkingLevel', () => {
   let piAgent: MockPiAgent;
-  let agent: CortexAgent;
+  let agent: AgentLoop;
 
   beforeEach(() => {
     piAgent = createMockPiAgent();
-    agent = createTestCortexAgent(piAgent, createDefaultConfig());
+    agent = createTestAgentLoop(piAgent, createDefaultConfig());
     vi.clearAllMocks();
     mockGetSupportedThinkingLevels.mockReturnValue([]);
     mockClampThinkingLevel.mockImplementation((_model, level) => level);
@@ -203,7 +203,7 @@ describe('ThinkingLevel', () => {
     it('returns supportsThinking: false for non-reasoning models', async () => {
       const model = { provider: 'anthropic', name: 'claude-haiku', reasoning: false } as PiModel;
       const cortexModel = makeModel(model);
-      const testAgent = createTestCortexAgent(piAgent, createDefaultConfig({ model: cortexModel }));
+      const testAgent = createTestAgentLoop(piAgent, createDefaultConfig({ model: cortexModel }));
 
       const caps = await testAgent.getModelThinkingCapabilities();
       expect(caps).toEqual({ supportsThinking: false, supportsMax: false, supportedLevels: [] });
@@ -213,7 +213,7 @@ describe('ThinkingLevel', () => {
     it('returns supportsMax: true for xhigh-capable reasoning models', async () => {
       const model = { provider: 'anthropic', name: 'claude-opus-4-6', id: 'claude-opus-4-6', reasoning: true } as PiModel;
       const cortexModel = makeModel(model);
-      const testAgent = createTestCortexAgent(piAgent, createDefaultConfig({ model: cortexModel }));
+      const testAgent = createTestAgentLoop(piAgent, createDefaultConfig({ model: cortexModel }));
       mockGetSupportedThinkingLevels.mockReturnValue(['off', 'medium', 'high', 'xhigh']);
 
       const caps = await testAgent.getModelThinkingCapabilities();
@@ -228,7 +228,7 @@ describe('ThinkingLevel', () => {
     it('returns supportsMax: false for standard reasoning models', async () => {
       const model = { provider: 'anthropic', name: 'claude-sonnet-4-6', id: 'claude-sonnet-4-6', reasoning: true } as PiModel;
       const cortexModel = makeModel(model);
-      const testAgent = createTestCortexAgent(piAgent, createDefaultConfig({ model: cortexModel }));
+      const testAgent = createTestAgentLoop(piAgent, createDefaultConfig({ model: cortexModel }));
       mockGetSupportedThinkingLevels.mockReturnValue(['medium', 'high']);
 
       const caps = await testAgent.getModelThinkingCapabilities();

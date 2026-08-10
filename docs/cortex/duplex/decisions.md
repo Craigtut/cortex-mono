@@ -1,6 +1,6 @@
 # Decision Record
 
-> **STATUS: DESIGN, NOT IMPLEMENTED**
+> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode (D14); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
 
 Decisions made during the 2026-08 design phase, with rationale and rejected alternatives. Newer decisions supersede older ones where they conflict.
 
@@ -37,6 +37,8 @@ Rejected: a per-slot policy (talker-only / reasoner-only / both) on the facade A
 
 Consumer slots apply to both loops. The consumer should not know the talker/reasoner split exists; that dynamic is Cortex's internal concern. If a large slot ever becomes a talker latency problem, Cortex may optimize placement internally without any API change.
 
+This covers **mid-session writes**, not only construction. 2b-i wired initial slots to both loops but left `getContextManager()` returning the reasoner's manager, so a consumer updating a persona slot mid-session would silently diverge the two loops. The facade's `getContextManager()` therefore returns a fan-out view: writes reach both loops, reads come from the reasoner. A per-slot routing knob remains forbidden.
+
 ## D7: The Log Is a Bus, Not a Context Projection
 
 Rejected: injecting log-derived synthetic messages into each loop's prompt view via `transformContext`.
@@ -55,7 +57,7 @@ The talker delegates via five fire-and-forget control tools: `spawn_task`, `stee
 Rejected, after initially being chosen: in-band directive tags parsed from the talker's text stream. The reversal rationale:
 
 - **Wrong-layer transposition.** The control-token systems (MoshiRAG `<ret>`, DuplexOmni `[THINK]`, DuplexSLA's action channel) are custom-trained models that control decode; a token is their only possible interface. Every production system at the HTTP API layer (OpenAI Realtime, Gemini Live, LiveKit, Pipecat, ElevenLabs) uses tool calls for the fast loop's control surface. AsyncFC formalizes the pattern: standard call-return contract, future-style immediate return, no retraining.
-- **Injection.** Tags are parsed from text, and untrusted text (tool output in deliveries, stdout in headlines, file contents in lookup results, users saying tag syntax) constantly enters the talker's context; an echoed `<answer>` would forge a permission decision. Tool calls cannot be echoed into existence, and `answer_ask` arguments validate against the pending-ask set.
+- **Injection by echo.** Tags are parsed from text, and untrusted text (tool output in deliveries, stdout in headlines, file contents in lookup results, users saying tag syntax) constantly enters the talker's context; an echoed `<answer>` would forge a permission decision. Tool calls cannot be echoed into existence: invocation requires a deliberate structured call. This closes echo, and only echo. **Persuasion is a separate threat and is not mitigated here**: injected text can still argue the talker into making a deliberate call, and tools are marginally worse than tags in this respect because each control-tool result lands in the talker's transcript, so prior `answer_ask(..., allow)` calls accumulate as few-shot precedent. Persuasion is handled by the router rules in D16, not by this decision.
 - **Reliability.** Models are trained heavily on schema'd tool calls with validation and structured retryable errors; bespoke tag grammar on a fast-tier model fails silently.
 - **The latency case for tags was overstated.** With `terminate: true` there is no follow-up call; the only remaining difference is dispatch-at-tag-close versus dispatch-at-message-end, which equals the duration of any post-delegation speech, typically nothing and promptable to nothing.
 
@@ -92,3 +94,69 @@ Both modes are built. Passthrough routes the facade straight to the reasoner and
 ## D15: Tier Depth Is Hard-Capped
 
 Tasks at tier 3 (sub-agents) cannot spawn further sub-agents. The reasoner spawns sub-agents; sub-agents are leaves. The existing `enableSubAgentTool: false` hardcode for children becomes configuration that the facade sets by tier.
+
+---
+
+The decisions below were added after the pre-implementation reviews. See review-findings.md for the findings that produced them.
+
+## D16: Consent Is Bound by the Router, Not by the Talker
+
+Validating that an askId exists and is pending establishes well-formedness, not authorization. The router enforces:
+
+- exactly one ask is voiced at a time;
+- `allow` is accepted only for the most-recently-voiced ask, only once, and **only from a talker turn whose causation chain includes a user utterance that arrived after the ask was voiced**. A turn triggered purely by a delivery, a headline refresh, or a lookup wake cannot grant permission, which is precisely the shape an injected-content persuasion attempt takes;
+- `deny` is unrestricted;
+- anything else returns a voiceable refusal and re-voices the pending ask. (The refusal costs one recovery turn and leaves the anomaly in the log.)
+
+This makes the log's causation stamps load-bearing for security, not just for observability, so they are built in P2 with the log rather than added later.
+
+**The broker must read the full cause set, never the latest-cause helper.** A run can consume several delivered items with different causes, and the loop exposes all of their tags; `latestCauseSeq` collapses that to one for log-stamping convenience. Collapsing before the check fails in both directions, and they are the same defect:
+
+- **Denies real consent.** Ask voiced at seq 10, user says "yes" at seq 12, an unrelated delivery lands at seq 14, the run carries both. The helper returns 14, which is not an utterance, so a genuine "yes" is refused.
+- **Grants consent nobody gave.** Same set, ask voiced at seq 22. The helper returns 25 > 22, so without a type filter the broker accepts a delivery the user never spoke, while the only real utterance predates the ask.
+
+Over a homogeneous utterance-only set the collapse is coincidentally correct, which is exactly why this stays invisible until a second kind of tag exists. So: **cause tags are a discriminated shape carrying kind and seq**, not bare numbers, and the check filters by kind before aggregating. Resolving a bare seq against the log instead would work until retention evicted the entry; a self-describing tag cannot degrade that way. The broker reads the full set through its own port; the collapsing helper stays as-is for log stamping, which is a single-value field and forced to collapse.
+
+One consequence to accept: a single-number `causedBy` on a log entry cannot express multi-cause, so a run that consumed two utterances stamps only the later one. Any consent audit or replay must reconstruct from the live tag set, never from the log alone, or it re-inherits the masking this rule exists to prevent.
+
+As built (`src/duplex/cause-tags.ts`): a tag is `{kind: SessionLogEntryType, seq: number}`, with `kind` reusing the log's own entry-type union and stamped at the site that appended the causing entry rather than resolved later, so a tag cannot disagree with the log and cannot degrade when retention evicts. The loop's `causeTag` slot stays `unknown`, which is right for a general-purpose primitive, so `collectCauseTags` is the only validator between arbitrary input and a consent decision and must stay strict. It also flattens nested sets, because the truncation-repair delivery carries a whole prior set in one slot. The broker reads the full set through `DuplexRouterPorts.currentTalkerCauseTags()`; `currentTalkerCauseSeq` remains the log-stamping collapse and must never be used for consent.
+
+**Not every user word arrives as a tag.** `steer()` forwards straight to the conversation loop with no log entry and no cause tag, so a user steering "yes, go ahead" into a live turn reaches neither the log nor this check. The failure direction is safe (consent denied, not granted), but the broker must not assume the tag set is a complete record of what the user said, and the voiced-first rule is what actually carries the weight here: an unheard "yes" simply means the ask stays pending and gets re-voiced.
+
+**Two rules the seq comparison alone does not give you**, both found while building the broker and both restricting rather than recovering:
+
+- **Anchor on voicing, not on the ask.** The comparison is against the seq of an `ask_voiced` entry appended when the voicing is actually delivered, re-anchored on every re-voice, not against the ask entry's own seq. Otherwise a "yes" spoken while this ask sat queued behind another voicing satisfies the comparison, because the ask entry existed long before the user could have heard it.
+- **A run carrying this ask's voicing cannot grant it.** A barge-in "yes" can park alongside the voicing delivery and be consumed by the same run, which passes the seq rule while having been spoken *before* the request was read out. So the presence of this ask's own voicing tag in the cause set disqualifies that run from granting it.
+
+Both fail toward one extra re-voice cycle, which is the correct direction: the user hears the request again and answers again.
+
+**An utterance tag means the user spoke, not that something reached the conversation surface.** The first broker build stamped `{kind: 'utterance'}` on every waking `deliver({target: 'conversation'})`, which meant a consumer speaking its own notification ("Your build finished") minted a tag the consent check accepts. The attack needs no injection into the tag path at all: voice an escalation ask, wait for any consumer-side notification, and a persuaded talker can grant consent whose audit trail points at a build message. The check was doing exactly what it was told; the vocabulary was wrong.
+
+So `deliver` carries an explicit speaker, and **the default is not the user**. A caller that genuinely relays human speech says so; everything else mints a non-qualifying kind. The default has to fail toward denial, because the failure modes are asymmetric: defaulting to user turns every existing and future notification path into a consent source silently, while defaulting to system costs at most a re-voice when a consumer forgets to mark real speech. `prompt()` is unambiguous user speech and stamps `utterance` directly.
+
+The general rule this is an instance of: **a consent input must be minted by the surface that can vouch for its origin.** Anything downstream of that, however convenient the tag looks, is only reporting what reached it. Secondary mitigation for the few-shot-precedent problem named in D8: control-tool results are bare uniform receipts, so the transcript carries as little imitable decision text as possible.
+
+These are router rules and never prompt rules, because the talker's judgment is precisely what an attacker targets (review-findings.md F2). Ask entries carry per-ask nonces, a `voiced` state, and a mandatory verbatim `renderedRequest`; the talker reads destructive and escalation requests verbatim rather than summarizing them (F14).
+
+## D17: Control Tools Never Fail Loudly
+
+Every control-tool outcome, including schema-validation failure, unknown task id, and dispatch error, returns `terminate: true` with a bare uniform receipt the talker can voice. Control tools never throw and never return `isError`, because pi's error results omit `terminate` and therefore reopen the loop; combined with an unbounded default `maxTurns` that produces an unbounded retry cycle with no attacker involved (F9). The facade additionally sets a hard low `maxTurns` on the talker rather than inheriting consumer budget config, and failed dispatches produce a lifecycle entry the talker voices so a user instruction never vanishes silently.
+
+**Two exceptions where terminate is deliberately withheld**, both guarding against a silent exchange (the user speaks, hears nothing, and the turn ends):
+
+- **Empty spoken text.** Fast-tier models frequently emit a tool call with no preamble, and `terminate: true` then ends the turn with nothing said. The facade's `afterToolCall` wrapper suppresses terminate when the assistant message's user-facing text (after stripping working tags) is empty, forcing exactly one follow-up turn that speaks. This converts dead air into one extra fast-model call, and uses machinery that already exists: pi passes `assistantMessage` into the hook, and `afterResult.terminate` overrides the tool's value.
+- **Truncation.** If the talker hits its output cap mid-tool-call, the call may never materialize, leaving a spoken acknowledgment with nothing dispatched and no error anywhere. The facade audits the talker's stop reason and runs a repair turn when a `maxTokens` stop produced no control-tool call.
+
+## D18: Conversation Is Context, Not Instruction
+
+Conversation deltas (both user utterances and talker replies) reach the reasoner queued rather than prompted, wrapped as explicitly context-only. Only a control-tool dispatch starts a reasoner turn.
+
+**Mechanism, settled during 2b-i.** The deltas ride *inside* the next dispatch message as a `<conversation-context>` block, rather than going through the reasoner's loop-owned silent queue. The silent queue flushes only into real prompts, and sweep runs deliberately never flush it (the unwind accounting from Phase 0), so a dispatch parked behind a busy reasoner would have arrived without the conversation it points at. That breaks pointer-not-paraphrase in exactly the busy case this decision exists for. Carrying the block in the dispatch makes the pairing exact in every loop state. The contract this decision asserts (queued not prompted; only dispatches start turns) is unchanged. Without this, every "thanks, that's great" runs a full primary-model turn over the whole session context, and any utterance can drive an agent that acts (F3). Talker replies are included because the reasoner cannot interpret "yes, do that" without its antecedent (F4).
+
+## D19: The Router Applies Backpressure
+
+Wake classes describe intent; they do not bound rate. The router enforces an interrupt token bucket with demotion to `when_idle`, content-hash dedup across recent deliveries, per-turn and per-exchange delegation caps, dispatch dedup on `(loopPath, turnIndex, toolName, argsHash)` to absorb retry-induced double dispatch, and a facade-level aggregate budget guard that exists from the moment duplex is first assembled (F13, F3).
+
+## D20: The Steer Fast-Path Is Removed
+
+Steers always route through the reasoner. Delivering a steer straight to a named child saved one hop and removed the only loop exercising judgment between injected content and a tool-carrying agent (F11).

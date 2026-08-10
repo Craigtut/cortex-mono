@@ -6,7 +6,7 @@
  * have been read during the current agentic loop, along with
  * metadata (mtime, offset, limit) for file-unchanged dedup.
  *
- * Created once per CortexAgent and cleared at the start
+ * Created once per AgentLoop and cleared at the start
  * of each agentic loop via clear().
  */
 

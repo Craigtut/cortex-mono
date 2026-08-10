@@ -396,6 +396,50 @@ export class BufferingCoordinator {
   }
 
   /**
+   * Resolve once the in-flight observer (if any) has settled. The internal
+   * completion handler was attached at launch, so by the time this resolves
+   * the chunk (or the failure cleanup) is already recorded. Resolves
+   * immediately when nothing is in flight; never rejects.
+   */
+  async waitForObserverSettled(): Promise<void> {
+    const inFlight = this.inFlightObserver;
+    if (!inFlight) return;
+    await inFlight.then(
+      () => {},
+      () => {},
+    );
+  }
+
+  /**
+   * Like {@link waitForObserverSettled}, but bounded by a wall clock:
+   * resolves false when the in-flight observer has not settled within
+   * `timeoutMs`. The observer stays in flight; its chunk (or failure
+   * cleanup) is still recorded whenever it eventually settles. This bound
+   * exists for callers that hold a gate while waiting (idle digestion): an
+   * unbounded await on a hung provider request would wedge the gate
+   * forever. Never rejects.
+   */
+  async waitForObserverSettledWithin(timeoutMs: number): Promise<boolean> {
+    const inFlight = this.inFlightObserver;
+    if (!inFlight) return true;
+    const settled = inFlight.then(
+      () => true,
+      () => true,
+    );
+    if (!Number.isFinite(timeoutMs)) return settled;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([settled, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
    * Whether a reflector call is currently in flight.
    */
   isReflectorInFlight(): boolean {
@@ -456,5 +500,34 @@ export class BufferingCoordinator {
     if (droppedFrontCount <= 0) return;
     this.bufferWatermark = Math.max(0, this.bufferWatermark - droppedFrontCount);
     this.activationEpoch++;
+  }
+
+  /**
+   * Reconcile buffer state after the source conversation history was
+   * trimmed from the tail (an aborted or failed run's stub, or a failed
+   * background delivery being unwound).
+   *
+   * pi emits turn_end for those messages before Cortex trims them, so an
+   * observer may have launched with an endIndex that counts them, or
+   * already completed and moved the watermark past the new source length.
+   * Without clamping, later messages land at indices the watermark already
+   * claims as observed, and the next activation slices away an unobserved
+   * message (or orphans a tool result at the surviving head).
+   *
+   * Clamping (rather than epoch-advancing) keeps the observation content:
+   * text describing a trimmed stub is harmless, while the clamped index
+   * stays aligned with the surviving source prefix.
+   *
+   * @param postSlotLength - length of the post-slot source history after
+   *   the tail trim
+   */
+  onSourceTailTrimmed(postSlotLength: number): void {
+    const length = Math.max(0, postSlotLength);
+    if (this.bufferWatermark > length) {
+      this.bufferWatermark = length;
+    }
+    if (this.inFlightObserverEndIndex !== null && this.inFlightObserverEndIndex > length) {
+      this.inFlightObserverEndIndex = length;
+    }
   }
 }

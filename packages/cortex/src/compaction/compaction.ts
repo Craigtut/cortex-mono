@@ -192,12 +192,19 @@ export function formatTurnsForSummarization(turns: AgentMessage[]): string {
 
 /**
  * Type for the LLM completion function.
- * Matches the signature of CortexAgent.directComplete().
+ * Matches the signature of AgentLoop.directComplete().
+ *
+ * The optional second argument names the purpose of the call ('observer',
+ * 'reflector'), which the wiring in AgentLoop maps to a usage-accounting
+ * category. Implementations that ignore it lose nothing but attribution.
  */
-export type CompleteFn = (context: {
-  systemPrompt: string;
-  messages: unknown[];
-}) => Promise<string>;
+export type CompleteFn = (
+  context: {
+    systemPrompt: string;
+    messages: unknown[];
+  },
+  options?: { purpose?: string },
+) => Promise<string>;
 
 /**
  * Type for the consumer's onBeforeCompaction handler.

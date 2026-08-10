@@ -187,7 +187,191 @@ describe('SubAgentManager', () => {
     });
   });
 
+  describe('cancel', () => {
+    it('untracks the entry, calls abortFn, and resolves the completion as cancelled', async () => {
+      const abortFn = vi.fn().mockResolvedValue(undefined);
+      const childAgent = { fake: true };
+      const entry = createTrackedEntry({ taskId: 'task-1', agent: childAgent });
+      manager.track(entry);
+
+      const cancelled = await manager.cancel('task-1', abortFn);
+
+      expect(cancelled).toBe(true);
+      expect(abortFn).toHaveBeenCalledWith(childAgent);
+      expect(manager.get('task-1')).toBeUndefined();
+      expect(manager.activeCount).toBe(0);
+
+      const result = await entry.completion;
+      expect(result.status).toBe('cancelled');
+    });
+
+    it('returns false for an unknown task ID', async () => {
+      const abortFn = vi.fn();
+      const cancelled = await manager.cancel('nope', abortFn);
+      expect(cancelled).toBe(false);
+      expect(abortFn).not.toHaveBeenCalled();
+    });
+
+    it('marks the task cancelled so late completions are discardable', async () => {
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+      expect(manager.isCancelled('task-1')).toBe(false);
+
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+      expect(manager.isCancelled('task-1')).toBe(true);
+    });
+
+    it('evicts the oldest cancelled task ID past the 200-entry cap', async () => {
+      // The cancelled-ID set is bounded so a long-lived agent cannot leak
+      // memory; eviction is oldest-first, so only the most recent 200
+      // cancels remain discardable.
+      const abortFn = vi.fn().mockResolvedValue(undefined);
+      for (let i = 0; i <= 200; i++) {
+        manager.track(createTrackedEntry({ taskId: `task-${i}` }));
+        await manager.cancel(`task-${i}`, abortFn);
+      }
+
+      // 201 cancels: the very first ID was evicted, the rest remain.
+      expect(manager.isCancelled('task-0')).toBe(false);
+      expect(manager.isCancelled('task-1')).toBe(true);
+      expect(manager.isCancelled('task-200')).toBe(true);
+    });
+
+    it('marks the task cancelled before running the async teardown', async () => {
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+
+      let cancelledDuringTeardown: boolean | null = null;
+      const abortFn = vi.fn().mockImplementation(async () => {
+        cancelledDuringTeardown = manager.isCancelled('task-1');
+      });
+
+      await manager.cancel('task-1', abortFn);
+      expect(cancelledDuringTeardown).toBe(true);
+    });
+
+    it('suppresses onCompleted for a completion arriving after the cancel', async () => {
+      const onCompleted = vi.fn();
+      manager.setHooks({ onCompleted });
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+      manager.complete('task-1', {
+        output: 'late result',
+        status: 'completed',
+        usage: { turns: 1, cost: 0, durationMs: 100 },
+      });
+
+      expect(onCompleted).not.toHaveBeenCalled();
+    });
+
+    it('fires onFailed with Cancelled', async () => {
+      const onFailed = vi.fn();
+      manager.setHooks({ onFailed });
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+      expect(onFailed).toHaveBeenCalledWith('task-1', 'Cancelled');
+    });
+
+    it('still cancels when abortFn throws', async () => {
+      const entry = createTrackedEntry({ taskId: 'task-1' });
+      manager.track(entry);
+
+      const cancelled = await manager.cancel('task-1', vi.fn().mockRejectedValue(new Error('boom')));
+
+      expect(cancelled).toBe(true);
+      expect(manager.isCancelled('task-1')).toBe(true);
+      const result = await entry.completion;
+      expect(result.status).toBe('cancelled');
+    });
+  });
+
+  describe('steer', () => {
+    it('queues the message into the child in-flight run and returns steered', () => {
+      const steer = vi.fn();
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { steer, isPrompting: true, isLoopActive: true } as never,
+      }));
+
+      const outcome = manager.steer('task-1', 'focus on Europe');
+
+      expect(outcome).toBe('steered');
+      expect(steer).toHaveBeenCalledWith('focus on Europe');
+    });
+
+    it('returns null for an unknown task ID', () => {
+      expect(manager.steer('nope', 'message')).toBeNull();
+    });
+
+    it('returns null in the settle window instead of starting a doomed turn', () => {
+      // The child's run has settled but complete() has not untracked it
+      // yet: a redirect accepted here is never polled again and dies with
+      // the child, while the caller is told it landed.
+      const steer = vi.fn();
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { steer, isPrompting: false, isLoopActive: false } as never,
+      }));
+
+      expect(manager.steer('task-1', 'message')).toBeNull();
+      expect(steer).not.toHaveBeenCalled();
+    });
+
+    it('returns null in the end-of-cycle drain window (gate held, no run in flight)', () => {
+      // After the child's run ended its gate stays held through the
+      // end-of-cycle drain. Steering polls never happen again in that
+      // window, so an accepted redirect would be silently dropped when the
+      // parent's continuation destroys the child. A gate-depth check
+      // (isLoopActive) passes here and accepts the doomed redirect; only
+      // the run-in-flight check is honest.
+      const steer = vi.fn();
+      const deliver = vi.fn(() => ({ outcome: 'steered' as const }));
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { steer, deliver, isPrompting: false, isLoopActive: true } as never,
+      }));
+
+      expect(manager.steer('task-1', 'message')).toBeNull();
+      expect(steer).not.toHaveBeenCalled();
+      expect(deliver).not.toHaveBeenCalled();
+    });
+
+    it('returns null when the child is already tearing down (steer throws)', () => {
+      const steer = vi.fn(() => {
+        throw new Error('Agent is being destroyed');
+      });
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { steer, isPrompting: true, isLoopActive: true } as never,
+      }));
+
+      expect(manager.steer('task-1', 'message')).toBeNull();
+    });
+
+    it('returns null after the task was cancelled', async () => {
+      const steer = vi.fn();
+      manager.track(createTrackedEntry({
+        taskId: 'task-1',
+        agent: { steer, isPrompting: true, isLoopActive: true } as never,
+      }));
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+
+      expect(manager.steer('task-1', 'message')).toBeNull();
+      expect(steer).not.toHaveBeenCalled();
+    });
+  });
+
   describe('cancelAll', () => {
+    it('marks every task cancelled', async () => {
+      manager.track(createTrackedEntry({ taskId: 'a' }));
+      manager.track(createTrackedEntry({ taskId: 'b' }));
+
+      await manager.cancelAll(vi.fn().mockResolvedValue(undefined));
+
+      expect(manager.isCancelled('a')).toBe(true);
+      expect(manager.isCancelled('b')).toBe(true);
+    });
+
     it('cancels all active sub-agents', async () => {
       const abortFn = vi.fn().mockResolvedValue(undefined);
 
@@ -239,6 +423,21 @@ describe('SubAgentManager', () => {
 
       expect(manager.activeCount).toBe(0);
       expect(manager.getActiveTaskIds()).toHaveLength(0);
+    });
+
+    it('keeps cancelled task IDs so late completions stay discardable after destroy', async () => {
+      // A cancelled child's completion continuation can settle after the
+      // parent's teardown reaches destroy() (it awaits its own child
+      // destroy). The cancelled-ID set must survive so that late result is
+      // still recognized as a purposeful discard, not dead-lettered as
+      // undelivered work. The set is capped at 200, so keeping it is not a
+      // leak.
+      manager.track(createTrackedEntry({ taskId: 'task-1' }));
+      await manager.cancel('task-1', vi.fn().mockResolvedValue(undefined));
+
+      manager.destroy();
+
+      expect(manager.isCancelled('task-1')).toBe(true);
     });
   });
 

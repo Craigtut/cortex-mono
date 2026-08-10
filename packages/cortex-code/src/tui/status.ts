@@ -22,6 +22,17 @@ export interface StatusBarState {
   /** Whether the reflector is currently running in the background. */
   reflectorActive: boolean;
   /**
+   * Whether the session's resolution report carries a `degraded` note: the
+   * consumer asked for something and is not getting it. Marks the model
+   * segment, because what these notes are about is the configuration the
+   * session actually resolved to, which is what that segment already shows.
+   *
+   * `info` notes deliberately do not set this. `duplex-cost-cap-unset` fires
+   * on every default duplex session, so surfacing info here would leave the
+   * marker permanently lit and mean nothing.
+   */
+  resolutionDegraded: boolean;
+  /**
    * Active sandbox rung ('restricted' | 'workspace' | 'trusted' | 'off').
    * Empty string hides the badge (state not yet known).
    */
@@ -78,6 +89,17 @@ const DEFAULT_MODE_ICON = '◆'; // ◆
 const YOLO_ICON = '⚡︎'; // ⚡ high voltage
 
 /**
+ * Marker for a degraded resolution note, appended to the model segment.
+ *
+ * A dagger, dim, and nothing else. These are not errors: the session works,
+ * it is just not the session the config asked for, so the marker's whole job
+ * is to raise the question and let `/status` answer it. A footnote mark is
+ * exactly that convention, and it reads as "there is a note here" rather than
+ * as a warning, which an amber or red glyph would not.
+ */
+const RESOLUTION_MARK = '†';
+
+/**
  * Footer status bar with progressive reduction.
  * Picks the most detailed layout that fits the terminal width.
  */
@@ -96,6 +118,7 @@ export class StatusBar implements Component {
     observationTokenCount: 0,
     observerActive: false,
     reflectorActive: false,
+    resolutionDegraded: false,
     sandboxRung: '',
     sandboxEnforcement: 'none',
   };
@@ -163,6 +186,11 @@ export class StatusBar implements Component {
       : '';
     const sandboxBadge = this.buildSandboxBadge();
     const modelStr = this.hintText ?? (s.provider ? `${s.provider}/${s.model}` : s.model);
+    // Suppressed while a hint is showing: the hint has replaced the model
+    // text entirely, so a mark about the model would be pointing at nothing.
+    const mark = s.resolutionDegraded && this.hintText === null
+      ? colors.muted(` ${RESOLUTION_MARK}`)
+      : '';
     const tokenStr = this.formatTokens(s.contextTokenCount, s.contextTokenLimit);
     const branchStr = s.gitBranch;
     const memStr = this.buildMemSegment();
@@ -173,17 +201,17 @@ export class StatusBar implements Component {
     // layout on very narrow terminals.
     const layouts = [
       // Full: mode [YOLO] [effort] [sandbox] | provider/model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, sandboxBadge, modelStr, tokenStr, memStr, branchStr, width),
+      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, sandboxBadge, modelStr, tokenStr, memStr, branchStr, width, mark),
       // No provider: mode [YOLO] [effort] [sandbox] | model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, sandboxBadge, s.model, tokenStr, memStr, branchStr, width),
+      () => this.layoutFull(modeBadge, yoloBadge, effortBadge, sandboxBadge, s.model, tokenStr, memStr, branchStr, width, mark),
       // No effort badge: mode [YOLO] [sandbox] | model    tokens  mem Xk ●    branch
-      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, branchStr, width),
+      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, branchStr, width, mark),
       // No branch: mode [YOLO] [sandbox] | model    tokens  mem Xk ●
-      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, '', width),
+      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, memStr, '', width, mark),
       // No mem: mode [YOLO] [sandbox] | model    tokens
-      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, '', '', width),
+      () => this.layoutFull(modeBadge, yoloBadge, '', sandboxBadge, s.model, tokenStr, '', '', width, mark),
       // No sandbox: mode [YOLO] | model    tokens
-      () => this.layoutFull(modeBadge, yoloBadge, '', '', s.model, tokenStr, '', '', width),
+      () => this.layoutFull(modeBadge, yoloBadge, '', '', s.model, tokenStr, '', '', width, mark),
       // Minimal: mode    tokens
       () => this.layoutMinimal(modeBadge, tokenStr, width),
     ];
@@ -211,6 +239,8 @@ export class StatusBar implements Component {
     memStr: string,
     branchStr: string,
     width: number,
+    /** Pre-colored resolution marker, or '' when there is nothing to note. */
+    mark: string,
   ): string | null {
     const flags: string[] = [];
     if (modeBadge) flags.push(colors.bold(colors.primary(modeBadge)));
@@ -220,7 +250,8 @@ export class StatusBar implements Component {
     const flagStr = flags.join('  ');
 
     const left = (flagStr ? flagStr + colors.muted(' | ') : '')
-      + colors.white(modelStr);
+      + colors.white(modelStr)
+      + mark;
 
     const right = this.colorizeTokens(tokenStr)
       + (memStr ? colors.muted('  ') + memStr : '')

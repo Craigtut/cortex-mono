@@ -25,6 +25,10 @@ Note: Compaction summarization uses the **primary model**, not the utility model
 
 The user never sees utility model output directly. It powers behind-the-scenes operations where speed and cost matter more than peak quality.
 
+### The duplex talker
+
+One exception to "the user never sees it": a `CortexAgent` in its default duplex mode runs the talker on the same auto-resolved fast tier unless `talker.model` overrides it. The talker's output is exactly what the user sees first, so on a provider with no mapping below (where the fast tier resolves to the primary model) the talker is neither fast nor cheap, and Cortex warns at construction. Name a talker model explicitly on those providers. See `consumer-guide.md`.
+
 ## Configuration
 
 ```typescript
@@ -98,4 +102,4 @@ The consumer stores both model selections in its own settings store:
 - Primary model ID
 - Utility model ID, or `'default'` for provider mapping
 
-On startup, the consumer resolves `'default'` to the actual model ID using the provider mapping, then passes both models to the `CortexAgent` constructor.
+On startup, the consumer resolves `'default'` to the actual model ID using the provider mapping, then passes both models to the `AgentLoop` constructor.

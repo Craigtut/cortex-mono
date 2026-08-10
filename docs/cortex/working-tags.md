@@ -80,7 +80,7 @@ In this interaction:
 Working tags are enabled by default and can be disabled by the consumer.
 
 ```typescript
-interface CortexAgentConfig {
+interface AgentLoopConfig {
   // ... other config
   workingTags?: {
     enabled?: boolean;  // default: true
@@ -92,9 +92,21 @@ When enabled, Cortex appends working tag guidance to its operational rules secti
 
 The consumer decides when to enable or disable. A common pattern: enable for text-based channels, disable for voice channels where the interaction is conversational and low-latency streaming matters more than internal/external separation.
 
+## Streaming Sanitization (WorkingTagStreamFilter)
+
+Raw `response_chunk` deltas carry `<working>` content verbatim (tags are stripped only at `turn_end`), and a tag can split across chunks at any position, so chunk-by-chunk stripping cannot be done by consumers. `WorkingTagStreamFilter` is the streaming counterpart of `stripWorkingTags`, with holdback buffering:
+
+- `push(chunk)` returns the text safe to emit now. Text from any `<` is held until the tag disambiguates: released verbatim when it provably is not a working tag, swallowed when it opens one. A completed block emits one newline (the same sentinel `stripWorkingTags` uses).
+- `flush()` at stream end releases a held prefix that never became a tag (a trailing `<` is emitted) and drops unterminated working content, matching the batch parser's unclosed-tag rule. It is synchronous and unconditional, so a close tag that never arrives cannot wedge the stream.
+- `reset()` clears state for the next assistant message.
+
+Whitespace differs slightly from the batch parser (which normalizes whole messages); the voice-relevant invariants hold exactly: no working content is ever emitted, and all user-facing content is emitted by flush time.
+
+The duplex `CortexAgent` uses this filter internally to emit `talker_delta` events on its merged event bridge (payload `{ text }`, `loopPath: 'talker'`). Voice consumers subscribe to `talker_delta` for TTS instead of `response_chunk`.
+
 ## System Prompt Guidance
 
-When `workingTags.enabled` is true, Cortex adds working tag guidance in two places:
+When `workingTags.enabled` is true, Cortex adds working tag guidance in three places. When it is false, none of the three appear: see [When working tags are disabled](#when-working-tags-are-disabled).
 
 ### 1. Response Delivery Section (System Prompt)
 
@@ -170,6 +182,29 @@ Each layer targets a different part of the problem:
 - **afterToolCall reminder**: Reinforces the behavior at the exact moment narration occurs (after receiving tool results, before generating the next response). This catches turns 2+ in the agentic loop.
 
 The consumer does not need to add their own working tag instructions. Channel-specific communication style guidance (e.g., "You are communicating via SMS, be concise") is the consumer's responsibility and goes in the consumer's system prompt content.
+
+### When Working Tags Are Disabled
+
+Setting `workingTags.enabled` to false (at construction, or via `setWorkingTagsEnabled(false)` at runtime) removes **all three** layers. The prompt must never ask for a delimiter that nothing parses: with the parser off, `parseWorkingTags` is skipped and `turn_end.textOutput` is not populated at all, so a `<working>` block the model still emits is delivered to the consumer verbatim. For a voice consumer that means TTS speaks the model's internal reasoning out loud.
+
+Concretely:
+
+- **Response Delivery section**: omitted from `composeSystemPrompt`.
+- **Tool Usage section**: the shared tool-selection rules are unchanged, but the "Text output during tool use" subsection swaps to a variant that mentions no tags. It keeps the same no-narration discipline and tells the model there is no second channel, so it must not write its reasoning out at all:
+
+  ```
+  Everything you write outside of a tool call is delivered to the
+  user exactly as written. There is no separate channel for internal
+  reasoning, so do not write your reasoning out. Think it through
+  silently, then say only the part meant for the user.
+  ```
+
+  Rules 2 and 3 change correspondingly: keep your analysis to yourself, and only produce text when you have something meaningful to tell the user.
+- **Tool result reminder**: not appended (gated on `agent.isWorkingTagsEnabled` in the `afterToolCall` hook).
+
+`setWorkingTagsEnabled()` rebuilds the system prompt through `setBasePrompt()` on every change, so toggling at runtime swaps the Tool Usage variant along with everything else. Note that this rewrites the whole system prompt, which invalidates the cached prefix; toggling per request is expensive and usually the wrong design.
+
+Consumers that disable working tags for latency reasons should know that the flag buys nothing on the streaming path. `response_chunk` deltas are raw in both modes, so a consumer streaming to TTS needs `WorkingTagStreamFilter` (or its own equivalent) either way. What the flag actually costs is `turn_end.textOutput`, which is where the split reply lives.
 
 ## Event Model
 

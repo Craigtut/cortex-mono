@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { CortexAgent } from '../../src/cortex-agent.js';
-import type { PiAgent, PiModel } from '../../src/cortex-agent.js';
+import { AgentLoop } from '../../src/agent-loop.js';
+import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
-import type { CortexAgentConfig } from '../../src/types.js';
+import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 
 // ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ function makeModel(raw: PiModel) {
   return wrapModel(raw, raw.provider, raw.name, raw.contextWindow);
 }
 
-function createConfig(overrides?: Partial<CortexAgentConfig>): CortexAgentConfig {
+function createConfig(overrides?: Partial<AgentLoopConfig>): AgentLoopConfig {
   return {
     model: makeModel({ provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel),
     workingDirectory: '/tmp/test-workspace',
@@ -133,12 +133,12 @@ function createConfig(overrides?: Partial<CortexAgentConfig>): CortexAgentConfig
   };
 }
 
-type Ctor = new (agent: PiAgent, config: CortexAgentConfig) => CortexAgent;
-function build(agent: PiAgent, config: CortexAgentConfig): CortexAgent {
-  return new (CortexAgent as unknown as Ctor)(agent, config);
+type Ctor = new (agent: PiAgent, config: AgentLoopConfig) => AgentLoop;
+function build(agent: PiAgent, config: AgentLoopConfig): AgentLoop {
+  return new (AgentLoop as unknown as Ctor)(agent, config);
 }
 
-describe('CortexAgent background retry', () => {
+describe('AgentLoop background retry', () => {
   let mock: RetryMockAgent;
 
   afterEach(() => {
@@ -165,7 +165,9 @@ describe('CortexAgent background retry', () => {
       attempt: 1,
       maxAttempts: 3,
     });
-    expect(succeeded).toHaveBeenCalledWith({ attempts: 1 });
+    // Second argument is the loop's origin context: every fan-out callback
+    // carries it so a composite consumer can tell which loop retried.
+    expect(succeeded).toHaveBeenCalledWith({ attempts: 1 }, { loopPath: 'main' });
     expect(errored).not.toHaveBeenCalled();
   });
 
@@ -191,7 +193,10 @@ describe('CortexAgent background retry', () => {
 
     expect(scheduled).toHaveBeenCalledTimes(3); // one per allowed retry
     expect(mock.continueCalls).toBe(3);
-    expect(exhausted).toHaveBeenCalledWith({ attempts: 3, category: 'network' });
+    expect(exhausted).toHaveBeenCalledWith(
+      { attempts: 3, category: 'network' },
+      { loopPath: 'main' },
+    );
     expect(errored).toHaveBeenCalledTimes(1);
     expect(errored.mock.calls[0][0].category).toBe('network');
   });
@@ -353,5 +358,234 @@ describe('CortexAgent background retry', () => {
     // The wait was cancelled before the retry ran.
     expect(mock.continueCalls).toBe(0);
     expect(errored.mock.calls[0][0].category).toBe('cancelled');
+  });
+});
+
+describe('AgentLoop abort-stub trim', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function lastMessage(mock: RetryMockAgent): { role?: string; stopReason?: string } {
+    return (mock.state.messages[mock.state.messages.length - 1] ?? {}) as {
+      role?: string;
+      stopReason?: string;
+    };
+  }
+
+  it('trims the aborted assistant stub left by an abort mid-turn', async () => {
+    // Same settlement choreography as the resurrect test: abort() lands
+    // while the turn is in flight, and pi appends its synthetic failure stub.
+    const mock = createRetryMock(['fail', 'ok']);
+    let releasePrompt: (() => void) | null = null;
+    let idleResolve: (() => void) | null = null;
+    const basePrompt = mock.prompt.bind(mock);
+    mock.prompt = async (input: string): Promise<unknown> => {
+      await new Promise<void>((resolve) => { releasePrompt = resolve; });
+      const result = await basePrompt(input);
+      idleResolve?.();
+      idleResolve = null;
+      return result;
+    };
+    mock.waitForIdle = (): Promise<void> => new Promise<void>((resolve) => {
+      idleResolve = resolve;
+    });
+    mock.abort = (): void => {
+      mock.abortCalled = true;
+      releasePrompt?.();
+      releasePrompt = null;
+    };
+
+    const agent = build(mock, createConfig());
+    const turn = agent.prompt('hi').catch(() => 'rejected');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await agent.abort();
+    expect(await turn).toBe('rejected');
+
+    // The synthetic failure stub is gone; history ends on the user message.
+    expect(lastMessage(mock).role).toBe('user');
+  });
+
+  /**
+   * A mock whose single run parks until abort, then appends an aborted
+   * assistant message with the given content (mirroring pi returning the
+   * accumulated partial content with stopReason 'aborted', no error state).
+   */
+  function createCleanAbortMock(abortedContent: unknown): RetryMockAgent {
+    const mock = createRetryMock([]);
+    let releasePrompt: (() => void) | null = null;
+    let idleResolve: (() => void) | null = null;
+    mock.prompt = async (input: string): Promise<unknown> => {
+      mock.promptCalls += 1;
+      mock.state.errorMessage = undefined;
+      mock.state.messages.push({ role: 'user', content: input } as never);
+      await new Promise<void>((resolve) => { releasePrompt = resolve; });
+      mock.state.messages.push({
+        role: 'assistant',
+        content: abortedContent,
+        stopReason: 'aborted',
+      } as never);
+      idleResolve?.();
+      idleResolve = null;
+      return undefined;
+    };
+    mock.waitForIdle = (): Promise<void> => new Promise<void>((resolve) => {
+      idleResolve = resolve;
+    });
+    mock.abort = (): void => {
+      mock.abortCalled = true;
+      releasePrompt?.();
+      releasePrompt = null;
+    };
+    return mock;
+  }
+
+  async function runCleanAbort(mock: RetryMockAgent): Promise<void> {
+    const agent = build(mock, createConfig());
+    const turn = agent.prompt('hi');
+    await new Promise((resolve) => setImmediate(resolve));
+    await agent.abort();
+    await turn;
+  }
+
+  it('keeps partial assistant text the user already saw when a clean abort ends the run', async () => {
+    // Abort mid-stream without a throw: pi records the accumulated partial
+    // content with stopReason 'aborted' and prompt() resolves normally. The
+    // streamed text was already rendered by the consumer UI, so trimming it
+    // would make the model forget an answer the user read.
+    const mock = createCleanAbortMock([{ type: 'text', text: 'partial answer' }]);
+
+    await runCleanAbort(mock);
+
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'aborted' });
+    const content = lastMessage(mock) as { content?: Array<{ text?: string }> };
+    expect(content.content?.[0]?.text).toBe('partial answer');
+  });
+
+  it('trims a cleanly-aborted stub with no text content', async () => {
+    const mock = createCleanAbortMock([]);
+
+    await runCleanAbort(mock);
+
+    expect(lastMessage(mock).role).toBe('user');
+  });
+
+  it('trims an aborted message whose tool call would be left unpaired', async () => {
+    // Partial text plus a dispatched tool call whose result never ran: an
+    // unpaired tool call in history is a hard provider error on the next
+    // request, so the whole message goes even at the cost of the text.
+    const mock = createCleanAbortMock([
+      { type: 'text', text: 'let me check that file' },
+      { type: 'toolCall', toolCallId: 'tc_1', name: 'Read', args: {} },
+    ]);
+
+    await runCleanAbort(mock);
+
+    expect(lastMessage(mock).role).toBe('user');
+  });
+
+  it('leaves no failure stub behind when aborted during the backoff wait', async () => {
+    const mock = createRetryMock(['fail', 'ok']);
+    const agent = build(
+      mock,
+      createConfig({ retryPolicy: { backoffMs: [1000], maxBackoffMs: 1000, maxAttempts: 3 } }),
+    );
+    agent.onRetryScheduled(() => {
+      void agent.abort();
+    });
+
+    await agent.prompt('hi').catch(() => {});
+
+    expect(lastMessage(mock).role).toBe('user');
+  });
+
+  it('does not treat a provider error containing ABORTED as an abort', async () => {
+    // ECONNABORTED is a network failure; the abort heuristic must not match
+    // "abort" inside a larger identifier, or the error is mislabeled as a
+    // cancellation and its diagnostic stub is trimmed.
+    const mock = createRetryMock([]);
+    mock.prompt = async (input: string): Promise<unknown> => {
+      mock.promptCalls += 1;
+      mock.state.messages.push({ role: 'user', content: input } as never);
+      mock.state.errorMessage = 'read ECONNABORTED';
+      mock.state.messages.push({
+        role: 'assistant',
+        content: [],
+        stopReason: 'error',
+        errorMessage: 'read ECONNABORTED',
+      } as never);
+      return undefined;
+    };
+    const agent = build(mock, createConfig({ retryPolicy: { enabled: false } }));
+    const errored = vi.fn();
+    agent.onError(errored);
+
+    await expect(agent.prompt('hi')).rejects.toThrow();
+
+    expect(errored.mock.calls[0][0].category).not.toBe('cancelled');
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'error' });
+  });
+
+  it('keeps the failure stub for a surfaced non-abort failure', async () => {
+    // Retry disabled: the network failure surfaces immediately, un-aborted.
+    // Its stub is diagnostic state the consumer may inspect; only aborts trim.
+    const mock = createRetryMock(['fail', 'ok']);
+    const agent = build(mock, createConfig({ retryPolicy: { enabled: false } }));
+
+    await expect(agent.prompt('hi')).rejects.toThrow();
+
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'error' });
+  });
+
+  it('does not trim a normal successful turn', async () => {
+    const mock = createRetryMock(['ok']);
+    const agent = build(mock, createConfig());
+
+    await agent.prompt('hi');
+
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'end_turn' });
+  });
+
+  it('tells the compaction manager the post-slot length after trimming an aborted stub', async () => {
+    // pi emits turn_end for the stub before Cortex trims it, so an
+    // observational buffer watermark may already count it. The trim must
+    // notify the compaction manager with the surviving post-slot length so
+    // the watermark is clamped and the next activation cannot slice away a
+    // message that was never observed.
+    const mock = createCleanAbortMock([]);
+    const agent = build(mock, createConfig());
+    const internal = agent as unknown as {
+      compactionManager: { onSourceHistoryTailTrimmed: (n: number) => void };
+    };
+    const spy = vi.spyOn(internal.compactionManager, 'onSourceHistoryTailTrimmed');
+
+    const turn = agent.prompt('hi');
+    await new Promise((resolve) => setImmediate(resolve));
+    await agent.abort();
+    await turn;
+
+    // History ends on the committed user message: post-slot length 1.
+    expect(lastMessage(mock).role).toBe('user');
+    expect(spy).toHaveBeenCalledWith(1);
+  });
+
+  it('does not notify the compaction manager when nothing was trimmed', async () => {
+    // A clean abort that keeps the partial text trims nothing, so there is
+    // no tail-trim to reconcile.
+    const mock = createCleanAbortMock([{ type: 'text', text: 'partial answer' }]);
+    const agent = build(mock, createConfig());
+    const internal = agent as unknown as {
+      compactionManager: { onSourceHistoryTailTrimmed: (n: number) => void };
+    };
+    const spy = vi.spyOn(internal.compactionManager, 'onSourceHistoryTailTrimmed');
+
+    const turn = agent.prompt('hi');
+    await new Promise((resolve) => setImmediate(resolve));
+    await agent.abort();
+    await turn;
+
+    expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'aborted' });
+    expect(spy).not.toHaveBeenCalled();
   });
 });

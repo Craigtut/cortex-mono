@@ -1,7 +1,7 @@
 /**
  * Core types for the @animus-labs/cortex package.
  *
- * These types define the public API surface for CortexAgent configuration,
+ * These types define the public API surface for AgentLoop configuration,
  * context management, error classification, working tags, budget guards,
  * compaction, events, and model tiers.
  *
@@ -20,6 +20,9 @@ import type {
   ReflectionEvent,
 } from './compaction/observational/types.js';
 import type { SandboxProvider, ResolveNetworkAccess } from './sandbox/types.js';
+// Type-only: mcp-client.ts imports this module's types, so a runtime import
+// here would be a cycle; the erased type import is not.
+import type { McpClientManager } from './mcp-client.js';
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -29,7 +32,7 @@ import type { SandboxProvider, ResolveNetworkAccess } from './sandbox/types.js';
  * Pluggable logger interface for Cortex diagnostics.
  *
  * Cortex never decides where logs go. The consumer provides an implementation
- * via CortexAgentConfig.logger. If omitted, all logging is silently discarded.
+ * via AgentLoopConfig.logger. If omitted, all logging is silently discarded.
  *
  * All methods share the same signature for uniformity. The optional `data`
  * parameter carries structured context (token counts, server names, error
@@ -89,11 +92,39 @@ export interface CortexUsage {
  * Cortex tracks this in memory; consumers persist and restore as needed.
  */
 export interface SessionUsage {
-  /** Total cost in USD across all turns. */
+  /**
+   * Total cost in USD across all recorded spend: loop turns (this loop's
+   * and forwarded children's) plus direct/utility completions.
+   */
   totalCost: number;
   /** Total number of LLM turns across all loops. */
   totalTurns: number;
-  /** Accumulated token counts across all turns. */
+  /** Accumulated token counts across all recorded spend. */
+  tokens: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+  /**
+   * Direct/utility completion spend broken down by category tag (e.g.
+   * 'observer', 'reflector', 'summarization', 'webfetch', 'bash_utility',
+   * or a consumer-supplied tag). Absent until the first tagged completion
+   * is recorded. Bucket contents are also included in the top-level totals.
+   */
+  utility?: Record<string, UtilityUsageBucket>;
+}
+
+/**
+ * Accumulated spend of one direct/utility completion category within
+ * {@link SessionUsage}.
+ */
+export interface UtilityUsageBucket {
+  /** Number of completions recorded under this category. */
+  calls: number;
+  /** Accumulated cost in USD. */
+  cost: number;
+  /** Accumulated token counts. */
   tokens: {
     input: number;
     output: number;
@@ -107,7 +138,7 @@ export interface SessionUsage {
 // ---------------------------------------------------------------------------
 
 /**
- * The lifecycle state of a CortexAgent instance.
+ * The lifecycle state of an AgentLoop instance.
  *
  * CREATED -> ACTIVE -> DESTROYING -> DESTROYED
  *
@@ -131,7 +162,7 @@ export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'max
 
 /**
  * Describes a model's thinking/reasoning capabilities.
- * Returned by CortexAgent.getModelThinkingCapabilities().
+ * Returned by AgentLoop.getModelThinkingCapabilities().
  */
 export interface ModelThinkingCapabilities {
   /** Whether the model supports extended thinking at all. */
@@ -153,18 +184,95 @@ export interface CortexToolPermissionResult {
   reason?: string;
 }
 
+/**
+ * Context passed to resolvePermission alongside the tool name and args.
+ */
+export interface ToolPermissionRequestContext {
+  /**
+   * Fires when the run that asked is aborted. Cortex stops waiting for the
+   * resolver's answer at that point, so a consumer UI showing an approval
+   * prompt should listen and dismiss the now-moot prompt.
+   */
+  signal?: AbortSignal;
+  /**
+   * Unique nonce for this specific ask. Always set when Cortex invokes the
+   * resolver; two asks never share an id, even for identical tool calls.
+   * Consumers can key pending-prompt UI state on it.
+   */
+  askId?: string;
+  /**
+   * Path identity of the loop that raised the ask (e.g. 'main' for a
+   * standalone loop, 'main/<taskId>' for a sub-agent it spawned). Always set
+   * when Cortex invokes the resolver, so a consumer fielding asks from
+   * several concurrent loops can attribute each prompt.
+   */
+  loopPath?: string;
+  /**
+   * Verbatim rendering of what is being asked: the permission name plus the
+   * actual command, path, or URL from the tool arguments, truncated but
+   * never summarized. Always set when Cortex invokes the resolver. Surfaces
+   * that present the ask to a human (a TUI prompt, a voice loop reading the
+   * request aloud) should use this text rather than re-deriving their own,
+   * so what the human hears is what the tool will actually do.
+   */
+  renderedRequest?: string;
+}
+
+/**
+ * A permission ask currently blocked on a decision, as surfaced by
+ * AgentLoop.getPendingAsks(). Each entry corresponds to one resolver
+ * invocation still awaiting its answer; entries disappear when the ask
+ * settles (answered, blocked, or aborted).
+ */
+export interface PendingAsk {
+  /**
+   * The ask's per-ask nonce (also delivered to the resolver as
+   * ToolPermissionRequestContext.askId). Security-relevant: consent binding
+   * keys on it, so ids are crypto-random, never reused, and never derived
+   * from guessable data.
+   */
+  askId: string;
+  /** Path identity of the loop that raised the ask. */
+  loopPath: string;
+  /** Permission name presented to the resolver (tool name or synthetic escalation name). */
+  toolName: string;
+  /** Verbatim request rendering (see ToolPermissionRequestContext.renderedRequest). */
+  renderedRequest: string;
+  /** Epoch ms when the ask was raised. */
+  requestedAt: number;
+  /**
+   * Whether the ask has been presented to the human. Set via
+   * AgentLoop.markAskVoiced(); a consent router should accept an allow only
+   * for the most recently voiced ask.
+   */
+  voiced: boolean;
+}
+
+/**
+ * Origin identity passed as the second argument to loop-scoped callbacks
+ * (onError, onTurnComplete). Identifies which loop produced the signal when
+ * several AgentLoops share consumer-level handlers.
+ */
+export interface LoopOriginContext {
+  /**
+   * The loop's path identity: its configured `loopPath` (default 'main'),
+   * extended with '/<taskId>' segments for spawned sub-agents.
+   */
+  loopPath: string;
+}
+
 // ---------------------------------------------------------------------------
 // Agent Configuration
 // ---------------------------------------------------------------------------
 
 /**
- * Configuration for creating a CortexAgent instance.
+ * Configuration for creating an AgentLoop instance.
  *
  * The `model` field uses CortexModel as the public boundary.
  * Consumers obtain these handles from ProviderManager and pass them back to
- * CortexAgent. Raw pi-ai model objects stay inside Cortex.
+ * AgentLoop. Raw pi-ai model objects stay inside Cortex.
  */
-export interface CortexAgentConfig {
+export interface AgentLoopConfig {
   /** Primary model for the agentic loop, THOUGHT, REFLECT, and all consumer-facing work. */
   model: CortexModel;
 
@@ -207,7 +315,39 @@ export interface CortexAgentConfig {
     maxTurns?: number;
     /** Maximum cost in USD before force-stopping the loop. Default: Infinity. */
     maxCost?: number;
+    /**
+     * What the limits span. `'prompt'` (default) resets the counters at each
+     * prompt, so limits bound one logical turn. `'lifetime'` never resets
+     * them, so limits bound the loop's whole life: the mode for a resident
+     * loop prompted many times per session, where a per-prompt `maxCost`
+     * would never trip. Once breached, a lifetime guard aborts every further
+     * turn, including turns of later prompts.
+     */
+    scope?: BudgetScope;
+    /**
+     * Whether forwarded sub-agent turn usage counts against this guard's
+     * limits. Default false (a loop's own guard bounds only its own turns;
+     * child spend is bounded by the child's guard). An aggregate guard that
+     * must cover a loop and everything it spawns sets this true.
+     */
+    includeChildUsage?: boolean;
+    /**
+     * Whether direct/utility completion spend (observer, reflector,
+     * summarization, WebFetch, Bash utility calls) counts against maxCost.
+     * Default false. See BudgetGuardConfig.includeUtilityUsage.
+     */
+    includeUtilityUsage?: boolean;
   };
+
+  /**
+   * Keep tool-runtime workspace state (working directory, read-before-edit
+   * registry, undo history) across prompts instead of resetting it at each
+   * prompt start. For long-lived loops woken repeatedly by deliveries, where
+   * each wake continues one logical working session. Transient per-loop
+   * state (mutation lock, WebFetch rate-limit counter) still resets every
+   * prompt. Default false.
+   */
+  persistentRuntime?: boolean;
 
   /**
    * Background retry policy for transient turn failures. Sits above pi-ai's
@@ -219,6 +359,16 @@ export interface CortexAgentConfig {
 
   /** Maximum number of concurrent sub-agents. */
   maxConcurrentSubAgents?: number;
+
+  /**
+   * Named, independent sub-agent concurrency pools. A spawn that names a
+   * pool counts only against that pool's limit, so a saturated default pool
+   * (long task fleet) can never starve a small dedicated pool (quick
+   * lookups) and vice versa. A named pool missing from this map falls back
+   * to the maxConcurrentSubAgents limit while still being counted
+   * separately. Spawns without a pool use maxConcurrentSubAgents.
+   */
+  subAgentPools?: Record<string, number>;
 
   /**
    * Tool execution strategy for assistant messages with multiple tool calls.
@@ -234,7 +384,10 @@ export interface CortexAgentConfig {
 
   /** Bash tool configuration. */
   bash?: {
-    /** Token threshold at which Bash auto-yields control back to the agent. */
+    /**
+     * Milliseconds after which a still-running Bash command auto-yields into
+     * a background task (the agent is notified on completion). Default: 10000.
+     */
     autoYieldThreshold?: number;
     /** Path to the shell executable. */
     shellPath?: string;
@@ -275,14 +428,32 @@ export interface CortexAgentConfig {
   disableTools?: string[];
 
   /**
+   * Restrict the read-surface built-in tools (Read, Glob, Grep) to paths
+   * under these roots, enforced in-tool with symlink resolution and a
+   * visible refusal. For read-restricted loops (duplex quick lookups spawn
+   * with `[workingDirectory]`): their answers become conversation, so an
+   * unrestricted read is an exfiltration path. Gates only the read tools;
+   * combine with `disableTools` (write/exec tools) and the sandbox for a
+   * fully restricted loop. Inherited by spawned sub-agents. Undefined or
+   * empty = unrestricted, exactly as before.
+   */
+  readPathAllowlist?: string[];
+
+  /**
    * Structured permission result for a tool call.
    * - `allow`: proceed immediately
    * - `block`: deny the call
    * - `ask`: consumer requires approval before the call can proceed
+   *
+   * The context carries the run's abort signal. Cortex races the returned
+   * promise against that signal (an abort blocks the call and unblocks the
+   * loop immediately), so a resolver awaiting human input should dismiss its
+   * prompt when the signal fires: the answer is no longer consulted.
    */
   resolvePermission?: (
     toolName: string,
     toolArgs: unknown,
+    context?: ToolPermissionRequestContext,
   ) => Promise<boolean | CortexToolPermissionResult>;
 
   /**
@@ -384,6 +555,15 @@ export interface CortexAgentConfig {
   sessionId?: string;
 
   /**
+   * Path identity for this loop, threaded through consumer-visible signals
+   * (permission asks, onError/onTurnComplete origin context, persistResult
+   * metadata, log prefixes) so several loops behind one owner stay
+   * distinguishable. Sub-agents spawned by this loop extend it with
+   * '/<taskId>'. Default: 'main'.
+   */
+  loopPath?: string;
+
+  /**
    * Called before a sub-agent is spawned (foreground or background), giving
    * the consumer a chance to record the spawn and curate the child's starting
    * context. Receives the requested spawn parameters plus the generated taskId,
@@ -403,6 +583,21 @@ export interface CortexAgentConfig {
    * it could not delegate. Omit to always allow (subject to concurrency).
    */
   canSpawnSubAgent?: () => boolean | { allowed: boolean; reason?: string };
+
+  /**
+   * External shared MCP client manager. When provided, this loop uses it
+   * instead of constructing its own: one connection (and one stdio
+   * subprocess) per server total, shared across every loop holding the same
+   * manager. Registration is additive (listener arrays), so several loops
+   * observe tool changes and subprocess lifecycle without displacing each
+   * other. Ownership stays with the provider: the loop unsubscribes its own
+   * listeners on destroy but never closes the shared connections, and the
+   * owner configures the manager's logger, envOverrides, and sandbox. The
+   * duplex facade uses this to multiplex one manager into the reasoner
+   * (docs/cortex/duplex/sub-agents.md "MCP and Shared Services"). When
+   * omitted, the loop owns a private manager exactly as before.
+   */
+  mcpClientManager?: McpClientManager;
 }
 
 /**
@@ -692,9 +887,41 @@ export interface ToolCallEndPayload {
   error?: string;
 }
 
+/**
+ * Typed payload for utility_usage events, emitted once per direct/utility
+ * completion (observer, reflector, summarization, WebFetch summarization,
+ * Bash utility calls, consumer-tagged calls). The usage itself rides the
+ * event's `usage` field.
+ */
+export interface UtilityUsagePayload {
+  /** The category tag the spend was recorded under. */
+  category: string;
+}
+
+/**
+ * Typed payload for the duplex facade's sanitized talker-delta events
+ * ('talker_delta'): the voice-safe streaming text of the talker's current
+ * assistant message, with working-tag content removed by holdback buffering
+ * across chunk boundaries. Voice consumers route THIS to TTS, never raw
+ * response_chunk (whose deltas carry `<working>` content verbatim).
+ */
+export interface TalkerDeltaPayload {
+  /** Sanitized delta text, safe to speak. */
+  text: string;
+}
+
 // ---------------------------------------------------------------------------
 // Budget Guard
 // ---------------------------------------------------------------------------
+
+/**
+ * What a budget guard's limits span.
+ * - `'prompt'`: the owner resets counters at each prompt; limits bound one
+ *   logical turn (the historical behavior).
+ * - `'lifetime'`: counters are never reset; limits bound the guard's whole
+ *   life, and a breached guard keeps aborting turns started after the breach.
+ */
+export type BudgetScope = 'prompt' | 'lifetime';
 
 /**
  * Budget guard configuration with explicit limits.
@@ -705,6 +932,22 @@ export interface BudgetGuardConfig {
   maxTurns: number;
   /** Maximum cost in USD. Default: Infinity. */
   maxCost: number;
+  /** What the limits span. Default: 'prompt'. */
+  scope?: BudgetScope;
+  /**
+   * Count forwarded child (sub-agent) turn_end usage against this guard's
+   * limits instead of skipping it. Default false. The plumbing an aggregate
+   * guard needs to bound a loop plus everything it spawns.
+   */
+  includeChildUsage?: boolean;
+  /**
+   * Count direct/utility completion spend (observer, reflector,
+   * summarization, WebFetch, Bash utility calls) against maxCost, via the
+   * utility_usage event. Default false. Without it an aggregate guard is
+   * blind to exactly the spend class duplex doubles (two resident loops
+   * observing overlapping content), so the facade's aggregate guard sets it.
+   */
+  includeUtilityUsage?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +983,12 @@ export type PersistResultFn = (
     toolCallId?: string;
     /** Present when called from compaction (reactive paths). */
     messageIndex?: number;
+    /**
+     * Path identity of the loop whose tool result is being persisted (e.g.
+     * 'main', or 'main/<taskId>' for a sub-agent). Always set when the
+     * callback is invoked through an AgentLoop.
+     */
+    loopPath?: string;
   },
 ) => Promise<string>;
 
@@ -800,7 +1049,7 @@ export interface MicrocompactionConfig {
    * includes a file path reference the agent can Read to recover full content.
    * Only fires for non-reproducible and computational tools.
    *
-   * Typically set at the top-level CortexAgentConfig.persistResult and
+   * Typically set at the top-level AgentLoopConfig.persistResult and
    * propagated here automatically.
    */
   persistResult?: PersistResultFn;
@@ -864,7 +1113,7 @@ export interface AdaptiveThresholdConfig {
 }
 
 /**
- * Full compaction configuration for CortexAgent.
+ * Full compaction configuration for AgentLoop.
  *
  * Supports two strategies:
  * - `'observational'` (default): Observer/Reflector background compression
@@ -882,6 +1131,26 @@ export interface CortexCompactionConfig {
    * @default 'observational'
    */
   strategy?: 'observational' | 'classic';
+
+  /**
+   * Non-blocking posture: disable every synchronous LLM call inside
+   * transformContext, leaving emergency truncation as the only in-band
+   * fallback. For a presence loop whose turns must never stall on a
+   * multi-second observer or summarization call.
+   *
+   * - Observational strategy: activation still consumes already-buffered
+   *   chunks (instant), but the forced synchronous observer on the
+   *   unobserved tail and the pre-truncation catch-up observation are
+   *   skipped, and reflection at threshold swaps in a buffered result or
+   *   launches asynchronously instead of running inline.
+   * - Classic strategy: L2 summarization is skipped in-band (L1 trimming
+   *   and L3 truncation, both mechanical, still run).
+   *
+   * Explicit digestion entry points run the blocking work regardless, so an
+   * owner can schedule it during idle windows.
+   * @default false
+   */
+  nonBlocking?: boolean;
 
   /** Microcompaction (L1) configuration. Used when strategy is 'classic'. */
   microcompaction: MicrocompactionConfig;
@@ -965,7 +1234,7 @@ export interface CompactionExhaustedInfo {
 // ---------------------------------------------------------------------------
 
 /**
- * Event handlers emitted by CortexAgent during the agentic loop lifecycle.
+ * Event handlers emitted by AgentLoop during the agentic loop lifecycle.
  */
 export interface CortexEvents {
   /** Fired when the full agentic loop finishes (agent_end, not turn_end). */
@@ -981,9 +1250,9 @@ export interface CortexEvents {
   /** Fired when all compaction layers have failed. Consumer should take recovery action. */
   onCompactionExhausted: (info: CompactionExhaustedInfo) => void;
   /** Fired when an error is classified during the agentic loop. */
-  onError: (error: ClassifiedError) => void;
+  onError: (error: ClassifiedError, origin: LoopOriginContext) => void;
   /** Fired at the end of each turn with parsed working tag output. */
-  onTurnComplete: (output: AgentTextOutput) => void;
+  onTurnComplete: (output: AgentTextOutput, origin: LoopOriginContext) => void;
   /** Fired when a sub-agent is spawned for delegated work. */
   onSubAgentSpawned: (taskId: string, instructions: string, background: boolean) => void;
   /** Fired when a sub-agent completes successfully. */
@@ -1214,11 +1483,34 @@ export interface SubAgentSpawnConfig {
   maxCost?: number;
   /** Run asynchronously. Default: false (blocks until complete). */
   background?: boolean;
+  /**
+   * Wall-clock cap in milliseconds for the whole spawn. On expiry the child
+   * is aborted and its result reports status 'timed_out' (with whatever
+   * partial output its transcript holds). Default: no cap.
+   */
+  timeoutMs?: number;
+  /**
+   * Model for this spawn. Default: the parent's primary model. The child's
+   * utility model re-resolves from this model's provider, so a fast-model
+   * spawn stays fast end to end.
+   */
+  model?: CortexModel;
+  /** Thinking level for this spawn. Default: pi-agent-core's default. */
+  thinkingLevel?: ThinkingLevel;
+  /** Compaction configuration for this spawn. Default: Cortex defaults. */
+  compaction?: Partial<CortexCompactionConfig>;
+  /**
+   * Named concurrency pool this spawn counts against (see
+   * AgentLoopConfig.subAgentPools). Spawns without a pool count against
+   * maxConcurrentSubAgents. Pools are independent: work in one pool never
+   * blocks capacity in another.
+   */
+  pool?: string;
 }
 
 /**
  * Describes a sub-agent about to be spawned. Passed to
- * CortexAgentConfig.onBeforeSubAgentSpawn so a consumer can record the spawn
+ * AgentLoopConfig.onBeforeSubAgentSpawn so a consumer can record the spawn
  * and decide what background context to seed.
  */
 export interface SubAgentSpawnRequest {
@@ -1291,17 +1583,102 @@ export interface SubAgentResult {
 }
 
 /**
+ * Content the loop gave up on delivering after repeated failures: a
+ * background completion (sub-agent result or backgrounded Bash command)
+ * dropped from the delivery queue, or a parked wake delivery whose
+ * carrying runs failed until its attempt cap or elapsed budget ran out.
+ * Returned by getDeadLetteredBackgroundResults() so a consumer can surface
+ * or re-drive the work; without this, a deterministic delivery failure
+ * would either redeliver forever or vanish silently.
+ */
+export interface DeadLetteredBackgroundResult {
+  /** What kind of work produced the dropped content. */
+  kind: 'subagent' | 'bash' | 'wake_delivery';
+  /**
+   * Task ID of the sub-agent or background Bash command. Dropped wake
+   * deliveries have no task; they carry the synthetic id 'wake-delivery'.
+   */
+  taskId: string;
+  /** Delivery attempts made before giving up. */
+  attempts: number;
+  /** Message of the last delivery failure. */
+  lastError: string;
+  /** When the item was dead-lettered (epoch ms). */
+  deadLetteredAt: number;
+  /** The formatted delivery message that never reached the loop. */
+  message: string;
+}
+
+/**
+ * Budget counters a child handle exposes. A structural subset of BudgetGuard
+ * so this file needs no import of the class.
+ */
+export interface SubAgentBudgetView {
+  getTurnCount(): number;
+  getTotalCost(): number;
+  getMaxTurns(): number;
+  getMaxCost(): number;
+}
+
+/**
+ * Typed handle to a spawned child loop. A structural subset of AgentLoop
+ * (which imports these types, so importing the class here would be
+ * circular); every AgentLoop satisfies it. This is the surface the
+ * sub-agent manager and status/steering paths rely on: delivery, teardown,
+ * and live usage reads.
+ */
+export interface SubAgentHandle {
+  /** The child's loop path identity ('parentPath/taskId'). */
+  readonly loopPath: string;
+  /** Post-hoc context token count from the child's most recent turn. */
+  readonly currentContextTokenCount: number;
+  /**
+   * True while any gate task is running or queued on the child. False for a
+   * tracked child means it is in the settle window (its run ended but
+   * completion has not untracked it) or has not started its run yet; a
+   * delivery there would start a turn that teardown destroys moments later.
+   */
+  readonly isLoopActive: boolean;
+  /**
+   * True while a logical turn is actually in flight on the child. Narrower
+   * than isLoopActive, which also stays true through the child's
+   * end-of-cycle drain window after its run ended; a steer accepted there
+   * would never be polled again and dies with the child.
+   */
+  readonly isPrompting: boolean;
+  /**
+   * Deliver a message regardless of the child's run state. Mirrors
+   * AgentLoop.deliver: prompted when idle with wake wanted, parked for the
+   * child's next run when its gate is held, queued when silent.
+   */
+  deliver(content: string, options?: { wake?: boolean }): {
+    outcome: 'prompted' | 'parked' | 'queued';
+    turn?: Promise<unknown>;
+  };
+  /** Queue a steering message on the child's running loop (no-op when idle). */
+  steer(message: string): void;
+  /** Abort the child's current loop without destroying it. */
+  abort(): Promise<void>;
+  /** Tear the child down. */
+  destroy(timeoutMs?: number): Promise<void>;
+  /** Live budget counters for status surfaces. */
+  getBudgetGuard(): SubAgentBudgetView;
+}
+
+/**
  * Tracked sub-agent record managed by SubAgentManager.
  */
 export interface TrackedSubAgent {
   /** Unique task identifier. */
   taskId: string;
-  /** The sub-agent CortexAgent instance. */
-  agent: unknown; // CortexAgent (avoid circular import)
+  /** Typed handle to the sub-agent's AgentLoop instance. */
+  agent: SubAgentHandle;
   /** The instructions the sub-agent was spawned with. */
   instructions: string;
   /** Whether this is a background sub-agent. */
   background: boolean;
+  /** Named concurrency pool this spawn counts against (default pool when absent). */
+  pool?: string;
   /** Spawn timestamp. */
   spawnedAt: number;
   /** Promise that resolves when the sub-agent completes. */

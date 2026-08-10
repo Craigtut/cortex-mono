@@ -106,6 +106,9 @@ interface CortexCompactionConfig {
   // Strategy selection
   strategy?: 'observational' | 'classic';  // default: 'observational'
 
+  // Non-blocking posture: no synchronous LLM call in transformContext
+  nonBlocking?: boolean;  // default: false
+
   // Classic-specific (used when strategy === 'classic')
   microcompaction?: Partial<MicrocompactionConfig>;
   compaction?: Partial<CompactionConfig>;
@@ -120,6 +123,13 @@ interface CortexCompactionConfig {
 ```
 
 When `strategy` is `'observational'` (or omitted), observational memory handles compression. L1 threshold trimming and L2 summarization are disabled. When `'classic'`, the existing L1 + L2 + L3 system operates unchanged.
+
+### Non-Blocking Posture and Idle Digestion
+
+For loops whose turns must never stall on a multi-second in-band LLM call (a presence loop mid-conversation), two controls exist:
+
+- **`nonBlocking: true`** disables every synchronous LLM call inside `transformContext`. Activation still consumes already-buffered chunks (a cheap merge), but the forced synchronous observer on the unobserved tail, the pre-truncation catch-up observation, and inline reflection are skipped; reflection at threshold swaps in a buffered result or launches asynchronously instead. Emergency truncation remains the only blocking in-band path, at the accepted cost of dropping unobserved content if the failsafe fires before digestion catches up.
+- **`AgentLoop.digestIdle()`** runs the deferred work OUTSIDE a prompt: it waits for any in-flight observer chunk to land, observes the still-unobserved tail (buffering the result as a chunk), then runs the threshold pass (activation, reflection, classic summarization) with blocking work explicitly allowed even under the non-blocking posture. It is serialized through the loop gate, so it can never race a running turn's history mutations; an owner schedules it during idle windows so the expensive calls happen while nobody is waiting. Returns `{ observerRan, historyCompacted }`. The observer waits are bounded (`observerTimeoutMs`, default 60s): on timeout the digestion returns `observerRan: false` and releases the gate while the hung observer stays in flight (its chunk still lands whenever it settles), so a hung utility request can never wedge the loop.
 
 ### ObservationalMemoryConfig
 
@@ -676,10 +686,10 @@ Observational memory is the default. No configuration change is needed to use it
 
 ```typescript
 // Default: observational memory (zero config)
-const agent = await CortexAgent.create(config);
+const agent = await AgentLoop.create(config);
 
 // With hooks (method-level, like onBeforeCompaction)
-const agent = await CortexAgent.create(config);
+const agent = await AgentLoop.create(config);
 agent.onObservation((event) => {
   // persist compacted messages if desired
 });
@@ -688,7 +698,7 @@ agent.onReflection((event) => {
 });
 
 // Opt into classic compaction
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   compaction: {
     strategy: 'classic',
   }
@@ -779,7 +789,7 @@ agent.onLoopComplete(() => {
 And restores after creation:
 
 ```typescript
-const agent = await CortexAgent.create(config);
+const agent = await AgentLoop.create(config);
 agent.restoreConversationHistory(saved.history);
 if (saved.omState) {
   agent.restoreObservationalMemoryState(saved.omState);
@@ -823,7 +833,7 @@ The consumer provides a `search` function. Cortex wraps it in a tool.
 
 ```typescript
 // Consumer configuration
-const agent = await CortexAgent.create({
+const agent = await AgentLoop.create({
   compaction: {
     strategy: 'observational',
     observational: {
@@ -945,7 +955,7 @@ packages/cortex/src/compaction/
 - When observational memory is active, `emergencyTruncate()` must skip observation slot messages
 - Add `observationSlotIndex` parameter to identify which messages to protect
 
-#### `packages/cortex/src/cortex-agent.ts`
+#### `packages/cortex/src/agent-loop.ts`
 
 - In constructor: when `strategy === 'observational'`, append `'_observations'` to slot list
 - Wire `ObservationalMemoryEngine` with `utilityComplete` for observer/reflector calls
@@ -1005,7 +1015,7 @@ packages/cortex/src/compaction/
    - Wire `ObservationalMemoryEngine` with `CompleteFn` and event handlers
    - Expose state save/restore through to engine
 
-8. **CortexAgent integration** (`cortex-agent.ts`)
+8. **AgentLoop integration** (`agent-loop.ts`)
    - Slot registration for `_observations`
    - Event wiring (turn_end to engine, engine events to consumer hooks)
    - Public API surface (state, events, triggerObservation)

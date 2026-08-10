@@ -2,16 +2,17 @@
 
 Start here if you are integrating `@animus-labs/cortex` into an application:
 
-- [Using Cortex](./consumer-guide.md): install, create an agent, configure providers, slots, persistence, permissions, MCP, tools, skills, compaction, and shutdown.
-- [Built-in Tools](./tools/README.md): tools registered automatically by `CortexAgent.create()`.
+- [Using Cortex](./consumer-guide.md): install, create an agent, configure providers, slots, persistence, permissions, MCP, tools, skills, compaction, and shutdown. `CortexAgent` is the entry point and duplex is its default mode.
+- [Built-in Tools](./tools/README.md): tools registered automatically on the reasoner loop.
 - [Provider Manager](./provider-manager.md): provider discovery, OAuth, API key validation, custom endpoints, and model resolution.
 
 Architecture and implementation references:
 
-- [Duplex Architecture](./duplex/README.md): the planned talker/reasoner restructure for responsive interaction (design phase)
+- [Duplex Architecture](./duplex/README.md): the talker/reasoner design, its decision record, and the migration plan
 
 - [Product Vision](./product-vision.md)
 - [Cortex Architecture](./cortex-architecture.md)
+- [CortexAgent Facade](./cortex-agent.md): the composite facade over AgentLoop, and the delegation table a migration reads
 - [Context Manager](./context-manager.md)
 - [System Prompt](./system-prompt.md)
 - [Working Tags](./working-tags.md)

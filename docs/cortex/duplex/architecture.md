@@ -1,6 +1,6 @@
 # Duplex Architecture
 
-> **STATUS: DESIGN, NOT IMPLEMENTED**
+> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode (D14); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
 
 ## Problem
 

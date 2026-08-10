@@ -65,6 +65,14 @@ export type {
 // ---------------------------------------------------------------------------
 
 /**
+ * Default wall-clock budget for idle digestion's observer waits. Idle
+ * digestion holds the caller's loop gate, so waiting on a hung utility
+ * request must be bounded; a healthy observer call settles well inside
+ * this. Overridable per call (digestIdle's observerTimeoutMs).
+ */
+export const DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS = 60_000;
+
+/**
  * Rehydrate buffered chunks loaded from persistence. `createdAt` survives
  * JSON serialization as an ISO string; convert it back to a `Date` so the
  * in-memory shape matches {@link ObservationChunk}.
@@ -125,7 +133,7 @@ export class ObservationalMemoryEngine {
   // -------------------------------------------------------------------------
 
   /**
-   * Set the LLM completion function (wired to utilityComplete on CortexAgent).
+   * Set the LLM completion function (wired to utilityComplete on AgentLoop).
    */
   setCompleteFn(fn: CompleteFn): void {
     this.completeFn = fn;
@@ -188,6 +196,15 @@ export class ObservationalMemoryEngine {
    * @param setHistory - Set conversation history in the context (post-slot)
    * @param getSourceHistory - Get the original transcript history (agent.state.messages post-slot)
    * @param setSourceHistory - Replace the original transcript history
+   * @param options - allowSync (default true): whether synchronous LLM
+   *   calls may run inline. When false (the non-blocking posture),
+   *   activation only consumes already-buffered chunks, the Step 2 forced
+   *   observer is skipped, and reflection never runs inline.
+   *   isStale reports whether the pass has been abandoned (a timed-out
+   *   idle digestion); a stale pass's observation and reflection events
+   *   are suppressed, since its history rewrite is discarded by the
+   *   owner's setSourceHistory guard and reporting it would tell a
+   *   consumer about work that never landed.
    * @returns Modified context with updated observations and trimmed history
    */
   async applyInTransformContext(
@@ -198,10 +215,13 @@ export class ObservationalMemoryEngine {
     setHistory: (ctx: AgentContext, history: AgentMessage[]) => AgentContext,
     getSourceHistory: () => AgentMessage[],
     setSourceHistory: (history: AgentMessage[]) => void,
+    options?: { allowSync?: boolean; isStale?: () => boolean },
   ): Promise<AgentContext> {
     if (utilization < this.config.activationThreshold) {
       return context;
     }
+    const allowSync = options?.allowSync ?? true;
+    const isStale = options?.isStale;
 
     // --- Activation ---
     const sourceHistory = getSourceHistory();
@@ -246,7 +266,7 @@ export class ObservationalMemoryEngine {
     const netTokenReduction = trimmedMessageTokens - slotOverheadTokens;
     const postChunkUtilization = utilization - (this.contextWindow > 0 ? netTokenReduction / this.contextWindow : 0);
 
-    if (postChunkUtilization >= this.config.activationThreshold && this.completeFn) {
+    if (allowSync && postChunkUtilization >= this.config.activationThreshold && this.completeFn) {
       // Force sync observer on remaining unbuffered messages
       const unbufferedMessages = postChunkSource;
 
@@ -294,8 +314,12 @@ export class ObservationalMemoryEngine {
       this.observationTokenCount = estimateTokens(this.observations);
     }
 
-    // Step 4: Fire observation event
-    if (compactedMessages.length > 0) {
+    // Step 4: Fire observation event. Checked at dispatch time: an
+    // abandoned digestion pass settling here (the Step 2 observer call can
+    // outlive the digestion timeout by minutes) had its history trim
+    // discarded, so reporting the observation would describe a rewrite
+    // that never landed.
+    if (compactedMessages.length > 0 && !isStale?.()) {
       this.fireObservationEvent({
         compactedMessages,
         observations: this.observations,
@@ -306,11 +330,11 @@ export class ObservationalMemoryEngine {
     }
 
     // Step 5: Handle reflection (may replace this.observations with condensed version)
-    await this.handleReflection();
+    await this.handleReflection(allowSync, isStale);
 
     // Step 6: Build slot content AFTER reflection so it contains post-reflection
     // observations. Previously this was captured before reflection, requiring
-    // an external patch in cortex-agent.ts to correct stale content.
+    // an external patch in agent-loop.ts to correct stale content.
     const slotContent = this.buildSlotContent();
 
     // Step 7: Rebuild context with updated observations and trimmed history
@@ -402,6 +426,83 @@ export class ObservationalMemoryEngine {
         this.logger ?? undefined,
       );
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Idle digestion
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run pending observation buffering OUTSIDE a prompt: wait for any
+   * in-flight observer to land its chunk, then observe the still-unobserved
+   * tail (when it clears the buffering floor) and wait for that chunk too.
+   *
+   * Chunks stay buffered rather than activating here: activation trims raw
+   * history, which is a threshold decision, while this call only ensures the
+   * expensive observer work is DONE so the next activation (in-band or via
+   * an explicit digestion pass) is a cheap chunk merge. This is the
+   * primitive behind "digest during idle windows".
+   *
+   * Both waits are bounded by `timeoutMs` (a single wall-clock budget for
+   * the whole call): callers hold the loop gate while digesting, so a hung
+   * utility request must time the digestion out rather than wedge the gate.
+   * A timed-out observer stays in flight and lands its chunk whenever it
+   * settles; only the waiting is abandoned.
+   *
+   * @param messages - The full message array (slot messages included)
+   * @param slotCount - Number of slot messages to skip
+   * @param timeoutMs - Wall-clock budget for observer waits (default 60s)
+   * @returns true when an observer call ran to completion in this digestion
+   */
+  async digestPendingBuffers(
+    messages: AgentMessage[],
+    slotCount: number,
+    timeoutMs: number = DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS,
+  ): Promise<boolean> {
+    if (!this.completeFn) return false;
+    const deadline = Date.now() + timeoutMs;
+
+    // Let an already-running observer finish and record its chunk, so the
+    // tail computed below starts at the settled watermark. On timeout,
+    // skip launching a second observer behind a hung one.
+    if (!(await this.buffering.waitForObserverSettledWithin(timeoutMs))) {
+      this.logger?.warn('Idle digestion timed out waiting for the in-flight observer');
+      return false;
+    }
+
+    const history = messages.slice(slotCount);
+    const watermark = this.buffering.getWatermark();
+    const unobserved = history.slice(watermark);
+    if (unobserved.length === 0) return false;
+
+    const unobservedTokens = unobserved.reduce((sum, msg) => {
+      const content = typeof msg.content === 'string'
+        ? msg.content
+        : JSON.stringify(msg.content);
+      return sum + estimateTokens(content);
+    }, 0);
+    // Same floor onTurnEnd's buffering uses: observing a trivial tail
+    // thrashes the utility model for nothing.
+    if (unobservedTokens < this.config.bufferMinTokens) return false;
+
+    this.buffering.launchObserver(
+      this.completeFn,
+      [...unobserved],
+      watermark + unobserved.length,
+      this.observations || null,
+      this.buildObserverConfig(),
+      this.logger ?? undefined,
+    );
+    if (!this.buffering.isObserverInFlight()) {
+      // launchObserver declined (the coordinator was aborted): no observer
+      // ran, so do not report one.
+      return false;
+    }
+    if (!(await this.buffering.waitForObserverSettledWithin(deadline - Date.now()))) {
+      this.logger?.warn('Idle digestion timed out waiting for its observer call');
+      return false;
+    }
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -592,6 +693,21 @@ export class ObservationalMemoryEngine {
   }
 
   /**
+   * Reconcile buffer state after the tail of the post-slot source history
+   * was trimmed (aborted/failed run stubs, unwound background deliveries).
+   *
+   * pi emits turn_end for those messages before Cortex trims them, so an
+   * observer counting them may be in flight (or already completed) with an
+   * end index past the new source length. The watermark is clamped so the
+   * next activation cannot slice away messages that were never observed.
+   *
+   * @param postSlotLength - post-slot source history length after the trim
+   */
+  onSourceHistoryTailTrimmed(postSlotLength: number): void {
+    this.buffering.onSourceTailTrimmed(postSlotLength);
+  }
+
+  /**
    * Returns the current slot content string.
    */
   getSlotContent(): string {
@@ -665,8 +781,15 @@ export class ObservationalMemoryEngine {
    * Determines whether reflection should run (sync, async, or none) based
    * on the current observation token count relative to the effective
    * reflection threshold.
+   *
+   * @param allowSync - When false (non-blocking posture), the sync branch
+   *   consumes a buffered reflection if one is ready (instant) but never
+   *   runs the reflector inline; it launches one asynchronously instead.
    */
-  private async handleReflection(): Promise<void> {
+  private async handleReflection(
+    allowSync = true,
+    isStale?: () => boolean,
+  ): Promise<void> {
     if (!this.completeFn) return;
 
     const effectiveThreshold = computeEffectiveReflectionThreshold(
@@ -694,18 +817,38 @@ export class ObservationalMemoryEngine {
           this.observationTokenCount = estimateTokens(this.observations);
           this.generationCount++;
 
-          this.fireReflectionEvent({
-            previousObservations,
-            newObservations: this.observations,
-            generationCount: this.generationCount,
-            compressionLevel: buffered.compressionLevel,
-            timestamp: new Date(),
-          });
+          // Suppressed for an abandoned pass (see applyInTransformContext
+          // Step 4): the swap-in above keeps the engine coherent, but the
+          // event must not report it as landed work.
+          if (!isStale?.()) {
+            this.fireReflectionEvent({
+              previousObservations,
+              newObservations: this.observations,
+              generationCount: this.generationCount,
+              compressionLevel: buffered.compressionLevel,
+              timestamp: new Date(),
+            });
+          }
           return;
         }
       }
 
-      // No buffered reflection, run synchronously
+      // No buffered reflection ready. Under the non-blocking posture the
+      // inline call is forbidden: launch (or keep) an async reflector so
+      // the condensed result buffers for a later swap-in instead.
+      if (!allowSync) {
+        if (!this.buffering.isReflectorInFlight()) {
+          this.buffering.launchReflector(
+            this.completeFn,
+            this.observations,
+            this.buildReflectorConfig(effectiveThreshold),
+            this.logger ?? undefined,
+          );
+        }
+        return;
+      }
+
+      // Run synchronously
       const output = await runReflector(
         this.completeFn,
         this.observations,
@@ -716,13 +859,15 @@ export class ObservationalMemoryEngine {
       this.observationTokenCount = estimateTokens(this.observations);
       this.generationCount++;
 
-      this.fireReflectionEvent({
-        previousObservations,
-        newObservations: this.observations,
-        generationCount: this.generationCount,
-        compressionLevel: output.compressionLevel,
-        timestamp: new Date(),
-      });
+      if (!isStale?.()) {
+        this.fireReflectionEvent({
+          previousObservations,
+          newObservations: this.observations,
+          generationCount: this.generationCount,
+          compressionLevel: output.compressionLevel,
+          timestamp: new Date(),
+        });
+      }
       return;
     }
 

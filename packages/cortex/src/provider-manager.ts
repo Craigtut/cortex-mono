@@ -3,9 +3,9 @@
  * OAuth login/refresh, API key validation, model resolution, and custom
  * endpoint creation.
  *
- * ProviderManager and CortexAgent are fully independent. Neither knows
+ * ProviderManager and AgentLoop are fully independent. Neither knows
  * about the other. The consumer creates both, uses ProviderManager for
- * auth/discovery, and provides a getApiKey callback to CortexAgent.
+ * auth/discovery, and provides a getApiKey callback to AgentLoop.
  *
  * Pi-ai is loaded dynamically so consumers never import it directly.
  * If the dependency is missing or unavailable, methods that require it

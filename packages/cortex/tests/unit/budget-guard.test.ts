@@ -518,4 +518,154 @@ describe('BudgetGuard', () => {
       expect(guard.isBreached()).toBe(true);
     });
   });
+
+  // -----------------------------------------------------------------------
+  // Child usage inclusion (aggregate-guard plumbing)
+  // -----------------------------------------------------------------------
+
+  describe('includeChildUsage', () => {
+    it('counts forwarded child turns and cost when opted in', () => {
+      const guard = new BudgetGuard(
+        { maxTurns: Infinity, maxCost: Infinity, includeChildUsage: true },
+        abortFn,
+      );
+      guard.wire(bridge);
+
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+      bridge.forwardFrom(childBridge, 'child-1');
+
+      childSource.emit(turnEndWithCost(0.05));
+      source.emit(turnEndWithCost(0.02));
+
+      expect(guard.getTurnCount()).toBe(2);
+      expect(guard.getTotalCost()).toBeCloseTo(0.07);
+    });
+
+    it('aborts on child spend crossing the limit when opted in', () => {
+      const guard = new BudgetGuard(
+        { maxCost: 0.05, includeChildUsage: true },
+        abortFn,
+      );
+      guard.wire(bridge);
+
+      const childBridge = new EventBridge(false);
+      const childSource = createMockSource();
+      childBridge.wire(childSource);
+      bridge.forwardFrom(childBridge, 'child-1');
+
+      childSource.emit(turnEndWithCost(0.06));
+
+      expect(abortFn).toHaveBeenCalledTimes(1);
+      expect(guard.isBreached()).toBe(true);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Lifetime scope
+  // -----------------------------------------------------------------------
+
+  describe('lifetime scope', () => {
+    it('keeps aborting turns after a breach (a later prompt must not slip through)', () => {
+      const guard = new BudgetGuard({ maxTurns: 2, scope: 'lifetime' }, abortFn);
+      guard.wire(bridge);
+
+      source.emit({ type: 'turn_end' });
+      source.emit({ type: 'turn_end' }); // Breach
+      expect(abortFn).toHaveBeenCalledTimes(1);
+
+      // A prompt started after the breach: under lifetime scope nothing
+      // resets the guard, so its first turn must be aborted too.
+      source.emit({ type: 'turn_end' });
+      expect(abortFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('prompt scope still aborts only once per breach window', () => {
+      const guard = new BudgetGuard({ maxTurns: 2, scope: 'prompt' }, abortFn);
+      guard.wire(bridge);
+
+      source.emit({ type: 'turn_end' });
+      source.emit({ type: 'turn_end' }); // Breach
+      source.emit({ type: 'turn_end' });
+
+      expect(abortFn).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Utility usage (aggregate guard visibility, duplex D19)
+  // -----------------------------------------------------------------------
+
+  describe('includeUtilityUsage', () => {
+    function emitUtility(total: number, childTaskId?: string): void {
+      const usage = {
+        input: 500, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 600,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total },
+      };
+      if (childTaskId) {
+        const childBridge = new EventBridge(false);
+        bridge.forwardFrom(childBridge, childTaskId);
+        childBridge.emitUtilityUsage('observer', usage);
+      } else {
+        bridge.emitUtilityUsage('observer', usage);
+      }
+    }
+
+    it('ignores utility spend by default (per-loop guards bound turns only)', () => {
+      const guard = new BudgetGuard({ maxCost: 0.05 }, abortFn);
+      guard.wire(bridge);
+
+      emitUtility(0.06);
+
+      expect(guard.getTotalCost()).toBe(0);
+      expect(abortFn).not.toHaveBeenCalled();
+    });
+
+    it('counts utility spend toward maxCost when opted in', () => {
+      const guard = new BudgetGuard(
+        { maxCost: 0.05, includeUtilityUsage: true },
+        abortFn,
+      );
+      guard.wire(bridge);
+
+      emitUtility(0.03);
+      expect(guard.getTotalCost()).toBeCloseTo(0.03);
+      expect(abortFn).not.toHaveBeenCalled();
+
+      emitUtility(0.03); // Crosses the limit on utility spend alone.
+      expect(abortFn).toHaveBeenCalledTimes(1);
+      expect(guard.isBreached()).toBe(true);
+    });
+
+    it('never counts utility events toward maxTurns', () => {
+      const guard = new BudgetGuard(
+        { maxTurns: 1, includeUtilityUsage: true },
+        abortFn,
+      );
+      guard.wire(bridge);
+
+      emitUtility(0.01);
+      expect(guard.getTurnCount()).toBe(0);
+      expect(abortFn).not.toHaveBeenCalled();
+    });
+
+    it('applies the child gate to forwarded utility events', () => {
+      const ownOnly = new BudgetGuard(
+        { maxCost: Infinity, includeUtilityUsage: true },
+        abortFn,
+      );
+      ownOnly.wire(bridge);
+      emitUtility(0.02, 'child-1');
+      expect(ownOnly.getTotalCost()).toBe(0);
+
+      const aggregate = new BudgetGuard(
+        { maxCost: Infinity, includeUtilityUsage: true, includeChildUsage: true },
+        abortFn,
+      );
+      aggregate.wire(bridge);
+      emitUtility(0.02, 'child-2');
+      expect(aggregate.getTotalCost()).toBeCloseTo(0.02);
+    });
+  });
 });

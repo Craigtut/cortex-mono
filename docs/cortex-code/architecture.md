@@ -98,7 +98,7 @@ Three-layer separation. Each layer has a single concern:
 │  Cortex Framework                                      │
 │                                                        │
 │  ┌─────────────────────────────────────────────────┐  │
-│  │  CortexAgent                                    │  │
+│  │  AgentLoop                                      │  │
 │  │  (agentic loop, tools, compaction, skills)      │  │
 │  └─────────────────────────────────────────────────┘  │
 │  ┌─────────────────────────────────────────────────┐  │
@@ -116,7 +116,7 @@ Three-layer separation. Each layer has a single concern:
 
 The central orchestrator. Owns the lifecycle of a Cortex agent session:
 
-- Creates and configures the `CortexAgent` with the active mode's settings
+- Creates and configures the `AgentLoop` with the active mode's settings
 - Provides the `getApiKey` callback, backed by the credential store
 - Provides the `transformContext` callback for ephemeral context injection
 - Streams agent output to the TUI
@@ -254,7 +254,7 @@ Additional modes can be added later as we learn what different context configura
 
 ### Permission System
 
-**How it works**: Cortex Code provides a `resolvePermission` callback to CortexAgent, which wires it into pi-agent-core's `beforeToolCall` hook. The hook is fully async: pi-agent-core `await`s the result before proceeding with tool execution. This means Cortex Code can return a Promise from `resolvePermission` that blocks until the user makes a decision in the TUI, with no Cortex-level changes required.
+**How it works**: Cortex Code provides a `resolvePermission` callback to AgentLoop, which wires it into pi-agent-core's `beforeToolCall` hook. The hook is fully async: pi-agent-core `await`s the result before proceeding with tool execution. This means Cortex Code can return a Promise from `resolvePermission` that blocks until the user makes a decision in the TUI, with no Cortex-level changes required.
 
 ```typescript
 // Simplified permission flow
@@ -366,7 +366,7 @@ interface CredentialStore {
 
 **`getApiKey` callback flow:**
 
-The session controller provides a `getApiKey` callback to CortexAgent that bridges the credential store and ProviderManager:
+The session controller provides a `getApiKey` callback to AgentLoop that bridges the credential store and ProviderManager:
 
 ```typescript
 const getApiKey = async (provider: string): Promise<string> => {
@@ -593,7 +593,7 @@ Cortex Code uses Vitest, matching the monorepo convention. The testing approach 
 
 ### Unit Tests
 
-These exercise pure logic with no TUI or Cortex agent involved. Mock filesystem operations and CortexAgent where needed.
+These exercise pure logic with no TUI or Cortex agent involved. Mock filesystem operations and AgentLoop where needed.
 
 | Module | What to test | Approach |
 |--------|-------------|----------|
@@ -606,7 +606,7 @@ These exercise pure logic with no TUI or Cortex agent involved. Mock filesystem 
 | `discovery/mcp.ts` | MCP config parsing, server entry validation | Pure functions |
 | `commands/index.ts` | Command registry, fuzzy search filtering | Pure functions |
 | `persistence/sessions.ts` | Save/restore round-trip, debouncing, stale session cleanup | Mock `fs` |
-| `session.ts` | Agent lifecycle (create, prompt, abort, destroy), auto-save triggers, model switch flow | Mock `CortexAgent` |
+| `session.ts` | Agent lifecycle (create, prompt, abort, destroy), auto-save triggers, model switch flow | Mock `AgentLoop` |
 
 ### Component Render Tests
 
@@ -623,7 +623,7 @@ Snapshot tests: capture `render(80)` and `render(120)` output for each component
 
 ### Integration Tests
 
-Test the session controller's integration with a real (but minimal) CortexAgent. These are slower and may require network access for provider validation.
+Test the session controller's integration with a real (but minimal) AgentLoop. These are slower and may require network access for provider validation.
 
 | Scenario | What to test |
 |----------|-------------|

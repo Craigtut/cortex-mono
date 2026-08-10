@@ -8,9 +8,9 @@ Cortex separates two axes: containment (what a running command is physically abl
 
 ## What you supply
 
-1. A `SandboxProvider` on `CortexAgentConfig.sandbox`. Use `SandboxRuntimeProvider` from `@animus-labs/cortex-sandbox` (macOS Seatbelt, Linux bubblewrap; native Windows is scaffolded). You initialize it with a `SandboxPolicy`, then hand it to `CortexAgent.create`.
-2. `CortexAgentConfig.resolveNetworkAccess`, the single egress decision. Cortex calls it from in-process WebFetch, and you wire the same function into the provider's network ask-callback, so shell egress and WebFetch share one allowlist and one prompt.
-3. `CortexAgentConfig.resolvePermission`, which you already implement for tool permissions. It additionally receives sandbox escalation requests under a distinct tool name (below), so you prompt to run one command outside the box.
+1. A `SandboxProvider` on `AgentLoopConfig.sandbox`. Use `SandboxRuntimeProvider` from `@animus-labs/cortex-sandbox` (macOS Seatbelt, Linux bubblewrap; native Windows is scaffolded). You initialize it with a `SandboxPolicy`, then hand it to `CortexAgent.create` (or to `AgentLoop.create` if you are building on the loop primitive directly).
+2. `AgentLoopConfig.resolveNetworkAccess`, the single egress decision. Cortex calls it from in-process WebFetch, and you wire the same function into the provider's network ask-callback, so shell egress and WebFetch share one allowlist and one prompt.
+3. `AgentLoopConfig.resolvePermission`, which you already implement for tool permissions. It additionally receives sandbox escalation requests under a distinct tool name (below), so you prompt to run one command outside the box.
 
 That is the whole framework contract. The provider does the OS work; your callbacks own the human decisions.
 
@@ -44,11 +44,13 @@ const agent = await CortexAgent.create({
 });
 ```
 
+`sandbox` and `envOverrides` are shared config: every loop and every sub-agent the facade builds runs inside the same box. `resolvePermission` and `resolveNetworkAccess` route through the facade's permission broker in duplex mode, so an `ask` is voiced to the user in conversation rather than blocking a loop; your callback's contract is unchanged, and `allow` and `deny` decisions pass straight through.
+
 ## The framework API surface
 
 From `@animus-labs/cortex`:
 
-- Config: `CortexAgentConfig.sandbox?: SandboxProvider`, `.resolveNetworkAccess?: ResolveNetworkAccess`, `.resolvePermission?`.
+- Config: `AgentLoopConfig.sandbox?: SandboxProvider`, `.resolveNetworkAccess?: ResolveNetworkAccess`, `.resolvePermission?`.
 - Policy vocabulary: `SandboxRung` (`restricted` | `workspace` | `trusted` | `off`), `SandboxPolicy` (`filesystem: { writableRoots, denyRead, denyWrite, allowRead? }`, `network: { mode, allowedDomains, deniedDomains, allowLocalBinding? }`).
 - Status (the honesty contract): `SandboxStatus` (`filesystem`/`network`: `enforced` | `partial` | `none`, `backend`, `degradations: string[]`). Never claims more than is enforced.
 - Provider contract: `SandboxProvider` (`initialize`, `wrapSpawn`, optional `classifyFailure`, `scrubCredentialEnv`, `status`, `dispose`).
@@ -88,6 +90,8 @@ async function resolveNetworkAccess(req: NetworkAccessRequest): Promise<NetworkA
 ```
 
 Fail closed: if the prompt throws or is dismissed, return `deny`. The seeded registries (`SEEDED_REGISTRY_DOMAINS`) are pre-allowed, so normal installs do not prompt.
+
+On `CortexAgent`, wire `agent.getNetworkAccessResolver()` into the provider's `onNetworkRequest`, not your raw function. The facade may wrap the one you configured (in duplex mode an `ask` becomes a spoken permission request), and the wrapped function is what the agent actually enforces. Wiring the raw one instead sends shell egress down a different path than WebFetch, which fails closed and silently: egress stops working and no request is ever put to the user. The agent logs a warning if it is holding a wrapped resolver nobody ever collected.
 
 ## Single-command escalation
 

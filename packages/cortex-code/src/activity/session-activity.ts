@@ -66,6 +66,12 @@ export interface AwaitingPermissionActivity {
   /** Tool arguments sanitized for external display and storage. */
   args: unknown;
   requestedAt: string;
+  /**
+   * Cortex's per-ask nonce for this permission request, when the resolver
+   * received one. Lets external readers correlate this activity record with
+   * the ask identity Cortex threads through its own callbacks and events.
+   */
+  askId?: string;
 }
 
 export interface ActivityFinalExit {
@@ -513,7 +519,11 @@ export class FileSessionActivityReporter {
     ], timestamp);
   }
 
-  recordPermissionRequested(toolName: string, toolArgs: unknown): PermissionRequestHandle {
+  recordPermissionRequested(
+    toolName: string,
+    toolArgs: unknown,
+    options?: { askId?: string },
+  ): PermissionRequestHandle {
     const timestamp = this.timestamp();
     const id = `perm-${randomUUID()}`;
     const displaySummary = buildActivityDisplaySummary(toolName, toolArgs);
@@ -524,6 +534,7 @@ export class FileSessionActivityReporter {
       displaySummary,
       args: sanitizedArgs,
       requestedAt: timestamp,
+      ...(options?.askId !== undefined ? { askId: options.askId } : {}),
     };
 
     this.state.awaitingPermission = permission;
@@ -539,6 +550,7 @@ export class FileSessionActivityReporter {
           toolName,
           displaySummary,
           args: permission.args,
+          ...(options?.askId !== undefined ? { askId: options.askId } : {}),
         },
       },
     ], timestamp);

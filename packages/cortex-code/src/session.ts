@@ -20,16 +20,23 @@ import {
   ProviderManager,
   BASH_ESCALATION_PERMISSION_NAME,
   type CortexModel,
+  type CortexAgentConfig,
+  type CortexAgentStateV1,
+  type CortexAgentStateV2,
   type CortexEvent,
   type CortexToolPermissionResult,
+  type ToolPermissionRequestContext,
   type AgentTextOutput,
   type ClassifiedError,
   type CompactionResult,
   type RetryScheduledInfo,
   type RetrySucceededInfo,
   type RetryExhaustedInfo,
+  type LoopOriginContext,
+  type ResolutionNote,
   type ThinkingLevel,
   type McpStdioConfig,
+  type ObservationalMemoryState,
   type ToolCallEndPayload,
   type ToolCallStartPayload,
   type ToolCallUpdatePayload,
@@ -53,7 +60,7 @@ import { checkProjectMcpTrust, trustProjectMcpConfig } from './discovery/mcp-tru
 import { checkProjectTrust, recordProjectTrust } from './discovery/project-trust.js';
 import {
   generateSessionId,
-  createDebouncedSaver,
+  createDebouncedStateSaver,
   createToolResultPersistor,
   type SessionMeta,
 } from './persistence/sessions.js';
@@ -98,6 +105,13 @@ import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * How long shutdown waits for a fresh composite snapshot before falling back
+ * to the last one the facade published. getState() resolves at a quiescence
+ * window, which a session that is still working may not reach.
+ */
+const SHUTDOWN_SNAPSHOT_TIMEOUT_MS = 2000;
 
 function formatEffortLabel(level: ThinkingLevel): string {
   return level === 'max'
@@ -160,8 +174,41 @@ export class Session {
   private sessionId: string;
   /** True when this session was launched to resume a saved one. */
   private readonly isResume: boolean;
-  private saver: ReturnType<typeof createDebouncedSaver>;
+  private saver: ReturnType<typeof createDebouncedStateSaver>;
+  /**
+   * The last composite snapshot the facade handed over. Shutdown falls back
+   * to it when a fresh `getState()` cannot settle in time, so a session that
+   * is still busy at exit is saved slightly stale rather than not at all.
+   */
+  private lastCompositeState: CortexAgentStateV2 | null = null;
+  /**
+   * True while the agent as a whole is busy: any resident loop running, a
+   * sub-agent alive, a delivery parked, an ask pending. Drives the spinner,
+   * the abort gate and the MCP reload gate.
+   *
+   * Deliberately NOT keyed on `onLoopComplete`. That callback fans out to
+   * every resident loop and carries no origin, so under duplex the talker's
+   * sub-second turn would report the whole agent idle while the reasoner is
+   * still working: the spinner would vanish and Ctrl+C would become a no-op
+   * for the rest of a multi-minute run. It is keyed on the facade's
+   * `workSettled` predicate instead, via {@link awaitWorkSettled}.
+   */
   private isRunning = false;
+  /**
+   * True from the moment `handleInput` commits to a turn until its
+   * `prompt()` settles. Conversation-scoped, unlike {@link isRunning}: it
+   * covers the pre-prompt window (ephemeral context, pre_turn hooks) that
+   * the facade cannot see, so a second input arriving in it still steers.
+   */
+  private promptInFlight = false;
+  /**
+   * Bumped whenever new work starts. A settlement wait that spans a bump is
+   * stale (the user started something else) and re-waits instead of
+   * reporting idle.
+   */
+  private workGeneration = 0;
+  /** Guards against stacking settlement waiters; one is enough. */
+  private settleWatcherActive = false;
   /**
    * In-flight OAuth resolve/refresh promises, keyed by provider. Providers like
    * Anthropic rotate the refresh token on every use and invalidate the prior
@@ -178,8 +225,16 @@ export class Session {
    * failure a second time as a generic "Error". Reset at the start of each turn.
    */
   private lastTurnErrorHandled = false;
-  /** Live background-retry state, while a transient failure is being retried. */
-  private retryState: { info: RetryScheduledInfo } | null = null;
+  /**
+   * Live background-retry state, while a transient failure is being retried,
+   * stamped with the loop it belongs to.
+   *
+   * There is one countdown line and two loops that can retry. Without the
+   * stamp, a talker retry resolving would call clearRetry() and wipe the
+   * reasoner's countdown, leaving the user staring at nothing through a long
+   * backoff on the work they are actually waiting for.
+   */
+  private retryState: { info: RetryScheduledInfo; loopPath: string } | null = null;
   /** 1s ticker that refreshes the retry countdown line. */
   private retryTicker: ReturnType<typeof setInterval> | null = null;
   private createdAt: number;
@@ -196,6 +251,18 @@ export class Session {
   private titleManager: TitleManager | null = null;
 
   private readonly config: CortexCodeConfig;
+  /**
+   * The Cortex facade mode this CLI runs, declared once so the pin in
+   * {@link buildAgentConfig} and every mode-dependent routing decision in
+   * this file cannot drift apart.
+   *
+   * Pinned to passthrough rather than left to the facade default, which is
+   * duplex: a coding CLI is a typed, single-surface client with no talker to
+   * speak for it, and passthrough routes straight to the reasoner, so
+   * behavior matches the single loop this session drove before the facade.
+   * Turning cortex-code duplex is its own change, not a default it inherits.
+   */
+  private readonly agentMode: NonNullable<CortexAgentConfig['mode']> = 'passthrough';
   private readonly mode: Mode;
   private readonly model: CortexModel;
   private provider: string;
@@ -233,7 +300,12 @@ export class Session {
     });
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.isResume = options.resumeSessionId !== undefined;
-    this.saver = createDebouncedSaver(this.sessionId);
+    // Shorter than the saver's 500 ms default. The facade already debounces
+    // onStateChanged by 500 ms, so a second full window there only delayed
+    // the settled write; and this window is now the crash exposure for
+    // turn-boundary checkpoints, where the whole point is bytes on disk
+    // sooner. Still long enough to coalesce a burst of turns.
+    this.saver = createDebouncedStateSaver(this.sessionId, 150);
     this.compactionStrategy = options.compactionStrategy ?? 'observational';
     this.updateInfo = options.updateInfo ?? null;
     this.createdAt = Date.now();
@@ -286,25 +358,7 @@ export class Session {
     this.sandboxProvider = await this.initSandbox();
 
     // Create agent (built-in tools are auto-registered by Cortex)
-    this.agent = await CortexAgent.create({
-      model: this.model,
-      utilityModel: 'default',
-      workingDirectory: this.cwd,
-      initialBasePrompt: this.mode.systemPrompt,
-      slots: this.mode.contextSlots,
-      resolvePermission: (toolName, toolArgs) => this.resolvePermission(toolName, toolArgs),
-      // WebFetch's egress gate: the same decision function the sandbox egress
-      // proxy consults for shell commands, so one grant covers both paths.
-      resolveNetworkAccess: (req) => this.resolveNetworkAccess(req),
-      isAutoApprove: () => this.yoloMode,
-      ...(this.sandboxProvider ? { sandbox: this.sandboxProvider } : {}),
-      getApiKey: (provider) => this.getApiKey(provider),
-      contextWindowLimit: this.config.contextWindowLimit ?? null,
-      compaction: { strategy: this.compactionStrategy },
-      persistResult: createToolResultPersistor(this.sessionId),
-      logger: log,
-      ...this.buildDiagnosticsConfig() ? { diagnostics: this.buildDiagnosticsConfig()! } : {},
-    });
+    this.agent = await CortexAgent.create(this.buildAgentConfig());
 
     if (this.initialUtilityModelId) {
       try {
@@ -396,22 +450,16 @@ export class Session {
     });
 
     // Update footer
-    this.app.updateStatus({
-      mode: this.mode.name,
-      modeCount: AVAILABLE_MODES.length,
-      provider: this.provider,
-      model: this.modelId,
-      contextTokenCount: this.getDisplayedCurrentContextTokens(),
-      contextTokenLimit: this.agent.effectiveContextWindow,
-      gitBranch: branch,
-      yoloMode: this.yoloMode,
-      effortLevel: initialEffort,
-      observationalMode: this.compactionStrategy === 'observational',
-      ...this.sandboxIndicatorState(),
-    });
+    this.pushInitialFooterState(branch, initialEffort);
 
     // Recommend (never apply) /sandbox off when already inside a container.
     void this.surfaceContainerRecommendation();
+
+    // Put the session on disk before it can do any work. Everything after
+    // this point can crash without the session becoming unlistable. A
+    // resumed session already has an artifact and resume() has not read it
+    // yet, so it checkpoints itself once the restore lands instead.
+    if (!this.isResume) await this.writeInitialCheckpoint();
 
     // Start TUI event loop
     this.app.start();
@@ -523,8 +571,12 @@ export class Session {
 
     if (!this.agent) return;
 
-    // If the agent is already running, steer it with the new message
-    if (this.isRunning) {
+    // If the CONVERSATION is already mid-turn, steer it with the new
+    // message. Deliberately narrower than isRunning: under duplex the
+    // reasoner can be minutes into a task while the talker is free, and the
+    // user's next sentence belongs to the talker as a fresh prompt, not
+    // steered into a loop that is not listening for it.
+    if (this.promptInFlight || !this.agent.conversationIdle) {
       log.info('Steering agent with user message', { text: text.slice(0, 100) });
       void this.activity.recordWorking();
       this.app!.transcript.addUserMessage(text);
@@ -549,8 +601,8 @@ export class Session {
 
     // Show spinner
     this.app!.showStatusSpinner(randomThinkingLabel());
-    this.isRunning = true;
-    this.freezeDiagnostics.setSessionRunning(true);
+    this.promptInFlight = true;
+    this.beginWork();
     await this.activity.recordWorking();
 
     // Run pre_turn hooks: outside processes can inject context the agent
@@ -586,11 +638,88 @@ export class Session {
         }
       }
     } finally {
-      this.isRunning = false;
-      this.freezeDiagnostics.setSessionRunning(false);
-      this.app!.hideStatusSpinner();
-      this.app!.focusEditor();
-      void this.activity.recordAwaitingInput();
+      this.promptInFlight = false;
+      // The turn is NOT necessarily over: under duplex prompt() resolves
+      // when the talker has spoken, with the reasoner still working. Hand
+      // the "we are done" UI to the settlement watcher, which reads the
+      // whole agent rather than the loop that happened to finish first.
+      this.watchForWorkSettled();
+    }
+  }
+
+  /**
+   * Mark the agent busy for a newly started piece of work. Bumping the
+   * generation invalidates any settlement wait already in flight, so work
+   * that starts while the previous wait is resolving cannot be reported as
+   * idle by it.
+   */
+  private beginWork(): void {
+    this.workGeneration += 1;
+    this.isRunning = true;
+    this.freezeDiagnostics.setSessionRunning(true);
+  }
+
+  /**
+   * Arm (once) a wait for the whole agent to go quiet, and apply the
+   * end-of-work UI when it does.
+   */
+  private watchForWorkSettled(): void {
+    if (this.settleWatcherActive) return;
+    this.settleWatcherActive = true;
+    void this.awaitWorkSettled()
+      .then((settled) => {
+        if (settled) this.applyWorkSettledUi();
+      })
+      .catch((err: unknown) => {
+        log.debug('Work settlement wait failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        this.settleWatcherActive = false;
+      });
+  }
+
+  /**
+   * Resolve true once the agent as a whole is quiet. Resolves false when the
+   * verdict no longer belongs to this session (the agent was replaced or
+   * torn down), so the caller leaves the UI alone.
+   */
+  private async awaitWorkSettled(): Promise<boolean> {
+    const agent = this.agent;
+    if (!agent) return false;
+    for (;;) {
+      const generation = this.workGeneration;
+      await agent.waitForWorkSettled();
+      if (this.agent !== agent) return false;
+      // A destroyed agent is as settled as it will ever get; without this a
+      // prompt() that rejected on teardown would leave the spinner up.
+      if (agent.state === 'destroyed' || agent.state === 'destroying') return true;
+      if (this.workGeneration !== generation) continue;
+      if (agent.workSettled) return true;
+    }
+  }
+
+  /**
+   * The end-of-work UI: everything the user reads as "the agent is done and
+   * waiting for me". Fires once per settled exchange, not once per loop.
+   */
+  private applyWorkSettledUi(): void {
+    this.isRunning = false;
+    this.promptInFlight = false;
+    this.freezeDiagnostics.setSessionRunning(false);
+    this.app?.transcript.closeActiveToolGroups();
+    this.app?.hideStatusSpinner();
+    this.app?.focusEditor();
+    void this.activity.recordAwaitingInput();
+    // One completed exchange: advance the title cadence (regenerates every
+    // N turns, idle here so it never competes with the main loop).
+    this.titleManager?.onUserTurnComplete();
+    // If the MCP config changed during the turn, apply it now. Doing this
+    // here (vs mid-turn) avoids invalidating the tool snapshot that
+    // pi-agent-core captured at prompt() entry.
+    if (this.mcpReloadPending) {
+      void this.runQueuedMcpReload();
     }
   }
 
@@ -721,18 +850,21 @@ export class Session {
    */
   private async registerSkillsWithTrust(): Promise<void> {
     if (!this.agent) return;
-    const registry = this.agent.getSkillRegistry();
+    // Through the facade's addSkill(), not getSkillRegistry().addSkill():
+    // the facade owns which loops a skill lands on, and reaching past it
+    // registers on whatever loop the getter happens to return today.
+    const agent = this.agent;
     const skills = await discoverSkills(this.cwd);
 
     const globalSkills = skills.filter((s) => !isProjectSkill(s));
     const projectSkills = skills.filter(isProjectSkill);
-    for (const skill of globalSkills) registry.addSkill(skill);
+    for (const skill of globalSkills) agent.addSkill(skill);
 
     if (projectSkills.length === 0) return;
 
     const signature = await computeProjectSkillsSignature(skills);
     if (await checkProjectTrust(this.cwd, 'skills', signature)) {
-      for (const skill of projectSkills) registry.addSkill(skill);
+      for (const skill of projectSkills) agent.addSkill(skill);
       return;
     }
 
@@ -743,7 +875,7 @@ export class Session {
     );
     if (decision === 'trust' && signature !== null) {
       await recordProjectTrust(this.cwd, 'skills', signature);
-      for (const skill of projectSkills) registry.addSkill(skill);
+      for (const skill of projectSkills) agent.addSkill(skill);
       this.app!.transcript.addNotification('Skills', `Registered ${projectSkills.length} project skill(s).`);
       return;
     }
@@ -934,7 +1066,60 @@ export class Session {
     }
   }
 
-  /** Wire all CortexAgent events to the TUI. */
+  /** The duplex talker's loop path, or null in passthrough, which has none. */
+  private get talkerLoopPath(): string | null {
+    return this.agentMode === 'duplex' ? 'talker' : null;
+  }
+
+  /**
+   * The loop whose streamed text is the user-visible reply: the reasoner in
+   * passthrough, the talker in duplex. Passthrough hands back the reasoner's
+   * own bridge verbatim, so its events carry no `loopPath` at all; the duplex
+   * merged bridge stamps every event with one.
+   */
+  private get conversationLoopPath(): string {
+    return this.talkerLoopPath ?? 'reasoner';
+  }
+
+  /** True when an event came from the loop the user is actually talking to. */
+  private isConversationEvent(event: CortexEvent): boolean {
+    return event.loopPath === undefined || event.loopPath === this.conversationLoopPath;
+  }
+
+  /**
+   * True when an event came from the talker.
+   *
+   * Used to keep the talker's tool calls out of the transcript. The talker's
+   * toolset is fixed and is entirely control plumbing (`spawn_task`,
+   * `steer_task`, `cancel_task`, `quick_lookup`, `answer_ask`): it has no
+   * file, shell, MCP or sub-agent tools, by construction. A coding CLI's
+   * transcript is a record of what was done to the workspace, and routing
+   * chatter rendered beside Read/Edit/Bash is noise that reads like work.
+   *
+   * Filtered on the loop rather than on a list of tool names deliberately, so
+   * a control tool added to the talker later is hidden by inheritance instead
+   * of appearing in the transcript the day it ships. Sub-agent tool calls are
+   * unaffected: they carry `childTaskId` and their own `reasoner/<taskId>`
+   * path, and are handled by the child branches above.
+   */
+  private isTalkerEvent(event: CortexEvent): boolean {
+    return this.talkerLoopPath !== null && event.loopPath === this.talkerLoopPath;
+  }
+
+  /**
+   * Whether a fan-out callback came from the loop doing the user's work.
+   *
+   * Defined by excluding the talker rather than by naming the reasoner, so it
+   * cannot be wrong about what the reasoner's loop path is called: passthrough
+   * has no talker and every origin is work, and a sub-agent
+   * (`reasoner/<taskId>`) is work too, which is what its compaction and
+   * observation events should count as.
+   */
+  private isWorkLoop(origin: LoopOriginContext): boolean {
+    return origin.loopPath !== this.talkerLoopPath;
+  }
+
+  /** Wire all agent events to the TUI. */
   private wireEvents(): void {
     if (!this.agent || !this.app) return;
     const bridge = this.agent.getEventBridge();
@@ -947,6 +1132,7 @@ export class Session {
 
     bridge.on('response_start', (event: CortexEvent) => {
       if (event.childTaskId) return;
+      if (!this.isConversationEvent(event)) return;
       assistantStarted = false;
       rawStreamText = '';
       workingTagOpen = false;
@@ -956,6 +1142,11 @@ export class Session {
     bridge.on('response_chunk', (event: CortexEvent) => {
       // Skip child agent streaming; only parent text goes to transcript
       if (event.childTaskId) return;
+      // Skip the work loop's streaming too. The merged duplex bridge carries
+      // both resident loops and neither sets childTaskId, so without this
+      // the reasoner's private working prose streams into the assistant
+      // bubble and is then replaced by the talker's actual reply.
+      if (!this.isConversationEvent(event)) return;
 
       // Text flowing again means a pending retry reconnected.
       this.noteProgressAfterRetry();
@@ -982,6 +1173,9 @@ export class Session {
         this.recordSubAgentToolStart(event);
         return;
       }
+      // The talker's control tools are routing plumbing, not work. See
+      // isTalkerEvent().
+      if (this.isTalkerEvent(event)) return;
 
       // A tool starting means the agent is making progress again.
       this.noteProgressAfterRetry();
@@ -1024,6 +1218,7 @@ export class Session {
     // Streaming tool updates (bash output, etc.)
     bridge.on('tool_call_update', (event: CortexEvent) => {
       if (event.childTaskId) return;
+      if (this.isTalkerEvent(event)) return;
 
       const p = event.payload as ToolCallUpdatePayload | undefined;
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
@@ -1041,6 +1236,7 @@ export class Session {
         this.recordSubAgentToolEnd(event);
         return;
       }
+      if (this.isTalkerEvent(event)) return;
 
       const p = event.payload as ToolCallEndPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
@@ -1073,24 +1269,25 @@ export class Session {
       workingTagOpen = false;
     });
 
-    // Loop complete (auto-save, update footer, hide spinner)
+    // A loop finished. Not "the agent is idle": this callback is registered
+    // on every resident loop and carries no origin, so under duplex the
+    // talker's sub-second turn fires it while the reasoner is minutes from
+    // done. Only the cheap per-loop refresh happens here; the end-of-work
+    // UI waits for the facade's settlement predicate.
     this.agent.onLoopComplete(() => {
-      this.isRunning = false;
-      this.triggerAutoSave();
       this.updateFooterContextUsage();
-      this.app?.transcript.closeActiveToolGroups();
-      this.app?.hideStatusSpinner();
-      this.app?.focusEditor();
-      void this.activity.recordAwaitingInput();
-      // One completed user turn: advance the title cadence (regenerates every
-      // N turns, idle here so it never competes with the main loop).
-      this.titleManager?.onUserTurnComplete();
-      // If the MCP config changed during the turn, apply it now. Doing this
-      // here (vs mid-turn) avoids invalidating the tool snapshot that
-      // pi-agent-core captured at prompt() entry.
-      if (this.mcpReloadPending) {
-        void this.runQueuedMcpReload();
-      }
+      this.watchForWorkSettled();
+    });
+
+    // Persistence trigger. Debounced by the facade and fired with a
+    // consistent composite snapshot (log plus both loops' histories and
+    // memory), which is why autosave hangs off this rather than off
+    // onLoopComplete and turn_end: those fire per loop and per turn, so one
+    // exchange used to write the session out three times, each time from a
+    // reasoner-only read that under duplex would silently drop the user's
+    // actual dialogue.
+    this.agent.onStateChanged((state) => {
+      this.recordComposite(state);
     });
 
     // Error handling with per-category display
@@ -1156,20 +1353,26 @@ export class Session {
     });
 
     // Background retry lifecycle: drive the compact, in-place status line.
-    this.agent.onRetryScheduled((info: RetryScheduledInfo) => {
-      this.startRetryCountdown(info);
+    // Every one of these is registered on both resident loops, so each keys
+    // on the origin: the line has one slot and two possible owners.
+    this.agent.onRetryScheduled((info: RetryScheduledInfo, origin: LoopOriginContext) => {
+      this.startRetryCountdown(info, origin.loopPath);
     });
-    this.agent.onRetrySucceeded((_info: RetrySucceededInfo) => {
-      this.clearRetry();
+    this.agent.onRetrySucceeded((_info: RetrySucceededInfo, origin: LoopOriginContext) => {
+      this.clearRetryFor(origin.loopPath);
     });
-    this.agent.onRetryExhausted((_info: RetryExhaustedInfo) => {
+    this.agent.onRetryExhausted((_info: RetryExhaustedInfo, origin: LoopOriginContext) => {
       // The matching fatal onError fires right after and renders the terminal
       // 'failed' line; just stop the countdown here.
-      this.stopRetryTicker();
+      if (this.retryState?.loopPath === origin.loopPath) this.stopRetryTicker();
     });
 
-    // Compaction notification
-    this.agent.onPostCompaction((result: CompactionResult) => {
+    // Compaction notification. The reasoner's only: the footer this updates
+    // reads the reasoner's context window, so a talker compaction would
+    // announce numbers that do not correspond to anything the user can see,
+    // about a context they do not own.
+    this.agent.onPostCompaction((result: CompactionResult, origin: LoopOriginContext) => {
+      if (!this.isWorkLoop(origin)) return;
       const beforeK = (result.tokensBefore / 1000).toFixed(1);
       const afterK = (result.tokensAfter / 1000).toFixed(1);
       // Mark in the durable transcript where context was summarized away. The
@@ -1184,6 +1387,12 @@ export class Session {
       );
       this.updateFooterContextUsage();
     });
+
+    // The two failure notifications below deliberately fire for ANY loop,
+    // unlike the informational one above. A talker whose compaction degrades
+    // or runs out of layers is a conversation about to break, which the user
+    // needs to know even though the remedy text is written for the reasoner's
+    // context. A duplicated warning beats a swallowed one.
 
     // Compaction degraded (Layer 2 failed, Layer 3 used as fallback)
     this.agent.onCompactionDegraded((info) => {
@@ -1201,11 +1410,16 @@ export class Session {
       );
     });
 
-    // Observational memory events (only fire when strategy is 'observational')
-    this.agent.onObservation(() => {
+    // Observational memory events (only fire when strategy is 'observational').
+    // The status they refresh is read off the reasoner's compaction manager,
+    // so a talker generation would only trigger a redundant re-read of a
+    // number that did not change.
+    this.agent.onObservation((_event, origin: LoopOriginContext) => {
+      if (!this.isWorkLoop(origin)) return;
       this.updateObservationalMemoryStatus();
     });
-    this.agent.onReflection(() => {
+    this.agent.onReflection((_event, origin: LoopOriginContext) => {
+      if (!this.isWorkLoop(origin)) return;
       this.updateObservationalMemoryStatus();
     });
 
@@ -1235,17 +1449,22 @@ export class Session {
     // Background sub-agent result delivery: Cortex restarts the agentic loop
     // automatically; update TUI state so the user sees activity.
     this.agent.onBackgroundResultDelivery(() => {
-      this.isRunning = true;
+      this.beginWork();
       this.app!.showStatusSpinner('Processing background results...');
       void this.activity.recordWorking();
     });
 
-    // Update tokens and auto-save on turn_end (fires after each LLM turn,
-    // including mid-loop turns between tool calls)
-    bridge.on('turn_end', () => {
+    // Update tokens on turn_end (fires after each LLM turn, including
+    // mid-loop turns between tool calls), and take a crash-recovery
+    // checkpoint. onStateChanged is the authoritative persistence trigger,
+    // but it cannot fire during a long task, so it is not on its own enough
+    // to keep one on disk. A child's turn boundary says nothing about the
+    // parent's history, so children are skipped.
+    bridge.on('turn_end', (event: CortexEvent) => {
       this.updateFooterContextUsage();
       this.updateObservationalMemoryStatus();
-      this.triggerAutoSave();
+      if (event.childTaskId) return;
+      this.crashCheckpoint();
     });
   }
 
@@ -1608,7 +1827,9 @@ export class Session {
   private async resolvePermission(
     toolName: string,
     toolArgs: unknown,
+    context?: ToolPermissionRequestContext,
   ): Promise<boolean | CortexToolPermissionResult> {
+    const abortSignal = context?.signal;
     // Refuse-to-run (opt-in). When the consumer requires enforcement and the
     // rung is contained but the OS sandbox is not actually enforcing (backend
     // 'none': helper missing/blocked/quarantined), block shell commands rather
@@ -1681,6 +1902,13 @@ export class Session {
       await this.permissionLockPromise;
     }
 
+    // The asking run may have been aborted while this ask waited behind
+    // another prompt (or before it arrived). Cortex has already stopped
+    // waiting for this resolver, so never show a prompt for dead work.
+    if (abortSignal?.aborted) {
+      return { decision: 'block', reason: 'Run aborted before the permission prompt was shown' };
+    }
+
     // Re-check: a previous prompt may have added an "always allow"/deny rule.
     const preAfterWait = await preflightPermission(toolName, toolArgs, preflightDeps);
     if (preAfterWait.decision === 'allow') return true;
@@ -1695,7 +1923,11 @@ export class Session {
       this.permissionLockRelease = resolve;
     });
 
-    const permission = this.activity.recordPermissionRequested(toolName, toolArgs);
+    const permission = this.activity.recordPermissionRequested(
+      toolName,
+      toolArgs,
+      context?.askId !== undefined ? { askId: context.askId } : undefined,
+    );
     await permission.written;
     let permissionResolution: PermissionResolution = 'denied';
 
@@ -1705,13 +1937,52 @@ export class Session {
     // the controller stops the watcher once the prompt resolves, however it
     // resolved.
     const externalController = new AbortController();
-    const externalDecision = watchDecisionFile(
+    const fileDecision = watchDecisionFile(
       this.activity.decisionPath(permission.id),
       externalController.signal,
     );
 
+    // Dismiss the prompt when the asking run is aborted. Cortex races the
+    // resolver against the run's abort signal and proceeds with a block, so
+    // an unanswered prompt would sit on screen for dead work while holding
+    // permissionLockPromise, serializing the next live ask behind it. The
+    // abort settles the prompt through the same external-decision channel a
+    // companion app uses, which removes it from the TUI and releases the lock.
+    let abortDismissed = false;
+    let onAbort: (() => void) | undefined;
+    let externalDecision = fileDecision;
+    if (abortSignal) {
+      // The aborted pre-check above ran BEFORE recordPermissionRequested and
+      // the awaited state write, and addEventListener never fires for a
+      // signal that is already aborted. An abort landing inside that window
+      // must settle the decision here, or the prompt sits on screen for
+      // dead work holding permissionLockPromise forever, serializing every
+      // later ask behind it.
+      let abortDecision: Promise<'deny'>;
+      if (abortSignal.aborted) {
+        abortDismissed = true;
+        abortDecision = Promise.resolve('deny');
+      } else {
+        abortDecision = new Promise<'deny'>((resolve) => {
+          onAbort = () => {
+            abortDismissed = true;
+            resolve('deny');
+          };
+          abortSignal.addEventListener('abort', onAbort, { once: true });
+        });
+      }
+      externalDecision = Promise.race([fileDecision, abortDecision]);
+    }
+
     try {
       const result = await this.app.showPermissionPrompt(toolName, toolArgs, externalDecision);
+      if (abortDismissed) {
+        permissionResolution = 'cancelled';
+        return {
+          decision: 'block',
+          reason: 'Run aborted before the permission prompt was answered',
+        };
+      }
       permissionResolution = result.decision === 'allow' ? 'allowed' : 'denied';
 
       if (result.scope === 'project-edits') {
@@ -1729,6 +2000,9 @@ export class Session {
       void this.activity.recordError(error instanceof Error ? error : String(error));
       throw error;
     } finally {
+      if (abortSignal && onAbort) {
+        abortSignal.removeEventListener('abort', onAbort);
+      }
       externalController.abort();
       await this.activity.recordPermissionResolved(permission.id, toolName, permissionResolution);
       const release = this.permissionLockRelease;
@@ -1877,37 +2151,49 @@ export class Session {
     );
   }
 
-  /** Resume a previous session by loading and restoring its history. */
+  /**
+   * Resume a previous session.
+   *
+   * Composite (v2) saves are preferred; a session written before the
+   * composite format existed still loads through the v1 pair, which the
+   * facade upgrades transparently. Both go in through the one all-or-nothing
+   * `restore()`, which subsumes the three separate loop-level restore calls
+   * (history, observational state, usage): those could each land
+   * independently and mid-run, while `restore()` applies them in order and
+   * refuses outright while a loop is running, so a /resume typed during a
+   * turn fails loudly instead of splicing history out from under it.
+   */
   async resume(sessionId: string): Promise<void> {
-    const { loadSession: load, loadObservationalState } = await import('./persistence/sessions.js');
-    const saved = await load(sessionId);
-    if (!saved) {
+    if (!this.agent) return;
+
+    const loaded = await this.loadResumableSession(sessionId);
+    if (!loaded) {
       this.app?.transcript.addNotification('Resume Failed', `Session ${sessionId} not found.`);
+      // There was nothing under this id, so the session start() skipped a
+      // checkpoint for is effectively a fresh one. Give it the artifact it
+      // would have had, or it stays invisible to listSessions().
+      await this.writeInitialCheckpoint();
       return;
     }
 
-    if (!this.agent) return;
-
-    this.agent.restoreConversationHistory(
-      saved.history as Parameters<typeof this.agent.restoreConversationHistory>[0],
-    );
-    this.createdAt = saved.meta.createdAt;
-
-    // Restore accumulated usage (cost, turns, tokens) from the saved session
-    if (saved.meta.usage) {
-      this.agent.restoreSessionUsage(saved.meta.usage);
+    try {
+      // Awaited: restore() reports its guards as a rejection, so an
+      // unawaited call would leave a /resume typed during a turn escaping
+      // this catch as an unhandled rejection.
+      await this.agent.restore(loaded.artifact);
+    } catch (err) {
+      log.warn('Resume restore rejected', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.app?.transcript.addNotification(
+        'Resume Failed',
+        err instanceof Error ? err.message : String(err),
+      );
+      return;
     }
-
-    // Restore observational memory state if the session used observational compaction
-    if (this.compactionStrategy === 'observational') {
-      const omState = await loadObservationalState(sessionId);
-      if (omState) {
-        this.agent.restoreObservationalMemoryState(
-          omState as Parameters<typeof this.agent.restoreObservationalMemoryState>[0],
-        );
-        this.updateObservationalMemoryStatus();
-      }
-    }
+    this.createdAt = loaded.meta.createdAt;
+    this.updateObservationalMemoryStatus();
 
     // Replay message history into the transcript so the user sees the
     // previous conversation. Cortex already has the history in context; this
@@ -1916,17 +2202,83 @@ export class Session {
       const { replayHistoryToTranscript } = await import('./utils/replay-history.js');
       this.app.transcript.addNotification(
         'Session Resumed',
-        `Replaying ${saved.history.length} messages from previous session.`,
+        `Replaying ${loaded.dialogue.length} messages from previous session.`,
       );
-      replayHistoryToTranscript(saved.history, this.app.transcript);
+      replayHistoryToTranscript(loaded.dialogue, this.app.transcript);
     }
     this.updateFooterContextUsage();
+    // Re-baseline: start() checkpointed an empty agent, so without this the
+    // crash checkpoint's base would still be that empty snapshot and would
+    // blank the restored talker side on the first turn.
+    await this.writeInitialCheckpoint();
   }
 
-  /** Abort the current agent loop without destroying. */
+  /**
+   * Load a saved session as something `restore()` accepts, plus the history
+   * the transcript should replay. The replayed half is the DIALOGUE, which
+   * under duplex is the talker's transcript, not the reasoner's work log.
+   */
+  private async loadResumableSession(sessionId: string): Promise<{
+    artifact: CortexAgentStateV1 | CortexAgentStateV2;
+    meta: SessionMeta;
+    dialogue: unknown[];
+  } | null> {
+    const {
+      loadSessionState,
+      loadSession: load,
+      loadObservationalState,
+    } = await import('./persistence/sessions.js');
+
+    const composite = await loadSessionState(sessionId);
+    if (composite) {
+      const { state } = composite;
+      return {
+        artifact: state,
+        meta: composite.meta,
+        dialogue: state.talkerHistory.length > 0 ? state.talkerHistory : state.reasonerHistory,
+      };
+    }
+
+    const saved = await load(sessionId);
+    if (!saved) return null;
+
+    // Observational memory state, loaded before the restore because history
+    // and memory now go in together (the buffer watermark indexes into the
+    // history, so the facade orders them itself rather than trusting the
+    // caller to).
+    const omState = this.compactionStrategy === 'observational'
+      ? await loadObservationalState(sessionId)
+      : null;
+
+    return {
+      artifact: {
+        version: 1,
+        history: saved.history as CortexAgentStateV1['history'],
+        memory: (omState ?? null) as ObservationalMemoryState | null,
+        ...(saved.meta.usage ? { usage: saved.meta.usage } : {}),
+      },
+      meta: saved.meta,
+      dialogue: saved.history,
+    };
+  }
+
+  /**
+   * Abort the current agent loop without destroying.
+   *
+   * Skipped once teardown has begun: the editor discards the promise this
+   * returns (Ctrl+C is fire-and-forget), so anything that rejects in here
+   * rejects unhandled. CortexAgent.abort() is itself a no-op after destroy,
+   * but abort() during shutdown still has nothing to cancel and its activity
+   * record would land after the "done" record, so skip the whole body.
+   *
+   * The `isRunning` gate is what makes Ctrl+C work at all, which is why that
+   * flag is keyed on the facade's settlement predicate and not on any single
+   * loop's completion.
+   */
   async abort(): Promise<void> {
     this.freezeDiagnostics.recordAbortRequested('session.abort');
-    if (this.agent && this.isRunning) {
+    const tearingDown = this.agent?.state === 'destroying' || this.agent?.state === 'destroyed';
+    if (this.agent && this.isRunning && !tearingDown) {
       await this.agent.abort();
       void this.activity.recordError({
         category: 'cancelled',
@@ -1935,6 +2287,7 @@ export class Session {
       });
     }
     this.isRunning = false;
+    this.promptInFlight = false;
     this.freezeDiagnostics.setSessionRunning(false);
     this.app?.hideStatusSpinner();
     this.app?.focusEditor();
@@ -1965,17 +2318,11 @@ export class Session {
     // Immediate final save
     if (this.agent) {
       try {
-        const history = this.agent.getConversationHistory();
-        const meta = this.buildSessionMeta();
-        const { saveSession, saveObservationalState } = await import('./persistence/sessions.js');
-        const saves: Promise<void>[] = [saveSession(this.sessionId, history, meta)];
-        if (this.compactionStrategy === 'observational') {
-          const omState = this.agent.getObservationalMemoryState();
-          if (omState) {
-            saves.push(saveObservationalState(this.sessionId, omState));
-          }
+        const state = await this.finalCompositeState(this.agent);
+        if (state) {
+          const { saveSessionState } = await import('./persistence/sessions.js');
+          await saveSessionState(this.sessionId, state, this.buildSessionMeta());
         }
-        await Promise.all(saves);
       } catch {
         // Best-effort save during shutdown
       }
@@ -2054,6 +2401,49 @@ export class Session {
     );
   }
 
+  /**
+   * The config handed to CortexAgent.create(). Separate from start() so the
+   * mode is assertable without standing up a TUI and a sandbox.
+   *
+   * `mode` is passed explicitly rather than left to the facade default, which
+   * is duplex. See {@link agentMode} for why, and for the single place that
+   * decision is written down.
+   */
+  private buildAgentConfig(): CortexAgentConfig {
+    const diagnostics = this.buildDiagnosticsConfig();
+    return {
+      // No `duplex.maxTotalCost`, and that is a decision rather than an
+      // omission. The facade's aggregate guard is uncapped without it, so a
+      // duplex session would run two resident loops, sub-agents, lookups and
+      // doubled observational spend with no session ceiling. A ceiling is
+      // still the wrong answer here: this CLI sets no `budgetGuard.maxCost`
+      // either, so a session cap would be the only cost limit in the product
+      // and its effect would be a long coding session hard-stopping mid-task
+      // with no prior warning. Cost limits for a coding CLI want a warning
+      // tier before a stop, and that is a product decision, not a constant.
+      // Inert while the mode below is passthrough; revisit together with it.
+      mode: this.agentMode,
+      model: this.model,
+      utilityModel: 'default',
+      workingDirectory: this.cwd,
+      initialBasePrompt: this.mode.systemPrompt,
+      slots: this.mode.contextSlots,
+      resolvePermission: (toolName, toolArgs, context) =>
+        this.resolvePermission(toolName, toolArgs, context),
+      // WebFetch's egress gate: the same decision function the sandbox egress
+      // proxy consults for shell commands, so one grant covers both paths.
+      resolveNetworkAccess: (req) => this.resolveNetworkAccess(req),
+      isAutoApprove: () => this.yoloMode,
+      ...(this.sandboxProvider ? { sandbox: this.sandboxProvider } : {}),
+      getApiKey: (provider) => this.getApiKey(provider),
+      contextWindowLimit: this.config.contextWindowLimit ?? null,
+      compaction: { strategy: this.compactionStrategy },
+      persistResult: createToolResultPersistor(this.sessionId),
+      logger: log,
+      ...(diagnostics ? { diagnostics } : {}),
+    };
+  }
+
   private buildDiagnosticsConfig(): import('@animus-labs/cortex').CortexDiagnosticsConfig | undefined {
     const freeze = this.config.diagnostics?.freeze;
     if (!freeze?.enabled) return undefined;
@@ -2063,12 +2453,53 @@ export class Session {
     return { promptWatchdog: watchdog };
   }
 
+  /**
+   * The footer's full opening state. Separate from start() so a test can put
+   * the footer in the state a real session opens with by calling the same
+   * code, rather than by assembling a state object of its own and proving
+   * only that the renderer works.
+   */
+  private pushInitialFooterState(branch: string, effortLevel: ThinkingLevel): void {
+    if (!this.agent || !this.app) return;
+    this.app.updateStatus({
+      mode: this.mode.name,
+      modeCount: AVAILABLE_MODES.length,
+      provider: this.provider,
+      model: this.modelId,
+      contextTokenCount: this.getDisplayedCurrentContextTokens(),
+      contextTokenLimit: this.agent.effectiveContextWindow,
+      gitBranch: branch,
+      yoloMode: this.yoloMode,
+      effortLevel,
+      observationalMode: this.compactionStrategy === 'observational',
+      ...this.sandboxIndicatorState(),
+      ...this.resolutionIndicatorState(),
+    });
+  }
+
   private updateFooterContextUsage(): void {
     if (!this.agent || !this.app) return;
     this.app.updateStatus({
       contextTokenCount: this.getDisplayedCurrentContextTokens(),
       contextTokenLimit: this.agent.effectiveContextWindow,
+      ...this.resolutionIndicatorState(),
     });
+  }
+
+  /**
+   * The footer's degraded marker. Recomputed on every footer refresh rather
+   * than set once: `network-resolver-unwired` is appended at the first
+   * prompt, so a flag written only at startup would never light for it.
+   *
+   * `info` notes are excluded deliberately. `duplex-cost-cap-unset` is an
+   * info note that fires on every default duplex session, so counting info
+   * here would leave the marker permanently on and carrying no information.
+   */
+  private resolutionIndicatorState(): { resolutionDegraded: boolean } {
+    return {
+      resolutionDegraded: this.getResolutionReport()
+        .some((note) => note.severity === 'degraded'),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -2080,8 +2511,8 @@ export class Session {
    * spinner with a single line that ticks down to the next attempt; a 1s timer
    * keeps the countdown live.
    */
-  private startRetryCountdown(info: RetryScheduledInfo): void {
-    this.retryState = { info };
+  private startRetryCountdown(info: RetryScheduledInfo, loopPath: string): void {
+    this.retryState = { info, loopPath };
     // A retry wait is not "thinking"; swap the spinner for the status line.
     this.app?.hideStatusSpinner();
     this.renderRetryWaiting();
@@ -2122,6 +2553,16 @@ export class Session {
   }
 
   /**
+   * Tear down the retry UI only if the loop reporting the resolution is the
+   * one whose countdown is on screen. The other loop's retry is not the one
+   * the user is watching, and clearing on it would blank a live countdown.
+   */
+  private clearRetryFor(loopPath: string): void {
+    if (this.retryState && this.retryState.loopPath !== loopPath) return;
+    this.clearRetry();
+  }
+
+  /**
    * The agent produced output (text or a tool call) after a retry was pending,
    * which means we reconnected: drop the retry line immediately rather than
    * waiting for the whole turn to resolve.
@@ -2149,17 +2590,122 @@ export class Session {
     );
   }
 
-  private triggerAutoSave(): void {
+  /**
+   * Write the session out once, now, before it has done anything.
+   *
+   * Persistence is otherwise driven by `onStateChanged`, which the facade
+   * only emits from a `getState()` taken at gate quiescence. A session that
+   * starts work and never reaches quiescence therefore never wrote anything:
+   * a brand-new session killed during its first task left no `meta.json`, so
+   * `listSessions()` could not see it and `/resume` could not find it. Not
+   * stale, invisible.
+   *
+   * The agent is idle at both call sites, so the snapshot is a real
+   * consistent composite rather than a placeholder, and it gives
+   * {@link crashCheckpoint} the talker side it needs as a base.
+   *
+   * Callers must not invoke this on a resumed session before `resume()` has
+   * read the file: `start()` runs first, and an unconditional write there
+   * would overwrite the very session the user asked to resume with an empty
+   * agent.
+   */
+  private async writeInitialCheckpoint(): Promise<void> {
     if (!this.agent) return;
     try {
-      const history = this.agent.getConversationHistory();
-      const meta = this.buildSessionMeta();
-      // Bundle observational state into the same debounced write so the
-      // persisted buffer watermark stays aligned with the saved history.
-      const omState = this.compactionStrategy === 'observational'
-        ? this.agent.getObservationalMemoryState() ?? undefined
-        : undefined;
-      this.saver.save(history, meta, omState);
+      const state = await this.agent.getState();
+      this.lastCompositeState = state;
+      const { saveSessionState } = await import('./persistence/sessions.js');
+      await saveSessionState(this.sessionId, state, this.buildSessionMeta());
+    } catch (err) {
+      log.warn('Initial session checkpoint failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * A crash-recovery checkpoint taken at a turn boundary, mid-run.
+   *
+   * `getState()` cannot help here: it resolves only when the loop gate is
+   * empty, and a ten-minute task holds the gate for its whole duration, so
+   * settlement-driven persistence writes nothing until the task is over. That
+   * is a crash away from losing the task.
+   *
+   * Passthrough only, deliberately. A turn boundary is a coherent point for
+   * ONE loop (pi has appended the assistant message and every tool result of
+   * the batch before `turn_end` fires), and in passthrough that one loop is
+   * the whole agent, so this is a consistent snapshot rather than the mid-run
+   * partial the old `triggerAutoSave` was taking. Under duplex it would not
+   * be: the other loop can be mid-turn at this instant, and the consumer has
+   * no way to read its history except through the `getState()` that is
+   * blocked. Closing that gap needs a turn-boundary snapshot on the facade,
+   * not a workaround here.
+   *
+   * Observational memory rides along only when neither the observer nor the
+   * reflector is in flight. Its buffer watermark indexes into history, so a
+   * generation landing between the two reads would persist a watermark that
+   * does not match what was saved; omitting it costs observations on crash
+   * recovery and keeps the artifact coherent.
+   */
+  private crashCheckpoint(): void {
+    if (!this.agent || this.agentMode !== 'passthrough') return;
+    const base = this.lastCompositeState;
+    if (!base) return;
+
+    const memorySettled = this.compactionStrategy === 'observational'
+      ? !this.agent.getCompactionManager().isObserverInFlight()
+        && !this.agent.getCompactionManager().isReflectorInFlight()
+      : true;
+    const usage = this.agent.getSessionUsage();
+
+    this.recordComposite({
+      ...base,
+      log: this.agent.getLog(),
+      // Passthrough: the conversation loop IS the reasoner. The talker side
+      // comes from the base snapshot rather than being blanked, so a duplex
+      // artifact restored into this session round-trips instead of losing a
+      // half it cannot see.
+      reasonerHistory: this.agent.getConversationHistory(),
+      reasonerMemory: memorySettled ? this.agent.getObservationalMemoryState() : null,
+      usage: { ...base.usage, total: usage, perLoop: { ...base.usage.perLoop, reasoner: usage } },
+    });
+  }
+
+  /**
+   * The composite snapshot to write at exit. `getState()` resolves only at a
+   * quiescence window, so a session still mid-run at exit would block the
+   * shutdown path; bound the wait and fall back to the last snapshot the
+   * facade published, which is stale by at most one debounce rather than
+   * absent.
+   */
+  private async finalCompositeState(agent: CortexAgent): Promise<CortexAgentStateV2 | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), SHUTDOWN_SNAPSHOT_TIMEOUT_MS);
+      timer.unref();
+    });
+    try {
+      const fresh = await Promise.race([agent.getState().catch(() => null), bound]);
+      return fresh ?? this.lastCompositeState;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Cache the composite snapshot and queue it for disk. The snapshot carries
+   * the session log, BOTH loops' histories and observational memory, and
+   * per-loop usage, so nothing that only exists on the conversation loop is
+   * lost. The reasoner-only trio (`getConversationHistory()` plus
+   * `getObservationalMemoryState()` plus `getSessionUsage()`) that used to
+   * build a v1 artifact here reads the work transcript under duplex, and the
+   * dialogue it omits was never written, so no later migration could get it
+   * back.
+   */
+  private recordComposite(state: CortexAgentStateV2): void {
+    this.lastCompositeState = state;
+    try {
+      this.saver.save(state, this.buildSessionMeta());
     } catch {
       // Swallow auto-save errors silently
     }
@@ -2399,6 +2945,19 @@ export class Session {
 
   getAgent(): CortexAgent | null { return this.agent; }
   getApp(): App | null { return this.app; }
+
+  /**
+   * The session's resolution report: what the assembly actually resolved to
+   * where that differs from what was configured.
+   *
+   * Read live rather than snapshotted at startup. Most notes are assembly
+   * facts, but `network-resolver-unwired` is recorded when the check first
+   * runs, which is at the first prompt, so a report captured once at startup
+   * would permanently miss the one note this CLI can currently produce.
+   */
+  getResolutionReport(): ResolutionNote[] {
+    return this.agent?.getResolutionReport() ?? [];
+  }
   getYoloMode(): boolean { return this.yoloMode; }
   getCompactionStrategy(): 'observational' | 'classic' { return this.compactionStrategy; }
   setYoloMode(enabled: boolean): void {
