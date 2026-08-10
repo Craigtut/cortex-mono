@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { TuiMainScreen, type TUI, Container, SelectList, type Component } from '@earendil-works/pi-tui';
+import { TUI, Container, SelectList, type Component } from '@earendil-works/pi-tui';
 import { OverlayBox } from '../../src/tui/overlay-box.js';
 
 // Permissive SelectList theme: identity styling so a deferred render never throws.
@@ -48,12 +48,6 @@ describe('overlay focus survives a multi-step flow (real pi-tui focus-restore)',
     tui = undefined;
   });
 
-  // pi-tui renamed the TUI-level input entry point (handleInput ->
-  // handleTerminalInput) and keeps it private; this test drives it directly.
-  function sendInput(t: TUI, data: string): void {
-    (t as unknown as { handleTerminalInput(d: string): void }).handleTerminalInput(data);
-  }
-
   function makeTui(): TUI {
     const terminal = {
       columns: 120,
@@ -64,7 +58,7 @@ describe('overlay focus survives a multi-step flow (real pi-tui focus-restore)',
       hideCursor() {},
       showCursor() {},
     };
-    return new TuiMainScreen(terminal as never);
+    return new TUI(terminal as never);
   }
 
   // Reproduce the /login two-step flow inside an overlay:
@@ -84,7 +78,7 @@ describe('overlay focus survives a multi-step flow (real pi-tui focus-restore)',
     const tierList = new SelectList([{ value: 'oauth', label: 'OAuth' }], 1, selectTheme);
     inner.addChild(tierList);
     focusInner(box, tierList);
-    sendInput(tui, '\x1b[B'); // navigate within the first list
+    tui.handleInput('\x1b[B'); // navigate within the first list
 
     // Step 2: provider-selection (clear + a fresh list, as SetupRenderer does).
     inner.clear();
@@ -98,7 +92,7 @@ describe('overlay focus survives a multi-step flow (real pi-tui focus-restore)',
 
     let selected: string | null = null;
     providerList.onSelect = (item) => { selected = item.value as string; };
-    sendInput(tui, '\r'); // Enter on the highlighted item (Anthropic)
+    tui.handleInput('\r'); // Enter on the highlighted item (Anthropic)
     return selected;
   }
 

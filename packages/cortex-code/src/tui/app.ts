@@ -1,6 +1,5 @@
 import {
-  TuiMainScreen,
-  type TUI,
+  TUI,
   ProcessTerminal,
   Container,
   Spacer,
@@ -52,7 +51,7 @@ export class App {
     this.cwd = cwd;
     this.diagnostics = diagnostics;
     this.terminal = new ProcessTerminal();
-    this.tui = new TuiMainScreen(this.terminal);
+    this.tui = new TUI(this.terminal);
 
     // Suppress cursor positioning globally. pi-tui's positionHardwareCursor()
     // moves the terminal cursor to the focused editor on every render cycle

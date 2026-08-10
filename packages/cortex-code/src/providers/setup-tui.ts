@@ -8,8 +8,7 @@
  */
 
 import {
-  TuiMainScreen,
-  type TUI,
+  TUI,
   ProcessTerminal,
   Container,
   Text,
@@ -635,7 +634,7 @@ export async function runFirstRunSetup(
   const flow = await createFlow(providerManager);
 
   const terminal = new ProcessTerminal();
-  const tui = new TuiMainScreen(terminal);
+  const tui = new TUI(terminal);
   const mainContainer = new Container();
   tui.addChild(mainContainer);
 
