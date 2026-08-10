@@ -95,7 +95,7 @@ for (const note of agent.getResolutionReport()) {
   // note.code:     'talker-model-fallback' | 'talker-utility-model-skipped' | ...
   // note.summary / note.detail / note.remedy: three lengths of the same statement
   // note.data:     the same facts structurally, if you want your own wording
-  ui.showConfigNotice(note);
+  console.warn(`[${note.severity}] ${note.summary} ${note.remedy}`);
 }
 ```
 
