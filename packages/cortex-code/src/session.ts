@@ -2116,12 +2116,33 @@ export class Session {
 
   /** Credential resolution: stored API key or OAuth refresh. */
   private async getApiKey(provider: string): Promise<string> {
-    // Pi-agent-core passes the model's provider field (e.g., "custom" for
-    // custom endpoints). Credentials may be stored under the session's
-    // provider name (e.g., "ollama"), so fall back to that if needed.
+    // Pi-agent-core passes the model's provider field. For anything built by
+    // createCustomModel that is the synthetic id "custom", whose credential is
+    // filed under the connection name instead (e.g. "ollama"), so a "custom"
+    // request falls back to the session's provider name.
+    //
+    // Only "custom" does. Every other id names a real provider, and a real
+    // provider's credential is filed under its own name or not stored at all:
+    // borrowing a different provider's would send its token to an endpoint it
+    // was not issued for. That is reachable, because a loop can outlive a
+    // provider switch (a duplex talker still on the startup provider's model
+    // after /model moved the session), and the honest answer there is that
+    // this model has no credential.
+    //
+    // A borrowed entry is therefore never an OAuth one, which is what keeps
+    // the OAuth branch below resolving under an id pi-ai actually knows. It
+    // used to resolve the session's OAuth credential under the literal string
+    // "custom", and pi-ai registers no such provider.
     let entry = await this.credentialStore.getProvider(provider);
-    if (!entry && provider !== this.provider) {
-      entry = await this.credentialStore.getProvider(this.provider);
+    if (!entry && provider === 'custom' && provider !== this.provider) {
+      const sessionEntry = await this.credentialStore.getProvider(this.provider);
+      if (sessionEntry?.method === 'oauth') {
+        log.warn('Not lending OAuth credentials to a custom-endpoint model', {
+          sessionProvider: this.provider,
+        });
+      } else {
+        entry = sessionEntry;
+      }
     }
     if (!entry) {
       // Keyless providers (e.g., Ollama) may not have a credential store
