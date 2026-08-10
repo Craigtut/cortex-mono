@@ -1606,12 +1606,14 @@ You have 12 emotions.`;
       expect(piAgent.state.thinkingLevel).toBe('high');
     });
 
-    it('maps max to xhigh in agent state', () => {
+    it('writes max to agent state unmapped', () => {
+      // Cortex level names are pi level names; the old max -> xhigh rewrite
+      // made a model's real ceiling unrequestable.
       const agent = createTestAgentLoop(piAgent, config);
 
       agent.setThinkingLevel('max');
 
-      expect(piAgent.state.thinkingLevel).toBe('xhigh');
+      expect(piAgent.state.thinkingLevel).toBe('max');
     });
   });
 

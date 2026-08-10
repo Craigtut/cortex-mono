@@ -126,8 +126,13 @@ describe('ThinkingLevel', () => {
   });
 
   describe('setThinkingLevel', () => {
-    it('maps "max" to "xhigh" in agent state', () => {
+    it('writes "max" through to agent state unmapped', () => {
       agent.setThinkingLevel('max');
+      expect(piAgent.state.thinkingLevel).toBe('max');
+    });
+
+    it('writes "xhigh" through to agent state unmapped', () => {
+      agent.setThinkingLevel('xhigh');
       expect(piAgent.state.thinkingLevel).toBe('xhigh');
     });
 
@@ -158,9 +163,16 @@ describe('ThinkingLevel', () => {
   });
 
   describe('getThinkingLevel', () => {
-    it('returns "max" when pi-agent state has "xhigh"', () => {
+    it('returns "xhigh" when pi-agent state has "xhigh"', () => {
+      // Was 'max': the old build renamed pi's xhigh on the way out, which is
+      // what made the two rungs indistinguishable to callers.
       (piAgent.state as Record<string, unknown>).thinkingLevel = 'xhigh';
-      expect(agent.getThinkingLevel()).toBe('max');
+      expect(agent.getThinkingLevel()).toBe('xhigh');
+    });
+
+    it('falls back to "medium" for a pi level this build does not model', () => {
+      (piAgent.state as Record<string, unknown>).thinkingLevel = 'ultra';
+      expect(agent.getThinkingLevel()).toBe('medium');
     });
 
     it('returns "high" when pi-agent state has "high"', () => {
@@ -189,7 +201,7 @@ describe('ThinkingLevel', () => {
   });
 
   describe('round-trip mapping', () => {
-    const levels: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'max'];
+    const levels: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
     for (const level of levels) {
       it(`round-trips "${level}" through set and get`, () => {
@@ -210,7 +222,10 @@ describe('ThinkingLevel', () => {
       expect(mockGetSupportedThinkingLevels).toHaveBeenCalled();
     });
 
-    it('returns supportsMax: true for xhigh-capable reasoning models', async () => {
+    it('reports xhigh as xhigh, not as max', async () => {
+      // The old build folded xhigh into max. On a model that exposes BOTH,
+      // that collapse made the ceiling unreachable: asking for Cortex "max"
+      // sent "xhigh" and the real max was never requestable.
       const model = { provider: 'anthropic', name: 'claude-opus-4-6', id: 'claude-opus-4-6', reasoning: true } as PiModel;
       const cortexModel = makeModel(model);
       const testAgent = createTestAgentLoop(piAgent, createDefaultConfig({ model: cortexModel }));
@@ -219,10 +234,21 @@ describe('ThinkingLevel', () => {
       const caps = await testAgent.getModelThinkingCapabilities();
       expect(caps).toEqual({
         supportsThinking: true,
-        supportsMax: true,
-        supportedLevels: ['off', 'medium', 'high', 'max'],
+        supportsMax: false,
+        supportedLevels: ['off', 'medium', 'high', 'xhigh'],
       });
       expect(mockGetSupportedThinkingLevels).toHaveBeenCalled();
+    });
+
+    it('reports both rungs when a model exposes xhigh and max', async () => {
+      const model = { provider: 'anthropic', name: 'claude-opus-4-8', id: 'claude-opus-4-8', reasoning: true } as PiModel;
+      const cortexModel = makeModel(model);
+      const testAgent = createTestAgentLoop(piAgent, createDefaultConfig({ model: cortexModel }));
+      mockGetSupportedThinkingLevels.mockReturnValue(['off', 'high', 'xhigh', 'max']);
+
+      const caps = await testAgent.getModelThinkingCapabilities();
+      expect(caps.supportedLevels).toEqual(['off', 'high', 'xhigh', 'max']);
+      expect(caps.supportsMax).toBe(true);
     });
 
     it('returns supportsMax: false for standard reasoning models', async () => {
@@ -239,13 +265,38 @@ describe('ThinkingLevel', () => {
       });
     });
 
-    it('clamps using pi-ai and maps xhigh back to max', async () => {
-      mockClampThinkingLevel.mockReturnValue('xhigh');
+    it('clamps down to the model ceiling without consulting pi', async () => {
+      // pi's own clamp ranks by position in ITS global ladder, so a level the
+      // installed pi does not know is unrecognized rather than "too high":
+      // pi 0.80.3 answers clamp("max") with "off". Cortex's vocabulary can
+      // legitimately run ahead of the installed pi, so clamping is done here
+      // against the model's advertised list instead.
+      mockGetSupportedThinkingLevels.mockReturnValue(['off', 'medium', 'high', 'xhigh']);
 
       const clamped = await agent.clampThinkingLevel('max');
 
-      expect(clamped).toBe('max');
-      expect(mockClampThinkingLevel).toHaveBeenCalledWith(expect.any(Object), 'xhigh');
+      expect(clamped).toBe('xhigh');
+      expect(mockClampThinkingLevel).not.toHaveBeenCalled();
+    });
+
+    it('never silently clamps a top request to off', async () => {
+      // The specific pi footgun this replaces: 'max' -> 'off' turns a request
+      // for the most thinking into none at all.
+      mockGetSupportedThinkingLevels.mockReturnValue(['off', 'minimal', 'low']);
+
+      expect(await agent.clampThinkingLevel('max')).toBe('low');
+    });
+
+    it('passes a supported level through untouched', async () => {
+      mockGetSupportedThinkingLevels.mockReturnValue(['off', 'medium', 'high', 'xhigh']);
+
+      expect(await agent.clampThinkingLevel('high')).toBe('high');
+    });
+
+    it('clamps up to the weakest level when the request is below the floor', async () => {
+      mockGetSupportedThinkingLevels.mockReturnValue(['high', 'xhigh']);
+
+      expect(await agent.clampThinkingLevel('minimal')).toBe('high');
     });
   });
 });

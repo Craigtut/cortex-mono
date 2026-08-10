@@ -120,6 +120,7 @@ import type {
   UtilityUsageBucket,
   UtilityUsagePayload,
 } from './types.js';
+import { THINKING_LEVEL_ORDER } from './types.js';
 import { processToolResult } from './tool-result-persistence.js';
 
 // ---------------------------------------------------------------------------
@@ -204,23 +205,29 @@ export interface PiModel {
 }
 
 // ---------------------------------------------------------------------------
-// ThinkingLevel mapping (Cortex "max" <-> pi-agent-core "xhigh")
+// ThinkingLevel crossing to pi (names are identical; see toPiThinkingLevel)
 // ---------------------------------------------------------------------------
 
 /**
- * Map Cortex's consumer-facing ThinkingLevel to pi-agent-core's value.
- * "max" -> "xhigh"; all others pass through 1:1.
+ * Cortex's level names are pi's level names, so both directions are identity.
+ *
+ * These used to remap "max" <-> "xhigh", back when Cortex's vocabulary topped
+ * out one rung below pi's. That collapse silently under-requested: on a model
+ * exposing both xhigh and max, asking for Cortex "max" sent "xhigh". Worse,
+ * when pi later re-keyed a model's thinkingLevelMap onto "max", the sent
+ * "xhigh" missed the lookup entirely and fell through pi's `default` branch to
+ * "high" — two rungs down, with nothing logged. Keep these as the single
+ * documented crossing point rather than inlining casts at call sites.
  */
-function mapToPiThinkingLevel(level: ThinkingLevel): string {
-  return level === 'max' ? 'xhigh' : level;
+function toPiThinkingLevel(level: ThinkingLevel): string {
+  return level;
 }
 
-/**
- * Map pi-agent-core's thinking level back to Cortex's consumer-facing value.
- * "xhigh" -> "max"; all others pass through 1:1.
- */
-function mapFromPiThinkingLevel(level: string): ThinkingLevel {
-  return (level === 'xhigh' ? 'max' : level) as ThinkingLevel;
+/** Narrow a pi level name to Cortex's union, or null if pi added one we don't model. */
+function fromPiThinkingLevel(level: string): ThinkingLevel | null {
+  return (THINKING_LEVEL_ORDER as readonly string[]).includes(level)
+    ? (level as ThinkingLevel)
+    : null;
 }
 
 /** Leading context slot used to seed a sub-agent with background context. */
@@ -249,20 +256,43 @@ const DEFAULT_HEADLINE_MAX_TOKENS = 2_000;
 /** Marker appended when a headline block is cut at its token cap. */
 const HEADLINE_TRUNCATION_MARKER = '\n[headline block truncated]';
 
-const CORTEX_THINKING_LEVELS: readonly ThinkingLevel[] = [
-  'off',
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'max',
-];
+/**
+ * Strongest supported level that is no stronger than `level`.
+ *
+ * Falls back to the weakest supported level when the request sits below
+ * everything the model offers, and to 'off' when the model offers nothing.
+ * Ranking runs through THINKING_LEVEL_ORDER rather than the supported list's
+ * own indices, so an out-of-order or sparse list from a provider still
+ * compares correctly.
+ */
+function clampToSupported(
+  level: ThinkingLevel,
+  supported: readonly ThinkingLevel[],
+): ThinkingLevel {
+  if (supported.includes(level)) return level;
+  if (supported.length === 0) return 'off';
 
-function mapFromPiThinkingLevels(levels: readonly string[]): ThinkingLevel[] {
+  const rank = (l: ThinkingLevel): number => THINKING_LEVEL_ORDER.indexOf(l);
+  const wanted = rank(level);
+  const ranked = [...supported].sort((a, b) => rank(a) - rank(b));
+
+  let best: ThinkingLevel | null = null;
+  for (const candidate of ranked) {
+    if (rank(candidate) <= wanted) best = candidate;
+  }
+  return best ?? ranked[0]!;
+}
+
+/**
+ * Narrow pi's per-model level list to Cortex's union, preserving pi's order
+ * and dropping anything Cortex does not model. Order matters: callers clamp
+ * against this list, so it must run weakest to strongest.
+ */
+function fromPiThinkingLevels(levels: readonly string[]): ThinkingLevel[] {
   const mapped: ThinkingLevel[] = [];
   for (const level of levels) {
-    const cortexLevel = mapFromPiThinkingLevel(level);
-    if ((CORTEX_THINKING_LEVELS as readonly string[]).includes(cortexLevel) && !mapped.includes(cortexLevel)) {
+    const cortexLevel = fromPiThinkingLevel(level);
+    if (cortexLevel !== null && !mapped.includes(cortexLevel)) {
       mapped.push(cortexLevel);
     }
   }
@@ -3080,7 +3110,7 @@ export class AgentLoop {
         tools: [],
         messages: [],
         ...(cortexConfig.thinkingLevel !== undefined && {
-          thinkingLevel: mapToPiThinkingLevel(cortexConfig.thinkingLevel),
+          thinkingLevel: toPiThinkingLevel(cortexConfig.thinkingLevel),
         }),
       },
       getApiKey: cortexConfig.getApiKey,
@@ -3807,24 +3837,26 @@ export class AgentLoop {
 
   /**
    * Change the thinking/reasoning effort level.
-   * Maps Cortex's "max" to pi-agent-core's "xhigh" internally.
+   *
+   * Does not validate against the model: callers that want a guaranteed
+   * accepted value should pass the result of {@link clampThinkingLevel}.
    *
    * @param level - The consumer-facing thinking level
    */
   setThinkingLevel(level: ThinkingLevel): void {
-    const piLevel = mapToPiThinkingLevel(level);
-    (this.agent.state as Record<string, unknown>)['thinkingLevel'] = piLevel;
+    (this.agent.state as Record<string, unknown>)['thinkingLevel'] = toPiThinkingLevel(level);
   }
 
   /**
    * Get the current thinking/reasoning effort level.
-   * Maps pi-agent-core's "xhigh" back to Cortex's "max".
    *
-   * @returns The current consumer-facing thinking level, or 'medium' if not set
+   * @returns The current consumer-facing thinking level, or 'medium' if unset
+   *   or set to a level this Cortex build does not model.
    */
   getThinkingLevel(): ThinkingLevel {
     const piLevel = (this.agent.state as Record<string, unknown>)['thinkingLevel'];
-    return typeof piLevel === 'string' ? mapFromPiThinkingLevel(piLevel) : 'medium';
+    if (typeof piLevel !== 'string') return 'medium';
+    return fromPiThinkingLevel(piLevel) ?? 'medium';
   }
 
   get isWorkingTagsEnabled(): boolean {
@@ -3849,7 +3881,7 @@ export class AgentLoop {
   async getModelThinkingCapabilities(): Promise<ModelThinkingCapabilities> {
     try {
       const { getSupportedThinkingLevels } = await import('@earendil-works/pi-ai');
-      const supportedLevels = mapFromPiThinkingLevels(
+      const supportedLevels = fromPiThinkingLevels(
         getSupportedThinkingLevels(this.primaryPiModel as any),
       );
       return {
@@ -3872,21 +3904,23 @@ export class AgentLoop {
   }
 
   /**
-   * Clamp a requested thinking level to the current model's supported levels.
-   * Pi may clamp upward before clamping downward, so callers should surface
-   * clamping to users when latency or cost could change.
+   * Clamp a requested thinking level to the nearest level the current model
+   * accepts, never exceeding what was asked for.
+   *
+   * Deliberately does NOT delegate to pi's clampThinkingLevel. Pi clamps by
+   * position in its own global ladder, so a level its build does not know is
+   * not "too high", it is unrecognized: pi 0.80.3 answers clamp("max") with
+   * "off", turning a request for the most thinking into none at all. Since
+   * Cortex's vocabulary can legitimately run ahead of the installed pi (that
+   * is the whole point of naming levels per-model), that failure mode is
+   * reachable by ordinary config. Clamping against the model's own advertised
+   * list keeps the answer bounded by what the model actually accepts.
+   *
+   * Callers should surface a clamp to users when latency or cost changes.
    */
   async clampThinkingLevel(level: ThinkingLevel): Promise<ThinkingLevel> {
-    try {
-      const { clampThinkingLevel } = await import('@earendil-works/pi-ai');
-      return mapFromPiThinkingLevel(
-        clampThinkingLevel(this.primaryPiModel as any, mapToPiThinkingLevel(level) as any),
-      );
-    } catch {
-      const caps = await this.getModelThinkingCapabilities();
-      if (caps.supportedLevels.includes(level)) return level;
-      return caps.supportedLevels[0] ?? 'off';
-    }
+    const caps = await this.getModelThinkingCapabilities();
+    return clampToSupported(level, caps.supportedLevels);
   }
 
   /**

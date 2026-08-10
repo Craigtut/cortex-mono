@@ -153,12 +153,34 @@ export type CortexLifecycleState = 'created' | 'active' | 'destroying' | 'destro
 // ---------------------------------------------------------------------------
 
 /**
- * Consumer-facing thinking/effort level.
+ * Consumer-facing thinking/effort level. Names and ordering match pi-ai's
+ * vocabulary exactly, so a level passes through to the provider unmapped.
  *
- * "max" maps to pi-ai/pi-agent-core's "xhigh" internally.
+ * Which of these a given model actually accepts is a per-model fact, not a
+ * global one: ask {@link AgentLoop.getModelThinkingCapabilities}. Cortex used
+ * to collapse "xhigh" and "max" into a single "max", which silently
+ * under-requested on models that expose both.
+ *
  * "off" disables extended thinking entirely.
  */
-export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'max';
+export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/**
+ * Every thinking level, weakest to strongest, with "off" first.
+ *
+ * The single source of ordering truth. Use it to compare or clamp levels;
+ * do not hardcode a ladder at a call site, because which entries are valid
+ * depends on the model.
+ */
+export const THINKING_LEVEL_ORDER: readonly ThinkingLevel[] = [
+  'off',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
 
 /**
  * Describes a model's thinking/reasoning capabilities.
@@ -167,9 +189,14 @@ export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'max
 export interface ModelThinkingCapabilities {
   /** Whether the model supports extended thinking at all. */
   supportsThinking: boolean;
-  /** Whether the model supports the "max" (xhigh) thinking level. */
+  /**
+   * Whether this model accepts the literal "max" level.
+   *
+   * Not a synonym for "has a top level": a model whose ceiling is "xhigh"
+   * reports false here. Prefer reading {@link supportedLevels} directly.
+   */
   supportsMax: boolean;
-  /** Exact thinking levels this model accepts, using Cortex's public names. */
+  /** Exact thinking levels this model accepts, strongest last. */
   supportedLevels: ThinkingLevel[];
 }
 

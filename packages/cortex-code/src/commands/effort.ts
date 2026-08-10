@@ -2,21 +2,29 @@ import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import type { Command } from './index.js';
 import { selectListTheme } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';
-import type { ThinkingLevel } from '@animus-labs/cortex';
+import { THINKING_LEVEL_ORDER, type ThinkingLevel } from '@animus-labs/cortex';
 
 const SEPARATOR_VALUE = '_separator';
 
-/** Thinking levels in display order: active levels first, then separator, then Off. */
-const THINKING_LEVELS: Array<{ value: ThinkingLevel; label: string; description: string }> = [
-  { value: 'minimal', label: 'Minimal', description: 'Lightest reasoning' },
-  { value: 'low', label: 'Low', description: 'Light reasoning' },
-  { value: 'medium', label: 'Medium', description: 'Balanced (default)' },
-  { value: 'high', label: 'High', description: 'Deep reasoning' },
-  { value: 'max', label: 'Max', description: 'Maximum reasoning depth' },
-];
+/**
+ * Display copy per level. Which of these the menu offers is decided by the
+ * MODEL, not by this table: a level appears only if the active model
+ * advertises it. Entries here that the model does not support are simply
+ * never rendered, so this can safely list levels no current model exposes.
+ */
+const LEVEL_COPY: Record<Exclude<ThinkingLevel, 'off'>, { label: string; description: string }> = {
+  minimal: { label: 'Minimal', description: 'Lightest reasoning' },
+  low: { label: 'Low', description: 'Light reasoning' },
+  medium: { label: 'Medium', description: 'Balanced (default)' },
+  high: { label: 'High', description: 'Deep reasoning' },
+  xhigh: { label: 'Very High', description: 'Extended reasoning' },
+  max: { label: 'Max', description: 'Maximum reasoning depth' },
+};
 
 const OFF_LEVEL = { value: 'off' as ThinkingLevel, label: 'Off', description: 'No extended thinking' };
-const THINKING_LEVEL_ORDER: ThinkingLevel[] = ['minimal', 'low', 'medium', 'high', 'max'];
+
+/** Active levels weakest-to-strongest, i.e. the canonical order minus 'off'. */
+const ACTIVE_LEVEL_ORDER: ThinkingLevel[] = THINKING_LEVEL_ORDER.filter(l => l !== 'off');
 
 export const effortCommand: Command = {
   name: 'effort',
@@ -37,12 +45,11 @@ export const effortCommand: Command = {
       return;
     }
 
-    // Build level list based on capabilities
+    // The model decides what is on the menu; this only orders and labels it.
     const supported = new Set(caps.supportedLevels);
-    const available = THINKING_LEVEL_ORDER
+    const available = ACTIVE_LEVEL_ORDER
       .filter(level => supported.has(level))
-      .map(level => THINKING_LEVELS.find(item => item.value === level)!)
-      .filter(Boolean);
+      .map(level => ({ value: level, ...LEVEL_COPY[level as Exclude<ThinkingLevel, 'off'>] }));
 
     const current = session.getEffectiveEffort();
 

@@ -81,6 +81,9 @@ export type {
   ToolCallEndPayload,
   PromptWatchdogDiagnosticsConfig,
 } from './types.js';
+// Value export: consumers building an effort picker need the canonical
+// ordering to sort or compare a model's supported levels.
+export { THINKING_LEVEL_ORDER } from './types.js';
 
 // Logger
 export { NOOP_LOGGER } from './noop-logger.js';

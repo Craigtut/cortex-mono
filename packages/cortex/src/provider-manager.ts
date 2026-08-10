@@ -22,6 +22,7 @@ import {
 import { createRequire } from 'node:module';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ThinkingLevel } from './types.js';
+import { THINKING_LEVEL_ORDER } from './types.js';
 import type { ProviderInfo, ModelInfo } from './provider-registry.js';
 import { wrapModel } from './model-wrapper.js';
 import { inferUtilityModelId } from './utility-model-inference.js';
@@ -843,19 +844,14 @@ const LEGACY_MODEL_PREFIXES: Record<string, string[]> = {
 // Model mapping helper
 // ---------------------------------------------------------------------------
 
-const CORTEX_THINKING_LEVELS: readonly ThinkingLevel[] = [
-  'off',
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'max',
-];
-
+/**
+ * Narrow a pi level name to Cortex's union. Identity apart from the
+ * membership check: Cortex's names are pi's names. This used to fold "xhigh"
+ * into "max", which made a model advertising both report a single top level.
+ */
 function mapPiThinkingLevel(level: string): ThinkingLevel | null {
-  const mapped = level === 'xhigh' ? 'max' : level;
-  return (CORTEX_THINKING_LEVELS as readonly string[]).includes(mapped)
-    ? mapped as ThinkingLevel
+  return (THINKING_LEVEL_ORDER as readonly string[]).includes(level)
+    ? (level as ThinkingLevel)
     : null;
 }
 

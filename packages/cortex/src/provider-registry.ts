@@ -11,6 +11,8 @@
  * Reference: provider-manager.md
  */
 
+import type { ThinkingLevel } from './types.js';
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -44,8 +46,11 @@ export interface ModelInfo {
   contextWindow: number;
   /** Whether the model supports extended thinking. */
   supportsThinking: boolean;
-  /** Thinking levels supported by this model, in Cortex's public naming. */
-  supportedThinkingLevels: Array<'off' | 'minimal' | 'low' | 'medium' | 'high' | 'max'>;
+  /**
+   * Thinking levels supported by THIS model, weakest first. Per-model, not a
+   * global set: read it rather than assuming a fixed ladder.
+   */
+  supportedThinkingLevels: ThinkingLevel[];
   /** Whether the model supports image input. */
   supportsImages: boolean;
   /** Pricing per million tokens (if available). */
