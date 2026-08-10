@@ -149,7 +149,7 @@ class SetupRenderer {
         const input = new Input();
         input.handleInput = (data: string) => {
           if (matchesKey(data, Key.enter)) {
-            const text = (input as unknown as { text: string }).text?.trim();
+            const text = input.getValue().trim();
             if (text) {
               this.apiKeyInput = text;
               const nextStep = this.flow.advance(text);
@@ -299,7 +299,7 @@ class SetupRenderer {
         const urlInput = new Input();
         urlInput.handleInput = (data: string) => {
           if (matchesKey(data, Key.enter)) {
-            const text = (urlInput as unknown as { text: string }).text?.trim();
+            const text = urlInput.getValue().trim();
             if (text) {
               this.customBaseUrl = text;
               // Base URL captured; collect the API key before validating.
@@ -401,7 +401,7 @@ class SetupRenderer {
     const input = new Input();
     input.handleInput = (data: string) => {
       if (matchesKey(data, Key.enter)) {
-        const text = (input as unknown as { text: string }).text?.trim() ?? '';
+        const text = input.getValue().trim();
         this.customApiKey = text.length > 0 ? text : null;
         this.flow.advance(text); // custom-entry -> custom-validation
         this.handleStep({
@@ -435,7 +435,7 @@ class SetupRenderer {
     const input = new Input();
     input.handleInput = (data: string) => {
       if (matchesKey(data, Key.enter)) {
-        const text = (input as unknown as { text: string }).text?.trim();
+        const text = input.getValue().trim();
         if (text) {
           // flow is at model-selection; advancing produces the complete result.
           this.handleStep(this.flow.advance(text));
@@ -496,7 +496,7 @@ class SetupRenderer {
     return new Promise<string>((resolve) => {
       input.handleInput = (data: string) => {
         if (matchesKey(data, Key.enter)) {
-          const text = (input as unknown as { text: string }).text?.trim() ?? '';
+          const text = input.getValue().trim();
           if (text || allowEmpty) {
             this.contentContainer.clear();
             this.contentContainer.addChild(loader);
