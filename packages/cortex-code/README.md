@@ -32,9 +32,32 @@ cortex --model claude-sonnet-4-20250514
 # Start in YOLO mode (bypass tool permissions)
 cortex --yolo
 
+# Run the talker/reasoner duplex agent for one session
+cortex --duplex
+
 # Skip the startup check for a newer version
 cortex --no-update-check
 ```
+
+## Agent Mode
+
+Cortex Code runs a single reasoner loop (`passthrough`) by default. The
+alternative, `duplex`, puts a fast talker model in front of a persistent
+reasoner so the session can answer a question or take a correction while the
+reasoner is still working, instead of queueing it behind the task.
+
+Passthrough is the default because a coding CLI streams the reasoner's tool
+calls live, so there is little dead air for a talker to fill, and duplex adds a
+second model between what you typed and the loop holding the tools. Opt in per
+session with `--duplex`, or for good with `"agentMode": "duplex"` in
+`~/.cortex/config.json`; `--no-duplex` overrides the config key for one
+session. `/status` names the mode in force, and the footer badges `duplex`
+while it is on.
+
+Duplex needs a distinct fast model to be worth anything. On a provider whose
+models cannot be enumerated (a custom endpoint, or Ollama) the talker falls
+back to the primary model, which delivers none of the benefit; that shows up as
+a `†` in the footer, with the reason under `/status`.
 
 ## Updates
 
