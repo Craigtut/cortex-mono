@@ -80,6 +80,27 @@ class SetupRenderer {
     } else {
       this.tui.setFocus(component);
     }
+    this.paint();
+  }
+
+  /**
+   * Schedule a repaint.
+   *
+   * Mutating a Container does not schedule one, and neither does setFocus:
+   * pi-tui repaints on keystrokes and on whatever component asks. Every step
+   * of this flow that lands from a promise (OAuth returning, a key validating,
+   * an endpoint answering) therefore paints nothing on its own, and the last
+   * frame a Loader animated stays on screen. That is how a completed OAuth
+   * login looked frozen on "Exchanging authorization code for tokens...": the
+   * model list was live and focused underneath it, one repaint away.
+   *
+   * So every method here that touches the container ends with this call,
+   * including the synchronous ones, where it is redundant but cheap: a
+   * requestRender that nothing needs coalesces into the frame the keystroke
+   * was already going to draw.
+   */
+  private paint(): void {
+    this.tui.requestRender();
   }
 
   private renderStep(step: SetupStep): void {
@@ -167,6 +188,7 @@ class SetupRenderer {
               this.contentContainer.clear();
               this.contentContainer.addChild(new Text(`  ${colors.success('\u2713')} Connected to ${provider}`, 0, 0));
               this.contentContainer.addChild(new Spacer(1));
+              this.paint();
 
               try {
                 const models = await this.providerManager.listModels(provider);
@@ -184,6 +206,7 @@ class SetupRenderer {
             } else {
               this.contentContainer.clear();
               this.contentContainer.addChild(new Text(`  ${colors.error('\u2717')} Invalid API key: ${result.message ?? 'validation failed'}`, 0, 0));
+              this.paint();
               setTimeout(() => {
                 this.flow.goBack();
                 this.renderStep(this.flow.goBack());
@@ -193,6 +216,7 @@ class SetupRenderer {
             loader.stop();
             this.contentContainer.clear();
             this.contentContainer.addChild(new Text(`  ${colors.error('\u2717')} Validation failed`, 0, 0));
+            this.paint();
             setTimeout(() => {
               this.flow.goBack();
               this.renderStep(this.flow.goBack());
@@ -238,6 +262,7 @@ class SetupRenderer {
           this.contentContainer.clear();
           this.contentContainer.addChild(new Text(`  ${colors.success('\u2713')} Signed in to ${provider}`, 0, 0));
           this.contentContainer.addChild(new Spacer(1));
+          this.paint();
 
           try {
             const models = await this.providerManager.listModels(provider);
@@ -259,6 +284,7 @@ class SetupRenderer {
             `  ${colors.error('\u2717')} OAuth failed: ${err instanceof Error ? err.message : String(err)}`,
             0, 0,
           ));
+          this.paint();
           setTimeout(() => {
             this.flow.goBack();
             this.renderStep(this.flow.goBack());
@@ -318,6 +344,7 @@ class SetupRenderer {
           this.contentContainer.clear();
           this.contentContainer.addChild(new Text(`  ${colors.success('\u2713')} Connected`, 0, 0));
           this.contentContainer.addChild(new Spacer(1));
+          this.paint();
 
           // Advance to model selection and populate it from the endpoint's
           // /models listing. If the endpoint advertises none, fall back to a
@@ -337,6 +364,7 @@ class SetupRenderer {
           loader.stop();
           this.contentContainer.clear();
           this.contentContainer.addChild(new Text(`  ${colors.error('\u2717')} Connection failed`, 0, 0));
+          this.paint();
           setTimeout(() => {
             this.flow.goBack();
             this.renderStep(this.flow.goBack());
@@ -389,7 +417,10 @@ class SetupRenderer {
       }
     };
     this.contentContainer.addChild(input);
-    this.tui.setFocus(input);
+    // Through focus(), not tui.setFocus(): in the overlay, focusing an inner
+    // child directly gets redirected back to the OverlayBox and the input is
+    // dropped. Same reason every other step in this flow uses focus().
+    this.focus(input);
   }
 
   /**
@@ -414,7 +445,7 @@ class SetupRenderer {
       }
     };
     this.contentContainer.addChild(input);
-    this.tui.setFocus(input);
+    this.focus(input);
   }
 
   /**
@@ -469,11 +500,13 @@ class SetupRenderer {
           if (text || allowEmpty) {
             this.contentContainer.clear();
             this.contentContainer.addChild(loader);
+            this.paint();
             resolve(text);
           }
         } else if (matchesKey(data, Key.escape)) {
           this.contentContainer.clear();
           this.contentContainer.addChild(loader);
+          this.paint();
           resolve('');
         } else {
           Input.prototype.handleInput.call(input, data);
@@ -502,11 +535,13 @@ class SetupRenderer {
       list.onSelect = (item) => {
         this.contentContainer.clear();
         this.contentContainer.addChild(loader);
+        this.paint();
         resolve(item.value);
       };
       list.onCancel = () => {
         this.contentContainer.clear();
         this.contentContainer.addChild(loader);
+        this.paint();
         resolve(undefined);
       };
     });
@@ -648,6 +683,9 @@ export async function runFirstRunSetup(
             `  ${colors.muted('You can add more providers later with /login')}`,
             `  ${colors.muted('You can switch models with /model')}`,
           ].join('\n'), 0, 0));
+          // Same reason as SetupRenderer.paint(): this lands from a promise,
+          // and nothing else schedules a frame once the step's loader stopped.
+          tui.requestRender();
 
           setTimeout(() => {
             tui.stop();
@@ -666,6 +704,7 @@ export async function runFirstRunSetup(
             `  ${colors.error('\u2717')} Failed to resolve model: ${err instanceof Error ? err.message : String(err)}`,
             0, 0,
           ));
+          tui.requestRender();
         }
       },
       () => {
