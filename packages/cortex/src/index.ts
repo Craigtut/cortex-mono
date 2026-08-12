@@ -100,6 +100,7 @@ export {
   extractWorkingContent,
   parseWorkingTags,
   WorkingTagStreamFilter,
+  INTERNAL_TAG_NAMES,
 } from './working-tags.js';
 
 // Error Classifier

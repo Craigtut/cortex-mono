@@ -11,25 +11,44 @@
  * - Unclosed <working> tag: all content after the opening tag is treated as working.
  * - Simple regex, not a full XML parser.
  *
+ * `<thinking>` is accepted as an alias everywhere `<working>` is: models with
+ * reasoning disabled routinely fall back to their trained scratchpad tag
+ * instead of the prompted one (observed on the duplex talker, which runs
+ * thinkingLevel 'off' and does its thinking in-band), and an unrecognized
+ * delimiter leaks the reasoning verbatim to the consumer. The alias list is
+ * deliberately short and explicit; stripping unknown XML generically would
+ * eat legitimate quoted content.
+ *
  * Reference: working-tags.md
  */
 
 import type { AgentTextOutput } from './types.js';
 
 /**
- * Regex pattern for matching working tag blocks.
- *
- * Matches <working>...</working> pairs (non-greedy) and captures the content.
- * The `s` flag makes `.` match newlines so working content can span multiple lines.
- * The `g` flag finds all blocks in the text.
+ * Tag names treated as internal-reasoning delimiters. `working` is the
+ * prompted contract; `thinking` is the trained-habit alias.
  */
-const WORKING_TAG_PATTERN = /<working>(.*?)<\/working>/gs;
+export const INTERNAL_TAG_NAMES = ['working', 'thinking'] as const;
+
+const TAG_ALTERNATION = INTERNAL_TAG_NAMES.join('|');
 
 /**
- * Pattern for detecting an unclosed <working> tag at the end of the text.
- * Captures everything after the last unclosed <working> tag.
+ * Regex pattern for matching internal-tag blocks.
+ *
+ * Matches <working>...</working> or <thinking>...</thinking> pairs
+ * (non-greedy, close must match open) and captures the content in group 2.
+ * The `s` flag makes `.` match newlines so content can span multiple lines.
+ * The `g` flag finds all blocks in the text.
  */
-const UNCLOSED_TAG_PATTERN = /<working>([\s\S]*)$/;
+const WORKING_TAG_PATTERN = new RegExp(`<(${TAG_ALTERNATION})>(.*?)</\\1>`, 'gs');
+
+/**
+ * Pattern for detecting an unclosed internal tag at the end of the text.
+ * Captures everything after the last unclosed opening tag. Applied after
+ * closed blocks are removed, so a mismatched pair (e.g. <working>...</thinking>)
+ * falls through to this rule and is treated as unclosed.
+ */
+const UNCLOSED_TAG_PATTERN = new RegExp(`<(?:${TAG_ALTERNATION})>([\\s\\S]*)$`);
 
 /**
  * Strip all <working> tag content from text, returning only user-facing content.
@@ -74,20 +93,30 @@ export function extractWorkingContent(text: string): string | null {
 
   let match: RegExpExecArray | null;
   while ((match = WORKING_TAG_PATTERN.exec(text)) !== null) {
-    const content = match[1];
+    const content = match[2];
     if (content !== undefined && content.trim().length > 0) {
       blocks.push(content.trim());
     }
   }
 
-  // Check for unclosed tag
-  // We need to check if there's an unclosed <working> AFTER the last closed block
-  const lastClosingIndex = text.lastIndexOf('</working>');
-  const lastOpeningIndex = text.lastIndexOf('<working>');
+  // Check for unclosed tag: an opening tag of any alias AFTER the last
+  // closing tag of any alias.
+  let lastOpeningIndex = -1;
+  let openingTagLength = 0;
+  let lastClosingIndex = -1;
+  for (const name of INTERNAL_TAG_NAMES) {
+    const openTag = `<${name}>`;
+    const openIdx = text.lastIndexOf(openTag);
+    if (openIdx > lastOpeningIndex) {
+      lastOpeningIndex = openIdx;
+      openingTagLength = openTag.length;
+    }
+    lastClosingIndex = Math.max(lastClosingIndex, text.lastIndexOf(`</${name}>`));
+  }
 
   if (lastOpeningIndex > lastClosingIndex) {
     // There is an unclosed tag after all closed blocks
-    const unclosedContent = text.slice(lastOpeningIndex + '<working>'.length);
+    const unclosedContent = text.slice(lastOpeningIndex + openingTagLength);
     if (unclosedContent.trim().length > 0) {
       blocks.push(unclosedContent.trim());
     }
@@ -121,8 +150,11 @@ export function parseWorkingTags(text: string): AgentTextOutput {
 // Streaming filter (voice-safe deltas)
 // ---------------------------------------------------------------------------
 
-const OPEN_TAG = '<working>';
-const CLOSE_TAG = '</working>';
+/** Open/close tag pairs the stream filter recognizes, one per alias. */
+const TAG_PAIRS = INTERNAL_TAG_NAMES.map((name) => ({
+  open: `<${name}>`,
+  close: `</${name}>`,
+}));
 
 /**
  * Streaming working-tag filter with holdback buffering, for the duplex
@@ -153,12 +185,15 @@ const CLOSE_TAG = '</working>';
 export class WorkingTagStreamFilter {
   private mode: 'text' | 'working' = 'text';
   /**
-   * Held text. In text mode: an ambiguous prefix of `<working>` starting at
-   * its `<`. In working mode: an ambiguous prefix of `</working>` (kept
-   * only for matching; never emitted unless the close completes... it never
-   * is: close-tag prefixes are suppressed content if they diverge).
+   * Held text. In text mode: an ambiguous prefix of an opening tag starting
+   * at its `<`. In working mode: an ambiguous prefix of the current block's
+   * close tag (kept only for matching; never emitted unless the close
+   * completes... it never is: close-tag prefixes are suppressed content if
+   * they diverge).
    */
   private hold = '';
+  /** Close tag of the block currently open (working mode only). */
+  private closeTag = '';
 
   /** Filter one raw delta; returns the text safe to emit now. */
   push(chunk: string): string {
@@ -175,33 +210,36 @@ export class WorkingTagStreamFilter {
         }
         out += input.slice(i, lt);
         const rest = input.slice(lt);
-        if (rest.startsWith(OPEN_TAG)) {
+        const opened = TAG_PAIRS.find((pair) => rest.startsWith(pair.open));
+        if (opened) {
           this.mode = 'working';
-          i = lt + OPEN_TAG.length;
+          // The close must match the alias that opened the block.
+          this.closeTag = opened.close;
+          i = lt + opened.open.length;
           continue;
         }
-        if (OPEN_TAG.startsWith(rest)) {
+        if (TAG_PAIRS.some((pair) => pair.open.startsWith(rest))) {
           // Ambiguous prefix at chunk end: hold until the next push or
           // flush decides.
           this.hold = rest;
           break;
         }
-        // Provably not the open tag: the '<' is literal text.
+        // Provably not an open tag: the '<' is literal text.
         out += '<';
         i = lt + 1;
       } else {
         const lt = input.indexOf('<', i);
         if (lt === -1) break; // all suppressed
         const rest = input.slice(lt);
-        if (rest.startsWith(CLOSE_TAG)) {
+        if (rest.startsWith(this.closeTag)) {
           this.mode = 'text';
           // The completed block collapses to one newline, matching
           // stripWorkingTags' sentinel, so surrounding words stay separated.
           out += '\n';
-          i = lt + CLOSE_TAG.length;
+          i = lt + this.closeTag.length;
           continue;
         }
-        if (CLOSE_TAG.startsWith(rest)) {
+        if (this.closeTag.startsWith(rest)) {
           this.hold = rest;
           break;
         }

@@ -292,6 +292,8 @@ These are the same functions Cortex uses internally for `AgentTextOutput` constr
 
 ### Parsing Rules
 
+- `<thinking>` is accepted as an alias of `<working>` everywhere: batch parser, stream filter, and turn-end output. Models running with API-level reasoning disabled (the duplex talker) routinely fall back to their trained scratchpad tag instead of the prompted one, and an unrecognized delimiter leaks the reasoning verbatim to the consumer. The alias list (`INTERNAL_TAG_NAMES`, exported) is deliberately short and explicit; unknown XML is never stripped generically because agents legitimately quote angle-bracketed content.
+- A close tag must match its open tag's alias. A crossed pair (`<working>...</thinking>`) falls through to the unclosed-tag rule.
 - Tags are flat delimiters: `<working>` opens, `</working>` closes. Nesting is not supported.
 - Multiple `<working>` blocks in a single turn are concatenated (separated by newlines) in the `working` property.
 - Whitespace between a closing `</working>` tag and subsequent user-facing text is normalized (collapsed to a single space or newline as appropriate).

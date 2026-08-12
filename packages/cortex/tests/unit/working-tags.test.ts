@@ -324,3 +324,91 @@ describe('WorkingTagStreamFilter', () => {
     expect(filter.flush()).toBe('');
   });
 });
+
+// ---------------------------------------------------------------------------
+// <thinking> alias: a reasoning-off model that falls back to its trained
+// scratchpad tag must be stripped everywhere <working> is (observed live on
+// the duplex talker, where the raw tags rendered verbatim in the TUI).
+// ---------------------------------------------------------------------------
+
+describe('thinking tag alias', () => {
+  it('stripWorkingTags removes a thinking block', () => {
+    const text = 'Hello! <thinking>The Glob tool is not available.</thinking> Delegating now.';
+    expect(stripWorkingTags(text)).toBe('Hello!\nDelegating now.');
+  });
+
+  it('stripWorkingTags removes mixed working and thinking blocks', () => {
+    const text =
+      '<thinking>first</thinking>Update. <working>second</working>Answer.';
+    expect(stripWorkingTags(text)).toBe('Update.\nAnswer.');
+  });
+
+  it('stripWorkingTags drops an unclosed thinking tag', () => {
+    const text = 'Answer. <thinking>cut off mid';
+    expect(stripWorkingTags(text)).toBe('Answer.');
+  });
+
+  it('stripWorkingTags treats a mismatched pair as unclosed', () => {
+    // The close must match the open; a crossed pair falls through to the
+    // unclosed rule and everything from the open tag is dropped.
+    const text = 'Answer. <working>leaked</thinking>';
+    expect(stripWorkingTags(text)).toBe('Answer.');
+  });
+
+  it('extractWorkingContent captures thinking content alongside working content', () => {
+    const text = '<thinking>alpha</thinking>Mid.<working>beta</working>';
+    expect(extractWorkingContent(text)).toBe('alpha\nbeta');
+  });
+
+  it('extractWorkingContent captures an unclosed thinking tail', () => {
+    const text = 'Visible. <thinking>trailing thought';
+    expect(extractWorkingContent(text)).toBe('trailing thought');
+  });
+
+  it('parseWorkingTags routes thinking content to working, not userFacing', () => {
+    const text = 'Hi. <thinking>internal</thinking> Done.';
+    const output = parseWorkingTags(text);
+    expect(output.userFacing).toBe('Hi.\nDone.');
+    expect(output.working).toBe('internal');
+    expect(output.raw).toBe(text);
+  });
+
+  it('stream filter suppresses a thinking block, including across chunk splits', () => {
+    const filter = new WorkingTagStreamFilter();
+    let out = '';
+    for (const chunk of ['Hi <thin', 'king>secret</thin', 'king>done']) {
+      out += filter.push(chunk);
+    }
+    out += filter.flush();
+    expect(out).toBe('Hi \ndone');
+    expect(out).not.toContain('secret');
+  });
+
+  it('stream filter is split-invariant for thinking blocks', () => {
+    const text = 'A <thinking>secret</thinking> B <working>secret</working> C';
+    const oneShot = (() => {
+      const f = new WorkingTagStreamFilter();
+      return f.push(text) + f.flush();
+    })();
+    for (let i = 0; i <= text.length; i++) {
+      const f = new WorkingTagStreamFilter();
+      const split = f.push(text.slice(0, i)) + f.push(text.slice(i)) + f.flush();
+      expect(split, `split at ${i}`).toBe(oneShot);
+      expect(split).not.toContain('secret');
+    }
+  });
+
+  it('stream filter keeps non-alias tags literal', () => {
+    const filter = new WorkingTagStreamFilter();
+    const out = filter.push('a <think>not an alias</think> b') + filter.flush();
+    expect(out).toBe('a <think>not an alias</think> b');
+  });
+
+  it('stream filter requires the close to match the open alias', () => {
+    // A crossed pair never closes the block: content stays suppressed and
+    // flush drops it, matching the batch parser's unclosed rule.
+    const filter = new WorkingTagStreamFilter();
+    const out = filter.push('ok <working>secret</thinking> tail') + filter.flush();
+    expect(out).toBe('ok ');
+  });
+});
