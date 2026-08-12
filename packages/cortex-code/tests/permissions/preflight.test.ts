@@ -579,3 +579,74 @@ describe('preflightPermission: sandbox denyRead projection onto Glob', () => {
     expect(out.decision).not.toBe('block');
   });
 });
+
+describe('preflightPermission: sandbox-broad read auto-approve', () => {
+  // Under full OS filesystem enforcement, reads align with what the sandboxed
+  // shell can already see: broad, minus denyRead. Without it, the workspace-
+  // only auto-approve is the conservative fallback (the pre-sandbox behavior).
+  const broadDeps = (overrides: Partial<PreflightDeps> = {}) =>
+    deps({ sandboxReadsBroad: true, ...overrides });
+
+  it('auto-approves Read, Grep, and Glob outside the workspace when reads are broad', async () => {
+    for (const [tool, args] of [
+      ['Read', { file_path: '/home/user/other-repo/CLAUDE.md' }],
+      ['Grep', { pattern: 'spawnBackgroundSubAgent', path: '/home/user/other-repo' }],
+      ['Glob', { pattern: '*.md', path: '/home/user/other-repo' }],
+    ] as const) {
+      const out = await preflightPermission(tool, args, broadDeps());
+      expect(out.decision, tool).toBe('allow');
+    }
+  });
+
+  it('still prompts for the same reads when the sandbox is off or partial', async () => {
+    for (const [tool, args] of [
+      ['Read', { file_path: '/home/user/other-repo/CLAUDE.md' }],
+      ['Grep', { pattern: 'x', path: '/home/user/other-repo' }],
+      ['Glob', { pattern: '*.md', path: '/home/user/other-repo' }],
+    ] as const) {
+      const out = await preflightPermission(tool, args, deps());
+      expect(out.decision, tool).toBe('prompt');
+    }
+  });
+
+  it('an explicit deny rule beats the broad read auto-approve', async () => {
+    const out = await preflightPermission(
+      'Grep',
+      { pattern: 'x', path: '/home/user/other-repo' },
+      broadDeps({ matchRule: async () => 'deny' }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('denyRead still blocks a broad Read before the auto-approve is reached', async () => {
+    const out = await preflightPermission(
+      'Read',
+      { file_path: '/home/user/.ssh/id_ed25519' },
+      broadDeps({ sandboxDenyRead: ['/home/user/.ssh'] }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('denyRead still blocks a broad Glob rooted under a protected directory', async () => {
+    const out = await preflightPermission(
+      'Glob',
+      { pattern: '*', path: '/home/user/.ssh' },
+      broadDeps({ sandboxDenyRead: ['/home/user/.ssh'] }),
+    );
+    expect(out.decision).toBe('block');
+  });
+
+  it('never widens the write tools: an out-of-root Edit still prompts', async () => {
+    const out = await preflightPermission(
+      'Edit',
+      { file_path: '/home/user/other-repo/file.ts' },
+      broadDeps({ sandboxWritableRoots: ['/workspace'] }),
+    );
+    expect(out.decision).toBe('prompt');
+  });
+
+  it('does not widen tools outside the read set', async () => {
+    const out = await preflightPermission('TaskOutput', { taskId: 't1' }, broadDeps());
+    expect(out.decision).toBe('prompt');
+  });
+});

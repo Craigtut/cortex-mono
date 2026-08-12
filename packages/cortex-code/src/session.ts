@@ -1885,6 +1885,16 @@ export class Session {
       sandboxBashEnforced:
         this.sandboxStatus?.filesystem === 'enforced' &&
         this.sandboxStatus?.network === 'enforced',
+      // Broad read auto-approve for Read/Grep/Glob, matching the sandboxed
+      // shell's view: reads are broad by policy design, denyRead is the only
+      // read-side restriction. Requires FULL filesystem enforcement, not
+      // partial: Windows Tier 1 cannot deny secret-file reads to
+      // subprocesses, and Grep's denyRead guarantee is the kernel containing
+      // ripgrep. Network enforcement is irrelevant to reads, so this is
+      // deliberately looser than sandboxBashEnforced's both-axes gate.
+      sandboxReadsBroad:
+        this.sandboxStatus?.filesystem === 'enforced' &&
+        this.sandboxPolicy !== undefined,
       // With an active sandbox policy, WebFetch is gated per host by the same
       // network decision as shell egress; that gate replaces the per-call tool
       // prompt. Purely policy-level, so it applies even where OS enforcement

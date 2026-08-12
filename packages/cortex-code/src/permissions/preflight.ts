@@ -56,6 +56,19 @@ export interface PreflightDeps {
    * sandbox is off, leaving in-process write behavior unchanged.
    */
   sandboxWritableRoots?: readonly string[];
+  /**
+   * True when the OS sandbox FULLY enforces filesystem containment
+   * (`status.filesystem === 'enforced'`) and a policy is active. Reads are
+   * then broad by design (sandboxing.md: "read broadly, write workspace"):
+   * the policy's denyRead is the only read-side restriction, enforced
+   * in-process for Read/Glob (1c) and by the kernel for Grep's ripgrep. So
+   * the read-only tools auto-approve ANYWHERE, matching what the sandboxed
+   * shell can already see, instead of only inside the workspace. False or
+   * absent (sandbox off, or a partial backend like Windows Tier 1 that
+   * cannot deny secret reads to subprocesses) keeps the conservative
+   * workspace-only auto-approve.
+   */
+  sandboxReadsBroad?: boolean;
 }
 
 const IN_PROCESS_WRITE_TOOLS = new Set(['Write', 'Edit', 'UndoEdit']);
@@ -63,6 +76,12 @@ const IN_PROCESS_WRITE_TOOLS = new Set(['Write', 'Edit', 'UndoEdit']);
 const IN_PROCESS_READ_TOOLS = new Set(['Read', 'Edit']);
 /** Glob enumerates filenames under a directory in-process (no subprocess). */
 const IN_PROCESS_LIST_TOOLS = new Set(['Glob']);
+/**
+ * The read-only tools eligible for the sandbox-broad auto-approve (4). Edit
+ * is excluded despite being on the read list: it writes, and the write
+ * floors govern it.
+ */
+const SANDBOX_BROAD_READ_TOOLS = new Set(['Read', 'Grep', 'Glob']);
 
 /** Realpath a path if it exists, else return it unchanged (never throws). */
 function canonSync(p: string): string {
@@ -260,7 +279,8 @@ function sandboxPolicyFileDenial(
  *   2. Yolo mode                  -> allow
  *   3. Explicit deny rule         -> block   (beats the read-only auto-approve)
  *   3b. Sandboxed Bash            -> allow   (the OS boundary is the control)
- *   4. Read-only within project   -> allow
+ *   4. Read-only tool             -> allow   (anywhere under full sandbox enforcement,
+ *                                             minus denyRead; else within project only)
  *   5. Explicit allow rule        -> allow
  *   6. Otherwise                  -> prompt
  *
@@ -360,7 +380,18 @@ export async function preflightPermission(
   //     and the tool call itself auto-runs.
   if (deps.webFetchNetworkGated && toolName === 'WebFetch') return { decision: 'allow' };
 
-  // 4. Read-only tools contained in the workspace auto-approve.
+  // 4. Read-only tools auto-approve. Under full OS filesystem enforcement the
+  //    policy is the read control: reads are broad by design ("read broadly,
+  //    write workspace"), with denyRead the only read-side restriction,
+  //    already applied in-process above (1c) for Read/Glob and by the kernel
+  //    for Grep's sandboxed ripgrep. So reads run without a prompt anywhere
+  //    the shell could already look, instead of Bash silently listing a
+  //    sibling repo while Grep on the same directory prompts per call. Deny
+  //    rules still win (3). Without that enforcement, only reads contained
+  //    in the workspace auto-approve, exactly as before.
+  if (deps.sandboxReadsBroad && SANDBOX_BROAD_READ_TOOLS.has(toolName)) {
+    return { decision: 'allow' };
+  }
   if (await deps.isReadOnlyInProject(toolName, toolArgs)) return { decision: 'allow' };
 
   // 5. Explicit allow rule.
