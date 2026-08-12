@@ -19,6 +19,7 @@ import {
   CortexAgent,
   ProviderManager,
   BASH_ESCALATION_PERMISSION_NAME,
+  INTERNAL_TAG_NAMES,
   type CortexModel,
   type CortexAgentConfig,
   type CortexAgentStateV1,
@@ -2811,15 +2812,28 @@ export class Session {
     wasOpen: boolean,
     setOpen: (open: boolean) => void,
   ): void {
-    const lastOpenIdx = rawText.lastIndexOf('<working>');
-    const lastCloseIdx = rawText.lastIndexOf('</working>');
+    // Scan every internal-tag alias (<working>, <thinking>, ...) so a model
+    // that drifted to its trained scratchpad tag still feeds the spinner
+    // subtitle instead of silently vanishing from it.
+    let lastOpenIdx = -1;
+    let openTagLen = 0;
+    let lastCloseIdx = -1;
+    for (const name of INTERNAL_TAG_NAMES) {
+      const openTag = `<${name}>`;
+      const openIdx = rawText.lastIndexOf(openTag);
+      if (openIdx > lastOpenIdx) {
+        lastOpenIdx = openIdx;
+        openTagLen = openTag.length;
+      }
+      lastCloseIdx = Math.max(lastCloseIdx, rawText.lastIndexOf(`</${name}>`));
+    }
 
     if (lastOpenIdx > lastCloseIdx) {
       // Inside an unclosed working tag (streaming)
       setOpen(true);
     } else if (wasOpen && lastCloseIdx >= lastOpenIdx) {
       // Working tag just closed: extract content and enqueue for display
-      const content = rawText.slice(lastOpenIdx + '<working>'.length, lastCloseIdx).trim();
+      const content = rawText.slice(lastOpenIdx + openTagLen, lastCloseIdx).trim();
       if (content) {
         this.app!.enqueueWorkingTagText(content);
       }
