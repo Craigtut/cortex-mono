@@ -324,6 +324,17 @@ describe('duplex config builders', () => {
     expect(talker.resolveNetworkAccess).toBeUndefined();
   });
 
+  it('tells the talker explicitly which tools it does not have', () => {
+    // A fast-tier model with the standard toolset baked into its habits
+    // tried Glob and Bash live and narrated the failures; the role prompt
+    // states the negative, and that wanting such a tool means delegate.
+    expect(TALKER_ROLE_PROMPT).toContain('Your ONLY tools are the control tools');
+    for (const name of ['Read', 'Glob', 'Grep', 'Bash', 'Edit', 'Write', 'WebFetch'] as const) {
+      expect(TALKER_ROLE_PROMPT).toContain(name);
+    }
+    expect(TALKER_ROLE_PROMPT).toContain('never tell the user a tool is unavailable');
+  });
+
   it('never routes consumer tools, sub-agent config, or MCP surface to the talker', () => {
     const talker = buildTalkerConfig(baseConfig, testModel()) as Record<string, unknown>;
     expect(talker['tools']).toBeUndefined();
