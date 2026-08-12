@@ -46,6 +46,8 @@ const agent = await CortexAgent.create({
 
 `sandbox` and `envOverrides` are shared config: every loop and every sub-agent the facade builds runs inside the same box. `resolvePermission` and `resolveNetworkAccess` route through the facade's permission broker in duplex mode, so an `ask` is voiced to the user in conversation rather than blocking a loop; your callback's contract is unchanged, and `allow` and `deny` decisions pass straight through.
 
+Your resolver never sees Cortex's internal orchestration tools (`Deliver`, `SteerSubAgent`, the talker's control tools, `SubAgent`, `recall`, `load_skill`, `ToolSearch`): they carry `permissionExempt` on the tool contract and the gate skips the resolver for them. Do not add rules for these names; there is nothing to approve. You may set `permissionExempt: true` on your own tools when they are equally internal (pure in-process dispatches), never on anything that touches files, network, or processes.
+
 ## The framework API surface
 
 From `@animus-labs/cortex`:

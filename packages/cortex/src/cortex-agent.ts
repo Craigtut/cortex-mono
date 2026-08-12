@@ -943,6 +943,9 @@ export const AGENT_LOOP_DELEGATION = {
   // Withheld: context-composition internals; the hook is wiring between the
   // loop and pi, not a consumer surface.
   getTransformContextHook: 'withheld',
+  // Withheld: permission-gate internal (which registered tools bypass the
+  // resolver); per-loop by construction, meaningless as a composite value.
+  isToolPermissionExempt: 'withheld',
   // Callback registration.
   onLoopComplete: 'forwarded',
   onError: 'forwarded',

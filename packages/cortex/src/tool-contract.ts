@@ -40,6 +40,28 @@ export interface CortexTool<TParams = unknown, TResult = unknown> {
   isMcp?: boolean;
 
   /**
+   * Exempts this tool from the consumer permission gate: `beforeToolCall`
+   * never consults `resolvePermission` for it.
+   *
+   * This is the marker for Cortex-internal orchestration tools, calls that
+   * dispatch inside the process and have no side effects a consumer could
+   * meaningfully gate: SubAgent, the duplex Deliver/SteerSubAgent pair, the
+   * talker's control tools, recall, load_skill, ToolSearch. Gating one of
+   * these asks the user for permission to run Cortex's own plumbing (a live
+   * defect: a reasoner's Deliver was prompted as "Permission Required",
+   * blocking the delivery of the very answer being asked about).
+   *
+   * Consumers may set it on their own tools when a tool is equally internal
+   * (a pure in-process dispatch with nothing to approve). Never set it on a
+   * tool that touches files, network, processes, or anything else a user
+   * would expect a say over.
+   *
+   * Ignored for MCP tools: the exemption lookup refuses `isMcp` tools, so a
+   * remote server cannot self-exempt by declaring the field.
+   */
+  permissionExempt?: boolean;
+
+  /**
    * Optional pi-agent-core execution hint. Use "sequential" for tools that
    * must update shared agent state before later tool calls in the same batch.
    */

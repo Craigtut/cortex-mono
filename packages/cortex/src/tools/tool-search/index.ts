@@ -88,6 +88,9 @@ export function createToolSearchTool(
     ].join('\n'),
     parameters: ToolSearchParams,
     alwaysLoad: true, // ToolSearch itself must never be deferred
+    // Schema discovery over the loop's own registry; the loaded tools'
+    // actual calls remain individually gated.
+    permissionExempt: true,
     executionMode: 'sequential',
     async execute(params): Promise<ToolContentDetails<ToolSearchDetails>> {
       const max = params.max_results ?? DEFAULT_MAX_RESULTS;

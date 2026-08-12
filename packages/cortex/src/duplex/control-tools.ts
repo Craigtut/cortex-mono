@@ -222,5 +222,11 @@ export function buildControlTools(router: ControlDispatchTarget): CortexTool[] {
     },
   };
 
-  return [spawnTask, steerTask, cancelTask, quickLookup, answerAsk];
+  // Every control tool is a sub-millisecond local dispatch into the facade
+  // router. The talker is built without a resolver today, but the class is
+  // marked anyway so a future resolver-bearing loop can never gate them
+  // (communication.md: asserted in tests).
+  return [spawnTask, steerTask, cancelTask, quickLookup, answerAsk].map(
+    (tool) => ({ ...tool, permissionExempt: true }),
+  );
 }

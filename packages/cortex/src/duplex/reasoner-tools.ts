@@ -41,6 +41,9 @@ const WAKE_VALUES: ReadonlySet<string> = new Set(['interrupt', 'when_idle', 'sil
 export function buildDeliverTool(router: DeliveryTarget): CortexTool {
   return {
     name: 'Deliver',
+    // An in-process dispatch into the router; gating it asks the user for
+    // permission to receive their own answer.
+    permissionExempt: true,
     description:
       'Deliver content to the user through the conversation surface. wake: ' +
       "'interrupt' only for things the user must hear now, 'when_idle' for " +
@@ -92,6 +95,9 @@ export interface SubAgentSteerTarget {
 export function buildSteerSubAgentTool(loop: SubAgentSteerTarget): CortexTool {
   return {
     name: 'SteerSubAgent',
+    // Queues a message into a child this loop already owns; internal
+    // orchestration, nothing for a consumer to approve.
+    permissionExempt: true,
     description:
       'Redirect a running sub-agent without cancelling it. The message is ' +
       "queued into the sub-agent's run and lands at its next turn boundary. " +

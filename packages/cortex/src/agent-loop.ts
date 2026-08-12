@@ -3185,6 +3185,14 @@ export class AgentLoop {
         // Spawning a sub-agent is an internal orchestration decision, not a
         // side-effecting operation. Always allow without prompting.
         if (toolCall.name === SUB_AGENT_TOOL_NAME) return undefined;
+        // Cortex-internal orchestration tools (permissionExempt on the
+        // registered tool) never consult the consumer's resolver: prompting
+        // a user to approve Deliver or recall is asking permission to run
+        // Cortex's own plumbing. The flag is read off the loop's registry,
+        // never off the call, and MCP tools are refused inside the lookup.
+        if (cacheBreakpointState.agentLoop?.isToolPermissionExempt(toolCall.name)) {
+          return undefined;
+        }
         // An already-aborted run never consults the resolver: pi only checks
         // the signal AFTER this hook, and a consumer prompt for a dead run
         // would flash pointlessly.
@@ -4107,6 +4115,21 @@ export class AgentLoop {
     this.currentPiTools = allTools;
     (this.agent.state as Record<string, unknown>)['tools'] = allTools;
     this.refreshPromptState();
+  }
+
+  /**
+   * Whether a tool call by this name skips the consumer permission gate.
+   *
+   * True only when the REGISTERED tool carries `permissionExempt` and is not
+   * an MCP wrapper (a remote server must not self-exempt by declaring the
+   * field), plus the legacy SubAgent name check. Exemption is a property of
+   * the tool object this loop registered, never of the call: an unknown
+   * name, or the same name arriving via MCP, still goes to the resolver.
+   */
+  isToolPermissionExempt(toolName: string): boolean {
+    if (toolName === SUB_AGENT_TOOL_NAME) return true;
+    const tool = this.registeredTools.find((t) => t.name === toolName);
+    return tool !== undefined && tool.permissionExempt === true && tool.isMcp !== true;
   }
 
   /**

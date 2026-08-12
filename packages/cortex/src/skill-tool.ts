@@ -68,10 +68,14 @@ export function createLoadSkillTool(config: LoadSkillToolConfig): {
   name: string;
   description: string;
   parameters: typeof LoadSkillParams;
+  permissionExempt: true;
   execute: (args: unknown) => Promise<unknown>;
 } {
   return {
     name: LOAD_SKILL_TOOL_NAME,
+    // Loads consumer-registered skill content into context; progressive
+    // disclosure is internal orchestration, not a gateable side effect.
+    permissionExempt: true,
 
     description: `Load a skill's full instructions into your active context. Call this tool when you need detailed guidance for a specific task. The skill's instructions will be available in your context for the remainder of this loop.
 

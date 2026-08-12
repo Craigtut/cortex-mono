@@ -98,6 +98,9 @@ export function createRecallTool(recallConfig: RecallConfig): CortexTool<{
 }, string> {
   return {
     name: 'recall',
+    // Reads this loop's own in-memory conversation archive; internal to
+    // observational memory, nothing for a consumer to approve.
+    permissionExempt: true,
     description:
       'Search through past conversation history for specific details. ' +
       'Use when your observations mention something but lack the detail needed, ' +

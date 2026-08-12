@@ -129,10 +129,15 @@ export function createSubAgentTool(config: SubAgentToolConfig): {
   name: string;
   description: string;
   parameters: typeof SubAgentParams;
+  permissionExempt: true;
   execute: (args: unknown) => Promise<unknown>;
 } {
   return {
     name: SUB_AGENT_TOOL_NAME,
+    // Internal orchestration: the child's own tool calls are still gated
+    // individually. beforeToolCall also has a legacy name check for this
+    // tool; the flag makes the classification visible on the tool itself.
+    permissionExempt: true,
     description: `Spawn a sub-agent to handle a delegated task independently. Use for tasks that are complex, long-running, or can proceed in parallel with your main work.
 
 Foreground mode (default): Blocks until the sub-agent completes and returns its result directly. Use for quick, focused tasks where you need the result to continue.
