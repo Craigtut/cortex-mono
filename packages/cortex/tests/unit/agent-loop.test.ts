@@ -8,6 +8,7 @@ import type { CortexModel } from '../../src/model-wrapper.js';
 import { DEFAULT_TOOL_THRESHOLDS, MAX_RESULT_TOKENS } from '../../src/tool-result-persistence.js';
 import { fromPiAgentTool } from '../../src/tool-contract.js';
 import type { CortexTool } from '../../src/tool-contract.js';
+import { TOOL_NAMES } from '../../src/tools/index.js';
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent factory
@@ -660,6 +661,80 @@ describe('AgentLoop', () => {
       const prompt = agent.composeSystemPrompt('Consumer');
 
       expect(prompt).toContain('# Executing with Care');
+    });
+
+    // Tool-aware sections: a prompt naming an absent tool is an instruction
+    // to hallucinate it (the duplex talker followed "use Glob" straight into
+    // an unknown-tool error narrated to the user).
+
+    it('omits Tool Usage and Executing with Care when every built-in tool is disabled', () => {
+      const agent = createTestAgentLoop(
+        piAgent,
+        { ...config, disableTools: Object.values(TOOL_NAMES) },
+        undefined,
+        { enableSubAgentTool: false, enableLoadSkillTool: false },
+      );
+      const prompt = agent.composeSystemPrompt('Consumer');
+
+      expect(prompt).not.toContain('# Tool Usage');
+      expect(prompt).not.toContain('# Executing with Care');
+      expect(prompt).not.toContain('use Glob');
+      expect(prompt).not.toContain('use Bash');
+      expect(prompt).not.toContain('[tool_use:');
+      // Section names disappear from the inspector surface too.
+      const names = agent.getSystemPromptSections().map(s => s.name);
+      expect(names).not.toContain('Tool Usage');
+      expect(names).not.toContain('Executing with Care');
+    });
+
+    it('drops file-handling guidance when the loop cannot mutate files', () => {
+      const agent = createTestAgentLoop(
+        piAgent,
+        { ...config, disableTools: Object.values(TOOL_NAMES) },
+        undefined,
+        { enableSubAgentTool: false, enableLoadSkillTool: false },
+      );
+      const prompt = agent.composeSystemPrompt('Consumer');
+
+      expect(prompt).toContain('# Taking Action');
+      expect(prompt).not.toContain('Do not create files unless necessary');
+      expect(prompt).not.toContain('Do not modify files you haven\'t read');
+    });
+
+    it('names only registered tools in the Tool Usage bullets', () => {
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        disableTools: [TOOL_NAMES.Glob, TOOL_NAMES.WebFetch],
+      });
+      const prompt = agent.composeSystemPrompt('Consumer');
+
+      expect(prompt).toContain('# Tool Usage');
+      expect(prompt).toContain('To read files: use Read');
+      expect(prompt).not.toContain('To find files by name: use Glob');
+      expect(prompt).not.toContain('To fetch web content: use WebFetch');
+    });
+
+    it('drops the Bash redirection list when Bash is disabled', () => {
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        disableTools: [TOOL_NAMES.Bash],
+      });
+      const prompt = agent.composeSystemPrompt('Consumer');
+
+      expect(prompt).toContain('# Tool Usage');
+      expect(prompt).not.toContain('Do NOT use Bash');
+    });
+
+    it('drops the same-file serialization bullet when Edit and Write are disabled', () => {
+      const agent = createTestAgentLoop(piAgent, {
+        ...config,
+        disableTools: [TOOL_NAMES.Edit, TOOL_NAMES.Write, TOOL_NAMES.UndoEdit],
+      });
+      const prompt = agent.composeSystemPrompt('Consumer');
+
+      expect(prompt).not.toContain('Multiple Edit or Write calls');
+      // Still capable of file mutation elsewhere? No: file bullets go too.
+      expect(prompt).not.toContain('Do not create files unless necessary');
     });
 
     it('includes Environment section with platform info', () => {

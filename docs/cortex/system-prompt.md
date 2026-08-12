@@ -92,7 +92,7 @@ How the agent should handle system-level concerns.
 
 ### Section 3: Taking Action
 
-General principles for how the agent should approach work.
+General principles for how the agent should approach work. The two file-handling bullets at the end appear only when the loop has a file-mutating tool (Write or Edit) registered.
 
 ```
 # Taking Action
@@ -112,7 +112,11 @@ General principles for how the agent should approach work.
 
 ### Section 4: Tool Usage
 
-Static guidance about preferring dedicated tools over shell commands and keeping tool-use turns free of narration.
+Guidance about preferring dedicated tools over shell commands and keeping tool-use turns free of narration.
+
+This section is toolset-aware, not static. It is composed from the tools the loop actually has registered: the per-tool bullets name only registered tools, the Bash redirection list appears only when Bash is present, and the same-file serialization bullet only when Edit or Write is. When the loop has no built-in tools at all (the duplex talker), the whole section is omitted, along with Executing with Care. A prompt that names an absent tool is an instruction to hallucinate it: the talker followed a static "use Glob" into an unknown-tool error and narrated the failure to the user. The prompt recomposes whenever the toolset changes at runtime.
+
+The full section, as a loop with every built-in tool sees it:
 
 ```
 # Tool Usage
