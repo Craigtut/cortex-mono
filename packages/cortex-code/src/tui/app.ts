@@ -1,5 +1,6 @@
 import {
-  TUI,
+  TuiMainScreen,
+  type TUI,
   ProcessTerminal,
   Container,
   Spacer,
@@ -51,7 +52,7 @@ export class App {
     this.cwd = cwd;
     this.diagnostics = diagnostics;
     this.terminal = new ProcessTerminal();
-    this.tui = new TUI(this.terminal);
+    this.tui = new TuiMainScreen(this.terminal);
 
     // Suppress cursor positioning globally. pi-tui's positionHardwareCursor()
     // moves the terminal cursor to the focused editor on every render cycle
@@ -266,9 +267,15 @@ export class App {
   private patchRenderScheduler(): void {
     const tui = this.tui as unknown as Record<string, unknown>;
     const doRender = tui['doRender'];
-    if (typeof doRender !== 'function') return;
+    if (typeof doRender !== 'function') {
+      // Loud, because the failure is invisible otherwise: rendering keeps
+      // working through pi's own scheduler and only the yield behaviour,
+      // freeze diagnostics and redraw recovery quietly disappear.
+      log.warn('[TUI] pi-tui has no doRender; render scheduler patch not installed');
+      return;
+    }
 
-    tui['requestRender'] = (force = false) => {
+    const scheduleRender = (force = false): void => {
       this.diagnostics?.recordRenderRequested(force);
       if (force) {
         tui['previousLines'] = [];
@@ -327,6 +334,18 @@ export class App {
         }
       });
     };
+
+    tui['requestRender'] = scheduleRender;
+
+    // pi-tui 0.84 split the latency-sensitive keystroke path onto its own
+    // entry point (tui.js: handleInput -> requestImmediateRender), so patching
+    // only requestRender silently stops covering typing: the setImmediate
+    // yield this patch exists to provide reverts to pi's process.nextTick,
+    // freeze diagnostics stop counting those frames, and the forced-redraw
+    // recovery no longer wraps them. Route both names at the same scheduler.
+    if (typeof tui['requestImmediateRender'] === 'function') {
+      tui['requestImmediateRender'] = scheduleRender;
+    }
   }
 
   private resetRenderState(tui: Record<string, unknown>): void {

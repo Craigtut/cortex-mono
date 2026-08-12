@@ -29,6 +29,9 @@ vi.mock('@earendil-works/pi-ai', () => ({
 vi.mock('@earendil-works/pi-ai/providers/all', () => ({
   getBuiltinModel: (...args: unknown[]) => mockGetModel(...args),
   getBuiltinModels: (...args: unknown[]) => mockGetModels(...args),
+  // OAuth moved here: pi dropped its global registry entrypoint in favour of
+  // a per-provider auth.oauth on the builtin provider list.
+  builtinProviders: () => mockBuiltinProviders(),
 }));
 
 vi.mock('@earendil-works/pi-ai/compat', () => ({
@@ -36,32 +39,33 @@ vi.mock('@earendil-works/pi-ai/compat', () => ({
   completeSimple: (...args: unknown[]) => mockCompleteSimple(...args),
 }));
 
-// Mock pi-ai/oauth module
+// Mock pi's per-provider OAuth (formerly the pi-ai/oauth registry).
 const mockLoginAnthropic = vi.fn();
 const mockLoginCodex = vi.fn();
-const mockGetOAuthApiKey = vi.fn();
-const mockGetOAuthProvider = vi.fn((provider: string) => {
-  if (provider === 'anthropic') {
-    return { id: provider, name: 'Anthropic', login: mockLoginAnthropic };
-  }
-  if (provider === 'openai-codex') {
-    return { id: provider, name: 'OpenAI Codex', login: mockLoginCodex };
-  }
-  if (provider === 'github-copilot') {
-    return { id: provider, name: 'GitHub Copilot', login: vi.fn() };
-  }
-  return undefined;
-});
+const mockRefresh = vi.fn(async (cred: Record<string, unknown>) => cred);
+const mockToAuth = vi.fn(async (cred: Record<string, unknown>) => ({ apiKey: cred['access'] as string }));
 
-vi.mock('@earendil-works/pi-ai/oauth', () => ({
-  getOAuthProvider: (...args: unknown[]) => mockGetOAuthProvider(...args),
-  getOAuthProviders: () => [
-    { id: 'anthropic', name: 'Anthropic', login: mockLoginAnthropic },
-    { id: 'openai-codex', name: 'OpenAI Codex', login: mockLoginCodex },
-    { id: 'github-copilot', name: 'GitHub Copilot', login: vi.fn() },
-  ],
-  getOAuthApiKey: (...args: unknown[]) => mockGetOAuthApiKey(...args),
-}));
+function oauthProvider(id: string, name: string, login: unknown) {
+  return {
+    id,
+    name,
+    auth: {
+      oauth: {
+        name,
+        login,
+        refresh: (...args: unknown[]) => mockRefresh(...(args as [Record<string, unknown>])),
+        toAuth: (...args: unknown[]) => mockToAuth(...(args as [Record<string, unknown>])),
+      },
+    },
+  };
+}
+
+const mockBuiltinProviders = vi.fn(() => [
+  oauthProvider('anthropic', 'Anthropic', mockLoginAnthropic),
+  oauthProvider('openai-codex', 'OpenAI Codex', mockLoginCodex),
+  oauthProvider('github-copilot', 'GitHub Copilot', vi.fn()),
+  { id: 'openai', name: 'OpenAI', auth: {} },
+]);
 
 const PI_OAUTH_SUCCESS_HTML = `<!doctype html>
 <html lang="en">
@@ -303,7 +307,7 @@ describe('ProviderManager', () => {
 
       const result = await pm.initiateOAuth('anthropic', callbacks);
 
-      expect(mockGetOAuthProvider).toHaveBeenCalledWith('anthropic');
+      expect(mockBuiltinProviders).toHaveBeenCalled();
       expect(mockLoginAnthropic).toHaveBeenCalledTimes(1);
       expect(typeof result.credentials).toBe('string');
       expect(result.meta.provider).toBe('anthropic');
@@ -312,7 +316,10 @@ describe('ProviderManager', () => {
       expect(result.meta.expiresAt).toBeDefined();
     });
 
-    it('passes normalized callbacks and signal to the login function', async () => {
+    it('passes a single interaction object with signal, prompt and notify', async () => {
+      // pi replaced the callbacks bag with one AuthInteraction. Cortex adapts
+      // its own OAuthCallbacks onto it, so consumers see no change and pi
+      // sees exactly the three members it documents.
       mockLoginAnthropic.mockResolvedValue({});
 
       const callbacks = {
@@ -325,19 +332,82 @@ describe('ProviderManager', () => {
 
       await pm.initiateOAuth('anthropic', callbacks);
 
-      const callArgs = mockLoginAnthropic.mock.calls[0][0] as Record<string, unknown>;
-      expect(callArgs['onAuth']).not.toBe(callbacks.onAuth);
-      expect(callArgs['onPrompt']).not.toBe(callbacks.onPrompt);
-      expect(callArgs['onProgress']).toBe(callbacks.onProgress);
-      expect(callArgs['onManualCodeInput']).toBe(callbacks.onManualCodeInput);
-      expect(callArgs['onSelect']).toBe(callbacks.onSelect);
-      expect(callArgs['signal']).toBeInstanceOf(AbortSignal);
-      expect(callArgs['renderCallbackPage']).toBeUndefined();
+      const interaction = mockLoginAnthropic.mock.calls[0][0] as Record<string, unknown>;
+      expect(Object.keys(interaction).sort()).toEqual(['notify', 'prompt', 'signal']);
+      expect(interaction['signal']).toBeInstanceOf(AbortSignal);
+      expect(typeof interaction['prompt']).toBe('function');
+      expect(typeof interaction['notify']).toBe('function');
+      // Adapters, not the consumer's functions handed through raw.
+      expect(interaction['prompt']).not.toBe(callbacks.onPrompt);
+      expect(interaction['notify']).not.toBe(callbacks.onProgress);
+    });
+
+    it('routes a progress event to onProgress', async () => {
+      mockLoginAnthropic.mockImplementation(async (interaction) => {
+        interaction.notify({ type: 'progress', message: 'Exchanging code...' });
+        return {};
+      });
+      const onProgress = vi.fn();
+
+      await pm.initiateOAuth('anthropic', { onAuth: vi.fn(), onPrompt: vi.fn(), onProgress });
+
+      expect(onProgress).toHaveBeenCalledWith('Exchanging code...');
+    });
+
+    it('routes a select prompt to onSelect and returns the chosen id', async () => {
+      let chosen: string | undefined;
+      mockLoginAnthropic.mockImplementation(async (interaction) => {
+        chosen = await interaction.prompt({
+          type: 'select',
+          message: 'Pick an org',
+          options: [{ id: 'org-a', label: 'Org A' }, { id: 'org-b', label: 'Org B' }],
+        });
+        return {};
+      });
+      const onSelect = vi.fn(async () => 'org-b');
+
+      await pm.initiateOAuth('anthropic', { onAuth: vi.fn(), onPrompt: vi.fn(), onSelect });
+
+      expect(onSelect).toHaveBeenCalledWith({
+        message: 'Pick an org',
+        options: [{ id: 'org-a', label: 'Org A' }, { id: 'org-b', label: 'Org B' }],
+      });
+      expect(chosen).toBe('org-b');
+    });
+
+    it('rejects the prompt when the consumer cancels a select', async () => {
+      // pi's contract is resolve-with-answer / reject-on-cancel. Cortex signals
+      // cancel as undefined, which must not reach pi as the string "undefined".
+      mockLoginAnthropic.mockImplementation(async (interaction) => {
+        await interaction.prompt({ type: 'select', message: 'Pick', options: [{ id: 'a', label: 'A' }] });
+        return {};
+      });
+
+      await expect(pm.initiateOAuth('anthropic', {
+        onAuth: vi.fn(),
+        onPrompt: vi.fn(),
+        onSelect: vi.fn(async () => undefined),
+      })).rejects.toThrow(/cancelled/i);
+    });
+
+    it('routes a manual_code prompt to onManualCodeInput', async () => {
+      let code: string | undefined;
+      mockLoginAnthropic.mockImplementation(async (interaction) => {
+        code = await interaction.prompt({ type: 'manual_code', message: 'Paste the code' });
+        return {};
+      });
+      const onManualCodeInput = vi.fn(async () => 'pasted-code');
+
+      await pm.initiateOAuth('anthropic', { onAuth: vi.fn(), onPrompt: vi.fn(), onManualCodeInput });
+
+      expect(onManualCodeInput).toHaveBeenCalled();
+      expect(code).toBe('pasted-code');
     });
 
     it('annotates localhost callback OAuth auth URLs', async () => {
-      mockLoginAnthropic.mockImplementation(async (oauthCallbacks) => {
-        oauthCallbacks.onAuth({
+      mockLoginAnthropic.mockImplementation(async (interaction) => {
+        interaction.notify({
+          type: 'auth_url',
           url: 'https://claude.ai/oauth/authorize?test=1',
           instructions: 'Complete login in your browser.',
         });
@@ -362,16 +432,17 @@ describe('ProviderManager', () => {
     });
 
     it('extracts device codes from OAuth auth instructions', async () => {
-      const mockLoginGitHub = vi.fn(async (oauthCallbacks) => {
-        oauthCallbacks.onAuth('https://github.com/login/device', 'Enter code: ABCD-1234');
+      const mockLoginGitHub = vi.fn(async (interaction) => {
+        interaction.notify({
+          type: 'device_code',
+          userCode: 'ABCD-1234',
+          verificationUri: 'https://github.com/login/device',
+        });
         return {};
       });
-      mockGetOAuthProvider.mockImplementationOnce((provider: string) => {
-        if (provider === 'github-copilot') {
-          return { id: provider, name: 'GitHub Copilot', login: mockLoginGitHub };
-        }
-        return undefined;
-      });
+      mockBuiltinProviders.mockReturnValueOnce([
+        oauthProvider('github-copilot', 'GitHub Copilot', mockLoginGitHub),
+      ]);
 
       const onAuth = vi.fn();
 
@@ -380,17 +451,17 @@ describe('ProviderManager', () => {
         onPrompt: vi.fn(),
       });
 
-      expect(onAuth).toHaveBeenCalledWith({
+      expect(onAuth).toHaveBeenCalledWith(expect.objectContaining({
         url: 'https://github.com/login/device',
-        instructions: 'Enter code: ABCD-1234',
         flowType: 'device_code',
         deviceCode: 'ABCD-1234',
-      });
+      }));
     });
 
     it('normalizes OAuth prompt metadata', async () => {
-      mockLoginAnthropic.mockImplementation(async (oauthCallbacks) => {
-        await oauthCallbacks.onPrompt({
+      mockLoginAnthropic.mockImplementation(async (interaction) => {
+        await interaction.prompt({
+          type: 'text',
           message: 'Paste the redirect URL:',
           placeholder: 'http://localhost:53692/callback',
           allowEmpty: false,
@@ -707,46 +778,61 @@ describe('ProviderManager', () => {
   });
 
   describe('resolveOAuthApiKey', () => {
-    it('calls getOAuthApiKey and returns the result', async () => {
-      const originalCreds = { accessToken: 'old', refreshToken: 'refresh' };
-      const newCreds = { accessToken: 'new', refreshToken: 'refresh' };
+    // pi deleted getOAuthApiKey with no replacement. Cortex reimplements it as
+    // expiry-check -> refresh -> toAuth, which is the path every request by an
+    // already-logged-in user takes.
+    const future = () => Date.now() + 3600_000;
+    const past = () => Date.now() - 1_000;
 
-      mockGetOAuthApiKey.mockResolvedValue({
-        apiKey: 'resolved-api-key',
-        newCredentials: newCreds,
-      });
+    it('derives the key via toAuth without refreshing a live credential', async () => {
+      const creds = { access: 'live-token', refresh: 'r', expires: future(), type: 'oauth' };
 
-      const result = await pm.resolveOAuthApiKey(
-        'anthropic',
-        JSON.stringify(originalCreds),
-      );
+      const result = await pm.resolveOAuthApiKey('anthropic', JSON.stringify(creds));
 
-      expect(result.apiKey).toBe('resolved-api-key');
-      expect(result.changed).toBe(true);
-      expect(JSON.parse(result.credentials)).toEqual(newCreds);
+      expect(result.apiKey).toBe('live-token');
+      expect(mockRefresh).not.toHaveBeenCalled();
+      expect(mockToAuth).toHaveBeenCalledTimes(1);
+      expect(result.changed).toBe(false);
       expect(result.meta.provider).toBe('anthropic');
     });
 
-    it('detects when credentials have not changed', async () => {
-      const creds = { accessToken: 'same', refreshToken: 'refresh' };
+    it('refreshes an expired credential and reports the new blob', async () => {
+      const creds = { access: 'stale', refresh: 'r', expires: past(), type: 'oauth' };
+      mockRefresh.mockResolvedValueOnce({ access: 'fresh', refresh: 'r2', expires: future(), type: 'oauth' });
 
-      mockGetOAuthApiKey.mockResolvedValue({
-        apiKey: 'api-key',
-        newCredentials: creds,
-      });
+      const result = await pm.resolveOAuthApiKey('anthropic', JSON.stringify(creds));
 
-      const serialized = JSON.stringify(creds);
-      const result = await pm.resolveOAuthApiKey('anthropic', serialized);
-
-      expect(result.changed).toBe(false);
-      expect(result.credentials).toBe(serialized);
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+      expect(result.apiKey).toBe('fresh');
+      expect(result.changed).toBe(true);
+      expect(JSON.parse(result.credentials).access).toBe('fresh');
     });
 
-    it('throws when getOAuthApiKey returns null', async () => {
-      mockGetOAuthApiKey.mockResolvedValue(null);
+    it('refreshes a credential that is close to expiry, not just a dead one', async () => {
+      // A token expiring mid-request fails the request it was fetched for.
+      const creds = { access: 'nearly', refresh: 'r', expires: Date.now() + 30_000, type: 'oauth' };
+      mockRefresh.mockResolvedValueOnce({ access: 'fresh', refresh: 'r', expires: future(), type: 'oauth' });
 
-      await expect(pm.resolveOAuthApiKey('anthropic', '{}'))
-        .rejects.toThrow('OAuth resolution failed');
+      const result = await pm.resolveOAuthApiKey('anthropic', JSON.stringify(creds));
+
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+      expect(result.apiKey).toBe('fresh');
+    });
+
+    it('throws when toAuth yields no apiKey', async () => {
+      mockToAuth.mockResolvedValueOnce({});
+
+      await expect(
+        pm.resolveOAuthApiKey('anthropic', JSON.stringify({ access: 'x', refresh: 'r', expires: future() })),
+      ).rejects.toThrow('OAuth resolution failed');
+    });
+
+    it('reports a provider with no OAuth support instead of silently failing', async () => {
+      // The regression that shipped: an emptied pi entrypoint made every
+      // provider look OAuth-less. Only a genuinely OAuth-less provider should.
+      await expect(
+        pm.resolveOAuthApiKey('openai', JSON.stringify({ access: 'x', refresh: 'r', expires: future() })),
+      ).rejects.toThrow(/does not support OAuth/);
     });
   });
 

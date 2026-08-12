@@ -441,3 +441,4 @@ export type {
   ApiKeyValidationStatus,
   ApiKeyValidationResult,
 } from './provider-manager.js';
+export { forcedToolChoiceFor } from './tool-choice.js';

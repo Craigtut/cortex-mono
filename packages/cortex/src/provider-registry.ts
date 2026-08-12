@@ -267,11 +267,19 @@ export const PROVIDER_REGISTRY: ProviderInfo[] = [
 
 /**
  * Provider IDs that support OAuth login flows.
+ *
+ * A STATIC FALLBACK, not the source of truth. pi owns which providers ship an
+ * OAuth flow and adds to that set between releases, so prefer
+ * `ProviderManager.listOAuthCapableProviders()`, which reads the installed
+ * pi. This list is only used when pi cannot be loaded at all.
  */
 export const OAUTH_PROVIDER_IDS: string[] = [
   'anthropic',
-  'openai-codex',
   'github-copilot',
+  'kimi-coding',
+  'openai-codex',
+  'openrouter',
+  'xai',
 ];
 
 // ---------------------------------------------------------------------------

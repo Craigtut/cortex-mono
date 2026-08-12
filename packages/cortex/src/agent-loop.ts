@@ -121,6 +121,7 @@ import type {
   UtilityUsagePayload,
 } from './types.js';
 import { THINKING_LEVEL_ORDER } from './types.js';
+import { forcedToolChoiceFor } from './tool-choice.js';
 import { processToolResult } from './tool-result-persistence.js';
 
 // ---------------------------------------------------------------------------
@@ -2981,9 +2982,9 @@ export class AgentLoop {
         } as Parameters<typeof completeFn>[1],
         {
           ...(completeOptions ?? {}),
-          // Force the model to call a tool (since we only pass one, it must call ours).
-          // "any" has the widest provider support across Anthropic, Google, Mistral, OpenAI, Bedrock.
-          toolChoice: 'any',
+          // Force the model to call a tool (we pass exactly one, so it must
+          // call ours). The spelling is per-API-family: OpenAI rejects "any".
+          toolChoice: forcedToolChoiceFor(unwrapModel(this.primaryModel)),
         } as Parameters<typeof completeFn>[2],
       );
 

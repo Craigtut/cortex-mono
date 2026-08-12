@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import {
   PRIMARY_MODEL_DEFAULTS,
   ProviderManager,
+  forcedToolChoiceFor,
   unwrapModel,
   type CortexModel,
 } from '@animus-labs/cortex';
@@ -294,7 +295,8 @@ async function completeWithModel(input: {
     apiKey: input.apiKey,
   };
   if (input.schema) {
-    completeOptions['toolChoice'] = 'any';
+    // Per-API-family spelling: OpenAI rejects "any".
+    completeOptions['toolChoice'] = forcedToolChoiceFor(unwrapModel(input.model));
   }
 
   const result = await piAi.complete(

@@ -316,19 +316,66 @@ interface PiAiModule {
   complete?: ((model: unknown, context: unknown, options?: unknown) => Promise<unknown>) | undefined;
 }
 
-interface PiOAuthProvider {
-  id: string;
-  name: string;
-  login: (callbacks: Record<string, unknown>) => Promise<Record<string, unknown>>;
+/** A pi OAuth credential blob. `expires` is epoch millis. */
+interface PiOAuthCredential extends Record<string, unknown> {
+  type: 'oauth';
+  access: string;
+  refresh: string;
+  expires: number;
 }
 
-interface PiAiOAuthModule {
-  getOAuthProvider?: ((id: string) => PiOAuthProvider | undefined) | undefined;
-  getOAuthProviders?: (() => PiOAuthProvider[]) | undefined;
-  getOAuthApiKey?: ((
-    provider: string,
-    credentials: Record<string, unknown>,
-  ) => Promise<{ apiKey: string; newCredentials: Record<string, unknown> } | null>) | undefined;
+/** Request auth pi derives from a credential. */
+interface PiModelAuth {
+  apiKey?: string;
+  headers?: Record<string, string>;
+  baseUrl?: string;
+}
+
+/**
+ * pi's per-provider OAuth implementation, reached through
+ * `builtinProviders()` rather than a global registry.
+ *
+ * The registry pi used to export (`getOAuthProvider`, `getOAuthApiKey`, ...)
+ * is gone: its entrypoint is a types-only shim now, so those reads yielded
+ * undefined rather than failing. Notably there is no `getOAuthApiKey`
+ * replacement; deriving a usable key is now the app's job, which is what
+ * {@link ProviderManager.resolveOAuthApiKey} reimplements on top of
+ * refresh + toAuth.
+ */
+interface PiOAuthAuth {
+  name: string;
+  isSubscription?: boolean;
+  loginLabel?: string;
+  login: (interaction: PiAuthInteraction) => Promise<PiOAuthCredential>;
+  refresh: (credential: PiOAuthCredential, signal: AbortSignal) => Promise<PiOAuthCredential>;
+  toAuth: (credential: PiOAuthCredential) => Promise<PiModelAuth>;
+}
+
+/** pi's login prompt shapes. `select` resolves to the chosen option id. */
+type PiAuthPrompt = { signal?: AbortSignal } & (
+  | { type: 'text'; message: string; placeholder?: string }
+  | { type: 'secret'; message: string; placeholder?: string }
+  | { type: 'select'; message: string; options: readonly { id: string; label: string; description?: string }[] }
+  | { type: 'manual_code'; message: string; placeholder?: string }
+);
+
+/** pi's login progress events. */
+type PiAuthEvent =
+  | { type: 'info'; message: string; links?: readonly { url: string; label?: string }[] }
+  | { type: 'auth_url'; url: string; instructions?: string }
+  | { type: 'device_code'; userCode: string; verificationUri: string; intervalSeconds?: number; expiresInSeconds?: number }
+  | { type: 'progress'; message: string };
+
+interface PiAuthInteraction {
+  signal: AbortSignal;
+  prompt: (prompt: PiAuthPrompt) => Promise<string>;
+  notify: (event: PiAuthEvent) => void;
+}
+
+interface PiBuiltinProvider {
+  id: string;
+  name?: string;
+  auth?: { oauth?: PiOAuthAuth };
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +421,16 @@ let oauthCallbackResultNotified = false;
 
 /** Default overall OAuth flow timeout (pi-ai hangs without this). */
 const DEFAULT_OAUTH_FLOW_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * Refresh this far ahead of expiry. A token that expires while the request
+ * it was fetched for is still in flight fails that request, so treat
+ * nearly-expired as expired.
+ */
+const OAUTH_REFRESH_SKEW_MS = 5 * 60_000;
+
+/** Cap a token refresh so a stalled provider cannot wedge a turn. */
+const OAUTH_REFRESH_TIMEOUT_MS = 15_000;
 
 function normalizeOAuthPromptInfo(prompt: unknown): OAuthPromptInfo {
   if (typeof prompt === 'string') {
@@ -742,18 +799,50 @@ async function loadPiAi(): Promise<PiAiModule> {
 }
 
 /**
- * Lazily load the pi-ai OAuth module.
- * Throws a clear error if pi-ai is not installed.
+ * Load pi's builtin provider list, asserting the symbol we need is really there.
+ *
+ * The assertion is the point. A dynamic import of a module that exports
+ * nothing SUCCEEDS and yields `{}`, so a try/catch around the import cannot
+ * detect an emptied entrypoint, and a cast to a hand-written all-optional
+ * interface makes `{}` typecheck. That combination is exactly how pi-ai
+ * gutting its `/oauth` entrypoint reached users as the false message
+ * "provider does not support OAuth". Check for the function, and name it when
+ * it is missing, so the next pi reshape fails loudly here instead of being
+ * laundered into a plausible lie downstream.
  */
-async function loadPiAiOAuth(): Promise<PiAiOAuthModule> {
+async function loadPiBuiltinProviders(): Promise<PiBuiltinProvider[]> {
+  let mod: Record<string, unknown>;
   try {
-    const modulePath = '@earendil-works/pi-ai/oauth';
-    return await import(/* @vite-ignore */ modulePath) as PiAiOAuthModule;
+    const modulePath = '@earendil-works/pi-ai/providers/all';
+    mod = await import(/* @vite-ignore */ modulePath) as Record<string, unknown>;
   } catch {
     throw new Error(
-      'pi-ai is not installed. Install @earendil-works/pi-ai to use OAuth features.'
+      'pi-ai is not installed. Install @earendil-works/pi-ai to use OAuth features.',
     );
   }
+
+  const builtinProviders = mod['builtinProviders'];
+  if (typeof builtinProviders !== 'function') {
+    throw new Error(
+      'pi-ai/providers/all does not export builtinProviders(). The installed ' +
+        'pi-ai is incompatible with this version of Cortex.',
+    );
+  }
+  return (builtinProviders as () => PiBuiltinProvider[])();
+}
+
+/**
+ * Resolve one provider's OAuth implementation, or null if it has none.
+ */
+async function loadPiOAuth(providerId: string): Promise<PiOAuthAuth | null> {
+  const providers = await loadPiBuiltinProviders();
+  return providers.find(p => p.id === providerId)?.auth?.oauth ?? null;
+}
+
+/** Provider ids whose pi definition ships an OAuth flow. */
+async function loadOAuthCapableProviderIds(): Promise<string[]> {
+  const providers = await loadPiBuiltinProviders();
+  return providers.filter(p => p.auth?.oauth).map(p => p.id).sort();
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,8 +1131,7 @@ export class ProviderManager implements IProviderManager {
    *   network/token-exchange failures from pi-ai) propagate as-is.
    */
   async initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult> {
-    const oauthModule = await loadPiAiOAuth();
-    const oauthProvider = oauthModule.getOAuthProvider?.(provider);
+    const oauthProvider = await loadPiOAuth(provider);
     if (!oauthProvider) {
       throw new OAuthError(
         'unsupported_provider',
@@ -1114,18 +1202,58 @@ export class ProviderManager implements IProviderManager {
       )), { once: true });
     });
 
-    const login = oauthProvider.login({
-      onAuth: (info: unknown, legacyInstructions?: string) => {
-        callbacks.onAuth(
-          normalizeOAuthAuthInfo(provider, info, legacyInstructions, this.oauthCallbackRoutes),
-        );
-      },
-      onPrompt: (prompt: unknown) => callbacks.onPrompt(normalizeOAuthPromptInfo(prompt)),
-      onProgress: callbacks.onProgress,
-      onManualCodeInput: callbacks.onManualCodeInput,
-      onSelect: callbacks.onSelect,
+    // pi replaced the callbacks bag with a single interaction object: every
+    // out-bound message is notify(AuthEvent) and every in-bound answer is
+    // prompt(AuthPrompt). Adapt here so Cortex's consumer-facing
+    // OAuthCallbacks contract is unchanged by the pi restructure.
+    const interaction: PiAuthInteraction = {
       signal: abort.signal,
-    }) as Promise<Record<string, unknown>>;
+      notify: (event: PiAuthEvent) => {
+        switch (event.type) {
+          case 'auth_url':
+            callbacks.onAuth(
+              normalizeOAuthAuthInfo(provider, event, event.instructions, this.oauthCallbackRoutes),
+            );
+            return;
+          case 'device_code':
+            // pi hands us the code as structured data, so pass it straight
+            // through rather than re-deriving it from a prose instruction
+            // (which is what the old string-parsing path had to do).
+            callbacks.onAuth({
+              url: event.verificationUri,
+              flowType: 'device_code',
+              deviceCode: event.userCode,
+              instructions: `Enter code ${event.userCode}`,
+            });
+            return;
+          case 'info':
+          case 'progress':
+            callbacks.onProgress?.(event.message);
+            return;
+        }
+      },
+      prompt: async (prompt: PiAuthPrompt): Promise<string> => {
+        if (prompt.type === 'manual_code' && callbacks.onManualCodeInput) {
+          return await callbacks.onManualCodeInput();
+        }
+        if (prompt.type === 'select' && callbacks.onSelect) {
+          const chosen = await callbacks.onSelect({
+            message: prompt.message,
+            options: prompt.options.map(o => ({ id: o.id, label: o.label })),
+          });
+          // pi's prompt() contract is "resolve with the answer, reject on
+          // cancel". Cortex signals cancel as undefined, so translate rather
+          // than handing pi the string "undefined".
+          if (chosen === undefined) {
+            throw new OAuthError('cancelled', provider, `OAuth flow for "${provider}" was cancelled.`);
+          }
+          return chosen;
+        }
+        return await callbacks.onPrompt(normalizeOAuthPromptInfo(prompt));
+      },
+    };
+
+    const login = oauthProvider.login(interaction) as Promise<Record<string, unknown>>;
     // Whichever promise loses the race may still settle later (pi-ai's
     // login can hang or settle late; the aux promises can reject after the
     // race is decided). Attach inert handlers so a late rejection never
@@ -1174,33 +1302,73 @@ export class ProviderManager implements IProviderManager {
    * @throws Error if pi-ai is not installed or resolution fails
    */
   async resolveOAuthApiKey(provider: string, credentials: string): Promise<OAuthRefreshResult> {
-    const oauthModule = await loadPiAiOAuth();
-    const getOAuthApiKeyFn = oauthModule.getOAuthApiKey;
-    if (typeof getOAuthApiKeyFn !== 'function') {
-      throw new Error('getOAuthApiKey not found in pi-ai/oauth');
+    const oauth = await loadPiOAuth(provider);
+    if (!oauth) {
+      throw new OAuthError(
+        'unsupported_provider',
+        provider,
+        `Provider "${provider}" does not support OAuth`,
+      );
     }
 
     const rawCredentials = JSON.parse(credentials) as Record<string, unknown>;
-    // Security: spread rawCredentials first so Cortex-owned 'type' cannot be overridden
-    const credMap = { [provider]: { ...rawCredentials, type: 'oauth' as const } };
+    // Security: spread first so a stored blob cannot override Cortex's 'type'.
+    const current = { ...rawCredentials, type: 'oauth' as const } as PiOAuthCredential;
 
-    const result = await getOAuthApiKeyFn(provider, credMap);
-
-    if (!result) {
-      throw new Error(`OAuth resolution failed for provider "${provider}"`);
+    // pi removed getOAuthApiKey without a replacement, splitting it into
+    // refresh (network, may rotate the token) and toAuth (pure derivation).
+    // Refresh slightly early: a token that expires mid-flight fails the
+    // request it was fetched for.
+    let settled = current;
+    if (typeof current.expires === 'number'
+      && Date.now() >= current.expires - OAUTH_REFRESH_SKEW_MS) {
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), OAUTH_REFRESH_TIMEOUT_MS);
+      timer.unref?.();
+      try {
+        settled = await oauth.refresh(current, abort.signal);
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
-    const originalSerialized = credentials;
-    const newSerialized = JSON.stringify(result.newCredentials);
-    const changed = newSerialized !== originalSerialized;
-    const meta = buildOAuthMeta(provider, result.newCredentials);
+    const auth = await oauth.toAuth(settled);
+    if (!auth.apiKey) {
+      throw new Error(
+        `OAuth resolution failed for provider "${provider}": pi returned no apiKey`,
+      );
+    }
+
+    const newSerialized = JSON.stringify(settled);
+    const changed = newSerialized !== credentials;
 
     return {
-      apiKey: result.apiKey,
+      apiKey: auth.apiKey,
       credentials: changed ? newSerialized : credentials,
-      meta,
+      meta: buildOAuthMeta(provider, settled),
       changed,
     };
+  }
+
+  /**
+   * Provider ids whose installed pi definition ships an OAuth flow.
+   *
+   * Read from pi rather than from Cortex's static list, so a provider pi
+   * gains OAuth for becomes available without a Cortex release. Falls back to
+   * the static list if pi cannot be loaded.
+   */
+  async listOAuthCapableProviders(): Promise<string[]> {
+    let fromPi: string[];
+    try {
+      fromPi = await loadOAuthCapableProviderIds();
+    } catch {
+      return [...OAUTH_PROVIDER_IDS];
+    }
+    // Intersect with what Cortex models. pi ships OAuth for gateways Cortex
+    // has no PROVIDER_REGISTRY entry for (radius today); advertising those
+    // would offer a login the rest of the stack cannot follow through on.
+    const known = new Set(PROVIDER_REGISTRY.map(p => p.id));
+    return fromPi.filter(id => known.has(id));
   }
 
   // -----------------------------------------------------------------------

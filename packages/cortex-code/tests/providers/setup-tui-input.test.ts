@@ -18,7 +18,7 @@
  * fails at the final assertion with validateApiKey never called.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { TUI, Input, SelectList } from '@earendil-works/pi-tui';
+import { TuiMainScreen, type TUI, Input, SelectList } from '@earendil-works/pi-tui';
 
 vi.mock('../../src/providers/ollama.js', () => ({
   detectOllama: async () => ({ running: false, models: [] }),
@@ -91,7 +91,7 @@ function selectByValue(list: SelectList, value: string): void {
 
 describe('provider setup API-key entry (real pi-tui Input)', () => {
   it('submits the typed key on Enter', async () => {
-    const tui = new TUI(stubTerminal());
+    const tui: TUI = new TuiMainScreen(stubTerminal());
     const providerManager = {
       // Resolving 'invalid' keeps the flow from advancing past validation into
       // model listing; the assertion here is about what validateApiKey RECEIVES.

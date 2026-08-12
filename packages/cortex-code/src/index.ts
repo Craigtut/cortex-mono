@@ -105,7 +105,23 @@ async function main(): Promise<void> {
         ...(entry?.apiKey ? { apiKey: entry.apiKey } : {}),
       });
     } else {
-      model = await providerManager.resolveModel(provider, modelId);
+      try {
+        model = await providerManager.resolveModel(provider, modelId);
+      } catch (error) {
+        // A stored model id can stop existing under us: pi prunes retired
+        // models from its catalog on upgrade (0.80 -> 0.84 dropped 77 across
+        // the providers Cortex supports), and resolveModel throws by design on
+        // a catalog miss. Left uncaught that is a hard startup failure with no
+        // way back in, so fall back to the provider default and say so.
+        const fallbackId = getDefaultModel(provider);
+        if (fallbackId === modelId) throw error;
+        console.warn(
+          `Model "${modelId}" is no longer available for provider "${provider}". ` +
+          `Falling back to "${fallbackId}". Use /model to pick a different one.`,
+        );
+        model = await providerManager.resolveModel(provider, fallbackId);
+        modelId = fallbackId;
+      }
     }
   }
 
