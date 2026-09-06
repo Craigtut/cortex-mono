@@ -27,6 +27,7 @@ import type { ProviderInfo, ModelInfo } from './provider-registry.js';
 import { wrapModel } from './model-wrapper.js';
 import { inferUtilityModelId } from './utility-model-inference.js';
 import type { CortexModel } from './model-wrapper.js';
+import type { OllamaModelConfig } from './providers/ollama/runtime.js';
 
 const nodeRequire = createRequire(import.meta.url);
 
@@ -296,6 +297,7 @@ export interface IProviderManager {
   // Model Resolution
   resolveModel(provider: string, modelId: string): Promise<CortexModel>;
   createCustomModel(config: CustomModelConfig): Promise<CortexModel>;
+  createOllamaModel(config: OllamaModelConfig): Promise<CortexModel>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1510,6 +1512,12 @@ export class ProviderManager implements IProviderManager {
       config.modelId,
       config.contextWindow ?? 128_000,
     );
+  }
+
+  /** Resolve the selected local model's capabilities and actual runtime allocation. */
+  async createOllamaModel(config: OllamaModelConfig): Promise<CortexModel> {
+    const { createOllamaModel } = await import('./providers/ollama/model.js');
+    return createOllamaModel(config);
   }
 
   // -----------------------------------------------------------------------

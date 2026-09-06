@@ -252,3 +252,33 @@ const agent = new Agent({
 - **Format content**: No XML wrapping, no tags. The consumer formats content however they want.
 - **Handle persistence**: Serializing `agent.state.messages` for crash recovery is the consumer's responsibility. Cortex provides `getConversationHistory()` and `restoreConversationHistory()` on the `AgentLoop`, not on the ContextManager.
 - **Compact conversation history**: Compaction is a separate cortex capability that composes with the ContextManager via `transformContext`.
+
+## Context capacity and budgets
+
+Cortex keeps backend capacity separate from each loop's compaction budget.
+`CortexModel.contextWindow` is the capacity that hard overflow protection uses.
+`contextWindowLimit` is an optional positive integer for proactive compaction.
+Its effective value is `min(limit, capacity)`, or capacity when no limit is set.
+Explicit limits below 16K are honored across providers. `MINIMUM_CONTEXT_WINDOW`
+remains a legacy fallback for unknown capacity, not a floor on a known budget.
+A budget does not guarantee every request fits it: system instructions and an
+indivisible recent turn can exceed the budget. Hard overflow handling still
+uses backend capacity.
+
+Provider resolution owns runtime allocation. A loop changing its budget cannot
+resize memory on a shared backend. Providers which support allocation controls
+can apply an allocation cap while resolving a model; that resolved model is
+then shared by loops with independent compaction budgets. Cloud providers do
+not receive an unsupported context-allocation parameter.
+
+For [Ollama](ollama.md), `ProviderManager.createOllamaModel()` accepts an exact
+`contextWindow` and an optional `contextWindowLimit` allocation cap in native
+mode. Cortex Code forwards its configured limit to both provider setup and
+loop configuration. The native provider sends the resolved allocation as
+`options.num_ctx` on every request, independently of the output-token limit.
+Cortex Code `/status` reports requested budget, effective budget, and backend
+capacity for every provider, plus allocation details for Ollama.
+
+Compaction's recent-history protection is capped at half the budget, and the
+observer batch minimum cannot exceed its utility model's capacity-based cap.
+These constraints keep minimum-size preferences from defeating small budgets.

@@ -18,6 +18,7 @@
  *   - cross-platform-considerations.md
  */
 
+import { resolveContextBudget } from './context-budget.js';
 import * as os from 'node:os';
 import { ContextManager } from './context-manager.js';
 import type { AgentContext, AgentMessage, AgentStateAccessor } from './context-manager.js';
@@ -121,7 +122,7 @@ import type {
   UtilityUsagePayload,
 } from './types.js';
 import { THINKING_LEVEL_ORDER } from './types.js';
-import { forcedToolChoiceFor } from './tool-choice.js';
+import { structuredCompletionRequest, parseSchemaCompletion } from './structured-completion.js';
 import { processToolResult } from './tool-result-persistence.js';
 
 // ---------------------------------------------------------------------------
@@ -301,10 +302,9 @@ function fromPiThinkingLevels(levels: readonly string[]): ThinkingLevel[] {
 }
 
 /**
- * Minimum context window floor in tokens.
- * Below this, the system prompt alone may not fit, breaking the agent.
+ * Legacy fallback for unknown capacity. Explicit budgets have no minimum floor.
  */
-export const MINIMUM_CONTEXT_WINDOW = 16_384;
+export { MINIMUM_CONTEXT_WINDOW } from './context-budget.js';
 
 /**
  * Operational reminder appended to tool results when working tags are enabled.
@@ -1334,6 +1334,7 @@ export class AgentLoop {
     this.compactionManager.setCacheInfo(
       this.primaryModel.provider,
       this._cacheRetention ?? 'none',
+      this.primaryModel.capabilities?.promptCaching,
     );
 
     // Apply context window limit from config and model
@@ -3009,6 +3010,7 @@ export class AgentLoop {
     this._lastDirectUsage = null;
     const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
 
+    const structuredRequest = structuredCompletionRequest(this.primaryModel, schema, tool);
     const structStartMs = Date.now();
     try {
       // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
@@ -3020,13 +3022,12 @@ export class AgentLoop {
         {
           systemPrompt: resolved.systemPrompt,
           messages: resolved.messages,
-          tools: [tool],
+          ...structuredRequest.context,
         } as Parameters<typeof completeFn>[1],
         {
           ...(completeOptions ?? {}),
-          // Force the model to call a tool (we pass exactly one, so it must
-          // call ours). The spelling is per-API-family: OpenAI rejects "any".
-          toolChoice: forcedToolChoiceFor(unwrapModel(this.primaryModel)),
+          // The provider capability selects native schema output or a forced tool.
+          ...structuredRequest.options,
         } as Parameters<typeof completeFn>[2],
       );
 
@@ -3047,7 +3048,9 @@ export class AgentLoop {
       });
 
       // Extract tool call arguments from the response
-      return this.extractToolCallArgs(result, toolName);
+      return this.primaryModel.capabilities?.structuredOutput === 'json-schema'
+        ? parseSchemaCompletion(result, schema)
+        : this.extractToolCallArgs(result, toolName);
     } catch (err) {
       throw this.surfaceDirectError(err, keyError, options?.signal);
     }
@@ -3847,6 +3850,7 @@ export class AgentLoop {
     this.compactionManager.setCacheInfo(
       this.primaryModel.provider,
       this._cacheRetention ?? 'none',
+      this.primaryModel.capabilities?.promptCaching,
     );
   }
 
@@ -3992,7 +3996,7 @@ export class AgentLoop {
   setCacheRetention(value: 'none' | 'short' | 'long'): void {
     this._cacheRetention = value;
     // Update L1 cache-aware gating with the new TTL.
-    this.compactionManager.setCacheInfo(this.primaryModel.provider, value);
+    this.compactionManager.setCacheInfo(this.primaryModel.provider, value, this.primaryModel.capabilities?.promptCaching);
   }
 
   /**
@@ -4796,7 +4800,7 @@ export class AgentLoop {
   /**
    * Set the context window size (from model metadata).
    * If a contextWindowLimit is set, the effective value will be
-   * min(limit, contextWindow) with a floor of MINIMUM_CONTEXT_WINDOW.
+   * min(limit, contextWindow).
    */
   setContextWindow(contextWindow: number): void {
     this.primaryPiModel = {
@@ -4817,10 +4821,11 @@ export class AgentLoop {
   /**
    * Set a user-configured limit on the context window.
    * The effective context window becomes min(limit, model.contextWindow)
-   * with a floor of MINIMUM_CONTEXT_WINDOW (16K tokens).
+   * without increasing explicit limits. This does not resize server allocation.
    * Pass null to remove the limit and use the model's full context window.
    */
   setContextWindowLimit(limit: number | null): void {
+    resolveContextBudget(this.primaryModel.contextWindow, limit);
     this._contextWindowLimit = limit;
     this._updateEffectiveContextWindow();
     this.rebuildLoadSkillDescription();
@@ -4834,7 +4839,7 @@ export class AgentLoop {
   }
 
   /**
-   * Get the effective context window after applying the limit and floor.
+   * Get the effective context window after clamping the limit to backend capacity.
    */
   get effectiveContextWindow(): number {
     return this.compactionManager.contextWindow;
@@ -4852,43 +4857,14 @@ export class AgentLoop {
    * and the user-configured limit.
    */
   private _updateEffectiveContextWindow(): void {
-    const modelWindow = this.primaryModel.contextWindow;
-    if (!modelWindow || !Number.isFinite(modelWindow)) {
-      // Model does not advertise a context window. Set a safe floor
-      // rather than leaving a stale value from a previous model.
-      //
-      // Defensive rather than routine: wrapModel() falls back to 200k, so a
-      // CortexModel always carries a finite window and this branch is only
-      // reachable from a hand-built model object.
-      this.compactionManager.setContextWindow(MINIMUM_CONTEXT_WINDOW);
-      this.compactionManager.setModelContextWindow(MINIMUM_CONTEXT_WINDOW);
-      this.warnContextWindowOverride(
-        this._contextWindowLimit,
-        MINIMUM_CONTEXT_WINDOW,
-        'the model advertises no context window, so the safe floor applies instead',
-      );
-      return;
+    const budget = resolveContextBudget(this.primaryModel.contextWindow, this._contextWindowLimit);
+    // Hard overflow protection uses backend capacity. Proactive compaction uses
+    // the loop budget. Neither value changes the provider's runtime allocation.
+    this.compactionManager.setModelContextWindow(budget.capacity);
+    this.compactionManager.setContextWindow(budget.effective);
+    if (budget.adjustmentReason) {
+      this.warnContextWindowOverride(this._contextWindowLimit, budget.effective, budget.adjustmentReason);
     }
-
-    // Always set the model's actual context window for Layer 3 failsafe.
-    // Layer 3 uses this to avoid dropping messages when the model still
-    // has capacity, even if the user's budget has been exceeded.
-    this.compactionManager.setModelContextWindow(modelWindow);
-
-    // Determine the effective budget for Layer 1/2:
-    // - explicit limit set by consumer: use it (clamped to model max)
-    // - null (default): use the model's full context window
-    const limit = this._contextWindowLimit ?? modelWindow;
-    const clamped = Math.min(limit, modelWindow);
-    const effective = Math.max(MINIMUM_CONTEXT_WINDOW, clamped);
-    this.compactionManager.setContextWindow(effective);
-    this.warnContextWindowOverride(
-      this._contextWindowLimit,
-      effective,
-      clamped < MINIMUM_CONTEXT_WINDOW
-        ? 'it is below the safe floor'
-        : "it exceeds the model's own context window",
-    );
 
     // Set utility model context window for observational memory clamps
     const utilityModel = this.getUtilityModel();
@@ -4898,13 +4874,7 @@ export class AgentLoop {
   }
 
   /**
-   * Say so when a consumer's contextWindowLimit is not the number actually
-   * in force. Silence here is a genuine DX trap: the limit is a compaction
-   * budget, so a consumer who set 12000 and is quietly running on 16384
-   * sees compaction fire later than they asked for and has nothing to read
-   * that explains it. Warn rather than debug, since it means a configured
-   * value is not being honored, and once per distinct outcome, since this
-   * recomputes on every model or limit change.
+   * Report a budget clamped by backend capacity, once per distinct outcome.
    */
   private warnContextWindowOverride(
     configured: number | null,
@@ -6558,9 +6528,9 @@ export class AgentLoop {
   }
 
   private buildAvailableSkillsSummary(): string {
-    const effectiveContextWindow = this.compactionManager?.contextWindow ?? Math.max(
-      MINIMUM_CONTEXT_WINDOW,
-      this._contextWindowLimit ?? this.primaryModel.contextWindow ?? MINIMUM_CONTEXT_WINDOW,
+    const effectiveContextWindow = this.compactionManager?.contextWindow ?? Math.min(
+      this.primaryModel.contextWindow,
+      this._contextWindowLimit ?? this.primaryModel.contextWindow,
     );
     const maxTokens = Math.max(128, Math.floor(effectiveContextWindow * 0.02));
     return this.skillRegistry.getAvailableSkillsSummary(maxTokens);

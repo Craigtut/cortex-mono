@@ -269,6 +269,9 @@ describe('getToolCategory', () => {
 // ---------------------------------------------------------------------------
 
 describe('computeHotZone', () => {
+  it('leaves room to trim when the budget is smaller than the preferred hot zone', () => {
+    expect(computeHotZone(8_192, MICROCOMPACTION_DEFAULTS)).toBe(4_096);
+  });
   it('uses the floor on small windows', () => {
     expect(computeHotZone(32_000, MICROCOMPACTION_DEFAULTS)).toBe(16_000);
   });

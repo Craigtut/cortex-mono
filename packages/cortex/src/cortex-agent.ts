@@ -3801,7 +3801,7 @@ export class CortexAgent {
   /**
    * Set the consumer's context-window limit on every resident loop
    * (CONFIG_ROUTING contextWindowLimit: per-loop). Each loop clamps the same
-   * number against its own model window and the safe floor, so the talker's
+   * number against its own backend capacity, so the talker's
    * smaller fast-tier window is respected without the consumer knowing the
    * split exists.
    */

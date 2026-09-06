@@ -218,6 +218,7 @@ export class CompactionManager {
    * the cache as perpetually cold (trim freely). Set via setCacheInfo().
    */
   private _providerCacheTtlMs = 0;
+  private _automaticPrefixCache = false;
 
   /**
    * Consumer handlers for compaction lifecycle events. **These are the live
@@ -349,7 +350,8 @@ export class CompactionManager {
    * @param provider - The active provider name (e.g., "anthropic", "openai")
    * @param cacheRetention - The configured cache retention ('none' | 'short' | 'long')
    */
-  setCacheInfo(provider: string, cacheRetention: CacheRetention): void {
+  setCacheInfo(provider: string, cacheRetention: CacheRetention, promptCaching?: 'automatic-prefix'): void {
+    this._automaticPrefixCache = promptCaching === 'automatic-prefix';
     const cfg = PROVIDER_CACHE_CONFIG[provider];
     if (!cfg || !cfg.supported || cacheRetention === 'none') {
       this._providerCacheTtlMs = 0;
@@ -374,10 +376,13 @@ export class CompactionManager {
     return (now - this._lastLlmCallTimestamp) >= this._providerCacheTtlMs;
   }
 
-  /**
-   * Get the effective cache TTL (ms) for the current provider + retention.
-   * Zero means caching is unsupported or disabled.
-   */
+  /** Prefix preservation is a trimming policy, not a claim that the server cache is warm. */
+  shouldTrimHistory(tokens: number): boolean {
+    if (!this._automaticPrefixCache) return this.isCacheCold();
+    return this._contextWindow > 0 && tokens >= this._contextWindow * COMPACTION_DEFAULTS.threshold;
+  }
+
+  /** Effective explicit cache TTL. Zero also covers automatic caches with unknown lifetime. */
   get providerCacheTtlMs(): number {
     return this._providerCacheTtlMs;
   }
@@ -886,7 +891,7 @@ export class CompactionManager {
     let lastLayer2Error: Error | undefined;
     let effectiveThreshold = 0;
 
-    const cacheCold = this.isCacheCold();
+    const cacheCold = this.shouldTrimHistory(currentTokens);
 
     if (this._strategy === 'observational' && this.observationalEngine && getSourceHistory && setSourceHistory) {
       // Observational memory path: observer/reflector handle conversation
@@ -905,7 +910,7 @@ export class CompactionManager {
       // updated context so the observation slot's new size is reflected.
       const postObsTotal = this.estimateCurrentContextTokens(context);
       const trimmedHistory = await this.microcompaction.apply(
-        history, this._contextWindow, postObsTotal, { cacheCold },
+        history, this._contextWindow, postObsTotal, { cacheCold: this.shouldTrimHistory(postObsTotal) },
       );
       if (trimmedHistory !== history) {
         context = setHistory(context, trimmedHistory);

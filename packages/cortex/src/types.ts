@@ -492,7 +492,8 @@ export interface AgentLoopConfig {
 
   /**
    * Limit the effective context window for compaction calculations.
-   * Clamped to min(limit, model.contextWindow) with a floor of MINIMUM_CONTEXT_WINDOW (16K).
+   * Positive integer, clamped to backend capacity without a minimum budget floor.
+   * This is a compaction budget. Set OllamaModelConfig.contextWindowLimit to also cap server allocation.
    * null or undefined = use the model's full context window.
    */
   contextWindowLimit?: number | null;
@@ -1033,7 +1034,7 @@ export interface MicrocompactionConfig {
   /**
    * Absolute floor for the hot zone size (in tokens). Tool results within the
    * hot zone of the most recent message are never trimmed. The effective hot
-   * zone is `max(hotZoneMinTokens, contextWindow * hotZoneRatio)`.
+   * zone is `min(contextWindow / 2, max(hotZoneMinTokens, contextWindow * hotZoneRatio))`.
    * Default: 16000.
    */
   hotZoneMinTokens: number;

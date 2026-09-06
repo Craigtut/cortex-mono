@@ -16,6 +16,7 @@
 /** API families that spell a forced tool call as "required". */
 const REQUIRED_STYLE_APIS: ReadonlySet<string> = new Set([
   'openai-completions',
+  'cortex-ollama-openai',
   'openai-responses',
   'openai-codex-responses',
   'azure-openai-responses',

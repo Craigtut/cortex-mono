@@ -24,6 +24,12 @@
  *
  * Internally, this wraps pi-ai's Model<T> type.
  */
+export interface ModelCapabilities {
+  promptCaching?: 'automatic-prefix' | undefined;
+  structuredOutput?: 'json-schema' | undefined;
+  trainedContextWindow?: number | undefined;
+}
+
 export interface CortexModel {
   /** @internal Brand tag for nominal type safety. */
   readonly __brand: 'CortexModel';
@@ -31,8 +37,9 @@ export interface CortexModel {
   readonly provider: string;
   /** Model identifier (e.g., 'claude-sonnet-4-20250514'). */
   readonly modelId: string;
-  /** Context window size in tokens. */
+  /** Backend context capacity in tokens, before applying any loop compaction budget. */
   readonly contextWindow: number;
+  readonly capabilities?: ModelCapabilities;
 }
 
 // The symbol key used to store the underlying pi-ai model.
@@ -79,6 +86,8 @@ export function wrapModel(
     modelId,
     contextWindow: contextWindow ?? extractContextWindow(model) ?? 200_000,
     [INNER_MODEL]: model,
+    ...((model as { cortexCapabilities?: ModelCapabilities }).cortexCapabilities
+      ? { capabilities: (model as { cortexCapabilities: ModelCapabilities }).cortexCapabilities } : {}),
   };
   return wrapped;
 }

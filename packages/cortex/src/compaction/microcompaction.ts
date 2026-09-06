@@ -265,13 +265,15 @@ export function getToolCategory(
 
 /**
  * Compute the effective hot zone size in tokens.
- * `max(hotZoneMinTokens, contextWindow * hotZoneRatio)`.
+ * Protect recent results, but leave at least half of a small budget available
+ * for older history to degrade. The preferred minimum must not protect the
+ * entire context from trimming.
  */
 export function computeHotZone(
   contextWindow: number,
   config: Pick<MicrocompactionConfig, 'hotZoneMinTokens' | 'hotZoneRatio'>,
 ): number {
-  return Math.max(config.hotZoneMinTokens, contextWindow * config.hotZoneRatio);
+  return Math.min(contextWindow * 0.5, Math.max(config.hotZoneMinTokens, contextWindow * config.hotZoneRatio));
 }
 
 /**
@@ -739,4 +741,3 @@ function formatPersistedReplacement(
   // clear
   return `[Tool result persisted -- ${toolName} -- use Read on ${path} for full content]`;
 }
-

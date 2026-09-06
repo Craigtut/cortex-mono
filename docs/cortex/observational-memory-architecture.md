@@ -1051,3 +1051,12 @@ The buffer interval is recomputed at each `turn_end` from current total utilizat
 ### 4. Observation Slot Size for Session Resumption
 
 On session resumption with a large observation history, the observation slot may contain significant token counts. This is expected and correct (it's the compressed memory). But it means the effective message budget on resumption is smaller than at session start. The dynamic threshold system handles this naturally.
+
+### Small context budgets
+
+Explicit Cortex budgets below 16K are honored. The observer's preferred
+`bufferMinTokens` never overrides the effective buffer cap from the utility
+model's capacity. For example, a 4096-token utility model has a 2457.6-token
+buffer cap even when the preferred batch minimum is 5000 tokens. Reflection
+continues to use the smaller of the primary budget fraction and the utility
+capacity fraction. See [context capacity and budgets](context-manager.md#context-capacity-and-budgets).

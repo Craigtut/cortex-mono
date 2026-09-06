@@ -34,6 +34,12 @@ describe('BufferingCoordinator', () => {
   });
 
   describe('computeBufferInterval', () => {
+    it('lets utility capacity bound a minimum batch that cannot fit', () => {
+      expect(coordinator.computeBufferInterval(100, {
+        bufferTargetCycles: 4, bufferTokenCap: 30000, bufferMinTokens: 5000,
+        utilityModelContextWindow: 4096,
+      })).toBe(4096 * 0.6);
+    });
     it('divides tokens until activation by target cycles', () => {
       const interval = coordinator.computeBufferInterval(40_000, {
         bufferTargetCycles: 4,

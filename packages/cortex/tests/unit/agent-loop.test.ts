@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { AgentLoop, MINIMUM_CONTEXT_WINDOW } from '../../src/agent-loop.js';
+import { AgentLoop } from '../../src/agent-loop.js';
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
 import type { AgentLoopConfig } from '../../src/types.js';
@@ -1575,30 +1575,22 @@ You have 12 emotions.`;
       expect(overrideWarning(logger)).toBeUndefined();
     });
 
-    it('warns when a limit below the safe floor is silently raised to it', () => {
-      // The DX trap, and the reachable one: contextWindowLimit is a
-      // compaction budget, so a consumer running on 16384 instead of the
-      // 12000 they set sees compaction fire at a different time with
-      // nothing anywhere explaining why.
+    it.each(['anthropic', 'openai', 'google', 'custom'])('honors a small explicit budget for %s', provider => {
       const logger = loggerStub();
       const agent = createTestAgentLoop(piAgent, {
-        ...config,
-        logger,
-        model: makeModel({
-          provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000,
-        } as PiModel),
-        contextWindowLimit: 12_000,
+        ...config, logger,
+        model: makeModel({ provider, name: 'test', contextWindow: 200_000 } as PiModel),
+        contextWindowLimit: 8_192,
       });
-
-      expect(agent.effectiveContextWindow).toBe(MINIMUM_CONTEXT_WINDOW);
-      const warning = overrideWarning(logger)!;
-      expect(warning).toBeDefined();
-      expect(warning[1]).toMatchObject({
-        configured: 12_000,
-        effective: MINIMUM_CONTEXT_WINDOW,
-      });
-      expect(String((warning[1] as { reason: string }).reason))
-        .toContain('below the safe floor');
+      expect(agent.effectiveContextWindow).toBe(8_192);
+      expect(agent.modelContextWindow).toBe(200_000);
+      expect(overrideWarning(logger)).toBeUndefined();
+      agent.setContextWindowLimit(4_096);
+      expect(agent.effectiveContextWindow).toBe(4_096);
+      expect(() => agent.setContextWindowLimit(0)).toThrow();
+      expect(agent.contextWindowLimit).toBe(4_096);
+      agent.setContextWindowLimit(null);
+      expect(agent.effectiveContextWindow).toBe(200_000);
     });
 
     it('warns when a limit above the model window is clamped down to it', () => {
@@ -1625,16 +1617,16 @@ You have 12 emotions.`;
         model: makeModel({
           provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000,
         } as PiModel),
-        contextWindowLimit: 12_000,
+        contextWindowLimit: 400_000,
       });
       const afterConstruction = logger.warn.mock.calls.length;
 
-      agent.setContextWindowLimit(12_000);
-      agent.setContextWindowLimit(12_000);
+      agent.setContextWindowLimit(400_000);
+      agent.setContextWindowLimit(400_000);
       expect(logger.warn.mock.calls.length).toBe(afterConstruction);
 
       // A different outcome is a different fact, and is reported.
-      agent.setContextWindowLimit(9_000);
+      agent.setContextWindowLimit(500_000);
       expect(logger.warn.mock.calls.length).toBe(afterConstruction + 1);
     });
   });

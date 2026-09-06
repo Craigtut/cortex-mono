@@ -70,7 +70,8 @@ export class BufferingCoordinator {
    * The interval targets `bufferTargetCycles` observer calls between the
    * current utilization and the activation threshold. It is clamped between
    * `bufferMinTokens` and `effectiveBufferCap` (the lesser of
-   * `bufferTokenCap` and 60% of the utility model's context window).
+   * `bufferTokenCap` and 60% of the utility model's context window). The cap
+   * wins when a small utility model cannot accommodate the preferred minimum.
    *
    * @param tokensUntilActivation - tokens remaining before activation threshold
    * @param config - buffer interval configuration
@@ -90,9 +91,9 @@ export class BufferingCoordinator {
       config.utilityModelContextWindow * 0.6,
     );
     const dynamicInterval = tokensUntilActivation / config.bufferTargetCycles;
-    return Math.max(
-      Math.min(dynamicInterval, effectiveBufferCap),
-      config.bufferMinTokens,
+    return Math.min(
+      Math.max(dynamicInterval, config.bufferMinTokens),
+      effectiveBufferCap,
     );
   }
 
