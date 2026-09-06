@@ -794,3 +794,9 @@ These providers require complex credential configurations beyond a single API ke
 3. **Validation cost**: `validateApiKey()` makes a real LLM call (with `maxTokens: 1`). This costs a tiny amount. Should there be a cheaper validation path, or is this acceptable?
 
 4. **OAuth cancellation**: Pi-ai's login functions may or may not support `AbortSignal`. If they don't, `cancelOAuth()` would need to track and reject the pending promise manually.
+
+## Local Ollama models
+
+Use `ProviderManager.createOllamaModel()` for local Ollama connections. It
+resolves capabilities and loaded context allocation and supports native or
+OpenAI-compatible transport. See [Ollama integration](ollama.md).

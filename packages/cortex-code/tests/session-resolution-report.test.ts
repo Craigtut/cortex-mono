@@ -79,6 +79,11 @@ function lastNotification(ctx: DuplexSession): string {
 }
 
 describe('the footer marks a degraded resolution', () => {
+  it('shows requested budget and backend capacity separately in status', async () => {
+    const ctx = await createDuplexSession(cwd, {}, { contextWindowLimit: 8192 });
+    await statusCommand.handler(ctx.session, []);
+    expect(lastNotification(ctx)).toContain('Context: requested 8192, budget 8192, capacity 200000 tokens');
+  });
   it('marks the model when the talker fell back to the primary model', async () => {
     const ctx = await createDuplexSession(cwd, {}, { model: unenumerableModel() });
 

@@ -1,3 +1,4 @@
+import { getOllamaHost } from '@animus-labs/cortex';
 /**
  * First-run provider setup state machine.
  * Logic only, no rendering. The TUI drives this by calling getCurrentStep()
@@ -134,7 +135,7 @@ export class ProviderSetupFlow {
           provider: 'ollama',
           method: 'custom',
           model: input,
-          baseUrl: process.env['OLLAMA_HOST'] ?? 'http://localhost:11434/v1',
+          baseUrl: `${getOllamaHost()}/v1`,
         };
         this.currentStep = { type: 'complete' };
         break;

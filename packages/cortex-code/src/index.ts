@@ -47,14 +47,14 @@ async function main(): Promise<void> {
     { BUILD_MODE },
     { listSessions },
     { runFirstRunSetup },
-    { getOllamaHost, getOllamaContextWindow },
+    { resolveConfiguredModel },
     { resolveUpdateInfo },
   ] = await Promise.all([
     import('./session.js'),
     import('./modes/build.js'),
     import('./persistence/sessions.js'),
     import('./providers/setup-tui.js'),
-    import('./providers/ollama.js'),
+    import('./providers/model-resolution.js'),
     import('./updates/checker.js'),
   ]);
 
@@ -76,7 +76,7 @@ async function main(): Promise<void> {
 
   if (!hasProviders) {
     // No credentials stored: run first-run setup
-    const setupResult = await runFirstRunSetup(providerManager, credentialStore);
+    const setupResult = await runFirstRunSetup(providerManager, credentialStore, config.ollama, config.contextWindowLimit);
     provider = setupResult.provider;
     modelId = setupResult.modelId;
     model = setupResult.resolvedModel;
@@ -91,19 +91,10 @@ async function main(): Promise<void> {
     provider = resolvedProvider;
     modelId = args.model ?? config.defaultModel ?? defaults.model ?? getDefaultModel(provider);
 
-    // Ollama/custom connections need createCustomModel; standard providers use resolveModel
+    // Resolve local connections through the shared provider configuration.
     const entry = await credentialStore.getProvider(provider);
     if (entry?.method === 'custom' || provider === 'ollama') {
-      const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
-      const contextWindow = provider === 'ollama'
-        ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), modelId) ?? undefined
-        : undefined;
-      model = await providerManager.createCustomModel({
-        baseUrl,
-        modelId,
-        contextWindow,
-        ...(entry?.apiKey ? { apiKey: entry.apiKey } : {}),
-      });
+      model = await resolveConfiguredModel(providerManager, provider, modelId, entry, config.ollama, config.contextWindowLimit);
     } else {
       try {
         model = await providerManager.resolveModel(provider, modelId);

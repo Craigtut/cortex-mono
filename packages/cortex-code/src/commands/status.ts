@@ -1,3 +1,4 @@
+import { getOllamaRuntimeInfo } from '@animus-labs/cortex';
 import type { ResolutionNote } from '@animus-labs/cortex';
 import type { Command } from './index.js';
 
@@ -19,6 +20,15 @@ export const statusCommand: Command = {
     const app = session.getApp();
     if (!app) return;
 
+    const agent = session.getAgent();
+    const contextStatus = agent
+      ? `\nContext: requested ${agent.contextWindowLimit ?? 'model capacity'}, budget ${agent.effectiveContextWindow}, capacity ${agent.modelContextWindow} tokens`
+      : '';
+    const runtime = agent ? getOllamaRuntimeInfo(agent.getModel()) : null;
+    const runtimeStatus = runtime
+      ? `\nOllama: ${runtime.transport}, ${runtime.contextWindow} tokens allocated`
+        + (runtime.trainedContextWindow ? `, trained maximum ${runtime.trainedContextWindow}` : '')
+      : '';
     const notes = session.getResolutionReport() as ResolutionNote[];
     const body = notes.length === 0
       ? 'Everything resolved as configured.'
@@ -26,7 +36,7 @@ export const statusCommand: Command = {
 
     app.transcript.addNotification(
       'Session Status',
-      `${renderAgentMode(session.getAgentMode())}\n\n${body}`,
+      `${renderAgentMode(session.getAgentMode())}${contextStatus}${runtimeStatus}\n\n${body}`,
     );
   },
 };

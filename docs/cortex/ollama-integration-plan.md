@@ -1,6 +1,11 @@
 # Ollama integration plan
 
-Status: proposed, not implemented. Reviewed 2026-09-06.
+Status: implemented with native transport opt-in. Reviewed 2026-09-06.
+
+See [the consumer guide](ollama.md) for configuration and the sequential
+benchmark. Native remains opt-in until the target-hardware comparison passes.
+The sections below record the design; the consumer guide describes current
+behavior.
 
 Build a dedicated Ollama provider in Cortex, with native `/api/chat` inference
 as the target transport. Keep pi-agent-core and pi-ai's message/event contract.
@@ -28,12 +33,12 @@ registration bridge so the planned `createModels()` migration can replace it.
 Sources: [pi-ai provider documentation](https://github.com/earendil-works/pi/blob/9767ba275f3e9a5ee0f5c5342249b629ab1b2282/packages/ai/README.md),
 [installed compatibility implementation](../../node_modules/@earendil-works/pi-ai/dist/compat.js).
 
-## Current behavior and confirmed gaps
+## Baseline behavior and confirmed gaps
 
-The current path is Cortex Code model resolution, `createCustomModel()`,
+Before implementation, the path was Cortex Code model resolution, `createCustomModel()`,
 `AgentLoop`, pi-agent-core, pi-ai's OpenAI completions adapter, and Ollama.
 
-| Area | Current behavior | Required change |
+| Area | Baseline behavior | Required change |
 | --- | --- | --- |
 | Provider identity | Ollama is wrapped as `custom`. | Preserve `ollama` identity and connection-specific configuration. |
 | Model metadata | Clones GPT-4.1, inheriting `reasoning: false`, image support, output limits, and pricing. | Construct an explicit descriptor using discovered capabilities and local configuration. Local inference has zero API price. |
@@ -272,6 +277,6 @@ global settings. Quantized KV is a separate memory/quality experiment.
    an explicit OpenAI-compatible fallback for older servers or proxies, with
    its control limitations visible. Never switch protocols silently on failure.
 
-No production code or Ollama server settings changed during this research.
-The localhost server was unavailable, so throughput, VRAM use, and actual cache
-reuse remain unmeasured. The protocol and registry probes used synthetic data.
+Production integration and automated contract tests are implemented. No global
+Ollama server settings were changed. The target-hardware comparison remains
+pending; synthetic protocol tests do not establish real throughput or VRAM use.

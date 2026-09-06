@@ -26,7 +26,9 @@ import {
 } from '@earendil-works/pi-tui';
 import { ProviderManager, type CortexModel, PROVIDER_REGISTRY, OAUTH_PROVIDER_IDS } from '@animus-labs/cortex';
 import { ProviderSetupFlow, type SetupResult, type SetupStep } from './setup.js';
-import { detectOllama, getOllamaContextWindow, getOllamaHost } from './ollama.js';
+import { detectOllama } from './ollama.js';
+import { resolveConfiguredModel } from './model-resolution.js';
+import type { CortexCodeConfig } from '../config/config.js';
 import { CredentialStore, type CredentialEntry } from '../config/credentials.js';
 import { renderOAuthCallbackPage } from './oauth-callback-page.js';
 import { colors, selectListTheme } from '../tui/theme.js';
@@ -602,26 +604,14 @@ async function createFlow(providerManager: ProviderManager): Promise<ProviderSet
 // ---------------------------------------------------------------------------
 
 async function resolveModelForResult(
-  providerManager: ProviderManager,
-  result: SetupResult,
+  providerManager: ProviderManager, result: SetupResult, ollama?: CortexCodeConfig['ollama'],
+  contextWindowLimit?: CortexCodeConfig['contextWindowLimit'],
 ): Promise<CortexModel> {
-  if (result.method === 'custom' || result.provider === 'ollama') {
-    // Ollama and custom connections use createCustomModel with a base URL.
-    // For Ollama, query the model's real trained context length so we don't
-    // fall back to createCustomModel's generic 128k default (which overflows
-    // small-context local models). Mirrors the stored-credentials path in index.ts.
-    const baseUrl = result.baseUrl ?? 'http://localhost:11434/v1';
-    const contextWindow = result.provider === 'ollama'
-      ? await getOllamaContextWindow(getOllamaHost(result.baseUrl), result.model) ?? undefined
-      : undefined;
-    return providerManager.createCustomModel({
-      baseUrl,
-      modelId: result.model,
-      contextWindow,
-      ...(result.apiKey ? { apiKey: result.apiKey } : {}),
-    });
-  }
-  return providerManager.resolveModel(result.provider, result.model);
+  return resolveConfiguredModel(providerManager, result.provider, result.model, {
+    method: result.method,
+    ...(result.baseUrl ? { baseUrl: result.baseUrl } : {}),
+    ...(result.apiKey ? { apiKey: result.apiKey } : {}),
+  }, ollama, contextWindowLimit);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +621,8 @@ async function resolveModelForResult(
 export async function runFirstRunSetup(
   providerManager: ProviderManager,
   credentialStore: CredentialStore,
+  ollama?: CortexCodeConfig['ollama'],
+  contextWindowLimit?: CortexCodeConfig['contextWindowLimit'],
 ): Promise<SetupTuiResult> {
   const flow = await createFlow(providerManager);
 
@@ -671,7 +663,7 @@ export async function runFirstRunSetup(
         await credentialStore.setDefaults(result.provider, result.model);
 
         try {
-          const resolvedModel = await resolveModelForResult(providerManager, result);
+          const resolvedModel = await resolveModelForResult(providerManager, result, ollama, contextWindowLimit);
 
           // Show completion
           contentContainer.clear();

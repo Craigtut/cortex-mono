@@ -93,7 +93,7 @@ import { workspaceSettingsPath } from './permissions/rules.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { log } from './logger.js';
-import { getOllamaHost, getOllamaContextWindow } from './providers/ollama.js';
+import { resolveConfiguredModel } from './providers/model-resolution.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
 import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
 import { FileSessionActivityReporter, watchDecisionFile, type PermissionResolution } from './activity/session-activity.js';
@@ -1993,7 +1993,7 @@ export class Session {
     if (!entry) {
       // Keyless providers (e.g., Ollama) may not have a credential store
       // entry at all. Return a placeholder so the OpenAI SDK doesn't throw.
-      if (provider === 'custom' || this.provider === 'ollama') {
+      if (provider === 'custom' || provider === 'ollama') {
         return 'sk-no-key-required';
       }
       throw new Error(`No credentials for provider "${provider}". Run /login to connect.`);
@@ -2925,14 +2925,7 @@ export class Session {
 
   private async resolveProviderModel(provider: string, modelId: string): Promise<CortexModel> {
     const entry = await this.credentialStore.getProvider(provider);
-    if (entry?.method === 'custom' || provider === 'ollama') {
-      const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
-      const contextWindow = provider === 'ollama'
-        ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), modelId) ?? undefined
-        : undefined;
-      return this.providerManager.createCustomModel({ baseUrl, modelId, contextWindow });
-    }
-    return this.providerManager.resolveModel(provider, modelId);
+    return resolveConfiguredModel(this.providerManager, provider, modelId, entry, this.config.ollama, this.config.contextWindowLimit);
   }
 
   private async applyUtilityModel(modelId: string, persist: boolean): Promise<void> {
@@ -2974,17 +2967,7 @@ export class Session {
 
   /** Switch the primary model. Returns the new CortexModel or throws. */
   async switchModel(modelId: string): Promise<void> {
-    let newModel;
-    const entry = await this.credentialStore.getProvider(this.provider);
-    if (entry?.method === 'custom' || this.provider === 'ollama') {
-      const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
-      const contextWindow = this.provider === 'ollama'
-        ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), modelId) ?? undefined
-        : undefined;
-      newModel = await this.providerManager.createCustomModel({ baseUrl, modelId, contextWindow });
-    } else {
-      newModel = await this.providerManager.resolveModel(this.provider, modelId);
-    }
+    const newModel = await this.resolveProviderModel(this.provider, modelId);
     this.agent!.setModel(newModel);
     this.modelId = modelId;
     // Reconcile effort with new model's capabilities
@@ -3000,17 +2983,7 @@ export class Session {
   async switchProvider(newProvider: string, newModelId: string): Promise<void> {
     log.info('Switching provider', { from: this.provider, to: newProvider, model: newModelId });
 
-    let newModel;
-    const entry = await this.credentialStore.getProvider(newProvider);
-    if (entry?.method === 'custom' || newProvider === 'ollama') {
-      const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
-      const contextWindow = newProvider === 'ollama'
-        ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), newModelId) ?? undefined
-        : undefined;
-      newModel = await this.providerManager.createCustomModel({ baseUrl, modelId: newModelId, contextWindow });
-    } else {
-      newModel = await this.providerManager.resolveModel(newProvider, newModelId);
-    }
+    const newModel = await this.resolveProviderModel(newProvider, newModelId);
 
     this.agent!.setModel(newModel);
     this.provider = newProvider;

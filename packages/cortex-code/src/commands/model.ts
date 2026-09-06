@@ -43,7 +43,8 @@ export const providerCommand: Command = {
 
     // Auto-detect running Ollama and include it even without a credential entry
     if (!providerIds.includes('ollama')) {
-      const ollama = await detectOllama();
+      const entry = await session.getCredentialStore().getProvider('ollama');
+      const ollama = await detectOllama({ baseUrl: entry?.baseUrl, apiKey: entry?.apiKey });
       if (ollama.running && ollama.models.length > 0) {
         providerIds.push('ollama');
       }
@@ -135,15 +136,16 @@ async function showModelPicker(
   try {
     if (provider === 'ollama') {
       // Ollama models come from the local Ollama API, not pi-ai's registry
-      const ollama = await detectOllama();
+      const entry = await session.getCredentialStore().getProvider('ollama');
+      const ollama = await detectOllama({ baseUrl: entry?.baseUrl, apiKey: entry?.apiKey });
       // Fetch context windows in parallel (fast local /api/show calls)
       const contextWindows = await Promise.all(
-        ollama.models.map(m => getOllamaContextWindow(ollama.host, m.name)),
+        ollama.models.map(m => getOllamaContextWindow(ollama.host, m.name, { apiKey: entry?.apiKey })),
       );
       models = ollama.models.map((m, i) => ({
         id: m.name,
         name: m.details?.parameter_size ? `${m.name} (${m.details.parameter_size})` : m.name,
-        contextWindow: contextWindows[i] ?? 128_000,
+        contextWindow: contextWindows[i] ?? 0,
       }));
     } else {
       const pm = session.getProviderManager();
@@ -188,7 +190,9 @@ async function showModelPicker(
 
   for (const m of models) {
     const isCurrent = m.id === currentModelId;
-    const ctxK = `${(m.contextWindow / 1000).toFixed(0)}k`;
+    const ctxK = m.contextWindow > 0
+      ? `${(m.contextWindow / 1000).toFixed(0)}k${provider === 'ollama' ? ' trained maximum' : ''}`
+      : 'context unknown';
     const item: SelectItem = {
       value: m.id,
       label: isCurrent ? `${m.id} \u2190 current` : m.id,
@@ -237,7 +241,8 @@ async function showModelPicker(
       }
 
       // Primary model selection
-      if (item.value === currentModelId && provider === session.getProvider()) {
+      // Local allocation can change outside Cortex. Reselecting refreshes it.
+      if (provider !== 'ollama' && item.value === currentModelId && provider === session.getProvider()) {
         app.transcript.addNotification('Model', `Already using ${item.value}.`);
         resolve();
         return;
@@ -250,7 +255,7 @@ async function showModelPicker(
         agent.estimateCurrentContextTokens(),
       );
 
-      if (selectedModel && currentTokens > selectedModel.contextWindow) {
+      if (selectedModel && selectedModel.contextWindow > 0 && currentTokens > selectedModel.contextWindow) {
         await showModelSwitchWarning(session, provider, item.value, currentTokens, selectedModel.contextWindow);
       } else {
         await doModelSwitch(session, provider, item.value);

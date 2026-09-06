@@ -3,15 +3,16 @@ import { readFile } from 'node:fs/promises';
 import {
   PRIMARY_MODEL_DEFAULTS,
   ProviderManager,
-  forcedToolChoiceFor,
+  structuredCompletionRequest,
+  parseSchemaCompletion,
   unwrapModel,
   type CortexModel,
 } from '@animus-labs/cortex';
 
 import { loadConfig } from './config/config.js';
-import { CredentialStore, type CredentialEntry } from './config/credentials.js';
+import { CredentialStore } from './config/credentials.js';
 import { resolveStoredOAuthApiKey } from './utils/oauth-credentials.js';
-import { getOllamaContextWindow, getOllamaHost } from './providers/ollama.js';
+import { resolveConfiguredModel } from './providers/model-resolution.js';
 
 interface CompleteArgs {
   promptParts: string[];
@@ -204,32 +205,8 @@ async function resolveCompletionModel(input: {
       ?? await input.credentialStore.getDefaultUtilityModel(provider)
       ?? primaryModelId;
 
-  const model = await resolveModel(input.providerManager, entry, provider, utilityModelId);
+  const model = await resolveConfiguredModel(input.providerManager, provider, utilityModelId, entry, config.ollama, config.contextWindowLimit);
   return { provider, modelId: utilityModelId, model };
-}
-
-async function resolveModel(
-  providerManager: ProviderManager,
-  entry: CredentialEntry | null,
-  provider: string,
-  modelId: string,
-): Promise<CortexModel> {
-  if (entry?.method === 'custom' || provider === 'ollama') {
-    const baseUrl = entry?.baseUrl ?? 'http://localhost:11434/v1';
-    const contextWindow = provider === 'ollama'
-      ? await getOllamaContextWindow(getOllamaHost(entry?.baseUrl), modelId) ?? undefined
-      : undefined;
-    const customConfig: { baseUrl: string; modelId: string; contextWindow?: number } = {
-      baseUrl,
-      modelId,
-    };
-    if (contextWindow !== undefined) {
-      customConfig.contextWindow = contextWindow;
-    }
-    return providerManager.createCustomModel(customConfig);
-  }
-
-  return providerManager.resolveModel(provider, modelId);
 }
 
 async function resolveApiKey(
@@ -283,20 +260,13 @@ async function completeWithModel(input: {
     systemPrompt: input.systemPrompt,
     messages: [{ role: 'user', content: input.prompt }],
   };
+  const completeOptions: Record<string, unknown> = { apiKey: input.apiKey };
   if (input.schema) {
-    context['tools'] = [{
-      name: toolName,
-      description: 'Produce structured output',
-      parameters: input.schema,
-    }];
-  }
-
-  const completeOptions: Record<string, unknown> = {
-    apiKey: input.apiKey,
-  };
-  if (input.schema) {
-    // Per-API-family spelling: OpenAI rejects "any".
-    completeOptions['toolChoice'] = forcedToolChoiceFor(unwrapModel(input.model));
+    const request = structuredCompletionRequest(input.model, input.schema, {
+      name: toolName, description: 'Produce structured output', parameters: input.schema,
+    });
+    Object.assign(context, request.context);
+    Object.assign(completeOptions, request.options);
   }
 
   const result = await piAi.complete(
@@ -307,6 +277,7 @@ async function completeWithModel(input: {
   checkForSilentError(result);
 
   if (input.schema) {
+    if (input.model.capabilities?.structuredOutput === 'json-schema') return parseSchemaCompletion(result, input.schema);
     const toolArgs = extractToolCallArgs(result, toolName);
     if (toolArgs) {
       return toolArgs;
