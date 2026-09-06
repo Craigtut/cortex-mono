@@ -4,7 +4,14 @@ All notable changes to `@animus-labs/cortex` are documented here.
 
 ## Unreleased
 
-- Upgrade pi-agent-core and pi-ai from `0.84.1` to `0.85.1`. Existing Cortex integrations need no API migration; see `docs/cortex/pi-upgrade-0.85.1.md` for the upstream compatibility review.
+## 0.6.0
+
+- Breaking: rename the former single-loop `CortexAgent` to `AgentLoop` and its configuration to `AgentLoopConfig`. `CortexAgent` now owns a composite agent with duplex talker/reasoner behavior by default; use `AgentLoop` for the prior primitive or `mode: 'passthrough'` for a single-loop facade.
+- Breaking: remove the deprecated `systemPrompt` config, `buildSystemPrompt()`, and `rebuildSystemPrompt()` aliases. Use `initialBasePrompt` and the current prompt APIs. Facade persistence now uses composite `getState()`/`restore()` state; consult `docs/cortex/cortex-agent.md` before migrating.
+- Add duplex routing, session logs, loop-origin metadata, permission coordination, and conversation/work settlement APIs.
+- Add a consumer-provided sandbox boundary for Bash, Grep, stdio MCP, and sub-agent execution, plus network-access resolution and per-command escalation.
+- Upgrade pi-agent-core and pi-ai from the published `0.80.3` baseline to `0.85.1`; migrate OAuth to per-provider authentication and derive effort choices from model metadata.
+- Fix credential scrubbing, internal-tool permission exemptions, prompt tool descriptions, and working-tag aliases and stream filtering.
 - Add structured contexts (`slots`/`history`/`ephemeral`/`prompt`) to `directComplete()`, `structuredComplete()`, and `utilityComplete()`, applying the agentic loop's cache breakpoint strategy to direct calls.
 - Add per-call `sessionId` override to direct completion options for cache affinity across distinct pipelines.
 - Forward the agent's `cacheRetention` and `sessionId` on `utilityComplete()` calls (previously dropped).

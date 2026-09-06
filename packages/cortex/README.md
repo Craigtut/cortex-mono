@@ -18,7 +18,7 @@ Requires Node.js 24+.
 import { AgentLoop, ProviderManager } from '@animus-labs/cortex';
 
 const providers = new ProviderManager();
-const model = await providers.resolveModel('anthropic', 'claude-sonnet-4-20250514');
+const model = await providers.resolveModel('anthropic', 'claude-sonnet-4-6');
 
 const agent = await AgentLoop.create({
   model,

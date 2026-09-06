@@ -1,21 +1,21 @@
-name: Release Cortex Code
+name: Release Cortex Sandbox
 
 on:
   push:
     tags:
-      - "cortex-code-v*"
+      - "cortex-sandbox-v*"
 
 permissions:
   contents: read
 
 env:
-  PACKAGE_NAME: "@animus-labs/cortex-code"
-  PACKAGE_DIR: "packages/cortex-code"
-  TAG_PREFIX: "cortex-code-v"
+  PACKAGE_NAME: "@animus-labs/cortex-sandbox"
+  PACKAGE_DIR: "packages/cortex-sandbox"
+  TAG_PREFIX: "cortex-sandbox-v"
   NPM_VERSION: "11.18.0"
 
 concurrency:
-  group: release-cortex-code-${{ github.ref_name }}
+  group: release-cortex-sandbox-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -62,51 +62,33 @@ jobs:
             exit 1
           fi
 
-      - name: Check published workspace dependencies
+      - name: Check published Cortex peer dependency
         run: |
-          for dependency in cortex cortex-sandbox; do
-            range="$(node -p "require('./${PACKAGE_DIR}/package.json').dependencies['@animus-labs/${dependency}']")"
-            npm view "@animus-labs/${dependency}@${range}" version
-          done
+          range="$(node -p "require('./${PACKAGE_DIR}/package.json').peerDependencies['@animus-labs/cortex']")"
+          npm view "@animus-labs/cortex@${range}" version
 
-      # Dependencies first. Every workspace cortex-code imports resolves to a
-      # gitignored dist and none of them has a prepare script, so on a clean
-      # runner @animus-labs/cortex, /cortex-sandbox and /brand do not exist
-      # until something builds them. Typechecking or testing before that point
-      # does not fail safe: verified on a clean checkout, tsc reports TS2307
-      # across the package and 28 of 66 test files fail to import. On a runner
-      # where a dist happens to be lying around it is worse, because the job
-      # then certifies whatever build that was rather than the one it packs.
-      # The enumeration below is what drifted (it named only cortex, and
-      # cortex-code imports three). Keeping it explicit rather than building
-      # every workspace avoids dragging apps/ into a package release; the
-      # Typecheck step immediately after is the drift guard, since a
-      # dependency added later and not built here fails there with TS2307.
-      - name: Build workspace dependencies
-        run: npm run build -w packages/brand -w packages/cortex -w packages/cortex-sandbox
+      # The sandbox public types import Cortex. Build its declarations first.
+      - name: Build Cortex
+        run: npm run build -w packages/cortex
 
       - name: Typecheck
-        run: npm run typecheck -w packages/cortex-code
+        run: npm run typecheck -w packages/cortex-sandbox
 
-      # Against the built package, not framework source: this job exists to
-      # certify the artifact.
       - name: Test
-        run: npm run test:run -w packages/cortex-code
-        env:
-          CORTEX_TEST_TARGET: dist
+        run: npm run test:run -w packages/cortex-sandbox
 
-      - name: Build Cortex Code
-        run: npm run build -w packages/cortex-code
+      - name: Build
+        run: npm run build -w packages/cortex-sandbox
 
       - name: Pack package
         run: |
           mkdir -p release-artifacts
-          npm pack -w packages/cortex-code --pack-destination release-artifacts
+          npm pack -w packages/cortex-sandbox --pack-destination release-artifacts
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cortex-code-package
+          name: cortex-sandbox-package
           path: release-artifacts/*.tgz
           if-no-files-found: error
           retention-days: 7
@@ -133,7 +115,7 @@ jobs:
       - name: Download package artifact
         uses: actions/download-artifact@v4
         with:
-          name: cortex-code-package
+          name: cortex-sandbox-package
           path: release-artifacts
 
       - name: Stage package

@@ -34,7 +34,8 @@
     "src",
     "vendor",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "exports": {
     ".": {
@@ -61,7 +62,7 @@
     "@anthropic-ai/sandbox-runtime": "0.0.63"
   },
   "peerDependencies": {
-    "@animus-labs/cortex": "^0.5.0"
+    "@animus-labs/cortex": "^0.6.0"
   },
   "devDependencies": {
     "@animus-labs/cortex": "*",
