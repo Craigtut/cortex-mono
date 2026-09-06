@@ -4,6 +4,7 @@ All notable changes to `@animus-labs/cortex-code` are documented here.
 
 ## Unreleased
 
+- Upgrade pi-ai and pi-tui from `0.84.1` to `0.85.1`. Default rendering behavior is unchanged; pi-tui no longer reads `PI_HARDWARE_CURSOR` or `PI_CLEAR_ON_SHRINK`, and its redraw debug variable is now `PI_TUI_DEBUG_REDRAW`.
 - **Session files moved to a composite artifact, and the move is one-way.**
   A session now saves as `state.json`, which carries the session log, both
   agent loops' histories, observational memory and per-loop usage. The old

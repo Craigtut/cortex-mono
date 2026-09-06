@@ -58,8 +58,8 @@
   "dependencies": {
     "@animus-labs/cortex": "^0.5.0",
     "@animus-labs/cortex-sandbox": "^0.1.0",
-    "@earendil-works/pi-ai": "^0.84.1",
-    "@earendil-works/pi-tui": "^0.84.1",
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
     "chalk": "^5.4.0",
     "cli-highlight": "^2.1.11",
     "proper-lockfile": "^4.1.2"

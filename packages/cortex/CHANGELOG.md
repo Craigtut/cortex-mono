@@ -4,6 +4,7 @@ All notable changes to `@animus-labs/cortex` are documented here.
 
 ## Unreleased
 
+- Upgrade pi-agent-core and pi-ai from `0.84.1` to `0.85.1`. Existing Cortex integrations need no API migration; see `docs/cortex/pi-upgrade-0.85.1.md` for the upstream compatibility review.
 - Add structured contexts (`slots`/`history`/`ephemeral`/`prompt`) to `directComplete()`, `structuredComplete()`, and `utilityComplete()`, applying the agentic loop's cache breakpoint strategy to direct calls.
 - Add per-call `sessionId` override to direct completion options for cache affinity across distinct pipelines.
 - Forward the agent's `cacheRetention` and `sessionId` on `utilityComplete()` calls (previously dropped).
