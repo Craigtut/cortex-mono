@@ -6,6 +6,8 @@ All notable changes to `@animus-labs/cortex` are documented here.
 
 ## 0.6.0
 
+- Add native local Ollama support through `ProviderManager.createOllamaModel()`, including runtime context allocation, thinking, structured output, and inference metrics. Requires Ollama `0.15.0` or newer.
+- Honor small context budgets without the former 16K floor, share budget calculations across compaction strategies, and preserve Ollama prompt prefixes until context pressure requires trimming.
 - Breaking: rename the former single-loop `CortexAgent` to `AgentLoop` and its configuration to `AgentLoopConfig`. `CortexAgent` now owns a composite agent with duplex talker/reasoner behavior by default; use `AgentLoop` for the prior primitive or `mode: 'passthrough'` for a single-loop facade.
 - Breaking: remove the deprecated `systemPrompt` config, `buildSystemPrompt()`, and `rebuildSystemPrompt()` aliases. Use `initialBasePrompt` and the current prompt APIs. Facade persistence now uses composite `getState()`/`restore()` state; consult `docs/cortex/cortex-agent.md` before migrating.
 - Add duplex routing, session logs, loop-origin metadata, permission coordination, and conversation/work settlement APIs.
