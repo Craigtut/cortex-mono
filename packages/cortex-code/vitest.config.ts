@@ -40,7 +40,7 @@ export default defineConfig({
   },
   resolve: {
     alias: target === 'source'
-      // Anchored: a bare prefix would also capture @animus-labs/cortex-sandbox.
+      // Resolve only the root export; preserve subpath resolution.
       ? [{ find: /^@animus-labs\/cortex$/, replacement: cortexSource }]
       : [],
   },

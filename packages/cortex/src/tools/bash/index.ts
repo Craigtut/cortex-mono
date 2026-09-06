@@ -635,7 +635,7 @@ export function createBashTool(config: BashToolConfig): {
           }
         }, autoYieldThreshold);
 
-        proc.on('close', (code) => {
+        proc.on('close', async (code) => {
           clearTimeout(timeoutTimer);
           clearTimeout(autoYieldTimer);
           if (streamInterval) {
@@ -690,7 +690,7 @@ export function createBashTool(config: BashToolConfig): {
           if (sandboxWrapped && !timedOut && code !== null && code !== 0) {
             let denial: SandboxDenial | null = null;
             try {
-              denial = config.sandbox?.classifyFailure?.({
+              denial = await config.sandbox?.classifyFailure?.({
                 command: fullCommand,
                 exitCode: code,
                 stderr,

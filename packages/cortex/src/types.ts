@@ -421,11 +421,9 @@ export interface AgentLoopConfig {
   };
 
   /**
-   * Optional OS-level sandbox for subprocess execution (the Bash tool, and in
-   * future other spawn sites). Cortex ships no enforcement of its own; the
-   * consumer supplies an already-initialized SandboxProvider (e.g. from
-   * @animus-labs/cortex-sandbox) that wraps each spawn in an OS boundary.
-   * When omitted, subprocess execution is unchanged. See docs/cortex/sandboxing.md.
+   * Advanced loop primitive: a borrowed, initialized sandbox provider.
+   * The caller owns its lifecycle. Most consumers should use CortexAgent
+   * with sandbox: true or SandboxOptions for automatic setup and cleanup.
    */
   sandbox?: SandboxProvider;
 

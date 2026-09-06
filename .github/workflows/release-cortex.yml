@@ -65,11 +65,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck -w packages/cortex
 
-      - name: Test
-        run: npm run test:run -w packages/cortex
-
       - name: Build
         run: npm run build -w packages/cortex
+
+      - name: Test
+        run: npm run test:run -w packages/cortex
 
       - name: Pack package
         run: |

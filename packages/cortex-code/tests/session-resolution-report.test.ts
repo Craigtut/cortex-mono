@@ -178,7 +178,11 @@ describe('a note that appears after assembly still reaches the footer', () => {
     const ctx = await createDuplexSession(cwd, {}, {
       talker: { model: fastModel() },
       duplex: { maxTotalCost: 5 },
-      sandbox: { status: () => ({ mode: 'none' }) } as never,
+      sandbox: {
+        initialize: async () => ({}),
+        wrapSpawn: async (spec: unknown) => spec,
+        dispose: async () => {},
+      } as never,
       resolveNetworkAccess: async () => ({ decision: 'allow' as const }),
     });
 

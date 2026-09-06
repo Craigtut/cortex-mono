@@ -1,9 +1,4 @@
-/**
- * Sandbox seam (public surface).
- *
- * Type-only: core defines the vocabulary and provider contract; enforcement is
- * supplied by a consumer package. See docs/cortex/sandboxing.md.
- */
+/** Built-in sandbox policy, platform adapters, and public configuration. */
 export type {
   SandboxRung,
   SandboxFilesystemPolicy,
@@ -24,3 +19,41 @@ export type {
   NetworkAccessDecision,
   ResolveNetworkAccess,
 } from './types.js';
+
+export { SandboxRuntimeProvider } from './backends/runtime.js';
+export type { SandboxRuntimeProviderOptions } from './backends/runtime.js';
+export {
+  WindowsRestrictedTokenProvider,
+  serializeWindowsPolicy,
+  buildHelperInvocation,
+  deriveWorkspaceCapabilitySidName,
+  defaultHelperPath,
+  isHelperSetupFailure,
+  runHelperSelfTest,
+  WINDOWS_POLICY_VERSION,
+  WINDOWS_HELPER_SETUP_FAILURE_EXIT,
+  WINDOWS_HELPER_SETUP_FAILURE_SENTINEL,
+  WINDOWS_HELPER_SELFTEST_OK,
+  DEFAULT_CAPABILITY_SID_NAME,
+} from './backends/windows.js';
+export type {
+  WindowsRestrictedTokenProviderOptions,
+  WindowsHelperPolicy,
+  HelperSelfTestResult,
+} from './backends/windows.js';
+export { createSandboxProvider } from './factory.js';
+export type { CreateSandboxProviderOptions } from './factory.js';
+export { denialFromViolations, denialFromFailureHeuristic } from './classify.js';
+export type { ViolationLike, DenialCorroborationContext } from './classify.js';
+export {
+  buildDefaultPolicy,
+  defaultSecretReadDenies,
+  defaultDangerousWriteDenies,
+  matchesDomainPattern,
+  matchesAnyDomainPattern,
+  SEEDED_REGISTRY_DOMAINS,
+  DEFAULT_CREDENTIAL_ENV_VARS,
+} from './policy.js';
+export type { DefaultPolicyOptions } from './policy.js';
+
+export type { SandboxConfig, SandboxOptions, SandboxState } from './options.js';

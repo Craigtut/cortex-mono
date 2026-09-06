@@ -6,7 +6,7 @@ companion to the design in [`sandboxing.md`](./sandboxing.md) ("Layer 3: native
 Windows (no WSL2)").
 
 > **Status: built and behaviorally verified on Windows; code-signing still
-> pending.** The helper crate (`packages/cortex-sandbox/windows-helper`) now
+> pending.** The helper crate (`packages/cortex/windows-helper`) now
 > compiles clean on `x86_64-pc-windows-msvc` (Rust 1.94 / `windows` crate 0.58),
 > its `cargo test` suite passes, and the full adversarial containment suite
 > (`tests/windows-containment.integration.test.ts`, run through the real
@@ -24,9 +24,9 @@ Windows (no WSL2)").
 
 ## What ships, and how the pieces fit
 
-- **Rust helper** (`packages/cortex-sandbox/windows-helper`): a small exe,
+- **Rust helper** (`packages/cortex/windows-helper`): a small exe,
   `cortex-sandbox-helper.exe`, built for Windows and Authenticode-signed.
-- **TS provider** (`packages/cortex-sandbox/src/windows.ts`,
+- **TS provider** (`packages/cortex/src/sandbox/backends/windows.ts`,
   `WindowsRestrictedTokenProvider`): on win32, Cortex's Bash tool spawns the
   helper in place of the shell. It writes the policy JSON to a private
   per-session directory that is never under a writable root (and lists that
@@ -55,7 +55,7 @@ Prerequisites on the Windows build agent:
   the Windows SDK import libs).
 
 ```powershell
-cd packages\cortex-sandbox\windows-helper
+cd packages\cortex\windows-helper
 cargo build --release --target x86_64-pc-windows-msvc
 cargo test  --target x86_64-pc-windows-msvc   # policy + command-line unit tests
 ```
@@ -193,7 +193,7 @@ Place the signed binary where the provider looks for it (see
 `defaultHelperPath()` in `src/windows.ts`):
 
 ```
-packages/cortex-sandbox/vendor/win32-x64/cortex-sandbox-helper.exe
+packages/cortex/vendor/win32-x64/cortex-sandbox-helper.exe
 ```
 
 The package's `files` allowlist must include `vendor/` so the binary is
@@ -313,7 +313,7 @@ Both are called out here so a reviewer can weigh them.
 ## Adversarial containment tests (run on Windows before trusting it)
 
 These are codified as an automated suite in
-`packages/cortex-sandbox/tests/windows-containment.integration.test.ts`, which
+`packages/cortex/tests/unit/sandbox/windows-containment.integration.test.ts`, which
 drives the real `WindowsRestrictedTokenProvider` with the bundled binary and
 skips on any non-win32 host or when the binary is absent. It uses **PowerShell**
 as the shell, matching cortex's own `selectWindowsShell` and the helper's
@@ -321,7 +321,7 @@ command-line reconstruction (Node's `child_process.spawn` and PowerShell both
 use CommandLineToArgvW quoting; `cmd.exe` has its own quote parser and is never
 used by cortex on Windows, so the helper matches `spawn`, not `cmd`). Run it with
 `npx vitest run tests/windows-containment.integration.test.ts` from
-`packages/cortex-sandbox`.
+`packages/cortex`.
 
 The suite asserts (verified passing on a local build) that each of these is
 **denied** (non-zero, and the write does not land on disk):
@@ -384,3 +384,7 @@ provider must keep reporting UNCONTAINED `none` rather than claim the Tier-1
   one is `/sandbox off` or clearing the antivirus block. The preflight
   (`--selftest`) already catches the dominant case (a helper that cannot run or
   create a restricted token at all) at initialize time.
+
+## Managed Cortex setup
+
+The helper is now part of the Cortex package layout. `CortexAgent` manages its lifecycle when sandboxing is enabled. Strict managed setup requires the requested protections and rejects the current partial Tier 1 boundary; explicitly set `requireEnforcement: false` to accept it. Cortex Code retains its explicit degraded-operation preference and Windows opt-in default.

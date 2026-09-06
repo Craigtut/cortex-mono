@@ -64,26 +64,26 @@ jobs:
 
       - name: Check published workspace dependencies
         run: |
-          for dependency in cortex cortex-sandbox; do
+          for dependency in cortex; do
             range="$(node -p "require('./${PACKAGE_DIR}/package.json').dependencies['@animus-labs/${dependency}']")"
             npm view "@animus-labs/${dependency}@${range}" version
           done
 
       # Dependencies first. Every workspace cortex-code imports resolves to a
       # gitignored dist and none of them has a prepare script, so on a clean
-      # runner @animus-labs/cortex, /cortex-sandbox and /brand do not exist
+      # runner @animus-labs/cortex and /brand do not exist
       # until something builds them. Typechecking or testing before that point
       # does not fail safe: verified on a clean checkout, tsc reports TS2307
       # across the package and 28 of 66 test files fail to import. On a runner
       # where a dist happens to be lying around it is worse, because the job
       # then certifies whatever build that was rather than the one it packs.
       # The enumeration below is what drifted (it named only cortex, and
-      # cortex-code imports three). Keeping it explicit rather than building
+      # cortex-code imports two). Keeping it explicit rather than building
       # every workspace avoids dragging apps/ into a package release; the
       # Typecheck step immediately after is the drift guard, since a
       # dependency added later and not built here fails there with TS2307.
       - name: Build workspace dependencies
-        run: npm run build -w packages/brand -w packages/cortex -w packages/cortex-sandbox
+        run: npm run build -w packages/brand -w packages/cortex
 
       - name: Typecheck
         run: npm run typecheck -w packages/cortex-code

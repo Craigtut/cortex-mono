@@ -331,7 +331,7 @@ export type {
 } from './tools/tool-search/index.js';
 export type { DeferredToolsConfig } from './types.js';
 
-// Sandbox seam (types + provider contract; enforcement is consumer-supplied)
+// Sandbox policy and provider contract.
 export type {
   SandboxRung,
   SandboxFilesystemPolicy,
@@ -443,3 +443,7 @@ export type {
   ApiKeyValidationResult,
 } from './provider-manager.js';
 export { forcedToolChoiceFor } from './tool-choice.js';
+
+// Built-in sandbox backends and policy settings.
+export { createSandboxProvider, buildDefaultPolicy, matchesAnyDomainPattern, matchesDomainPattern, SEEDED_REGISTRY_DOMAINS, DEFAULT_CREDENTIAL_ENV_VARS, WindowsRestrictedTokenProvider } from './sandbox/index.js';
+export type { SandboxConfig, SandboxOptions, SandboxState, CreateSandboxProviderOptions, DefaultPolicyOptions } from './sandbox/index.js';

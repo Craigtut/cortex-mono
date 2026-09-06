@@ -13,6 +13,12 @@ Two modes:
 
 **If you are upgrading an existing consumer, read "What changes when duplex is the default" below before anything else.** Three surfaces change meaning without changing type.
 
+## Managed sandboxing
+
+Set `sandbox: true` to opt in to workspace containment, or supply `SandboxOptions` for policy settings. Cortex initializes and disposes the backend, shares it across loops, and wires network decisions automatically. `getSandboxState()` reports the effective policy; trusted host code can call `setSandboxRung()` after work settles. See the [sandbox consumer guide](./sandbox-consumer-guide.md).
+
+The `network-resolver-unwired` note below applies only to manually supplied providers. Managed sandboxing wires the broker automatically.
+
 ## Construction
 
 ```typescript

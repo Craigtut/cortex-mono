@@ -107,6 +107,7 @@ function fakeSandbox() {
   return {
     initialize: async () => ({}),
     wrapSpawn: async (spec: unknown) => spec,
+    dispose: async () => {},
   } as never;
 }
 

@@ -1,12 +1,9 @@
 /**
  * OS-level sandbox seam for Cortex.
  *
- * Cortex core defines the policy vocabulary and the provider interface, but
- * ships no enforcement and takes no new dependency. A consumer supplies a
- * SandboxProvider (e.g. @animus-labs/cortex-sandbox) that translates a
- * SandboxPolicy into OS primitives (macOS Seatbelt, Linux bubblewrap, a
- * Windows helper) and wraps subprocess spawns. When no provider is configured,
- * behavior is unchanged.
+ * Cortex owns managed sandbox setup through CortexAgentConfig.sandbox.
+ * Platform backends translate SandboxPolicy into OS boundaries and wrap
+ * subprocess spawns. AgentLoop accepts a borrowed provider for advanced use.
  *
  * See docs/cortex/sandboxing.md for the design.
  */
@@ -29,7 +26,7 @@ export interface SandboxFilesystemPolicy {
   allowRead?: string[];
   /**
    * The per-session writable temp dir (a member of writableRoots), created by
-   * the consumer to scope temp writes instead of granting the whole machine
+   * Cortex to scope temp writes instead of granting the whole machine
    * temp root. When set, a provider points the sandboxed child's TMPDIR/TEMP/TMP
    * at it so a tool writing to its default temp lands inside the boundary.
    * Absent when the whole os.tmpdir() is the writable temp (legacy behavior).
@@ -192,18 +189,18 @@ export interface SandboxCommandFailure {
 }
 
 /**
- * OS-level enforcement supplied by a consumer. Core calls into this at the
- * subprocess boundary; it never implements enforcement itself. The consumer
- * constructs and initializes the provider (it owns policy computation and any
- * interactive egress prompts) before handing it to the agent.
+ * Backend contract. Managed CortexAgent sessions own initialization and cleanup;
+ * advanced callers may also initialize a provider and lend it to AgentLoop.
  */
 export interface SandboxProvider {
   /**
    * Establish enforcement for the given policy (start egress proxy, prepare the
-   * OS profile). Called once by the consumer before use. Returns the honest
+   * OS profile). Called by the owner before use and on policy changes. Returns the honest
    * status of what is actually enforced.
    */
   initialize(policy: SandboxPolicy): Promise<SandboxStatus>;
+  /** Optional in-process tool policy, checked by Cortex before permissions. */
+  checkToolCall?(name: string, args: unknown, cwd: string): string | null;
   /**
    * Wrap a shell command spawn so it launches contained, returning the argv and
    * env to spawn. Async because a backend may generate an OS profile or await a
@@ -237,7 +234,7 @@ export interface SandboxProvider {
    * null when the failure is not attributable to the sandbox. Reliable on macOS
    * (violation log), best-effort on Linux (stderr heuristic).
    */
-  classifyFailure?(failure: SandboxCommandFailure): SandboxDenial | null;
+  classifyFailure?(failure: SandboxCommandFailure): SandboxDenial | null | Promise<SandboxDenial | null>;
   /**
    * Called by the Bash tool when a sandbox-WRAPPED spawn fails at the process
    * 'error' stage AND the error code means the wrapper binary could not be found

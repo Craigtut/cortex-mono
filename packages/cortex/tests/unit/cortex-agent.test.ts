@@ -22,6 +22,9 @@ import {
 } from '../../src/cortex-agent.js';
 import type { CortexAgentConfig, ForwardedLoopMember } from '../../src/cortex-agent.js';
 
+// These harnesses bypass create() and inject already-resolved loop configuration.
+type ResolvedFacadeConfig = Omit<CortexAgentConfig, 'sandbox'> & Pick<AgentLoopConfig, 'sandbox'>;
+
 // ---------------------------------------------------------------------------
 // Mock PiAgent (holdable runs, steering/follow-up queues), the shared shape
 // used across agent-loop unit tests.
@@ -193,7 +196,7 @@ type TestAgentLoopConstructor = new (
 
 type TestCortexAgentConstructor = new (
   reasoner: AgentLoop,
-  config: CortexAgentConfig,
+  config: ResolvedFacadeConfig,
 ) => CortexAgent;
 
 function testModel(): CortexModel {
@@ -215,7 +218,7 @@ function createLoop(agent: PiAgent, overrides?: Partial<AgentLoopConfig>): Agent
   });
 }
 
-function createFacade(overrides?: Partial<CortexAgentConfig>): {
+function createFacade(overrides?: Partial<ResolvedFacadeConfig>): {
   facade: CortexAgent;
   loop: AgentLoop;
   piAgent: FacadeMockPiAgent;
@@ -332,7 +335,7 @@ describe('CortexAgent config routing', () => {
 
   it('strips facade-owned keys and passes everything else through unchanged', () => {
     const resolvePermission = vi.fn();
-    const config: CortexAgentConfig = {
+    const config: ResolvedFacadeConfig = {
       model: testModel(),
       workingDirectory: '/tmp/test-workspace',
       initialBasePrompt: 'base',

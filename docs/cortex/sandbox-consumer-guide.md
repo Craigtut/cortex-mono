@@ -1,130 +1,111 @@
-# Sandboxing: consumer integration guide
+# Sandboxing for consumers
 
-This is the developer guide for wiring OS-level sandboxing into a product built on `@animus-labs/cortex`. It covers the framework API, the two things a consumer supplies, the security contract you are responsible for, and a worked example. For the design and threat model, see `sandboxing.md`. Cortex Code is the reference implementation; this guide generalizes it.
+Sandboxing is an opt-in capability of `@animus-labs/cortex`. Cortex creates the backend, policy, network gate, and temporary directory, shares them with its loops and sub-agents, and cleans up on `destroy()`. No separate sandbox package is needed.
 
-## The model in one paragraph
+## Enable it
 
-Cortex separates two axes: containment (what a running command is physically able to do, enforced by the OS) and approval (when the human is asked, enforced in-process). The framework owns the seam and the vocabulary; it ships no enforcement itself. A consumer wires two things: a `SandboxProvider` (the enforcement backend, usually `@animus-labs/cortex-sandbox`) and a small set of decision callbacks (network grants, permission, escalation). Everything else, the trust ladder, the status indicator, the prompts, is UX the consumer builds on top of that seam.
-
-## What you supply
-
-1. A `SandboxProvider` on `AgentLoopConfig.sandbox`. Use `SandboxRuntimeProvider` from `@animus-labs/cortex-sandbox` (macOS Seatbelt, Linux bubblewrap; native Windows is scaffolded). You initialize it with a `SandboxPolicy`, then hand it to `CortexAgent.create` (or to `AgentLoop.create` if you are building on the loop primitive directly).
-2. `AgentLoopConfig.resolveNetworkAccess`, the single egress decision. Cortex calls it from in-process WebFetch, and you wire the same function into the provider's network ask-callback, so shell egress and WebFetch share one allowlist and one prompt.
-3. `AgentLoopConfig.resolvePermission`, which you already implement for tool permissions. It additionally receives sandbox escalation requests under a distinct tool name (below), so you prompt to run one command outside the box.
-
-That is the whole framework contract. The provider does the OS work; your callbacks own the human decisions.
-
-## Quickstart
+Add one setting to your existing agent config:
 
 ```ts
-import { CortexAgent } from '@animus-labs/cortex';
-import { SandboxRuntimeProvider, buildDefaultPolicy } from '@animus-labs/cortex-sandbox';
-
-// 1. Build a policy for the workspace. Writable roots come from TRUSTED config,
-//    never from model input (see the security contract below).
-const provider = new SandboxRuntimeProvider({
-  // Called for a domain not already on the allowlist. Return true to allow.
-  onNetworkRequest: (req) => resolveNetworkAccess({ ...req, via: 'shell' }).then((d) => d.decision === 'allow'),
-  onDegraded: (reasons) => log.warn('sandbox degraded', { reasons }),
-});
-const policy = buildDefaultPolicy('workspace', {
-  workspaceRoots: [cwd],
-  extraDenyWrite: [join(home, '.myapp')],       // your own config/creds tree
-  extraDenyRead: [join(home, '.myapp', 'credentials.json')],
-});
-const status = await provider.initialize(policy);
-if (status.backend === 'none') log.warn('sandbox not enforced', { reasons: status.degradations });
-
-// 2. Hand the provider and the shared decision function to the agent.
 const agent = await CortexAgent.create({
-  // ...your normal config...
-  sandbox: provider,
-  resolveNetworkAccess,        // same function used above for the shell path
-  resolvePermission,           // your existing permission callback (handles escalation, below)
+  model,
+  workingDirectory: projectDirectory,
+  getApiKey,
+  sandbox: true,
+});
+
+try {
+  await agent.prompt('Review this project');
+} finally {
+  await agent.destroy();
+}
+```
+
+Omit `sandbox`, pass `false`, or set `{ enabled: false }` to opt out. Enabling it chooses the workspace policy. Cortex uses `workingDirectory` as the writable workspace and creates a private temporary directory. Built-in defaults protect common credential locations and dangerous configuration paths, including Git hooks and Git config.
+
+Sandboxing and approval are separate settings. Existing permission callbacks continue to decide when to ask the user. Sandbox policy still blocks protected file operations if a callback approves them, and applies when no callback is supplied.
+
+## Settings
+
+Use an object when the defaults need adjustment:
+
+```ts
+const agent = await CortexAgent.create({
+  model,
+  workingDirectory: projectDirectory,
+  getApiKey,
+  sandbox: {
+    workspaceRoots: [projectDirectory, sharedBuildDirectory],
+    denyRead: [credentialsFile],
+    denyWrite: [applicationSettingsDirectory],
+    allowedDomains: ['api.example.com'],
+    deniedDomains: ['blocked.example.com'],
+    onStatusChange: (state) => updateSandboxIndicator(state),
+  },
 });
 ```
 
-`sandbox` and `envOverrides` are shared config: every loop and every sub-agent the facade builds runs inside the same box. `resolvePermission` and `resolveNetworkAccess` route through the facade's permission broker in duplex mode, so an `ask` is voiced to the user in conversation rather than blocking a loop; your callback's contract is unchanged, and `allow` and `deny` decisions pass straight through.
+Paths resolve relative to `workingDirectory`. `workspaceRoots` replaces the default workspace list; deny paths and allowed domains extend the built-in protections and seeded registry list. Denied domains take precedence.
 
-Your resolver never sees Cortex's internal orchestration tools (`Deliver`, `SteerSubAgent`, the talker's control tools, `SubAgent`, `recall`, `load_skill`, `ToolSearch`): they carry `permissionExempt` on the tool contract and the gate skips the resolver for them. Do not add rules for these names; there is nothing to approve. You may set `permissionExempt: true` on your own tools when they are equally internal (pure in-process dispatches), never on anything that touches files, network, or processes.
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `enabled` | `true` when settings are supplied | Opt out without removing config. |
+| `rung` | `workspace` | Choose `restricted`, `workspace`, `trusted`, or `off`. |
+| `workspaceRoots` | `[workingDirectory]` | Directories writable at workspace/trusted rungs. |
+| `denyRead`, `denyWrite` | `[]` | Protect application secrets and settings in addition to defaults. |
+| `allowedDomains`, `deniedDomains` | `[]` | Extend network policy. |
+| `requireEnforcement` | `true` | Refuse setup/execution if the requested OS boundary is unavailable or partial. |
+| `onStatusChange` | absent | Observe effective policy and enforcement. |
+| `windowsHelperPath` | bundled helper location | Supply a native Windows helper when available. |
+| `provider` | platform backend | Advanced backend override; Cortex initializes and disposes it. |
 
-## The framework API surface
+A host that cannot enforce the requested policy causes `CortexAgent.create()` to reject. An enforcement failure during the session blocks later tool execution. To explicitly allow degraded operation, set `requireEnforcement: false` and use `onStatusChange` or `getSandboxState()` to display what is actually enforced. This does not turn missing OS protections into working protections.
 
-From `@animus-labs/cortex`:
+## Network decisions
 
-- Config: `AgentLoopConfig.sandbox?: SandboxProvider`, `.resolveNetworkAccess?: ResolveNetworkAccess`, `.resolvePermission?`.
-- Policy vocabulary: `SandboxRung` (`restricted` | `workspace` | `trusted` | `off`), `SandboxPolicy` (`filesystem: { writableRoots, denyRead, denyWrite, allowRead? }`, `network: { mode, allowedDomains, deniedDomains, allowLocalBinding? }`).
-- Status (the honesty contract): `SandboxStatus` (`filesystem`/`network`: `enforced` | `partial` | `none`, `backend`, `degradations: string[]`). Never claims more than is enforced.
-- Provider contract: `SandboxProvider` (`initialize`, `wrapSpawn`, optional `classifyFailure`, `scrubCredentialEnv`, `status`, `dispose`).
-- Network decision: `NetworkAccessRequest` (`{ host, port?, via: 'shell' | 'webfetch', url? }`), `NetworkAccessDecision` (`{ decision: 'allow' | 'deny', scope? }`), `ResolveNetworkAccess`.
-- Escalation: `BASH_ESCALATION_PERMISSION_NAME` (`'Bash(escalate)'`), `isBashEscalationRequest(args)`.
-
-From `@animus-labs/cortex-sandbox`:
-
-- `SandboxRuntimeProvider`, `SandboxRuntimeProviderOptions`.
-- `buildDefaultPolicy(rung, opts)` and the building blocks `defaultSecretReadDenies`, `defaultDangerousWriteDenies`, `SEEDED_REGISTRY_DOMAINS`, `DEFAULT_CREDENTIAL_ENV_VARS`.
-- `matchesDomainPattern` / `matchesAnyDomainPattern` (use these so your in-process allow decisions match the OS proxy exactly).
-
-## Your security responsibilities (the contract)
-
-Core enforces the boundary, but a few properties are the consumer's to uphold. These are exactly the places the framework cannot protect you from yourself.
-
-- Sandbox posture comes from trusted config only. Derive the rung, the writable roots, and the allowed domains from your global/user config, never from a file in the workspace working tree. A cloned untrusted repo must not be able to weaken its own sandbox.
-- Writable roots are never model-controlled. Do not feed a tool's `cwd` argument into `writableRoots`; the model would make anywhere writable by changing directory (CVE-2025-59532).
-- Deny your own config tree. Add your product's settings, permission rules, network grants, and credential files to `denyWrite` (and the credential file to `denyRead`), so a sandboxed command cannot forge a grant or disable the sandbox. Also project the policy's `denyWrite`/`denyRead` onto your in-process file tools (Write/Edit/UndoEdit/Read), resolving symlinks, since those tools bypass the OS boundary; Cortex Code does this in its permission preflight as a hard floor above its auto-approve mode.
-- Your `resolvePermission` must actually gate escalation. Core routes an escalation request to you under `BASH_ESCALATION_PERMISSION_NAME` and fails closed if you have no resolver, but a resolver that blindly allows would auto-approve leaving the sandbox. Prompt for it (see below).
-- Rung changes are a human action. Never expose a way for the model to move to a less-contained rung or to Off.
-
-## The network prompt (one decision, both paths)
-
-Implement `resolveNetworkAccess` once. It is the single source of truth for "may the agent reach this host," called from both WebFetch (in-process) and, via the provider's ask-callback, from shell egress. A grant applies to both.
+Cortex applies the same network policy to sandboxed shell traffic and WebFetch. Workspace policy pre-allows seeded package registries and your `allowedDomains`. Unknown domains are denied unless you supply `resolveNetworkAccess`:
 
 ```ts
-async function resolveNetworkAccess(req: NetworkAccessRequest): Promise<NetworkAccessDecision> {
-  if (matchesAnyDomainPattern(req.host, policy.network.allowedDomains)) return { decision: 'allow' };
-  if (isGranted(req.host)) return { decision: 'allow' };
-  const choice = await promptUser(`Allow the agent to reach ${req.host}? (${req.via})`); // once / session / always / deny
-  if (choice === 'deny') return { decision: 'deny' };
-  if (choice === 'always') persistGrant(req.host);
-  else if (choice === 'session') sessionGrant(req.host);
-  return { decision: 'allow', scope: choice };
-}
+const agent = await CortexAgent.create({
+  model,
+  workingDirectory: projectDirectory,
+  getApiKey,
+  sandbox: true,
+  resolveNetworkAccess: async (request) => {
+    const allowed = await askUserAboutHost(request.host);
+    return allowed
+      ? { decision: 'allow', scope: 'session' }
+      : { decision: 'deny' };
+  },
+});
 ```
 
-Fail closed: if the prompt throws or is dismissed, return `deny`. The seeded registries (`SEEDED_REGISTRY_DOMAINS`) are pre-allowed, so normal installs do not prompt.
+Cortex wires the backend callback automatically, including the duplex permission broker. There is no second callback to attach after creation. Session grants apply to both request paths; persistence of longer-lived preferences belongs to the consumer. Explicit denials always win. Restricted policy denies network access. WebFetch's separate SSRF protections remain in force.
 
-On `CortexAgent`, wire `agent.getNetworkAccessResolver()` into the provider's `onNetworkRequest`, not your raw function. The facade may wrap the one you configured (in duplex mode an `ask` becomes a spoken permission request), and the wrapped function is what the agent actually enforces. Wiring the raw one instead sends shell egress down a different path than WebFetch, which fails closed and silently: egress stops working and no request is ever put to the user. The agent logs a warning if it is holding a wrapped resolver nobody ever collected.
+## Inspect and change policy
 
-## Single-command escalation
+`agent.getSandboxState()` returns a snapshot of the effective rung, policy, backend, and filesystem/network enforcement. It returns `undefined` when there is no managed sandbox.
 
-When the sandbox blocks a command, the model may set the Bash param `escalateOutsideSandbox: true` to request running that one command uncontained. Cortex re-presents that call to your `resolvePermission` under `BASH_ESCALATION_PERMISSION_NAME` so you can render a distinct prompt:
+After work settles, trusted host code can call `await agent.setSandboxRung('restricted')`. Calls during active work are rejected. Connected stdio MCP servers must be disconnected first and reconnected afterward, because an already running subprocess keeps the OS profile it launched with. Do not expose this method as a model tool. Consumers decide which policy changes their users may make and whether preferences should persist.
 
-```ts
-async function resolvePermission(toolName, args) {
-  if (toolName === BASH_ESCALATION_PERMISSION_NAME) {
-    // A deliberate exit from the boundary. Always a fresh human decision.
-    const ok = await promptUser(`Run this command OUTSIDE the sandbox?\n${args.command}`); // allow-once / deny
-    return ok ? true : { decision: 'block' };
-  }
-  // ...your normal permission flow...
-}
-```
+To begin uncontained but allow later activation, use `{ rung: 'off' }`. This keeps a managed controller available without starting an OS backend. `sandbox: false` creates no controller.
 
-Guarantees the framework provides: escalation never bypasses the catastrophic-command floor, an existing plain-`Bash` deny rule still blocks it, it is per-command and never persists, and an approved escalation still has its credential env vars scrubbed (it loses OS containment, not the secret invariant). Do not offer an "always" scope for escalation.
+## Consumer responsibilities and limits
 
-## Transparency
+Use trusted host configuration for writable roots, secrets, and settings. Add product-specific credential files to `denyRead` and product configuration to `denyWrite`. Do not derive writable roots from model tool arguments or untrusted repository settings.
 
-Read `provider.status()` (a `SandboxStatus`) to show an always-visible indicator: the active rung, and whether it is `enforced`, `partial`, or `none`. Show `none` honestly when enforcement is unavailable rather than implying containment. When a sandboxed command fails, `provider.classifyFailure(failure)` returns a `SandboxDenial` (reliable on macOS, best-effort on Linux) so you can tell the model the failure looks like a denial and that escalation is available.
+Built-in Read, Write, Edit, UndoEdit, and Glob receive in-process path checks. Bash, Grep, and managed stdio MCP spawns use the backend. Custom tools that perform their own filesystem or network operations still run inside the host process; they must use the same policy or an appropriate isolated execution path. Remote MCP servers run outside this host's sandbox. Skill preprocessing is also outside the subprocess boundary and should use trusted skills. See [architecture and limits](./sandboxing.md).
 
-## Embeddability (floor and ceiling)
+Single-command Bash escalation is still a separate approval. Cortex uses `BASH_ESCALATION_PERMISSION_NAME` (`Bash(escalate)`) and refuses escalation without a permission resolver. A consumer resolver must treat it as a request to leave containment, rather than blindly allowing it.
 
-For a consumer-facing product, you decide how much of the ladder to expose:
+Native Windows remains limited by its helper availability and Tier 1 protections. The current helper does not enforce secret-file read denial or network restrictions. Strict setup therefore refuses workspace/restricted containment there. See the [Windows build runbook](./windows-sandbox-build.md).
 
-- Pin a minimum rung and hide the dial: compute the policy from a fixed rung and never surface `/sandbox off`. End users cannot weaken it.
-- Or expose the full ladder for a developer tool: let the user pick a rung, persisted per workspace, with the network and escalation prompts above.
+## Advanced providers and migration
 
-Either way the framework enforces, your product governs, and the end user operates within the bounds you set.
+Most consumers should use `sandbox: true` or settings. The platform implementations remain separate modules within Cortex. `createSandboxProvider`, `buildDefaultPolicy`, and the provider/policy types are exported from `@animus-labs/cortex` for advanced integrations.
 
-## Not yet covered (know the gaps)
+An uninitialized custom backend can be supplied through `sandbox: { provider }`; Cortex owns initialization, policy, temporary-directory lifetime, and disposal. A custom backend must implement the network behavior it promises in its status. The built-in network callback wiring applies to the default backend.
 
-Subprocess reads are contained: the Grep tool's ripgrep and stdio MCP servers now run through the provider's `wrapExec`, so `denyRead` applies to them, and Grep's in-process JS fallback is disabled under an enforcing sandbox so it cannot be used to retry a denied read. Still open: in-process egress beyond WebFetch (the provider API endpoint, MCP HTTP, which has no subprocess to wrap) is not routed through the boundary. These are named in `sandboxing.md` under coverage gaps. Native Windows enforcement is scaffolded but pending a Windows build; until it is built Windows reports `none` and runs uncontained, which the status honestly reflects.
+For compatibility, passing an already initialized `SandboxProvider` directly as `sandbox` still borrows that provider. Its owner must initialize, wire network callbacks, and dispose it. `AgentLoopConfig.sandbox` also remains this low-level borrowed-provider API. Use `CortexAgent` for managed setup.
+
+Consumers of the former separate package should remove that dependency and replace provider construction and teardown with settings on `CortexAgent.create()`. Move product-specific deny paths and network domains into the settings object. Remove manual temporary-directory creation and `getNetworkAccessResolver()` wiring when adopting managed setup.

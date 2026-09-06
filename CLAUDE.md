@@ -54,7 +54,7 @@ Three main exports:
 
 ### Sanitized Boundary
 
-**Cortex must never import from any consumer package.** Consumers import from Cortex, never the reverse. Cortex's only dependencies are `pi-agent-core`, `pi-ai`, `@modelcontextprotocol/sdk`, `typebox`, `@vscode/ripgrep`, and `zod-to-json-schema`.
+**Cortex must never import from any consumer package.** Consumers import from Cortex, never the reverse. Platform sandbox backends belong in `packages/cortex/src/sandbox/`, with CortexAgent owning opt-in setup and cleanup. Framework dependencies, including the pinned sandbox runtime, are declared in `packages/cortex/package.json`.
 
 ## Development Guidelines
 
@@ -159,6 +159,7 @@ Detailed documentation lives in `/docs/cortex/`. Use `/doc-explorer <topic>` to 
 - **Tool Result Persistence**: `docs/cortex/tool-result-persistence.md` (proactive bookend + persist for oversized tool results)
 - **Skills**: `docs/cortex/skill-system.md` (progressive disclosure, SKILL.md format, registry)
 - **Providers**: `docs/cortex/provider-manager.md` (discovery, OAuth, model resolution)
+- **Sandboxing**: `docs/cortex/sandbox-consumer-guide.md` (managed opt-in setup), `docs/cortex/sandboxing.md` (ownership and platform limits)
 - **MCP**: `docs/cortex/mcp-integration.md` (MCP client, tool wrapping, namespacing)
 - **Tools**: `docs/cortex/tools/` (per-tool documentation)
 - **System Prompt**: `docs/cortex/system-prompt.md` (prompt assembly, operational rules)

@@ -1,6 +1,6 @@
 # Release process
 
-Cortex uses separate tag-triggered release workflows for the framework, sandbox, and CLI packages. The workflows stage packages on npm with trusted publishing. A maintainer still approves the staged package with 2FA before it goes live. A package's first publication must be done manually because npm cannot stage a brand-new package.
+Cortex uses separate tag-triggered release workflows for the framework and CLI packages. The workflows stage packages on npm with trusted publishing. A maintainer still approves the staged package with 2FA before it goes live. A package's first publication must be done manually because npm cannot stage a brand-new package.
 
 No npm publish token should be stored in GitHub.
 
@@ -9,7 +9,6 @@ No npm publish token should be stored in GitHub.
 | Package | Workflow | Tag format |
 | --- | --- | --- |
 | `@animus-labs/cortex` | `.github/workflows/release-cortex.yml` | `cortex-vX.Y.Z` |
-| `@animus-labs/cortex-sandbox` | `.github/workflows/release-cortex-sandbox.yml` | `cortex-sandbox-vX.Y.Z` |
 | `@animus-labs/cortex-code` | `.github/workflows/release-cortex-code.yml` | `cortex-code-vX.Y.Z` |
 
 Each workflow rejects the release if the tag does not match the package version, if the changelog is missing that version, or if the package version is already published on npm.
@@ -24,7 +23,7 @@ Recommended settings:
 
 - Add required reviewers.
 - Prevent self-review if there is more than one maintainer.
-- Restrict deployment tags to `cortex-v*`, `cortex-sandbox-v*`, and `cortex-code-v*`.
+- Restrict deployment tags to `cortex-v*` and `cortex-code-v*`.
 
 The environment approval happens before npm receives an OIDC token.
 
@@ -50,10 +49,7 @@ For `@animus-labs/cortex-code`:
 
 Then set each package's publishing access to require 2FA and disallow tokens.
 
-For `@animus-labs/cortex-sandbox`, use the same settings with workflow filename
-`release-cortex-sandbox.yml` after the initial manual publication. The sandbox
-and CLI workflows check that their workspace dependency versions are already
-available on npm, so publish and approve dependencies before triggering them.
+The CLI workflow checks that its Cortex dependency is available on npm. Publish and approve Cortex before triggering the CLI release.
 
 ## Release 0.6.0
 
@@ -64,8 +60,7 @@ package returned 404. The next release set is:
 | Order | Package | Version | Reason |
 | --- | --- | --- | --- |
 | 1 | `@animus-labs/cortex` | `0.6.0` | Breaking API restructure and new sandbox/duplex capabilities. |
-| 2 | `@animus-labs/cortex-sandbox` | `0.1.0` | First release; requires Cortex `^0.6.0`. |
-| 3 | `@animus-labs/cortex-code` | `0.6.0` | New framework dependency, sandbox integration, and session format. |
+| 2 | `@animus-labs/cortex-code` | `0.6.0` | New framework dependency, sandbox integration, and session format. |
 
 This is a minor version boundary for the pre-1.0 packages, not a patch:
 the former `CortexAgent` is now `AgentLoop`, the new facade defaults to duplex,
@@ -77,41 +72,18 @@ Validate locally before release:
 
 ```bash
 npm run release:check:cortex
-npm run release:check:cortex-sandbox
 npm run release:check:cortex-code
 ```
 
-Publish and approve Cortex `0.6.0` through its tag workflow first. Then pack and
-review the initial sandbox tarball, and publish it interactively with npm 2FA:
+Publish and approve Cortex `0.6.0` through its tag workflow first, then Cortex Code `0.6.0`. Sandboxing ships inside Cortex; there is no third package or sandbox release workflow.
 
-```bash
-mkdir -p release-artifacts
-npm pack -w packages/cortex-sandbox --pack-destination release-artifacts
-npm publish ./release-artifacts/animus-labs-cortex-sandbox-0.1.0.tgz --access public
-```
+The Cortex tarball does not yet contain a signed Windows helper. Managed sandboxing defaults to refusing unavailable or partial enforcement. Cortex Code explicitly retains degraded operation and Windows opt-in. Native Windows containment claims still depend on the signing and artifact work described in `docs/cortex/windows-sandbox-build.md`.
 
-Do not trigger the sandbox staging workflow for this first version.
-[npm staged publishing requires an existing package](https://docs.npmjs.com/staged-publishing/).
-Configure its trusted publisher after this initial publication for subsequent
-releases. Finally, trigger and approve Cortex Code `0.6.0` through its tag workflow.
+These are publishing instructions, not actions performed by local release preparation. npm and GitHub approvals still apply.
 
-The sandbox `0.1.0` tarball does not contain the signed Windows helper. It
-provides macOS/Linux backends and the Windows provider interface, with honest
-no-containment reporting when no helper is supplied. A release promising native
-Windows containment must wait for signing and Windows artifact automation
-described in `docs/cortex/windows-sandbox-build.md`. Cortex Code keeps Windows
-containment opt-in and supports `sandbox.requireEnforcement`.
+Local validation of the merged packages passed 3,653 tests (12 platform-specific skips), source typechecking, lint with no errors, and all 28 checked documentation examples. The CLI's 564 tests also passed against built Cortex. A clean install of the two tarballs passed CLI startup and real macOS sandbox setup, write containment, independent agent cleanup, and temporary-directory removal. The isolated production dependency audit reported zero vulnerabilities. Validation ran on macOS with Node 25.2.1; native Windows helper testing and signing were not run for this merge.
 
-The commands above are publishing instructions, not actions performed by local
-release preparation. npm and GitHub approvals still apply.
-
-Local preparation passed all three package release checks (2,966 framework,
-99 sandbox, and 575 CLI tests; 12 sandbox tests skipped), lint with no errors,
-and all 28 documentation examples. Installing the three tarballs together in a
-clean directory passed dependency resolution, framework/sandbox imports, model
-lookup, and CLI startup. The isolated production dependency audit reported zero
-vulnerabilities. These checks ran on macOS with Node 25.2.1; remote release jobs
-and Windows helper signing were not run.
+The separate test-source typecheck report remains a non-gating backlog (451 Cortex and 21 CLI diagnostics). The new sandbox tests have no diagnostics in that report.
 
 ## Prepare a Cortex release
 

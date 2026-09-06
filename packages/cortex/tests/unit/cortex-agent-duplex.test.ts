@@ -37,6 +37,9 @@ import {
 } from '../../src/duplex/permission-broker.js';
 import type { BrokeredAskDecision, PermissionBroker } from '../../src/duplex/permission-broker.js';
 import type { CortexAgentConfig, CortexAgentStateV2 } from '../../src/cortex-agent.js';
+
+// These harnesses bypass create() and inject already-resolved loop configuration.
+type ResolvedFacadeConfig = Omit<CortexAgentConfig, 'sandbox'> & Pick<AgentLoopConfig, 'sandbox'>;
 import { CONTROL_TOOL_NAMES } from '../../src/duplex/control-tools.js';
 import {
   REASONER_ROLE_PROMPT,
@@ -198,7 +201,7 @@ type TestAgentLoopConstructor = new (
 
 type TestCortexAgentConstructor = new (
   reasoner: AgentLoop,
-  config: CortexAgentConfig,
+  config: ResolvedFacadeConfig,
   talker?: AgentLoop,
 ) => CortexAgent;
 
@@ -220,7 +223,7 @@ interface DuplexHarness {
 
 const liveFacades: CortexAgent[] = [];
 
-function createDuplexFacade(overrides?: Partial<CortexAgentConfig>): DuplexHarness {
+function createDuplexFacade(overrides?: Partial<ResolvedFacadeConfig>): DuplexHarness {
   const talkerPi = createMockPiAgent();
   const reasonerPi = createMockPiAgent();
   const AgentLoopCtor = AgentLoop as unknown as TestAgentLoopConstructor;
@@ -295,7 +298,7 @@ function getPiTool(pi: DuplexMockPiAgent, name: string): {
 // ---------------------------------------------------------------------------
 
 describe('duplex config builders', () => {
-  const baseConfig: CortexAgentConfig = {
+  const baseConfig: ResolvedFacadeConfig = {
     model: testModel(),
     workingDirectory: '/tmp/test-workspace',
     initialBasePrompt: 'Consumer identity prompt',
@@ -2277,7 +2280,7 @@ describe('duplex permission broker', () => {
   });
 
   it('withBrokeredPermissions wraps exactly the configured surfaces', async () => {
-    const bare: CortexAgentConfig = {
+    const bare: ResolvedFacadeConfig = {
       model: testModel(),
       workingDirectory: '/tmp/test-workspace',
       mode: 'duplex',
@@ -2286,7 +2289,7 @@ describe('duplex permission broker', () => {
     expect(withBrokeredPermissions(bare, () => null)).toBe(bare);
 
     const consumerResolve = async (): Promise<{ decision: 'allow' }> => ({ decision: 'allow' });
-    const withPermission: CortexAgentConfig = { ...bare, resolvePermission: consumerResolve };
+    const withPermission: ResolvedFacadeConfig = { ...bare, resolvePermission: consumerResolve };
     const brokered = withBrokeredPermissions(withPermission, () => null);
     expect(brokered.resolvePermission).not.toBe(consumerResolve);
     expect(brokered.resolveNetworkAccess).toBeUndefined();

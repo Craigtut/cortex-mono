@@ -41,6 +41,12 @@ await agent.prompt('What files are in this directory?');
 await agent.destroy();
 ```
 
+## Built-in sandboxing
+
+Use `CortexAgent.create({ ...config, sandbox: true })` for managed workspace containment. Cortex selects the backend, applies default protections, shares it with its loops, and cleans up on `destroy()`. Omit the setting to opt out, or supply an object for writable roots, protected paths, domain rules, and status callbacks. Setup refuses unavailable enforcement by default.
+
+See the [sandbox consumer guide](../../docs/cortex/sandbox-consumer-guide.md) for settings and platform limits. No separate sandbox package is required.
+
 ## Key Features
 
 - **Context Slots**: Named, stability-ordered content blocks for prompt cache optimization. Ephemeral context provides fresh per-loop state without accumulating in persistent history.
@@ -55,6 +61,7 @@ await agent.destroy();
 
 ## Main Exports
 
+- `CortexAgent` - Composite agent with managed sandbox setup and session lifecycle
 - `AgentLoop` - Core agentic loop with context management
 - `ProviderManager` - Provider discovery, OAuth, and model resolution
 

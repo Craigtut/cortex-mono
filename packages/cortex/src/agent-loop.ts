@@ -3176,12 +3176,15 @@ export class AgentLoop {
       return streamSimple(model as any, context as any, streamOptions as any);
     };
 
-    if (cortexConfig.resolvePermission) {
+    if (cortexConfig.resolvePermission || cortexConfig.sandbox?.checkToolCall) {
       const resolver = cortexConfig.resolvePermission;
       const sandboxConfigured = cortexConfig.sandbox !== undefined;
       const loopPath = cortexConfig.loopPath ?? DEFAULT_LOOP_PATH;
       agentConfig['beforeToolCall'] = async (ctx: unknown, signal?: AbortSignal) => {
         const { toolCall, args } = ctx as { toolCall: { name: string }; args: unknown };
+        const sandboxDenial = cortexConfig.sandbox?.checkToolCall?.(toolCall.name, args, cortexConfig.workingDirectory);
+        if (sandboxDenial) return { block: true, reason: sandboxDenial };
+        if (!resolver) return undefined;
         // Spawning a sub-agent is an internal orchestration decision, not a
         // side-effecting operation. Always allow without prompting.
         if (toolCall.name === SUB_AGENT_TOOL_NAME) return undefined;

@@ -6,7 +6,7 @@ All notable changes to `@animus-labs/cortex-code` are documented here.
 
 ## 0.6.0
 
-- Require Cortex `^0.6.0` and the new `@animus-labs/cortex-sandbox` package.
+- Require Cortex `^0.6.0`, including its built-in sandbox implementation. Delegate sandbox policy, initialization, network wiring, and cleanup to Cortex.
 - Add optional duplex mode through `--duplex` and `agentMode`; the CLI keeps single-loop mode as its default.
 - Add OS sandbox integration, `/sandbox`, enforcement status, network-access prompts, and per-command escalation. macOS/Linux default to the workspace policy; Windows containment remains opt-in and requires a separately supplied helper binary.
 - Harden in-process file permissions, protected configuration paths, credential handling, and per-session temporary directories. Add `sandbox.requireEnforcement` to refuse shell execution when containment is unavailable.

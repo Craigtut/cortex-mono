@@ -109,7 +109,10 @@ import {
   buildBrokeredPermissionResolver,
 } from './duplex/permission-broker.js';
 import type { PermissionBroker } from './duplex/permission-broker.js';
-import type { ResolveNetworkAccess } from './sandbox/types.js';
+import type { ResolveNetworkAccess, SandboxProvider, SandboxRung } from './sandbox/types.js';
+import type { SandboxConfig, SandboxState } from './sandbox/options.js';
+import { isSandboxProvider } from './sandbox/options.js';
+import { SandboxSession } from './sandbox/session.js';
 import { buildDeliverTool, buildSteerSubAgentTool } from './duplex/reasoner-tools.js';
 import { QuickLookupManager } from './duplex/quick-lookups.js';
 import type { QuickLookupOutcome } from './duplex/quick-lookups.js';
@@ -242,7 +245,9 @@ export interface CortexSessionLogConfig {
  * Configuration for CortexAgent.create(). Everything AgentLoopConfig has,
  * plus the facade's own keys, routed per {@link CONFIG_ROUTING}.
  */
-export interface CortexAgentConfig extends AgentLoopConfig {
+export interface CortexAgentConfig extends Omit<AgentLoopConfig, 'sandbox'> {
+  /** Opt in with true or settings. Cortex owns built-in setup and cleanup. */
+  sandbox?: SandboxConfig;
   /** Consumer tools. Routed to the reasoner only (decisions.md D5). */
   tools?: CortexTool[];
   /** Facade mode. Default: 'duplex'; 'passthrough' is the opt-out (D14). */
@@ -297,6 +302,8 @@ export type ConfigDestination =
  * (review-findings.md F18). Runtime routing derives from it: 'facade' keys
  * are stripped before the loop config is built.
  */
+type ResolvedCortexAgentConfig = Omit<CortexAgentConfig, 'sandbox'> & { sandbox?: SandboxProvider };
+
 export const CONFIG_ROUTING: { [K in keyof Required<CortexAgentConfig>]: ConfigDestination } = {
   // Reasoner-only: the talker has its own dial (talker.model + a facade
   // thinking default) in 2b.
@@ -401,7 +408,7 @@ export const CONFIG_ROUTING: { [K in keyof Required<CortexAgentConfig>]: ConfigD
  * and 'shared' destinations all resolve to it. Exported for tests.
  */
 export function buildReasonerConfig(
-  config: CortexAgentConfig,
+  config: ResolvedCortexAgentConfig,
 ): AgentLoopConfig & { tools?: CortexTool[] } {
   const routed: Record<string, unknown> = {};
   for (const key of Object.keys(CONFIG_ROUTING) as Array<keyof CortexAgentConfig>) {
@@ -517,7 +524,7 @@ function appendRolePrompt(basePrompt: string | undefined, rolePrompt: string): s
  * plus the duplex posture. Exported for tests.
  */
 export function buildDuplexReasonerConfig(
-  config: CortexAgentConfig,
+  config: ResolvedCortexAgentConfig,
 ): AgentLoopConfig & { tools?: CortexTool[] } {
   const routed = buildReasonerConfig(config);
   const duplexed: AgentLoopConfig & { tools?: CortexTool[] } = {
@@ -589,7 +596,7 @@ function buildTalkerCompactionConfig(
  * for tests.
  */
 export function buildTalkerConfig(
-  config: CortexAgentConfig,
+  config: ResolvedCortexAgentConfig,
   talkerModel: CortexModel,
 ): AgentLoopConfig & { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean } {
   const talker: AgentLoopConfig & {
@@ -696,7 +703,7 @@ const LOOKUP_TOOL_NAMES: ReadonlySet<string> = new Set([
  * design. Exported for tests.
  */
 export function buildQuickLookupConfig(
-  config: CortexAgentConfig,
+  config: ResolvedCortexAgentConfig,
   model: CortexModel,
   alias: string,
 ): AgentLoopConfig & { enableSubAgentTool?: boolean; enableLoadSkillTool?: boolean } {
@@ -747,11 +754,11 @@ export function buildQuickLookupConfig(
  * Exported for tests.
  */
 export function withBrokeredPermissions(
-  config: CortexAgentConfig,
+  config: ResolvedCortexAgentConfig,
   getBroker: () => PermissionBroker | null,
-): CortexAgentConfig {
+): ResolvedCortexAgentConfig {
   if (!config.resolvePermission && !config.resolveNetworkAccess) return config;
-  const brokered: CortexAgentConfig = { ...config };
+  const brokered: ResolvedCortexAgentConfig = { ...config };
   if (config.resolvePermission) {
     brokered.resolvePermission = buildBrokeredPermissionResolver(
       config.resolvePermission,
@@ -1400,6 +1407,7 @@ export class CortexAgent {
   private readonly networkResolver: ResolveNetworkAccess | null;
   /** Whether a sandbox was configured (for the egress-wiring warning). */
   private readonly sandboxConfigured: boolean;
+  private ownedSandbox: SandboxSession | undefined;
   /** Whether anyone took the resolver to wire into a sandbox. */
   private networkResolverHandedOut = false;
   private unwiredNetworkResolverWarned = false;
@@ -1475,7 +1483,7 @@ export class CortexAgent {
    */
   private readonly resolutionNotes: ResolutionNote[] = [];
 
-  private constructor(reasoner: AgentLoop, config: CortexAgentConfig, talker?: AgentLoop) {
+  private constructor(reasoner: AgentLoop, config: ResolvedCortexAgentConfig, talker?: AgentLoop) {
     this.mode = config.mode ?? DEFAULT_MODE;
     if (this.mode === 'duplex' && !talker) {
       throw new Error('CortexAgent duplex mode requires a talker loop.');
@@ -1527,6 +1535,27 @@ export class CortexAgent {
    * persistent reasoner in duplex.
    */
   static async create(config: CortexAgentConfig): Promise<CortexAgent> {
+    const { sandbox, ...rest } = config;
+    // The facade owns the managed session; loops only receive its provider wrapper.
+    const managed = sandbox !== undefined && !isSandboxProvider(sandbox)
+      ? await SandboxSession.create(sandbox, config.workingDirectory, config.resolveNetworkAccess)
+      : undefined;
+    const resolved: ResolvedCortexAgentConfig = {
+      ...rest,
+      ...(managed ? { sandbox: managed, resolveNetworkAccess: managed.resolveNetworkAccess }
+        : isSandboxProvider(sandbox) ? { sandbox } : {}),
+    };
+    try {
+      const agent = await CortexAgent.createResolved(resolved, managed);
+      agent.ownedSandbox = managed;
+      return agent;
+    } catch (error) {
+      await managed?.dispose().catch(() => {});
+      throw error;
+    }
+  }
+
+  private static async createResolved(config: ResolvedCortexAgentConfig, managed?: SandboxSession): Promise<CortexAgent> {
     if ((config.mode ?? DEFAULT_MODE) === 'duplex') {
       // Broker the blocking permission surfaces before the loop configs are
       // built: the loops capture the resolver closures at creation, so the
@@ -1536,6 +1565,7 @@ export class CortexAgent {
       // only `ask` routes through the conversation (D16).
       const brokerBox: { broker: PermissionBroker | null } = { broker: null };
       let brokered = withBrokeredPermissions(config, () => brokerBox.broker);
+      if (managed && brokered.resolveNetworkAccess) managed.setNetworkResolver(brokered.resolveNetworkAccess);
       // The MCP multiplexer: one manager, one connection per server total,
       // projected to the reasoner (and its sub-agents via tool closures);
       // never the talker. A consumer-provided manager is adopted (and its
@@ -1572,6 +1602,7 @@ export class CortexAgent {
         throw err;
       }
       const agent = new CortexAgent(reasoner, brokered, talker);
+      if (managed) agent.networkResolverHandedOut = true;
       brokerBox.broker = agent.router?.permissionBroker ?? null;
       if (facadeMintedMcp) agent.ownedMcpManager = sharedMcp;
       return agent;
@@ -1589,7 +1620,7 @@ export class CortexAgent {
     return this.talker ?? this.reasoner;
   }
 
-  private wireDuplex(config: CortexAgentConfig): void {
+  private wireDuplex(config: ResolvedCortexAgentConfig): void {
     const talker = this.talker!;
     const routerOptions: DuplexRouterOptions = {};
     const tuning = config.duplex;
@@ -2491,7 +2522,7 @@ export class CortexAgent {
   }
 
   /** Spill retention-evicted entries through persistResult when configured. */
-  private spillEvictedEntries(evicted: SessionLogEntry[], config: CortexAgentConfig): void {
+  private spillEvictedEntries(evicted: SessionLogEntry[], config: ResolvedCortexAgentConfig): void {
     const persist = config.persistResult;
     if (!persist) return;
     const payload = evicted.map((entry) => JSON.stringify(entry)).join('\n');
@@ -3018,7 +3049,9 @@ export class CortexAgent {
         const teardowns: Array<Promise<void>> = [this.reasoner.destroy(timeoutMs)];
         if (this.talker) teardowns.push(this.talker.destroy(timeoutMs));
         if (this.lookups) teardowns.push(this.lookups.destroy());
-        await Promise.all(teardowns);
+        const results = await Promise.allSettled(teardowns);
+        const failed = results.find((result) => result.status === 'rejected');
+        if (failed?.status === 'rejected') throw failed.reason;
       } finally {
         // After the loops detach their listeners: the shared connections
         // (and stdio subprocesses) are facade-owned, so the loops never
@@ -3026,14 +3059,32 @@ export class CortexAgent {
         if (this.ownedMcpManager) {
           await this.ownedMcpManager.closeAll().catch(() => {});
         }
-        this.mergedBridge?.destroy();
-        this.log.clearSubscribers();
-        // Nothing appends after teardown, so a settlement wait blocked on
-        // the next append would never resume on its own.
-        for (const resolve of this.logAppendWaiters.splice(0)) resolve();
+        try {
+          await this.ownedSandbox?.dispose();
+        } finally {
+          this.mergedBridge?.destroy();
+          this.log.clearSubscribers();
+          // Nothing appends after teardown, so a settlement wait blocked on
+          // the next append would never resume on its own.
+          for (const resolve of this.logAppendWaiters.splice(0)) resolve();
+        }
       }
     })();
     return this.destroyPromise;
+  }
+
+  /** Snapshot of the effective managed sandbox policy and enforcement. */
+  getSandboxState(): SandboxState | undefined { return this.ownedSandbox?.getState(); }
+
+  /** Host-only policy change. Work must settle before changing an OS boundary. */
+  async setSandboxRung(rung: SandboxRung): Promise<void> {
+    this.assertNotDestroyed();
+    if (!this.ownedSandbox) throw new Error('No Cortex-managed sandbox was configured');
+    if (!this.workSettled) throw new Error('Wait for work to settle before changing sandbox policy');
+    if (this.getMcpClientManager().getConnectionStates().some((connection) =>
+      connection.connected && connection.config.transport === 'stdio',
+    )) throw new Error('Disconnect stdio MCP servers before changing sandbox policy, then reconnect them under the new policy');
+    await this.ownedSandbox.setRung(rung);
   }
 
   private assertNotDestroyed(): void {
@@ -3073,7 +3124,7 @@ export class CortexAgent {
    * assembly fact, and would also mean the log entries appeared whenever the
    * consumer happened to look.
    */
-  private collectAssemblyResolution(config: CortexAgentConfig): void {
+  private collectAssemblyResolution(config: ResolvedCortexAgentConfig): void {
     const notes = collectAssemblyResolutionNotes({
       mode: this.mode,
       requestedTalkerModel: config.talker?.model,
@@ -3985,7 +4036,7 @@ export class CortexAgent {
    * voiced conversation ask), in passthrough the consumer's own function
    * unchanged, undefined when none was configured. Wire THIS function, not
    * the raw one from config, into the SandboxProvider's ask callback
-   * (cortex-sandbox `onNetworkRequest`) with `via: 'shell'`, so shell
+   * (provider `onNetworkRequest`) with `via: 'shell'`, so shell
    * egress asks flow through the same broker pipeline as WebFetch instead
    * of blocking a loop invisibly.
    */
