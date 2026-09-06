@@ -26,7 +26,7 @@ export const statusCommand: Command = {
       : '';
     const runtime = agent ? getOllamaRuntimeInfo(agent.getModel()) : null;
     const runtimeStatus = runtime
-      ? `\nOllama: ${runtime.transport}, ${runtime.contextWindow} tokens allocated`
+      ? `\nOllama: ${runtime.contextWindow} tokens allocated`
         + (runtime.trainedContextWindow ? `, trained maximum ${runtime.trainedContextWindow}` : '')
       : '';
     const notes = session.getResolutionReport() as ResolutionNote[];

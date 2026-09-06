@@ -5,14 +5,12 @@ import { ProviderManager } from '../../src/provider-manager.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 import { ollamaServer } from '../helpers/ollama.js';
 import { CompactionManager, buildCompactionConfig } from '../../src/compaction/index.js';
-import { unwrapModel } from '../../src/model-wrapper.js';
-import { complete, streamSimple } from '@earendil-works/pi-ai/compat';
 
 const loops: AgentLoop[] = [];
 afterEach(async () => { await Promise.all(loops.splice(0).map(loop => loop.destroy())); });
 
 async function createLoop(server = ollamaServer(), tools: unknown[] = []) {
-  const model = await new ProviderManager().createOllamaModel({ modelId: 'test', transport: 'native', fetch: server.fetch });
+  const model = await new ProviderManager().createOllamaModel({ modelId: 'test', fetch: server.fetch });
   const loop = await AgentLoop.create({ model, workingDirectory: process.cwd(), initialBasePrompt: 'You are a test agent.',
     compaction: { strategy: 'classic' }, disableTools: Object.values(TOOL_NAMES), enableSubAgentTool: false, enableLoadSkillTool: false,
     tools: tools as never, thinkingLevel: 'low',
@@ -81,50 +79,7 @@ describe('Ollama through the installed agent loop', () => {
     expect(server.requests.filter(r => r.path === '/api/chat').map(r => r.body['options'].num_ctx)).toEqual([32768, 32768]);
   });
 
-  it('restores explicit off/high controls and cache metrics over the compatibility path', async () => {
-    const server = ollamaServer({ family: 'gptoss' });
-    const model = await new ProviderManager().createOllamaModel({ modelId: 'test', fetch: server.fetch });
-    const payloads: Record<string, any>[] = [];
-    const fetch = async (_url: unknown, init?: RequestInit) => {
-      payloads.push(JSON.parse(String(init?.body)));
-      return new Response('data: ' + JSON.stringify({ id: 'test', choices: [{ index: 0, delta: { content: 'Done' }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 100, completion_tokens: 1, prompt_tokens_details: { cached_tokens: 80 } },
-      }) + '\n\ndata: [DONE]\n\n', { headers: { 'Content-Type': 'text/event-stream' } });
-    };
-    const result = await streamSimple(unwrapModel(model) as never, { messages: [] }, { reasoning: 'high', cacheRetention: 'long', fetch }).result();
-    expect(result.stopReason).toBe('stop');
-    expect(result.usage.cacheRead).toBe(80);
-    expect(payloads[0]).toMatchObject({ reasoning_effort: 'high' });
-    expect(payloads[0]).not.toHaveProperty('prompt_cache_retention');
-  });
 
-  it('uses enforceable binary thinking controls and stable server defaults over compatibility', async () => {
-    const server = ollamaServer({ context: 32768, defaultContext: 8192, family: 'qwen3' });
-    const model = await new ProviderManager().createOllamaModel({ modelId: 'test', fetch: server.fetch });
-    expect(model.contextWindow).toBe(8192);
-    const payloads: Record<string, any>[] = [];
-    const fetch = async (_url: unknown, init?: RequestInit) => {
-      const payload = JSON.parse(String(init?.body));
-      payloads.push(payload);
-      // Model the v0.15 compatibility boundary: it resolves defaults and
-      // rejects string thinking levels on binary-thinking models.
-      server.setContext(8192);
-      if (payload.reasoning_effort && payload.reasoning_effort !== 'none') return new Response('thinking level not supported', { status: 400 });
-      return new Response('data: ' + JSON.stringify({ id: 'test', choices: [{ index: 0, delta: { content: 'Done' }, finish_reason: 'stop' }] })
-        + '\n\ndata: [DONE]\n\n', { headers: { 'Content-Type': 'text/event-stream' } });
-    };
-    const raw = unwrapModel(model) as never;
-    const context = { messages: [] };
-    expect((await streamSimple(raw, context, { reasoning: 'low', fetch }).result()).stopReason).toBe('stop');
-    expect(payloads.at(-1)).not.toHaveProperty('reasoning_effort');
-    expect((await streamSimple(raw, context, { fetch }).result()).stopReason).toBe('stop');
-    expect(payloads.at(-1)).toMatchObject({ reasoning_effort: 'none' });
-    // Raw completion retains server-default thinking, matching the native
-    // path used by utility work and the transport benchmark.
-    expect((await complete(raw, context, { fetch })).stopReason).toBe('stop');
-    expect(payloads.at(-1)).not.toHaveProperty('reasoning_effort');
-    expect(payloads.every(p => p['max_tokens'] === 2048)).toBe(true);
-  });
 });
 
 describe('automatic prefix preservation', () => {

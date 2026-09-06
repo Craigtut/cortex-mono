@@ -7,24 +7,23 @@ import { complete } from '@earendil-works/pi-ai/compat';
 
 const { values } = parseArgs({ options: {
   model: { type: 'string' }, host: { type: 'string' },
-  transport: { type: 'string', default: 'native' },
   repeats: { type: 'string', default: '3' }, help: { type: 'boolean' },
 } });
 if (values.help) {
-  console.log('Usage: node tools/benchmark-ollama.mjs --model <installed-model> [--host <url>] [--transport native|openai] [--repeats 3]');
+  console.log('Usage: node tools/benchmark-ollama.mjs --model <installed-model> [--host <url>] [--repeats 3]');
   console.log('Runs new-prefix, repeat-prefix, and appended-turn requests sequentially. Uses the existing allocation; never unloads models.');
   process.exit(0);
 }
-if (!values.model || !['native', 'openai'].includes(values.transport)) throw new Error('Provide --model and a native|openai transport');
+if (!values.model) throw new Error('Provide --model');
 const repeats = Number(values.repeats);
 if (!Number.isInteger(repeats) || repeats < 1 || repeats > 20) throw new Error('--repeats must be between 1 and 20');
 let metrics;
 const model = await new ProviderManager().createOllamaModel({
-  modelId: values.model, baseUrl: values.host, transport: values.transport,
+  modelId: values.model, baseUrl: values.host,
   onMetrics: value => { metrics = value; },
 });
 const raw = unwrapModel(model);
-console.log(JSON.stringify({ model: model.modelId, transport: values.transport, contextWindow: model.contextWindow,
+console.log(JSON.stringify({ model: model.modelId, contextWindow: model.contextWindow,
   trainedContextWindow: model.capabilities?.trainedContextWindow }));
 
 const lines = Math.min(250, Math.floor(model.contextWindow / 100));
@@ -38,9 +37,7 @@ async function run(phase, input) {
   const result = await complete(raw, input, {
     maxTokens: 32, temperature: 0,
     onPayload: payload => {
-      // Match sampling across native options and the compatibility endpoint.
-      if (values.transport === 'native') payload.options.top_p = 1;
-      else payload.top_p = 1;
+      payload.options.top_p = 1;
     },
   });
   if (result.stopReason === 'error' || result.stopReason === 'aborted') throw new Error(result.errorMessage);

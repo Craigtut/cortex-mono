@@ -70,13 +70,13 @@ export function streamOllama(rawModel: Model<string>, context: Context, options:
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
   };
   const started = performance.now();
-  const metrics: OllamaMetrics = { model: model.id, transport: 'native', contextWindow: runtime.contextWindow, totalMs: 0 };
+  const metrics: OllamaMetrics = { model: model.id, contextWindow: runtime.contextWindow, totalMs: 0 };
   const signal = AbortSignal.any([AbortSignal.timeout(options.timeoutMs ?? 600_000), ...(options.signal ? [options.signal] : [])]);
   void (async () => {
     try {
       signal.throwIfAborted();
       if (options.toolChoice && options.toolChoice !== 'auto' && options.toolChoice !== 'none') {
-        throw new Error('Native Ollama does not support forced tool choice; use structuredComplete() for schema output');
+        throw new Error('Ollama does not support forced tool choice; use structuredComplete() for schema output');
       }
       const requestContext = options.toolChoice === 'none' ? { ...context, tools: [] } : context;
       if (requestContext.tools?.length && !runtime.capabilities.includes('tools')) throw new Error('The selected Ollama model does not support tools');

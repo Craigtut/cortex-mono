@@ -10,40 +10,30 @@ Existing Ollama credentials continue to work, including entries saved as
 `method: "custom"`. The provider name remains `ollama`. Host normalization
 accepts `OLLAMA_HOST`, host/port addresses, and stored URLs ending in `/v1`.
 
-OpenAI compatibility remains the default transport pending comparison on the
-target hardware. Enable the native adapter in `.cortex/config.json`:
+Cortex uses Ollama's `/api/chat` API. There is one Ollama integration and no
+transport setting. Ollama 0.15.0 or newer is required for explicit input
+truncation and context shifting controls. Older servers receive an upgrade
+error before inference.
+
+Optional settings in `.cortex/config.json`:
 
 ```json
 {
-  "ollama": {
-    "transport": "native",
-    "keepAlive": "30m"
-  }
+  "ollama": { "keepAlive": "30m" }
 }
 ```
 
-Native mode requires Ollama 0.15.0 or newer. It uses `/api/chat` with explicit
-input-truncation and context-shifting controls. It never silently falls back to
-another protocol. Older servers can use `"transport": "openai"` if they report
-the running allocation through `/api/ps`.
+Resolution adopts the selected model's loaded context unless an allocation or
+cap is configured. If unloaded, Cortex prepares that model before reading its
+allocation. Model pickers only discover metadata and do not load models.
 
-Native resolution adopts the selected model's loaded context unless an
-allocation or cap is configured. If unloaded, it prepares that model before
-reading the allocation. Compatibility resolution always prepares the selected
-model with server/Modelfile defaults before measuring capacity, because its
-inference endpoint cannot preserve a prior native `num_ctx` override. Switching
-to compatibility can therefore reload the model and change VRAM use. Use native
-mode to keep an explicit allocation. Model pickers only discover metadata and
-do not load models.
-
-An explicit `ollama.contextWindow` requests a server allocation and requires
-native mode. Choose a value that fits your VRAM. In native mode, Cortex Code also
-passes its top-level `contextWindowLimit` as an allocation cap. For example:
+An explicit `ollama.contextWindow` requests a server allocation. Choose a value
+that fits your VRAM. Cortex Code also passes its top-level `contextWindowLimit` as an allocation cap. For example:
 
 ```json
 {
   "contextWindowLimit": 8192,
-  "ollama": { "transport": "native", "keepAlive": "30m" }
+  "ollama": { "keepAlive": "30m" }
 }
 ```
 
@@ -51,16 +41,15 @@ This reduces a larger allocation to 8192 and sends the resolved `num_ctx` on
 every request. A cap never increases a smaller loaded allocation. If the model
 is unloaded, it loads with the cap immediately. An explicit
 `ollama.contextWindow` can request a larger allocation, subject to the cap.
-The limit applies at startup and model resolution; editing configuration
-requires restarting or reselecting the model.
+The limit applies when the model is resolved. Restart Cortex Code after
+editing configuration.
 
-With OpenAI compatibility, `contextWindowLimit` remains a client compaction
-budget because that endpoint does not accept `num_ctx`. Cortex never raises
-the effective context above a known runtime limit, including allocations below
-16K. Explicit positive budgets are honored without a 16K floor.
+Cortex never raises the effective context above a known runtime limit,
+including allocations below 16K. Explicit positive budgets are honored
+without a 16K floor.
 
 The optional `ollama.maxOutputTokens` controls the default output cap, separately
-from allocation. Native calls keep `num_ctx` fixed across main, utility, and
+from allocation. Calls keep `num_ctx` fixed across main, utility, and
 structured requests. A smaller output cap does not shrink the allocation.
 Generation reserves estimated room for prompt formatting; server overflow
 remains an error rather than silently dropping input history.
@@ -69,17 +58,16 @@ A zero `keepAlive` is rejected because Ollama treats empty preparation calls
 with that value as an unload command. Negative values keep the model resident
 indefinitely.
 
-Native mode pins `shift: false`. The first native request can reload a runner
+Cortex pins `shift: false`. The first Cortex request can reload a runner
 previously using different options. Subsequent calls reuse the same options.
 Cortex does not unload models on exit or change global concurrency, Flash
 Attention, GPU placement, or KV quantization settings.
 
-`/status` shows transport, allocation, trained maximum, and Cortex budget. Native
+`/status` shows allocation, trained maximum, and Cortex budget. Ollama
 inference diagnostics include load time, prompt evaluation time, generation time,
 first output/text latency, and cached-token counts when reported by the server.
 These are written to the normal Cortex Code diagnostic log without prompt text.
-OpenAI compatibility reports the timings and usage it can observe, with fewer
-details. An absent cache metric is not treated as a measured cache miss.
+An absent cache metric is not treated as a measured cache miss.
 
 ## Framework API
 
@@ -89,8 +77,7 @@ import { CortexAgent, ProviderManager } from '@animus-labs/cortex';
 const providers = new ProviderManager();
 const model = await providers.createOllamaModel({
   modelId: 'qwen3:32b',
-  transport: 'native',
-  // Omit both to adopt the server's allocation.
+  // Omit contextWindow and contextWindowLimit to adopt the loaded allocation.
   contextWindowLimit: 8192,
   keepAlive: '30m',
   onMetrics: metrics => console.log(metrics),
@@ -117,12 +104,12 @@ continually resize its cache when their budgets differ.
 
 The provider accepts `baseUrl`, `apiKey`, a resolution abort signal, and an
 injectable fetch implementation. Resolution errors are explicit: unknown
-allocation, unsupported native version, and invalid context requests do not
+allocation, unsupported server version, and invalid context requests do not
 silently select a different model or allocation.
 
 Before inference, Cortex checks whether the running allocation still matches.
 If another client changed it, reselect the model to resolve the new limit. If
-the model expired, native mode prepares only that model with its pinned
+the model expired, Cortex prepares only that model with its pinned
 allocation. This check cannot reserve the shared server against simultaneous
 changes by another client.
 
@@ -130,19 +117,16 @@ changes by another client.
 
 Capabilities come from `/api/show`. Known Qwen3 and DeepSeek thinking families
 use a binary switch, exposed as `off` and `low` (enabled) in Cortex's effort
-vocabulary. Compatibility uses `reasoning_effort: "none"` for disabled
-thinking and omits effort for binary enabled thinking, using Ollama's enabled
-default. Native sends explicit `think: false` or `true`. GPT-OSS exposes `low`, `medium`, and `high`; it cannot disable
-thinking. Other families preserve the server default until configured.
+vocabulary, using `think: false` or `true`. GPT-OSS exposes `low`, `medium`, and
+`high`; it cannot disable thinking. Other families preserve the server default until configured.
 `ollama.thinking` can override the mapping with `binary`, `levels`, or `default`.
 Select a mapping supported by the model; Cortex cannot infer arbitrary custom
 template behavior from a model name alone.
 
-Assistant thinking stays separate from text and survives native tool
-continuations and session restore. Native `structuredComplete()` uses Ollama's
+Assistant thinking stays separate from text and survives tool
+continuations and session restore. `structuredComplete()` uses Ollama's
 JSON-schema format and validates the result against the schema. Arbitrary
-forced-tool selection is unsupported in native mode and returns an error.
-The OpenAI-compatible transport keeps the existing forced-tool path.
+forced-tool selection is unsupported and returns an error.
 
 ## Caching
 
@@ -159,19 +143,16 @@ After building Cortex, run against one already-installed model:
 
 ```bash
 npm run build -w packages/cortex
-node tools/benchmark-ollama.mjs --model qwen3:32b --transport openai
-node tools/benchmark-ollama.mjs --model qwen3:32b --transport native
+node tools/benchmark-ollama.mjs --model qwen3:32b
 ```
 
-Use `--host` for another server and `--repeats` to change the repeat count. Run
-each transport as a separate group to distinguish first-load or option-change
-cost from repeated-prefix latency. The script sends synthetic prompts
-sequentially, reports JSON metrics, and never unloads the model. Its new prefix
-is a cache probe, not a guarantee that every server cache is empty. Thinking
-uses the model's server default in both groups; temperature and top-p are
-explicitly matched. Repeat with representative coding tasks before choosing a
-transport based on throughput.
+Use `--host` for another server and `--repeats` to change the repeat count.
+The script sends synthetic prompts sequentially, reports JSON metrics, and
+never unloads the model. Its new prefix is a cache probe, not a guarantee that
+every server cache is empty. Thinking uses the model's server default;
+temperature and top-p are fixed. Repeat with representative coding tasks to
+measure throughput on the target hardware.
 
 The implementation is covered by synthetic server, pi-ai adapter, real
-AgentLoop, CLI, and regression tests. Hardware throughput and cache reuse need
-measurement on the target server before native becomes the default.
+AgentLoop, CLI, and regression tests. Automated tests do not establish real
+GPU throughput or cache reuse; those need measurement on the target server.

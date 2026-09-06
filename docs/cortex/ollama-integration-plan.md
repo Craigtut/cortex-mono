@@ -1,15 +1,15 @@
 # Ollama integration plan
 
-Status: implemented with native transport opt-in. Reviewed 2026-09-06.
+Status: implemented with one Ollama API path (`/api/chat`). Reviewed 2026-09-06.
 
 See [the consumer guide](ollama.md) for configuration and the sequential
-benchmark. Native remains opt-in until the target-hardware comparison passes.
-The sections below record the design; the consumer guide describes current
-behavior.
+benchmark. The compatibility rollout was removed: selecting Ollama always
+uses its native API, with no transport setting or fallback. The sections below
+record the investigation; the consumer guide describes current behavior.
 
 Build a dedicated Ollama provider in Cortex, with native `/api/chat` inference
-as the target transport. Keep pi-agent-core and pi-ai's message/event contract.
-Fix model metadata and runtime context accounting before switching transport.
+as the only inference path. Keep pi-agent-core and pi-ai's message/event contract.
+Resolve model metadata and runtime context accounting before inference.
 
 The target workload is one large local model competing for limited VRAM.
 This plan does not add models, change background-work behavior, or increase
@@ -243,9 +243,8 @@ fragmentation, and cache-aware trimming under both headroom and pressure.
 
 Run a sequential integration benchmark against one resident large model:
 
-1. Compare OpenAI and native transports with equivalent rendered input,
-   effective sampling, thinking, output caps, and allocation. Normalize defaults
-   before attributing a timing difference to transport.
+1. Record rendered input, effective sampling, thinking, output caps, and
+   allocation so repeated measurements use equivalent requests.
 2. Measure a warm runner with a new prefix, repeated prefix, appended user turn,
    and several tool continuations. Separately record true model-load latency
    when a load happens naturally; do not unload just to run routine validation.
@@ -262,21 +261,15 @@ choices. Match the existing single-model setup; do not automatically change
 global settings. Quantized KV is a separate memory/quality experiment.
 [Ollama server settings](https://docs.ollama.com/faq).
 
-## Delivery sequence
+## Delivery
 
-1. Add the dedicated provider descriptor and shared discovery/resolution path.
-   Correct capabilities, local pricing, thinking maps, and runtime context
-   accounting while retaining the current transport. Cover the 16K floor bug.
-2. Add general automatic-prefix cache policy and pressure-aware trimming tests.
-   Establish a sequential baseline on the target server.
-3. Implement the native adapter and schema-completion capability. Verify all
-   primary, utility, structured, child, and restore paths through the same
-   runtime profile. Version-gate newer native behavior.
-4. Compare equivalent requests on real hardware. Make native the Ollama default
-   only after functional parity and no material performance regression. Keep
-   an explicit OpenAI-compatible fallback for older servers or proxies, with
-   its control limitations visible. Never switch protocols silently on failure.
+The dedicated provider descriptor, shared resolution, automatic-prefix cache
+policy, native streaming adapter, schema output, and shared context budgeting
+are implemented. Ollama uses `/api/chat` exclusively; older servers receive a
+clear upgrade error. There is no alternate Ollama transport or rollout flag.
+Hardware measurements validate performance claims rather than gate selection
+of the provider's API.
 
 Production integration and automated contract tests are implemented. No global
-Ollama server settings were changed. The target-hardware comparison remains
+Ollama server settings were changed. Target-hardware measurement remains
 pending; synthetic protocol tests do not establish real throughput or VRAM use.

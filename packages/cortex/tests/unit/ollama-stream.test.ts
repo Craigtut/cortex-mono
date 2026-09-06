@@ -8,7 +8,7 @@ import { ollamaServer } from '../helpers/ollama.js';
 
 const context: Context = { systemPrompt: 'Be useful.', messages: [{ role: 'user', content: 'Hello', timestamp: 1 }] };
 async function setup(server = ollamaServer(), onMetrics = vi.fn()) {
-  const handle = await new ProviderManager().createOllamaModel({ modelId: 'test', transport: 'native', keepAlive: '30m', fetch: server.fetch, onMetrics });
+  const handle = await new ProviderManager().createOllamaModel({ modelId: 'test', keepAlive: '30m', fetch: server.fetch, onMetrics });
   return { server, onMetrics, model: unwrapModel(handle) as Model<string>, handle };
 }
 

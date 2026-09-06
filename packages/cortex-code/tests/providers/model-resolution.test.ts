@@ -12,8 +12,8 @@ describe('connection model resolution', () => {
     const native = vi.spyOn(manager, 'createOllamaModel').mockResolvedValue(model);
     const custom = vi.spyOn(manager, 'createCustomModel');
     expect(await resolveConfiguredModel(manager, 'ollama', 'test', { method: 'custom', baseUrl: 'http://server:11434/v1' },
-      { transport: 'native', contextWindow: 32768, keepAlive: '30m' })).toBe(model);
-    expect(native).toHaveBeenCalledWith(expect.objectContaining({ modelId: 'test', transport: 'native', contextWindow: 32768, baseUrl: 'http://server:11434/v1', keepAlive: '30m' }));
+      { contextWindow: 32768, keepAlive: '30m' })).toBe(model);
+    expect(native).toHaveBeenCalledWith(expect.objectContaining({ modelId: 'test', contextWindow: 32768, baseUrl: 'http://server:11434/v1', keepAlive: '30m' }));
     expect(custom).not.toHaveBeenCalled();
   });
 
@@ -24,13 +24,11 @@ describe('connection model resolution', () => {
     await expect(resolveConfiguredModel(manager, 'local-proxy', 'test', { method: 'custom' })).rejects.toThrow('base URL');
   });
 
-  it('passes the Cortex limit to native allocation without sending unsupported compatibility options', async () => {
+  it('passes the Cortex limit to allocation without requiring Ollama-specific settings', async () => {
     const manager = new ProviderManager();
     const resolve = vi.spyOn(manager, 'createOllamaModel').mockResolvedValue(wrapModel({}, 'ollama', 'test', 8192));
-    await resolveConfiguredModel(manager, 'ollama', 'test', null, { transport: 'native' }, 8192);
-    expect(resolve).toHaveBeenLastCalledWith(expect.objectContaining({ contextWindowLimit: 8192 }));
     await resolveConfiguredModel(manager, 'ollama', 'test', null, undefined, 8192);
-    expect(resolve.mock.calls.at(-1)?.[0]).not.toHaveProperty('contextWindowLimit');
+    expect(resolve).toHaveBeenLastCalledWith(expect.objectContaining({ contextWindowLimit: 8192 }));
   });
 
   it.each(['switchModel', 'switchProvider', 'setUtilityModel'] as const)('%s uses the same connection configuration', async method => {
@@ -39,7 +37,7 @@ describe('connection model resolution', () => {
     const resolve = vi.spyOn(manager, 'createOllamaModel').mockResolvedValue(model);
     const session = Object.create(Session.prototype) as Session;
     Object.assign(session, {
-      provider: 'ollama', providerManager: manager, config: { contextWindowLimit: 8192, ollama: { transport: 'native', contextWindow: 32768 } },
+      provider: 'ollama', providerManager: manager, config: { contextWindowLimit: 8192, ollama: { contextWindow: 32768 } },
       credentialStore: {
         getProvider: vi.fn(async () => ({ method: 'custom', baseUrl: 'http://server:11434/v1' })),
         setDefaults: vi.fn(), setDefaultUtilityModel: vi.fn(), getDefaultUtilityModel: vi.fn(async () => null),
@@ -49,6 +47,6 @@ describe('connection model resolution', () => {
     });
     if (method === 'switchProvider') await session.switchProvider('ollama', 'new');
     else await session[method]('new');
-    expect(resolve).toHaveBeenCalledWith(expect.objectContaining({ modelId: 'new', transport: 'native', contextWindow: 32768, contextWindowLimit: 8192 }));
+    expect(resolve).toHaveBeenCalledWith(expect.objectContaining({ modelId: 'new', contextWindow: 32768, contextWindowLimit: 8192 }));
   });
 });

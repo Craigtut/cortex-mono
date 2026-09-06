@@ -775,7 +775,7 @@ Note: Anthropic supports both OAuth and API key. It appears in both tables.
 
 ### Custom Endpoints
 
-Any OpenAI-compatible API (Ollama, vLLM, LM Studio, etc.) can be configured via `createCustomModel()`. These require a base URL, model ID, and optional API key.
+OpenAI-compatible endpoints such as vLLM and LM Studio can be configured via `createCustomModel()`. These require a base URL, model ID, and optional API key. Ollama uses the dedicated `createOllamaModel()` integration.
 
 ### Deferred Providers
 
@@ -798,5 +798,5 @@ These providers require complex credential configurations beyond a single API ke
 ## Local Ollama models
 
 Use `ProviderManager.createOllamaModel()` for local Ollama connections. It
-resolves capabilities and loaded context allocation and supports native or
-OpenAI-compatible transport. See [Ollama integration](ollama.md).
+resolves capabilities and loaded context allocation and uses Ollama's
+`/api/chat` API. Ollama 0.15.0 or newer is required. See [Ollama integration](ollama.md).

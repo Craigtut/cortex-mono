@@ -4,8 +4,8 @@ import { homedir } from 'node:os';
 import type { CortexAgentMode, SandboxRung, OllamaModelConfig } from '@animus-labs/cortex';
 
 export interface CortexCodeConfig {
-  /** Local runtime preferences. Native allocation is also capped by contextWindowLimit. */
-  ollama?: Pick<OllamaModelConfig, 'transport' | 'contextWindow' | 'keepAlive' | 'thinking' | 'maxOutputTokens'>;
+  /** Local runtime preferences. Allocation is also capped by contextWindowLimit. */
+  ollama?: Pick<OllamaModelConfig, 'contextWindow' | 'keepAlive' | 'thinking' | 'maxOutputTokens'>;
   /** Default model override. */
   defaultModel?: string;
   /** Default provider override. */

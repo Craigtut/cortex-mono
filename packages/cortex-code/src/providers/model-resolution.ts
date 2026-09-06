@@ -13,7 +13,7 @@ export async function resolveConfiguredModel(
   if (provider === 'ollama') {
     return manager.createOllamaModel({
       ...ollama, modelId, baseUrl: entry?.baseUrl,
-      ...(ollama?.transport === 'native' && contextWindowLimit != null ? { contextWindowLimit } : {}),
+      ...(contextWindowLimit != null ? { contextWindowLimit } : {}),
       apiKey: entry?.apiKey,
       onMetrics: metrics => log.debug('Ollama inference', { ...metrics }),
     });

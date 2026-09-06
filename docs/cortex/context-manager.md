@@ -272,8 +272,7 @@ then shared by loops with independent compaction budgets. Cloud providers do
 not receive an unsupported context-allocation parameter.
 
 For [Ollama](ollama.md), `ProviderManager.createOllamaModel()` accepts an exact
-`contextWindow` and an optional `contextWindowLimit` allocation cap in native
-mode. Cortex Code forwards its configured limit to both provider setup and
+`contextWindow` and an optional `contextWindowLimit` allocation cap. Cortex Code forwards its configured limit to both provider setup and
 loop configuration. The native provider sends the resolved allocation as
 `options.num_ctx` on every request, independently of the output-token limit.
 Cortex Code `/status` reports requested budget, effective budget, and backend

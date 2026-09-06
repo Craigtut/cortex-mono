@@ -427,7 +427,7 @@ Cortex Code has no default provider. On first run, a setup flow guides the user 
 
 1. **OAuth** (quickest): Anthropic, OpenAI Codex, Google Gemini, GitHub Copilot. pi-ai handles the OAuth callback server and browser redirect.
 2. **API key**: All pi-ai providers (Anthropic, OpenAI, Google, xAI, Groq, Cerebras, OpenRouter, Mistral, Hugging Face, etc.). Key is validated before saving.
-3. **Ollama** (local): Auto-detected by pinging `http://localhost:11434/` (or `OLLAMA_HOST` env var) with a 2-second timeout. If running, lists available models via `/api/tags`. Connects via pi-ai's OpenAI-compatible API with base URL `http://localhost:11434/v1`.
+3. **Ollama** (local): Auto-detected through `/api/tags` at `http://localhost:11434` (or `OLLAMA_HOST`) with a 2-second timeout. Uses Cortex's dedicated Ollama provider and `/api/chat` for inference. Requires Ollama 0.15.0 or newer. There is no transport selector. See [Ollama integration](../cortex/ollama.md).
 4. **Custom connection**: Any OpenAI-compatible endpoint with a custom base URL.
 
 Users can add more providers later via `/login` and remove them via `/logout`. See `tui-design.md` for the full setup flow UX.

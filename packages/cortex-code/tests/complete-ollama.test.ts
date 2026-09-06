@@ -18,7 +18,7 @@ describe('standalone native Ollama completion', () => {
       const server = ollamaServer();
       server.replies.push([{ message: { content: '{"answer":42}' }, done: true }]);
       vi.stubGlobal('fetch', server.fetch);
-      vi.spyOn(config, 'loadConfig').mockResolvedValue({ contextWindowLimit: 8192, ollama: { transport: 'native', keepAlive: '30m' } });
+      vi.spyOn(config, 'loadConfig').mockResolvedValue({ contextWindowLimit: 8192, ollama: { keepAlive: '30m' } });
       vi.spyOn(CredentialStore.prototype, 'getDefaults').mockResolvedValue({ provider: 'ollama', model: 'test' });
       vi.spyOn(CredentialStore.prototype, 'getProvider').mockResolvedValue(null);
       vi.spyOn(CredentialStore.prototype, 'getDefaultUtilityModel').mockResolvedValue(null);
