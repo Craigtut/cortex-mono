@@ -48,7 +48,7 @@
     }
   },
   "scripts": {
-    "build": "rm -rf dist tsconfig.tsbuildinfo && tsc",
+    "build": "node -e \"for (const p of ['dist', 'tsconfig.tsbuildinfo']) require('node:fs').rmSync(p, { recursive: true, force: true })\" && tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest",

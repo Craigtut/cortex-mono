@@ -51,3 +51,33 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+  windows:
+    name: Windows shell and provider setup
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Exercise real PowerShell 7 and 5.1 processes. Browser launching uses a
+      # mocked OS handler because hosted runners have no interactive desktop.
+      - name: Test Windows command execution and OAuth setup
+        run: >-
+          npx vitest run
+          packages/cortex/tests/unit/tools/bash-shell.test.ts
+          packages/cortex/tests/unit/tools/bash-windows.integration.test.ts
+          packages/cortex-code/tests/providers/browser-auth.test.ts
+          packages/cortex-code/tests/providers/setup-tui-render.test.ts
+          packages/cortex-code/tests/providers/setup-tui-input.test.ts
