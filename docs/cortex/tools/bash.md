@@ -60,8 +60,8 @@ Each platform uses its native shell. No external dependencies required.
 3. Args: `["-c"]`
 
 **Windows:**
-1. Discover PowerShell 7 (`pwsh.exe`): check `Program Files\PowerShell\7\pwsh.exe`, then `ProgramW6432`, then `pwsh` on PATH
-2. Fallback to Windows PowerShell 5.1: `System32\WindowsPowerShell\v1.0\powershell.exe`
+1. Discover PowerShell 7 (`pwsh.exe`): check absolute directories on `PATH`, then `ProgramW6432` and `ProgramFiles` under `PowerShell\7`, then `C:\Program Files\PowerShell\7`.
+2. Fall back to Windows PowerShell 5.1 under `%SystemRoot%\System32\WindowsPowerShell\v1.0`, then `powershell.exe` on `PATH`. A 32-bit Node process first checks `%SystemRoot%\Sysnative` for native PowerShell. Paths are normalized before execution.
 3. PowerShell 7 is preferred because PS 5.1 lacks `&&` operator support
 4. Args: `["-NoProfile", "-NonInteractive", "-Command"]`
 
@@ -79,7 +79,9 @@ The tool tracks the working directory across calls within a single agentic loop.
 
 **Mechanism:** After each command, the tool appends a directory capture suffix:
 - Unix: `; echo "___CWD___"; pwd`
-- PowerShell: `; Write-Host "___CWD___"; Get-Location`
+- PowerShell: `; Write-Output "___CWD___"; (Get-Location).Path`
+
+The actual suffix captures the command's exit status before printing the marker. PowerShell captures both `$?` and `$LASTEXITCODE` so failed cmdlets and native programs report failures. The directory is emitted as a plain string, without PowerShell's table formatting.
 
 The tool parses the marker from stdout, extracts the final working directory, and stores it. The next bash call uses this as the `cwd` option for `child_process.spawn`. The marker and directory output are stripped from the content returned to the model.
 

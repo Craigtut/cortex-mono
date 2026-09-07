@@ -16,6 +16,7 @@ import type { ToolContentDetails, ToolExecuteContext } from '../../types.js';
 import type { SandboxDenial, SandboxProvider } from '../../sandbox/types.js';
 import { killProcessTree } from '../shared/process-tree.js';
 import { buildSafeEnv, runSafetyChecks } from './safety.js';
+import { selectShell, buildShellCommand } from './shell.js';
 import {
   type BackgroundTask,
   type CortexToolRuntime,
@@ -173,107 +174,6 @@ export function getAllBackgroundTasks(): Map<string, BackgroundTask> {
 }
 
 // ---------------------------------------------------------------------------
-// Shell Selection
-// ---------------------------------------------------------------------------
-
-interface ShellConfig {
-  shell: string;
-  args: string[];
-}
-
-/**
- * Read /etc/shells and return the set of trusted shell paths.
- */
-function readTrustedShells(): Set<string> {
-  const trusted = new Set<string>();
-  try {
-    const content = fs.readFileSync('/etc/shells', 'utf8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith('#')) {
-        trusted.add(trimmed);
-      }
-    }
-  } catch {
-    // /etc/shells not available; empty set means we fall back
-  }
-  return trusted;
-}
-
-/**
- * Select the appropriate shell for the current platform.
- */
-function selectShell(customShellPath?: string): ShellConfig {
-  // Custom override
-  if (customShellPath) {
-    if (process.platform === 'win32') {
-      return { shell: customShellPath, args: ['-NoProfile', '-NonInteractive', '-Command'] };
-    }
-    return { shell: customShellPath, args: ['-c'] };
-  }
-
-  if (process.platform === 'win32') {
-    return selectWindowsShell();
-  }
-
-  return selectUnixShell();
-}
-
-function selectUnixShell(): ShellConfig {
-  const userShell = process.env['SHELL'];
-
-  if (userShell) {
-    // Reject fish (incompatible with common bashisms)
-    if (userShell.endsWith('/fish')) {
-      return findUnixFallback();
-    }
-
-    // Validate against /etc/shells
-    const trusted = readTrustedShells();
-    if (trusted.size === 0 || trusted.has(userShell)) {
-      return { shell: userShell, args: ['-c'] };
-    }
-  }
-
-  return findUnixFallback();
-}
-
-function findUnixFallback(): ShellConfig {
-  // Try /bin/bash first, then /bin/sh
-  for (const shell of ['/bin/bash', '/bin/sh']) {
-    try {
-      fs.accessSync(shell, fs.constants.X_OK);
-      return { shell, args: ['-c'] };
-    } catch {
-      continue;
-    }
-  }
-
-  return { shell: '/bin/sh', args: ['-c'] };
-}
-
-function selectWindowsShell(): ShellConfig {
-  // Try PowerShell 7 first
-  const ps7Paths = [
-    'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
-    `${process.env['ProgramW6432']}\\PowerShell\\7\\pwsh.exe`,
-  ];
-
-  for (const ps7 of ps7Paths) {
-    try {
-      fs.accessSync(ps7, fs.constants.X_OK);
-      return { shell: ps7, args: ['-NoProfile', '-NonInteractive', '-Command'] };
-    } catch {
-      continue;
-    }
-  }
-
-  // Fall back to Windows PowerShell 5.1
-  const ps5 = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-  return { shell: ps5, args: ['-NoProfile', '-NonInteractive', '-Command'] };
-}
-
-// ---------------------------------------------------------------------------
 // Output handling
 // ---------------------------------------------------------------------------
 
@@ -413,19 +313,8 @@ export function createBashTool(config: BashToolConfig): {
       // Build safe environment (Layer 1), with consumer overrides merged on top
       const safeEnv = buildSafeEnv(process.env, config.envOverrides);
 
-      // Append CWD capture suffix
       const isWindows = process.platform === 'win32';
-      // Capture exit code before CWD suffix so pwd/Get-Location don't mask it
-      const cwdSuffix = isWindows
-        ? `; $__ec=$LASTEXITCODE; Write-Host "${CWD_MARKER}"; Get-Location; exit $__ec`
-        : `; __ec=$?; echo "${CWD_MARKER}"; pwd; exit $__ec`;
-
-      // UTF-8 prefix for Windows PowerShell
-      const utf8Prefix = isWindows
-        ? '$OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; '
-        : '';
-
-      const fullCommand = `${utf8Prefix}${params.command}${cwdSuffix}`;
+      const fullCommand = buildShellCommand(params.command, CWD_MARKER);
 
       // Resolve the spawn, optionally wrapped by an OS sandbox. The wrapper is a
       // pure transform applied AFTER safety checks and the cwd-capture suffix, so
