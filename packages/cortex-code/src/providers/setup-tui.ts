@@ -31,6 +31,7 @@ import { resolveConfiguredModel } from './model-resolution.js';
 import type { CortexCodeConfig } from '../config/config.js';
 import { CredentialStore, type CredentialEntry } from '../config/credentials.js';
 import { renderOAuthCallbackPage } from './oauth-callback-page.js';
+import { showBrowserAuthorization } from './browser-auth.js';
 import { colors, selectListTheme } from '../tui/theme.js';
 import { addSplitFlapBoard } from '../tui/split-flap.js';
 import { OverlayBox } from '../tui/overlay-box.js';
@@ -236,13 +237,7 @@ class SetupRenderer {
 
         const provider = step.provider ?? '';
         this.providerManager.initiateOAuth(provider, {
-          onAuth: ({ url, instructions }) => {
-            loader.setMessage(instructions ?? `Opening browser...`);
-            import('node:child_process').then(cp => {
-              const cmd = process.platform === 'darwin' ? 'open' : 'xdg-open';
-              cp.execFile(cmd, [url], () => {});
-            });
-          },
+          onAuth: (auth) => showBrowserAuthorization(this.tui, this.contentContainer, loader, auth),
           onPrompt: async (prompt) => this.promptOAuthText(prompt.message, loader, prompt.allowEmpty ?? false),
           onManualCodeInput: async () => this.awaitManualCodeOnDemand(loader),
           onSelect: async (prompt) => this.promptOAuthSelect(prompt, loader),
