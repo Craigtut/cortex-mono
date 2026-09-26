@@ -47,6 +47,7 @@ export const AGENT_LOOP_DELEGATION = {
   clearSteeringQueue: 'forwarded',
   clearFollowUpQueue: 'forwarded',
   clearQueuedDeliveries: 'forwarded',
+  getQueuedDeliveries: 'forwarded',
   queuedDeliveryCount: 'forwarded',
   pendingWakeDeliveryCount: 'forwarded',
   // Subsumed: facade abort() and restore() clear every queue themselves

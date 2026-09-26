@@ -5,6 +5,7 @@
  * usage those owners' counters add up to.
  */
 
+import type { AgentLoop } from '../agent-loop.js';
 import type { SessionUsage } from '../types.js';
 import type { LoopTopology } from './loop-surface.js';
 import type { LogRecorder } from './log-recorder.js';
@@ -42,6 +43,8 @@ export class CompositeState {
     // artifact's talker side and router state through unchanged, so
     // nothing is lost on round trip.
     const session = this.session().captureState();
+    const talkerQueued = session.talkerQueuedDeliveries ?? [];
+    const reasonerQueued = work.getQueuedDeliveries();
     return {
       version: 2,
       log: this.recorder.log.getLog(),
@@ -51,6 +54,9 @@ export class CompositeState {
       reasonerMemory: work.getObservationalMemoryState(),
       usage: this.usage.breakdown(this.usageReadings()),
       ...(session.router ? { router: session.router } : {}),
+      ...(talkerQueued.length > 0 || reasonerQueued.length > 0
+        ? { queuedDeliveries: { talker: talkerQueued, reasoner: reasonerQueued } }
+        : {}),
     };
   }
 
@@ -72,6 +78,7 @@ export class CompositeState {
     const talkerHistory = structuredClone(v2.talkerHistory);
     const talkerMemory = structuredClone(v2.talkerMemory);
     const routerState = v2.router ? structuredClone(v2.router) : undefined;
+    const queued = structuredClone(v2.queuedDeliveries);
 
     // History before observational state (restore ordering), per loop.
     work.restoreConversationHistory(v2.reasonerHistory);
@@ -89,10 +96,15 @@ export class CompositeState {
     // What gets destroyed is recorded in the restored log, which is the
     // durable record of undelivered content from here on.
     this.recorder.recordDroppedQueue(work, 'restore', work.clearAllQueues());
+    // The artifact's own queued content is the restored session's.
+    requeueSilent(work, queued?.reasoner, this.recorder);
     // Everything the mode holds describes the replaced session too; what
-    // the artifact carries of the router's state comes back (passthrough
-    // carries it through untouched).
-    session.resetForRestore(routerState);
+    // the artifact carries of the router's state and the talker's queue
+    // comes back (passthrough carries both through untouched).
+    session.resetForRestore({
+      ...(routerState ? { router: routerState } : {}),
+      ...(Array.isArray(queued?.talker) ? { talkerQueuedDeliveries: queued.talker } : {}),
+    });
   }
 
   /** Each usage producer's live reading, for the ledger. */
@@ -104,4 +116,24 @@ export class CompositeState {
       lookups: this.session().lookupUsage(),
     };
   }
+}
+
+/**
+ * Queue restored silent content on a loop again, oldest first. Best effort
+ * per item: content the loop refuses (a malformed artifact entry, a loop
+ * with no base prompt yet) is recorded as dropped by the restore rather
+ * than failing a restore that has already applied everything else.
+ */
+export function requeueSilent(loop: AgentLoop, contents: unknown, recorder: LogRecorder): void {
+  if (!Array.isArray(contents)) return;
+  const refused: string[] = [];
+  for (const content of contents) {
+    if (typeof content !== 'string') continue;
+    try {
+      loop.deliver(content, { wake: false });
+    } catch {
+      refused.push(content);
+    }
+  }
+  recorder.recordDroppedQueue(loop, 'restore', refused);
 }

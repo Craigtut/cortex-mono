@@ -7,6 +7,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   createDuplexScenario,
+  createPassthroughScenario,
   destroyLiveFacades,
   entriesOfType,
   heldDeliveryCount,
@@ -110,5 +111,54 @@ describe('restoring what the router still held', () => {
     target.talkerPi.script = [{ text: 'That migration was interrupted.' }];
     await target.facade.prompt('how is the migration going?');
     expect(promptTexts(target.talkerPi)[0]).toContain('no longer running: task-1 (migrate the schema)');
+  });
+});
+
+describe('restoring queued silent deliveries', () => {
+  it('queues the talker silent deliveries again', async () => {
+    const source = createDuplexScenario();
+    source.facade.deliver('the build is green', { wake: false });
+    // Precondition: it waits on the talker's silent queue at capture time.
+    expect(source.talkerLoop.queuedDeliveryCount).toBe(1);
+    const state = await source.facade.getState();
+    expect(state.queuedDeliveries?.talker).toHaveLength(1);
+
+    const target = createDuplexScenario();
+    await target.facade.restore(state);
+    expect(target.talkerLoop.getQueuedDeliveries()).toEqual(state.queuedDeliveries!.talker);
+
+    // It surfaces with the user's next turn, as it would have.
+    target.talkerPi.script = [{ text: 'Good news on the build.' }];
+    await target.facade.prompt('anything new?');
+    expect(promptTexts(target.talkerPi)[0]).toContain('the build is green');
+  });
+
+  it('queues the reasoner silent deliveries again in passthrough', async () => {
+    const source = createPassthroughScenario();
+    source.facade.deliver('context for later', { wake: false });
+    expect(source.reasonerLoop.queuedDeliveryCount).toBe(1);
+    const state = await source.facade.getState();
+    expect(state.queuedDeliveries).toEqual({ talker: [], reasoner: ['context for later'] });
+
+    const target = createPassthroughScenario();
+    await target.facade.restore(state);
+    expect(target.reasonerLoop.getQueuedDeliveries()).toEqual(['context for later']);
+  });
+
+  it('carries a restored duplex talker queue through a passthrough round trip', async () => {
+    const source = createDuplexScenario();
+    source.facade.deliver('keep this', { wake: false });
+    const state = await source.facade.getState();
+
+    const passthrough = createPassthroughScenario();
+    await passthrough.facade.restore(state);
+    const roundTrip = await passthrough.facade.getState();
+    expect(roundTrip.queuedDeliveries?.talker).toEqual(state.queuedDeliveries!.talker);
+  });
+
+  it('omits the field when nothing is queued', async () => {
+    const source = createDuplexScenario();
+    expect(source.talkerLoop.queuedDeliveryCount).toBe(0);
+    expect(await source.facade.getState()).not.toHaveProperty('queuedDeliveries');
   });
 });

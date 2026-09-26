@@ -336,6 +336,7 @@ export abstract class LoopSurface {
   get queuedDeliveryCount(): number { return this.topology.conversation.queuedDeliveryCount; }
   get pendingWakeDeliveryCount(): number { return this.topology.conversation.pendingWakeDeliveryCount; }
   clearQueuedDeliveries(): string[] { return this.topology.conversation.clearQueuedDeliveries(); }
+  getQueuedDeliveries(): string[] { return this.topology.conversation.getQueuedDeliveries(); }
 
   /**
    * The CONVERSATION loop's post-slot transcript: the talker in duplex, the

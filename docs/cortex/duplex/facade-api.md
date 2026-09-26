@@ -127,6 +127,7 @@ The persisted artifact becomes a versioned composite:
   reasonerMemory:   {...},
   usage:            {...},          // single aggregate; restore is idempotent, not additive
   router:           {...},          // optional: alias counter, tasks, held results, pending deltas
+  queuedDeliveries: {...},          // optional: silent deliveries queued on each loop, re-queued on restore
 }
 ```
 

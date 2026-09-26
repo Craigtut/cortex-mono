@@ -24,6 +24,7 @@ import type {
   CortexAbortScope,
   CortexDeliverOptions,
   FacadeServices,
+  RestoredSessionParts,
   SessionMode,
   SessionStateParts,
 } from './session-mode.js';
@@ -230,6 +231,9 @@ export class PassthroughSession implements SessionMode {
       talkerHistory: structuredClone(this.retained.talkerHistory) as AgentMessage[],
       talkerMemory: structuredClone(this.retained.talkerMemory) as ObservationalMemoryState | null,
       ...(this.retained.router ? { router: structuredClone(this.retained.router) } : {}),
+      ...(this.retained.talkerQueuedDeliveries
+        ? { talkerQueuedDeliveries: [...this.retained.talkerQueuedDeliveries] }
+        : {}),
     };
   }
 
@@ -237,10 +241,10 @@ export class PassthroughSession implements SessionMode {
     this.retained = { ...this.retained, talkerHistory: parts.talkerHistory, talkerMemory: parts.talkerMemory };
   }
 
-  resetForRestore(routerState: DuplexRouterState | undefined): void {
+  resetForRestore(restored: RestoredSessionParts): void {
     this.activeCauseSeq = null;
-    const { router: _previous, ...rest } = this.retained;
-    this.retained = routerState ? { ...rest, router: routerState } : rest;
+    const { router: _router, talkerQueuedDeliveries: _queued, ...rest } = this.retained;
+    this.retained = { ...rest, ...restored };
   }
 
   beginDestroy(): void {}

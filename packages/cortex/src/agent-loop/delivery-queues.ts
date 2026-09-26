@@ -458,6 +458,11 @@ export class DeliveryQueues {
     return this.silent.splice(0);
   }
 
+  /** The silent queue's content in queue order, left in place. */
+  silentContents(): string[] {
+    return this.silent.map((item) => item.content);
+  }
+
   clearSilent(): string[] {
     return this.silent.splice(0).map((item) => item.content);
   }

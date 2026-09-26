@@ -189,6 +189,7 @@ export type {
   CortexAgentStateV1,
   CortexAgentStateV2,
   CortexAgentPersistedState,
+  CortexAgentQueuedDeliveries,
   CortexAgentUsageBreakdown,
 } from './facade/persisted-state.js';
 export type { DuplexRouterState } from './duplex/router-contract.js';

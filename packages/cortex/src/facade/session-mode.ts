@@ -57,7 +57,12 @@ export interface SessionStateParts {
   talkerHistory: AgentMessage[];
   talkerMemory: ObservationalMemoryState | null;
   router?: DuplexRouterState;
+  /** Silent deliveries queued on the talker, oldest first. */
+  talkerQueuedDeliveries?: string[];
 }
+
+/** What a restore hands the mode once its queues and router are reset. */
+export type RestoredSessionParts = Pick<SessionStateParts, 'router' | 'talkerQueuedDeliveries'>;
 
 /** What a mode needs of the facade that hosts it. */
 export interface FacadeServices {
@@ -115,7 +120,7 @@ export interface SessionMode {
    * Restore, second half, after the log is restored: whatever else the mode
    * holds describes the replaced session.
    */
-  resetForRestore(routerState: DuplexRouterState | undefined): void;
+  resetForRestore(restored: RestoredSessionParts): void;
 
   /** Teardown, synchronously at destroy(): timers and pending asks. */
   beginDestroy(): void;

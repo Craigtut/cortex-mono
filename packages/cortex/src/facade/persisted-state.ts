@@ -64,6 +64,21 @@ export interface CortexAgentStateV2 {
    * duplex.
    */
   router?: DuplexRouterState;
+  /**
+   * Silent deliveries queued on a resident loop, waiting for its next real
+   * prompt. A restore queues them again, so content handed over silently
+   * (a result the talker is meant to mention when relevant) is not lost to
+   * a persist/restore round trip. Optional, and absent when both queues
+   * are empty.
+   */
+  queuedDeliveries?: CortexAgentQueuedDeliveries;
+}
+
+/** Queued silent deliveries per resident loop, oldest first. */
+export interface CortexAgentQueuedDeliveries {
+  /** Empty for passthrough sessions. */
+  talker: string[];
+  reasoner: string[];
 }
 
 /**

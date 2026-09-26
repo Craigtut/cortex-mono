@@ -22,10 +22,12 @@ import {
 } from '../facade/settlement.js';
 import type { SettlementTerm } from '../facade/settlement.js';
 import type { ResolvedCortexAgentConfig } from '../facade/config.js';
+import { requeueSilent } from '../facade/composite-state.js';
 import type {
   CortexAbortScope,
   CortexDeliverOptions,
   FacadeServices,
+  RestoredSessionParts,
   SessionMode,
   SessionStateParts,
 } from '../facade/session-mode.js';
@@ -359,6 +361,7 @@ export class DuplexSession implements SessionMode {
       talkerHistory: this.talker.getConversationHistory(),
       talkerMemory: this.talker.getObservationalMemoryState(),
       router: this.router.exportState(),
+      talkerQueuedDeliveries: this.talker.getQueuedDeliveries(),
     };
   }
 
@@ -375,15 +378,17 @@ export class DuplexSession implements SessionMode {
    * talker content, router state (delegations, deltas, held deliveries,
    * dedup), the aggregate spend, the repair streak, and the voicings of
    * asks the router reset has already settled. What the artifact carries of
-   * the router's state comes back.
+   * the talker's queue and the router's state comes back, queue first: those
+   * deliveries reached the talker before anything the router still held.
    */
-  resetForRestore(routerState: DuplexRouterState | undefined): void {
+  resetForRestore(restored: RestoredSessionParts): void {
     this.recorder.recordDroppedQueue(this.talker, 'restore', this.talker.clearAllQueues());
     // Pending asks belong to the replaced session; every resolver settles
     // as deny so no loop stays blocked on an ask nobody can answer anymore.
     this.broker.reset();
     this.router.resetForRestore();
-    this.restoreRouterState(routerState);
+    requeueSilent(this.talker, restored.talkerQueuedDeliveries, this.recorder);
+    this.restoreRouterState(restored.router);
     this.parts.aggregate.resetForRestore();
     this.parts.guards.resetForRestore();
   }

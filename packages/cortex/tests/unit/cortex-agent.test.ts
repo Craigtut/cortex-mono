@@ -980,6 +980,7 @@ const POST_DESTROY_PROBES: Record<ForwardedLoopMember, PostDestroyProbe> = {
   clearSteeringQueue: { call: (t) => t.clearSteeringQueue() },
   clearFollowUpQueue: { call: (t) => t.clearFollowUpQueue() },
   clearQueuedDeliveries: { call: (t) => t.clearQueuedDeliveries() },
+  getQueuedDeliveries: { call: (t) => t.getQueuedDeliveries() },
   queuedDeliveryCount: { call: (t) => t.queuedDeliveryCount },
   pendingWakeDeliveryCount: { call: (t) => t.pendingWakeDeliveryCount },
   // Asks and headlines.

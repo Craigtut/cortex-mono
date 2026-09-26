@@ -97,6 +97,12 @@ export interface LoopDeliveryApi {
   clearQueuedDeliveries(): string[];
 
   /**
+   * The queued silent deliveries' content in queue order, without removing
+   * it: what a persistence snapshot records so a restore can queue it again.
+   */
+  getQueuedDeliveries(): string[];
+
+  /**
    * Retract parked wake deliveries whose content matches `predicate`,
    * returning the dropped content in queue order. Silent deliveries and pi's
    * queues are untouched.
