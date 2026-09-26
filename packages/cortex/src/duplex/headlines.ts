@@ -18,6 +18,7 @@
 import type { SessionUsage, SubAgentSnapshot } from '../types.js';
 import type { DelegationSnapshot } from './router.js';
 import { clipHeadTail } from '../permission-rendering.js';
+import { toolCallSubject } from '../tools/tool-call-subject.js';
 
 /**
  * What the block needs of a pending ask.
@@ -93,6 +94,25 @@ function clip(value: string, maxChars: number): string {
 
 function ageSeconds(now: number, timestamp: number): number {
   return Math.max(0, Math.round((now - timestamp) / 1000));
+}
+
+/**
+ * Identifying detail for the headline's "Current:" line, mirroring the
+ * loop's own log-line summarization: paths, commands, and patterns without
+ * content or results. Escaping happens inside the headline builder.
+ */
+export function summarizeHeadlineArgs(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+): string | null {
+  if (!args) return null;
+  const str = (value: unknown): string | null => (typeof value === 'string' ? value : null);
+  const subject = toolCallSubject(toolName, args);
+  if ('command' in subject) return str(subject.command)?.slice(0, 120) ?? null;
+  if ('path' in subject) return str(subject.path);
+  if ('pattern' in subject) return str(subject.pattern);
+  if ('url' in subject) return str(subject.url);
+  return null;
 }
 
 // ---------------------------------------------------------------------------

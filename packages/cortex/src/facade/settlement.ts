@@ -11,6 +11,8 @@
  * all terms at once.
  */
 
+import type { AgentLoop } from '../agent-loop.js';
+
 /** One condition settlement waits out. */
 export interface SettlementTerm {
   /** For diagnostics and ordering tests. */
@@ -26,6 +28,52 @@ export interface SettlementTerm {
 /** One macrotask yield: lets pending microtask cascades finish. */
 export function yieldMacrotask(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** A loop's gate: a run or any gate work in flight. */
+export function gateTerm(loop: AgentLoop): SettlementTerm {
+  return {
+    name: `${loop.loopPath}-gate`,
+    pending: () => loop.isLoopActive,
+    settled: () => loop.waitForLoopIdle(),
+  };
+}
+
+/**
+ * Parked wake deliveries have no settle signal of their own; they start a
+ * run when they land, which the gate terms then wait out.
+ */
+export function parkedWakesTerm(loop: AgentLoop): SettlementTerm {
+  return {
+    name: `${loop.loopPath}-parked-wakes`,
+    pending: () => loop.pendingWakeDeliveryCount > 0,
+    settled: () => null,
+  };
+}
+
+/** A loop's running sub-agents, waited out on their completion promises. */
+export function subAgentsTerm(loop: AgentLoop): SettlementTerm {
+  const manager = loop.getSubAgentManager();
+  return {
+    name: `${loop.loopPath}-sub-agents`,
+    pending: () => manager.activeCount > 0,
+    settled: async () => {
+      const completions = manager.getActiveTaskIds()
+        .map((taskId) => manager.get(taskId)?.completion)
+        .filter((completion) => completion !== undefined);
+      await Promise.all(completions);
+      await yieldMacrotask();
+    },
+  };
+}
+
+/** Asks in a loop's own registry (its own and its sub-agents'). */
+export function loopAsksTerm(loop: AgentLoop): SettlementTerm {
+  return {
+    name: `${loop.loopPath}-asks`,
+    pending: () => loop.getPendingAsks().length > 0,
+    settled: () => loop.waitForAskSettlement(),
+  };
 }
 
 /** Facade prompts accepted but not yet settled (chain-queued or running). */

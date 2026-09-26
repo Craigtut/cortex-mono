@@ -27,6 +27,7 @@ import type { AgentLoop } from '../../src/agent-loop.js';
 import {
   createDuplexScenario,
   destroyLiveFacades,
+  duplexRouterOf,
   entriesOfType,
   getBroker,
   heldDeliveryCount,
@@ -495,8 +496,7 @@ describe('adversarial: control-tool error loop', () => {
   it('a dispatch that throws still terminates the batch instead of reopening it', async () => {
     const h = createDuplexScenario();
     // Break the dispatch path the way a router bug would.
-    (h.facade as unknown as { router: { dispatchSpawn: () => string } }).router.dispatchSpawn =
-      () => { throw new Error('router exploded'); };
+    duplexRouterOf(h.facade).dispatchSpawn = () => { throw new Error('router exploded'); };
 
     h.talkerPi.script = [
       { text: 'Starting.', calls: [{ name: 'spawn_task', args: { instructions: 'do it' } }] },

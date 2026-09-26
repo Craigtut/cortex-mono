@@ -30,6 +30,7 @@ import type { CortexModel } from '../../src/model-wrapper.js';
 import { CortexAgent } from '../../src/cortex-agent.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
 import type { PermissionBroker } from '../../src/duplex/permission-broker.js';
+import type { DuplexRouter } from '../../src/duplex/router.js';
 import type { SessionLogEntry } from '../../src/session-log.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 import { partsOf } from './agent-loop/parts.js';
@@ -142,7 +143,7 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
   let rejectRun: ((err: Error) => void) | null = null;
   // Every waiter, like pi's shared run promise: two concurrent aborts both
   // wait on the same run, and a single slot would strand the first.
-  let idleResolvers: Array<() => void> = [];
+  const idleResolvers: Array<() => void> = [];
   let abortController: AbortController | null = null;
   let running = false;
   let callCounter = 0;
@@ -816,18 +817,25 @@ export function roles(messages: AgentMessage[]): string[] {
   return messages.map((message) => String(message.role));
 }
 
+/**
+ * The duplex facade's router. The one cast into the facade's internals that
+ * every suite goes through, so a renamed field breaks here, loudly, instead
+ * of in each suite (or silently, for a write through a stale path).
+ */
+export function duplexRouterOf(facade: CortexAgent): DuplexRouter {
+  const session = (facade as unknown as { duplex?: { router?: DuplexRouter } | null }).duplex;
+  if (!session?.router) throw new Error('duplexRouterOf: not a duplex facade, or its internals moved');
+  return session.router;
+}
+
 /** Talker-waking deliveries the router is still holding. */
 export function heldDeliveryCount(facade: CortexAgent): number {
-  return (facade as unknown as {
-    router: { pendingDeliveryCount: number };
-  }).router.pendingDeliveryCount;
+  return duplexRouterOf(facade).pendingDeliveryCount;
 }
 
 /** The duplex facade's consent boundary. */
 export function getBroker(facade: CortexAgent): PermissionBroker {
-  return (facade as unknown as {
-    router: { permissionBroker: PermissionBroker };
-  }).router.permissionBroker;
+  return duplexRouterOf(facade).permissionBroker;
 }
 
 /** Log entries of one type, in seq order. */

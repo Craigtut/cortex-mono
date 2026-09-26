@@ -36,6 +36,7 @@ import {
   buildBrokeredPermissionResolver,
 } from '../../src/duplex/brokered-resolvers.js';
 import type { BrokeredAskDecision, PermissionBroker } from '../../src/duplex/permission-broker.js';
+import { getBroker } from './duplex-scenario-harness.js';
 import type { CortexAgentConfig, CortexAgentStateV2 } from '../../src/cortex-agent.js';
 
 // These harnesses bypass create() and inject already-resolved loop configuration.
@@ -1893,12 +1894,6 @@ describe('duplex headlines', () => {
 // ---------------------------------------------------------------------------
 
 describe('duplex permission broker', () => {
-  function getBroker(facade: CortexAgent): PermissionBroker {
-    return (facade as unknown as {
-      router: { permissionBroker: PermissionBroker };
-    }).router.permissionBroker;
-  }
-
   function promptText(call: string | AgentMessage[]): string {
     if (typeof call === 'string') return call;
     return call

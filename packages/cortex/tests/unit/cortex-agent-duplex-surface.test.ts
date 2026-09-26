@@ -15,6 +15,7 @@ import {
   createRealDuplexScenario,
   createScriptedPiAgent,
   destroyLiveFacades,
+  duplexRouterOf,
   entriesOfType,
   getBroker,
   lifecycleEvents,
@@ -132,9 +133,9 @@ describe('duplex router tuning', () => {
     const { facade } = await createRealDuplexScenario({
       duplex: { maxDispatchesPerTurn: 1 },
     });
-    const options = (facade as unknown as {
-      router: { options: { maxDispatchesPerTurn: number; delegationMaxAgeMs: number } };
-    }).router.options;
+    const options = (duplexRouterOf(facade) as unknown as {
+      options: { maxDispatchesPerTurn: number; delegationMaxAgeMs: number };
+    }).options;
     expect(options.maxDispatchesPerTurn).toBe(1);
     // And an unset key keeps the router's own default rather than undefined.
     expect(options.delegationMaxAgeMs).toBeGreaterThan(0);
