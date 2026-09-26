@@ -1,11 +1,11 @@
 /**
- * Drives the REAL Session.resolvePermission with the ask context Cortex
- * threads through resolvePermission (signal, askId), so a wiring bug in
- * Session itself (discarding the context, leaving an aborted run's prompt on
- * screen while it holds permissionLockPromise, dropping the askId before the
- * activity record) is caught. Only the TUI prompt is stubbed; it mirrors the
- * real App.showPermissionPrompt contract: unsettled until the user answers or
- * the external-decision promise resolves.
+ * Drives the REAL permission resolver a Session hands Cortex (its permission
+ * broker) with the ask context Cortex threads through resolvePermission
+ * (signal, askId), so a wiring bug (discarding the context, leaving an aborted
+ * run's prompt on screen while it holds permissionLockPromise, dropping the
+ * askId before the activity record) is caught. Only the TUI prompt is
+ * stubbed; it mirrors the real App.showPermissionPrompt contract: unsettled
+ * until the user answers or the external-decision promise resolves.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
@@ -48,8 +48,11 @@ type ResolvePermissionFn = (
 
 interface SessionInternals {
   app: unknown;
-  permissionLockPromise: Promise<void> | null;
-  resolvePermission: ResolvePermissionFn;
+  /** The session's permission broker; the lock and the resolver live there. */
+  permissions: {
+    permissionLockPromise: Promise<void> | null;
+    resolvePermission: ResolvePermissionFn;
+  };
   activity: {
     recordPermissionRequested: (...args: unknown[]) => unknown;
     recordPermissionResolved: (...args: unknown[]) => Promise<void>;
@@ -122,7 +125,7 @@ describe('Session.resolvePermission ask context', () => {
     const controller = new AbortController();
     const resolved = vi.spyOn(internals.activity, 'recordPermissionResolved');
 
-    const resultPromise = internals.resolvePermission(
+    const resultPromise = internals.permissions.resolvePermission(
       'Bash',
       { command: 'git push origin main' },
       { signal: controller.signal, askId: 'ask-test-1', loopPath: 'main' },
@@ -141,7 +144,7 @@ describe('Session.resolvePermission ask context', () => {
     });
     // The lock is released so the next gated tool call is not serialized
     // behind a prompt for dead work.
-    expect(internals.permissionLockPromise).toBeNull();
+    expect(internals.permissions.permissionLockPromise).toBeNull();
     // The activity stream records the dismissal as a cancellation, not a denial.
     const lastCall = resolved.mock.calls.at(-1);
     expect(lastCall?.[2]).toBe('cancelled');
@@ -152,7 +155,7 @@ describe('Session.resolvePermission ask context', () => {
     const controller = new AbortController();
     const requested = vi.spyOn(internals.activity, 'recordPermissionRequested');
 
-    const resultPromise = internals.resolvePermission(
+    const resultPromise = internals.permissions.resolvePermission(
       'Bash',
       { command: 'git push origin main' },
       { signal: controller.signal, askId: 'ask-test-2', loopPath: 'main' },
@@ -195,7 +198,7 @@ describe('Session.resolvePermission ask context', () => {
       },
     );
 
-    const resultPromise = internals.resolvePermission(
+    const resultPromise = internals.permissions.resolvePermission(
       'Bash',
       { command: 'git push origin main' },
       { signal: controller.signal, askId: 'ask-window', loopPath: 'main' },
@@ -207,7 +210,7 @@ describe('Session.resolvePermission ask context', () => {
       decision: 'block',
       reason: 'Run aborted before the permission prompt was answered',
     });
-    expect(internals.permissionLockPromise).toBeNull();
+    expect(internals.permissions.permissionLockPromise).toBeNull();
     const lastCall = resolved.mock.calls.at(-1);
     expect(lastCall?.[2]).toBe('cancelled');
   });
@@ -217,7 +220,7 @@ describe('Session.resolvePermission ask context', () => {
 
     // First ask holds the lock.
     const firstController = new AbortController();
-    const firstAsk = internals.resolvePermission(
+    const firstAsk = internals.permissions.resolvePermission(
       'Bash',
       { command: 'git push origin main' },
       { signal: firstController.signal, askId: 'ask-first' },
@@ -227,7 +230,7 @@ describe('Session.resolvePermission ask context', () => {
 
     // Second ask queues behind the lock; its run aborts while it waits.
     const secondController = new AbortController();
-    const secondAsk = internals.resolvePermission(
+    const secondAsk = internals.permissions.resolvePermission(
       'Bash',
       { command: 'git push origin dev' },
       { signal: secondController.signal, askId: 'ask-second' },

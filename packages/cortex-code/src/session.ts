@@ -18,15 +18,12 @@ const { version: PKG_VERSION } = require('../package.json');
 import {
   CortexAgent,
   ProviderManager,
-  BASH_ESCALATION_PERMISSION_NAME,
   INTERNAL_TAG_NAMES,
   type CortexModel,
   type CortexAgentConfig,
   type CortexAgentStateV1,
   type CortexAgentStateV2,
   type CortexEvent,
-  type CortexToolPermissionResult,
-  type ToolPermissionRequestContext,
   type AgentTextOutput,
   type ClassifiedError,
   type CompactionResult,
@@ -50,9 +47,7 @@ import { OverlayBox } from './tui/overlay-box.js';
 import { resolveAgentMode, type CortexCodeConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { ApiKeyResolver } from './providers/api-key-resolver.js';
-import { PermissionRuleManager } from './permissions/rules.js';
-import { preflightPermission, type PreflightDeps } from './permissions/preflight.js';
-import { isPathWithinRealCwd } from './permissions/path-containment.js';
+import { PermissionBroker } from './permissions/prompt-broker.js';
 import { discoverProjectContext } from './discovery/context.js';
 import { discoverSkills, isProjectSkill, computeProjectSkillsSignature } from './discovery/skills.js';
 import { discoverMcpServers } from './discovery/mcp.js';
@@ -70,29 +65,14 @@ import type { UpdateInfo } from './updates/checker.js';
 import { UpdatePrompt } from './updates/update-prompt.js';
 import type { Mode } from './modes/types.js';
 import { AVAILABLE_MODES } from './modes/index.js';
-import path from 'node:path';
-import { homedir } from 'node:os';
-import type {
-  SandboxOptions,
-  SandboxState,
-  SandboxStatus,
-  SandboxPolicy,
-  SandboxRung,
-  NetworkAccessRequest,
-  NetworkAccessDecision,
-} from '@animus-labs/cortex';
-import {
-  NetworkAccessController,
-  NetworkGrantStore,
-  type NetworkPromptChoice,
-} from './permissions/network.js';
+import type { SandboxStatus, SandboxPolicy, SandboxRung } from '@animus-labs/cortex';
 import { workspaceSettingsPath } from './permissions/rules.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { log } from './logger.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
 import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
-import { FileSessionActivityReporter, watchDecisionFile, type PermissionResolution } from './activity/session-activity.js';
+import { FileSessionActivityReporter } from './activity/session-activity.js';
 import { McpConfigWatcher, type McpConfigChangeReason } from './mcp/mcp-watcher.js';
 import { reconcileMcpServers, type McpReconcileResult } from './mcp/reconcile.js';
 import { loadHookHandlers, readProjectHooksContent, hasProjectHooks } from './hooks/loader.js';
@@ -138,10 +118,8 @@ export interface SessionOptions {
 export class Session {
   private agent: CortexAgent | null = null;
   private readonly sandbox: SessionSandbox;
-  private readonly networkGrants: NetworkGrantStore;
-  private readonly networkAccess: NetworkAccessController;
   private app: App | null = null;
-  private rules: PermissionRuleManager;
+  private readonly permissions: PermissionBroker;
   private yoloMode: boolean;
   private sessionId: string;
   /** True when this session was launched to resume a saved one. */
@@ -190,8 +168,6 @@ export class Session {
   private lastTurnErrorHandled = false;
   private readonly retry = new RetryStatusLine(() => this.app);
   private createdAt: number;
-  private permissionLockPromise: Promise<void> | null = null;
-  private permissionLockRelease: (() => void) | null = null;
   private subAgentActivity = new Map<string, Map<string, { name: string; status: string; summary?: string }>>();
   private readonly freezeDiagnostics: FreezeDiagnostics;
   private readonly activity: FileSessionActivityReporter;
@@ -258,9 +234,7 @@ export class Session {
     this.cwd = options.cwd;
     this.initialUtilityModelId = options.initialUtilityModelId;
     this.yoloMode = options.yoloMode;
-    this.rules = new PermissionRuleManager(options.cwd);
     const settingsPath = workspaceSettingsPath(options.cwd);
-    this.networkGrants = new NetworkGrantStore(settingsPath);
     this.sandbox = new SessionSandbox({
       config: options.config,
       cwd: options.cwd,
@@ -268,11 +242,6 @@ export class Session {
       getAgent: () => this.agent,
       getApp: () => this.app,
       onRungChanged: () => this.updateEphemeralContext(),
-    });
-    this.networkAccess = new NetworkAccessController({
-      getPolicy: () => this.sandbox.getPolicy()?.network,
-      prompt: (req) => this.promptNetworkAccess(req),
-      store: this.networkGrants,
     });
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.isResume = options.resumeSessionId !== undefined;
@@ -295,6 +264,14 @@ export class Session {
     });
     // Durable append-only conversation log, separate from the lossy history.json
     // snapshot. Read by sibling apps to summarize where a session left off.
+    this.permissions = new PermissionBroker({
+      cwd: options.cwd,
+      settingsPath,
+      activity: this.activity,
+      sandbox: this.sandbox,
+      getApp: () => this.app,
+      getYoloMode: () => this.yoloMode,
+    });
     this.updatePrompt = new UpdatePrompt({
       getApp: () => this.app,
       activity: this.activity,
@@ -322,8 +299,7 @@ export class Session {
     registerBuiltinCommands();
 
     // Load persisted permission rules and network domain grants
-    await this.rules.loadPersistedRules();
-    await this.networkGrants.load();
+    await this.permissions.load();
 
     // Create TUI
     const callbacks: AppCallbacks = {
@@ -1408,277 +1384,9 @@ export class Session {
     });
   }
 
-  /**
-   * Permission resolution: rules check, then serialized inline TUI prompt.
-   *
-   * Concurrent permission requests (from parallel tool execution) are
-   * serialized so only one prompt is active at a time. After waiting,
-   * rules are re-checked because a previous prompt may have created a
-   * rule that now covers this request.
-   */
   /** Abnormal-exit teardown. Cortex owns its sandbox and temporary directory. */
   async disposeSandbox(): Promise<void> {
     await this.agent?.destroy();
-  }
-
-  private async resolvePermission(
-    toolName: string,
-    toolArgs: unknown,
-    context?: ToolPermissionRequestContext,
-  ): Promise<boolean | CortexToolPermissionResult> {
-    const abortSignal = context?.signal;
-    const sandboxStatus = this.sandbox.getStatus();
-    const sandboxPolicy = this.sandbox.getPolicy();
-    const preflightDeps: PreflightDeps = {
-      yoloMode: this.yoloMode,
-      cwd: this.cwd,
-      matchRule: (t, a) => this.rules.matchRule(t, a),
-      isReadOnlyInProject: (t, a) => this.isReadOnlyInProject(t, a),
-      // Sandboxed shell commands past the catastrophic floor and any deny rule
-      // auto-run inside the OS boundary instead of prompting. Gate on BOTH axes:
-      // a filesystem-only backend (e.g. future Windows Tier 1, fs enforced but
-      // network none) must keep prompting rather than auto-run with open egress.
-      sandboxBashEnforced:
-        sandboxStatus?.filesystem === 'enforced' &&
-        sandboxStatus?.network === 'enforced',
-      // Broad read auto-approve for Read/Grep/Glob, matching the sandboxed
-      // shell's view: reads are broad by policy design, denyRead is the only
-      // read-side restriction. Requires FULL filesystem enforcement, not
-      // partial: Windows Tier 1 cannot deny secret-file reads to
-      // subprocesses, and Grep's denyRead guarantee is the kernel containing
-      // ripgrep. Network enforcement is irrelevant to reads, so this is
-      // deliberately looser than sandboxBashEnforced's both-axes gate.
-      sandboxReadsBroad:
-        sandboxStatus?.filesystem === 'enforced' &&
-        sandboxPolicy !== undefined,
-      // With an active sandbox policy, WebFetch is gated per host by the same
-      // network decision as shell egress; that gate replaces the per-call tool
-      // prompt. Purely policy-level, so it applies even where OS enforcement
-      // is degraded (the gate runs in-process).
-      webFetchNetworkGated: sandboxPolicy !== undefined,
-      // Project the policy's filesystem deny sets onto the in-process file
-      // tools (Write/Edit/UndoEdit/Read/Glob), which bypass the OS boundary the
-      // shell is contained by. writableRoots is the positive floor: the shell
-      // may write only inside it, so an in-process write escaping it must not
-      // auto-approve either. Absent when the sandbox is off.
-      ...(sandboxPolicy
-        ? {
-            sandboxDenyWrite: sandboxPolicy.filesystem.denyWrite,
-            sandboxDenyRead: sandboxPolicy.filesystem.denyRead,
-            sandboxWritableRoots: sandboxPolicy.filesystem.writableRoots,
-          }
-        : {}),
-    };
-
-    // Fast path: deterministic decision (catastrophic floor > yolo > deny rule
-    // > read-only-in-project > allow rule) before acquiring the prompt lock.
-    const pre = await preflightPermission(toolName, toolArgs, preflightDeps);
-    if (pre.decision === 'allow') return true;
-    if (pre.decision === 'block') {
-      return pre.reason ? { decision: 'block', reason: pre.reason } : { decision: 'block' };
-    }
-
-    if (!this.app) return { decision: 'block', reason: 'TUI not initialized' };
-
-    // Serialize: wait for any active permission prompt to finish
-    while (this.permissionLockPromise) {
-      await this.permissionLockPromise;
-    }
-
-    // The asking run may have been aborted while this ask waited behind
-    // another prompt (or before it arrived). Cortex has already stopped
-    // waiting for this resolver, so never show a prompt for dead work.
-    if (abortSignal?.aborted) {
-      return { decision: 'block', reason: 'Run aborted before the permission prompt was shown' };
-    }
-
-    // Re-check: a previous prompt may have added an "always allow"/deny rule.
-    const preAfterWait = await preflightPermission(toolName, toolArgs, preflightDeps);
-    if (preAfterWait.decision === 'allow') return true;
-    if (preAfterWait.decision === 'block') {
-      return preAfterWait.reason
-        ? { decision: 'block', reason: preAfterWait.reason }
-        : { decision: 'block' };
-    }
-
-    // Acquire lock and show the prompt
-    this.permissionLockPromise = new Promise<void>((resolve) => {
-      this.permissionLockRelease = resolve;
-    });
-
-    const permission = this.activity.recordPermissionRequested(
-      toolName,
-      toolArgs,
-      context?.askId !== undefined ? { askId: context.askId } : undefined,
-    );
-    await permission.written;
-    let permissionResolution: PermissionResolution = 'denied';
-
-    // Allow answering out-of-band (e.g. a companion app writing a decision to
-    // the session's control directory) as well as from the inline TUI prompt:
-    // watch for an external decision and let whichever lands first win. Aborting
-    // the controller stops the watcher once the prompt resolves, however it
-    // resolved.
-    const externalController = new AbortController();
-    const fileDecision = watchDecisionFile(
-      this.activity.decisionPath(permission.id),
-      externalController.signal,
-    );
-
-    // Dismiss the prompt when the asking run is aborted. Cortex races the
-    // resolver against the run's abort signal and proceeds with a block, so
-    // an unanswered prompt would sit on screen for dead work while holding
-    // permissionLockPromise, serializing the next live ask behind it. The
-    // abort settles the prompt through the same external-decision channel a
-    // companion app uses, which removes it from the TUI and releases the lock.
-    let abortDismissed = false;
-    let onAbort: (() => void) | undefined;
-    let externalDecision = fileDecision;
-    if (abortSignal) {
-      // The aborted pre-check above ran BEFORE recordPermissionRequested and
-      // the awaited state write, and addEventListener never fires for a
-      // signal that is already aborted. An abort landing inside that window
-      // must settle the decision here, or the prompt sits on screen for
-      // dead work holding permissionLockPromise forever, serializing every
-      // later ask behind it.
-      let abortDecision: Promise<'deny'>;
-      if (abortSignal.aborted) {
-        abortDismissed = true;
-        abortDecision = Promise.resolve('deny');
-      } else {
-        abortDecision = new Promise<'deny'>((resolve) => {
-          onAbort = () => {
-            abortDismissed = true;
-            resolve('deny');
-          };
-          abortSignal.addEventListener('abort', onAbort, { once: true });
-        });
-      }
-      externalDecision = Promise.race([fileDecision, abortDecision]);
-    }
-
-    try {
-      const result = await this.app.showPermissionPrompt(toolName, toolArgs, externalDecision);
-      if (abortDismissed) {
-        permissionResolution = 'cancelled';
-        return {
-          decision: 'block',
-          reason: 'Run aborted before the permission prompt was answered',
-        };
-      }
-      permissionResolution = result.decision === 'allow' ? 'allowed' : 'denied';
-
-      if (result.scope === 'project-edits') {
-        // Project-wide edit/write permission: add rules for both tools
-        const cwdPattern = `${this.cwd}/*`;
-        await this.rules.addRule('project', 'allow', 'Edit', cwdPattern);
-        await this.rules.addRule('project', 'allow', 'Write', cwdPattern);
-      } else if (result.pattern && result.scope) {
-        await this.rules.addRule(result.scope, result.decision, toolName, result.pattern);
-      }
-
-      return result.decision === 'allow' ? true : { decision: 'block' };
-    } catch (error) {
-      permissionResolution = 'error';
-      void this.activity.recordError(error instanceof Error ? error : String(error));
-      throw error;
-    } finally {
-      if (abortSignal && onAbort) {
-        abortSignal.removeEventListener('abort', onAbort);
-      }
-      externalController.abort();
-      await this.activity.recordPermissionResolved(permission.id, toolName, permissionResolution);
-      const release = this.permissionLockRelease;
-      this.permissionLockPromise = null;
-      this.permissionLockRelease = null;
-      release?.();
-    }
-  }
-
-  /**
-   * The single network egress decision, shared by sandboxed shell commands
-   * (the provider's ask-callback) and WebFetch (Cortex's resolveNetworkAccess
-   * seam). Auto-allows the seeded registry allowlist and prior grants;
-   * otherwise prompts once per host with once/session/always scope.
-   */
-  private resolveNetworkAccess(req: NetworkAccessRequest): Promise<NetworkAccessDecision> {
-    return this.networkAccess.resolve(req);
-  }
-
-  /**
-   * Show the unified network prompt, serialized with tool permission prompts
-   * through the same lock so shell and WebFetch asks never overlap. Recorded
-   * in the activity stream so a companion app can answer out-of-band.
-   */
-  private async promptNetworkAccess(req: NetworkAccessRequest): Promise<NetworkPromptChoice> {
-    // Yolo mode never prompts. Allow this request only (no lasting grant);
-    // deniedDomains and the restricted rung are enforced before we get here.
-    if (this.yoloMode) return 'once';
-    if (!this.app) return 'deny';
-
-    // Serialize: wait for any active permission or network prompt to finish.
-    while (this.permissionLockPromise) {
-      await this.permissionLockPromise;
-    }
-    this.permissionLockPromise = new Promise<void>((resolve) => {
-      this.permissionLockRelease = resolve;
-    });
-
-    const permission = this.activity.recordPermissionRequested('NetworkAccess', {
-      host: req.host,
-      via: req.via,
-      ...(req.url ? { url: req.url } : {}),
-    });
-    await permission.written;
-    let permissionResolution: PermissionResolution = 'denied';
-
-    const externalController = new AbortController();
-    const externalDecision = watchDecisionFile(
-      this.activity.decisionPath(permission.id),
-      externalController.signal,
-    );
-
-    try {
-      const choice = await this.app.showNetworkPrompt(req, externalDecision);
-      permissionResolution = choice === 'deny' ? 'denied' : 'allowed';
-      return choice;
-    } catch (error) {
-      permissionResolution = 'error';
-      void this.activity.recordError(error instanceof Error ? error : String(error));
-      throw error;
-    } finally {
-      externalController.abort();
-      await this.activity.recordPermissionResolved(permission.id, 'NetworkAccess', permissionResolution);
-      const release = this.permissionLockRelease;
-      this.permissionLockPromise = null;
-      this.permissionLockRelease = null;
-      release?.();
-    }
-  }
-
-  /** Check if a tool call is a read-only operation within the project directory. */
-  private async isReadOnlyInProject(toolName: string, toolArgs: unknown): Promise<boolean> {
-    const args = toolArgs as Record<string, unknown>;
-    switch (toolName) {
-      case 'Read': {
-        // Mirror getMatchValue/matchRule's `file_path ?? path` so the read-only
-        // auto-approve and the rule layer can never disagree on the target.
-        const filePath = String(args['file_path'] ?? args['path'] ?? '');
-        return this.isWithinCwd(filePath);
-      }
-      case 'Glob':
-      case 'Grep': {
-        const searchPath = String(args['path'] ?? this.cwd);
-        return this.isWithinCwd(searchPath);
-      }
-      default:
-        return false;
-    }
-  }
-
-  /** Check if a path resolves within the current working directory. */
-  private async isWithinCwd(targetPath: string): Promise<boolean> {
-    return isPathWithinRealCwd(targetPath, this.cwd);
   }
 
   /**
@@ -1961,10 +1669,10 @@ export class Session {
       initialBasePrompt: this.mode.systemPrompt,
       slots: this.mode.contextSlots,
       resolvePermission: (toolName, toolArgs, context) =>
-        this.resolvePermission(toolName, toolArgs, context),
+        this.permissions.resolvePermission(toolName, toolArgs, context),
       // WebFetch's egress gate: the same decision function the sandbox egress
       // proxy consults for shell commands, so one grant covers both paths.
-      resolveNetworkAccess: (req) => this.resolveNetworkAccess(req),
+      resolveNetworkAccess: (req) => this.permissions.resolveNetworkAccess(req),
       isAutoApprove: () => this.yoloMode,
       ...(sandboxOptions ? { sandbox: sandboxOptions } : {}),
       getApiKey: (provider) => this.apiKeys.getApiKey(provider),
@@ -2390,12 +2098,8 @@ export class Session {
   }
   /** Domain grants for transparency surfaces (/sandbox status). */
   getNetworkGrantInfo(): { persisted: readonly string[]; session: readonly string[] } {
-    return {
-      persisted: this.networkGrants.getDomains(),
-      session: this.networkAccess.getSessionGrants(),
-    };
+    return this.permissions.getNetworkGrantInfo();
   }
-  getRules(): PermissionRuleManager { return this.rules; }
   getProviderManager(): ProviderManager { return this.providerManager; }
   getCredentialStore(): CredentialStore { return this.credentialStore; }
   getProvider(): string { return this.models.provider; }
