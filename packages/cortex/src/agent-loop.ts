@@ -715,6 +715,14 @@ export interface IdleDigestionOptions {
    * history mutations are discarded rather than applied over live state.
    */
   observerTimeoutMs?: number;
+  /**
+   * Preempts the digestion: when it aborts, the pass stops waiting exactly
+   * as a timeout would (the in-flight call is left to settle and its
+   * mutations are discarded) and releases the gate at once. An owner that
+   * digests in idle windows aborts it when input arrives, so a user's next
+   * words never wait behind background compaction.
+   */
+  signal?: AbortSignal;
 }
 
 /** Result of {@link AgentLoop.digestIdle}. */
@@ -729,6 +737,8 @@ export interface IdleDigestionResult {
    * activation trimmed it, or summarization rewrote it).
    */
   historyCompacted: boolean;
+  /** Whether the pass was cut short by {@link IdleDigestionOptions.signal}. */
+  preempted?: boolean;
 }
 
 /**
@@ -5095,74 +5105,123 @@ export class AgentLoop {
       if (this.isShuttingDown()) {
         return { observerRan: false, historyCompacted: false };
       }
-
-      // 1. Buffer catch-up (observational only): make sure the expensive
-      // observer work over the unobserved tail is done and chunked, so the
-      // next activation is a cheap merge.
-      let observerRan = false;
-      if (this.compactionManager.strategy === 'observational') {
-        observerRan = await this.compactionManager.digestPendingObservationBuffers(
-          this.agent.state.messages,
-          this.contextManager.slotCount,
-          options?.observerTimeoutMs,
-        );
+      const signal = options?.signal;
+      if (signal?.aborted) {
+        return { observerRan: false, historyCompacted: false, preempted: true };
       }
+      // Resolves when the owner preempts; every wait below races it.
+      let removePreemptListener = (): void => {};
+      const preempted = new Promise<'preempted'>((resolve) => {
+        if (!signal) return;
+        const onAbort = (): void => resolve('preempted');
+        signal.addEventListener('abort', onAbort, { once: true });
+        removePreemptListener = () => signal.removeEventListener('abort', onAbort);
+      });
 
-      // 2. Threshold pass: run the same pipeline transformContext runs
-      // against the live source history. Source mutations (activation
-      // trims, summarization rewrites) persist; the returned view is
-      // discarded. _forceBlockingCompaction lets the manager run its
-      // synchronous paths regardless of the configured posture; those
-      // paths block on utility requests (reflection, summarization), so
-      // the pass shares the observer deadline rather than holding the
-      // gate indefinitely behind a hung request.
-      const lengthBefore = this.agent.state.messages.length;
-      const hook = this.getTransformContextHook();
-      const passGeneration = this._digestionGeneration;
-      this._forceBlockingCompaction = true;
-      const thresholdPass = (async () => {
-        try {
-          await hook(this.buildAgentContextSnapshot());
-        } finally {
-          // Only the pass that still owns the current generation may lower
-          // the flag: an abandoned pass settling here while a LATER pass is
-          // mid-flight would otherwise silently degrade that pass to the
-          // non-blocking posture.
-          if (passGeneration === this._digestionGeneration) {
-            this._forceBlockingCompaction = false;
-          }
-        }
-      })();
-      const timeoutMs = options?.observerTimeoutMs ?? DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS;
-      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const timedOut = await Promise.race([
-          thresholdPass.then(() => false),
-          new Promise<boolean>((resolve) => {
-            timer = setTimeout(() => resolve(true), timeoutMs);
-          }),
-        ]);
-        if (timedOut) {
-          // Abandoned, not cancelled: nothing can cancel the hung utility
-          // call, so it can still settle minutes from now, after the gate
-          // released and a real prompt appended live messages. Advance the
-          // generation so that late continuation discards itself instead of
-          // replacing live history from its stale snapshot, lower the flag
-          // for the pass (its own finally is now stale), and swallow the
-          // eventual settlement.
-          this._digestionGeneration += 1;
+        // 1. Buffer catch-up (observational only): make sure the expensive
+        // observer work over the unobserved tail is done and chunked, so the
+        // next activation is a cheap merge. Preempting abandons only the
+        // wait, like the timeout: the observer lands its chunk when it
+        // settles.
+        let observerRan = false;
+        if (this.compactionManager.strategy === 'observational') {
+          const catchUp = this.compactionManager.digestPendingObservationBuffers(
+            this.agent.state.messages,
+            this.contextManager.slotCount,
+            options?.observerTimeoutMs,
+          );
+          const outcome = await Promise.race([catchUp, preempted]);
+          if (outcome === 'preempted') {
+            catchUp.catch(() => {});
+            this.logger.debug('idle digestion preempted during observer catch-up');
+            return { observerRan: false, historyCompacted: false, preempted: true };
+          }
+          observerRan = outcome;
+        }
+        if (signal?.aborted) {
+          return { observerRan, historyCompacted: false, preempted: true };
+        }
+        return await this.runDigestionThresholdPass(observerRan, preempted, options);
+      } finally {
+        removePreemptListener();
+      }
+    });
+  }
+
+  /**
+   * Phase 2 of {@link digestIdle}, under the gate it holds: the threshold
+   * pass, bounded by the timeout and by preemption, which abandon it the
+   * same way.
+   */
+  private async runDigestionThresholdPass(
+    observerRan: boolean,
+    preempted: Promise<'preempted'>,
+    options?: IdleDigestionOptions,
+  ): Promise<IdleDigestionResult> {
+    // 2. Threshold pass: run the same pipeline transformContext runs
+    // against the live source history. Source mutations (activation
+    // trims, summarization rewrites) persist; the returned view is
+    // discarded. _forceBlockingCompaction lets the manager run its
+    // synchronous paths regardless of the configured posture; those
+    // paths block on utility requests (reflection, summarization), so
+    // the pass shares the observer deadline rather than holding the
+    // gate indefinitely behind a hung request.
+    const lengthBefore = this.agent.state.messages.length;
+    const hook = this.getTransformContextHook();
+    const passGeneration = this._digestionGeneration;
+    this._forceBlockingCompaction = true;
+    const thresholdPass = (async () => {
+      try {
+        await hook(this.buildAgentContextSnapshot());
+      } finally {
+        // Only the pass that still owns the current generation may lower
+        // the flag: an abandoned pass settling here while a LATER pass is
+        // mid-flight would otherwise silently degrade that pass to the
+        // non-blocking posture.
+        if (passGeneration === this._digestionGeneration) {
           this._forceBlockingCompaction = false;
-          thresholdPass.catch(() => {});
+        }
+      }
+    })();
+    const timeoutMs = options?.observerTimeoutMs ?? DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let wasPreempted = false;
+    try {
+      const abandoned = await Promise.race([
+        thresholdPass.then(() => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), timeoutMs);
+        }),
+        preempted.then(() => {
+          wasPreempted = true;
+          return true;
+        }),
+      ]);
+      if (abandoned) {
+        // Abandoned (timed out or preempted), not cancelled: nothing can
+        // cancel the utility call, so it can still settle minutes from
+        // now, after the gate released and a real prompt appended live
+        // messages. Advance the generation so that late continuation
+        // discards itself instead of replacing live history from its stale
+        // snapshot, lower the flag for the pass (its own finally is now
+        // stale), and swallow the eventual settlement.
+        this._digestionGeneration += 1;
+        this._forceBlockingCompaction = false;
+        thresholdPass.catch(() => {});
+        if (wasPreempted) {
+          this.logger.debug('idle digestion threshold pass preempted');
+        } else {
           this.logger.warn('idle digestion threshold pass timed out', { timeoutMs });
         }
-      } finally {
-        clearTimeout(timer);
       }
-      const historyCompacted = this.agent.state.messages.length !== lengthBefore;
+    } finally {
+      clearTimeout(timer);
+    }
+    const historyCompacted = this.agent.state.messages.length !== lengthBefore;
 
-      this.logger.debug('idle digestion complete', { observerRan, historyCompacted });
-      return { observerRan, historyCompacted };
-    });
+    this.logger.debug('idle digestion complete', { observerRan, historyCompacted });
+    return { observerRan, historyCompacted, ...(wasPreempted ? { preempted: true } : {}) };
   }
 
   /**

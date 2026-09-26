@@ -259,6 +259,49 @@ describe('digestIdle observer wait bound', () => {
   });
 });
 
+describe('digestIdle preemption', () => {
+  it('releases the gate at once when preempted during a hung observer wait', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const complete = vi.fn(() => new Promise<string>(() => {}));
+    loop.getCompactionManager().setObservationalCompleteFn(complete as unknown as CompleteFn);
+    seedHistory(piAgent);
+
+    const preempt = new AbortController();
+    const digestion = loop.digestIdle({ signal: preempt.signal });
+    await waitUntil(() => complete.mock.calls.length === 1);
+    // Precondition: the pass is holding the gate on the hung observer.
+    expect(loop.isLoopActive).toBe(true);
+
+    preempt.abort();
+    const result = await digestion;
+    expect(result).toMatchObject({ observerRan: false, preempted: true });
+    await waitUntil(() => !loop.isLoopActive, 200);
+    await loop.prompt('the user spoke');
+    expect(piAgent.promptCalls.some(
+      (call) => typeof call === 'string' && call.includes('the user spoke'),
+    )).toBe(true);
+  });
+
+  it('abandons a hung threshold pass when preempted, like a timeout', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent, { compaction: { strategy: 'classic' } });
+    const complete = vi.fn(() => new Promise<string>(() => {}));
+    loop.getCompactionManager().setCompleteFn(complete as unknown as CompleteFn);
+    for (let i = 0; i < 10; i++) seedHistory(piAgent, 2_000);
+    loop.getCompactionManager().updateCurrentContextTokenCount(15_000);
+
+    const preempt = new AbortController();
+    const digestion = loop.digestIdle({ signal: preempt.signal });
+    await waitUntil(() => complete.mock.calls.length > 0);
+    preempt.abort();
+
+    const result = await digestion;
+    expect(result).toMatchObject({ historyCompacted: false, preempted: true });
+    await waitUntil(() => !loop.isLoopActive, 200);
+  });
+});
+
 describe('digestIdle abandoned pass invalidation', () => {
   // The dangerous shape is hang-then-SETTLE, not hang-forever: nothing can
   // cancel the hung utility call, so after the timeout lowers the gate and

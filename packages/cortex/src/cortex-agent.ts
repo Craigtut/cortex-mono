@@ -1449,6 +1449,12 @@ export class CortexAgent {
   private fanOutContextManager: FanOutContextManager | null = null;
   private digestionTimer: ReturnType<typeof setTimeout> | null = null;
   private idleDigestionDelayMs = 10_000;
+  /**
+   * Preempts the idle digestion pass in flight, if any. Digestion holds a
+   * loop's gate, so any input bound for either loop aborts it rather than
+   * waiting behind background compaction (see preemptIdleDigestion).
+   */
+  private digestionPreempt: AbortController | null = null;
 
   /** Serializes facade prompt() calls (concurrent prompts queue, never throw). */
   private promptChain: Promise<void> = Promise.resolve();
@@ -1717,6 +1723,7 @@ export class CortexAgent {
 
     const ports: DuplexRouterPorts = {
       deliverToTalker: (content, wake) => {
+        if (wake) this.preemptIdleDigestion();
         talker.deliver(content, { wake });
       },
       talkerIdle: () => !talker.isLoopActive,
@@ -1757,6 +1764,7 @@ export class CortexAgent {
         }
         this.deferredAskVoicing = false;
         this.trackAskVoicing(content);
+        this.preemptIdleDigestion();
         talker.deliver(content, { wake: true, causeTag });
       },
       // Keep the loop registry's voiced flag truthful for tool asks so
@@ -1979,6 +1987,7 @@ export class CortexAgent {
     causeSeq: number | null,
     options?: ReasonerDispatchOptions,
   ): void {
+    this.preemptIdleDigestion();
     const deliverOptions: DeliverOptions = {
       ...(causeSeq !== null
         ? { causeTag: { kind: 'directive', seq: causeSeq } satisfies CauseTag }
@@ -2430,23 +2439,45 @@ export class CortexAgent {
     // Only when genuinely quiet; a digestion pass holds the loop gate, so a
     // busy moment skips and the next run completion reschedules.
     if (!this.conversationIdle || this.router.pendingDeliveryCount > 0) return;
+    // The quiet moment can end at any time. Input arriving mid-pass aborts
+    // this, and the pass releases the gate at once instead of making the
+    // user's next words wait out observer catch-up and forced compaction
+    // (up to two full utility timeouts per loop).
+    const preempt = new AbortController();
+    this.digestionPreempt = preempt;
     try {
-      if (!this.talker.isLoopActive) await this.talker.digestIdle();
-    } catch (err) {
-      this.logger.warn('talker idle digestion failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    if (this.destroyed) return;
-    try {
-      if (!this.reasoner.isLoopActive && this.reasoner.getSubAgentManager().activeCount === 0) {
-        await this.reasoner.digestIdle();
+      try {
+        if (!this.talker.isLoopActive) await this.talker.digestIdle({ signal: preempt.signal });
+      } catch (err) {
+        this.logger.warn('talker idle digestion failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-    } catch (err) {
-      this.logger.warn('reasoner idle digestion failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      if (this.destroyed || preempt.signal.aborted) return;
+      try {
+        if (!this.reasoner.isLoopActive && this.reasoner.getSubAgentManager().activeCount === 0) {
+          await this.reasoner.digestIdle({ signal: preempt.signal });
+        }
+      } catch (err) {
+        this.logger.warn('reasoner idle digestion failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    } finally {
+      if (this.digestionPreempt === preempt) this.digestionPreempt = null;
     }
+  }
+
+  /**
+   * Input is arriving for a loop: stop any idle digestion pass holding a
+   * gate. Called on every path that hands wake content to either loop, so
+   * nothing a user or the other loop is waiting on sits behind background
+   * compaction. The next quiet moment reschedules digestion.
+   */
+  private preemptIdleDigestion(): void {
+    if (!this.digestionPreempt) return;
+    this.digestionPreempt.abort();
+    this.digestionPreempt = null;
   }
 
   // -------------------------------------------------------------------------
@@ -2820,6 +2851,7 @@ export class CortexAgent {
   private async promptDuplex(input: string, options?: DirectCompletionOptions): Promise<unknown> {
     const talker = this.talker!;
     this.noteUnwiredNetworkResolver();
+    this.preemptIdleDigestion();
     this.pendingFacadePrompts += 1;
     try {
       const entry = this.appendEntry({
@@ -2942,6 +2974,7 @@ export class CortexAgent {
   private deliverDuplex(content: string, options?: CortexDeliverOptions): DeliverResult {
     const target = options?.target ?? 'conversation';
     const router = this.router!;
+    if (options?.wake !== false) this.preemptIdleDigestion();
     // Only an explicit 'user' speaker mints the consent-qualifying kind.
     // The default is 'system' so that a consumer notification can never
     // stand in for the user answering a permission ask (D16); prompt() is
@@ -3025,9 +3058,11 @@ export class CortexAgent {
 
   /**
    * Queue a steering message into the running turn (drained at the next
-   * turn boundary). No-op while idle, exactly like AgentLoop.steer().
-   * Duplex: the conversation surface (the talker) is what a consumer
-   * steers; directives reach the reasoner through the router.
+   * turn boundary). Passthrough matches AgentLoop.steer(), including the
+   * no-op while idle. Duplex: the conversation surface (the talker) is what
+   * a consumer steers, and with no talker turn in flight the message is
+   * handled as the user's next prompt() instead of being queued for a run
+   * that may never come; directives reach the reasoner through the router.
    *
    * No-op after destroy, matching AgentLoop.steer(). Teardown races are
    * ordinary here (a keystroke landing while shutdown runs), and the loop
@@ -3036,6 +3071,21 @@ export class CortexAgent {
    */
   steer(message: string): void {
     if (this.destroyed) return;
+    if (this.talker && !this.talker.isPrompting) {
+      // Duplex, with no talker turn in flight: the gate can still be held
+      // (idle digestion, an end-of-run drain), so the loop would accept the
+      // steer into pi's queue with no run to read it, where it waits for
+      // whatever run starts next and is never logged. A consumer steers
+      // precisely when it believes the conversation is busy, so this is the
+      // user's next utterance: route it as one, logged, preempting the
+      // digestion, and opening (or joining) the next talker run.
+      void this.prompt(message).catch((err: unknown) => {
+        this.logger.warn('steer delivered as a prompt failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+      return;
+    }
     this.conversationLoop.steer(message);
   }
 
