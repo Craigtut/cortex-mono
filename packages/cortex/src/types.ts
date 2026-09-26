@@ -285,7 +285,7 @@ export interface LoopOriginContext {
    * The loop's path identity: its configured `loopPath` (default 'main'),
    * extended with '/<taskId>' segments for spawned sub-agents.
    */
-  loopPath: string;
+  readonly loopPath: string;
 }
 
 /** Loop identity used when the consumer does not configure one. */

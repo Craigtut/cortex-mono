@@ -134,7 +134,9 @@ export function assembleLoop(params: {
   if (!config.model) {
     throw new Error('AgentLoopConfig.model is required but was undefined. Pass a CortexModel.');
   }
-  const origin: LoopOriginContext = { loopPath };
+  // One object reaches every consumer callback, so it is frozen: a handler
+  // that wrote to it would relabel the loop for every handler after it.
+  const origin: LoopOriginContext = Object.freeze({ loopPath });
   const retryPolicy = resolveRetryPolicy(config.retryPolicy);
   const eventUnsubscribers: Array<() => void> = [];
   // Parts built further down, referenced by ports that only run later.

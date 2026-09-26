@@ -1671,3 +1671,23 @@ describe('AgentLoop.deliver atTurnBoundary fallback to the next run', () => {
     await turn;
   });
 });
+
+describe('AgentLoop origin context', () => {
+  it('hands every handler an origin no earlier handler can rewrite', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const seen: string[] = [];
+    loop.onLoopComplete((origin) => {
+      try {
+        (origin as { loopPath: string }).loopPath = 'rewritten';
+      } catch {
+        // A frozen origin refuses the write in strict mode.
+      }
+      seen.push(origin.loopPath);
+    });
+    loop.onLoopComplete((origin) => { seen.push(origin.loopPath); });
+    await loop.prompt('one');
+    await loop.prompt('two');
+    expect(seen).toEqual(['main', 'main', 'main', 'main']);
+  });
+});
