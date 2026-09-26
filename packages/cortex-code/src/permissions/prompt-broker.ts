@@ -196,27 +196,35 @@ export class PermissionBroker {
     const app = this.getApp();
     if (!app) return { decision: 'block', reason: 'TUI not initialized' };
 
-    // Serialize: wait for any active permission prompt to finish
-    await this.promptLock.waitUntilFree();
+    // Serialize: wait for any active prompt to finish. A release wakes every
+    // waiter and the re-check below awaits, so another ask can take the lock
+    // in between; go round again until it is still free after the re-check.
+    let releaseLock: () => void;
+    for (;;) {
+      await this.promptLock.waitUntilFree();
 
-    // The asking run may have been aborted while this ask waited behind
-    // another prompt (or before it arrived). Cortex has already stopped
-    // waiting for this resolver, so never show a prompt for dead work.
-    if (abortSignal?.aborted) {
-      return { decision: 'block', reason: 'Run aborted before the permission prompt was shown' };
+      // The asking run may have been aborted while this ask waited behind
+      // another prompt (or before it arrived). Cortex has already stopped
+      // waiting for this resolver, so never show a prompt for dead work.
+      if (abortSignal?.aborted) {
+        return { decision: 'block', reason: 'Run aborted before the permission prompt was shown' };
+      }
+
+      // Re-check: a previous prompt may have added an "always allow"/deny rule.
+      const preAfterWait = await preflightPermission(toolName, toolArgs, preflightDeps);
+      if (preAfterWait.decision === 'allow') return true;
+      if (preAfterWait.decision === 'block') {
+        return preAfterWait.reason
+          ? { decision: 'block', reason: preAfterWait.reason }
+          : { decision: 'block' };
+      }
+
+      // Acquire the lock in the same synchronous step as the free check.
+      if (!this.promptLock.isHeld) {
+        releaseLock = this.promptLock.take();
+        break;
+      }
     }
-
-    // Re-check: a previous prompt may have added an "always allow"/deny rule.
-    const preAfterWait = await preflightPermission(toolName, toolArgs, preflightDeps);
-    if (preAfterWait.decision === 'allow') return true;
-    if (preAfterWait.decision === 'block') {
-      return preAfterWait.reason
-        ? { decision: 'block', reason: preAfterWait.reason }
-        : { decision: 'block' };
-    }
-
-    // Acquire lock and show the prompt
-    const releaseLock = this.promptLock.take();
 
     const permission = this.activity.recordPermissionRequested(
       toolName,
