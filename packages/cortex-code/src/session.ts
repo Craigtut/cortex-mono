@@ -65,8 +65,7 @@ import { log } from './logger.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
 import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
 import { FileSessionActivityReporter } from './activity/session-activity.js';
-import { McpConfigWatcher, type McpConfigChangeReason } from './mcp/mcp-watcher.js';
-import { reconcileMcpServers, type McpReconcileResult } from './mcp/reconcile.js';
+import { McpReloadScheduler } from './mcp/reload-scheduler.js';
 import { applyPreTurnHooks } from './hooks/pre-turn.js';
 import type { HookEvent, HookHandler } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
@@ -164,9 +163,7 @@ export class Session {
   private readonly freezeDiagnostics: FreezeDiagnostics;
   private readonly activity: FileSessionActivityReporter;
   private readonly transcriptWriter: TranscriptWriter;
-  private mcpWatcher: McpConfigWatcher | null = null;
-  private mcpReloadPending: McpConfigChangeReason | null = null;
-  private mcpReloadInFlight = false;
+  private readonly mcpReload: McpReloadScheduler;
   private hookHandlers: Record<HookEvent, HookHandler[]> | null = null;
   private readonly trust: ProjectTrustGates;
   private titleManager: TitleManager | null = null;
@@ -258,6 +255,13 @@ export class Session {
     // Durable append-only conversation log, separate from the lossy history.json
     // snapshot. Read by sibling apps to summarize where a session left off.
     this.trust = new ProjectTrustGates(options.cwd, () => this.agent, () => this.app);
+    this.mcpReload = new McpReloadScheduler({
+      cwd: options.cwd,
+      getAgent: () => this.agent,
+      getApp: () => this.app,
+      isBusy: () => this.isRunning,
+      resolveProjectTrust: (cwd, servers) => this.trust.resolveProjectMcpTrust(cwd, servers.map(s => s.name)),
+    });
     this.permissions = new PermissionBroker({
       cwd: options.cwd,
       settingsPath,
@@ -349,12 +353,7 @@ export class Session {
 
     // Watch ~/.cortex/mcp.json and {cwd}/.cortex/mcp.json for changes so we
     // can pick them up between turns without a restart.
-    this.mcpWatcher = new McpConfigWatcher({
-      cwd: this.cwd,
-      onChange: (reason) => this.scheduleMcpReload(reason),
-      log: (msg, data) => log.info(msg, data),
-    });
-    await this.mcpWatcher.start();
+    await this.mcpReload.start();
 
     // Load lifecycle hook handlers from ~/.cortex/hooks.json and
     // {cwd}/.cortex/hooks.json. Loading is non-fatal: a malformed config or
@@ -595,87 +594,12 @@ export class Session {
     // If the MCP config changed during the turn, apply it now. Doing this
     // here (vs mid-turn) avoids invalidating the tool snapshot that
     // pi-agent-core captured at prompt() entry.
-    if (this.mcpReloadPending) {
-      void this.runQueuedMcpReload();
-    }
+    this.mcpReload.runIfPending();
   }
 
-  /**
-   * Queue an MCP config reload. If the agentic loop is currently running, the
-   * reload is deferred until `onLoopComplete`; otherwise it runs immediately.
-   * Multiple queued reloads collapse into one pass.
-   */
-  private scheduleMcpReload(reason: McpConfigChangeReason): void {
-    this.mcpReloadPending = reason;
-    if (!this.isRunning) {
-      void this.runQueuedMcpReload();
-    }
-  }
-
-  /**
-   * Public entry point for the `/mcp-reload` slash command. Force a
-   * reconciliation pass; same gating rules as a watcher-driven reload.
-   */
+  /** The `/mcp-reload` entry point: same gating as a watcher-driven reload. */
   async triggerMcpReload(): Promise<void> {
-    this.scheduleMcpReload('manual');
-  }
-
-  /**
-   * Execute one queued reconciliation pass. Guards against re-entrancy so
-   * concurrent watcher events do not stomp on each other.
-   */
-  private async runQueuedMcpReload(): Promise<void> {
-    if (this.mcpReloadInFlight) return;
-    if (!this.agent) {
-      this.mcpReloadPending = null;
-      return;
-    }
-    this.mcpReloadInFlight = true;
-    const reason = this.mcpReloadPending ?? 'manual';
-    this.mcpReloadPending = null;
-    try {
-      const result = await reconcileMcpServers(this.agent, this.cwd, {
-        resolveProjectTrust: (cwd, servers) => this.trust.resolveProjectMcpTrust(cwd, servers.map(s => s.name)),
-        log: (msg, data) => log.info(msg, data),
-      });
-      this.notifyMcpReloadOutcome(reason, result);
-    } catch (err) {
-      log.warn('MCP reload failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      this.app?.transcript.addNotification(
-        'MCP Reload Failed',
-        err instanceof Error ? err.message : String(err),
-      );
-    } finally {
-      this.mcpReloadInFlight = false;
-      // A change that arrived while we were running would have set
-      // mcpReloadPending again; pick it up immediately if so.
-      if (this.mcpReloadPending && !this.isRunning) {
-        void this.runQueuedMcpReload();
-      }
-    }
-  }
-
-  private notifyMcpReloadOutcome(reason: McpConfigChangeReason, result: McpReconcileResult): void {
-    const parts: string[] = [];
-    if (result.added.length > 0) parts.push(`+${result.added.length} added`);
-    if (result.removed.length > 0) parts.push(`-${result.removed.length} removed`);
-    if (result.updated.length > 0) parts.push(`${result.updated.length} updated`);
-    if (result.skippedDueToUntrustedProject.length > 0) {
-      parts.push(`${result.skippedDueToUntrustedProject.length} skipped (untrusted)`);
-    }
-    if (result.errors.length > 0) parts.push(`${result.errors.length} error(s)`);
-    if (parts.length === 0 && reason === 'manual') {
-      this.app?.transcript.addNotification('MCP', 'Already up to date.');
-      return;
-    }
-    if (parts.length > 0) {
-      this.app?.transcript.addNotification(
-        reason === 'manual' ? 'MCP Reload' : 'MCP Config Changed',
-        parts.join(', '),
-      );
-    }
+    this.mcpReload.schedule('manual');
   }
 
   /** The duplex talker's loop path, or null in passthrough, which has none. */
@@ -1272,14 +1196,7 @@ export class Session {
 
     // Tear down MCP config watcher first so a late filesystem event cannot
     // schedule work against the agent we're about to destroy.
-    if (this.mcpWatcher) {
-      try {
-        await this.mcpWatcher.stop();
-      } catch {
-        // ignore
-      }
-      this.mcpWatcher = null;
-    }
+    await this.mcpReload.stop();
 
     // Flush pending saves
     await this.saver.flush();
