@@ -78,7 +78,8 @@ export interface LoopRunApi {
    * teardown.
    *
    * Steps: abort the in-progress loop and wait for it to unwind;
-   * dead-letter undelivered background completions; destroy all
+   * dead-letter undelivered background completions and loop-owned
+   * deliveries (parked wake, queued silent); destroy all
    * sub-agents; emit onLoopComplete for a final checkpoint (best-effort);
    * close owned MCP connections; release skills, listeners, agent state and
    * compaction; mark as destroyed. Background processes are force-killed

@@ -88,8 +88,9 @@ export function partitionExhausted<T extends DeliveryAttempts>(
 /** Dead-lettered completions retained for consumer inspection. */
 const DEFAULT_DEAD_LETTER_CAP = 50;
 
-/** Synthetic taskId for dead-lettered wake deliveries, which have no task. */
+/** Synthetic taskIds for dead-lettered loop-owned deliveries, which have no task. */
 const WAKE_DELIVERY_DEAD_LETTER_ID = 'wake-delivery';
+const SILENT_DELIVERY_DEAD_LETTER_ID = 'silent-delivery';
 
 /**
  * The bounded record of content the loop gave up on. Not cleared on
@@ -129,6 +130,20 @@ export class DeadLetterStore {
         kind: 'wake_delivery',
         taskId: WAKE_DELIVERY_DEAD_LETTER_ID,
         attempts: item.deliveryAttempts ?? 0,
+        lastError,
+        deadLetteredAt: Date.now(),
+        message: item.content,
+      });
+    }
+  }
+
+  /** One entry per silent delivery a teardown dropped before any prompt took it. */
+  recordSilent(dropped: ReadonlyArray<{ content: string }>, lastError: string): void {
+    for (const item of dropped) {
+      this.record({
+        kind: 'silent_delivery',
+        taskId: SILENT_DELIVERY_DEAD_LETTER_ID,
+        attempts: 0,
         lastError,
         deadLetteredAt: Date.now(),
         message: item.content,

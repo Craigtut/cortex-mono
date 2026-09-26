@@ -38,8 +38,9 @@ export interface LoopDeliveryApi {
    * The decision and its action happen in one synchronous frame, so there
    * is no time-of-check race against prompt().
    *
-   * Silent and parked content is dropped on destroy(); a facade that needs
-   * it durable drains it first ({@link clearQueuedDeliveries},
+   * Silent and parked content still held at destroy() is dead-lettered
+   * (kinds 'silent_delivery' and 'wake_delivery'); a facade that needs it
+   * delivered elsewhere drains it first ({@link clearQueuedDeliveries},
    * {@link clearAllQueues}). abort() also cancels parked content, including
    * content that parks while the abort is completing, so it never rides a
    * run that starts after the user stopped the agent.

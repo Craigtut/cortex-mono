@@ -1150,6 +1150,47 @@ describe('AgentLoop follow-up and queue surfaces', () => {
   });
 });
 
+describe('AgentLoop teardown dead-letters loop-owned queued content', () => {
+  // Like abort(), which dead-letters the parked content it drops, and like
+  // pending background completions at teardown: nothing the loop accepted
+  // for delivery vanishes without an entry saying so.
+
+  it('destroy() dead-letters parked wake and queued silent deliveries', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const deadLettered = vi.fn();
+    loop.onBackgroundResultDeadLettered(deadLettered);
+
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    loop.deliver('parked behind the run');
+    loop.deliver('for the next prompt', { wake: false });
+    // Precondition: both are held by the loop when teardown starts.
+    expect(loop.pendingWakeDeliveryCount).toBe(1);
+    expect(loop.queuedDeliveryCount).toBe(1);
+
+    await loop.destroy();
+    await turn.catch(() => {});
+
+    const entries = deadLettered.mock.calls.map((call) => call[0] as {
+      kind: string; taskId: string; lastError: string; message: string;
+    });
+    expect(entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'wake_delivery', message: 'parked behind the run', lastError: 'agent shut down before delivery',
+      }),
+      expect.objectContaining({
+        kind: 'silent_delivery', taskId: 'silent-delivery', message: 'for the next prompt',
+        lastError: 'agent shut down before delivery',
+      }),
+    ]));
+    expect(entries).toHaveLength(2);
+    expect(loop.getDeadLetteredBackgroundResults().map((result) => result.message))
+      .toEqual(expect.arrayContaining(['parked behind the run', 'for the next prompt']));
+  });
+});
+
 describe('AgentLoop abort-cancelled wake deliveries are dead-lettered', () => {
   // An abort deliberately destroys parked wake content. The destruction
   // must reach the dead-letter surface (and through it the facade's

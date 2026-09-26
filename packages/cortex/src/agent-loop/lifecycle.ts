@@ -40,7 +40,7 @@ export interface LifecycleParts {
   agent: Pick<PiAgent, 'abort' | 'waitForIdle' | 'reset'>;
   diagnostics: Pick<PromptWatchdogDiagnostics, 'recordAbortRequested' | 'startAbortWait' | 'finishAbortWait' | 'stop'>;
   runner: Pick<TurnRunner, 'unwound' | 'isPrompting'>;
-  queues: Pick<DeliveryQueues, 'dropAllWakeForAbort' | 'clearForTeardown'>;
+  queues: Pick<DeliveryQueues, 'dropAllWakeForAbort' | 'deadLetterForTeardown'>;
   abortState: AbortState;
   gate: LoopGate;
   background: Pick<BackgroundDelivery, 'pending' | 'deadLetterAllPending' | 'deliveryHandlers'>;
@@ -180,9 +180,10 @@ export class LoopLifecycle {
     // 1b. Queued tasks no-op now that the lifecycle is 'destroying'.
     await p.gate.settled;
 
-    // 1c. Completions still awaiting delivery will never be delivered;
-    // dead-letter them (handlers are still registered at this point).
+    // 1c. Completions and loop-owned deliveries still awaiting delivery
+    // never will be; dead-letter them (handlers are still registered here).
     p.background.deadLetterAllPending('agent shut down before delivery');
+    p.queues.deadLetterForTeardown('agent shut down before delivery');
 
     // 2. A full child destroy(), since a pi-level abort would leave the
     // child's MCP connections, subscriptions and timers alive.
@@ -226,7 +227,6 @@ export class LoopLifecycle {
     p.subAgents.failedHandlers.clear();
     p.background.deliveryHandlers.clear();
     p.deadLetters.handlers.clear();
-    p.queues.clearForTeardown();
     p.asks.clear();
   }
 }

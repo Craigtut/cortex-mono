@@ -29,8 +29,10 @@ export interface LoopSubAgentApi {
    * Register a handler that fires when content is dead-lettered: a
    * background completion whose delivery gave up (attempts exhausted,
    * elapsed budget spent, or a fatal error) or that the agent shut down
-   * before delivering, or a parked wake delivery dropped after its
-   * carrying runs failed repeatedly (kind 'wake_delivery'). The consumer
+   * before delivering, a parked wake delivery dropped after its carrying
+   * runs failed repeatedly or by an abort or teardown (kind
+   * 'wake_delivery'), or a silent delivery still queued at teardown (kind
+   * 'silent_delivery'). The consumer
    * can surface the content to the user or re-drive the work; Cortex will
    * not retry it.
    */

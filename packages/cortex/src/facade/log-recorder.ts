@@ -248,7 +248,9 @@ export class LogRecorder {
           ? (result.attempts > 0
               ? `Wake delivery dropped after ${result.attempts} failed carrying runs`
               : `Wake delivery dropped: ${result.lastError}`)
-          : `Background ${result.kind} ${result.taskId} delivery dead-lettered after ${result.attempts} attempts`,
+          : result.kind === 'silent_delivery'
+            ? `Silent delivery dropped: ${result.lastError}`
+            : `Background ${result.kind} ${result.taskId} delivery dead-lettered after ${result.attempts} attempts`,
         data: {
           event: 'delivery_dead_lettered',
           kind: result.kind,
@@ -260,7 +262,9 @@ export class LogRecorder {
           // undelivered content, so a truncated copy here would make the
           // in-memory dead-letter store (which does not survive the
           // process) the only complete record.
-          ...(result.kind === 'wake_delivery' ? { message: result.message } : {}),
+          ...(result.kind === 'wake_delivery' || result.kind === 'silent_delivery'
+            ? { message: result.message }
+            : {}),
         },
       });
       afterEntry?.(result);

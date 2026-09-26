@@ -476,9 +476,15 @@ export class DeliveryQueues {
     return dropped;
   }
 
-  /** Teardown: both queues are dropped by contract (the sweep no-ops then). */
-  clearForTeardown(): void {
-    this.silent.splice(0);
-    this.wake.splice(0);
+  /**
+   * Teardown, once queued sweeps have no-opped: nothing held here will be
+   * delivered, so it is dead-lettered like abort's drops and pending
+   * background completions (deliver() refuses new content from here on).
+   */
+  deadLetterForTeardown(reason: string): void {
+    const wake = this.wake.splice(0);
+    const silent = this.silent.splice(0);
+    if (wake.length > 0) this.ports.deadLetters.recordWake(wake, reason);
+    if (silent.length > 0) this.ports.deadLetters.recordSilent(silent, reason);
   }
 }

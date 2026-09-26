@@ -1621,11 +1621,16 @@ export interface SubAgentResult {
  * would either redeliver forever or vanish silently.
  */
 export interface DeadLetteredBackgroundResult {
-  /** What kind of work produced the dropped content. */
-  kind: 'subagent' | 'bash' | 'wake_delivery';
   /**
-   * Task ID of the sub-agent or background Bash command. Dropped wake
-   * deliveries have no task; they carry the synthetic id 'wake-delivery'.
+   * What kind of work produced the dropped content: a background sub-agent
+   * or Bash command, or a loop-owned delivery (a parked wake delivery, or a
+   * silent one queued for the next prompt when the loop was destroyed).
+   */
+  kind: 'subagent' | 'bash' | 'wake_delivery' | 'silent_delivery';
+  /**
+   * Task ID of the sub-agent or background Bash command. Loop-owned
+   * deliveries have no task; they carry the synthetic id 'wake-delivery' or
+   * 'silent-delivery'.
    */
   taskId: string;
   /** Delivery attempts made before giving up. */
