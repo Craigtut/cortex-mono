@@ -76,8 +76,8 @@ import { FileSessionActivityReporter } from './activity/session-activity.js';
 import { McpConfigWatcher, type McpConfigChangeReason } from './mcp/mcp-watcher.js';
 import { reconcileMcpServers, type McpReconcileResult } from './mcp/reconcile.js';
 import { loadHookHandlers, readProjectHooksContent, hasProjectHooks } from './hooks/loader.js';
-import { runHookHandlers } from './hooks/runner.js';
-import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
+import { applyPreTurnHooks } from './hooks/pre-turn.js';
+import type { HookEvent, HookHandler } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
@@ -488,7 +488,11 @@ export class Session {
     // should see before this turn (e.g. inter-agent message notifications).
     // Failures inside individual handlers are logged but do not block the
     // turn.
-    const promptForAgent = await this.applyPreTurnHooks(text);
+    const promptForAgent = await applyPreTurnHooks(
+      this.hookHandlers?.pre_turn ?? [],
+      { sessionId: this.sessionId, cwd: this.cwd },
+      text,
+    );
 
     this.lastTurnErrorHandled = false;
     try {
@@ -887,41 +891,6 @@ export class Session {
         resolve('skip');
       };
     });
-  }
-
-  /**
-   * Invoke every registered `pre_turn` hook handler in parallel and prepend
-   * their concatenated `additionalContext` (if any) to the user's prompt.
-   * Returns the (possibly augmented) prompt text the agent should see.
-   *
-   * Hooks are external subprocesses; per-handler failures are logged and the
-   * other handlers still run. If no handlers are configured or none return
-   * context, the original prompt is returned unchanged.
-   */
-  private async applyPreTurnHooks(userText: string): Promise<string> {
-    const handlers = this.hookHandlers?.pre_turn ?? [];
-    if (handlers.length === 0) return userText;
-    const envelope: PreTurnEnvelope = {
-      event: 'pre_turn',
-      sessionId: this.sessionId,
-      cwd: this.cwd,
-      timestamp: new Date().toISOString(),
-      version: 1,
-      userPrompt: userText,
-    };
-    const { additionalContext, results } = await runHookHandlers(handlers, envelope);
-    for (const result of results) {
-      if (result.error) {
-        log.warn('pre_turn hook failed', {
-          handler: result.handler.name,
-          error: result.error,
-          exitCode: result.exitCode,
-          signal: result.signal,
-        });
-      }
-    }
-    if (additionalContext.length === 0) return userText;
-    return `<pre-turn-context>\n${additionalContext}\n</pre-turn-context>\n\n${userText}`;
   }
 
   private notifyMcpReloadOutcome(reason: McpConfigChangeReason, result: McpReconcileResult): void {
