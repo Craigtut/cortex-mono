@@ -97,6 +97,18 @@ export type {
   PendingWakeDelivery,
 } from './agent-loop/api/delivery.js';
 export type { LoopRunInfo, PromptOptions } from './agent-loop/api/run.js';
+// The public surface by concern, for dependents that need one slice of it.
+export type {
+  LoopCompletionApi,
+  LoopContextApi,
+  LoopDeliveryApi,
+  LoopEventApi,
+  LoopModelApi,
+  LoopPromptApi,
+  LoopRunApi,
+  LoopSubAgentApi,
+  LoopToolApi,
+};
 export type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
 export { TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop/pi-hooks.js';
 export type {
@@ -134,11 +146,6 @@ export class AgentLoop implements
   private readonly agent: PiAgent;
   private readonly config: AgentLoopConfig;
   private readonly logger: CortexLogger;
-  /**
-   * Path identity of this loop (config `loopPath`, default 'main'). Threaded
-   * through permission asks, callback origin context, persistResult metadata,
-   * and log prefixes; sub-agents extend it with '/<taskId>'.
-   */
   readonly loopPath: string;
   private workingTagsEnabled: boolean;
   /** The loop's modules, wired by assembly.ts. */

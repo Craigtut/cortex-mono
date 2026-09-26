@@ -10,6 +10,14 @@ import type { AgentTextOutput, ClassifiedError, LoopOriginContext, RetryExhauste
 
 export interface LoopEventApi {
   /**
+   * Path identity of this loop (config `loopPath`, default 'main'), the
+   * label every callback origin and log entry it produces carries. Threaded
+   * through permission asks, persistResult metadata and log prefixes too;
+   * sub-agents extend it with '/<taskId>'.
+   */
+  readonly loopPath: string;
+
+  /**
    * Register a handler for when a logical turn's agentic loop completes
    * (pi's agent_end, once per turn: not for a failed attempt a retry may
    * follow). A good point to checkpoint conversation history. The origin

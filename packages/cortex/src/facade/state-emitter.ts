@@ -5,7 +5,7 @@
  * observation) settles for the debounce window.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopContextApi, LoopEventApi } from '../agent-loop.js';
 import type { CortexLogger } from '../types.js';
 import { errorMessageOf } from '../error-classifier.js';
 import type { CortexAgentStateV2 } from './persisted-state.js';
@@ -62,7 +62,7 @@ export class StateEmitter {
    * composite state dirty so onStateChanged fires for them too. Log appends
    * mark it through the recorder's append listener.
    */
-  watch(loops: readonly AgentLoop[]): void {
+  watch(loops: ReadonlyArray<LoopEventApi & LoopContextApi>): void {
     for (const loop of loops) {
       loop.onLoopComplete(() => this.markDirty());
       loop.onPostCompaction(() => this.markDirty());

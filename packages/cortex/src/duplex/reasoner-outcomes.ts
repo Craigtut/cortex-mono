@@ -19,7 +19,7 @@
  * reasoner has said nothing for a while" means exactly that.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopEventApi, LoopRunApi } from '../agent-loop.js';
 import type {
   ClassifiedError,
   RetryExhaustedInfo,
@@ -79,7 +79,7 @@ function clipFailureDetail(message: string): string {
 export type RequestedAbort = 'user' | 'cancel';
 
 export interface ReasonerOutcomePorts {
-  reasoner: AgentLoop;
+  reasoner: LoopEventApi & LoopRunApi;
   /** The reasoner's logical run in flight (ReasonerRunTracker), or null. */
   runId(): number | null;
   /** The router's delivery intake (wake policy) and delegation retirement. */

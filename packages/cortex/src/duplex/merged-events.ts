@@ -3,7 +3,7 @@
  * loop, plus the sanitized talker-delta stream voice consumers speak from.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopEventApi } from '../agent-loop.js';
 import type { CortexLogger } from '../types.js';
 import { EventBridge, extractResponseChunkText } from '../event-bridge.js';
 import type { CortexEvent } from '../event-bridge.js';
@@ -19,7 +19,7 @@ export class MergedEvents {
    * main-loop events arriving as pseudo-children go dark against every
    * `if (event.childTaskId) return;` consumer filter.
    */
-  constructor(talker: AgentLoop, reasoner: AgentLoop, logger: CortexLogger) {
+  constructor(talker: LoopEventApi, reasoner: LoopEventApi, logger: CortexLogger) {
     this.bridge = new EventBridge(false, logger);
     const talkerBridge = talker.getEventBridge();
     this.bridge.forwardLoopFrom(talkerBridge, talker.loopPath);
@@ -62,7 +62,7 @@ export class MergedEvents {
    * which also feeds the aggregate budget guard, so lookup spend is bounded
    * like everything else. Returns the detach function.
    */
-  forwardLookup(loop: AgentLoop): () => void {
+  forwardLookup(loop: LoopEventApi): () => void {
     return this.bridge.forwardLoopFrom(loop.getEventBridge(), loop.loopPath);
   }
 

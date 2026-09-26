@@ -18,7 +18,10 @@
  * logged but never delivered.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopCompletionApi, LoopContextApi, LoopRunApi } from '../agent-loop.js';
+
+/** What the lookup fleet drives on each ephemeral lookup loop. */
+type LookupLoop = LoopRunApi & LoopContextApi & LoopCompletionApi;
 import type { CortexLogger, SessionUsage } from '../types.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
 import { errorMessageOf } from '../error-classifier.js';
@@ -52,7 +55,7 @@ export interface QuickLookupPorts {
    * its merged bridge; `cleanup` runs after the lookup settles, before the
    * loop is destroyed.
    */
-  createLoop(alias: string): Promise<{ loop: AgentLoop; cleanup?: () => void }>;
+  createLoop(alias: string): Promise<{ loop: LookupLoop; cleanup?: () => void }>;
   /** Receive a terminal outcome. Errors are swallowed and logged. */
   onOutcome(outcome: QuickLookupOutcome): void;
   logger?: CortexLogger;
@@ -79,14 +82,14 @@ interface ActiveLookup {
   question: string;
   causeSeq: number | null;
   startedAt: number;
-  loop: AgentLoop | null;
+  loop: LookupLoop | null;
   cancelled: boolean;
   /** Resolves when the lookup has fully settled (loop destroyed, outcome emitted). */
   completion: Promise<void>;
 }
 
 /** Spoken text of the latest assistant message in a loop's history that has any. */
-function extractAnswer(loop: AgentLoop): string {
+function extractAnswer(loop: LookupLoop): string {
   const history = loop.getConversationHistory();
   for (let i = history.length - 1; i >= 0; i--) {
     const message = history[i] as unknown as { role?: string };
@@ -214,7 +217,7 @@ export class QuickLookupManager {
   // -------------------------------------------------------------------------
 
   private async run(entry: ActiveLookup): Promise<void> {
-    let loop: AgentLoop;
+    let loop: LookupLoop;
     let cleanup: (() => void) | undefined;
     try {
       const created = await this.ports.createLoop(entry.alias);
@@ -272,7 +275,7 @@ export class QuickLookupManager {
     }
   }
 
-  private accumulateUsage(loop: AgentLoop): void {
+  private accumulateUsage(loop: LookupLoop): void {
     try {
       const usage = loop.getSessionUsage();
       this.settledUsage.totalCost += usage.totalCost;

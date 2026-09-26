@@ -5,7 +5,17 @@
  * result path rather than by prompt.
  */
 
-import type { AgentLoop, ToolResultInterceptorInfo, ToolResultInterceptorResult } from '../agent-loop.js';
+import type {
+  LoopDeliveryApi,
+  LoopEventApi,
+  LoopRunApi,
+  LoopToolApi,
+  ToolResultInterceptorInfo,
+  ToolResultInterceptorResult,
+} from '../agent-loop.js';
+
+/** What the guards reach on the talker. */
+type GuardedTalker = LoopRunApi & LoopDeliveryApi & LoopEventApi & LoopToolApi;
 import type { CortexLogger } from '../types.js';
 import { payloadOf } from '../event-bridge.js';
 import type { CortexEvent } from '../event-bridge.js';
@@ -25,7 +35,7 @@ function appendSpeakNudge(content: unknown): unknown {
 
 export class TalkerGuards {
   private readonly logger: CortexLogger;
-  private talker: AgentLoop | null = null;
+  private talker: GuardedTalker | null = null;
   /** One truncation repair per streak (D17 stop-reason audit). */
   private repairPending = false;
 
@@ -37,7 +47,7 @@ export class TalkerGuards {
    * Install both guards on the talker. The audit listens on turn_end, so
    * handlers registered on the talker's turn_end before this run first.
    */
-  attach(talker: AgentLoop): void {
+  attach(talker: GuardedTalker): void {
     this.talker = talker;
     talker.setToolResultInterceptor((info) => this.guardToolResult(info));
     talker.getEventBridge().on('turn_end', (event) => {

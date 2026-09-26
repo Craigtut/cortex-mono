@@ -5,7 +5,7 @@
  * usage those owners' counters add up to.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopDeliveryApi, LoopEventApi } from '../agent-loop.js';
 import type { SessionUsage } from '../types.js';
 import type { LoopTopology } from './loop-surface.js';
 import type { LogRecorder } from './log-recorder.js';
@@ -124,7 +124,11 @@ export class CompositeState {
  * with no base prompt yet) is recorded as dropped by the restore rather
  * than failing a restore that has already applied everything else.
  */
-export function requeueSilent(loop: AgentLoop, contents: unknown, recorder: LogRecorder): void {
+export function requeueSilent(
+  loop: LoopDeliveryApi & Pick<LoopEventApi, 'loopPath'>,
+  contents: unknown,
+  recorder: LogRecorder,
+): void {
   if (!Array.isArray(contents)) return;
   const refused: string[] = [];
   for (const content of contents) {

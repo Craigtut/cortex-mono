@@ -19,7 +19,7 @@
  * loop_start is not the reasoner starting.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopEventApi, LoopRunApi } from '../agent-loop.js';
 import type { CortexEvent } from '../event-bridge.js';
 
 /** One live attempt of one logical run. */
@@ -31,11 +31,11 @@ export interface ReasonerAttempt {
 }
 
 export class ReasonerRunTracker {
-  private readonly reasoner: AgentLoop;
+  private readonly reasoner: LoopRunApi & LoopEventApi;
   private readonly startListeners: Array<(attempt: ReasonerAttempt) => void> = [];
   private readonly endListeners: Array<(event: CortexEvent) => void> = [];
 
-  constructor(reasoner: AgentLoop) {
+  constructor(reasoner: LoopRunApi & LoopEventApi) {
     this.reasoner = reasoner;
     const bridge = reasoner.getEventBridge();
     bridge.on('loop_start', (event) => {

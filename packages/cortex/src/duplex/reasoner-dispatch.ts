@@ -7,7 +7,7 @@
  * run.
  */
 
-import type { AgentLoop, DeliverOptions } from '../agent-loop.js';
+import type { DeliverOptions, LoopDeliveryApi, LoopEventApi, LoopRunApi } from '../agent-loop.js';
 import type { CortexLogger } from '../types.js';
 import { errorMessageOf } from '../error-classifier.js';
 import type { LogEntryInput } from '../facade/log-recorder.js';
@@ -15,7 +15,7 @@ import type { CauseTag } from './cause-tags.js';
 import type { ReasonerDispatchOptions } from './router-contract.js';
 
 export interface ReasonerDispatchPorts {
-  reasoner: AgentLoop;
+  reasoner: LoopDeliveryApi & LoopRunApi & Pick<LoopEventApi, 'loopPath'>;
   append(input: LogEntryInput): void;
   /** Input is about to reach a loop (idle digestion yields to it). */
   beforeInput(): void;

@@ -6,7 +6,13 @@
  * consumes it, which is where the D16 consent check finds user speech.
  */
 
-import type { AgentLoop, DeliverResult, DirectCompletionOptions } from '../agent-loop.js';
+import type {
+  DeliverResult,
+  DirectCompletionOptions,
+  LoopDeliveryApi,
+  LoopEventApi,
+  LoopRunApi,
+} from '../agent-loop.js';
 import type { CortexLogger } from '../types.js';
 import type { SessionLogEntryType } from '../session-log.js';
 import { errorMessageOf } from '../error-classifier.js';
@@ -18,8 +24,8 @@ import type { DuplexRouter } from './router.js';
 import { wrapExternalContent } from './prompts.js';
 
 export interface ConversationInputPorts {
-  talker: AgentLoop;
-  reasoner: AgentLoop;
+  talker: LoopDeliveryApi & LoopRunApi & Pick<LoopEventApi, 'loopPath'>;
+  reasoner: LoopDeliveryApi & Pick<LoopEventApi, 'loopPath'>;
   router: Pick<
     DuplexRouter,
     'noteUserUtterance' | 'noteUserContext' | 'noteWorkContext' | 'composeWorkDispatch'

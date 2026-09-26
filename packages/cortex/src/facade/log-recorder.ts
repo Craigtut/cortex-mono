@@ -8,7 +8,7 @@
  * handlers and their signatures are untouched and passthrough parity holds.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopEventApi, LoopSubAgentApi } from '../agent-loop.js';
 import type {
   AgentTextOutput,
   ClassifiedError,
@@ -119,7 +119,7 @@ export class LogRecorder {
    * surface. `afterReply` runs once the entry is written, with the raw
    * user-facing text.
    */
-  wireConversation(loop: AgentLoop, afterReply?: (text: string) => void): void {
+  wireConversation(loop: LoopEventApi, afterReply?: (text: string) => void): void {
     loop.onTurnComplete((output: AgentTextOutput, origin: LoopOriginContext) => {
       if (output.userFacing.trim().length === 0) return;
       this.append({
@@ -132,7 +132,7 @@ export class LogRecorder {
   }
 
   /** Error and retry entries for one loop (both loops in duplex). */
-  wireErrors(loop: AgentLoop): void {
+  wireErrors(loop: LoopEventApi): void {
     loop.onError((error: ClassifiedError, origin: LoopOriginContext) => {
       this.append({
         type: 'error',
@@ -163,7 +163,7 @@ export class LogRecorder {
   }
 
   /** Sub-agent lifecycle and dead-letter entries (the work surface). */
-  wireWork(loop: AgentLoop): void {
+  wireWork(loop: LoopEventApi & LoopSubAgentApi): void {
     loop.onSubAgentSpawned((taskId, instructions, background) => {
       const entry = this.append({
         type: 'lifecycle',
@@ -237,7 +237,7 @@ export class LogRecorder {
    * nothing saying why. `afterEntry` runs once the entry is written.
    */
   wireDeadLetters(
-    loop: AgentLoop,
+    loop: LoopEventApi & LoopSubAgentApi,
     afterEntry?: (result: DeadLetteredBackgroundResult) => void,
   ): void {
     loop.onBackgroundResultDeadLettered((result: DeadLetteredBackgroundResult) => {
@@ -279,7 +279,7 @@ export class LogRecorder {
    * the only caller in a position to preserve it (the loop-level abort
    * dead-letter path never sees content the facade already cleared).
    */
-  recordDroppedQueue(loop: AgentLoop, reason: 'abort' | 'restore', dropped: string[]): void {
+  recordDroppedQueue(loop: Pick<LoopEventApi, 'loopPath'>, reason: 'abort' | 'restore', dropped: string[]): void {
     if (dropped.length === 0) return;
     this.append({
       type: 'lifecycle',

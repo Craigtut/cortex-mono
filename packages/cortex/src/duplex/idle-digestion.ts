@@ -8,13 +8,13 @@
  * preempts it rather than waiting behind background compaction.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopRunApi, LoopSubAgentApi } from '../agent-loop.js';
 import type { CortexLogger } from '../types.js';
 import { errorMessageOf } from '../error-classifier.js';
 
 export interface IdleDigestionPorts {
-  talker: AgentLoop;
-  reasoner: AgentLoop;
+  talker: LoopRunApi & LoopSubAgentApi;
+  reasoner: LoopRunApi & LoopSubAgentApi;
   /** Whether the session is genuinely quiet (conversation idle, nothing held). */
   quiet(): boolean;
   destroyed(): boolean;

@@ -11,7 +11,9 @@
  * all terms at once.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type { LoopDeliveryApi, LoopEventApi, LoopRunApi, LoopSubAgentApi } from '../agent-loop.js';
+
+type Named = Pick<LoopEventApi, 'loopPath'>;
 
 /** One condition settlement waits out. */
 export interface SettlementTerm {
@@ -31,7 +33,7 @@ export function yieldMacrotask(): Promise<void> {
 }
 
 /** A loop's gate: a run or any gate work in flight. */
-export function gateTerm(loop: AgentLoop): SettlementTerm {
+export function gateTerm(loop: LoopRunApi & Named): SettlementTerm {
   return {
     name: `${loop.loopPath}-gate`,
     pending: () => loop.isLoopActive,
@@ -43,7 +45,7 @@ export function gateTerm(loop: AgentLoop): SettlementTerm {
  * Parked wake deliveries, waited out on the loop's own drain signal. They
  * start a run when they land, which the gate terms then wait out.
  */
-export function parkedWakesTerm(loop: AgentLoop): SettlementTerm {
+export function parkedWakesTerm(loop: LoopDeliveryApi & Named): SettlementTerm {
   return {
     name: `${loop.loopPath}-parked-wakes`,
     pending: () => loop.pendingWakeDeliveryCount > 0,
@@ -52,7 +54,7 @@ export function parkedWakesTerm(loop: AgentLoop): SettlementTerm {
 }
 
 /** A loop's running sub-agents, waited out on their completion promises. */
-export function subAgentsTerm(loop: AgentLoop): SettlementTerm {
+export function subAgentsTerm(loop: LoopSubAgentApi & Named): SettlementTerm {
   const manager = loop.getSubAgentManager();
   return {
     name: `${loop.loopPath}-sub-agents`,
@@ -68,7 +70,7 @@ export function subAgentsTerm(loop: AgentLoop): SettlementTerm {
 }
 
 /** Asks in a loop's own registry (its own and its sub-agents'). */
-export function loopAsksTerm(loop: AgentLoop): SettlementTerm {
+export function loopAsksTerm(loop: LoopDeliveryApi & Named): SettlementTerm {
   return {
     name: `${loop.loopPath}-asks`,
     pending: () => loop.getPendingAsks().length > 0,

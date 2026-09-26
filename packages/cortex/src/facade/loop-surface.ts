@@ -17,7 +17,32 @@
  * (loop-delegation.ts); this class implements its topology-determined part.
  */
 
-import type { AgentLoop } from '../agent-loop.js';
+import type {
+  AgentLoop,
+  LoopCompletionApi,
+  LoopContextApi,
+  LoopDeliveryApi,
+  LoopEventApi,
+  LoopModelApi,
+  LoopPromptApi,
+  LoopRunApi,
+} from '../agent-loop.js';
+
+/**
+ * The conversation loop as the facade reaches it: its queues, transcript,
+ * events, run state, prompt, model and usage. Never its tools or
+ * sub-agents: in duplex those are the talker's control toolset and nothing
+ * the consumer surface may drive.
+ */
+export type ConversationLoop = LoopDeliveryApi & LoopContextApi & LoopEventApi & LoopRunApi
+  & LoopPromptApi & LoopModelApi & LoopCompletionApi;
+
+/**
+ * A resident loop as the session-wide operations reach it: waits,
+ * persistence triggers, and the settings that fan out to every loop
+ * (models, prompt, context).
+ */
+export type ResidentLoop = LoopRunApi & LoopEventApi & LoopContextApi & LoopModelApi & LoopPromptApi;
 import type {
   DirectCompletionOptions,
   IdleDigestionOptions,
@@ -70,9 +95,9 @@ export interface LoopTopology {
   /** The loop that does the work: the reasoner in both modes. */
   readonly work: AgentLoop;
   /** The loop the user talks to: the talker in duplex, the reasoner in passthrough. */
-  readonly conversation: AgentLoop;
+  readonly conversation: ConversationLoop;
   /** Every resident loop, work loop first. */
-  readonly resident: readonly AgentLoop[];
+  readonly resident: readonly ResidentLoop[];
 }
 
 /** The topology of a session: one loop in passthrough, the pair in duplex. */
