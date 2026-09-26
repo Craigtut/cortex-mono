@@ -177,24 +177,43 @@ export class ConversationInput {
   }
 
   /**
-   * Steer the conversation surface. With no talker turn in flight the gate
-   * can still be held (idle digestion, an end-of-run drain), so the loop
-   * would accept the steer into pi's queue with no run to read it, where it
-   * waits for whatever run starts next and is never logged. A consumer
-   * steers precisely when it believes the conversation is busy, so this is
-   * the user's next utterance: route it as one, logged, preempting the
-   * digestion, and opening (or joining) the next talker run.
+   * Steer the conversation surface: the user's next utterance, given while
+   * the conversation may be busy. Logged and carrying its utterance cause
+   * tag like any user input, so it reaches the reasoner's deltas and can
+   * satisfy the D16 consent check for a request the user already heard.
+   *
+   * With a talker turn in flight it joins that run at its next turn
+   * boundary (the loop's atTurnBoundary hand-over), and the run takes its
+   * cause tag at that moment, never earlier: consent still traces to user
+   * words the run has actually seen. Where the hand-over is not provably
+   * exact it parks for the next run instead. pi's own steering queue is
+   * never used, since content there is unlogged and carries no causation.
+   *
+   * With no turn in flight the gate can still be held (idle digestion, an
+   * end-of-run drain), so it becomes a prompt: preempting the digestion and
+   * opening (or joining) the next talker run.
    */
   steer(message: string): void {
     const { talker } = this.ports;
-    if (talker.isPrompting) {
-      talker.steer(message);
+    if (!talker.isPrompting) {
+      void this.ports.promptThroughFacade(message).catch((err: unknown) => {
+        this.ports.logger.warn('steer delivered as a prompt failed', {
+          error: errorMessageOf(err),
+        });
+      });
       return;
     }
-    void this.ports.promptThroughFacade(message).catch((err: unknown) => {
-      this.ports.logger.warn('steer delivered as a prompt failed', {
-        error: errorMessageOf(err),
-      });
+    const entry = this.ports.recorder.append({
+      type: 'utterance',
+      loopPath: talker.loopPath,
+      content: message,
+      causedBy: null,
     });
+    this.ports.router.noteUserUtterance(message);
+    talker.deliver(message, {
+      causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag,
+      atTurnBoundary: true,
+    });
+    this.ports.reopenVoicing();
   }
 }

@@ -17,12 +17,14 @@
  *   the voicing was authored before the user could have heard the request.
  * - anything else is a voiceable refusal, and the pending ask is re-read.
  *
- * The tag set is NOT a complete record of what the user said: steer()
- * bypasses causation, so a user steering "yes, go ahead" reaches neither
- * the log nor this check. That failure direction is safe by design: an
- * unheard yes leaves the ask pending and it gets re-voiced. There is
- * deliberately NO recovery path that tries to infer such consent; any
- * recovery heuristic would itself be an attack surface.
+ * Every user input reaches this check the same way: prompt(), a deliver()
+ * with `speaker: 'user'`, and a steer() into a live talker turn are each
+ * logged as an utterance and carry its tag into the run that consumes the
+ * words (a steer joins the live run at a turn boundary, and only from that
+ * moment). Words that never reached a run carry no tag, and that failure
+ * direction is safe by design: an unheard yes leaves the ask pending. There
+ * is deliberately NO recovery path that tries to infer consent from
+ * anything else; any recovery heuristic would itself be an attack surface.
  */
 
 import type { CauseTag } from './cause-tags.js';

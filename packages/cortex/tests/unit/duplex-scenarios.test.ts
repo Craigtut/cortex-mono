@@ -670,6 +670,91 @@ describe('scenario: permission brokering through conversation', () => {
     await waitUntil(() => h.facade.getPendingAsks().length === 0, 2000, 'ask settled');
   });
 
+  /** Raise an ask, read it out, and leave the talker idle. Returns its id. */
+  async function voicedAsk(h: ReturnType<typeof brokeredScenario>): Promise<string> {
+    h.reasonerPi.script = [
+      { text: 'Deploying.', calls: [{ name: 'Deploy', args: { command: 'ship --prod' } }] },
+      { text: 'Deployed.' },
+    ];
+    h.talkerPi.script = [
+      { text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'deploy' } }] },
+      { text: 'It wants to run ship --prod. Allow that?' },
+    ];
+    await h.facade.prompt('please deploy');
+    await waitUntil(() => entriesOfType(h.facade, 'ask').length === 1, 2000, 'ask raised');
+    await waitUntil(() => !h.talkerLoop.isLoopActive, 2000, 'request read out');
+    return pendingAskId(h.facade);
+  }
+
+  it('accepts a yes steered into a live talker turn, from the turn after it lands', async () => {
+    const h = brokeredScenario();
+    const askId = await voicedAsk(h);
+
+    h.talkerPi.hold = true;
+    h.talkerPi.script = [
+      { text: 'Take your time.' },
+      { text: 'Approving that.', calls: [{ name: 'answer_ask', args: { askId, decision: 'allow' } }] },
+    ];
+    void h.facade.prompt('hmm, let me think about it');
+    await waitUntil(() => h.talkerLoop.isPrompting, 2000, 'talker turn live');
+    h.facade.steer('yes, go ahead');
+
+    // Logged as the user's words the moment they arrive.
+    const yes = entriesOfType(h.facade, 'utterance').find((entry) => entry.content === 'yes, go ahead');
+    expect(yes).toBeDefined();
+
+    h.talkerPi.releaseRun();
+    await waitUntil(() => h.deployed.length === 1, 2000, 'tool ran after approval');
+    // One talker run: the steer joined the live turn rather than a later run.
+    expect(h.talkerPi.promptCalls).toHaveLength(3);
+    const answer = entriesOfType(h.facade, 'ask_answer')[0]!;
+    expect(answer.data).toMatchObject({ decision: 'allow' });
+    expect(answer.causedBy).toBe(yes!.seq);
+  });
+
+  it('refuses a steered yes in the run that is reading the request out', async () => {
+    const h = brokeredScenario();
+    h.reasonerPi.script = [
+      { text: 'Deploying.', calls: [{ name: 'Deploy', args: { command: 'ship --prod' } }] },
+      { text: 'Stopped.' },
+    ];
+    h.talkerPi.script = [
+      { text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'deploy' } }] },
+    ];
+    await h.facade.prompt('please deploy');
+    await waitUntil(() => entriesOfType(h.facade, 'ask').length === 1, 2000, 'ask raised');
+    await waitUntil(() => !h.talkerLoop.isLoopActive, 2000, 'voicing run over');
+    const askId = pendingAskId(h.facade);
+
+    // The next talker run carries a fresh voicing; the user's steered yes
+    // lands inside that same run.
+    h.talkerPi.hold = true;
+    h.talkerPi.script = [
+      { text: 'It wants to run ship --prod. Allow that?' },
+      { text: 'Approving that.', calls: [{ name: 'answer_ask', args: { askId, decision: 'allow' } }] },
+      { text: 'Okay.' },
+    ];
+    getBroker(h.facade).voicing.noteLost();
+    await waitUntil(() => h.talkerLoop.isPrompting, 2000, 'voicing run live');
+    h.facade.steer('yes');
+    h.talkerPi.releaseRun();
+    await waitUntil(
+      () => h.talkerPi.toolResults.some((result) => result.name === 'answer_ask'),
+      2000, 'answer attempted',
+    );
+    await waitUntil(() => !h.talkerLoop.isLoopActive, 2000, 'talker idle');
+
+    // Refused for carrying the voicing, not for lacking the user's words:
+    // the steered yes did join the run.
+    const refusals = lifecycleEvents(h.facade, 'dispatch_refused')
+      .map((entry) => (entry.data as { reason?: string }).reason);
+    expect(refusals).toContain('allow from the run that carried the voicing');
+    expect(entriesOfType(h.facade, 'ask_answer')).toHaveLength(0);
+    expect(h.deployed).toHaveLength(0);
+    expect(getBroker(h.facade).pendingAskCount).toBe(1);
+    getBroker(h.facade).answer(askId, 'deny', undefined);
+  });
+
   it('an unanswered ask times out as a deny the reasoner can see', async () => {
     const h = brokeredScenario({ askTimeoutMs: 40 });
     h.reasonerPi.script = [
