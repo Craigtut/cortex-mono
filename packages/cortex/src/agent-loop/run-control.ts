@@ -5,28 +5,24 @@
  * Loop gate. Every loop-owning task (consumer prompts, background drains,
  * wake sweeps, idle digestion) is serialized through one promise chain, so
  * a concurrent prompt() can never corrupt a running loop's tool runtime or
- * history boundary. Depth counts the running task plus queued ones, so
- * callers can fail fast before mutating shared loop state. The tail never
- * rejects.
+ * history boundary. The tail never rejects.
  *
  * Abort epoch. abort() cancels parked wake deliveries, including ones that
  * park during its own await windows. The live controller cannot express
  * that (a drain that starts mid-abort replaces it, and abort() skips the
  * gate wait when background deliveries are pending), so parked items are
- * stamped with the epoch at park time and every take of the parked queue
- * drops items stamped before the most recent abort completed. The
- * in-progress count covers the window before the epoch advances at the
- * end of abort().
+ * stamped with the epoch at park time and every take drops items stamped
+ * before the most recent abort completed. The in-progress count covers the
+ * window before the epoch advances.
+ *
+ * Reference: cortex-architecture.md "Loop gate, turn unwind, abort epoch"
  */
 
 export class LoopGate {
   private tail: Promise<void> = Promise.resolve();
   private depthCount = 0;
 
-  /**
-   * Serialize a task behind every previously enqueued one. At most one
-   * gate task executes at a time.
-   */
+  /** Serialize a task behind every previously enqueued one. */
   enqueue<T>(task: () => Promise<T>): Promise<T> {
     this.depthCount += 1;
     const run = this.tail.then(task);
@@ -184,8 +180,7 @@ export async function raceTimeout(
 
 /**
  * Sleep for `ms`, waking early if `signal` aborts. Resolves true when the
- * full delay elapsed, false when aborted, so a cancel during a
- * multi-minute backoff takes effect immediately.
+ * full delay elapsed, false when aborted.
  */
 export function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
@@ -204,11 +199,8 @@ export function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<boo
 }
 
 /**
- * Whether pi's run state records an abort/cancel as its error. Matches
- * "abort"/"cancelled" only as a word start, not inside a larger
- * identifier: a provider error like ECONNABORTED is a network failure, and
- * misreading it as an abort would trim its failure stub and mislabel the
- * error as a cancellation.
+ * Whether pi's run state records an abort/cancel as its error. Matches only
+ * at a word start: ECONNABORTED is a network failure, not a cancellation.
  */
 export function isAbortShapedError(agentState: Record<string, unknown>): boolean {
   const rawError = agentState['errorMessage'] ?? agentState['error'];

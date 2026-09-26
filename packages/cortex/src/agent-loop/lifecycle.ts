@@ -10,6 +10,8 @@
  * destroy(): mark destroying before any await (nothing new can start) ->
  * abort the controller -> ordered cleanup raced against a force-kill
  * deadline -> destroyed.
+ *
+ * Reference: cortex-architecture.md "Loop gate, turn unwind, abort epoch"
  */
 
 import type { BudgetGuard } from '../budget-guard.js';
@@ -95,49 +97,36 @@ export class LoopLifecycle {
 
   async abort(): Promise<void> {
     const p = this.parts();
-    // Capture the current turn's unwind promise BEFORE aborting, so the
-    // wait below is scoped to the turn being cancelled and never to a later
-    // turn started by a background delivery.
+    // Captured BEFORE aborting, so the wait is scoped to the cancelled turn
+    // and never to a later one a background delivery starts.
     const unwound = p.runner.unwound;
 
     p.diagnostics.recordAbortRequested();
     p.logger.info('abort requested', { isPrompting: p.runner.isPrompting });
     p.queues.dropAllWakeForAbort();
-    // A delivery can also park DURING the await windows below; the abort
-    // epoch cancels it the same way (run-control.ts).
     const abort = p.abortState.begin();
     try {
       p.agent.abort();
       p.diagnostics.startAbortWait();
       try {
         await p.agent.waitForIdle();
-        // waitForIdle() only covers pi-agent-core's run promise (it resolves,
-        // never rejects). The Cortex-side unwind (retry classification, the
-        // prompt finally block) may not have observed the abort yet, so wait
-        // for it too: renewing the controller before that classification
-        // ran would reclassify the cancelled turn as a retryable failure.
+        // waitForIdle() only covers pi's run. Renewing the controller before
+        // the Cortex-side unwind classified the abort would make the
+        // cancelled turn look like a retryable failure.
         await unwound;
       } finally {
         p.diagnostics.finishAbortWait();
       }
 
-      // When no background delivery is pending, also wait for the gate to
-      // release the aborted cycle so a follow-up prompt() cannot spuriously
-      // fail fast on a stale gate. This is bounded: a queued task is either
-      // the just-unwound running turn (its finally drain is an empty no-op
-      // before release), a same-frame prompt() that has not started yet
-      // (it sees the aborted controller at dequeue and cancels without ever
-      // reaching pi), or a wake sweep that finds the parked list dropped
-      // above (one parked during this window is dropped by the epoch gate)
-      // and never starts a run. When deliveries ARE pending they start a
-      // fresh (non-aborted) loop, so return rather than block on it.
+      // Wait for the gate so a follow-up prompt() does not fail fast on a
+      // stale one. Bounded: every queued task either no-ops or cancels at
+      // dequeue. Pending background deliveries start a fresh loop instead,
+      // so do not block on them.
       if (p.background.pending.length === 0) {
         await p.gate.settled;
       }
 
-      // Reset so the agent is reusable, unless teardown owns the controller
-      // now or a newer turn (e.g. a background delivery that started during
-      // the wait) already installed its own controller.
+      // renew() leaves a controller a newer turn already installed.
       if (!this.isShuttingDown) abort.renew();
     } finally {
       abort.end();
@@ -159,18 +148,13 @@ export class LoopLifecycle {
       mcpConnections: p.mcp.manager.connectionCount,
     });
 
-    // Transition BEFORE any await so nothing can start a new loop while
-    // teardown runs: prompt() rejects, queued gate tasks no-op, background
-    // completions are dropped, and the end-of-cycle drain is skipped.
+    // Before any await, so nothing can start a new loop during teardown.
     this.current = 'destroying';
-    // Cancel Cortex-side waits immediately: a pending retry-backoff timer is
-    // cleared by its abort listener, and the current turn's unwind is
-    // classified as cancelled instead of scheduling further retries.
+    // Cancels retry backoff and classifies the current unwind as cancelled.
     p.abortState.abortCurrent();
 
     this.destroyPromise = (async () => {
       try {
-        // Race the cleanup against a force-kill deadline.
         if (await raceTimeout(this.orderedCleanup(p), timeoutMs) === 'timeout') {
           p.processes.killAll();
         }
@@ -193,19 +177,15 @@ export class LoopLifecycle {
       // Ignore errors during wait (agent may already be idle)
     }
 
-    // 1b. Wait for the loop gate to drain: the aborted cycle's Cortex-side
-    // unwind plus any queued delivery tasks (which no-op now that the
-    // lifecycle is 'destroying'). Bounded by destroy()'s force-kill race.
+    // 1b. Queued tasks no-op now that the lifecycle is 'destroying'.
     await p.gate.settled;
 
     // 1c. Completions still awaiting delivery will never be delivered;
     // dead-letter them (handlers are still registered at this point).
     p.background.deadLetterAllPending('agent shut down before delivery');
 
-    // 2. Cancel all sub-agents with a full child destroy(), not just a
-    // pi-level abort, which would leave the child's MCP connections, event
-    // subscriptions, and compaction timers alive. Bounded by this
-    // destroy()'s own force-kill deadline.
+    // 2. A full child destroy(), since a pi-level abort would leave the
+    // child's MCP connections, subscriptions and timers alive.
     try {
       await p.subAgentManager.cancelAll(async (agent) => {
         await agent.destroy();
@@ -218,8 +198,7 @@ export class LoopLifecycle {
     // handler is logged and teardown continues)
     p.loopComplete.emit(p.origin);
 
-    // 4. Detach from the MCP manager; close connections only when owned (a
-    // shared manager's connections belong to its owner and outlive this loop)
+    // 4. Closes connections only when this loop owns the manager
     await p.mcp.detach();
 
     // 5. Clear skill buffer and registry
@@ -238,9 +217,7 @@ export class LoopLifecycle {
     p.compactionManager.destroy();
     p.tools.runtime.destroy();
 
-    // 9. Clear all handler lists and the loop-owned queues. The dead-letter
-    // store itself is deliberately kept: it must still answer after
-    // destroy() (which itself dead-letters anything pending).
+    // 9. The dead-letter store is kept: it must still answer after destroy().
     p.loopComplete.clear();
     p.errorHandlers.clear();
     p.turnComplete.clear();

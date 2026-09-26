@@ -12,14 +12,13 @@ export interface LoopRunApi {
   /**
    * Send a prompt to the agent and run the agentic loop.
    *
-   * Transitions from CREATED to ACTIVE on first call.
-   * Catches errors, classifies them, and emits onError.
+   * Transitions from CREATED to ACTIVE on first call. Errors are classified
+   * and emitted through onError; transient failures are retried in the
+   * background per the retry policy.
    *
-   * Every loop start (consumer prompt() calls and background-completion
-   * deliveries) is serialized through an internal gate, so a concurrent
-   * prompt() can never corrupt the running loop's tool runtime or history
-   * boundary. A prompt() issued while a loop is active or queued fails fast
-   * BEFORE any shared state is touched; use steer() to reach a running loop.
+   * Every loop start is serialized through an internal gate. A prompt()
+   * issued while a loop is active or queued fails fast BEFORE any shared
+   * state is touched; use steer() or deliver() to reach a running loop.
    *
    * @param input - The prompt text
    * @returns The agent's response (opaque, from pi-agent-core)
@@ -36,14 +35,11 @@ export interface LoopRunApi {
   readonly isLoopActive: boolean;
 
   /**
-   * True while a logical turn is in flight: from runPromptOnce entry (the
-   * first agent.prompt attempt) through its retry continuations until the
-   * turn unwinds. Narrower than {@link isLoopActive}, which also covers
-   * gate tasks that never run pi (an idle digestion pass, an empty drain,
-   * the end-of-cycle drain window after a run ended). A steer() is only
-   * meaningful while this is true: pi polls its steering queue at run
-   * start and at turn boundaries within a run, so content queued when no
-   * turn is in flight waits for whatever run starts next.
+   * True while a logical turn is in flight: from the first agent.prompt
+   * attempt through its retry continuations until the turn unwinds.
+   * Narrower than {@link isLoopActive}, which also covers gate tasks that
+   * never run pi (idle digestion, an empty drain). A steer() only reaches a
+   * run while this is true; otherwise it waits for the next run.
    */
   readonly isPrompting: boolean;
 
@@ -51,30 +47,22 @@ export interface LoopRunApi {
    * Cause tags of the run currently holding the gate: the tags of every
    * wake delivery this run consumed (its own prompt input, spliced parked
    * content, or a sweep batch). Empty while no run is live and for runs
-   * that carry no tagged content (background drains, untagged prompts).
-   * Set at run start in the same frame the delivery batches are taken and
-   * cleared in the run's own finally, so the value is always exactly the
-   * live run's; a later run can never inherit a previous run's tags. The
-   * duplex facade reads this to stamp log-entry causation (D16 binds
-   * consent to those stamps, docs/cortex/duplex/log-and-context.md).
+   * that carry no tagged content. Always exactly the live run's; a later
+   * run never inherits a previous run's tags. The duplex facade stamps
+   * log-entry causation from this (D16, docs/cortex/duplex/log-and-context.md).
    */
   readonly activeRunCauseTags: readonly unknown[];
 
   /**
    * Resolve once the loop gate is empty: no gate task running or queued.
-   * This is the awaitable form of {@link isLoopActive}, and the primitive
-   * settlement predicates build on. It deliberately keys on gate depth
-   * rather than {@link isPrompting}, which reads idle while gate tasks
-   * (queued drains, delivery sweeps, idle digestion) are still pending.
+   * The awaitable form of {@link isLoopActive} (not {@link isPrompting},
+   * which reads idle while drains, sweeps or digestion are pending). Tasks
+   * enqueued by tasks extend the wait.
    *
-   * Event-driven, not polled: each pass awaits the current gate tail and
-   * re-checks, so tasks enqueued by tasks (a run scheduling a drain, a
-   * parked delivery scheduling a sweep) extend the wait. The depth is zero
-   * in the frame this resolves in, but the caller's continuation runs a
-   * microtask later, and an unrelated continuation can enqueue a gate task
-   * in between; a caller that needs check-then-act atomicity must therefore
-   * re-check {@link isLoopActive} synchronously before acting, and wait
-   * again if the gate refilled.
+   * The caller's continuation runs a microtask after the gate emptied, and
+   * another task can enqueue in between. For check-then-act atomicity,
+   * re-check {@link isLoopActive} synchronously before acting and wait again
+   * if the gate refilled.
    */
   waitForLoopIdle(): Promise<void>;
 
@@ -85,19 +73,16 @@ export interface LoopRunApi {
   abort(): Promise<void>;
 
   /**
-   * Ordered cleanup of all resources.
-   * Called by the consumer when the agent is no longer needed.
+   * Ordered cleanup of all resources. Called by the consumer when the
+   * agent is no longer needed. Idempotent; concurrent calls share one
+   * teardown.
    *
-   * Steps:
-   * 1. Abort any in-progress agentic loop
-   * 2. Wait for idle (with timeout)
-   * 3. Cancel all sub-agents (stub, wired in Phase 4)
-   * 4. Emit onLoopComplete for final checkpoint (best-effort)
-   * 5. Close all MCP client connections (kills stdio subprocesses, closes HTTP)
-   * 6. Clear skill buffer (stub, wired in Phase 4)
-   * 7. Unsubscribe all event listeners
-   * 8. Clear agent state
-   * 9. Mark as destroyed
+   * Steps: abort the in-progress loop and wait for it to unwind;
+   * dead-letter undelivered background completions; destroy all
+   * sub-agents; emit onLoopComplete for a final checkpoint (best-effort);
+   * close owned MCP connections; release skills, listeners, agent state and
+   * compaction; mark as destroyed. Background processes are force-killed
+   * if cleanup exceeds the timeout.
    *
    * @param timeoutMs - Maximum time to wait for cleanup (default: 8000ms)
    */
@@ -123,24 +108,17 @@ export interface LoopRunApi {
   /**
    * Run deferred digestion OUTSIDE a prompt: pending observation buffering
    * plus the threshold pass (observation activation, reflection, and, for
-   * the classic strategy, summarization), with blocking work explicitly
-   * allowed even under the non-blocking posture. This is the primitive
-   * behind scheduling digestion in idle windows: without it, observation
-   * only triggers on turn_end and compaction only runs inside
-   * transformContext, so there is no way to do either between turns.
+   * the classic strategy, summarization), with blocking work allowed even
+   * under the non-blocking posture. The primitive behind digesting in idle
+   * windows; otherwise observation only triggers on turn_end and compaction
+   * only runs inside transformContext.
    *
-   * Serialized through the loop gate, so it can never race a running
-   * turn's history mutations; called while a turn is active, it runs after
-   * that turn finishes. prompt() fails fast while digestion holds the gate
-   * (deliver() parks or queues as usual). Both phases are bounded by
-   * options.observerTimeoutMs (default 60s): the observer catch-up waits
-   * time out inside the compaction manager, and the blocking threshold
-   * pass is raced against the same deadline here, so a hung utility
-   * request (observer, reflector, or summarizer) times the digestion out
-   * instead of wedging the gate. A timed-out pass is invalidated, not just
-   * abandoned: when its hung call eventually settles, its history rewrite
-   * is discarded instead of being applied over messages a later prompt has
-   * appended in the meantime.
+   * Serialized through the loop gate: called during a turn, it runs after
+   * that turn. prompt() fails fast while digestion holds the gate (deliver()
+   * parks or queues as usual). Each phase is bounded by
+   * options.observerTimeoutMs and preemptible via options.signal; a hung
+   * utility request times the digestion out instead of wedging the gate,
+   * and its late history rewrite is discarded.
    */
   digestIdle(options?: IdleDigestionOptions): Promise<IdleDigestionResult>;
 }

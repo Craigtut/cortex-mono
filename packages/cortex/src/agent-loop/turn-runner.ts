@@ -5,12 +5,8 @@
  * tags, the history boundary the cache breakpoints key on, and the unwind
  * promise abort() waits on.
  *
- * Retries resume the failed turn with agent.continue() after trimming pi's
- * synthetic failure stub, so completed tool calls do not re-run and the
- * user message is never duplicated. The returned promise stays pending
- * across the whole backoff window; an abort during a wait cancels it.
- *
- * Reference: error-recovery.md
+ * Reference: error-recovery.md, cortex-architecture.md "Loop gate, turn
+ * unwind, abort epoch"
  */
 
 import type { AgentMessage } from '../context-manager.js';
@@ -73,22 +69,16 @@ export class TurnRunner {
   readonly retryExhausted: HandlerList<[RetryExhaustedInfo, LoopOriginContext]>;
 
   private prompting = false;
-  // Cause tags of the run in flight (see DeliverOptions.causeTag): computed
-  // in the same synchronous frame that takes the delivery batches at run
-  // start, assigned as the first statement of the try owning the clearing
-  // finally, so a reader can never observe a dead or previous run's tags.
+  // Cause tags of the run in flight (see DeliverOptions.causeTag).
   private activeTags: readonly unknown[] = [];
-  // Tag handoff for the deliver() prompted branch: staged immediately
-  // before prompt() is called with the gate empty, so the very next run
-  // task (that prompt's own) consumes it.
+  // Staged by deliver()'s prompted branch with the gate empty, so the very
+  // next run (that prompt's own) consumes it.
   private pendingCauseTag: unknown = undefined;
   private activeRetention: CacheRetention | null = null;
-  // Messages before the current prompt: the boundary between "old history"
-  // (stable, cacheable) and "new tick content", which enables cross-tick
-  // prefix caching of conversation history. Compaction moves it mid-run.
+  // Messages before the current prompt: stable, cacheable history versus
+  // new tick content. Compaction moves it mid-run.
   private boundaryIndex = 0;
-  // Resolves when the current turn's unwind (catch/finally of run) has
-  // completed. abort() awaits this so its controller reset can never land
+  // abort() awaits the turn's unwind so its controller reset never lands
   // before the cancelled turn's error classification observes the abort.
   private unwoundPromise: Promise<void> = Promise.resolve();
   private resolveUnwound: (() => void) | null = null;
@@ -137,20 +127,16 @@ export class TurnRunner {
   /**
    * One gate-owned loop cycle: run the logical turn, then deliver any
    * background completions that arrived while it ran. Lifecycle is
-   * re-checked here (at dequeue time) so a destroy() that lands between
-   * enqueue and dequeue can never start a new loop.
+   * re-checked at dequeue so a destroy() after enqueue never starts a loop.
    */
   async runCycle(input: string, options?: DirectCompletionOptions): Promise<unknown> {
     this.ports.assertNotShuttingDown();
     try {
       return await this.run(input, options);
     } finally {
-      // Deliver background results that arrived while prompting. This runs
-      // before the consumer's await resolves, keeping its UI state
-      // consistent, and still under the same gate acquisition. A terminal
-      // delivery failure is a background concern: it surfaces through
-      // onError (once, at this chain root), never by rejecting a consumer
-      // turn that already succeeded or replacing that turn's own error.
+      // Still under the same gate acquisition, before the consumer's await
+      // resolves. A terminal delivery failure surfaces through onError once,
+      // never by rejecting or replacing the consumer turn's own outcome.
       try {
         await this.ports.drainBackground();
       } catch (err) {
@@ -160,21 +146,14 @@ export class TurnRunner {
   }
 
   /**
-   * Run one logical prompt turn (first attempt plus transparent background
-   * retries). Must be called while holding the loop gate; all mutation of
-   * shared loop state (tool runtime, history boundary, prompting flag)
-   * happens here, after the gate has been acquired.
+   * Run one logical prompt turn. Must be called while holding the loop gate;
+   * all mutation of shared loop state happens here.
    *
-   * @param fromDrain - True for the background-completion delivery path,
-   *   which deliberately starts a fresh loop after an abort. The consumer
-   *   path (false) instead cancels a turn whose controller was aborted
-   *   before it dequeued (e.g. a same-frame prompt()+abort()).
-   * @param retryPolicyOverride - Per-run retry policy. The drain passes a
-   *   policy whose elapsed ceiling is its remaining delivery budget, so a
-   *   re-queued delivery cannot re-enter the full retry ladder.
-   * @param causeTags - Cause tags for content a drain-started run carries
-   *   itself (the sweep passes its batch's tags; the non-drain path derives
-   *   tags from the spliced wake batch and the pending prompt tag instead).
+   * @param fromDrain - Background delivery path: starts a fresh loop even
+   *   after an abort, where a consumer turn aborted before dequeue cancels.
+   * @param retryPolicyOverride - The drain's policy, capped at its remaining
+   *   delivery budget.
+   * @param causeTags - Tags for content a drain-started run carries itself.
    */
   async run(
     input: string,
@@ -183,30 +162,22 @@ export class TurnRunner {
     retryPolicyOverride?: RetryPolicy,
     causeTags?: unknown[],
   ): Promise<unknown> {
-    // Transition to ACTIVE on first loop
     this.ports.activate();
 
-    // Consume the deliver()-prompted cause tag first thing, even on paths
-    // that cancel before the run starts: the tag belongs to THIS cycle, and
-    // leaving it pending would mislabel a later, unrelated run.
+    // Consumed even on paths that cancel before the run starts: left
+    // pending, it would mislabel a later, unrelated run.
     let directCauseTag: unknown;
     if (!fromDrain) {
       directCauseTag = this.pendingCauseTag;
       this.pendingCauseTag = undefined;
     }
 
-    // Abort visibility at dequeue. prompt() installs a fresh (non-aborted)
-    // controller synchronously, so if THIS controller is aborted here an
-    // abort() must have landed between enqueue and dequeue.
+    // prompt() installs a fresh controller synchronously, so an aborted one
+    // here means abort() landed between enqueue and dequeue.
     if (this.ports.abort.signal.aborted) {
       if (fromDrain) {
-        // A scheduled drain delivers background results by starting a fresh
-        // loop even after an abort, so replace the aborted controller and
-        // proceed.
         this.ports.abort.renewIfAborted();
       } else {
-        // A consumer turn cancelled before it ever reached pi. Surface it
-        // like any other cancellation and never start the run.
         const abortErr = new Error('Prompt aborted before it started');
         abortErr.name = 'AbortError';
         this.ports.emitError(abortErr, true);
@@ -217,60 +188,35 @@ export class TurnRunner {
     const effectiveRetention = options?.cacheRetention ?? this.ports.cacheRetention();
     this.activeRetention = effectiveRetention ?? null;
 
-    // Flush queued silent deliveries into this prompt's message batch. Only
-    // real prompts flush (never drain-started delivery runs): the queue's
-    // contract is "available in context at the next real prompt", and the
-    // drain's failure unwind counts messages from its own pre-delivery
-    // boundary, which flushed extras would corrupt. Taken AFTER the abort
-    // check above so a turn cancelled before it started leaves the queue
-    // intact for the next prompt.
+    // Silent and parked wake deliveries ride ahead of the prompt in one
+    // batch. Taken after the abort check (a pre-start cancel leaves them
+    // queued) and synchronously with the run start, so a later sweep finds
+    // nothing to re-deliver. Drain-started runs take neither: their failure
+    // unwind counts from the pre-delivery boundary.
     const silentBatch = fromDrain ? [] : this.ports.queues.takeSilent();
-    // Parked wake deliveries ride ahead of the prompt in the same batch,
-    // taken in this same synchronous frame (before pi pushes the batch at
-    // run start) so a sweep task that fires later finds nothing and cannot
-    // re-deliver content this run consumed. Items an abort cancelled are
-    // dropped by the take, not spliced into a post-abort prompt. If the
-    // run fails terminally without progressing past the batch, the catch
-    // below unwinds the wake portion and re-parks it: content the caller
-    // was told was 'parked' must end in a run that answers it, never
-    // silently demote to inert transcript context.
     const wakeBatch = fromDrain ? [] : this.ports.queues.takeDeliverableWake();
 
-    // Compute this run's cause tags in the same synchronous frame the
-    // batches were taken: caller-supplied tags (sweep runs), tags riding the
-    // spliced wake batch, and the deliver()-prompted input's own tag. The
-    // ASSIGNMENT happens as the first statement of the try below, so the
-    // clearing finally is paired with the set by construction: a throwing
-    // consumer logger (or diagnostics sink) between here and the try leaves
-    // the tags untouched instead of live for a run that never happened,
-    // where the next error entry would read the dead run's stamp (the fault
-    // class the interceptor site fixed the same way). Nothing between the
-    // batch take and the try awaits, so the same-frame property holds.
+    // Assigned as the first statement of the try below, so the clearing
+    // finally pairs with the set by construction: a throwing logger before
+    // the try cannot leave a dead run's tags live.
     const runCauseTags: readonly unknown[] = [
       ...(causeTags ?? []),
       ...wakeBatch.map((item) => item.causeTag).filter((tag) => tag !== undefined),
       ...(directCauseTag !== undefined ? [directCauseTag] : []),
     ];
 
-    // Long-lived mode keeps workspace state (cwd, read-before-edit registry,
-    // undo history) across prompts; transient state resets regardless.
+    // Long-lived mode keeps workspace state (cwd, read registry, undo).
     this.ports.toolRuntime.resetForLoop(
       this.ports.config.persistentRuntime ? { preserveWorkspaceState: true } : undefined,
     );
-    // Budget limits cover the whole logical turn: reset here (once per
-    // prompt) instead of on loop_start, which pi-agent-core emits again for
-    // every background-retry continuation. Under a lifetime budget scope the
-    // guard is never reset, so limits bound the loop's whole life.
+    // Reset once per prompt, not on loop_start (which pi emits again for
+    // every retry continuation). A lifetime scope never resets.
     if ((this.ports.config.budgetGuard?.scope ?? 'prompt') === 'prompt') {
       this.ports.budget.reset();
     }
     this.prompting = true;
     const loopStartMs = Date.now();
 
-    // Record the message count before this prompt so the transformContext
-    // hook knows where "old history" ends and "new tick content" begins.
-    // This enables cache breakpoint optimization: old history is stable
-    // across ticks and can be cached, while new content changes each tick.
     this.boundaryIndex = this.ports.agent.state.messages.length;
 
     this.ports.logger.debug('loop start', {
@@ -285,9 +231,8 @@ export class TurnRunner {
       modelId: this.ports.model().modelId,
     });
 
-    // Created immediately before the try so every code path that leaves a
-    // pending turnUnwound is guaranteed to hit the finally that resolves it
-    // (abort() awaits this promise and must never hang).
+    // Created immediately before the try so the finally always resolves it;
+    // abort() awaits it and must never hang.
     this.unwoundPromise = new Promise<void>((resolve) => {
       this.resolveUnwound = resolve;
     });
@@ -301,17 +246,11 @@ export class TurnRunner {
     } catch (err) {
       const error = toError(err);
       promptStatus = this.ports.isAborted() ? 'cancelled' : 'rejected';
-      // A wake delivery spliced into a failed consumer prompt would
-      // otherwise sit in the transcript with no run ever answering it.
-      // Unwind and re-park it so a sweep re-delivers it with a run of its
-      // own. An aborted turn instead cancels its spliced deliveries, the
-      // same way abort() cancels parked ones.
+      // Parked content must end in a run that answers it, so a failed
+      // prompt re-parks its wake batch. An aborted turn cancels it instead.
       if (promptStatus !== 'cancelled') {
         this.ports.queues.reparkAfterFailedPrompt(wakeBatch, silentBatch.length, error.message);
       }
-      // Classification, overflow handling, retry orchestration, and the onError
-      // emission all happen inside runTurnWithRetry. Here we only record status
-      // for diagnostics and re-throw to the consumer.
       throw error;
     } finally {
       this.activeRetention = null;
@@ -334,34 +273,22 @@ export class TurnRunner {
         pendingBackgroundResults: this.ports.pendingBackgroundCount(),
       });
 
-      // Signal that this turn has fully unwound (status classified, flags
-      // cleared). abort() waits on this before resetting the controller.
       this.resolveUnwound?.();
       this.resolveUnwound = null;
     }
   }
 
   /**
-   * Run one user turn, transparently retrying transient failures in the
-   * background per the configured RetryPolicy.
+   * The first attempt uses `agent.prompt(input)`. Each retry resumes with
+   * `agent.continue()` after trimming pi's synthetic failure message, so
+   * completed tool calls do not re-run and the user message is never
+   * duplicated. The promise stays pending across backoff; an abort during a
+   * wait cancels it. A non-retryable or exhausted failure emits onError and
+   * throws.
    *
-   * The first attempt uses `agent.prompt(input)`. Each retry resumes the failed
-   * turn with `agent.continue()` after trimming pi-agent-core's synthetic
-   * failure message, so completed tool calls do not re-run and the user message
-   * is never duplicated. The returned promise stays pending across the whole
-   * backoff window; an abort during a backoff wait cancels it.
-   *
-   * On a non-retryable failure (auth, a 404 classified as unknown, context
-   * overflow, abort) or once retries are exhausted, it emits onError and throws
-   * exactly as the non-retrying path did, so the consumer's existing handling
-   * is unchanged for those cases.
-   *
-   * @param fromDrain - True for background-completion deliveries. The drain
-   *   chain re-queues a failed delivery and re-attempts it, so per-attempt
-   *   onError emission is deferred to the chain root: a later attempt that
-   *   succeeds surfaces no error at all, and a terminal failure surfaces
-   *   exactly once (mirroring how an in-run retry that recovers reports
-   *   onRetrySucceeded rather than onError).
+   * @param fromDrain - Defers onError (and onRetryExhausted) to the drain
+   *   chain root, which re-queues a failed delivery: a later success surfaces
+   *   no error, and a terminal failure surfaces exactly once.
    */
   private async runWithRetry(
     input: string,
@@ -374,16 +301,8 @@ export class TurnRunner {
     let retryIndex = 0;
     let firstFailureAt: number | undefined;
 
-    // Parked wake deliveries and queued silent deliveries ride ahead of the
-    // prompt in one message batch; pi pushes every batch message into the
-    // transcript at run start, so after the first attempt they are durable
-    // history and retries (continue()) see them without re-sending. Both
-    // queues are spliced by runPromptOnce in the same synchronous frame as
-    // this call, so a sweep task that fires later finds nothing and cannot
-    // re-deliver content this run consumed. Drain-started runs splice
-    // neither queue: their failure unwind counts messages from the
-    // pre-delivery boundary, which flushed extras would corrupt, and the
-    // sweep delivers parked wake content with a run of its own.
+    // pi pushes the whole batch into the transcript at run start, so retries
+    // (continue()) see it without re-sending.
     const leadingBatch = [...wakeBatch, ...silentBatch];
     const promptInput: string | AgentMessage[] = leadingBatch.length > 0
       ? [
@@ -396,26 +315,21 @@ export class TurnRunner {
         ]
       : input;
 
-    // Resolves to the turn result, or throws after onError has been emitted.
     for (;;) {
       try {
         const result =
           retryIndex === 0 ? await this.ports.agent.prompt(promptInput) : await this.ports.agent.continue();
 
-        // Pi-agent-core catches streaming/provider errors internally and stores
-        // them in state.errorMessage without re-throwing. Surface these so
-        // Cortex's error classification and consumer handlers can process them.
+        // pi stores streaming/provider errors in state.errorMessage without
+        // re-throwing.
         const agentState = this.ports.agent.state as Record<string, unknown>;
         const stateError = agentState['errorMessage'] ?? agentState['error'];
         if (stateError) {
           throw new Error(String(stateError));
         }
 
-        // An abort can end the run cleanly: the stream returns a message with
-        // stopReason 'aborted' (no error state) and prompt() resolves. Trim
-        // the aborted assistant stub so it does not linger in history and get
-        // rewritten to "(no output)" on a later turn. No-op when the last
-        // message is a normal assistant turn.
+        // An abort can end the run cleanly (stopReason 'aborted'). Trim the
+        // stub so a later turn does not rewrite it to "(no output)".
         if (this.ports.isAborted()) {
           this.trimFailureStubs();
         }
@@ -429,8 +343,6 @@ export class TurnRunner {
         const aborted = this.ports.isAborted();
         const classified = classifyError(error, { wasAborted: aborted });
 
-        // Reactive overflow detection: emergency truncation, then surface (not
-        // retried by default; context_overflow is not a retryable category).
         if (isContextOverflow(error)) {
           this.ports.handleOverflow();
         }
@@ -438,9 +350,7 @@ export class TurnRunner {
         if (firstFailureAt === undefined) firstFailureAt = Date.now();
         const elapsedMs = Date.now() - firstFailureAt;
 
-        // Only retry when the policy allows AND the transcript can actually be
-        // resumed (last message after trimming is a user/tool-result, never a
-        // dangling assistant turn that continue() would reject).
+        // continue() rejects a transcript ending in a dangling assistant turn.
         const policyAllowsRetry = shouldRetry(
           classified,
           { retryIndex, elapsedMs, aborted },
@@ -449,12 +359,8 @@ export class TurnRunner {
         const willRetry = policyAllowsRetry && this.resumableAfterTrim();
 
         if (!willRetry) {
-          // Signal "gave up" only when the retry budget was genuinely exhausted
-          // (not when the transcript simply could not be resumed), and only if
-          // we had actually been retrying a transient failure. Never for a
-          // drain delivery: its ladder ending is not terminal (the batch is
-          // re-queued and the next attempt may succeed), so like onError the
-          // give-up signal is the chain root's to make (dead-letter).
+          // "Gave up" only when a transient retry budget genuinely ran out,
+          // and never for a drain delivery (its chain root dead-letters).
           if (
             !fromDrain &&
             retryIndex > 0 &&
@@ -464,10 +370,8 @@ export class TurnRunner {
           ) {
             this.retryExhausted.emit({ attempts: retryIndex, category: classified.category }, this.ports.origin);
           }
-          // A user abort is a cancellation, not a failure to keep: remove the
-          // aborted assistant stub pi appended, exactly as the retry path
-          // does, so it cannot linger in history and later be rewritten to
-          // "(no output)". Non-abort failures keep their stub (unchanged).
+          // A cancellation is not a failure to keep. Non-abort failures keep
+          // their stub.
           if (aborted) {
             this.trimFailureStubs();
           }
@@ -500,12 +404,8 @@ export class TurnRunner {
 
         const completed = await sleepUnlessAborted(delayMs, this.ports.abort.signal);
         if (!completed) {
-          // Aborted during the wait: surface as cancelled, do not retry. Throw a
-          // fresh AbortError rather than the original transient failure so the
-          // consumer's catch sees a cancellation (matching the in-run abort
-          // path) instead of a stale network/rate-limit message. The synthetic
-          // failure stub that was awaiting this retry is trimmed like any
-          // other aborted turn.
+          // A fresh AbortError, so the consumer sees a cancellation rather
+          // than the stale transient failure.
           this.trimFailureStubs();
           if (!fromDrain) {
             this.ports.emitError(error, true);
@@ -515,8 +415,6 @@ export class TurnRunner {
           throw abortErr;
         }
 
-        // Remove pi-agent-core's synthetic failure message so continue() sees a
-        // user/tool-result as the last message and resumes cleanly.
         this.trimFailureStubs();
         retryIndex += 1;
       }
