@@ -7,7 +7,7 @@
  */
 
 import type { CauseTag } from './cause-tags.js';
-import type { RouterLogInput } from './router.js';
+import type { RouterLogInput } from './router-contract.js';
 
 /**
  * Bound on dispatch_refused lifecycle entries per talker turn (N4). The
@@ -69,6 +69,18 @@ export class DispatchPolicy {
    * advance the watermark: a delivery- or directive-caused run is not the
    * user speaking and must not refresh delegation budgets. The cause set
    * carries no ordering guarantee, so the whole set is scanned.
+   *
+   * Resetting at ARRIVAL instead would clear the dedup map under a batch
+   * still running, so its retry-induced duplicate spawn would dispatch
+   * identical work twice, and a talker that had exhausted its caps would
+   * earn a fresh budget inside the very turn that was capped.
+   *
+   * Open question (review N1): the per-exchange cap refreshes only on a
+   * consumed user utterance, so a long autonomous stretch (deliveries
+   * waking the talker with no new user input) runs against one fixed
+   * delegation budget until the user next speaks. Whether autonomous turns
+   * should ever refresh the cap is a policy call deferred until real usage
+   * data exists.
    */
   beginDispatch(): void {
     let newest = this.lastConsumedUtteranceSeq;

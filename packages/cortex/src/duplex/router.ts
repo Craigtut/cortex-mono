@@ -1,24 +1,16 @@
 /**
- * DuplexRouter: the facade's control-tool dispatch surface, wake policy,
- * and backpressure between the resident loops (communication.md; decisions
- * D8, D10, D17, D18, D19, D20).
+ * DuplexRouter: traffic between the resident loops (communication.md;
+ * decisions D8, D10, D17, D18, D19, D20). It is the talker's control-tool
+ * dispatch target and the intake for everything bound back to the talker,
+ * composed from the parts that own each rule:
  *
- * Producer proposes, router disposes: the reasoner proposes a wake class
- * per delivery and the router may demote it. Wake classes describe intent,
- * not rate; the router bounds rate with an interrupt token bucket,
- * content-hash dedup over recent deliveries, per-turn and per-exchange
- * delegation caps, dispatch dedup (absorbing retry-induced double
- * dispatch), and a facade-enforced minimum inter-delivery spacing that an
- * always-idle or never-idle consumer signal cannot collapse.
- *
- * The router also owns the conversation-delta buffer (D18): both sides of
- * the conversation are buffered facade-side and flushed as a context-only
- * block INSIDE the next dispatch message, so a directive can never reach
- * the reasoner without the conversation it points at (a directive parked
- * behind a busy reasoner is delivered by a sweep run, which never flushes
- * the loop's silent queue; carrying the block in the dispatch message makes
- * the pairing exact in every loop state). Only a dispatch starts a reasoner
- * turn; deltas alone never do.
+ * - DelegationRegistry: which delegations exist and are still live.
+ * - ConversationDeltas: the conversation the reasoner has not seen yet,
+ *   flushed INSIDE the next dispatch message (D18), so a directive never
+ *   reaches the reasoner without the conversation it points at.
+ * - DispatchPolicy: delegation caps, dispatch dedup, bounded refusals.
+ * - DeliveryIntake and DeliveryScheduler: the wake policy (producer
+ *   proposes, router disposes), dedup, the interrupt bucket and pacing.
  */
 
 import type { CortexLogger } from '../types.js';
@@ -27,7 +19,6 @@ import { NOOP_LOGGER } from '../noop-logger.js';
 import { errorMessageOf } from '../error-classifier.js';
 import {
   buildCancelDirective,
-  buildLookupResultText,
   buildSpawnDirective,
   buildSteerDirective,
   buildWorkInputDirective,
@@ -35,253 +26,43 @@ import {
   wrapDeliveryForTalker,
 } from './prompts.js';
 import { latestCauseSeq } from './cause-tags.js';
-import type { CauseTag } from './cause-tags.js';
 import { DispatchPolicy } from './dispatch-policy.js';
 import { DeliveryScheduler } from './delivery-scheduler.js';
+import { DeliveryIntake } from './delivery-intake.js';
 import { DelegationRegistry } from './delegations.js';
-import type { DelegationRegistryState, DelegationSnapshot } from './delegations.js';
+import type { DelegationSnapshot } from './delegations.js';
 import { ConversationDeltas } from './conversation-deltas.js';
-import type { ConversationDeltasState } from './conversation-deltas.js';
 import { asTrimmedString } from './control-tools.js';
 import type { ControlDispatchTarget } from './control-tools.js';
-import { PERMISSION_BROKER_DEFAULTS } from './permission-broker.js';
-import type { AskAnswerOutcome } from './permission-broker.js';
+import { DUPLEX_ROUTER_DEFAULTS } from './router-contract.js';
+import type {
+  DuplexRouterOptions,
+  DuplexRouterPorts,
+  DuplexRouterState,
+  ReasonerDispatchOptions,
+  ResolvedRouterOptions,
+} from './router-contract.js';
 import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
 import type { QuickLookupOutcome, QuickLookupRequestResult } from './quick-lookups.js';
 
-// ---------------------------------------------------------------------------
-// Ports and options
-// ---------------------------------------------------------------------------
-
-/** Log entry input the router produces (a subset of the facade's schema). */
-export interface RouterLogInput {
-  type: 'directive' | 'delivery' | 'lifecycle' | 'ask' | 'ask_answer' | 'lookup_result';
-  loopPath: string;
-  content: string;
-  wake?: WakeClass;
-  causedBy?: number;
-  data?: Record<string, unknown>;
-}
-
-/** What the router needs from the facade. */
-export interface DuplexRouterPorts {
-  /**
-   * Hand content to the talker: wake true starts or parks a turn, wake
-   * false lands in the talker's silent queue (never pi's steering queue;
-   * the loop's deliver() enforces that).
-   */
-  deliverToTalker(content: string, wake: boolean): void;
-  /** Whether the conversation surface is idle (the default lull signal). */
-  talkerIdle(): boolean;
-  /**
-   * Wake-deliver a composed dispatch message to the reasoner. causeSeq is
-   * the log seq of the directive (or work utterance) for causation binding
-   * of the run it starts (or, with atTurnBoundary, the live run it joins).
-   */
-  dispatchToReasoner(message: string, causeSeq: number | null, options?: ReasonerDispatchOptions): void;
-  /** Append a session log entry; returns its seq. */
-  appendLog(input: RouterLogInput): number;
-  /**
-   * The FULL discriminated cause set of the talker's live run (empty when
-   * no run is live or its content carried no tags). The set carries NO
-   * ordering guarantee: readers must scan it, never assume ascending seq
-   * order or read only the last element. This is the surface the D16
-   * consent check reads (does the chain include a user utterance newer than
-   * the voiced ask), where the collapsing helper above would misread a
-   * mixed-kind set in both directions. Log stamps collapse it with
-   * latestCauseSeq; nothing deciding behavior may.
-   */
-  currentTalkerCauseTags(): readonly CauseTag[];
-  /**
-   * The FULL discriminated cause set of the reasoner's live run, with the
-   * same no-ordering contract as {@link currentTalkerCauseTags}. Delegation
-   * retirement reads it: a run routinely consumes several directives (a spawn
-   * with a steer parked behind it), and a collapse to the newest would leave
-   * the delegation the result actually answers listed as live forever.
-   *
-   * There is deliberately no separate stamping port beside either set: the
-   * log stamp is latestCauseSeq over the same set, so the two cannot
-   * disagree.
-   */
-  currentReasonerCauseTags(): readonly CauseTag[];
-  /**
-   * Settle a permission ask from the talker's answer_ask (the broker's
-   * answer, where the D16 consent rules live).
-   */
-  answerAsk(askId: unknown, decision: unknown, reason: unknown): AskAnswerOutcome;
-  /**
-   * Id of the reasoner's latest attempt (ReasonerRunTracker). Bounds on
-   * per-attempt log noise reset when it changes.
-   */
-  reasonerAttemptId(): number;
-  /**
-   * Start a facade-spawned quick lookup (D13): an ephemeral read-only
-   * sub-agent, never a reasoner directive. causeSeq is the log seq of the
-   * quick_lookup directive; the outcome carries it back for causation. The
-   * verdict is synchronous so a cap refusal reaches the talker's receipt in
-   * the same dispatch.
-   */
-  spawnLookup(question: string, causeSeq: number | null): QuickLookupRequestResult;
-  /**
-   * Why new work cannot be dispatched right now, or null when it can. Set
-   * after the session's aggregate spending limit is breached: a spawn,
-   * steer or lookup would only start a run the guard stops at once, so the
-   * talker gets a receipt it can relay instead. Cancels and permission
-   * answers stay open (they reduce work, or unblock it being wound down).
-   */
-  workRefusal?(): string | null;
-  /** Consumer idle signal (advisory, facade-api.md). */
-  idleSignal?: (() => boolean) | undefined;
-  logger?: CortexLogger;
-  /** Loop-path labels for log entries. Defaults: 'talker' / 'reasoner'. */
-  talkerLoopPath?: string;
-  reasonerLoopPath?: string;
-}
-
-/** How a dispatch should reach a reasoner that may be mid-run. */
-export interface ReasonerDispatchOptions {
-  /**
-   * The directive redirects work the live run may be doing (steer, cancel):
-   * a live run takes it at its next turn boundary instead of the next run.
-   */
-  atTurnBoundary?: boolean;
-  /**
-   * Every piece of work the live run serves has just been cancelled: stop
-   * that run, then deliver. The facade may decline (it will not destroy
-   * other content parked behind the run) and fall back to atTurnBoundary.
-   */
-  abortLiveRun?: boolean;
-}
-
-/** Router tunables; every default is overridable for tests and consumers. */
-export interface DuplexRouterOptions {
-  /** Minimum ms between talker-waking deliveries. */
-  minDeliverySpacingMs?: number;
-  /** Ms after which a held when_idle delivery degrades to interrupt. */
-  whenIdleDegradeMs?: number;
-  /** Poll interval while a when_idle delivery waits for a lull. */
-  idlePollMs?: number;
-  /** Interrupt token bucket capacity (D19). */
-  interruptBucketCapacity?: number;
-  /** Ms to earn one interrupt token back. */
-  interruptRefillMs?: number;
-  /** Window for content-hash dedup across recent deliveries. */
-  deliveryDedupWindowMs?: number;
-  /** Cap on remembered delivery hashes. */
-  deliveryDedupMaxEntries?: number;
-  /** Delegation dispatches allowed per talker turn. */
-  maxDispatchesPerTurn?: number;
-  /** Delegation dispatches allowed per exchange (user utterance). */
-  maxDispatchesPerExchange?: number;
-  /** Reasoner-run silence that triggers a synthesized progress delivery. */
-  watchdogIntervalMs?: number;
-  /**
-   * How long a delegation may stay tracked without a result before it is
-   * dropped. The backstop behind result-driven retirement, for work whose
-   * conclusion never produces a delivery the router can attribute.
-   */
-  delegationMaxAgeMs?: number;
-  /** Char bound on the buffered conversation deltas. */
-  deltaBufferMaxChars?: number;
-  /**
-   * Timeout for tool and network permission asks; on expiry the ask
-   * settles as deny with a reason. Null disables the timeout.
-   */
-  askTimeoutMs?: number | null;
-  /**
-   * Timeout for sandbox escalation asks: long rather than absent, since no
-   * bound at all lets a talker that never relays the request block the
-   * asking run indefinitely (PERMISSION_BROKER_DEFAULTS). Null disables it.
-   */
-  escalationAskTimeoutMs?: number | null;
-  /**
-   * Coalescing window before a settled ask lets the next queued one be
-   * voiced, so one talker turn settling several asks still produces exactly
-   * one voicing (PERMISSION_BROKER_DEFAULTS).
-   */
-  settleVoiceDelayMs?: number;
-  /** Clock override for tests. */
-  now?: () => number;
-}
-
-export const DUPLEX_ROUTER_DEFAULTS = {
-  minDeliverySpacingMs: 2_000,
-  whenIdleDegradeMs: 30_000,
-  idlePollMs: 250,
-  interruptBucketCapacity: 3,
-  interruptRefillMs: 20_000,
-  deliveryDedupWindowMs: 120_000,
-  deliveryDedupMaxEntries: 32,
-  maxDispatchesPerTurn: 4,
-  maxDispatchesPerExchange: 8,
-  watchdogIntervalMs: 90_000,
-  delegationMaxAgeMs: 1_800_000,
-  deltaBufferMaxChars: 16_000,
-  // Ask timeouts and voicing cadence are read by the session's permission
-  // broker; they sit here because consumer duplex tuning is one record.
-  askTimeoutMs: PERMISSION_BROKER_DEFAULTS.askTimeoutMs,
-  escalationAskTimeoutMs: PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs,
-  settleVoiceDelayMs: PERMISSION_BROKER_DEFAULTS.settleVoiceDelayMs,
-} as const;
-
-type ResolvedOptions = typeof DUPLEX_ROUTER_DEFAULTS;
-
-/**
- * Bound on delivery_absorbed lifecycle entries per reasoner attempt (the N4
- * rule applied to the intake side): a reasoner (or its retry ladder)
- * re-emitting the same content arbitrarily many times in one attempt must
- * not write an entry per repeat. The dedup itself still absorbs every repeat;
- * past the bound only the log stays quiet, with the last written entry
- * marking the suppression.
- */
-const MAX_ABSORBED_ENTRIES_PER_ATTEMPT = 3;
-
-/**
- * Whether a delivery reports the work reaching a conclusion: it retires the
- * delegation it answers, and an explicit one stands in for the run's
- * implicit final-text delivery.
- *
- * `silent` is a milestone or progress note by contract (the reasoner's
- * role prompt says so), and the watchdog's synthetic delivery says
- * explicitly that the work is STILL running, so neither concludes
- * anything. A facade-synthesized terminal delivery (a failed run) does:
- * nothing further is coming for that task. The router may demote
- * `interrupt` to `when_idle` but never to or from `silent`, so the
- * proposed and the applied wake class give the same answer here.
- */
-export function deliveryConcludes(
-  wake: WakeClass | undefined,
-  meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
-): boolean {
-  if (meta?.terminal) return true;
-  if (meta?.synthetic) return false;
-  return wake !== 'silent';
-}
-
-/**
- * The router state that has to survive a persist/restore round trip
- * (CortexAgentStateV2.router). Everything else the router holds (caps,
- * dedup, the token bucket, spacing) describes the moment, not the session,
- * and restarts clean.
- */
-export interface DuplexRouterState extends DelegationRegistryState, ConversationDeltasState {
-  /**
-   * Talker-waking deliveries already logged but not yet handed to the
-   * talker. The log records them as delivered content, so dropping them at
-   * restore would leave a result the user never heard looking delivered.
-   */
-  pendingDeliveries: string[];
-}
 
 // ---------------------------------------------------------------------------
 // DuplexRouter
 // ---------------------------------------------------------------------------
 
 export type { DelegationSnapshot } from './delegations.js';
+export { DUPLEX_ROUTER_DEFAULTS } from './router-contract.js';
+export type {
+  DuplexRouterOptions,
+  DuplexRouterPorts,
+  DuplexRouterState,
+  ReasonerDispatchOptions,
+  RouterLogInput,
+} from './router-contract.js';
 
 export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   private readonly ports: DuplexRouterPorts;
-  private readonly options: ResolvedOptions;
+  private readonly options: ResolvedRouterOptions;
   private readonly logger: CortexLogger;
   private readonly now: () => number;
   private readonly talkerLoopPath: string;
@@ -296,11 +77,10 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   // Dispatch backpressure (D19).
   private readonly policy: DispatchPolicy;
-  /** Absorbed-duplicate lifecycle entries written this reasoner attempt (bounded). */
-  private absorbed = { attemptId: -1, entries: 0 };
 
   // Delivery backpressure and pacing (D19).
   private readonly scheduler: DeliveryScheduler;
+  private readonly intake: DeliveryIntake;
 
   private destroyed = false;
 
@@ -349,6 +129,11 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         logger: this.logger,
       },
     );
+    this.intake = new DeliveryIntake(
+      ports,
+      { delegations: this.delegations, deltas: this.deltas, scheduler: this.scheduler },
+      { reasonerLoopPath: this.reasonerLoopPath, logger: this.logger },
+    );
 
   }
 
@@ -358,22 +143,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   /**
    * A new user utterance arrived: buffer the delta. The exchange rollover
-   * (caps, dedup, turn index) deliberately does NOT happen here: arrival
-   * can be mid talker turn (a barge-in parks behind the live run), and
-   * resetting at arrival would clear the dedup map under the batch still
-   * running, so its retry-induced duplicate spawn would dispatch identical
-   * work twice, and a talker that had exhausted its caps would earn a
-   * fresh budget inside the very turn that was capped. The rollover
-   * happens when a talker run CONSUMES the utterance instead: its cause
-   * tag appears on the run and the next dispatch, or the turn boundary at
-   * the latest, sees it (DispatchPolicy.beginDispatch).
-   *
-   * Open question (review N1): the per-exchange cap refreshes only on a
-   * consumed user utterance, so a long autonomous stretch (deliveries
-   * waking the talker with no new user input) runs against one fixed
-   * delegation budget until the user next speaks. Whether autonomous
-   * turns should ever refresh the cap is a policy call deferred until
-   * real usage data exists.
+   * deliberately does NOT happen at arrival, which can be mid talker turn
+   * (a barge-in parks behind the live run): it happens when a talker run
+   * CONSUMES the utterance (DispatchPolicy.beginDispatch).
    */
   noteUserUtterance(text: string): void {
     this.deltas.push({ speaker: 'user', text });
@@ -584,50 +356,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     return receipt;
   }
 
-  /**
-   * A quick lookup settled: append the durable lookup_result entry, join
-   * the outcome into the reasoner's conversation deltas (shared context,
-   * D13: the reasoner sees everything the talker learned, at its next
-   * dispatch), and wake the talker. Cancelled lookups are logged by the
-   * facade and never reach here.
-   */
-  deliverLookupResult(outcome: QuickLookupOutcome): void {
-    if (this.destroyed || outcome.status === 'cancelled') return;
-    const loopPath = `lookup/${outcome.alias}`;
-    const text = buildLookupResultText(
-      outcome.alias,
-      outcome.question,
-      outcome.status,
-      outcome.answer,
-    );
-
-    // Proposed interrupt (D13: results wake the talker), bounded by the
-    // same token bucket as reasoner interrupts (D19): a demoted result
-    // arrives at the next lull instead.
-    const demoted = !this.scheduler.drawInterrupt();
-    const wake: 'interrupt' | 'when_idle' = demoted ? 'when_idle' : 'interrupt';
-    if (demoted) this.logger.info('lookup result demoted to when_idle (token bucket empty)');
-
-    this.ports.appendLog({
-      type: 'lookup_result',
-      loopPath,
-      content: text,
-      wake,
-      data: {
-        alias: outcome.alias,
-        question: outcome.question,
-        status: outcome.status,
-        durationMs: outcome.durationMs,
-        ...(demoted ? { demoted: true } : {}),
-        ...(outcome.error !== undefined ? { error: outcome.error } : {}),
-      },
-      ...(outcome.causeSeq !== null ? { causedBy: outcome.causeSeq } : {}),
-    });
-
-    this.deltas.push({ speaker: 'lookup', text });
-    this.scheduler.enqueue(text, wake);
-  }
-
   dispatchAnswerAsk(askIdRaw: unknown, decisionRaw: unknown, reasonRaw: unknown): string {
     this.policy.beginDispatch();
     // The D16 consent rules live in the broker; a refused answer is logged
@@ -643,8 +371,14 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   }
 
   // -------------------------------------------------------------------------
-  // Reasoner delivery intake (wake policy, D10/D19)
+  // Delivery intake (wake policy, D10/D13/D19)
   // -------------------------------------------------------------------------
+
+  /** A quick lookup settled (cancelled ones are logged by the session). */
+  deliverLookupResult(outcome: QuickLookupOutcome): void {
+    if (this.destroyed) return;
+    this.intake.lookupResult(outcome);
+  }
 
   deliverFromReasoner(
     content: string,
@@ -654,107 +388,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     if (this.destroyed) {
       return { delivered: false, reason: 'router destroyed' };
     }
-    // cancel_task is the one discard path (communication.md): a result
-    // whose causation is entirely cancelled work never reaches the user.
-    // It is still recorded, so the audit trail shows what was withheld.
-    const causeTags = this.ports.currentReasonerCauseTags();
-    if (this.delegations.servesOnlyCancelled(causeTags)) {
-      this.ports.appendLog({
-        type: 'lifecycle',
-        loopPath: this.reasonerLoopPath,
-        content: 'Delivery dropped: its task was cancelled',
-        data: {
-          event: 'delivery_dropped_cancelled',
-          content,
-          ...(meta?.implicit ? { implicit: true } : {}),
-          ...(meta?.synthetic ? { synthetic: true } : {}),
-        },
-        ...this.reasonerCause(),
-      });
-      return { delivered: false, reason: 'the task it answers was cancelled' };
-    }
-
-    // Content-hash dedup over recent deliveries: a reasoner (or its retry
-    // ladder) emitting the same content repeatedly costs one delivery. The
-    // causing directive seq is part of the identity: a repeat the user
-    // explicitly asked for ("run it again", new directive) whose result is
-    // byte-identical to the previous run's must still be delivered, or the
-    // second request looks unanswered.
-    const cause = this.reasonerCause();
-    const proposed: WakeClass = wakeProposed ?? 'when_idle';
-    const admission = this.scheduler.admit(`${cause.causedBy ?? 'uncaused'}:${content.trim()}`, proposed);
-    if (admission.duplicate) {
-      // An absorbed duplicate still leaves a trace: communication.md says
-      // results are never silently dropped from the audit trail. Entries
-      // are bounded per reasoner run (same rule as dispatch_refused, N4)
-      // so a run re-emitting the same content in a loop cannot grow the
-      // log unboundedly.
-      const attemptId = this.ports.reasonerAttemptId();
-      if (this.absorbed.attemptId !== attemptId) this.absorbed = { attemptId, entries: 0 };
-      if (this.absorbed.entries < MAX_ABSORBED_ENTRIES_PER_ATTEMPT) {
-        this.absorbed.entries += 1;
-        const atBound = this.absorbed.entries === MAX_ABSORBED_ENTRIES_PER_ATTEMPT;
-        this.ports.appendLog({
-          type: 'lifecycle',
-          loopPath: this.reasonerLoopPath,
-          content: 'Duplicate delivery absorbed',
-          data: {
-            event: 'delivery_absorbed',
-            ...(meta?.implicit ? { implicit: true } : {}),
-            ...(meta?.synthetic ? { synthetic: true } : {}),
-            ...(atBound ? { furtherAbsorbedSuppressed: true } : {}),
-          },
-          ...cause,
-        });
-      }
-      return { delivered: false, reason: 'duplicate of a recent delivery' };
-    }
-    // Producer proposes, router disposes: interrupts draw from the token
-    // bucket and demote to when_idle when it is empty.
-    const { wake, demoted } = admission;
-    if (demoted) this.logger.info('interrupt delivery demoted to when_idle (token bucket empty)');
-
-    // The log is the durable record of the delivery; a delivery dropped
-    // later (abort, restore) stays retained here (facade-api.md abort
-    // table).
-    this.ports.appendLog({
-      type: 'delivery',
-      loopPath: this.reasonerLoopPath,
-      content,
-      wake,
-      data: {
-        proposedWake: proposed,
-        ...(demoted ? { demoted: true } : {}),
-        ...(meta?.implicit ? { implicit: true } : {}),
-        ...(meta?.synthetic ? { synthetic: true } : {}),
-        ...(meta?.terminal ? { terminal: true } : {}),
-      },
-      ...cause,
-    });
-
-    // A result retires the work it answers, so the block and the watchdog
-    // stop calling finished work live. Read AFTER the log append and before
-    // any queueing, while the producing run is still the live one.
-    if (deliveryConcludes(wake, meta)) {
-      this.delegations.retireFor(this.ports.currentReasonerCauseTags());
-    }
-
-    if (wake === 'silent') {
-      // Silent never wakes and never waits: it lands in the talker's own
-      // silent queue (never pi's steering queue) and surfaces with the next
-      // real prompt.
-      try {
-        this.ports.deliverToTalker(wrapDeliveryForTalker(content), false);
-      } catch (err) {
-        this.logger.error('silent delivery to talker failed', {
-          error: errorMessageOf(err),
-        });
-      }
-      return { delivered: true, wake };
-    }
-
-    this.scheduler.enqueue(content, wake);
-    return { delivered: true, wake };
+    return this.intake.fromReasoner(content, wakeProposed, meta);
   }
 
   // -------------------------------------------------------------------------
@@ -885,7 +519,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.dropWorkContext();
     this.delegations.clear();
     this.policy.reset();
-    this.absorbed = { attemptId: -1, entries: 0 };
+    this.intake.reset();
   }
 
   destroy(): void {
@@ -945,21 +579,16 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     const seq = latestCauseSeq(this.ports.currentTalkerCauseTags());
     return seq !== null ? { causedBy: seq } : {};
   }
-
-  private reasonerCause(): { causedBy?: number } {
-    const seq = latestCauseSeq(this.ports.currentReasonerCauseTags());
-    return seq !== null ? { causedBy: seq } : {};
-  }
 }
 
 /** Drop undefined values so spreads never clobber defaults with undefined. */
 function pruneUndefined(
   options: DuplexRouterOptions | undefined,
-): Partial<ResolvedOptions> {
+): Partial<ResolvedRouterOptions> {
   if (!options) return {};
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(options)) {
     if (value !== undefined && key !== 'now') out[key] = value;
   }
-  return out as Partial<ResolvedOptions>;
+  return out as Partial<ResolvedRouterOptions>;
 }

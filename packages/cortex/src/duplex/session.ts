@@ -31,7 +31,8 @@ import type {
 } from '../facade/session-mode.js';
 import { collectCauseTags } from './cause-tags.js';
 import type { CausationSource } from './cause-tags.js';
-import type { DuplexRouter, DuplexRouterState } from './router.js';
+import type { DuplexRouter } from './router.js';
+import type { DuplexRouterState } from './router-contract.js';
 import type { PermissionBroker } from './permission-broker.js';
 import { FanOutContextManager } from './fanout-context-manager.js';
 import { highestTaskAlias } from './delegations.js';

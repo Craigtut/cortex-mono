@@ -12,7 +12,7 @@ import type { CortexLogger } from '../types.js';
 import { errorMessageOf } from '../error-classifier.js';
 import type { LogEntryInput } from '../facade/log-recorder.js';
 import type { CauseTag } from './cause-tags.js';
-import type { ReasonerDispatchOptions } from './router.js';
+import type { ReasonerDispatchOptions } from './router-contract.js';
 
 export interface ReasonerDispatchPorts {
   reasoner: AgentLoop;

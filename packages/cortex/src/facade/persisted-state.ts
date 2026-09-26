@@ -9,7 +9,7 @@ import type { ObservationalMemoryState } from '../compaction/index.js';
 import type { SessionLogEntry } from '../session-log.js';
 import type { SessionUsage } from '../types.js';
 import { cloneSessionUsage, zeroSessionUsage } from '../session-usage.js';
-import type { DuplexRouterState } from '../duplex/router.js';
+import type { DuplexRouterState } from '../duplex/router-contract.js';
 
 type AssertExtends<A extends B, B> = A;
 

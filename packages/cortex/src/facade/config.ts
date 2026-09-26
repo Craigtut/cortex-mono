@@ -8,7 +8,7 @@ import type { CortexTool } from '../tool-contract.js';
 import type { CortexModel } from '../model-wrapper.js';
 import type { SandboxProvider } from '../sandbox/types.js';
 import type { SandboxConfig } from '../sandbox/options.js';
-import type { DuplexRouterOptions } from '../duplex/router.js';
+import type { DuplexRouterOptions } from '../duplex/router-contract.js';
 
 /**
  * Facade mode. `duplex` (talker + reasoner) is the default.

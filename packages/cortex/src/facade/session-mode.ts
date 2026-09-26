@@ -14,7 +14,7 @@ import type { ObservationalMemoryState } from '../compaction/index.js';
 import type { BudgetGuard } from '../budget-guard.js';
 import type { EventBridge } from '../event-bridge.js';
 import type { CausationSource } from '../duplex/cause-tags.js';
-import type { DuplexRouterState } from '../duplex/router.js';
+import type { DuplexRouterState } from '../duplex/router-contract.js';
 import type { LogRecorder } from './log-recorder.js';
 import type { PromptTracker, SettlementTerm } from './settlement.js';
 

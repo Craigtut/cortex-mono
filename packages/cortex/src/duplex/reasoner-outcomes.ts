@@ -28,8 +28,29 @@ import type { WakeClass } from '../session-log.js';
 import { spokenText } from '../working-tags.js';
 import type { DuplexHeadlines } from './headlines.js';
 import type { DuplexRouter } from './router.js';
-import { deliveryConcludes } from './router.js';
 import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
+
+/**
+ * Whether a delivery reports the work reaching a conclusion: it retires the
+ * delegation it answers (router intake), and an explicit one stands in for
+ * the attempt's implicit final-text delivery (the outcome policy below).
+ *
+ * `silent` is a milestone or progress note by contract (the reasoner's
+ * role prompt says so), and the watchdog's synthetic delivery says
+ * explicitly that the work is STILL running, so neither concludes
+ * anything. A facade-synthesized terminal delivery (a failed run) does:
+ * nothing further is coming for that task. The router may demote
+ * `interrupt` to `when_idle` but never to or from `silent`, so the
+ * proposed and the applied wake class give the same answer here.
+ */
+export function deliveryConcludes(
+  wake: WakeClass | undefined,
+  meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
+): boolean {
+  if (meta?.terminal) return true;
+  if (meta?.synthetic) return false;
+  return wake !== 'silent';
+}
 
 /** Chars of a provider error message carried into a failure delivery. */
 const MAX_FAILURE_DETAIL_CHARS = 300;
