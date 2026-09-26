@@ -103,6 +103,7 @@ import { loadHookHandlers, readProjectHooksContent, hasProjectHooks } from './ho
 import { runHookHandlers } from './hooks/runner.js';
 import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
+import { RetryStatusLine } from './session/retry-status.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -223,18 +224,7 @@ export class Session {
    * failure a second time as a generic "Error". Reset at the start of each turn.
    */
   private lastTurnErrorHandled = false;
-  /**
-   * Live background-retry state, while a transient failure is being retried,
-   * stamped with the loop it belongs to.
-   *
-   * There is one countdown line and two loops that can retry. Without the
-   * stamp, a talker retry resolving would call clearRetry() and wipe the
-   * reasoner's countdown, leaving the user staring at nothing through a long
-   * backoff on the work they are actually waiting for.
-   */
-  private retryState: { info: RetryScheduledInfo; loopPath: string } | null = null;
-  /** 1s ticker that refreshes the retry countdown line. */
-  private retryTicker: ReturnType<typeof setInterval> | null = null;
+  private readonly retry = new RetryStatusLine(() => this.app);
   private createdAt: number;
   private permissionLockPromise: Promise<void> | null = null;
   private permissionLockRelease: (() => void) | null = null;
@@ -599,7 +589,7 @@ export class Session {
     log.info('User prompt', { text: text.slice(0, 100) });
 
     // A fresh turn supersedes any terminal "gave up, send a message" retry line.
-    this.clearRetry();
+    this.retry.clear();
 
     // Add user message to transcript
     this.app!.transcript.addUserMessage(text);
@@ -1159,7 +1149,7 @@ export class Session {
       if (!this.isConversationEvent(event)) return;
 
       // Text flowing again means a pending retry reconnected.
-      this.noteProgressAfterRetry();
+      this.retry.noteProgress();
 
       if (!assistantStarted) {
         this.app!.transcript.startAssistantMessage();
@@ -1188,7 +1178,7 @@ export class Session {
       if (this.isTalkerEvent(event)) return;
 
       // A tool starting means the agent is making progress again.
-      this.noteProgressAfterRetry();
+      this.retry.noteProgress();
 
       const p = event.payload as ToolCallStartPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
@@ -1321,28 +1311,20 @@ export class Session {
         case 'network':
         case 'server_error':
         case 'rate_limit': {
-          const attempts = this.retryState?.info.attempt ?? 0;
-          const maxAttempts = this.retryState?.info.maxAttempts ?? 0;
-          this.stopRetryTicker();
-          this.app!.transcript.setRetryStatus({
-            phase: 'failed',
-            attempt: attempts,
-            maxAttempts,
-            ...(error.causeDetail ? { detail: error.causeDetail } : {}),
-          });
+          this.retry.fail(error.causeDetail);
           break;
         }
         case 'authentication':
           // The OAuth mechanics ("Failed to refresh token") are jargon and
           // already in the durable transcript; the user just needs the fix.
-          this.clearRetry();
+          this.retry.clear();
           this.app!.transcript.addNotification('Authentication expired', '', {
             severity: 'error',
             action: 'run /login to reconnect',
           });
           break;
         case 'context_overflow':
-          this.clearRetry();
+          this.retry.clear();
           this.app!.transcript.addNotification('Context limit reached', '', {
             severity: 'error',
             action: 'use /context-window or /clear',
@@ -1350,10 +1332,10 @@ export class Session {
           break;
         case 'cancelled':
           // User-initiated abort; drop any pending retry line, no notification.
-          this.clearRetry();
+          this.retry.clear();
           break;
         default:
-          this.clearRetry();
+          this.retry.clear();
           this.app!.transcript.addNotification(
             error.originalMessage ?? String(error),
             error.causeDetail ?? '',
@@ -1366,15 +1348,15 @@ export class Session {
     // Every one of these is registered on both resident loops, so each keys
     // on the origin: the line has one slot and two possible owners.
     this.agent.onRetryScheduled((info: RetryScheduledInfo, origin: LoopOriginContext) => {
-      this.startRetryCountdown(info, origin.loopPath);
+      this.retry.start(info, origin.loopPath);
     });
     this.agent.onRetrySucceeded((_info: RetrySucceededInfo, origin: LoopOriginContext) => {
-      this.clearRetryFor(origin.loopPath);
+      this.retry.clearFor(origin.loopPath);
     });
     this.agent.onRetryExhausted((_info: RetryExhaustedInfo, origin: LoopOriginContext) => {
       // The matching fatal onError fires right after and renders the terminal
       // 'failed' line; just stop the countdown here.
-      if (this.retryState?.loopPath === origin.loopPath) this.stopRetryTicker();
+      this.retry.stopFor(origin.loopPath);
     });
 
     // Compaction notification. The reasoner's only: the footer this updates
@@ -2180,7 +2162,7 @@ export class Session {
   /** Graceful shutdown: save, destroy agent, stop TUI. */
   async shutdown(): Promise<void> {
     // Stop the retry countdown timer so it cannot fire after teardown.
-    this.stopRetryTicker();
+    this.retry.stopTicker();
 
     // Tear down MCP config watcher first so a late filesystem event cannot
     // schedule work against the agent we're about to destroy.
@@ -2385,75 +2367,6 @@ export class Session {
       resolutionDegraded: this.getResolutionReport()
         .some((note) => note.severity === 'degraded'),
     };
-  }
-
-  // ---------------------------------------------------------------------------
-  // Background retry status (compact, in-place line)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Begin (or update) the compact retry countdown. Replaces the "thinking"
-   * spinner with a single line that ticks down to the next attempt; a 1s timer
-   * keeps the countdown live.
-   */
-  private startRetryCountdown(info: RetryScheduledInfo, loopPath: string): void {
-    this.retryState = { info, loopPath };
-    // A retry wait is not "thinking"; swap the spinner for the status line.
-    this.app?.hideStatusSpinner();
-    this.renderRetryWaiting();
-    this.stopRetryTicker();
-    this.retryTicker = setInterval(() => this.renderRetryWaiting(), 1000);
-  }
-
-  /** Render the current waiting/reconnecting line from retryState. */
-  private renderRetryWaiting(): void {
-    if (!this.retryState || !this.app) return;
-    const { info } = this.retryState;
-    const secondsRemaining = Math.max(0, (info.nextAttemptAt - Date.now()) / 1000);
-    this.app.transcript.setRetryStatus(
-      secondsRemaining > 0
-        ? {
-            phase: 'waiting',
-            attempt: info.attempt,
-            maxAttempts: info.maxAttempts,
-            secondsRemaining,
-            ...(info.causeDetail ? { detail: info.causeDetail } : {}),
-          }
-        : { phase: 'reconnecting', attempt: info.attempt, maxAttempts: info.maxAttempts },
-    );
-  }
-
-  private stopRetryTicker(): void {
-    if (this.retryTicker) {
-      clearInterval(this.retryTicker);
-      this.retryTicker = null;
-    }
-  }
-
-  /** Tear down all retry UI (ticker, line, state). */
-  private clearRetry(): void {
-    this.stopRetryTicker();
-    this.retryState = null;
-    this.app?.transcript.clearRetryStatus();
-  }
-
-  /**
-   * Tear down the retry UI only if the loop reporting the resolution is the
-   * one whose countdown is on screen. The other loop's retry is not the one
-   * the user is watching, and clearing on it would blank a live countdown.
-   */
-  private clearRetryFor(loopPath: string): void {
-    if (this.retryState && this.retryState.loopPath !== loopPath) return;
-    this.clearRetry();
-  }
-
-  /**
-   * The agent produced output (text or a tool call) after a retry was pending,
-   * which means we reconnected: drop the retry line immediately rather than
-   * waiting for the whole turn to resolve.
-   */
-  private noteProgressAfterRetry(): void {
-    if (this.retryState) this.clearRetry();
   }
 
   private updateObservationalMemoryStatus(): void {
