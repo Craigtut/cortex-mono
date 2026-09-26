@@ -25,6 +25,7 @@ import {
   createRealDuplexScenario,
   destroyLiveFacades,
   entriesOfType,
+  duplexRouterOf,
   getBroker,
   installPermissionGate,
   lifecycleEvents,
@@ -577,10 +578,17 @@ describe('scenario: permission brokering through conversation', () => {
    * through the REAL permission gate and the REAL brokered resolver, so a
    * scripted tool call genuinely blocks on a spoken decision.
    */
-  function brokeredScenario(overrides?: { askTimeoutMs?: number }) {
+  function brokeredScenario(overrides?: { askTimeoutMs?: number; watchdogIntervalMs?: number }) {
     const h = createDuplexScenario(
-      overrides?.askTimeoutMs !== undefined
-        ? { duplex: { askTimeoutMs: overrides.askTimeoutMs } }
+      overrides !== undefined
+        ? {
+            duplex: {
+              ...(overrides.askTimeoutMs !== undefined ? { askTimeoutMs: overrides.askTimeoutMs } : {}),
+              ...(overrides.watchdogIntervalMs !== undefined
+                ? { watchdogIntervalMs: overrides.watchdogIntervalMs }
+                : {}),
+            },
+          }
         : undefined,
     );
     const deployed: string[] = [];
@@ -781,6 +789,50 @@ describe('scenario: permission brokering through conversation', () => {
     deliver.mockRestore();
     getBroker(h.facade).answer(askId, 'deny', undefined);
     await waitUntil(() => h.facade.getPendingAsks().length === 0, 2000, 'ask settled');
+  });
+
+  it('the watchdog tells the conversation the work is waiting on the user, without retiring it', async () => {
+    const h = brokeredScenario({ watchdogIntervalMs: 60 });
+    h.reasonerPi.script = [
+      { text: 'Deploying.', calls: [{ name: 'Deploy', args: { command: 'ship --prod' } }] },
+      { text: 'Stopped.' },
+    ];
+    h.talkerPi.script = [
+      { text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'deploy' } }] },
+      { text: 'It wants to run ship --prod. Allow that?' },
+    ];
+    await h.facade.prompt('please deploy');
+    await waitUntil(() => entriesOfType(h.facade, 'ask').length === 1, 2000, 'ask raised');
+
+    // The run is blocked on the user and silent: the watchdog speaks.
+    await waitUntil(
+      () => entriesOfType(h.facade, 'delivery').some((entry) => entry.content.includes('permission answer')),
+      2000, 'watchdog note',
+    );
+    const note = entriesOfType(h.facade, 'delivery')
+      .find((entry) => entry.content.includes('permission answer'))!;
+    expect(note.content).toContain('Background work (task-1) is paused waiting for the user');
+    expect(note.content).toContain('(Deploy)');
+    expect(note.data).toMatchObject({ synthetic: true, proposedWake: 'when_idle' });
+    // A progress note concludes nothing: the task is still live work.
+    expect(duplexRouterOf(h.facade).activeAliases()).toEqual(['task-1']);
+
+    getBroker(h.facade).answer(pendingAskId(h.facade), 'deny', undefined);
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner done');
+  });
+
+  it('the watchdog reports a silent run with no ask as still running', async () => {
+    const h = brokeredScenario({ watchdogIntervalMs: 60 });
+    h.reasonerPi.hold = true;
+    h.talkerPi.script = [{ text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'index everything' } }] }];
+    await h.facade.prompt('index everything');
+    await waitUntil(
+      () => entriesOfType(h.facade, 'delivery').some((entry) => entry.content.includes('still running')),
+      2000, 'watchdog note',
+    );
+    expect(duplexRouterOf(h.facade).activeAliases()).toEqual(['task-1']);
+    h.reasonerPi.releaseRun();
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner done');
   });
 
   it('an unanswered ask times out as a deny the reasoner can see', async () => {
