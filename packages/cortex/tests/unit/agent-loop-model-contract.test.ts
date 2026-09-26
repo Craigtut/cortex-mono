@@ -57,6 +57,8 @@ vi.mock('@earendil-works/pi-ai', () => ({
 vi.mock('@earendil-works/pi-ai/providers/all', () => ({
   getBuiltinModel: (...args: unknown[]) => mockGetModel(...args),
   getBuiltinModels: vi.fn(),
+  // Read by wrapModel's concurrency classification, which nothing here checks.
+  builtinProviders: () => [],
 }));
 
 vi.mock('@earendil-works/pi-ai/compat', () => ({
