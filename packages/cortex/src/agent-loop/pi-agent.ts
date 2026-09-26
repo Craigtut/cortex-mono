@@ -7,7 +7,7 @@
 import type { AgentMessage, AgentStateAccessor } from '../context-manager.js';
 import type { PiEventSource } from '../event-bridge.js';
 import type { CortexTool } from '../tool-contract.js';
-import type { ModelThinkingCapabilities, ThinkingLevel } from '../types.js';
+import type { AgentLoopConfig, ModelThinkingCapabilities, ThinkingLevel } from '../types.js';
 import { THINKING_LEVEL_ORDER } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -99,6 +99,16 @@ export interface AgentLoopConstructorOptions {
 }
 
 export type CacheRetention = 'none' | 'short' | 'long';
+
+/** What the managed factory (AgentLoop.create and sub-agent spawning) builds a loop from. */
+export interface ManagedLoopParams {
+  cortexConfig: AgentLoopConfig;
+  tools?: RegisteredTool[];
+  initialBasePrompt?: string;
+  initialSystemPrompt?: string;
+  constructorOptions?: AgentLoopConstructorOptions;
+  missingDependencyMessage: string;
+}
 
 // ---------------------------------------------------------------------------
 // ThinkingLevel crossing to pi (names are identical; see toPiThinkingLevel)

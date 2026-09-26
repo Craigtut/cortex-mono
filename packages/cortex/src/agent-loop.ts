@@ -32,12 +32,7 @@ import {
   shouldRetry,
   isRetryableCategory,
 } from './retry-policy.js';
-import {
-  assistantText,
-  findLastAssistant,
-  toolCallNames,
-  withPlaceholderContent,
-} from './pi-message.js';
+import { withPlaceholderContent } from './pi-message.js';
 import type { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
 import { isContextOverflow } from './compaction/failsafe.js';
@@ -59,6 +54,10 @@ import { SkillBinding } from './agent-loop/skills.js';
 import { createBuiltinTools } from './agent-loop/builtin-tools.js';
 import { ToolRegistry } from './agent-loop/tool-registry.js';
 import { McpAttachment } from './agent-loop/mcp-attachment.js';
+import { CHILD_SEED_CONTEXT_SLOT, prepareChildLoop } from './agent-loop/child-loop-config.js';
+import type { ChildLoopParams } from './agent-loop/child-loop-config.js';
+import { SubAgentSpawner } from './agent-loop/sub-agent-spawner.js';
+import type { ForegroundSpawnResult, SubAgentSpawnParams } from './agent-loop/sub-agent-spawner.js';
 import { mirrorChildPermissionResolver, PendingAskRegistry } from './agent-loop/permissions.js';
 import {
   buildPiAgentConfig,
@@ -78,7 +77,6 @@ import {
   buildBackgroundTaskState,
   formatBashCompletion,
   formatSubAgentCompletion,
-  summarizeToolActivity,
 } from './agent-loop/background-task-text.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { estimateTokens } from './token-estimator.js';
@@ -107,13 +105,11 @@ import type {
   McpToolCallProgress,
   LoadedSkill,
   SubAgentSpawnConfig,
-  SubAgentSpawnAugmentation,
   SubAgentResult,
   DeadLetteredBackgroundResult,
   SubAgentSnapshot,
   TrackedSubAgent,
   BudgetScope,
-  CortexCompactionConfig,
   PendingAsk,
   LoopOriginContext,
   ThinkingLevel,
@@ -148,9 +144,6 @@ export type {
   ToolResultInterceptorInfo,
   ToolResultInterceptorResult,
 } from './agent-loop/pi-hooks.js';
-
-/** Leading context slot used to seed a sub-agent with background context. */
-const CHILD_SEED_CONTEXT_SLOT = '_seed_context';
 
 /**
  * Default hard token cap for the consumer-fed headline block. Injected
@@ -412,9 +405,6 @@ export class AgentLoop {
   private readonly retrySucceededHandlers: HandlerList<[RetrySucceededInfo, LoopOriginContext]>;
   private readonly retryExhaustedHandlers: HandlerList<[RetryExhaustedInfo, LoopOriginContext]>;
   private readonly turnCompleteHandlers: HandlerList<[AgentTextOutput, LoopOriginContext]>;
-  private readonly subAgentSpawnedHandlers: HandlerList<[taskId: string, instructions: string, background: boolean]>;
-  private readonly subAgentCompletedHandlers: HandlerList<[taskId: string, result: string, status: string, usage: unknown]>;
-  private readonly subAgentFailedHandlers: HandlerList<[taskId: string, error: string]>;
   private readonly backgroundResultDeliveryHandlers: HandlerList<[taskIds: string[]]>;
   private pendingBackgroundResults: PendingBackgroundCompletion[] = [];
   // Content the loop gave up delivering (bounded; survives destroy)
@@ -523,6 +513,7 @@ export class AgentLoop {
 
   // Sub-Agent Manager for tracking active sub-agents
   private readonly subAgentManager: SubAgentManager;
+  private readonly subAgents: SubAgentSpawner;
 
   // Skill registry, the load_skill tool, and the loaded-skill buffer
   private readonly skills: SkillBinding;
@@ -563,16 +554,12 @@ export class AgentLoop {
     this.retryPolicy = resolveRetryPolicy(config.retryPolicy);
     this.loopPath = config.loopPath ?? DEFAULT_LOOP_PATH;
     this.logger = prefixLoggerWithLoopPath(config.logger ?? NOOP_LOGGER, this.loopPath);
-    const byTask = (taskId: string): Record<string, unknown> => ({ taskId });
     this.loopCompleteHandlers = new HandlerList('onLoopComplete', this.logger);
     this.errorHandlers = new HandlerList('onError', this.logger);
     this.retryScheduledHandlers = new HandlerList('onRetryScheduled', this.logger);
     this.retrySucceededHandlers = new HandlerList('onRetrySucceeded', this.logger);
     this.retryExhaustedHandlers = new HandlerList('onRetryExhausted', this.logger);
     this.turnCompleteHandlers = new HandlerList('onTurnComplete', this.logger);
-    this.subAgentSpawnedHandlers = new HandlerList('onSubAgentSpawned', this.logger, byTask);
-    this.subAgentCompletedHandlers = new HandlerList('onSubAgentCompleted', this.logger, byTask);
-    this.subAgentFailedHandlers = new HandlerList('onSubAgentFailed', this.logger, byTask);
     this.backgroundResultDeliveryHandlers = new HandlerList('onBackgroundResultDelivery', this.logger);
     this.deadLetters = new DeadLetterStore(this.logger);
     this.promptDiagnostics = new PromptWatchdogDiagnostics(
@@ -758,7 +745,7 @@ export class AgentLoop {
       onToolsChanged: () => this.refreshTools(),
     });
 
-    // Set up Sub-Agent Manager (must be before wireSubAgentHooks)
+    // Set up Sub-Agent Manager (must be before the spawner)
     this.subAgentManager = new SubAgentManager({
       maxConcurrent: config.maxConcurrentSubAgents ?? 4,
       ...(config.subAgentPools ? { pools: config.subAgentPools } : {}),
@@ -774,12 +761,22 @@ export class AgentLoop {
       logger: this.logger,
     });
 
-    // Wire sub-agent manager hooks to AgentLoop event handlers
-    // (must be after subAgentManager is initialized)
-    this.wireSubAgentHooks();
+    // Sub-agent spawning; wires the manager's hooks to the consumer fan-out.
+    this.subAgents = new SubAgentSpawner({
+      manager: this.subAgentManager,
+      createChild: (params) => this.createChildAgent(params),
+      eventBridge: this.eventBridge,
+      onBackgroundComplete: (item) => this.deliverOrQueueBackgroundCompletion(item),
+      purgePendingResult: (taskId) => {
+        this.pendingBackgroundResults = this.pendingBackgroundResults.filter(
+          item => !(item.kind === 'subagent' && item.taskId === taskId),
+        );
+      },
+      logger: this.logger,
+    });
 
     // Create and register the SubAgent tool.
-    // Must be after subAgentManager and wireSubAgentHooks.
+    // Must be after the spawner exists.
     if (options?.enableSubAgentTool !== false) {
       const subAgentTool = createSubAgentTool({
         spawnSubAgent: (params) => this.spawnForegroundSubAgentInternal(params),
@@ -2957,21 +2954,21 @@ export class AgentLoop {
    * Register a handler for sub-agent spawn events.
    */
   onSubAgentSpawned(handler: (taskId: string, instructions: string, background: boolean) => void): void {
-    this.subAgentSpawnedHandlers.add(handler);
+    this.subAgents.spawnedHandlers.add(handler);
   }
 
   /**
    * Register a handler for sub-agent completion events.
    */
   onSubAgentCompleted(handler: (taskId: string, result: string, status: string, usage: unknown) => void): void {
-    this.subAgentCompletedHandlers.add(handler);
+    this.subAgents.completedHandlers.add(handler);
   }
 
   /**
    * Register a handler for sub-agent failure events.
    */
   onSubAgentFailed(handler: (taskId: string, error: string) => void): void {
-    this.subAgentFailedHandlers.add(handler);
+    this.subAgents.failedHandlers.add(handler);
   }
 
   /**
@@ -3764,13 +3761,6 @@ export class AgentLoop {
     return !this._isPrompting;
   }
 
-  /** Tool calls (name only) made across a child agent's conversation history. */
-  private extractToolCallSummary(
-    history: unknown[],
-  ): Array<{ name: string; durationMs: number; error?: string }> {
-    return history.flatMap((msg) => toolCallNames(msg).map((name) => ({ name, durationMs: 0 })));
-  }
-
   /**
    * Perform ordered cleanup.
    */
@@ -3842,9 +3832,9 @@ export class AgentLoop {
     this.loopCompleteHandlers.clear();
     this.errorHandlers.clear();
     this.turnCompleteHandlers.clear();
-    this.subAgentSpawnedHandlers.clear();
-    this.subAgentCompletedHandlers.clear();
-    this.subAgentFailedHandlers.clear();
+    this.subAgents.spawnedHandlers.clear();
+    this.subAgents.completedHandlers.clear();
+    this.subAgents.failedHandlers.clear();
     this.backgroundResultDeliveryHandlers.clear();
     this.deadLetters.handlers.clear();
     this.pendingBackgroundResults = [];
@@ -3933,18 +3923,7 @@ export class AgentLoop {
    * Throws when the concurrency limit is reached.
    */
   async spawnBackgroundSubAgent(params: Omit<SubAgentSpawnConfig, 'background'>): Promise<{ taskId: string }> {
-    // Cap pre-check: fail before building the child agent. track() still
-    // re-checks under the same limit, so a concurrent spawn cannot slip past.
-    // Pool-aware: a spawn that names a pool checks that pool's own limit.
-    if (!this.subAgentManager.canSpawn(params.pool)) {
-      throw new Error(
-        `Cannot spawn sub-agent: concurrency limit reached ` +
-        `(${this.subAgentManager.activeCountInPool(params.pool)}/` +
-        `${this.subAgentManager.poolLimit(params.pool)} active` +
-        `${params.pool !== undefined ? ` in pool "${params.pool}"` : ''}).`,
-      );
-    }
-    return this.spawnBackgroundSubAgentInternal(params);
+    return this.subAgents.spawnBackgroundChecked(params);
   }
 
   /**
@@ -3954,29 +3933,7 @@ export class AgentLoop {
    * Returns false when the task ID is not an active sub-agent.
    */
   async cancelSubAgent(taskId: string): Promise<boolean> {
-    const cancelled = await this.subAgentManager.cancel(taskId, async (agent) => {
-      await agent.destroy();
-    });
-    if (cancelled) {
-      // Purge a result that already completed and sits queued for delivery.
-      // Results arriving after this point are dropped by the drain's
-      // isCancelled() check.
-      //
-      // DELIBERATELY REDUNDANT, and not deletable as dead code. With the
-      // drain check in place this purge has no observable effect (the drain
-      // filters the same item and returns without starting a run), so no
-      // test can distinguish its removal, and it will read as dead on every
-      // future audit. It stays because it makes cancellation prompt rather
-      // than deferred, and because it leaves the drain check one edit away
-      // from being the only thing between discarded work and the loop's
-      // context. Redundancy in a cancellation path is cheap; finding out it
-      // was load-bearing is not.
-      this.pendingBackgroundResults = this.pendingBackgroundResults.filter(
-        item => !(item.kind === 'subagent' && item.taskId === taskId),
-      );
-      this.logger.info('subagent cancelled', { taskId });
-    }
-    return cancelled;
+    return this.subAgents.cancel(taskId);
   }
 
   /**
@@ -3998,10 +3955,7 @@ export class AgentLoop {
    * child acted on it rather than treat true as delivery.
    */
   steerSubAgent(taskId: string, message: string): boolean {
-    const outcome = this.subAgentManager.steer(taskId, message);
-    if (outcome === null) return false;
-    this.logger.info('subagent steered', { taskId, outcome });
-    return true;
+    return this.subAgents.steer(taskId, message);
   }
 
   /**
@@ -4010,63 +3964,7 @@ export class AgentLoop {
    * or status surfaces). Returns an empty array when none are running.
    */
   getActiveSubAgents(): SubAgentSnapshot[] {
-    const snapshots: SubAgentSnapshot[] = [];
-    for (const taskId of this.subAgentManager.getActiveTaskIds()) {
-      const entry = this.subAgentManager.get(taskId);
-      if (!entry) continue;
-      const childAgent = entry.agent;
-      const budget = childAgent.getBudgetGuard();
-      snapshots.push({
-        taskId,
-        instructions: entry.instructions,
-        background: entry.background,
-        spawnedAt: entry.spawnedAt,
-        status: entry.pendingPermission ? 'waiting-for-permission' : 'running',
-        toolCount: entry.toolCount,
-        lastToolName: entry.lastToolName,
-        lastToolSummary: entry.lastToolSummary,
-        lastToolStartedAt: entry.lastToolStartedAt,
-        liveCostUsd: budget.getTotalCost(),
-        turnsUsed: budget.getTurnCount(),
-      });
-    }
-    return snapshots;
-  }
-
-  // -----------------------------------------------------------------------
-  // Private: Sub-agent hooks
-  // -----------------------------------------------------------------------
-
-  /**
-   * Wire the sub-agent manager's lifecycle hooks to AgentLoop event handlers.
-   */
-  private wireSubAgentHooks(): void {
-    this.subAgentManager.setHooks({
-      onSpawned: (taskId, instructions, background) => {
-        this.subAgentSpawnedHandlers.emit(taskId, instructions, background);
-      },
-      onCompleted: (taskId, result, status, usage) => {
-        this.subAgentCompletedHandlers.emit(taskId, result, status, usage);
-      },
-      onFailed: (taskId, error) => {
-        this.subAgentFailedHandlers.emit(taskId, error);
-      },
-    });
-
-    // Track child tool activity for background state visibility.
-    // Forwarded child events arrive on the parent's EventBridge with childTaskId set.
-    this.eventBridge.on('tool_call_start', (event) => {
-      if (!event.childTaskId) return;
-      const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
-      const toolName = payload?.toolName ?? 'unknown';
-      const args = payload?.args ?? {};
-      const summary = summarizeToolActivity(toolName, args);
-      // childTaskId is a path when the event was re-forwarded from a deeper
-      // descendant; attribute activity to this loop's direct child (the
-      // first segment), which is the task ID the manager tracks.
-      const directChildId = event.childTaskId.split('/')[0]!;
-      this.subAgentManager.updateToolActivity(directChildId, toolName, summary);
-    });
+    return this.subAgents.snapshots();
   }
 
   /**
@@ -4083,241 +3981,6 @@ export class AgentLoop {
       bashTasks: this.tools.runtime.backgroundTasks.getAll(),
       now: Date.now(),
     });
-  }
-
-  /**
-   * Spawn a foreground sub-agent and block until completion.
-   * Used by the SubAgent tool.
-   */
-  private async spawnForegroundSubAgentInternal(params: {
-    instructions: string;
-    tools?: string[];
-    systemPrompt?: string;
-    maxTurns?: number;
-    maxCost?: number;
-    timeoutMs?: number;
-    model?: CortexModel;
-    thinkingLevel?: ThinkingLevel;
-    compaction?: Partial<CortexCompactionConfig>;
-    pool?: string;
-  }): Promise<{ taskId: string; output: string; status: string; usage: { turns: number; cost: number; durationMs: number } }> {
-    const taskId = this.generateTaskId();
-    const startTime = Date.now();
-
-    this.logger.info('subagent spawned', {
-      taskId,
-      background: false,
-      instructionsLength: params.instructions.length,
-      tools: params.tools,
-      maxTurns: params.maxTurns,
-      ...(params.pool !== undefined ? { pool: params.pool } : {}),
-      ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
-    });
-
-    // Create a completion promise
-    let resolveCompletion!: (result: SubAgentResult) => void;
-    const completion = new Promise<SubAgentResult>((resolve) => {
-      resolveCompletion = resolve;
-    });
-
-    try {
-      const childAgent = await this.createChildAgent({ ...params, taskId, background: false });
-
-      // Track the sub-agent
-      const tracked: TrackedSubAgent = {
-        taskId,
-        agent: childAgent,
-        instructions: params.instructions,
-        background: false,
-        spawnedAt: startTime,
-        completion,
-        resolve: resolveCompletion,
-        toolCount: 0,
-        lastToolName: null,
-        lastToolSummary: null,
-        lastToolStartedAt: null,
-        pendingPermission: null,
-        ...(params.pool !== undefined ? { pool: params.pool } : {}),
-      };
-
-      if (!this.subAgentManager.track(tracked)) {
-        this.logger.warn('subagent rejected', {
-          taskId,
-          active: this.subAgentManager.activeCountInPool(params.pool),
-          limit: this.subAgentManager.poolLimit(params.pool),
-        });
-        // The child was fully constructed but never tracked; tear it down or
-        // it leaks (event subscriptions, compaction timers, tool runtime).
-        try {
-          await childAgent.destroy();
-        } catch {
-          // Best-effort cleanup
-        }
-        return {
-          taskId,
-          output: '',
-          status: 'failed',
-          usage: { turns: 0, cost: 0, durationMs: 0 },
-        };
-      }
-
-      // Forward child events to parent's EventBridge for real-time visibility
-      const unsubForward = this.eventBridge.forwardFrom(
-        childAgent.getEventBridge(),
-        taskId,
-      );
-
-      try {
-        // Run the sub-agent (foreground: wait for result)
-        const result = await this.runSubAgent(
-          childAgent,
-          params.instructions,
-          taskId,
-          startTime,
-          params.timeoutMs,
-        );
-
-        this.logger.info('subagent complete', {
-          taskId,
-          status: result.status,
-          turns: result.usage.turns,
-          cost: result.usage.cost,
-          durationMs: result.usage.durationMs,
-        });
-
-        return {
-          taskId,
-          output: result.output,
-          status: result.status,
-          usage: result.usage,
-        };
-      } finally {
-        // Always stop forwarding, whether the sub-agent succeeded or failed
-        unsubForward();
-      }
-    } catch (err) {
-      this.logger.error('subagent failed', {
-        taskId,
-        error: errorMessageOf(err),
-      });
-      this.subAgentManager.fail(taskId, errorMessageOf(err));
-      return {
-        taskId,
-        output: '',
-        status: 'failed',
-        usage: { turns: 0, cost: 0, durationMs: Date.now() - startTime },
-      };
-    }
-  }
-
-  /**
-   * Spawn a background sub-agent and return the task ID immediately.
-   */
-  private async spawnBackgroundSubAgentInternal(params: {
-    instructions: string;
-    tools?: string[];
-    systemPrompt?: string;
-    maxTurns?: number;
-    maxCost?: number;
-    timeoutMs?: number;
-    model?: CortexModel;
-    thinkingLevel?: ThinkingLevel;
-    compaction?: Partial<CortexCompactionConfig>;
-    pool?: string;
-  }): Promise<{ taskId: string }> {
-    const taskId = this.generateTaskId();
-    const startTime = Date.now();
-
-    this.logger.info('subagent spawned', {
-      taskId,
-      background: true,
-      instructionsLength: params.instructions.length,
-      tools: params.tools,
-      maxTurns: params.maxTurns,
-      ...(params.pool !== undefined ? { pool: params.pool } : {}),
-      ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
-    });
-
-    // Create a completion promise
-    let resolveCompletion!: (result: SubAgentResult) => void;
-    const completion = new Promise<SubAgentResult>((resolve) => {
-      resolveCompletion = resolve;
-    });
-
-    const childAgent = await this.createChildAgent({ ...params, taskId, background: true });
-
-    // Track the sub-agent
-    const tracked: TrackedSubAgent = {
-      taskId,
-      agent: childAgent,
-      instructions: params.instructions,
-      background: true,
-      spawnedAt: startTime,
-      completion,
-      resolve: resolveCompletion,
-      toolCount: 0,
-      lastToolName: null,
-      lastToolSummary: null,
-      lastToolStartedAt: null,
-      pendingPermission: null,
-      ...(params.pool !== undefined ? { pool: params.pool } : {}),
-    };
-
-    if (!this.subAgentManager.track(tracked)) {
-      this.logger.warn('subagent rejected', {
-        taskId,
-        active: this.subAgentManager.activeCountInPool(params.pool),
-        limit: this.subAgentManager.poolLimit(params.pool),
-      });
-      // The child was fully constructed but never tracked; tear it down or
-      // it leaks (event subscriptions, compaction timers, tool runtime).
-      try {
-        await childAgent.destroy();
-      } catch {
-        // Best-effort cleanup
-      }
-      throw new Error('Concurrency limit reached');
-    }
-
-    // Forward child events to the parent's EventBridge, exactly like the
-    // foreground path: this is what makes background children visible live
-    // (tool activity for the headline block, usage accounting) instead of
-    // only via a post-completion summary. Note session usage accumulates
-    // forwarded child turn usage, so background child spend now lands in
-    // getSessionUsage() just as foreground child spend always has.
-    const unsubForward = this.eventBridge.forwardFrom(
-      childAgent.getEventBridge(),
-      taskId,
-    );
-
-    // Run the sub-agent in the background. When it completes, deliver the
-    // result back to the parent agent and restart its agentic loop.
-    this.runSubAgent(childAgent, params.instructions, taskId, startTime, params.timeoutMs)
-      .then((result) => {
-        // The child has settled (and been destroyed by runSubAgent); stop
-        // forwarding before delivery so listeners never leak per task.
-        unsubForward();
-        this.logger.info('subagent complete', {
-          taskId,
-          background: true,
-          status: result.status,
-          turns: result.usage.turns,
-          cost: result.usage.cost,
-          durationMs: result.usage.durationMs,
-        });
-        return this.deliverOrQueueBackgroundCompletion({ kind: 'subagent', taskId, result });
-      })
-      .catch((err) => {
-        unsubForward();
-        this.logger.error('subagent failed', {
-          taskId,
-          background: true,
-          error: errorMessageOf(err),
-        });
-        this.subAgentManager.fail(taskId, errorMessageOf(err));
-      });
-
-    return { taskId };
   }
 
   /**
@@ -4602,130 +4265,24 @@ export class AgentLoop {
     return formatBashCompletion(task);
   }
 
-  private async createChildAgent(params: {
-    taskId: string;
-    instructions: string;
-    tools?: string[];
-    systemPrompt?: string;
-    maxTurns?: number;
-    maxCost?: number;
-    model?: CortexModel;
-    thinkingLevel?: ThinkingLevel;
-    compaction?: Partial<CortexCompactionConfig>;
-    background?: boolean;
-  }): Promise<AgentLoop> {
-    // Pre-spawn hook: lets the consumer record the spawn and curate the
-    // child's starting context (system prompt, tools, background seed) before
-    // the child is built. Purely additive; errors are swallowed.
-    let augmentation: SubAgentSpawnAugmentation | void = undefined;
-    if (this.config.onBeforeSubAgentSpawn) {
-      try {
-        augmentation = await this.config.onBeforeSubAgentSpawn({
-          taskId: params.taskId,
-          instructions: params.instructions,
-          background: params.background ?? false,
-          ...(params.tools ? { requestedTools: params.tools } : {}),
-          ...(params.systemPrompt ? { requestedSystemPrompt: params.systemPrompt } : {}),
-        });
-      } catch (err) {
-        this.logger.error('onBeforeSubAgentSpawn handler threw', {
-          taskId: params.taskId,
-          error: errorMessageOf(err),
-        });
-      }
-    }
-    const effectiveSystemPrompt = augmentation?.systemPrompt ?? params.systemPrompt;
-    const effectiveTools = augmentation?.tools ?? params.tools;
-    const seedContext = augmentation?.seedContext;
-
-    const childConfig = this.buildChildAgentConfig(params);
-    const promptSeed = this.resolveChildPromptSeed(effectiveSystemPrompt);
-
-    const childCortexConfig: AgentLoopConfig = {
-      // Per-spawn model override; the child's utility model re-resolves from
-      // this model's provider, so a fast-model spawn stays fast end to end.
-      model: params.model ?? this.models.primary,
-      workingDirectory: this.workingDirectory,
-      workingTags: { enabled: this.workingTagsEnabled },
-      budgetGuard: {
-        maxTurns: childConfig.maxTurns,
-        maxCost: childConfig.maxCost,
-      },
+  /** Build a sub-agent's loop (the spawner's factory; tests stand in for it). */
+  private async createChildAgent(params: ChildLoopParams): Promise<AgentLoop> {
+    const { createParams, seedContext } = await prepareChildLoop({
+      config: this.config,
+      model: this.models.primary,
+      workingTagsEnabled: this.workingTagsEnabled,
       contextWindowLimit: this.models.contextWindowLimit,
-      // Each sub-agent is its own logical session for prefix-cache routing.
-      sessionId: params.taskId,
-      // The child's identity extends this loop's path, so its asks, errors,
-      // and log lines are attributable through the spawn chain.
-      loopPath: `${this.loopPath}/${params.taskId}`,
-    };
-    if (params.thinkingLevel !== undefined) {
-      childCortexConfig.thinkingLevel = params.thinkingLevel;
-    }
-    if (params.compaction !== undefined) {
-      childCortexConfig.compaction = params.compaction;
-    }
-    if (seedContext) {
-      childCortexConfig.slots = [CHILD_SEED_CONTEXT_SLOT];
-    }
-    if (this.config.logger) childCortexConfig.logger = this.config.logger;
-    if (this.envOverrides) childCortexConfig.envOverrides = this.envOverrides;
-    // Inherit tool tuning so a child's Bash and WebFetch behave like the
-    // parent's (shell override, auto-yield timing, fetch rate limit).
-    if (this.config.bash) childCortexConfig.bash = this.config.bash;
-    if (this.config.webFetch) childCortexConfig.webFetch = this.config.webFetch;
-    // Share the parent's sandbox provider so a sub-agent's shell commands are
-    // contained by the same OS boundary. Sharing the instance (not cloning) is
-    // correct: the underlying SandboxManager is a process-global singleton.
-    if (this.config.sandbox) childCortexConfig.sandbox = this.config.sandbox;
-    // A read-restricted parent must not spawn read-unrestricted children.
-    if (this.config.readPathAllowlist) {
-      childCortexConfig.readPathAllowlist = this.config.readPathAllowlist;
-    }
-    // Share the egress gate so a sub-agent's WebFetch answers to the same
-    // network policy and grant set as the parent's.
-    if (this.config.resolveNetworkAccess) {
-      childCortexConfig.resolveNetworkAccess = this.config.resolveNetworkAccess;
-    }
-    if (this.config.getApiKey) childCortexConfig.getApiKey = this.config.getApiKey;
-    // Inherit tool result persistence so child tool calls (Bash, Grep, WebFetch
-    // inside a sub-agent doing research) get the same protection as the parent.
-    // The raw consumer callback, so the child stamps its own loopPath.
-    const rawPersistResult = this.tools.rawPersistResult;
-    if (rawPersistResult) childCortexConfig.persistResult = rawPersistResult;
-    const thresholds = this.tools.resultThresholds;
-    if (thresholds) childCortexConfig.toolResultThresholds = thresholds;
-    if (this.config.resolvePermission) {
-      childCortexConfig.resolvePermission = this.wrapChildPermissionResolver(
-        this.config.resolvePermission,
-        params.taskId,
-      );
-    }
-
-    const childCreateParams: {
-      cortexConfig: AgentLoopConfig;
-      tools: RegisteredTool[];
-      initialBasePrompt?: string;
-      initialSystemPrompt?: string;
-      constructorOptions: AgentLoopConstructorOptions;
-      missingDependencyMessage: string;
-    } = {
-      cortexConfig: childCortexConfig,
-      tools: this.tools.childInheritable(effectiveTools),
-      constructorOptions: {
-        enableSubAgentTool: false,
-        enableLoadSkillTool: false,
-      },
-      missingDependencyMessage:
-        'Sub-agent spawning requires @earendil-works/pi-agent-core to be installed.',
-    };
-    if (promptSeed.initialBasePrompt !== undefined) {
-      childCreateParams.initialBasePrompt = promptSeed.initialBasePrompt;
-    }
-    if (promptSeed.initialSystemPrompt !== undefined) {
-      childCreateParams.initialSystemPrompt = promptSeed.initialSystemPrompt;
-    }
-
-    const childAgent = await AgentLoop.createManagedAgent(childCreateParams);
+      loopPath: this.loopPath,
+      prompt: { base: this.systemPrompt.base(), current: this.systemPrompt.current() },
+      rawPersistResult: this.tools.rawPersistResult,
+      resultThresholds: this.tools.resultThresholds,
+      inheritableTools: (requested) => this.tools.childInheritable(requested),
+      childResolver: (taskId) => this.config.resolvePermission
+        ? this.wrapChildPermissionResolver(this.config.resolvePermission, taskId)
+        : undefined,
+      logger: this.logger,
+    }, params);
+    const childAgent = await AgentLoop.createManagedAgent(createParams);
 
     // Seed background context as the child's leading context slot. This is
     // reference material, not the child's objective (its task is its
@@ -4750,170 +4307,20 @@ export class AgentLoop {
     });
   }
 
-  private resolveChildPromptSeed(systemPrompt?: string): {
-    initialBasePrompt?: string;
-    initialSystemPrompt?: string;
-  } {
-    if (typeof systemPrompt === 'string') {
-      return { initialBasePrompt: systemPrompt };
-    }
-    const base = this.systemPrompt.base();
-    if (base !== null) {
-      return { initialBasePrompt: base };
-    }
-    return { initialSystemPrompt: this.systemPrompt.current() };
-  }
-
-  /**
-   * Run a sub-agent to completion. Handles result delivery to the manager.
-   *
-   * When `timeoutMs` is set, a wall-clock timer aborts the child on expiry
-   * and the result reports status 'timed_out' (with whatever partial output
-   * the child's transcript holds), whether the aborted run settles by
-   * resolving or by rejecting.
-   */
-  private async runSubAgent(
-    childAgent: AgentLoop,
-    instructions: string,
-    taskId: string,
-    startTime: number,
-    timeoutMs?: number,
-  ): Promise<SubAgentResult> {
-    let timedOut = false;
-    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-    if (timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 0) {
-      timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        this.logger.warn('subagent wall-clock timeout', { taskId, timeoutMs });
-        // Abort (not destroy) so the child unwinds cleanly; both settle
-        // paths below destroy it once the run ends.
-        void childAgent.abort().catch(() => {});
-      }, timeoutMs);
-      timeoutTimer.unref?.();
-    }
-
-    try {
-      await childAgent.prompt(instructions);
-
-      // prompt() returns void; extract the last assistant message from
-      // the child's conversation history.
-      const history = childAgent.getConversationHistory();
-      const output = assistantText(findLastAssistant(history));
-
-      const result: SubAgentResult = {
-        output,
-        // An aborted run can settle by resolving (stopReason 'aborted'), so
-        // the timeout flag decides, not the settle path.
-        status: timedOut ? 'timed_out' : 'completed',
-        usage: {
-          turns: childAgent.getBudgetGuard().getTurnCount(),
-          cost: childAgent.getBudgetGuard().getTotalCost(),
-          durationMs: Date.now() - startTime,
-          contextTokens: childAgent.currentContextTokenCount,
-        },
-        toolCalls: this.extractToolCallSummary(history),
-      };
-
-      this.subAgentManager.complete(taskId, result);
-
-      // Clean up child agent
-      try {
-        await childAgent.destroy();
-      } catch {
-        // Best-effort cleanup
-      }
-
-      return result;
-    } catch (err) {
-      const errorMsg = errorMessageOf(err);
-      // A cancel destroys the child mid-run, which surfaces here as an
-      // abort-shaped prompt failure. The cancel already resolved the
-      // tracked completion as cancelled and fired its hooks; report the
-      // same status instead of overriding it with 'failed' (the foreground
-      // path returns this result directly to the SubAgent tool).
-      const cancelled = this.subAgentManager.isCancelled(taskId);
-
-      // A timed-out run rejects with an abort-shaped failure; salvage the
-      // partial output so the spawner sees what the child got done.
-      const partialOutput = timedOut && !cancelled
-        ? assistantText(findLastAssistant(childAgent.getConversationHistory()))
-        : '';
-
-      const result: SubAgentResult = {
-        output: partialOutput,
-        status: cancelled ? 'cancelled' : timedOut ? 'timed_out' : 'failed',
-        usage: {
-          turns: childAgent.getBudgetGuard().getTurnCount(),
-          cost: childAgent.getBudgetGuard().getTotalCost(),
-          durationMs: Date.now() - startTime,
-          contextTokens: childAgent.currentContextTokenCount,
-        },
-      };
-
-      if (!cancelled) {
-        if (timedOut) {
-          // Timeout is a terminal outcome with a result, not an error:
-          // resolve the tracked completion with timed_out so the status
-          // reaches hooks and the background delivery path.
-          this.subAgentManager.complete(taskId, result);
-        } else {
-          this.subAgentManager.fail(taskId, errorMsg);
-        }
-      }
-
-      // Clean up child agent
-      try {
-        await childAgent.destroy();
-      } catch {
-        // Best-effort cleanup
-      }
-
-      return result;
-    } finally {
-      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
-    }
-  }
-
-  /**
-   * Build child agent config from parent config and spawn params.
-   * Budget guards can be tightened, not loosened.
-   */
-  private buildChildAgentConfig(params: {
-    maxTurns?: number;
-    maxCost?: number;
-  }): { maxTurns: number; maxCost: number } {
-    const parentMaxTurns = this.config.budgetGuard?.maxTurns ?? Infinity;
-    const parentMaxCost = this.config.budgetGuard?.maxCost ?? Infinity;
-
-    return {
-      maxTurns: params.maxTurns
-        ? Math.min(params.maxTurns, parentMaxTurns)
-        : parentMaxTurns,
-      maxCost: params.maxCost
-        ? Math.min(params.maxCost, parentMaxCost)
-        : parentMaxCost,
-    };
-  }
-
-  /**
-   * Generate a unique task ID for sub-agents.
-   */
-  private generateTaskId(): string {
-    // Simple UUID-like ID
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    bytes[6] = (bytes[6]! & 0x0f) | 0x40;
-    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-  }
-
   // -----------------------------------------------------------------------
   // TEMPORARY test compat: old private names that tests still reach
   // through casts, forwarding to the owning module. Pinned by
   // tests/unit/agent-loop-internals-contract.test.ts; removed once the
   // tests move onto the modules.
   // -----------------------------------------------------------------------
+
+  private spawnForegroundSubAgentInternal(params: SubAgentSpawnParams): Promise<ForegroundSpawnResult> {
+    return this.subAgents.spawnForeground(params);
+  }
+
+  private spawnBackgroundSubAgentInternal(params: SubAgentSpawnParams): Promise<{ taskId: string }> {
+    return this.subAgents.spawnBackground(params);
+  }
 
   private registerPendingAsk(ask: PendingAsk): void {
     this.asks.register(ask);

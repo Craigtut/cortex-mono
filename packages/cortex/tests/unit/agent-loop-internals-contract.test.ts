@@ -54,6 +54,9 @@ const COMPAT: Record<string, Kind> = {
   registerPendingAsk: 'method',
   settlePendingAsk: 'method',
   wrapChildPermissionResolver: 'method',
+  createChildAgent: 'method',
+  spawnForegroundSubAgentInternal: 'method',
+  spawnBackgroundSubAgentInternal: 'method',
 };
 
 function descriptorOf(name: string): PropertyDescriptor | undefined {
