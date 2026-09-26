@@ -97,6 +97,7 @@ import { wrapModel, unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import { SystemPromptState } from './agent-loop/system-prompt.js';
 import { HandlerList } from './agent-loop/handler-list.js';
+import { ProcessTracker } from './agent-loop/process-tracker.js';
 import { estimateTokens } from './token-estimator.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
@@ -511,9 +512,6 @@ function escapeBackgroundStateAttribute(value: string): string {
 // ---------------------------------------------------------------------------
 
 export class AgentLoop {
-  private static readonly globalTrackedPids = new Set<number>();
-  private static exitHandlerInstalled = false;
-
   private readonly agent: PiAgent;
   private readonly contextManager: ContextManager;
   private readonly eventBridge: EventBridge;
@@ -717,7 +715,7 @@ export class AgentLoop {
   private destroyPromise: Promise<void> | null = null;
 
   // Tracked subprocess PIDs for synchronous exit cleanup (Level 3 safety net)
-  private readonly trackedPids = new Set<number>();
+  private readonly processes = new ProcessTracker();
 
   // MCP Client Manager for tool server connections. May be an external
   // shared manager (config.mcpClientManager); ownership decides whether
@@ -960,10 +958,10 @@ export class AgentLoop {
     }
     this.mcpListenerUnsubscribers.push(
       this.mcpClientManager.addSubprocessSpawnedListener((pid) => {
-        this.trackPid(pid);
+        this.processes.track(pid);
       }),
       this.mcpClientManager.addSubprocessExitedListener((pid) => {
-        this.untrackPid(pid);
+        this.processes.untrack(pid);
       }),
       this.mcpClientManager.addToolsChangedListener(() => {
         this.refreshTools();
@@ -1081,9 +1079,6 @@ export class AgentLoop {
         this.refreshTools();
       }
     }
-
-    // Set up process exit safety net for orphaned subprocesses
-    this.setupExitHandler();
   }
 
   // -----------------------------------------------------------------------
@@ -3926,7 +3921,7 @@ export class AgentLoop {
       let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
       const forceKillPromise = new Promise<void>((resolve) => {
         forceKillTimer = setTimeout(() => {
-          this.forceKillAll();
+          this.processes.killAll();
           resolve();
         }, timeoutMs);
       });
@@ -4995,10 +4990,10 @@ export class AgentLoop {
         // the process-exit safety net cover background/auto-yielded
         // commands, not just MCP subprocesses.
         onProcessSpawned: (pid) => {
-          this.trackPid(pid);
+          this.processes.track(pid);
         },
         onProcessExited: (pid) => {
-          this.untrackPid(pid);
+          this.processes.untrack(pid);
         },
         onBackgroundTaskComplete: (taskId) => {
           void this.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId });
@@ -5471,53 +5466,6 @@ export class AgentLoop {
     // consumer's bounded post-mortem record of undelivered completed work,
     // and getDeadLetteredBackgroundResults() must still answer after
     // destroy() (which itself dead-letters anything still pending).
-  }
-
-  /**
-   * Force-kill all tracked subprocesses.
-   * Synchronous, last-resort fallback for unclean exits.
-   */
-  private forceKillAll(): void {
-    for (const pid of this.trackedPids) {
-      try {
-        process.kill(pid);
-      } catch {
-        // Process may have already exited
-      }
-      AgentLoop.globalTrackedPids.delete(pid);
-    }
-    this.trackedPids.clear();
-  }
-
-  /**
-   * Set up process exit handler for orphaned subprocess cleanup (Level 3 safety net).
-   */
-  private setupExitHandler(): void {
-    if (!AgentLoop.exitHandlerInstalled) {
-      process.on('exit', AgentLoop.handleProcessExit);
-      AgentLoop.exitHandlerInstalled = true;
-    }
-  }
-
-  private static handleProcessExit(): void {
-    for (const pid of AgentLoop.globalTrackedPids) {
-      try {
-        process.kill(pid);
-      } catch {
-        // Process may have already exited
-      }
-    }
-    AgentLoop.globalTrackedPids.clear();
-  }
-
-  private trackPid(pid: number): void {
-    this.trackedPids.add(pid);
-    AgentLoop.globalTrackedPids.add(pid);
-  }
-
-  private untrackPid(pid: number): void {
-    this.trackedPids.delete(pid);
-    AgentLoop.globalTrackedPids.delete(pid);
   }
 
   // -----------------------------------------------------------------------
@@ -6917,6 +6865,17 @@ export class AgentLoop {
     bytes[8] = (bytes[8]! & 0x3f) | 0x80;
     const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+
+  // -----------------------------------------------------------------------
+  // TEMPORARY test compat: old private names that tests still reach
+  // through casts, forwarding to the owning module. Pinned by
+  // tests/unit/agent-loop-internals-contract.test.ts; removed once the
+  // tests move onto the modules.
+  // -----------------------------------------------------------------------
+
+  private get trackedPids(): ReadonlySet<number> {
+    return this.processes.pids;
   }
 }
 
