@@ -27,17 +27,16 @@ import { NOOP_LOGGER } from '../noop-logger.js';
 import { errorMessageOf } from '../error-classifier.js';
 import {
   buildCancelDirective,
-  buildConversationBlock,
   buildLookupResultText,
   buildSpawnDirective,
   buildSteerDirective,
   buildWorkInputDirective,
   composeDispatchMessage,
-  DELTA_OVERFLOW_MARKER,
   wrapDeliveryForTalker,
 } from './prompts.js';
-import type { ConversationDelta } from './prompts.js';
 import type { CauseTag } from './cause-tags.js';
+import { ConversationDeltas } from './conversation-deltas.js';
+import type { ConversationDeltasState } from './conversation-deltas.js';
 import { asTrimmedString } from './control-tools.js';
 import type { ControlDispatchTarget } from './control-tools.js';
 import { PERMISSION_BROKER_DEFAULTS, PermissionBroker } from './permission-broker.js';
@@ -274,7 +273,7 @@ export function deliveryConcludes(
  * dedup, the token bucket, spacing) describes the moment, not the session,
  * and restarts clean.
  */
-export interface DuplexRouterState {
+export interface DuplexRouterState extends ConversationDeltasState {
   /**
    * The next task alias number. Aliases are how the talker, the transcript
    * and the user refer to work, so they never restart at task-1 over a
@@ -289,10 +288,6 @@ export interface DuplexRouterState {
    * restore would leave a result the user never heard looking delivered.
    */
   pendingDeliveries: string[];
-  /** Conversation the reasoner has not seen yet, flushed with the next dispatch. */
-  conversationDeltas: ConversationDelta[];
-  /** Whether that buffer already dropped lines (the next flush says so). */
-  conversationDeltasOverflowed: boolean;
 }
 
 /** One tracked delegation (a spawn_task dispatch), keyed by alias. */
@@ -331,10 +326,6 @@ interface PendingDelivery {
   enqueuedAt: number;
 }
 
-const DELTA_SPEAKERS: ReadonlySet<string> = new Set<ConversationDelta['speaker']>([
-  'user', 'assistant', 'consumer', 'lookup',
-]);
-
 /** FNV-1a 32-bit; cheap content identity for dedup, not security. */
 function fnv1a(input: string): number {
   let hash = 0x811c9dc5;
@@ -363,9 +354,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   private nextAliasNumber = 1;
 
   // Conversation deltas (D18), flushed into the next dispatch message.
-  private deltaBuffer: ConversationDelta[] = [];
-  private deltaBufferChars = 0;
-  private deltaOverflowed = false;
+  private readonly deltas: ConversationDeltas;
 
   // Dispatch backpressure (D19).
   private dispatchesThisTurn = 0;
@@ -420,6 +409,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.now = options?.now ?? Date.now;
     this.talkerLoopPath = ports.talkerLoopPath ?? 'talker';
     this.reasonerLoopPath = ports.reasonerLoopPath ?? 'reasoner';
+    this.deltas = new ConversationDeltas(this.options.deltaBufferMaxChars);
     this.interruptTokens = this.options.interruptBucketCapacity;
     this.lastTokenRefillAt = this.now();
 
@@ -479,17 +469,17 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * real usage data exists.
    */
   noteUserUtterance(text: string): void {
-    this.pushDelta({ speaker: 'user', text });
+    this.deltas.push({ speaker: 'user', text });
   }
 
   /** A talker reply: the other half of the conversation delta (F4). */
   noteTalkerReply(text: string): void {
-    this.pushDelta({ speaker: 'assistant', text });
+    this.deltas.push({ speaker: 'assistant', text });
   }
 
   /** Consumer-provided context for the work surface (no-wake work input). */
   noteWorkContext(text: string): void {
-    this.pushDelta({ speaker: 'consumer', text });
+    this.deltas.push({ speaker: 'consumer', text });
   }
 
   /**
@@ -497,7 +487,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * context without opening a new exchange.
    */
   noteUserContext(text: string): void {
-    this.pushDelta({ speaker: 'user', text });
+    this.deltas.push({ speaker: 'user', text });
   }
 
   /**
@@ -507,7 +497,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * the causation binding for the run).
    */
   composeWorkDispatch(content: string): string {
-    return composeDispatchMessage(this.consumeConversationBlock(), buildWorkInputDirective(content));
+    return composeDispatchMessage(this.deltas.consumeBlock(), buildWorkInputDirective(content));
   }
 
   /**
@@ -804,7 +794,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       ...(outcome.causeSeq !== null ? { causedBy: outcome.causeSeq } : {}),
     });
 
-    this.pushDelta({ speaker: 'lookup', text });
+    this.deltas.push({ speaker: 'lookup', text });
 
     const pending: PendingDelivery = { content: text, enqueuedAt: now };
     if (wake === 'interrupt') {
@@ -1259,7 +1249,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   /** Number of buffered conversation deltas awaiting a dispatch flush. */
   get deltaBufferSize(): number {
-    return this.deltaBuffer.length;
+    return this.deltas.size;
   }
 
   /**
@@ -1276,11 +1266,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   /** Drop buffered conversation deltas (abort scope 'work'/'all'). */
   dropWorkContext(): number {
-    const dropped = this.deltaBuffer.length;
-    this.deltaBuffer = [];
-    this.deltaBufferChars = 0;
-    this.deltaOverflowed = false;
-    return dropped;
+    return this.deltas.drop();
   }
 
   /**
@@ -1295,8 +1281,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         directiveSeqs: [...delegation.directiveSeqs],
       })),
       pendingDeliveries: [...this.interruptQueue, ...this.whenIdleQueue].map((item) => item.content),
-      conversationDeltas: this.deltaBuffer.map((delta) => ({ ...delta })),
-      conversationDeltasOverflowed: this.deltaOverflowed,
+      ...this.deltas.exportState(),
     };
   }
 
@@ -1350,12 +1335,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       this.delegations.set(delegation.alias, delegation);
     }
 
-    for (const delta of Array.isArray(state.conversationDeltas) ? state.conversationDeltas : []) {
-      if (typeof delta?.text === 'string' && DELTA_SPEAKERS.has(delta.speaker)) {
-        this.pushDelta({ speaker: delta.speaker, text: delta.text });
-      }
-    }
-    if (state.conversationDeltasOverflowed === true) this.deltaOverflowed = true;
+    this.deltas.restoreState(state);
 
     for (const content of Array.isArray(state.pendingDeliveries) ? state.pendingDeliveries : []) {
       if (typeof content !== 'string' || content.trim().length === 0) continue;
@@ -1427,7 +1407,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     causeSeq: number | null,
     options?: ReasonerDispatchOptions,
   ): boolean {
-    const message = composeDispatchMessage(this.consumeConversationBlock(), directive);
+    const message = composeDispatchMessage(this.deltas.consumeBlock(), directive);
     try {
       this.ports.dispatchToReasoner(message, causeSeq, options);
       return true;
@@ -1501,30 +1481,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       });
     }
     return receipt;
-  }
-
-  private consumeConversationBlock(): string | null {
-    if (this.deltaBuffer.length === 0) return null;
-    const deltas = this.deltaBuffer.splice(0);
-    this.deltaBufferChars = 0;
-    if (this.deltaOverflowed) {
-      deltas.unshift({ speaker: 'consumer', text: DELTA_OVERFLOW_MARKER });
-      this.deltaOverflowed = false;
-    }
-    return buildConversationBlock(deltas);
-  }
-
-  private pushDelta(delta: ConversationDelta): void {
-    this.deltaBuffer.push(delta);
-    this.deltaBufferChars += delta.text.length;
-    while (
-      this.deltaBufferChars > this.options.deltaBufferMaxChars &&
-      this.deltaBuffer.length > 1
-    ) {
-      const removed = this.deltaBuffer.shift()!;
-      this.deltaBufferChars -= removed.text.length;
-      this.deltaOverflowed = true;
-    }
   }
 
   private talkerCause(): { causedBy?: number } {
