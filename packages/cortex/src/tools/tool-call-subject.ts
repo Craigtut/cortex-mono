@@ -9,7 +9,7 @@
  * how it treats a non-string.
  */
 
-import { TOOL_NAMES } from './index.js';
+import { TOOL_NAMES } from './tool-names.js';
 
 export interface ToolCallSubject {
   /** Bash: the command line. */

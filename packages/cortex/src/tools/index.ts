@@ -120,17 +120,5 @@ export {
 // Tool name constants
 // ---------------------------------------------------------------------------
 
-export const TOOL_NAMES = {
-  Read: 'Read',
-  Write: 'Write',
-  Edit: 'Edit',
-  UndoEdit: 'UndoEdit',
-  Glob: 'Glob',
-  Grep: 'Grep',
-  Bash: 'Bash',
-  TaskOutput: 'TaskOutput',
-  WebFetch: 'WebFetch',
-  SubAgent: 'SubAgent',
-} as const;
-
-export type BuiltInToolName = keyof typeof TOOL_NAMES;
+export { TOOL_NAMES } from './tool-names.js';
+export type { BuiltInToolName } from './tool-names.js';

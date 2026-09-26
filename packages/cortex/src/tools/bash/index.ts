@@ -46,15 +46,7 @@ export const BashParams = Type.Object({
 
 export type BashParamsType = Static<typeof BashParams>;
 
-/**
- * Synthetic tool name a Bash escalation request is presented under at the
- * permission layer. A call with `escalateOutsideSandbox: true` (while a sandbox
- * provider is configured) reaches the consumer's resolvePermission under this
- * name instead of "Bash", so rules and auto-approve paths keyed on plain Bash
- * never silently approve an uncontained run, and the consumer can render a
- * distinct "run outside the sandbox?" prompt.
- */
-export const BASH_ESCALATION_PERMISSION_NAME = 'Bash(escalate)';
+export { BASH_ESCALATION_PERMISSION_NAME } from '../tool-names.js';
 
 /**
  * Whether a spawn-error code means the sandbox WRAPPER binary could not be found

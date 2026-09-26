@@ -14,8 +14,7 @@
  * run; a surface that needs certainty must read the tool call's own args.
  */
 
-import { TOOL_NAMES } from './tools/index.js';
-import { BASH_ESCALATION_PERMISSION_NAME } from './tools/bash/index.js';
+import { BASH_ESCALATION_PERMISSION_NAME, TOOL_NAMES } from './tools/tool-names.js';
 import { toolCallSubject } from './tools/tool-call-subject.js';
 
 /** Long enough that a real command line survives verbatim (D16: this is the string a human approves). */
