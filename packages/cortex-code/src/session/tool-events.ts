@@ -42,6 +42,50 @@ export interface ActivityRecordPorts {
   transcriptWriter: Pick<TranscriptWriter, 'addToolCall' | 'addToolResult'>;
 }
 
+/**
+ * Readers for the typed payload the EventBridge attaches to every tool event.
+ * The bridge always sets it for these types; the fallback reads the raw pi
+ * event on `data` so a payload-less event degrades instead of throwing.
+ */
+function rawData(event: CortexEvent): Record<string, unknown> {
+  return (event.data as Record<string, unknown> | undefined) ?? {};
+}
+
+function rawToolCallId(data: Record<string, unknown>): string {
+  return String(data['toolCallId'] ?? data['id'] ?? '');
+}
+
+export function readToolStart(event: CortexEvent): ToolCallStartPayload {
+  const payload = event.payload as ToolCallStartPayload | undefined;
+  if (payload) return payload;
+  const data = rawData(event);
+  return {
+    toolCallId: rawToolCallId(data),
+    toolName: String(data['toolName'] ?? 'unknown'),
+    args: (data['args'] as Record<string, unknown> | undefined) ?? {},
+  };
+}
+
+function readToolUpdate(event: CortexEvent): Pick<ToolCallUpdatePayload, 'toolCallId'> & { partialResult: unknown } {
+  const payload = event.payload as ToolCallUpdatePayload | undefined;
+  if (payload) return payload;
+  const data = rawData(event);
+  return { toolCallId: rawToolCallId(data), partialResult: data['partialResult'] };
+}
+
+export function readToolEnd(event: CortexEvent): Omit<ToolCallEndPayload, 'result'> & { result: unknown } {
+  const payload = event.payload as ToolCallEndPayload | undefined;
+  if (payload) return payload;
+  const data = rawData(event);
+  return {
+    toolCallId: rawToolCallId(data),
+    toolName: String(data['toolName'] ?? 'unknown'),
+    result: data['result'],
+    durationMs: Number(data['durationMs'] ?? data['duration'] ?? 0),
+    isError: Boolean(data['isError']),
+  };
+}
+
 /** Render the parent's tool calls as transcript rows; child calls update their sub-agent row. */
 export function wireToolRows(bridge: EventBridge, app: ToolRowApp, ports: ToolRowPorts): void {
   // Tool call lifecycle (uses typed payloads from EventBridge)
@@ -59,14 +103,11 @@ export function wireToolRows(bridge: EventBridge, app: ToolRowApp, ports: ToolRo
     // A tool starting means the agent is making progress again.
     ports.retry.noteProgress();
 
-    const p = event.payload as ToolCallStartPayload | undefined;
-    const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
+    const { toolName, toolCallId, args } = readToolStart(event);
 
     // SubAgent tool calls are displayed via the onSubAgentSpawned lifecycle hook
     if (toolName === 'SubAgent') return;
 
-    const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? Math.random());
-    const args = p?.args ?? ((event.data as Record<string, unknown> | undefined)?.['args'] as Record<string, unknown> ?? {});
     const displayArgs = buildToolDisplayArgs(toolName, args);
     const summary = summarizeToolStartArgs(toolName, toolCallId, args);
     const traceToolStarts = ports.freezeDiagnostics.isEnabled;
@@ -99,9 +140,7 @@ export function wireToolRows(bridge: EventBridge, app: ToolRowApp, ports: ToolRo
     if (event.childTaskId) return;
     if (ports.routing.isTalkerEvent(event)) return;
 
-    const p = event.payload as ToolCallUpdatePayload | undefined;
-    const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
-    const partialResult = p?.partialResult ?? (event.data as Record<string, unknown> | undefined)?.['partialResult'];
+    const { toolCallId, partialResult } = readToolUpdate(event);
 
     if (partialResult) {
       app.transcript.updateToolCall(toolCallId, partialResult);
@@ -117,19 +156,15 @@ export function wireToolRows(bridge: EventBridge, app: ToolRowApp, ports: ToolRo
     }
     if (ports.routing.isTalkerEvent(event)) return;
 
-    const p = event.payload as ToolCallEndPayload | undefined;
-    const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
+    const end = readToolEnd(event);
 
     // SubAgent tool_call_end is handled via onSubAgentCompleted/onSubAgentFailed
-    if (toolName === 'SubAgent') return;
+    if (end.toolName === 'SubAgent') return;
 
-    const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
-    const durationMs = p?.durationMs ?? Number((event.data as Record<string, unknown> | undefined)?.['durationMs'] ?? 0);
-
-    if (p?.isError && p.error) {
-      app.transcript.failToolCall(toolCallId, p.error, durationMs);
+    const { toolCallId, durationMs, result } = end;
+    if (end.isError && end.error) {
+      app.transcript.failToolCall(toolCallId, end.error, durationMs);
     } else {
-      const result = p?.result ?? (event.data as Record<string, unknown> | undefined)?.['result'];
       const details = (result as Record<string, unknown> | undefined)?.['details'];
       app.transcript.completeToolCall(toolCallId, result, details, durationMs);
     }
@@ -151,11 +186,7 @@ export function wireActivityRecords(bridge: EventBridge, ports: ActivityRecordPo
   });
 
   bridge.on('tool_call_start', (event: CortexEvent) => {
-    const p = event.payload as ToolCallStartPayload | undefined;
-    const data = event.data as Record<string, unknown> | undefined;
-    const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
-    const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? data?.['id'] ?? Math.random());
-    const args = p?.args ?? (data?.['args'] as Record<string, unknown> | undefined) ?? {};
+    const { toolName, toolCallId, args } = readToolStart(event);
     ports.activity.recordToolStarted({
       toolCallId,
       toolName,
@@ -166,22 +197,18 @@ export function wireActivityRecords(bridge: EventBridge, ports: ActivityRecordPo
   });
 
   bridge.on('tool_call_end', (event: CortexEvent) => {
-    const p = event.payload as ToolCallEndPayload | undefined;
-    const data = event.data as Record<string, unknown> | undefined;
-    const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
-    const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? data?.['id'] ?? '');
-    const isError = p?.isError ?? Boolean(data?.['isError']);
+    const { toolName, toolCallId, durationMs, isError, error, result } = readToolEnd(event);
     ports.activity.recordToolEnded({
       toolCallId,
       toolName,
-      durationMs: p?.durationMs ?? Number(data?.['durationMs'] ?? data?.['duration'] ?? 0),
+      durationMs,
       isError,
-      ...(p?.error ? { error: p.error } : {}),
+      ...(error ? { error } : {}),
       ...(event.childTaskId ? { childTaskId: event.childTaskId } : {}),
     });
-    const output = isError && p?.error
-      ? p.error
-      : extractToolResultText(p?.result ?? data?.['result']);
+    const output = isError && error
+      ? error
+      : extractToolResultText(result);
     ports.transcriptWriter.addToolResult(toolCallId, isError, output);
   });
 }

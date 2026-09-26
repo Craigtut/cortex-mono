@@ -5,8 +5,9 @@
  * update the parent SubAgent row, which lists what the child is doing.
  */
 
-import type { CortexEvent, ToolCallEndPayload, ToolCallStartPayload } from '@animus-labs/cortex';
+import type { CortexEvent } from '@animus-labs/cortex';
 import type { TranscriptManager } from '../tui/transcript.js';
+import { readToolEnd, readToolStart } from './tool-events.js';
 
 interface ChildToolActivity { name: string; status: string; summary?: string }
 
@@ -58,11 +59,7 @@ export class SubAgentActivity {
   toolStarted(event: CortexEvent): void {
     if (!event.childTaskId || !this.getApp()) return;
 
-    const p = event.payload as ToolCallStartPayload | undefined;
-    const data = event.data as Record<string, unknown> | undefined;
-    const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
-    const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? Math.random());
-    const args = p?.args ?? (data?.['args'] as Record<string, unknown> | undefined) ?? {};
+    const { toolName, toolCallId, args } = readToolStart(event);
     const summary = this.summarizeToolArgs(toolName, args);
 
     this.update(event.childTaskId, toolCallId, {
@@ -76,13 +73,8 @@ export class SubAgentActivity {
   toolEnded(event: CortexEvent): void {
     if (!event.childTaskId || !this.getApp()) return;
 
-    const p = event.payload as ToolCallEndPayload | undefined;
-    const data = event.data as Record<string, unknown> | undefined;
-    const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
-    const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? Math.random());
+    const { toolName, toolCallId, isError } = readToolEnd(event);
     const existing = this.tasks.get(event.childTaskId)?.get(toolCallId);
-
-    const isError = p?.isError ?? Boolean(data?.['isError']);
 
     this.update(event.childTaskId, toolCallId, {
       name: existing?.name ?? toolName,
