@@ -55,24 +55,11 @@ import { DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS } from './compaction/observa
 import { createRecallTool } from './compaction/observational/recall-tool.js';
 import { SubAgentManager } from './sub-agent-manager.js';
 import type { SkillRegistry } from './skill-registry.js';
-import { LOAD_SKILL_TOOL_NAME } from './skill-tool.js';
 import { createSubAgentTool, SUB_AGENT_TOOL_NAME } from './tools/sub-agent.js';
-import { createReadTool } from './tools/read.js';
-import { createWriteTool } from './tools/write.js';
-import { createEditTool } from './tools/edit.js';
-import { createUndoEditTool } from './tools/undo-edit.js';
-import { createGlobTool } from './tools/glob.js';
-import { createGrepTool } from './tools/grep.js';
 import {
-  createBashTool,
   BASH_ESCALATION_PERMISSION_NAME,
   isBashEscalationRequest,
 } from './tools/bash/index.js';
-import { createTaskOutputTool } from './tools/task-output.js';
-import { createWebFetchTool } from './tools/web-fetch/index.js';
-import { TOOL_NAMES } from './tools/index.js';
-import { DeferredToolRegistry } from './tools/tool-search/registry.js';
-import { createToolSearchTool } from './tools/tool-search/index.js';
 import { unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import { SystemPromptState } from './agent-loop/system-prompt.js';
@@ -83,12 +70,13 @@ import { wireLoopEvents } from './agent-loop/event-wiring.js';
 import { DirectCompletions } from './agent-loop/direct-completion.js';
 import { ModelSettings } from './agent-loop/model-settings.js';
 import { SkillBinding } from './agent-loop/skills.js';
+import { createBuiltinTools } from './agent-loop/builtin-tools.js';
+import { ToolRegistry } from './agent-loop/tool-registry.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { estimateTokens } from './token-estimator.js';
-import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
+import type { BackgroundTask, CortexToolRuntime } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { PromptWatchdogDiagnostics } from './prompt-diagnostics.js';
-import { assertValidCortexTool } from './tool-contract.js';
 import type { CortexTool } from './tool-contract.js';
 import type {
   CortexLogger,
@@ -125,11 +113,7 @@ import type {
   LoopOriginContext,
   ThinkingLevel,
   ModelThinkingCapabilities,
-  ToolExecuteContext,
-  PersistResultFn,
-  ToolCategory,
 } from './types.js';
-import { processToolResult } from './tool-result-persistence.js';
 import {
   clampToSupported,
   fromPiThinkingLevel,
@@ -510,29 +494,8 @@ export class AgentLoop {
   // Primary and utility models, context window limit, cache retention, session key.
   private readonly models: ModelSettings;
 
-  // Built-in tools registered at construction (distinct from MCP-discovered tools)
-  private readonly registeredTools: RegisteredTool[];
-  private readonly toolRuntime: CortexToolRuntime;
-  private currentPiTools: unknown[] = [];
-
-  // Deferred tool loading. When `_deferredToolsEnabled` is true, tools that
-  // match deferral criteria are pulled out of the per-turn tools array and
-  // announced by name via the `_available_tools` slot. The agent uses the
-  // ToolSearch tool to load specific tools on demand.
-  private readonly _deferredToolsEnabled: boolean;
-  private readonly _deferMcp: boolean;
-  private readonly _deferredAlwaysLoad: ReadonlySet<string>;
-  private readonly deferredToolRegistry: DeferredToolRegistry;
-
-  // Tool result persistence (proactive, at execution boundary).
-  // Same callback flows to compaction (reactive) via MicrocompactionConfig.
-  // `persistResult` is the consumer callback wrapped to stamp this loop's
-  // identity into metadata; `persistResultRaw` is the unwrapped consumer
-  // callback, inherited by child loops so they stamp their own path.
-  private readonly persistResult?: PersistResultFn;
-  private readonly persistResultRaw?: PersistResultFn;
-  private readonly toolCategories?: Record<string, ToolCategory>;
-  private readonly toolResultThresholds?: Record<string, number>;
+  // Registered and MCP tools, their pi adaptation, runtime, and result persistence
+  private readonly tools: ToolRegistry;
 
   // Compaction Manager
   private readonly compactionManager: CompactionManager;
@@ -733,10 +696,23 @@ export class AgentLoop {
     this.workingTagsEnabled = config.workingTags?.enabled ?? true;
     this.workingDirectory = config.workingDirectory;
     this.envOverrides = config.envOverrides;
-    this.toolRuntime = new CortexToolRuntime(this.workingDirectory);
+    this.tools = new ToolRegistry(config, {
+      mcpTools: () => this.mcpClientManager.getTools(),
+      writeAgentTools: (tools) => {
+        (this.agent.state as Record<string, unknown>)['tools'] = tools;
+      },
+      onToolsChanged: () => this.systemPrompt.refresh(),
+      refreshTools: () => this.refreshTools(),
+      slots: {
+        getSlot: (name) => this.contextManager.getSlot(name),
+        setSlot: (name, content) => this.contextManager.setSlot(name, content),
+      },
+      logger: this.logger,
+      loopPath: this.loopPath,
+    });
     this.systemPrompt = new SystemPromptState({
       agentState: () => this.agent.state,
-      hasTool: (name) => this.registeredTools.some((tool) => tool.name === name),
+      hasTool: (name) => this.tools.has(name),
       workingTagsEnabled: () => this.workingTagsEnabled,
       workingDirectory: this.workingDirectory,
     });
@@ -771,49 +747,33 @@ export class AgentLoop {
       logger: this.logger,
     });
 
-    // Resolve deferred tools config and create the registry up-front. Built-in
-    // tool creation needs the registry so it can wire ToolSearch's
-    // onAfterDiscovery callback to refreshTools().
-    this._deferredToolsEnabled = config.deferredTools?.enabled ?? false;
-    this._deferMcp = config.deferredTools?.deferMcp ?? true;
-    this._deferredAlwaysLoad = new Set(config.deferredTools?.alwaysLoad ?? []);
-    this.deferredToolRegistry = new DeferredToolRegistry();
-
     // Auto-register built-in tools, filtered by disableTools config
     const disabledSet = new Set(config.disableTools ?? []);
-    const builtinTools = this.createBuiltinTools(disabledSet);
-    this.registeredTools = this.normalizeRegisteredTools([...builtinTools, ...(tools ?? [])]);
+    const builtinTools = createBuiltinTools({
+      workingDirectory: this.workingDirectory,
+      runtime: this.tools.runtime,
+      config,
+      utilityComplete: (context, usageCategory) => this.utilityComplete(context, { usageCategory }),
+      processes: this.processes,
+      onBackgroundTaskComplete: (taskId) => {
+        void this.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId });
+      },
+      ...(this.tools.deferredEnabled
+        ? {
+            deferred: {
+              registry: this.tools.deferredRegistry,
+              onAfterDiscovery: () => this.refreshTools(),
+            },
+          }
+        : {}),
+    }, disabledSet);
+    this.tools.register([...builtinTools, ...(tools ?? [])]);
     this.models.applyToAgent();
 
     // Build the slot list. When using observational memory, append the
     // internal observation slot so it occupies the last slot position.
     const compactionConfig = buildCompactionConfig(config.compaction);
-
-    // Tool result persistence: top-level config.persistResult wins.
-    // Propagate it into MicrocompactionConfig so reactive paths (compaction
-    // trim, aggregate budget enforcement) and the proactive interceptor share
-    // the same callback.
-    if (config.persistResult && compactionConfig.microcompaction.persistResult
-      && compactionConfig.microcompaction.persistResult !== config.persistResult) {
-      this.logger.debug('top-level persistResult overrides compaction.microcompaction.persistResult');
-    }
-    // Backwards compatibility: a callback set only on the compaction config
-    // is used for the proactive interceptor as well.
-    const consumerPersistResult = config.persistResult ?? compactionConfig.microcompaction.persistResult;
-    if (consumerPersistResult) {
-      this.persistResultRaw = consumerPersistResult;
-      // Stamp this loop's identity into the metadata of every persistence
-      // call, proactive and reactive alike.
-      this.persistResult = (content, metadata) =>
-        consumerPersistResult(content, { ...metadata, loopPath: this.loopPath });
-      compactionConfig.microcompaction.persistResult = this.persistResult;
-    }
-    if (compactionConfig.microcompaction.toolCategories) {
-      this.toolCategories = compactionConfig.microcompaction.toolCategories;
-    }
-    if (config.toolResultThresholds) {
-      this.toolResultThresholds = config.toolResultThresholds;
-    }
+    this.tools.bindPersistence(config, compactionConfig.microcompaction);
 
     const compactionStrategy = compactionConfig.strategy ?? 'observational';
     // Slot ordering by stability (most stable first):
@@ -821,7 +781,7 @@ export class AgentLoop {
     //   2. consumer slots (consumer decides their own ordering)
     //   3. `_observations`   (changes potentially every turn)
     const slots: string[] = [];
-    if (this._deferredToolsEnabled) {
+    if (this.tools.deferredEnabled) {
       slots.push('_available_tools');
     }
     slots.push(...(config.slots ?? []));
@@ -967,13 +927,13 @@ export class AgentLoop {
         }),
         getModelId: () => this.models.primary.modelId,
       });
-      this.registeredTools.push(subAgentTool as RegisteredTool);
+      this.tools.registerInternal(subAgentTool as RegisteredTool);
     }
 
     // Create and register the load_skill tool.
     // Must be after the skill binding exists.
     if (options?.enableLoadSkillTool !== false) {
-      this.registeredTools.push(this.skills.createLoadSkillTool());
+      this.tools.registerInternal(this.skills.createLoadSkillTool());
     }
 
     // Adapt the normalized Cortex tool set to pi-agent-core's raw execute
@@ -1024,7 +984,7 @@ export class AgentLoop {
       const recallConfig = this.compactionManager.getRecallConfig();
       if (recallConfig) {
         const recallTool = createRecallTool(recallConfig);
-        this.registeredTools.push(recallTool as RegisteredTool);
+        this.tools.registerInternal(recallTool as RegisteredTool);
         this.refreshTools();
       }
     }
@@ -1302,7 +1262,7 @@ export class AgentLoop {
 
     // Long-lived mode keeps workspace state (cwd, read-before-edit registry,
     // undo history) across prompts; transient state resets regardless.
-    this.toolRuntime.resetForLoop(
+    this.tools.runtime.resetForLoop(
       this.config.persistentRuntime ? { preserveWorkspaceState: true } : undefined,
     );
     // Budget limits cover the whole logical turn: reset here (once per
@@ -2626,7 +2586,7 @@ export class AgentLoop {
     agentConfig['afterToolCall'] = async (ctx: unknown) => {
       const agent = cacheBreakpointState.agentLoop;
       if (!agent) return undefined;
-      agent.syncActiveLoopTools(ctx);
+      agent.tools.syncActiveLoopTools(ctx);
 
       const { toolCall, assistantMessage, args, result, isError } = ctx as {
         toolCall: { name: string };
@@ -2746,21 +2706,6 @@ export class AgentLoop {
         },
       );
     });
-  }
-
-  /**
-   * Extract safe, identifying fields from tool args for logging.
-   * Returns paths, commands, and patterns without content or results.
-   */
-  private static summarizeToolArgs(name: string, params: unknown): Record<string, unknown> {
-    if (!params || typeof params !== 'object') return {};
-    const subject = toolCallSubject(name, params);
-    if ('command' in subject) return { command: String(subject.command ?? '').slice(0, 200) };
-    if ('path' in subject) return { path: subject.path };
-    if ('pattern' in subject) return { pattern: subject.pattern, path: subject.scope };
-    if ('url' in subject) return { url: subject.url };
-    if ('taskId' in subject) return { taskId: subject.taskId };
-    return {};
   }
 
   private static buildPermissionReason(
@@ -3180,38 +3125,6 @@ export class AgentLoop {
   }
 
   /**
-   * Process a tool result through the result-persistence interceptor.
-   * Delegates to the shared `processToolResult` helper, supplying instance
-   * state (persistResult callback, tool categories, threshold overrides).
-   */
-  private applyToolResultPersistence(
-    toolName: string,
-    toolCallId: string,
-    result: unknown,
-  ): Promise<unknown> {
-    return processToolResult(result, {
-      toolName,
-      toolCallId,
-      persistResult: this.persistResult,
-      toolCategories: this.toolCategories,
-      thresholds: this.toolResultThresholds,
-    });
-  }
-
-  /**
-   * Pi 0.74 snapshots the agent state when prompt() starts. When ToolSearch
-   * loads deferred tools mid-run, keep the active loop context in sync so the
-   * next automatic provider call sees the newly loaded schemas.
-   */
-  private syncActiveLoopTools(ctx: unknown): void {
-    if (!this._deferredToolsEnabled) return;
-    if (!ctx || typeof ctx !== 'object') return;
-    const context = (ctx as { context?: { tools?: unknown[] } }).context;
-    if (!context || !Array.isArray(context.tools)) return;
-    context.tools = [...this.currentPiTools];
-  }
-
-  /**
    * Update the agent's tool set by adapting Cortex's canonical in-process
    * tool contract to pi-agent-core's raw execute signature.
    *
@@ -3220,64 +3133,7 @@ export class AgentLoop {
    * "deferred" set (announced by name in the `_available_tools` slot).
    */
   refreshTools(): void {
-    const mcpTools = this.mcpClientManager.getTools();
-    const candidateTools: CortexTool[] = [...this.registeredTools, ...mcpTools];
-
-    const { loaded, deferred } = this._deferredToolsEnabled
-      ? this.partitionDeferredTools(candidateTools)
-      : { loaded: candidateTools, deferred: [] as CortexTool[] };
-
-    if (this._deferredToolsEnabled) {
-      this.deferredToolRegistry.setDeferredPool(deferred);
-      this.updateAvailableToolsSlot();
-    }
-
-    const allTools = loaded.map(tool => {
-      const toolWithOptionalLabel = tool as unknown as { label?: unknown; name: string };
-      const label = typeof toolWithOptionalLabel.label === 'string'
-        ? toolWithOptionalLabel.label
-        : tool.name;
-
-      return {
-        ...tool,
-        label,
-        execute: async (
-          toolCallId: string,
-          params: unknown,
-          signal?: AbortSignal,
-          onUpdate?: (partialResult: unknown) => void,
-        ) => {
-          const context: ToolExecuteContext = { toolCallId };
-          if (signal) context.signal = signal;
-          if (onUpdate) context.onUpdate = onUpdate;
-          const toolStartMs = Date.now();
-          const result = await tool.execute(params, context);
-          this.logger.debug('[Tool] executed', {
-            name: tool.name,
-            durationMs: Date.now() - toolStartMs,
-            ...AgentLoop.summarizeToolArgs(tool.name, params),
-          });
-          // Already correct format: must have content as a non-empty array
-          if (result && typeof result === 'object' && 'content' in (result as Record<string, unknown>)) {
-            const asObj = result as Record<string, unknown>;
-            if (Array.isArray(asObj['content']) && asObj['content'].length > 0) {
-              return await this.applyToolResultPersistence(tool.name, toolCallId, result);
-            }
-            // Has 'content' key but it's undefined, null, empty, or non-array.
-            // Fall through to wrap as text.
-          }
-          // Wrap string/primitive return values
-          const wrapped = {
-            content: [{ type: 'text', text: typeof result === 'string' ? result : String(result ?? '') }],
-            details: {},
-          };
-          return await this.applyToolResultPersistence(tool.name, toolCallId, wrapped);
-        },
-      };
-    });
-    this.currentPiTools = allTools;
-    (this.agent.state as Record<string, unknown>)['tools'] = allTools;
-    this.systemPrompt.refresh();
+    this.tools.refresh();
   }
 
   /**
@@ -3290,9 +3146,7 @@ export class AgentLoop {
    * name, or the same name arriving via MCP, still goes to the resolver.
    */
   isToolPermissionExempt(toolName: string): boolean {
-    if (toolName === SUB_AGENT_TOOL_NAME) return true;
-    const tool = this.registeredTools.find((t) => t.name === toolName);
-    return tool !== undefined && tool.permissionExempt === true && tool.isMcp !== true;
+    return this.tools.isPermissionExempt(toolName);
   }
 
   /**
@@ -3301,15 +3155,7 @@ export class AgentLoop {
    * creation based on user permission changes).
    */
   addConsumerTool(tool: CortexTool): void {
-    const normalized = this.normalizeRegisteredTools([tool]);
-    if (normalized.length === 0) return;
-    const existing = this.registeredTools.findIndex(t => t.name === tool.name);
-    if (existing >= 0) {
-      this.registeredTools[existing] = normalized[0]!;
-    } else {
-      this.registeredTools.push(normalized[0]!);
-    }
-    this.refreshTools();
+    this.tools.add(tool);
   }
 
   /**
@@ -3317,61 +3163,7 @@ export class AgentLoop {
    * Built-in tools cannot be removed.
    */
   removeConsumerTool(toolName: string): void {
-    const idx = this.registeredTools.findIndex(t => t.name === toolName);
-    if (idx >= 0) {
-      this.registeredTools.splice(idx, 1);
-      this.refreshTools();
-    }
-  }
-
-  /**
-   * Partition candidate tools into "loaded" (sent on every turn) and
-   * "deferred" (announced by name in the `_available_tools` slot).
-   *
-   * A tool is deferred when:
-   *   - It is not in the consumer's `alwaysLoad` allowlist, AND
-   *   - Its `alwaysLoad` field is not true, AND
-   *   - It has not been discovered via ToolSearch this session, AND
-   *   - Either `tool.shouldDefer === true` OR
-   *     (`tool.isMcp === true` AND `_deferMcp` is true)
-   */
-  private partitionDeferredTools(
-    candidates: readonly CortexTool[],
-  ): { loaded: CortexTool[]; deferred: CortexTool[] } {
-    const discovered = this.deferredToolRegistry.getDiscovered();
-    const loaded: CortexTool[] = [];
-    const deferred: CortexTool[] = [];
-
-    for (const tool of candidates) {
-      if (this.shouldDeferTool(tool, discovered)) {
-        deferred.push(tool);
-      } else {
-        loaded.push(tool);
-      }
-    }
-    return { loaded, deferred };
-  }
-
-  private shouldDeferTool(tool: CortexTool, discovered: ReadonlySet<string>): boolean {
-    if (tool.alwaysLoad === true) return false;
-    if (this._deferredAlwaysLoad.has(tool.name)) return false;
-    if (discovered.has(tool.name)) return false;
-    if (tool.shouldDefer === true) return true;
-    if (tool.isMcp === true && this._deferMcp) return true;
-    return false;
-  }
-
-  /**
-   * Update the `_available_tools` slot if its content has actually changed.
-   * Skipping no-op writes preserves the prompt cache: identical bytes mean
-   * the cached prefix stays valid for the next API call.
-   */
-  private updateAvailableToolsSlot(): void {
-    const newContent = this.deferredToolRegistry.formatSlotContent();
-    const current = this.contextManager.getSlot('_available_tools');
-    if (newContent !== current) {
-      this.contextManager.setSlot('_available_tools', newContent);
-    }
+    this.tools.remove(toolName);
   }
 
   /**
@@ -4470,119 +4262,6 @@ export class AgentLoop {
   // Private: Model resolution
   // -----------------------------------------------------------------------
 
-  /**
-   * Create built-in tool instances, excluding any in the disabled set.
-   */
-  private createBuiltinTools(disabled: Set<string>): RegisteredTool[] {
-    const tools: RegisteredTool[] = [];
-    const cwd = this.workingDirectory;
-    const runtime = this.toolRuntime;
-    // In-tool path allowlist for the read-surface tools (Read, Glob, Grep).
-    // Enforced in the tools themselves, never by prompt: restricted loops
-    // (duplex quick lookups) speak their answers, so an out-of-scope read is
-    // an exfiltration path regardless of what the model was told.
-    const allowedRoots = this.config.readPathAllowlist;
-
-    if (!disabled.has(TOOL_NAMES.Read)) {
-      tools.push(createReadTool({ runtime, allowedRoots }) as RegisteredTool);
-    }
-    if (!disabled.has(TOOL_NAMES.Write)) {
-      tools.push(createWriteTool({ runtime }) as RegisteredTool);
-    }
-    if (!disabled.has(TOOL_NAMES.Edit)) {
-      tools.push(createEditTool({ runtime }) as RegisteredTool);
-    }
-    if (!disabled.has(TOOL_NAMES.UndoEdit)) {
-      tools.push(createUndoEditTool({ runtime }) as RegisteredTool);
-    }
-    if (!disabled.has(TOOL_NAMES.Glob)) {
-      tools.push(createGlobTool({ defaultCwd: cwd, allowedRoots }) as RegisteredTool);
-    }
-    if (!disabled.has(TOOL_NAMES.Grep)) {
-      // Thread the sandbox so ripgrep content search runs inside the same OS
-      // boundary as shell commands (enforces denyRead over secrets). No-op when
-      // no provider is configured.
-      tools.push(createGrepTool({
-        defaultCwd: cwd,
-        sandbox: this.config.sandbox,
-        allowedRoots,
-      }) as RegisteredTool);
-    }
-    if (!disabled.has(TOOL_NAMES.Bash)) {
-      tools.push(createBashTool({
-        runtime,
-        utilityComplete: (context) => this.utilityComplete(context as {
-          systemPrompt: string;
-          messages: Array<{ role: string; content: string }>;
-        }, { usageCategory: 'bash_utility' }),
-        isAutoApprove: () => this.config.isAutoApprove?.() ?? false,
-        // Track spawned shell PIDs so destroy()'s force-kill deadline and
-        // the process-exit safety net cover background/auto-yielded
-        // commands, not just MCP subprocesses.
-        onProcessSpawned: (pid) => {
-          this.processes.track(pid);
-        },
-        onProcessExited: (pid) => {
-          this.processes.untrack(pid);
-        },
-        onBackgroundTaskComplete: (taskId) => {
-          void this.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId });
-        },
-        sandbox: this.config.sandbox,
-        // The resolvePermission adaptation (beforeToolCall) screens every call
-        // before execute(), presenting escalation requests under a distinct
-        // name. That gate is what authorizes escalateOutsideSandbox; without a
-        // resolver the tool refuses escalation (fail closed).
-        permissionGated: this.config.resolvePermission !== undefined,
-        // Consumer tool tuning (AgentLoopConfig.bash).
-        shellPath: this.config.bash?.shellPath,
-        autoYieldThreshold: this.config.bash?.autoYieldThreshold,
-      }) as RegisteredTool);
-    }
-    if (!disabled.has(TOOL_NAMES.TaskOutput)) {
-      tools.push(createTaskOutputTool() as RegisteredTool);
-    }
-    if (!disabled.has(TOOL_NAMES.WebFetch)) {
-      tools.push(createWebFetchTool({
-        runtime,
-        // Wire the utility model for WebFetch summarization.
-        // Uses a lazy callback so it resolves against the current utility model
-        // (which may change at runtime via setModel).
-        utilityComplete: (context) => this.utilityComplete(context as {
-          systemPrompt: string;
-          messages: Array<{ role: string; content: string }>;
-        }, { usageCategory: 'webfetch' }),
-        // The consumer's unified egress gate, shared with sandboxed shell
-        // egress. Undefined = ungated, exactly as before.
-        resolveNetworkAccess: this.config.resolveNetworkAccess,
-        // Consumer tool tuning (AgentLoopConfig.webFetch).
-        maxPerLoop: this.config.webFetch?.maxPerLoop,
-      }) as RegisteredTool);
-    }
-    // ToolSearch is auto-registered when deferred tools are enabled. The
-    // consumer cannot disable it via disableTools (the agent has no other way
-    // to load deferred tool schemas).
-    if (this._deferredToolsEnabled) {
-      tools.push(createToolSearchTool({
-        registry: this.deferredToolRegistry,
-        onAfterDiscovery: () => this.refreshTools(),
-      }) as RegisteredTool);
-    }
-
-    return tools;
-  }
-
-  /**
-   * Normalize registered tools so this agent owns fresh mutable state and
-   * everything stored internally uses Cortex's canonical tool contract.
-   */
-  private normalizeRegisteredTools(tools: RegisteredTool[]): RegisteredTool[] {
-    return tools.map((tool) => {
-      const runtimeOwnedTool = cloneRuntimeAwareTool(tool, this.toolRuntime) ?? tool;
-      return assertValidCortexTool(runtimeOwnedTool);
-    });
-  }
-
   // -----------------------------------------------------------------------
   // Private: Lifecycle helpers
   // -----------------------------------------------------------------------
@@ -4709,7 +4388,7 @@ export class AgentLoop {
 
     // 8. Clean up compaction manager
     this.compactionManager.destroy();
-    this.toolRuntime.destroy();
+    this.tools.runtime.destroy();
 
     // 9. Clear all handler arrays
     this.loopCompleteHandlers.clear();
@@ -5005,7 +4684,7 @@ export class AgentLoop {
     }
 
     // Running background bash processes
-    const bgTasks = this.toolRuntime.backgroundTasks.getAll();
+    const bgTasks = this.tools.runtime.backgroundTasks.getAll();
     for (const [taskId, task] of bgTasks) {
       if (task.completed) continue;
 
@@ -5650,7 +5329,7 @@ export class AgentLoop {
     if (item.kind === 'subagent') {
       return this.formatBackgroundResult(item.taskId, item.result);
     }
-    const task = this.toolRuntime.backgroundTasks.get(item.taskId);
+    const task = this.tools.runtime.backgroundTasks.get(item.taskId);
     if (!task || !task.completed || task.notified) return null;
     task.notified = true;
     return this.formatBashCompletion(task);
@@ -5777,8 +5456,10 @@ export class AgentLoop {
     // Inherit tool result persistence so child tool calls (Bash, Grep, WebFetch
     // inside a sub-agent doing research) get the same protection as the parent.
     // The raw consumer callback, so the child stamps its own loopPath.
-    if (this.persistResultRaw) childCortexConfig.persistResult = this.persistResultRaw;
-    if (this.toolResultThresholds) childCortexConfig.toolResultThresholds = this.toolResultThresholds;
+    const rawPersistResult = this.tools.rawPersistResult;
+    if (rawPersistResult) childCortexConfig.persistResult = rawPersistResult;
+    const thresholds = this.tools.resultThresholds;
+    if (thresholds) childCortexConfig.toolResultThresholds = thresholds;
     if (this.config.resolvePermission) {
       childCortexConfig.resolvePermission = this.wrapChildPermissionResolver(
         this.config.resolvePermission,
@@ -5795,7 +5476,7 @@ export class AgentLoop {
       missingDependencyMessage: string;
     } = {
       cortexConfig: childCortexConfig,
-      tools: this.buildChildToolSet(effectiveTools),
+      tools: this.tools.childInheritable(effectiveTools),
       constructorOptions: {
         enableSubAgentTool: false,
         enableLoadSkillTool: false,
@@ -6026,39 +5707,6 @@ export class AgentLoop {
   }
 
   /**
-   * Build the tool set for a child agent.
-   * SubAgent and load_skill are always excluded from child agents.
-   */
-  private buildChildToolSet(
-    requestedTools?: string[],
-  ): RegisteredTool[] {
-    const parentTools = [...this.registeredTools, ...this.getMcpTools()];
-    // Exclude SubAgent, LoadSkill (disabled for children), and all built-in
-    // tools (the child's constructor creates its own built-in instances).
-    const builtInNames = new Set(Object.values(TOOL_NAMES));
-    const excludedNames = new Set([
-      SUB_AGENT_TOOL_NAME,
-      LOAD_SKILL_TOOL_NAME,
-      ...builtInNames,
-    ]);
-
-    let filteredTools: typeof parentTools;
-
-    if (requestedTools && requestedTools.length > 0) {
-      // Filter to only requested non-built-in tools
-      const requested = new Set(requestedTools);
-      filteredTools = parentTools.filter(
-        t => requested.has(t.name) && !excludedNames.has(t.name),
-      );
-    } else {
-      // Inherit non-built-in parent tools (e.g., MCP tools)
-      filteredTools = parentTools.filter(t => !excludedNames.has(t.name));
-    }
-
-    return filteredTools;
-  }
-
-  /**
    * Generate a unique task ID for sub-agents.
    */
   private generateTaskId(): string {
@@ -6080,6 +5728,18 @@ export class AgentLoop {
 
   private get trackedPids(): ReadonlySet<number> {
     return this.processes.pids;
+  }
+
+  private get registeredTools(): RegisteredTool[] {
+    return this.tools.registered;
+  }
+
+  private get toolRuntime(): CortexToolRuntime {
+    return this.tools.runtime;
+  }
+
+  private buildChildToolSet(requestedTools?: string[]): RegisteredTool[] {
+    return this.tools.childInheritable(requestedTools);
   }
 }
 

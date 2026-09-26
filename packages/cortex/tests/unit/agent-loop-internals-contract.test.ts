@@ -47,6 +47,9 @@ type Kind = 'getter' | 'accessor' | 'method';
 
 const COMPAT: Record<string, Kind> = {
   trackedPids: 'getter',
+  registeredTools: 'getter',
+  toolRuntime: 'getter',
+  buildChildToolSet: 'method',
 };
 
 function descriptorOf(name: string): PropertyDescriptor | undefined {
@@ -69,6 +72,20 @@ describe('AgentLoop test-compat contract', () => {
       }
     });
   }
+
+  it('registeredTools is the registry\'s live list', () => {
+    const loop = createLoop();
+    const internals = loop as unknown as { registeredTools: Array<{ name: string }> };
+    const before = internals.registeredTools;
+    loop.addConsumerTool({
+      name: 'contract_probe',
+      description: 'probe',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => 'ok',
+    } as never);
+    expect(internals.registeredTools).toBe(before);
+    expect(before.some((tool) => tool.name === 'contract_probe')).toBe(true);
+  });
 
   it('trackedPids reads the process tracker', () => {
     const loop = createLoop() as unknown as { trackedPids: ReadonlySet<number> };
