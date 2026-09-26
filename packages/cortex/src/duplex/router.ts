@@ -44,7 +44,8 @@ import { ConversationDeltas } from './conversation-deltas.js';
 import type { ConversationDeltasState } from './conversation-deltas.js';
 import { asTrimmedString } from './control-tools.js';
 import type { ControlDispatchTarget } from './control-tools.js';
-import { PERMISSION_BROKER_DEFAULTS, PermissionBroker } from './permission-broker.js';
+import { PERMISSION_BROKER_DEFAULTS } from './permission-broker.js';
+import type { AskAnswerOutcome } from './permission-broker.js';
 import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
 import type { QuickLookupOutcome, QuickLookupRequestResult } from './quick-lookups.js';
 
@@ -114,15 +115,12 @@ export interface DuplexRouterPorts {
    */
   currentReasonerCauseTags(): readonly CauseTag[];
   /**
-   * Wake-deliver a permission-ask voicing to the talker, carrying its
-   * ask-kind cause tag. The reserved ask lane (communication.md): calls
-   * arrive from the broker directly and must reach the talker without the
-   * delivery token bucket, dedup, spacing hold, or queues, because the loop
-   * that raised the ask blocks for as long as the voicing is delayed.
+   * Settle a permission ask from the talker's answer_ask (the broker's
+   * answer, where the D16 consent rules live).
    */
-  voiceAskToTalker(content: string, causeTag: CauseTag): void;
-  /** Mark a loop-registry pending ask as voiced (broker voicing sync). */
-  markAskVoiced?(askId: string): void;
+  answerAsk(askId: unknown, decision: unknown, reason: unknown): AskAnswerOutcome;
+  /** Asks blocked on the user right now (the watchdog reports a wait). */
+  pendingAsks(): ReadonlyArray<{ toolName: string; requestedAt: number }>;
   /**
    * Start a facade-spawned quick lookup (D13): an ephemeral read-only
    * sub-agent, never a reasoner directive. causeSeq is the log seq of the
@@ -226,6 +224,8 @@ export const DUPLEX_ROUTER_DEFAULTS = {
   watchdogIntervalMs: 90_000,
   delegationMaxAgeMs: 1_800_000,
   deltaBufferMaxChars: 16_000,
+  // Ask timeouts and voicing cadence are read by the session's permission
+  // broker; they sit here because consumer duplex tuning is one record.
   askTimeoutMs: PERMISSION_BROKER_DEFAULTS.askTimeoutMs,
   escalationAskTimeoutMs: PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs,
   settleVoiceDelayMs: PERMISSION_BROKER_DEFAULTS.settleVoiceDelayMs,
@@ -315,9 +315,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   private lastReasonerOutputAt = 0;
   private readonly watchdog: LivenessWatchdog;
 
-  // Permission broker (D16): the consent boundary for every ask in duplex.
-  private readonly broker: PermissionBroker;
-
   private destroyed = false;
 
   constructor(ports: DuplexRouterPorts, options?: DuplexRouterOptions) {
@@ -366,37 +363,12 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       },
     );
 
-    this.broker = new PermissionBroker(
-      {
-        appendLog: (input) => this.ports.appendLog(input),
-        voiceToTalker: (content, causeTag) => {
-          // The reserved ask lane: no token bucket, no dedup, no queues.
-          // Voicing stamps the spacing clock so queued normal deliveries
-          // hold off for one spacing window behind a fresh ask instead of
-          // talking over it.
-          this.scheduler.stampReservedLane();
-          this.ports.voiceAskToTalker(content, causeTag);
-        },
-        currentTalkerCauseTags: () => this.ports.currentTalkerCauseTags(),
-        ...(ports.markAskVoiced
-          ? { markAskVoiced: (askId: string) => this.ports.markAskVoiced!(askId) }
-          : {}),
-        ...(ports.logger ? { logger: ports.logger } : {}),
-      },
-      {
-        askTimeoutMs: this.options.askTimeoutMs,
-        escalationAskTimeoutMs: this.options.escalationAskTimeoutMs,
-        settleVoiceDelayMs: this.options.settleVoiceDelayMs,
-        now: this.now,
-      },
-    );
-
     this.watchdog = new LivenessWatchdog(
       {
         runStartedAt: () => (this.reasonerRunning ? this.reasonerRunStartAt : null),
         lastOutputAt: () => this.lastReasonerOutputAt,
         activeAliases: () => this.delegations.activeAliases(),
-        pendingAsks: () => this.broker.getPendingAsks(),
+        pendingAsks: () => this.ports.pendingAsks(),
         // Rides the normal intake (log entry, dedup, spacing); marks itself
         // synthetic and resets the silence clock through lastReasonerOutputAt.
         reportProgress: (text) => {
@@ -703,7 +675,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // log (D16) without one spraying turn growing it unboundedly (N4). No
     // delegation caps here: refusing a user's permission answer on a rate
     // cap would be the worse failure, same rule as cancel_task.
-    const outcome = this.broker.answer(askIdRaw, decisionRaw, reasonRaw);
+    const outcome = this.ports.answerAsk(askIdRaw, decisionRaw, reasonRaw);
     if (outcome.refusal !== undefined) {
       return this.policy.refuse('answer_ask', outcome.refusal, outcome.receipt);
     }
@@ -849,9 +821,12 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     return this.delegations.snapshot();
   }
 
-  /** The consent boundary for every permission ask in duplex (D16). */
-  get permissionBroker(): PermissionBroker {
-    return this.broker;
+  /**
+   * Content just went to the talker through the reserved ask lane: queued
+   * deliveries hold off one spacing window behind it (DeliveryScheduler).
+   */
+  stampReservedLane(): void {
+    this.scheduler.stampReservedLane();
   }
 
   /**
@@ -942,9 +917,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   /** Reset the router wholesale (facade restore()). */
   resetForRestore(): void {
-    // Pending asks belong to the replaced session; every resolver settles
-    // as deny so no loop stays blocked on an ask nobody can answer anymore.
-    this.broker.reset();
     this.scheduler.reset();
     this.dropWorkContext();
     this.delegations.clear();
@@ -956,9 +928,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    // Settle every pending ask first so no resolver promise outlives the
-    // router: a hanging ask would block its loop into the force-kill path.
-    this.broker.destroy();
     this.watchdog.destroy();
     this.scheduler.destroy();
   }

@@ -9,6 +9,7 @@ import {
   destroyLiveFacades,
   duplexRouterOf,
   entriesOfType,
+  getBroker,
   waitUntil,
 } from './duplex-scenario-harness.js';
 
@@ -70,5 +71,38 @@ describe('DuplexSession wiring order', () => {
     // The implicit final-text delivery was already logged when the merged
     // stream forwarded loop_end: session handlers run before consumers'.
     expect(deliveriesAtLoopEnd).toEqual([1]);
+  });
+});
+
+describe('the session owns the permission broker lifecycle', () => {
+  function pendingNetworkAsk(h: ReturnType<typeof createDuplexScenario>): { reason: () => string | undefined } {
+    let reason: string | undefined;
+    void getBroker(h.facade).requestDecision({
+      askId: 'ask-net-1',
+      loopPath: 'reasoner',
+      toolName: 'NetworkAccess',
+      renderedRequest: 'NetworkAccess (shell): example.com:443',
+      kind: 'network',
+    }).then((decision) => { reason = decision.reason; });
+    return { reason: () => reason };
+  }
+
+  it('a restore settles asks of the replaced session as deny', async () => {
+    const h = createDuplexScenario();
+    const ask = pendingNetworkAsk(h);
+    expect(getBroker(h.facade).pendingAskCount).toBe(1);
+    const state = await h.facade.getState();
+    await h.facade.restore(state);
+    await waitUntil(() => ask.reason() !== undefined, 2000, 'the ask settled');
+    expect(ask.reason()).toContain('restored');
+    expect(getBroker(h.facade).pendingAskCount).toBe(0);
+  });
+
+  it('destroy settles every pending ask so no resolver can hang', async () => {
+    const h = createDuplexScenario();
+    const ask = pendingNetworkAsk(h);
+    await h.facade.destroy();
+    await waitUntil(() => ask.reason() !== undefined, 2000, 'the ask settled');
+    expect(ask.reason()).toContain('shut down');
   });
 });

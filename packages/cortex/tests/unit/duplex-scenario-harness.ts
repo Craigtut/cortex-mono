@@ -31,6 +31,7 @@ import { CortexAgent } from '../../src/cortex-agent.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
 import type { PermissionBroker } from '../../src/duplex/permission-broker.js';
 import type { DuplexRouter } from '../../src/duplex/router.js';
+import type { DuplexSession } from '../../src/duplex/session.js';
 import type { SessionLogEntry } from '../../src/session-log.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 import { partsOf } from './agent-loop/parts.js';
@@ -818,14 +819,19 @@ export function roles(messages: AgentMessage[]): string[] {
 }
 
 /**
- * The duplex facade's router. The one cast into the facade's internals that
+ * The duplex facade's session. The one cast into the facade's internals that
  * every suite goes through, so a renamed field breaks here, loudly, instead
  * of in each suite (or silently, for a write through a stale path).
  */
+export function duplexSessionOf(facade: CortexAgent): DuplexSession {
+  const session = (facade as unknown as { duplex?: DuplexSession | null }).duplex;
+  if (!session?.router) throw new Error('duplexSessionOf: not a duplex facade, or its internals moved');
+  return session;
+}
+
+/** The duplex facade's router. */
 export function duplexRouterOf(facade: CortexAgent): DuplexRouter {
-  const session = (facade as unknown as { duplex?: { router?: DuplexRouter } | null }).duplex;
-  if (!session?.router) throw new Error('duplexRouterOf: not a duplex facade, or its internals moved');
-  return session.router;
+  return duplexSessionOf(facade).router;
 }
 
 /** Talker-waking deliveries the router is still holding. */
@@ -835,7 +841,7 @@ export function heldDeliveryCount(facade: CortexAgent): number {
 
 /** The duplex facade's consent boundary. */
 export function getBroker(facade: CortexAgent): PermissionBroker {
-  return duplexRouterOf(facade).permissionBroker;
+  return duplexSessionOf(facade).broker;
 }
 
 /** Log entries of one type, in seq order. */

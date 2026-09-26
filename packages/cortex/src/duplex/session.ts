@@ -32,7 +32,8 @@ import { collectCauseTags, latestCauseSeq } from './cause-tags.js';
 import type { CauseTag } from './cause-tags.js';
 import { DuplexRouter } from './router.js';
 import type { DuplexRouterPorts, DuplexRouterState } from './router.js';
-import type { PermissionBroker } from './permission-broker.js';
+import { PermissionBroker } from './permission-broker.js';
+import type { PermissionBrokerPorts } from './permission-broker.js';
 import { FanOutContextManager } from './fanout-context-manager.js';
 import { DuplexHeadlines, summarizeHeadlineArgs } from './headlines.js';
 import { stripAskFence } from './ask-fence.js';
@@ -95,6 +96,8 @@ export class DuplexSession {
   readonly reasoner: AgentLoop;
   readonly talker: AgentLoop;
   readonly router: DuplexRouter;
+  /** The consent boundary for every permission ask in the session (D16). */
+  readonly broker: PermissionBroker;
   private readonly services: DuplexSessionServices;
   private readonly recorder: LogRecorder;
   private readonly logger: CortexLogger;
@@ -196,7 +199,17 @@ export class DuplexSession {
       destroyed,
       logger: this.logger,
     });
-    this.router = new DuplexRouter(this.routerPorts(config), routerOptionsFrom(config.duplex));
+    const routerOptions = routerOptionsFrom(config.duplex);
+    this.broker = new PermissionBroker(this.brokerPorts(), {
+      ...(routerOptions.askTimeoutMs !== undefined ? { askTimeoutMs: routerOptions.askTimeoutMs } : {}),
+      ...(routerOptions.escalationAskTimeoutMs !== undefined
+        ? { escalationAskTimeoutMs: routerOptions.escalationAskTimeoutMs }
+        : {}),
+      ...(routerOptions.settleVoiceDelayMs !== undefined
+        ? { settleVoiceDelayMs: routerOptions.settleVoiceDelayMs }
+        : {}),
+    });
+    this.router = new DuplexRouter(this.routerPorts(config), routerOptions);
     this.headlines = new DuplexHeadlines({
       reasonerRunning: () => reasoner.isPrompting,
       reasonerUsage: () => reasoner.getSessionUsage(),
@@ -209,7 +222,7 @@ export class DuplexSession {
       // never cleared, so a voicing the broker later withdrew still reads as
       // heard there, and the block would offer a request as answerable that
       // the router would refuse an answer for.
-      pendingAsks: () => this.router.permissionBroker.getPendingAsks(),
+      pendingAsks: () => this.broker.getPendingAsks(),
     });
     this.outcomes = new ReasonerOutcomeReporter({
       reasoner,
@@ -235,11 +248,6 @@ export class DuplexSession {
       workLoopPath: reasoner.loopPath,
       logger: this.logger,
     });
-  }
-
-  /** The broker the brokered resolvers route `ask` decisions through. */
-  get broker(): PermissionBroker {
-    return this.router.permissionBroker;
   }
 
   /** Adopt the facade-minted MCP manager this session must close. */
@@ -278,10 +286,35 @@ export class DuplexSession {
       currentTalkerCauseSeq: () => latestCauseSeq(talker.activeRunCauseTags),
       currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
       currentReasonerCauseTags: () => collectCauseTags(reasoner.activeRunCauseTags),
-      // The broker's ask lane: a real wake delivery carrying the ask-kind
+      answerAsk: (askId, decision, reason) => this.broker.answer(askId, decision, reason),
+      pendingAsks: () => this.broker.getPendingAsks(),
+      workRefusal: () => this.aggregate.workRefusal(),
+      idleSignal: config.idleSignal,
+      logger: this.logger,
+      talkerLoopPath: talker.loopPath,
+      reasonerLoopPath: reasoner.loopPath,
+    };
+  }
+
+  private brokerPorts(): PermissionBrokerPorts {
+    const { talker, reasoner } = this;
+    return {
+      appendLog: (input) => this.recorder.append({
+        type: input.type,
+        loopPath: input.loopPath,
+        content: input.content,
+        causedBy: input.causedBy ?? null,
+        ...(input.wake !== undefined ? { wake: input.wake } : {}),
+        ...(input.data !== undefined ? { data: input.data } : {}),
+      }).seq,
+      // The reserved ask lane: a real wake delivery carrying the ask-kind
       // cause tag, so the run that voices the request is identifiable to
-      // the consent check (an answer from that same run cannot bind).
-      voiceAskToTalker: (content, causeTag) => {
+      // the consent check (an answer from that same run cannot bind). No
+      // token bucket, no dedup, no queues; it stamps the delivery spacing
+      // clock so queued ordinary deliveries hold off behind a fresh ask
+      // instead of talking over it.
+      voiceToTalker: (content, causeTag) => {
+        this.router.stampReservedLane();
         if (this.askVoicingHeld) {
           // A conversation abort just happened: the user said stop, so the
           // request is not read out now. Refusing the hand-off is how the
@@ -296,16 +329,13 @@ export class DuplexSession {
         this.digestion.preempt();
         talker.deliver(content, { wake: true, causeTag });
       },
+      currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
       // Keep the loop registry's voiced flag truthful for tool asks so
       // headline and consumer surfaces show what has been read out.
       markAskVoiced: (askId) => {
         reasoner.markAskVoiced(askId);
       },
-      workRefusal: () => this.aggregate.workRefusal(),
-      idleSignal: config.idleSignal,
       logger: this.logger,
-      talkerLoopPath: talker.loopPath,
-      reasonerLoopPath: reasoner.loopPath,
     };
   }
 
@@ -343,7 +373,7 @@ export class DuplexSession {
       // the broker still counts as read out. The broker withdraws its
       // consent anchor and reads it again (D16 anchor rules).
       if (result.kind === 'wake_delivery') {
-        router.permissionBroker.noteDeliveryDestroyed(result.message);
+        this.broker.noteDeliveryDestroyed(result.message);
       }
     });
 
@@ -607,7 +637,7 @@ export class DuplexSession {
       // Pending asks belong to the stopped work and settle as deny: tool
       // asks through each aborted run's own signal race, network asks
       // (which carry no signal) here. Double settlement is guarded.
-      router.permissionBroker.settleAll('abort');
+      this.broker.settleAll('abort');
       // Settling an ask kills the request; it does not kill the voicing
       // that was already handed to the talker. A voicing parked behind a
       // busy talker outlives its ask, gets read out afterwards, and the
@@ -732,7 +762,7 @@ export class DuplexSession {
    * in the headline block and still bounded by its own timeout.
    */
   private holdVoicingForReopen(): void {
-    const broker = this.router.permissionBroker;
+    const broker = this.broker;
     this.askVoicingHeld = true;
     let held: boolean;
     try {
@@ -765,7 +795,7 @@ export class DuplexSession {
     // noteVoicingLost rather than revoiceCurrent: the anchor is already
     // withdrawn and this re-read must take a fresh one, and it must not be
     // swallowed by the re-voice damping window the abort just stamped.
-    this.router.permissionBroker.noteVoicingLost();
+    this.broker.noteVoicingLost();
   }
 
   // -------------------------------------------------------------------------
@@ -796,7 +826,7 @@ export class DuplexSession {
   pendingAsks(): PendingAsk[] {
     const asks = this.reasoner.getPendingAsks();
     const mirrored = new Set(asks.map((ask) => ask.askId));
-    const brokerOnly = this.router.permissionBroker.getPendingAsks()
+    const brokerOnly = this.broker.getPendingAsks()
       .filter((ask) => !mirrored.has(ask.askId))
       .map(({ kind: _kind, ...ask }) => ask);
     return [...asks, ...brokerOnly];
@@ -829,8 +859,8 @@ export class DuplexSession {
       }],
       afterReasonerAsks: [{
         name: 'broker-asks',
-        pending: () => router.permissionBroker.pendingAskCount > 0,
-        settled: () => router.permissionBroker.waitForSettlement(),
+        pending: () => this.broker.pendingAskCount > 0,
+        settled: () => this.broker.waitForSettlement(),
       }],
     };
   }
@@ -969,6 +999,9 @@ export class DuplexSession {
    */
   resetForRestore(routerState: DuplexRouterState | undefined): void {
     this.recorder.recordDroppedQueue(this.talker, 'restore', this.talker.clearAllQueues());
+    // Pending asks belong to the replaced session; every resolver settles
+    // as deny so no loop stays blocked on an ask nobody can answer anymore.
+    this.broker.reset();
     this.router.resetForRestore();
     this.restoreRouterState(routerState);
     this.aggregate.resetForRestore();
@@ -1014,6 +1047,9 @@ export class DuplexSession {
   /** Stop the session's timers and settle its asks, synchronously. */
   beginDestroy(): void {
     this.digestion.destroy();
+    // Settle every pending ask first so no resolver promise outlives the
+    // session: a hanging ask would block its loop into the force-kill path.
+    this.broker.destroy();
     this.router.destroy();
     this.aggregate.destroy();
   }

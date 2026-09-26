@@ -27,7 +27,11 @@
  * drive, and leave the rest. If a throw fires, the test reached machinery it
  * never meant to, which is information rather than an inconvenience.
  */
-import type { DuplexRouterPorts } from '../../src/duplex/router.js';
+import { DuplexRouter } from '../../src/duplex/router.js';
+import type { DuplexRouterOptions, DuplexRouterPorts } from '../../src/duplex/router.js';
+import { PermissionBroker } from '../../src/duplex/permission-broker.js';
+import type { PermissionBrokerOptions } from '../../src/duplex/permission-broker.js';
+import type { CauseTag } from '../../src/duplex/cause-tags.js';
 
 /** The required members of the port contract, optional ones excluded. */
 type RequiredPort = {
@@ -58,7 +62,8 @@ const UNSTUBBED_PORTS: { [K in RequiredPort]: true } = {
   currentTalkerCauseSeq: true,
   currentTalkerCauseTags: true,
   currentReasonerCauseTags: true,
-  voiceAskToTalker: true,
+  answerAsk: true,
+  pendingAsks: true,
   spawnLookup: true,
 };
 
@@ -80,7 +85,7 @@ function unstubbed(name: string): () => never {
  * swaps `idleSignal` mid-test, and a spread would capture one value at
  * construction and quietly pin it.
  *
- * Optional ports (`markAskVoiced`, `idleSignal`, `logger`, the loop paths)
+ * Optional ports (`workRefusal`, `idleSignal`, `logger`, the loop paths)
  * get no default at all. Production guards them with `?.`, so installing a
  * throwing stub would turn "not provided" into "provided and explodes",
  * which is a different contract from the one under test.
@@ -98,4 +103,64 @@ export function makeTestRouterPorts(
   // new required port fails to compile above rather than slipping through
   // here. The cast asserts nothing the type system has not already checked.
   return base as unknown as DuplexRouterPorts;
+}
+
+/**
+ * The broker-side ports the duplex session supplies in production: the
+ * reserved ask lane into the talker and the loop-registry voiced sync.
+ */
+export interface TestVoicingPorts {
+  voiceAskToTalker(content: string, causeTag: CauseTag): void;
+  markAskVoiced?(askId: string): void;
+}
+
+/**
+ * A router and the permission broker it answers asks through, assembled
+ * the way DuplexSession assembles them: the broker logs through the same
+ * appendLog, reads the same talker cause tags, and stamps the router's
+ * spacing clock on every voicing; the router's answer_ask and the
+ * watchdog's pending-ask read go to the broker. Ask timeouts and the voicing
+ * cadence come from the router options, as they do from consumer tuning.
+ */
+export function makeTestRouter(
+  overrides: Partial<DuplexRouterPorts> & Partial<TestVoicingPorts>,
+  options?: DuplexRouterOptions,
+): { router: DuplexRouter; broker: PermissionBroker } {
+  // Descriptors, not a rest spread: a spread would read an idleSignal
+  // getter once here and pin it (see makeTestRouterPorts).
+  const { voiceAskToTalker: voiceDescriptor, markAskVoiced: markDescriptor, ...routerDescriptors } =
+    Object.getOwnPropertyDescriptors(overrides);
+  const voiceAskToTalker = voiceDescriptor?.value as TestVoicingPorts['voiceAskToTalker'] | undefined;
+  const markAskVoiced = markDescriptor?.value as TestVoicingPorts['markAskVoiced'] | undefined;
+  const brokerRef: { broker: PermissionBroker | null } = { broker: null };
+  const ports = makeTestRouterPorts({
+    answerAsk: (askId, decision, reason) => brokerRef.broker!.answer(askId, decision, reason),
+    pendingAsks: () => brokerRef.broker!.getPendingAsks(),
+  });
+  Object.defineProperties(ports, routerDescriptors);
+  const router = new DuplexRouter(ports, options);
+  const brokerOptions: PermissionBrokerOptions = {
+    ...(options?.askTimeoutMs !== undefined ? { askTimeoutMs: options.askTimeoutMs } : {}),
+    ...(options?.escalationAskTimeoutMs !== undefined
+      ? { escalationAskTimeoutMs: options.escalationAskTimeoutMs }
+      : {}),
+    ...(options?.settleVoiceDelayMs !== undefined
+      ? { settleVoiceDelayMs: options.settleVoiceDelayMs }
+      : {}),
+    ...(options?.now !== undefined ? { now: options.now } : {}),
+  };
+  const broker = new PermissionBroker({
+    appendLog: (input) => ports.appendLog(input),
+    voiceToTalker: (content, causeTag) => {
+      router.stampReservedLane();
+      if (!voiceAskToTalker) {
+        throw new Error('test broker port "voiceAskToTalker" was called but this harness did not stub it.');
+      }
+      voiceAskToTalker(content, causeTag);
+    },
+    currentTalkerCauseTags: () => ports.currentTalkerCauseTags(),
+    ...(markAskVoiced ? { markAskVoiced } : {}),
+  }, brokerOptions);
+  brokerRef.broker = broker;
+  return { router, broker };
 }

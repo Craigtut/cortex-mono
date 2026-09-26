@@ -13,7 +13,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { DuplexRouter, DUPLEX_ROUTER_DEFAULTS } from '../../src/duplex/router.js';
 import type { ReasonerDispatchOptions, RouterLogInput } from '../../src/duplex/router.js';
-import { makeTestRouterPorts } from './duplex-test-ports.js';
+import { makeTestRouter } from './duplex-test-ports.js';
+import type { PermissionBroker } from '../../src/duplex/permission-broker.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
 import {
@@ -23,6 +24,7 @@ import {
 
 interface Harness {
   router: DuplexRouter;
+  broker: PermissionBroker;
   log: Array<RouterLogInput & { seq: number }>;
   talkerDeliveries: Array<{ content: string; wake: boolean }>;
   askVoicings: Array<{ content: string; causeTag: CauseTag }>;
@@ -103,7 +105,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   // throws when called, so a test cannot pass on an answer it never
   // asked for. This harness drives the whole router, so it stubs
   // everything; the guarantee is for the next port added upstream.
-  const ports = makeTestRouterPorts({
+  const { router, broker } = makeTestRouter({
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
     voiceAskToTalker: (content, causeTag) => askVoicings.push({ content, causeTag }),
     talkerIdle: () => talkerIdle,
@@ -132,9 +134,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     get idleSignal() {
       return idleSignal;
     },
-  });
-
-  const router = new DuplexRouter(ports, {
+  }, {
     // Fast defaults so tests poll real timers briefly instead of sleeping.
     minDeliverySpacingMs: 0,
     idlePollMs: 5,
@@ -145,6 +145,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
 
   return {
     router,
+    broker,
     log,
     talkerDeliveries,
     askVoicings,
@@ -978,7 +979,7 @@ describe('liveness watchdog', () => {
     const h = createHarness({ watchdogIntervalMs: 200 });
     h.setTalkerIdle(true);
     h.router.noteReasonerRunStart();
-    void h.router.permissionBroker.requestDecision({
+    void h.broker.requestDecision({
       askId: 'ask-1',
       loopPath: 'reasoner',
       toolName: 'Bash',
@@ -986,7 +987,7 @@ describe('liveness watchdog', () => {
       kind: 'tool',
     });
     // Precondition: the ask is pending, so the run really is blocked on it.
-    expect(h.router.permissionBroker.getPendingAsks()).toHaveLength(1);
+    expect(h.broker.getPendingAsks()).toHaveLength(1);
     h.advance(250);
     await waitUntil(() => h.log.some(
       (entry) => entry.type === 'delivery' && (entry.data as { synthetic?: boolean }).synthetic === true,

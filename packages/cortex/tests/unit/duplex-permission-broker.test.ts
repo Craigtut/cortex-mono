@@ -12,13 +12,18 @@
  * tested as one mechanism.
  */
 import { describe, it, expect } from 'vitest';
-import { DUPLEX_ROUTER_DEFAULTS, DuplexRouter } from '../../src/duplex/router.js';
+import { DUPLEX_ROUTER_DEFAULTS } from '../../src/duplex/router.js';
+import type { DuplexRouter } from '../../src/duplex/router.js';
 import type { DuplexRouterOptions, RouterLogInput } from '../../src/duplex/router.js';
-import { makeTestRouterPorts } from './duplex-test-ports.js';
+import { makeTestRouter } from './duplex-test-ports.js';
 import { collectCauseTags } from '../../src/duplex/cause-tags.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
-import type { BrokeredAskDecision, BrokeredAskRequest } from '../../src/duplex/permission-broker.js';
+import type {
+  BrokeredAskDecision,
+  BrokeredAskRequest,
+  PermissionBroker,
+} from '../../src/duplex/permission-broker.js';
 import { PERMISSION_BROKER_DEFAULTS } from '../../src/duplex/permission-broker.js';
 import {
   buildBrokeredNetworkResolver,
@@ -27,6 +32,7 @@ import {
 
 interface Harness {
   router: DuplexRouter;
+  broker: PermissionBroker;
   log: Array<RouterLogInput & { seq: number }>;
   talkerDeliveries: Array<{ content: string; wake: boolean }>;
   askVoicings: Array<{ content: string; causeTag: CauseTag }>;
@@ -62,7 +68,7 @@ function createHarness(options?: DuplexRouterOptions): Harness {
   // throw when called rather than answering. That is how the required
   // `spawnLookup` came to be missing here for several router changes: the
   // annotation looked like a check and nothing typechecks test files.
-  const ports = makeTestRouterPorts({
+  const { router, broker } = makeTestRouter({
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
     voiceAskToTalker: (content, causeTag) => {
       if (voicingFails) throw new Error('talker is shutting down');
@@ -93,9 +99,7 @@ function createHarness(options?: DuplexRouterOptions): Harness {
       dispatchedCauseSeqs.map((seq) => ({ kind: 'directive', seq } as CauseTag)),
     // spawnLookup is deliberately absent: no broker test spawns a lookup,
     // and the factory's throwing default says so if one ever does.
-  });
-
-  const router = new DuplexRouter(ports, {
+  }, {
     minDeliverySpacingMs: 0,
     idlePollMs: 5,
     whenIdleDegradeMs: 10_000_000,
@@ -105,6 +109,7 @@ function createHarness(options?: DuplexRouterOptions): Harness {
 
   return {
     router,
+    broker,
     log,
     talkerDeliveries,
     askVoicings,
@@ -147,7 +152,7 @@ function requestAsk(
   overrides?: Partial<BrokeredAskRequest>,
 ): { decisions: BrokeredAskDecision[] } {
   const decisions: BrokeredAskDecision[] = [];
-  const alreadyPending = h.router.permissionBroker.pendingAskCount;
+  const alreadyPending = h.broker.pendingAskCount;
   const request: BrokeredAskRequest = {
     askId: 'ask-1',
     loopPath: alreadyPending === 0 ? 'reasoner' : `reasoner/task-${alreadyPending}`,
@@ -156,7 +161,7 @@ function requestAsk(
     kind: 'tool',
     ...overrides,
   };
-  void h.router.permissionBroker.requestDecision(request).then((decision) => {
+  void h.broker.requestDecision(request).then((decision) => {
     decisions.push(decision);
   });
   return { decisions };
@@ -237,7 +242,7 @@ describe('ask intake and voicing', () => {
     const first = requestAsk(h, { askId: 'ask-1' });
     requestAsk(h, { askId: 'ask-2', renderedRequest: 'Write: /tmp/other' });
     expect(h.askVoicings).toHaveLength(1);
-    expect(h.router.permissionBroker.getPendingAsks().map((ask) => [ask.askId, ask.voiced]))
+    expect(h.broker.getPendingAsks().map((ask) => [ask.askId, ask.voiced]))
       .toEqual([['ask-1', true], ['ask-2', false]]);
 
     // Deny is unrestricted; settling the first voices the second.
@@ -284,7 +289,7 @@ describe('ask intake and voicing', () => {
     // A re-voice reuses the same id rather than minting a guessable
     // successor, so a second reading is no easier to escape than the first.
     h.advance(3_001);
-    h.router.permissionBroker.revoiceCurrent();
+    h.broker.revoiceCurrent();
     await waitUntil(() => h.askVoicings.length === 2);
     expect(h.askVoicings[1]!.content).toContain(open);
     expect(h.askVoicings[1]!.content).toContain(close);
@@ -311,7 +316,7 @@ describe('ask intake and voicing', () => {
     // B settled before it was ever read out; C is the one voiced ask.
     expect(h.askVoicings.some((voicing) => voicing.content.includes('Bash: b'))).toBe(false);
     expect(h.askVoicings[1]!.content).toContain('Bash: c');
-    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+    expect(h.broker.getPendingAsks()).toMatchObject([
       { askId: 'ask-c', voiced: true },
     ]);
   });
@@ -365,7 +370,7 @@ describe('unheard voicings', () => {
     // The attempt is in the log, but no state says the user heard it.
     expect(h.log.some((entry) => entry.data?.['event'] === 'ask_voiced')).toBe(true);
     expect(h.voicedRegistryIds).toEqual([]);
-    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+    expect(h.broker.getPendingAsks()).toMatchObject([
       { askId: 'ask-1', voiced: false },
     ]);
 
@@ -392,7 +397,7 @@ describe('unheard voicings', () => {
     const firstAnchor = h.lastVoicedSeq();
     const voicing = h.askVoicings[0]!.content;
 
-    expect(h.router.permissionBroker.noteDeliveryDestroyed(voicing)).toBe(true);
+    expect(h.broker.noteDeliveryDestroyed(voicing)).toBe(true);
     expect(h.askVoicings).toHaveLength(2);
     const secondAnchor = h.lastVoicedSeq();
     expect(secondAnchor).toBeGreaterThan(firstAnchor);
@@ -413,7 +418,7 @@ describe('unheard voicings', () => {
     const h = createHarness();
     requestAsk(h);
     const anchor = h.lastVoicedSeq();
-    expect(h.router.permissionBroker.noteDeliveryDestroyed('<background-update>\nbuild done\n</background-update>'))
+    expect(h.broker.noteDeliveryDestroyed('<background-update>\nbuild done\n</background-update>'))
       .toBe(false);
     expect(h.askVoicings).toHaveLength(1);
     expect(h.lastVoicedSeq()).toBe(anchor);
@@ -445,7 +450,7 @@ describe('D16 consent binding', () => {
       decision: 'allow',
       qualifyingUtteranceSeq: voicedSeq + 1,
     });
-    expect(h.router.permissionBroker.pendingAskCount).toBe(0);
+    expect(h.broker.pendingAskCount).toBe(0);
   });
 
   it('refuses an allow whose cause set has no utterance, even with a newer delivery tag', async () => {
@@ -462,7 +467,7 @@ describe('D16 consent binding', () => {
     expect(result.terminate).toBe(true);
     expect(result.content[0]!.text).toContain('Not accepted');
     expect(decisions).toHaveLength(0);
-    expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+    expect(h.broker.pendingAskCount).toBe(1);
 
     // The anomaly is in the log (bounded dispatch_refused path).
     const refusal = h.log.find((entry) => entry.data?.['event'] === 'dispatch_refused')!;
@@ -479,7 +484,7 @@ describe('D16 consent binding', () => {
     const result = await callAnswerAsk(h, { decision: 'allow' });
     expect(result.content[0]!.text).toContain('Not accepted');
     expect(decisions).toHaveLength(0);
-    expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+    expect(h.broker.pendingAskCount).toBe(1);
   });
 
   it('refuses an allow from the run that carried the voicing (a stale yes parked alongside it)', async () => {
@@ -499,7 +504,7 @@ describe('D16 consent binding', () => {
     const result = await callAnswerAsk(h, { decision: 'allow' });
     expect(result.content[0]!.text).toContain('Not accepted');
     expect(decisions).toHaveLength(0);
-    expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+    expect(h.broker.pendingAskCount).toBe(1);
   });
 
   it('re-voices the pending ask after a refused allow, damped', async () => {
@@ -567,7 +572,7 @@ describe('D16 consent binding', () => {
     expect(bare.content[0]!.text).toBe('Approval passed along.');
     expect(first.decisions).toEqual([{ decision: 'allow' }]);
     expect(second.decisions).toHaveLength(0);
-    expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+    expect(h.broker.pendingAskCount).toBe(1);
   });
 
   it('only tags the facade actually stamped can qualify as consent', async () => {
@@ -616,7 +621,7 @@ describe('D16 consent binding', () => {
     ]);
     expect(first.decisions).toHaveLength(0);
     // The voiced first ask is untouched and still voiced.
-    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+    expect(h.broker.getPendingAsks()).toMatchObject([
       { askId: 'ask-1', voiced: true },
     ]);
     const answer = h.log.find((entry) => entry.type === 'ask_answer')!;
@@ -647,7 +652,7 @@ describe('D16 consent binding', () => {
     const secondCall = await answerAskById(h, 'ask-2', 'allow');
     expect(secondCall).toContain('Not accepted');
     expect(second.decisions).toHaveLength(0);
-    expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+    expect(h.broker.pendingAskCount).toBe(1);
   });
 
   it('a replayed allow takes effect exactly once', async () => {
@@ -696,7 +701,7 @@ describe('D16 consent binding', () => {
     expect(typo).toContain('No permission request has that id');
     // And the real ask is re-read rather than left silently pending.
     expect(h.askVoicings).toHaveLength(3);
-    expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+    expect(h.broker.pendingAskCount).toBe(1);
   });
 
   it('an unreadable decision is a voiceable refusal, never a grant or a throw', async () => {
@@ -709,7 +714,7 @@ describe('D16 consent binding', () => {
     expect(result.terminate).toBe(true);
     expect(result.content[0]!.text).toContain('allow or deny');
     expect(decisions).toHaveLength(0);
-    expect(h.router.permissionBroker.pendingAskCount).toBe(1);
+    expect(h.broker.pendingAskCount).toBe(1);
   });
 
   it('answers with nothing pending keep the bare no-pending receipt', async () => {
@@ -756,7 +761,7 @@ describe('the settle-to-voice coalescing window', () => {
     // pending: the snipe cost the attacker a refusal, not a grant.
     await waitUntil(() => h.askVoicings.length === 2);
     expect(h.askVoicings[1]!.content).toContain('Bash: b');
-    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+    expect(h.broker.getPendingAsks()).toMatchObject([
       { askId: 'ask-2', voiced: true },
     ]);
   });
@@ -858,7 +863,7 @@ describe('the settle-to-voice coalescing window', () => {
     expect(voicedAtStep).not.toBeNull();
     expect(voicedAtStep!).toBeLessThan(4);
     expect(h.askVoicings[1]!.content).toContain('Bash: 2');
-    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+    expect(h.broker.getPendingAsks()).toMatchObject([
       { askId: 'ask-2', voiced: true },
     ]);
     expect(asks.get('ask-2')!.decisions).toHaveLength(0);
@@ -872,7 +877,7 @@ describe('the settle-to-voice coalescing window', () => {
 describe('ask timeouts and settlement', () => {
   it('signals settlement when an ask settles, and at once with none pending', async () => {
     const h = createHarness();
-    const broker = h.router.permissionBroker;
+    const broker = h.broker;
     await broker.waitForSettlement();
 
     const ask = requestAsk(h, { askId: 'ask-net', kind: 'network', toolName: 'NetworkAccess' });
@@ -907,7 +912,7 @@ describe('ask timeouts and settlement', () => {
     // failing, which invites a retry loop (communication.md).
     expect(escalation.decisions).toHaveLength(0);
     await waitUntil(() => h.askVoicings.length === 2);
-    expect(h.router.permissionBroker.getPendingAsks()).toMatchObject([
+    expect(h.broker.getPendingAsks()).toMatchObject([
       { askId: 'ask-esc', voiced: true },
     ]);
   });
@@ -959,7 +964,7 @@ describe('ask timeouts and settlement', () => {
     const h = createHarness();
     const controller = new AbortController();
     controller.abort();
-    const decision = await h.router.permissionBroker.requestDecision({
+    const decision = await h.broker.requestDecision({
       askId: 'ask-dead',
       loopPath: 'reasoner',
       toolName: 'Bash',
@@ -975,7 +980,7 @@ describe('ask timeouts and settlement', () => {
     const h = createHarness();
     const first = requestAsk(h, { askId: 'ask-1' });
     const second = requestAsk(h, { askId: 'ask-2' });
-    h.router.destroy();
+    h.broker.destroy();
     await waitUntil(() => first.decisions.length === 1 && second.decisions.length === 1);
     expect(first.decisions[0]!.decision).toBe('deny');
     expect(second.decisions[0]!.decision).toBe('deny');
@@ -1004,24 +1009,24 @@ describe('ask timeouts and settlement', () => {
   it('settleAll is inert after destroy, like every other lifecycle method', async () => {
     const h = createHarness();
     const { decisions } = requestAsk(h);
-    h.router.destroy();
+    h.broker.destroy();
     await waitUntil(() => decisions.length === 1);
     const entries = h.log.length;
 
-    h.router.permissionBroker.settleAll('abort');
-    h.router.permissionBroker.reset();
+    h.broker.settleAll('abort');
+    h.broker.reset();
     expect(h.log).toHaveLength(entries);
     expect(decisions).toHaveLength(1);
   });
 
-  it('resetForRestore settles pending asks as deny (they belong to the replaced session)', async () => {
+  it('a restore reset settles pending asks as deny (they belong to the replaced session)', async () => {
     const h = createHarness();
     const { decisions } = requestAsk(h);
-    h.router.resetForRestore();
+    h.broker.reset();
     await waitUntil(() => decisions.length === 1);
     expect(decisions[0]!.decision).toBe('deny');
     expect(decisions[0]!.reason).toContain('restored');
-    expect(h.router.permissionBroker.pendingAskCount).toBe(0);
+    expect(h.broker.pendingAskCount).toBe(0);
   });
 });
 
@@ -1044,7 +1049,7 @@ describe("settleAll('abort')", () => {
     const c = requestAsk(h, { askId: 'ask-c', renderedRequest: 'Bash: c' });
     expect(h.askVoicings).toHaveLength(1);
 
-    h.router.permissionBroker.settleAll('abort');
+    h.broker.settleAll('abort');
 
     // The queued asks settle too. A drain that only reached the voiced one
     // would leave the loops behind ask-b and ask-c blocked on a decision
@@ -1070,7 +1075,7 @@ describe("settleAll('abort')", () => {
 
     // The registry is empty, so a late answer is told so rather than
     // rebinding to whatever is left.
-    expect(h.router.permissionBroker.pendingAskCount).toBe(0);
+    expect(h.broker.pendingAskCount).toBe(0);
     const late = await callAnswerAsk(h, { decision: 'allow' });
     expect(late.content[0]!.text).toBe('There are no pending permission requests to answer.');
   });
@@ -1087,7 +1092,7 @@ describe("settleAll('abort')", () => {
     const c = requestAsk(h, { askId: 'ask-c', renderedRequest: 'Bash: c' });
     expect(h.askVoicings).toHaveLength(1);
 
-    h.router.permissionBroker.settleAll('abort');
+    h.broker.settleAll('abort');
     await waitUntil(() =>
       a.decisions.length === 1 && b.decisions.length === 1 && c.decisions.length === 1);
     expect(h.askVoicings).toHaveLength(1);
@@ -1103,13 +1108,13 @@ describe("settleAll('abort')", () => {
     const toolResolver = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       undefined,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     // The network resolver's ask carries no abort signal, so the drain is
     // its only settlement path: get this wrong and egress hangs the loop.
     const networkResolver = buildBrokeredNetworkResolver(
       async () => ({ decision: 'ask' }),
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     const tool = toolResolver('Bash', { command: 'rm -rf /' }, {
       askId: 'ask-tool',
@@ -1117,9 +1122,9 @@ describe("settleAll('abort')", () => {
       renderedRequest: 'Bash: rm -rf /',
     });
     const egress = networkResolver({ host: 'evil.example', port: 443, via: 'webfetch' });
-    await waitUntil(() => h.router.permissionBroker.pendingAskCount === 2);
+    await waitUntil(() => h.broker.pendingAskCount === 2);
 
-    h.router.permissionBroker.settleAll('abort');
+    h.broker.settleAll('abort');
 
     expect(await tool).toEqual({
       decision: 'block',
@@ -1135,7 +1140,7 @@ describe("settleAll('abort')", () => {
     // every one of them dies of its own timeout instead.
     const h = createHarness();
     const dropped = requestAsk(h, { askId: 'ask-1' });
-    h.router.permissionBroker.settleAll('abort');
+    h.broker.settleAll('abort');
     await waitUntil(() => dropped.decisions.length === 1);
 
     const fresh = requestAsk(h, { askId: 'ask-2', renderedRequest: 'Bash: after the abort' });
@@ -1160,7 +1165,7 @@ describe('brokered resolvers', () => {
     const resolver = buildBrokeredPermissionResolver(
       async (toolName) => (toolName === 'Read' ? { decision: 'allow' } : false),
       undefined,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     expect(await resolver('Read', {}, undefined)).toEqual({ decision: 'allow' });
     expect(await resolver('Bash', {}, undefined)).toEqual({ decision: 'block' });
@@ -1173,7 +1178,7 @@ describe('brokered resolvers', () => {
     const resolver = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       undefined,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     const pending = resolver('Bash', { command: 'rm -rf /' }, {
       askId: 'ask-r1',
@@ -1207,7 +1212,7 @@ describe('brokered resolvers', () => {
     const resolver = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       undefined,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     void resolver('Bash(escalate)', { command: 'x' }, {
       askId: 'ask-esc',
@@ -1226,7 +1231,7 @@ describe('brokered resolvers', () => {
     const resolver = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       () => true,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     const decision = await resolver('Bash', { command: 'ls' }, {
       askId: 'ask-auto',
@@ -1245,7 +1250,7 @@ describe('brokered resolvers', () => {
       async (req) => (req.host === 'registry.npmjs.org'
         ? { decision: 'allow' }
         : { decision: 'ask' }),
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
 
     // Allowlisted host: no broker involvement.
@@ -1280,7 +1285,7 @@ describe('brokered resolvers', () => {
     const h = createHarness();
     const resolver = buildBrokeredNetworkResolver(
       async () => ({ decision: 'ask' }),
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     const pending = resolver({ host: 'internal.corp', port: 8443, via: 'shell' });
     await waitUntil(() => h.askVoicings.length === 1);
@@ -1305,7 +1310,7 @@ describe('brokered resolvers', () => {
     const h = createHarness();
     const resolver = buildBrokeredNetworkResolver(
       async () => ({ decision: 'ask' }),
-      () => h.router.permissionBroker,
+      () => h.broker,
       () => true,
     );
 
@@ -1376,7 +1381,7 @@ describe('brokered resolvers', () => {
     const bound = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       isAutoApprove,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     expect(await bound('Bash', { command: 'rm -rf /' }, undefined))
       .toEqual({ decision: 'allow' });
@@ -1388,7 +1393,7 @@ describe('brokered resolvers', () => {
     const h = createHarness();
     const resolver = buildBrokeredNetworkResolver(
       async () => ({ decision: 'ask' }),
-      () => h.router.permissionBroker,
+      () => h.broker,
       () => false,
     );
     const pending = resolver({ host: 'internal.corp', port: 8443, via: 'shell' });
@@ -1410,7 +1415,7 @@ describe('brokered resolvers', () => {
     const resolver = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       () => false,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     const pending = resolver('Bash', { command: 'rm -rf /' }, {
       askId: 'ask-off',
@@ -1432,7 +1437,7 @@ describe('brokered resolvers', () => {
     const resolver = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       undefined,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     const nonce = 'ask-3f7a1c2e-9b04-4d61-8a3f-5c2e7d901b64';
     const pending = resolver('Bash', { command: 'rm -rf /' }, {
@@ -1468,7 +1473,7 @@ describe('brokered resolvers', () => {
     const resolver = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       undefined,
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     const pending = resolver('Bash', { command: 'rm -rf /' }, {
       askId: 'ask-plain',
@@ -1488,7 +1493,7 @@ describe('brokered resolvers', () => {
     let consulted = 0;
     const resolver = buildBrokeredNetworkResolver(
       async (req) => (req.host === 'ok.example' ? { decision: 'allow' } : { decision: 'deny' }),
-      () => h.router.permissionBroker,
+      () => h.broker,
       () => { consulted += 1; return true; },
     );
     expect(await resolver({ host: 'ok.example', via: 'shell' })).toEqual({ decision: 'allow' });
@@ -1509,7 +1514,7 @@ describe('brokered resolvers', () => {
     const resolver = buildBrokeredPermissionResolver(
       async (toolName) => (toolName === 'Read' ? { decision: 'allow' } : { decision: 'block' }),
       () => { consulted += 1; return true; },
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
 
     expect(await resolver('Read', {}, undefined)).toEqual({ decision: 'allow' });
@@ -1523,7 +1528,7 @@ describe('brokered resolvers', () => {
     const asked = buildBrokeredPermissionResolver(
       async () => ({ decision: 'ask' }),
       () => { consulted += 1; return true; },
-      () => h.router.permissionBroker,
+      () => h.broker,
     );
     expect(await asked('Bash', {}, undefined)).toEqual({ decision: 'allow' });
     expect(consulted).toBe(1);
