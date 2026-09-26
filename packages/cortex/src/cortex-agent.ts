@@ -20,6 +20,13 @@
 
 import { AgentLoop } from './agent-loop.js';
 import { buildReasonerConfig, DEFAULT_MODE, routerOptionsFrom } from './facade/config.js';
+import { normalizePersistedState } from './facade/persisted-state.js';
+import type {
+  CortexAgentPersistedState,
+  CortexAgentStateV2,
+} from './facade/persisted-state.js';
+import { UsageLedger } from './facade/usage-ledger.js';
+import type { UsageReadings } from './facade/usage-ledger.js';
 import type {
   CortexAgentConfig,
   CortexAgentMode,
@@ -97,13 +104,6 @@ import {
 } from './resolution-report.js';
 import type { ResolutionNote, ResolutionNoteCode } from './resolution-report.js';
 import { spokenText, WorkingTagStreamFilter } from './working-tags.js';
-import {
-  addSessionUsage,
-  cloneSessionUsage,
-  diffSessionUsage,
-  isZeroSessionUsage,
-  zeroSessionUsage,
-} from './session-usage.js';
 import { toolCallSubject } from './tools/tool-call-subject.js';
 import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
 import type {
@@ -399,105 +399,13 @@ export type _ForwardedMembersExistOnFacade = AssertExtends<
 // Persisted state (versioned composite artifact)
 // ---------------------------------------------------------------------------
 
-/** Usage in the v2 artifact: one aggregate plus per-loop attribution. */
-export interface CortexAgentUsageBreakdown {
-  /**
-   * Aggregate across every loop, sub-agent, and utility call. Children are
-   * counted exactly once: each loop's session usage already includes its
-   * forwarded child events (bridge-of-record), so the aggregate is the sum
-   * of per-loop totals with SubAgentResult.usage never re-added on top.
-   */
-  total: SessionUsage;
-  /**
-   * Per-loop breakdown, so attribution survives a restore (a single blob
-   * would erase it). `talker` is null for passthrough sessions.
-   */
-  perLoop: {
-    talker: SessionUsage | null;
-    reasoner: SessionUsage;
-    /**
-     * Accumulated quick-lookup spend (settled lookup loops, duplex only).
-     * Absent when no lookup has ever run; carried through restores.
-     */
-    lookups?: SessionUsage;
-  };
-}
-
-/**
- * Version 2: the composite artifact (facade-api.md). The log, per-loop
- * histories, per-loop observational states, and the usage breakdown.
- * Sub-agent state is deliberately absent (tasks re-derive from the log's
- * directive/lifecycle entries; resumable tasks are out of scope).
- */
-export interface CortexAgentStateV2 {
-  version: 2;
-  log: SessionLogEntry[];
-  /** Post-slot talker history. Empty for passthrough sessions. */
-  talkerHistory: AgentMessage[];
-  /** Post-slot reasoner history. */
-  reasonerHistory: AgentMessage[];
-  /** Talker observational state, order-coupled to talkerHistory. */
-  talkerMemory: ObservationalMemoryState | null;
-  /** Reasoner observational state, order-coupled to reasonerHistory. */
-  reasonerMemory: ObservationalMemoryState | null;
-  usage: CortexAgentUsageBreakdown;
-  /**
-   * Duplex router state that must outlive a restore: the task alias
-   * counter, tracked tasks, results logged but not yet handed to the
-   * talker, and conversation the reasoner has not seen yet. Optional, so
-   * artifacts written before it existed still restore (the alias counter
-   * is then recovered from the log). Absent for sessions that never ran
-   * duplex.
-   */
-  router?: DuplexRouterState;
-}
-
-/**
- * Version 1: today's single-loop persistence surface (a conversation
- * history plus optionally observational state and session usage), given a
- * version wrapper so existing sessions upgrade transparently. It restores
- * into the reasoner with an empty talker and a log synthesized from
- * nothing.
- */
-export interface CortexAgentStateV1 {
-  version: 1;
-  history: AgentMessage[];
-  /**
-   * Both optional fields accept an explicit null so a consumer can build
-   * the artifact with a uniform spread. Under exactOptionalPropertyTypes a
-   * `SessionUsage | undefined` cannot be assigned to `usage?: SessionUsage`,
-   * which forced a conditional spread on one field while the other took a
-   * plain `?? null`; treating absent and null alike removes that asymmetry.
-   */
-  memory?: ObservationalMemoryState | null;
-  usage?: SessionUsage | null;
-}
-
-/**
- * Compile-time check on that uniformity. A consumer holding both fields as
- * `T | null` must be able to assign both directly; while `usage` was
- * `SessionUsage` only, exactOptionalPropertyTypes rejected the null and
- * forced a conditional spread on one field beside a plain `?? null` on the
- * other. Fails to typecheck if either field stops accepting null.
- */
-export type _V1OptionalFieldsAcceptNull = AssertExtends<
-  {
-    version: 1;
-    history: AgentMessage[];
-    memory: ObservationalMemoryState | null;
-    usage: SessionUsage | null;
-  },
-  CortexAgentStateV1
->;
-
-/**
- * What restore() accepts: a versioned artifact, or a bare message array
- * (today's rawest persistence shape, treated as v1 history).
- */
-export type CortexAgentPersistedState =
-  | CortexAgentStateV2
-  | CortexAgentStateV1
-  | AgentMessage[];
+export type {
+  CortexAgentPersistedState,
+  CortexAgentStateV1,
+  CortexAgentStateV2,
+  CortexAgentUsageBreakdown,
+  _V1OptionalFieldsAcceptNull,
+} from './facade/persisted-state.js';
 
 /**
  * The highest `task-N` alias the log's directives mention, or 0. The floor
@@ -512,39 +420,6 @@ function highestTaskAliasInLog(log: readonly SessionLogEntry[]): number {
     if (match) highest = Math.max(highest, Number(match[1]));
   }
   return highest;
-}
-
-/** Normalize any accepted persisted shape to v2. */
-function normalizePersistedState(state: CortexAgentPersistedState): CortexAgentStateV2 {
-  if (Array.isArray(state)) {
-    return upgradeV1({ version: 1, history: state });
-  }
-  if (state.version === 1) {
-    return upgradeV1(state);
-  }
-  if (state.version === 2) {
-    return state;
-  }
-  throw new Error(
-    `Unsupported CortexAgent state version: ${String((state as { version: unknown }).version)}`,
-  );
-}
-
-/** A v1 artifact restores into the reasoner with an empty talker and log. */
-function upgradeV1(state: CortexAgentStateV1): CortexAgentStateV2 {
-  const usage = state.usage ? cloneSessionUsage(state.usage) : zeroSessionUsage();
-  return {
-    version: 2,
-    log: [],
-    talkerHistory: [],
-    reasonerHistory: state.history,
-    talkerMemory: null,
-    reasonerMemory: state.memory ?? null,
-    usage: {
-      total: cloneSessionUsage(usage),
-      perLoop: { talker: null, reasoner: usage },
-    },
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -771,21 +646,7 @@ export class CortexAgent {
   /** Spawn lifecycle seq per live task, for completion causation. */
   private readonly spawnSeqByTaskId = new Map<string, number>();
 
-  // Baseline-plus-delta usage model: loops restart at zero after a
-  // restore, so the composite aggregate is restoredBaseline + live deltas
-  // rather than an additive merge into live counters (which would
-  // double-count on repeated restores).
-  private usageBaseline: {
-    talker: SessionUsage | null;
-    reasoner: SessionUsage;
-    lookups: SessionUsage | null;
-  } | null = null;
-  /** Reasoner live counters at the moment of the last restore. */
-  private usageAtRestore: SessionUsage | null = null;
-  /** Talker live counters at the moment of the last restore (duplex). */
-  private talkerUsageAtRestore: SessionUsage | null = null;
-  /** Lookup accumulator reading at the moment of the last restore (duplex). */
-  private lookupUsageAtRestore: SessionUsage | null = null;
+  private readonly usage = new UsageLedger();
   /**
    * Talker-side artifact content carried through a passthrough session
    * opaquely: passthrough has no talker loop to hydrate, but a restored
@@ -2754,12 +2615,6 @@ export class CortexAgent {
 
   /** Synchronous composite snapshot; caller guarantees gate quiescence. */
   private captureStateInFrame(): CortexAgentStateV2 {
-    const reasonerUsage = this.reasonerUsageWithBaseline();
-    const talkerUsage = this.talkerUsageWithBaseline();
-    const lookupUsage = this.lookupUsageWithBaseline();
-    let total = reasonerUsage;
-    if (talkerUsage) total = addSessionUsage(total, talkerUsage);
-    if (lookupUsage) total = addSessionUsage(total, lookupUsage);
     return {
       version: 2,
       log: this.log.getLog(),
@@ -2776,14 +2631,7 @@ export class CortexAgent {
         ? this.talker.getObservationalMemoryState()
         : structuredClone(this.retainedTalkerMemory),
       reasonerMemory: this.reasoner.getObservationalMemoryState(),
-      usage: {
-        total,
-        perLoop: {
-          talker: talkerUsage,
-          reasoner: reasonerUsage,
-          ...(lookupUsage ? { lookups: lookupUsage } : {}),
-        },
-      },
+      usage: this.usage.breakdown(this.usageReadings()),
       // Passthrough carries a restored duplex artifact's router state
       // through, like the talker side.
       ...(this.router
@@ -2792,45 +2640,13 @@ export class CortexAgent {
     };
   }
 
-  /** Reasoner usage under the baseline-plus-delta model. */
-  private reasonerUsageWithBaseline(): SessionUsage {
-    const live = this.reasoner.getSessionUsage();
-    if (!this.usageBaseline) return live;
-    const delta = this.usageAtRestore ? diffSessionUsage(live, this.usageAtRestore) : live;
-    return addSessionUsage(this.usageBaseline.reasoner, delta);
-  }
-
-  /**
-   * Talker usage under the same model. Null only when no talker loop
-   * exists and no restored baseline carries a talker side.
-   */
-  private talkerUsageWithBaseline(): SessionUsage | null {
-    if (!this.talker) {
-      return this.usageBaseline?.talker ? cloneSessionUsage(this.usageBaseline.talker) : null;
-    }
-    const live = this.talker.getSessionUsage();
-    if (!this.usageBaseline) return live;
-    const delta = this.talkerUsageAtRestore ? diffSessionUsage(live, this.talkerUsageAtRestore) : live;
-    const baseline = this.usageBaseline.talker;
-    return baseline ? addSessionUsage(baseline, delta) : delta;
-  }
-
-  /**
-   * Quick-lookup spend under the same model. Null when nothing was ever
-   * spent (the artifact omits an all-zero bucket rather than growing every
-   * duplex snapshot).
-   */
-  private lookupUsageWithBaseline(): SessionUsage | null {
-    const baseline = this.usageBaseline?.lookups ?? null;
-    if (!this.lookups) {
-      // Passthrough: carry a restored duplex artifact's lookup spend
-      // through unchanged, like the retained talker side.
-      return baseline ? cloneSessionUsage(baseline) : null;
-    }
-    const live = this.lookups.getSettledUsage();
-    const delta = this.lookupUsageAtRestore ? diffSessionUsage(live, this.lookupUsageAtRestore) : live;
-    const combined = baseline ? addSessionUsage(baseline, delta) : delta;
-    return isZeroSessionUsage(combined) ? null : combined;
+  /** Each usage producer's live reading, for the ledger. */
+  private usageReadings(): UsageReadings {
+    return {
+      reasoner: this.reasoner.getSessionUsage(),
+      talker: this.talker ? this.talker.getSessionUsage() : null,
+      lookups: this.lookups ? this.lookups.getSettledUsage() : null,
+    };
   }
 
   /**
@@ -2895,14 +2711,7 @@ export class CortexAgent {
     }
     this.log.restore(v2.log);
 
-    this.usageBaseline = {
-      talker: v2.usage.perLoop.talker ? cloneSessionUsage(v2.usage.perLoop.talker) : null,
-      reasoner: cloneSessionUsage(v2.usage.perLoop.reasoner),
-      lookups: v2.usage.perLoop.lookups ? cloneSessionUsage(v2.usage.perLoop.lookups) : null,
-    };
-    this.usageAtRestore = this.reasoner.getSessionUsage();
-    this.talkerUsageAtRestore = this.talker ? this.talker.getSessionUsage() : null;
-    this.lookupUsageAtRestore = this.lookups ? this.lookups.getSettledUsage() : null;
+    this.usage.rebase(v2.usage, this.usageReadings());
     this.spawnSeqByTaskId.clear();
     this.activeCauseSeq = null;
     // Pre-restore queued content belongs to the replaced session: left in
@@ -3491,12 +3300,7 @@ export class CortexAgent {
    * survive restores without double-counting.
    */
   getSessionUsage(): SessionUsage {
-    let total = this.reasonerUsageWithBaseline();
-    const talker = this.talkerUsageWithBaseline();
-    if (talker) total = addSessionUsage(total, talker);
-    const lookups = this.lookupUsageWithBaseline();
-    if (lookups) total = addSessionUsage(total, lookups);
-    return total;
+    return this.usage.total(this.usageReadings());
   }
 
   // Tools, MCP, skills ------------------------------------------------------

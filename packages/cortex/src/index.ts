@@ -184,14 +184,13 @@ export type {
   DuplexTuningConfig,
   ConfigDestination,
 } from './facade/config.js';
+export type { CortexAbortScope, CortexDeliverOptions } from './cortex-agent.js';
 export type {
-  CortexAbortScope,
-  CortexDeliverOptions,
   CortexAgentStateV1,
   CortexAgentStateV2,
   CortexAgentPersistedState,
   CortexAgentUsageBreakdown,
-} from './cortex-agent.js';
+} from './facade/persisted-state.js';
 export type { DuplexRouterState } from './duplex/router.js';
 
 // Resolution report (what a CortexAgent assembly resolved to, where that
