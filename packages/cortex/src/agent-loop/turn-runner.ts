@@ -249,7 +249,7 @@ export class TurnRunner {
       // Parked content must end in a run that answers it, so a failed
       // prompt re-parks its wake batch. An aborted turn cancels it instead.
       if (promptStatus !== 'cancelled') {
-        this.ports.queues.reparkAfterFailedPrompt(wakeBatch, silentBatch.length, error.message);
+        this.ports.queues.reparkAfterFailedPrompt(wakeBatch, silentBatch.length, error);
       }
       throw error;
     } finally {

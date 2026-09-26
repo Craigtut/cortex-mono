@@ -151,7 +151,7 @@ Two kinds of content reach the loop without a consumer caller waiting on them: b
 **Requeue or dead letter.** After a failed run the transcript is unwound first (see [Loop gate, turn unwind, abort epoch](#loop-gate-turn-unwind-abort-epoch)). Content the run progressed past is history and is never re-queued; its failure surfaces through `onError`. Otherwise `partitionExhausted()` charges each item an attempt and splits the batch:
 
 - Items with budget left go back to the front of their queue, ahead of anything that arrived meanwhile, and get another run (a re-queued background batch rides the drain's repeat; re-parked wake content gets a new sweep).
-- Items out of attempts or out of time are dead-lettered. For background completions a `fatal` failure, such as an authentication error, exhausts the whole batch at once, since an identical re-attempt cannot succeed.
+- Items out of attempts or out of time are dead-lettered. A `fatal` failure, such as an authentication error, exhausts the whole batch at once on every path (background drains, wake sweeps, and a failed prompt carrying spliced wake content), since an identical re-attempt cannot succeed.
 - Background completions are not charged an attempt when the run was aborted: the user stopped the agent, the delivery did not fail. Parked wake content whose carrying run was aborted is cancelled with it and dead-lettered.
 
 A failure that a later attempt recovers from never reaches `onError`. A background batch counts as recovered when every item has left the queue without being dead-lettered. A wake sweep stays silent while every item still has budget.

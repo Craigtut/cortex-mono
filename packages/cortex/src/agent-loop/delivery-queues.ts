@@ -306,15 +306,19 @@ export class DeliveryQueues {
         throw error;
       }
       // An abort cancels parked content with the turn that carried it.
-      if (classifyError(error, { wasAborted: this.ports.isAborted() }).category === 'cancelled') {
+      const classified = classifyError(error, { wasAborted: this.ports.isAborted() });
+      if (classified.category === 'cancelled') {
         this.ports.logger.info('wake delivery run aborted; parked content cancelled', {
           count: pending.length,
         });
         this.ports.deadLetters.recordWake(pending, 'cancelled by abort (carrying run aborted)');
         return;
       }
-      const { retry: requeue, exhausted: droppedItems } =
-        partitionExhausted(pending, WAKE_DELIVERY_LIMITS, Date.now());
+      // A fatal failure (an auth error) exhausts the batch at once, like
+      // background completions: an identical re-attempt cannot succeed.
+      const { retry: requeue, exhausted: droppedItems } = partitionExhausted(
+        pending, WAKE_DELIVERY_LIMITS, Date.now(), { fatal: classified.severity === 'fatal' },
+      );
       if (droppedItems.length > 0) {
         this.ports.logger.error('dropping parked wake deliveries after repeated failed runs', {
           dropped: droppedItems.length,
@@ -342,12 +346,13 @@ export class DeliveryQueues {
   /**
    * After a terminal prompt failure, re-park wake deliveries spliced into
    * its batch if the run never progressed past them, so 'parked' content
-   * never demotes to inert context. The prompt's own input stays.
+   * never demotes to inert context. The prompt's own input stays. A fatal
+   * failure dead-letters them instead of re-parking.
    */
   reparkAfterFailedPrompt(
     wakeBatch: QueuedDelivery[],
     trailingBatchCount: number,
-    lastError: string,
+    error: Error,
   ): void {
     if (wakeBatch.length === 0) return;
     const messages = this.ports.transcript.messages();
@@ -361,14 +366,15 @@ export class DeliveryQueues {
     if (unwind.trimmed) this.ports.transcript.notifyTailTrimmed();
     if (unwind.outcome !== 'repark') return;
 
+    const fatal = classifyError(error, { wasAborted: this.ports.isAborted() }).severity === 'fatal';
     const { retry: requeue, exhausted: droppedItems } =
-      partitionExhausted(wakeBatch, WAKE_DELIVERY_LIMITS, Date.now());
+      partitionExhausted(wakeBatch, WAKE_DELIVERY_LIMITS, Date.now(), { fatal });
     if (droppedItems.length > 0) {
       this.ports.logger.error('dropping wake deliveries after repeated failed carrying runs', {
         dropped: droppedItems.length,
         attempts: WAKE_DELIVERY_LIMITS.maxAttempts,
       });
-      this.ports.deadLetters.recordWake(droppedItems, lastError);
+      this.ports.deadLetters.recordWake(droppedItems, error.message);
     }
     if (requeue.length > 0) {
       // Ahead of anything that parked meanwhile, preserving arrival order.

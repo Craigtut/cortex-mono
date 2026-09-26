@@ -917,6 +917,69 @@ describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {
   });
 });
 
+describe('AgentLoop fatal failures exhaust parked wake content at once', () => {
+  // Retrying an authentication failure is futile until the consumer acts,
+  // which is why background completions dead-letter on a fatal error at
+  // once. Parked wake content follows the same rule on both of its paths.
+
+  /** A pi run that pushes its input and fails with an auth error. */
+  function failingWithAuth(piAgent: DeliverMockPiAgent): void {
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      throw new Error('401 Unauthorized: token expired');
+    };
+  }
+
+  it('a sweep run failing with an auth error dead-letters its content after one attempt', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    loop.onError(() => {});
+    const deadLettered = vi.fn();
+    loop.onBackgroundResultDeadLettered(deadLettered);
+    await loop.prompt('warm up');
+    piAgent.promptCalls = [];
+    failingWithAuth(piAgent);
+
+    const drain = partsOf(loop).background.schedule();
+    loop.deliver('needs a live credential');
+    await drain;
+
+    await waitUntil(() => deadLettered.mock.calls.length === 1 && !loop.isLoopActive);
+    expect(piAgent.promptCalls).toHaveLength(1);
+    expect(deadLettered.mock.calls[0]![0]).toMatchObject({
+      kind: 'wake_delivery', attempts: 1, message: 'needs a live credential',
+    });
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+  });
+
+  it('a consumer prompt failing with an auth error dead-letters its spliced wake batch', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    loop.onError(() => {});
+    const deadLettered = vi.fn();
+    loop.onBackgroundResultDeadLettered(deadLettered);
+    failingWithAuth(piAgent);
+
+    const turn = loop.prompt('real question');
+    // Parked while the gate is held, then spliced into the prompt's batch.
+    expect(loop.deliver('spliced content').outcome).toBe('parked');
+    await expect(turn).rejects.toThrow('401');
+
+    await waitUntil(() => deadLettered.mock.calls.length === 1 && !loop.isLoopActive);
+    // Precondition: the content rode the failed prompt's batch.
+    expect(Array.isArray(piAgent.promptCalls[0])).toBe(true);
+    expect(piAgent.promptCalls).toHaveLength(1);
+    expect(deadLettered.mock.calls[0]![0]).toMatchObject({
+      kind: 'wake_delivery', attempts: 1, message: 'spliced content',
+    });
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+  });
+});
+
 describe('AgentLoop.deliver and abort', () => {
   it('abort() drops parked wake deliveries instead of waiting on a swept run', async () => {
     const piAgent = createMockPiAgent();
