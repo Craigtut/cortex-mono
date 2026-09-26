@@ -174,16 +174,19 @@ export type {
 // CortexAgent (the composite facade over AgentLoop: passthrough and duplex
 // modes). AgentLoop remains the loop primitive and the package's primary
 // agent surface until the duplex default flips (Phase 3).
-export { CortexAgent, CONFIG_ROUTING, buildReasonerConfig } from './cortex-agent.js';
+export { CortexAgent } from './cortex-agent.js';
+export { CONFIG_ROUTING, buildReasonerConfig } from './facade/config.js';
 export type {
   CortexAgentMode,
   CortexAgentConfig,
-  CortexAbortScope,
-  CortexDeliverOptions,
   CortexSessionLogConfig,
   TalkerConfig,
   DuplexTuningConfig,
   ConfigDestination,
+} from './facade/config.js';
+export type {
+  CortexAbortScope,
+  CortexDeliverOptions,
   CortexAgentStateV1,
   CortexAgentStateV2,
   CortexAgentPersistedState,
