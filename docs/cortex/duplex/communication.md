@@ -13,8 +13,8 @@ Control toolset (initial):
 | Tool | Arguments | Facade action |
 |---|---|---|
 | `spawn_task` | `{ instructions }` | deliver new work to the reasoner |
-| `steer_task` | `{ taskAlias?, message }` | deliver a redirect to the reasoner (always; no fast-path, D20) |
-| `cancel_task` | `{ taskAlias }` | cancel the target, log a lifecycle entry |
+| `steer_task` | `{ taskAlias?, message }` | deliver a redirect to the reasoner (always; no fast-path, D20); a live reasoner run takes it at its next turn boundary |
+| `cancel_task` | `{ taskAlias }` | mark the task cancelled and tell the reasoner; stop the live reasoner run if it serves only cancelled work, otherwise steer the stop into it at its next turn boundary |
 | `answer_ask` | `{ askId, decision: 'allow' \| 'deny', reason? }` | settle the pending ask, subject to the consent rules in D16 |
 | `quick_lookup` | `{ question }` | spawn a read-only ephemeral sub-agent |
 
@@ -86,7 +86,9 @@ Even with a leaked nonce, D16 still holds and consent cannot be forged: what a c
 
 Defaults per entry type: milestones `silent`, final results `when_idle`, permission asks `interrupt`, conversation deltas to the reasoner `silent` (D18). Without a consumer idle signal, `when_idle` degrades to `interrupt` after a configurable delay; the same delay bounds the case where a signal exists but never reports a lull.
 
-Stale results are never dropped (the Nova 2 Sonic position): a delivery that arrives after the user changed direction still enters the log and the talker's context; the talker reconciles conversationally. Explicit `cancel_task` is the only discard path.
+Stale results are never dropped (the Nova 2 Sonic position): a delivery that arrives after the user changed direction still enters the log and the talker's context; the talker reconciles conversationally. Explicit `cancel_task` is the only discard path: a delivery whose causation is entirely cancelled work (the cancelled task's own directives, including the cancel itself) is not delivered, and is recorded as a `delivery_dropped_cancelled` lifecycle entry carrying the withheld content. A delivery from a run that also served live work is delivered as usual.
+
+A cancel stops work, not just its reporting. When every cause tag of the reasoner's live run belongs to a cancelled task, the facade aborts that run (logged as `cancelled_run_stopped`) and delivers the cancel directive once the abort completes, so the reasoner can clean up anything the task left running; dispatches issued during that abort wait for it rather than being cancelled with the run. The facade declines the abort when other content is parked behind the run, since aborting would drop it, and steers the stop in instead.
 
 ## Permission Brokering
 

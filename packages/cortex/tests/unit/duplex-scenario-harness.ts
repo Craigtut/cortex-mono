@@ -323,7 +323,12 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
             err.name = 'AbortError';
             throw err;
           }
-          if (calls.length === 0 || terminateBatch) break;
+          // Pi polls steering after every completed turn, terminated batch
+          // included, and keeps the run going when anything was queued.
+          const steered = agent.steeringQueue.splice(0) as AgentMessage[];
+          agent.state.messages.push(...steered);
+          runMessages.push(...steered);
+          if ((calls.length === 0 || terminateBatch) && steered.length === 0) break;
         }
 
         agent.state.messages.push(...(agent.followUpQueue.splice(0) as AgentMessage[]));

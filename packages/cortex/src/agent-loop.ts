@@ -29,7 +29,7 @@ import {
 } from './cache-breakpoints.js';
 import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-breakpoints.js';
 import { EventBridge } from './event-bridge.js';
-import type { PiEventSource } from './event-bridge.js';
+import type { CortexEvent, PiEventSource } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
 import { classifyError } from './error-classifier.js';
 import {
@@ -594,6 +594,22 @@ export interface DeliverOptions {
    * context-only and carries no causation.
    */
   causeTag?: unknown;
+  /**
+   * Let a run already in flight take this wake delivery at its next turn
+   * boundary, instead of the delivery waiting for the next run. For content
+   * that redirects the work the live run is doing (a steer, a stop), where
+   * waiting for the run to end defeats the point.
+   *
+   * Exact, like every other wake path: the content still parks on the
+   * loop-owned queue, and is handed to pi's steering queue only in the
+   * turn_end frame of a live, non-failed turn, and only while pi's queues
+   * are empty, i.e. immediately before the steering poll that drains
+   * exactly that one message. Anything else (no live run, retry backoff,
+   * digestion, a failed or aborted turn, public steer() content already
+   * queued, an ordinary parked delivery ahead of it) leaves it parked for
+   * the next run, as without the flag. Wake deliveries only.
+   */
+  atTurnBoundary?: boolean;
 }
 
 /**
@@ -681,6 +697,8 @@ interface QueuedDelivery {
   abortEpoch?: number;
   /** Causation tag riding with the content (see DeliverOptions.causeTag). */
   causeTag?: unknown;
+  /** A live run may take it at its next turn boundary (see DeliverOptions). */
+  atTurnBoundary?: boolean;
 }
 
 /** Options for {@link AgentLoop.digestIdle}. */
@@ -1237,6 +1255,15 @@ export class AgentLoop {
       this.logger,
     );
     this.budgetGuard.wire(this.eventBridge);
+    // After the budget guard, so a turn that breaches the budget is seen as
+    // breached here and does not have content steered into a run that is
+    // about to be aborted.
+    this.eventUnsubscribers.push(
+      this.eventBridge.on('turn_end', (event) => {
+        if (event.childTaskId) return;
+        this.steerTurnBoundaryDeliveries(event);
+      }),
+    );
 
     // Set up the MCP client manager: a private one by default, or an
     // external shared one (config.mcpClientManager: one connection per
@@ -2223,6 +2250,7 @@ export class AgentLoop {
         timestamp: Date.now(),
         abortEpoch: this._abortEpoch,
         ...(options?.causeTag !== undefined ? { causeTag: options.causeTag } : {}),
+        ...(options?.atTurnBoundary ? { atTurnBoundary: true } : {}),
       });
       this.scheduleWakeSweep();
       this.logger.debug('wake delivery parked for the next run', {
@@ -2280,6 +2308,55 @@ export class AgentLoop {
       this.deadLetterWakeDeliveries(dropped, 'cancelled by abort (parked during the abort window)');
     }
     return deliverable;
+  }
+
+  /**
+   * Hand the parked turn-boundary deliveries (DeliverOptions.atTurnBoundary)
+   * to the live run, in the turn_end frame, right before pi's steering poll.
+   *
+   * pi emits turn_end, awaits its listeners, and then polls the steering
+   * queue (unless the turn failed or was aborted, where it ends the run
+   * without polling). So content steered here, while pi's queues are empty,
+   * is exactly the message that poll drains, in either drain mode, and the
+   * run continues into a turn that sees it. Every condition that would break
+   * that guarantee leaves the content parked for the next run instead.
+   *
+   * Only the leading flagged items are taken: an ordinary delivery parked
+   * ahead of them (a new task, say) opens the next run, and letting a later
+   * redirect overtake it would hand the live run an instruction about work
+   * it has not been given yet.
+   */
+  private steerTurnBoundaryDeliveries(event: CortexEvent): void {
+    if (this.pendingWakeDeliveries.length === 0) return;
+    if (!this.pendingWakeDeliveries[0]!.atTurnBoundary) return;
+    if (!this._isPrompting || this.isShuttingDown()) return;
+    if (this._abortsInProgress > 0 || this.abortController.signal.aborted) return;
+    if (this.budgetGuard.isBreached()) return;
+    const message = (event.data as { message?: { stopReason?: unknown; errorMessage?: unknown } } | undefined)
+      ?.message;
+    if (!message) return;
+    if (message.stopReason === 'error' || message.stopReason === 'aborted' || message.errorMessage != null) {
+      return;
+    }
+    // Unknown queue state (a pi double without the probe) is not provably
+    // empty, so the content waits for the next run.
+    if (this.agent.hasQueuedMessages?.() !== false) return;
+
+    let count = 0;
+    while (
+      count < this.pendingWakeDeliveries.length &&
+      this.pendingWakeDeliveries[count]!.atTurnBoundary &&
+      (this.pendingWakeDeliveries[count]!.abortEpoch ?? this._abortEpoch) === this._abortEpoch
+    ) {
+      count += 1;
+    }
+    if (count === 0) return;
+    const taken = this.pendingWakeDeliveries.splice(0, count);
+    this.agent.steer({ role: 'user', content: taken.map((item) => item.content).join('\n\n') });
+    // The run now answers this content, so it carries its causation too.
+    const tags = taken.map((item) => item.causeTag).filter((tag) => tag !== undefined);
+    if (tags.length > 0) this._activeRunCauseTags = [...this._activeRunCauseTags, ...tags];
+    this.logger.debug('parked deliveries steered into the live run', { count });
   }
 
   /**

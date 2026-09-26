@@ -69,9 +69,9 @@ export interface DuplexRouterPorts {
   /**
    * Wake-deliver a composed dispatch message to the reasoner. causeSeq is
    * the log seq of the directive (or work utterance) for causation binding
-   * of the run it starts.
+   * of the run it starts (or, with atTurnBoundary, the live run it joins).
    */
-  dispatchToReasoner(message: string, causeSeq: number | null): void;
+  dispatchToReasoner(message: string, causeSeq: number | null, options?: ReasonerDispatchOptions): void;
   /** Append a session log entry; returns its seq. */
   appendLog(input: RouterLogInput): number;
   /**
@@ -131,6 +131,21 @@ export interface DuplexRouterPorts {
   /** Loop-path labels for log entries. Defaults: 'talker' / 'reasoner'. */
   talkerLoopPath?: string;
   reasonerLoopPath?: string;
+}
+
+/** How a dispatch should reach a reasoner that may be mid-run. */
+export interface ReasonerDispatchOptions {
+  /**
+   * The directive redirects work the live run may be doing (steer, cancel):
+   * a live run takes it at its next turn boundary instead of the next run.
+   */
+  atTurnBoundary?: boolean;
+  /**
+   * Every piece of work the live run serves has just been cancelled: stop
+   * that run, then deliver. The facade may decline (it will not destroy
+   * other content parked behind the run) and fall back to atTurnBoundary.
+   */
+  abortLiveRun?: boolean;
 }
 
 /** Router tunables; every default is overridable for tests and consumers. */
@@ -600,7 +615,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       data: { tool: 'steer_task', ...(alias ? { alias } : {}), message },
       ...this.talkerCause(),
     });
-    if (!this.dispatch(buildSteerDirective(alias, message), seq)) {
+    // At the live run's next turn boundary: a redirect that waits for the
+    // run to finish arrives after the work it was meant to change.
+    if (!this.dispatch(buildSteerDirective(alias, message), seq, { atTurnBoundary: true })) {
       return 'The redirect did not go through. Tell the user and try again.';
     }
     if (steered) {
@@ -642,7 +659,16 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       data: { tool: 'cancel_task', alias: delegation.alias },
       ...this.talkerCause(),
     });
-    this.dispatch(buildCancelDirective(delegation.alias, delegation.instructions), seq);
+    // Whatever the reasoner says in answer to the cancel belongs to the
+    // cancelled task too, so it is dropped with the rest of its results.
+    delegation.directiveSeqs.add(seq);
+    // A live run doing nothing but cancelled work is stopped outright; one
+    // that also serves live work gets the stop at its next turn boundary.
+    const liveRunCancelled = this.servesOnlyCancelledWork(this.ports.currentReasonerCauseTags());
+    this.dispatch(buildCancelDirective(delegation.alias, delegation.instructions), seq, {
+      atTurnBoundary: true,
+      ...(liveRunCancelled ? { abortLiveRun: true } : {}),
+    });
     return `Cancelling ${delegation.alias}.`;
   }
 
@@ -776,6 +802,26 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     }
     const now = this.now();
     this.lastReasonerOutputAt = now;
+
+    // cancel_task is the one discard path (communication.md): a result
+    // whose causation is entirely cancelled work never reaches the user.
+    // It is still recorded, so the audit trail shows what was withheld.
+    const causeTags = this.ports.currentReasonerCauseTags();
+    if (this.servesOnlyCancelledWork(causeTags)) {
+      this.ports.appendLog({
+        type: 'lifecycle',
+        loopPath: this.reasonerLoopPath,
+        content: 'Delivery dropped: its task was cancelled',
+        data: {
+          event: 'delivery_dropped_cancelled',
+          content,
+          ...(meta?.implicit ? { implicit: true } : {}),
+          ...(meta?.synthetic ? { synthetic: true } : {}),
+        },
+        ...this.reasonerCause(),
+      });
+      return { delivered: false, reason: 'the task it answers was cancelled' };
+    }
 
     // Content-hash dedup over recent deliveries: a reasoner (or its retry
     // ladder) emitting the same content repeatedly costs one delivery. The
@@ -1117,6 +1163,23 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     }
   }
 
+  /**
+   * Whether a reasoner run's causation is entirely cancelled delegations:
+   * non-empty, and every tag a directive belonging to one. A tag the
+   * registry cannot place (consumer work input, an unaliased steer, an aged
+   * out delegation) means the run serves something else as well.
+   */
+  private servesOnlyCancelledWork(causeTags: readonly CauseTag[]): boolean {
+    if (causeTags.length === 0) return false;
+    return causeTags.every((tag) => {
+      if (tag.kind !== 'directive') return false;
+      for (const delegation of this.delegations.values()) {
+        if (delegation.directiveSeqs.has(tag.seq)) return delegation.cancelled;
+      }
+      return false;
+    });
+  }
+
   private resolveDelegation(aliasName: string): TrackedDelegation | undefined {
     const exact = this.delegations.get(aliasName);
     if (exact) return exact;
@@ -1204,10 +1267,14 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * for work that was never handed over would replay on the retry that
    * could have succeeded).
    */
-  private dispatch(directive: string, causeSeq: number | null): boolean {
+  private dispatch(
+    directive: string,
+    causeSeq: number | null,
+    options?: ReasonerDispatchOptions,
+  ): boolean {
     const message = composeDispatchMessage(this.consumeConversationBlock(), directive);
     try {
-      this.ports.dispatchToReasoner(message, causeSeq);
+      this.ports.dispatchToReasoner(message, causeSeq, options);
       return true;
     } catch (err) {
       this.logger.error('dispatch to reasoner failed', {

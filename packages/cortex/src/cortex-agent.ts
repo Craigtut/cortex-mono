@@ -20,6 +20,7 @@
 
 import { AgentLoop } from './agent-loop.js';
 import type {
+  DeliverOptions,
   DeliverResult,
   DirectCompletionOptions,
   IdleDigestionOptions,
@@ -97,7 +98,7 @@ import type { ResolutionNote, ResolutionNoteCode } from './resolution-report.js'
 import { stripWorkingTags, WorkingTagStreamFilter } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
-import type { DuplexRouterOptions, DuplexRouterPorts } from './duplex/router.js';
+import type { DuplexRouterOptions, DuplexRouterPorts, ReasonerDispatchOptions } from './duplex/router.js';
 import { collectCauseTags, latestCauseSeq } from './duplex/cause-tags.js';
 import { FanOutContextManager } from './duplex/fanout-context-manager.js';
 import { DuplexHeadlines } from './duplex/headlines.js';
@@ -1390,6 +1391,11 @@ export class CortexAgent {
    */
   private reasonerDeliveredResultThisRun = false;
   /**
+   * Set while a cancel_task is aborting a reasoner run that served only the
+   * cancelled work; later dispatches chain behind it (see dispatchToReasoner).
+   */
+  private reasonerCancelAbort: Promise<void> | null = null;
+  /**
    * Whether the reasoner's current terminal failure already produced a
    * delivery. See deliverReasonerFailure for why a per-run reset is the
    * right unit for this and would not be for anything announced mid-ladder.
@@ -1709,7 +1715,8 @@ export class CortexAgent {
       },
       talkerIdle: () => !talker.isLoopActive,
       spawnLookup: (question, causeSeq) => lookups.request(question, causeSeq),
-      dispatchToReasoner: (message, causeSeq) => this.dispatchToReasoner(message, causeSeq),
+      dispatchToReasoner: (message, causeSeq, options) =>
+        this.dispatchToReasoner(message, causeSeq, options),
       appendLog: (input) => this.appendEntry({
         type: input.type,
         loopPath: input.loopPath,
@@ -1958,13 +1965,85 @@ export class CortexAgent {
    * reasoner is busy) carries the causation regardless of which path
    * delivers it.
    */
-  private dispatchToReasoner(message: string, causeSeq: number | null): void {
-    this.reasoner.deliver(
-      message,
-      causeSeq !== null
+  private dispatchToReasoner(
+    message: string,
+    causeSeq: number | null,
+    options?: ReasonerDispatchOptions,
+  ): void {
+    const deliverOptions: DeliverOptions = {
+      ...(causeSeq !== null
         ? { causeTag: { kind: 'directive', seq: causeSeq } satisfies CauseTag }
-        : undefined,
-    );
+        : {}),
+      ...(options?.atTurnBoundary ? { atTurnBoundary: true } : {}),
+    };
+    if (this.reasonerCancelAbort) {
+      // A cancel is stopping the reasoner's run. Anything handed over now
+      // would park inside the abort window and be cancelled with the run,
+      // so it waits for the abort to finish, in order.
+      this.reasonerCancelAbort = this.reasonerCancelAbort.then(() => {
+        this.deliverDispatchAfterCancel(message, deliverOptions, causeSeq);
+      });
+      return;
+    }
+    if (
+      options?.abortLiveRun &&
+      this.reasoner.isPrompting &&
+      // Aborting drops everything parked behind the run (other tasks'
+      // dispatches among it); stopping one task must not cost another.
+      this.reasoner.pendingWakeDeliveryCount === 0
+    ) {
+      this.appendEntry({
+        type: 'lifecycle',
+        loopPath: this.reasoner.loopPath,
+        content: 'Stopping the reasoner run: it served only cancelled work',
+        data: { event: 'cancelled_run_stopped' },
+        causedBy: causeSeq,
+      });
+      this.reasonerCancelAbort = this.reasoner.abort()
+        .catch((err: unknown) => {
+          this.logger.warn('cancel abort of the reasoner run failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .then(() => {
+          this.deliverDispatchAfterCancel(message, deliverOptions, causeSeq);
+        })
+        .finally(() => {
+          this.reasonerCancelAbort = null;
+        });
+      return;
+    }
+    this.reasoner.deliver(message, deliverOptions);
+  }
+
+  /**
+   * A dispatch deferred behind a cancel abort. It can no longer fail the
+   * control-tool call that produced it, so a failure is recorded the way
+   * the router records a synchronous one.
+   */
+  private deliverDispatchAfterCancel(
+    message: string,
+    deliverOptions: DeliverOptions,
+    causeSeq: number | null,
+  ): void {
+    if (this.destroyed) return;
+    try {
+      this.reasoner.deliver(message, deliverOptions);
+    } catch (err) {
+      this.logger.error('dispatch to reasoner failed after a cancel abort', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.appendEntry({
+        type: 'lifecycle',
+        loopPath: this.reasoner.loopPath,
+        content: 'Dispatch to the reasoner failed',
+        data: {
+          event: 'dispatch_failed',
+          error: err instanceof Error ? err.message : String(err),
+        },
+        causedBy: causeSeq,
+      });
+    }
   }
 
   /**

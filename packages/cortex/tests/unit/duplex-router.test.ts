@@ -12,7 +12,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { DuplexRouter, DUPLEX_ROUTER_DEFAULTS } from '../../src/duplex/router.js';
-import type { RouterLogInput } from '../../src/duplex/router.js';
+import type { ReasonerDispatchOptions, RouterLogInput } from '../../src/duplex/router.js';
 import { makeTestRouterPorts } from './duplex-test-ports.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
@@ -26,7 +26,11 @@ interface Harness {
   log: Array<RouterLogInput & { seq: number }>;
   talkerDeliveries: Array<{ content: string; wake: boolean }>;
   askVoicings: Array<{ content: string; causeTag: CauseTag }>;
-  reasonerDispatches: Array<{ message: string; causeSeq: number | null }>;
+  reasonerDispatches: Array<{
+    message: string;
+    causeSeq: number | null;
+    options?: ReasonerDispatchOptions;
+  }>;
   lookupSpawns: Array<{ question: string; causeSeq: number | null }>;
   /** Force the next spawnLookup verdicts to a refusal (null = accept). */
   setLookupRefusal: (reason: string | null) => void;
@@ -68,7 +72,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
   const askVoicings: Array<{ content: string; causeTag: CauseTag }> = [];
-  const reasonerDispatches: Array<{ message: string; causeSeq: number | null }> = [];
+  const reasonerDispatches: Harness['reasonerDispatches'] = [];
   const lookupSpawns: Array<{ question: string; causeSeq: number | null }> = [];
   let lookupRefusal: string | null = null;
   let nextLookupAlias = 1;
@@ -108,9 +112,13 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
       lookupSpawns.push({ question, causeSeq });
       return { accepted: true, alias: `lk-${nextLookupAlias++}` };
     },
-    dispatchToReasoner: (message, causeSeq) => {
+    dispatchToReasoner: (message, causeSeq, dispatchOptions) => {
       if (dispatchError) throw dispatchError;
-      reasonerDispatches.push({ message, causeSeq });
+      reasonerDispatches.push({
+        message,
+        causeSeq,
+        ...(dispatchOptions !== undefined ? { options: dispatchOptions } : {}),
+      });
       if (causeSeq !== null) dispatchedCauseSeqs.push(causeSeq);
     },
     appendLog: (input) => {
@@ -895,6 +903,57 @@ describe('control-tool dispatch', () => {
     expect(message).toContain(DELTA_OVERFLOW_MARKER);
     expect(message).toContain('keep this line');
     expect(message).not.toContain('a'.repeat(40));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steer and cancel against a live reasoner run
+// ---------------------------------------------------------------------------
+
+describe('steer and cancel against a live run', () => {
+  async function callTool(h: Harness, name: string, params: unknown): Promise<unknown> {
+    const tool = buildControlTools(h.router).find((candidate) => candidate.name === name)!;
+    return await tool.execute(params);
+  }
+
+  it('sends redirects and stops to the live run at its next turn boundary', async () => {
+    const h = createHarness();
+    await callTool(h, 'spawn_task', { instructions: 'scan the repo' });
+    await callTool(h, 'steer_task', { taskAlias: 'task-1', message: 'skip vendored code' });
+    expect(h.reasonerDispatches[0]!.options).toBeUndefined();
+    expect(h.reasonerDispatches[1]!.options).toEqual({ atTurnBoundary: true });
+  });
+
+  it('asks for the live run to be stopped only when it serves nothing but cancelled work', async () => {
+    const solo = createHarness();
+    await callTool(solo, 'spawn_task', { instructions: 'scan the repo' });
+    await callTool(solo, 'cancel_task', { taskAlias: 'task-1' });
+    expect(solo.reasonerDispatches[1]!.options).toEqual({ atTurnBoundary: true, abortLiveRun: true });
+
+    const shared = createHarness();
+    await callTool(shared, 'spawn_task', { instructions: 'scan the repo' });
+    await callTool(shared, 'spawn_task', { instructions: 'write the report' });
+    await callTool(shared, 'cancel_task', { taskAlias: 'task-1' });
+    expect(shared.reasonerDispatches[2]!.options).toEqual({ atTurnBoundary: true });
+  });
+
+  it('drops a result caused only by cancelled work, and logs what it withheld', async () => {
+    const h = createHarness();
+    h.setTalkerIdle(true);
+    await callTool(h, 'spawn_task', { instructions: 'scan the repo' });
+    await callTool(h, 'cancel_task', { taskAlias: 'task-1' });
+
+    const dropped = h.router.deliverFromReasoner('partial scan results', 'when_idle');
+    expect(dropped.delivered).toBe(false);
+    expect(h.log.filter((entry) => entry.type === 'delivery')).toHaveLength(0);
+    const record = h.log.find((entry) =>
+      (entry.data as { event?: string } | undefined)?.event === 'delivery_dropped_cancelled');
+    expect(record?.data).toMatchObject({ content: 'partial scan results' });
+
+    // Positive control: once the run also serves live work, results flow.
+    await callTool(h, 'spawn_task', { instructions: 'write the report' });
+    expect(h.router.deliverFromReasoner('report written', 'when_idle').delivered).toBe(true);
+    await waitUntil(() => h.talkerDeliveries.length === 1);
   });
 });
 
