@@ -1313,7 +1313,6 @@ describe('AgentLoop.deliver atTurnBoundary fallback to the next run', () => {
     let emit!: (event: PiEvent) => void;
     let release: (() => void) | null = null;
     const runs: Array<{ input: string | AgentMessage[]; tags: readonly unknown[] }> = [];
-    let loop!: AgentLoop;
     const steer = vi.fn();
     const pi = {
       state: { messages: [] as AgentMessage[], systemPrompt: '', tools: [] },
@@ -1333,7 +1332,7 @@ describe('AgentLoop.deliver atTurnBoundary fallback to the next run', () => {
       steer,
       ...(queueState !== 'unknown' ? { hasQueuedMessages: () => queueState === 'non-empty' } : {}),
     };
-    loop = createLoop(pi as unknown as PiAgent);
+    const loop = createLoop(pi as unknown as PiAgent);
     const endTurn = (): void => emit({
       type: 'turn_end',
       message: {

@@ -4,7 +4,7 @@ import type { PendingBackgroundCompletion } from '../../../src/agent-loop/backgr
 import { DeadLetterStore } from '../../../src/agent-loop/delivery-failure.js';
 import { AbortState, LoopGate } from '../../../src/agent-loop/run-control.js';
 import { DEFAULT_RETRY_POLICY } from '../../../src/retry-policy.js';
-import type { SubAgentResult } from '../../../src/types.js';
+import type { RetryPolicy, SubAgentResult } from '../../../src/types.js';
 
 const result: SubAgentResult = {
   output: 'done',
@@ -15,7 +15,9 @@ const result: SubAgentResult = {
 function setup(overrides?: { run?: () => Promise<unknown>; unwind?: boolean; cancelled?: string[] }) {
   const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
   const deadLetters = new DeadLetterStore(logger);
-  const runDeliveryTurn = vi.fn(overrides?.run ?? (async () => ({})));
+  const runDeliveryTurn = vi.fn<(message: string, policy: RetryPolicy, causeTags: unknown[]) => Promise<unknown>>(
+    overrides?.run ?? (async () => ({})),
+  );
   const emitError = vi.fn();
   const delivery = new BackgroundDelivery({
     gate: new LoopGate(),

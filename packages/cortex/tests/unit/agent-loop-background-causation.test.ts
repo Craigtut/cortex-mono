@@ -31,7 +31,6 @@ interface Harness {
 /** A loop whose first run calls `tool` with `params` from inside the run. */
 function setup(tool: string, params: unknown): Harness {
   const runs: Harness['runs'] = [];
-  let loop!: AgentLoop;
   const pi = {
     state: { messages: [] as AgentMessage[], systemPrompt: '', tools: [] as PiTool[] },
     subscribe() { return () => {}; },
@@ -50,7 +49,7 @@ function setup(tool: string, params: unknown): Harness {
     steer() {},
   };
   const raw = { provider: 'anthropic', name: 'claude-sonnet-4-20250514', contextWindow: 200_000 } as PiModel;
-  loop = new (AgentLoop as unknown as Ctor)(
+  const loop = new (AgentLoop as unknown as Ctor)(
     pi as unknown as PiAgent,
     {
       model: wrapModel(raw, raw.provider, raw.name, raw.contextWindow),
