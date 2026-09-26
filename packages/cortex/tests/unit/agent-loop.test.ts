@@ -1080,6 +1080,20 @@ You have 12 emotions.`;
       expect(handler).toHaveBeenCalledTimes(1);
     });
 
+    it('isRunning is true only while a turn is in flight', async () => {
+      const agent = createTestAgentLoop(piAgent, config);
+      expect(agent.isRunning).toBe(false);
+      let during: boolean | undefined;
+      agent.onTurnComplete(() => {
+        during = agent.isRunning;
+      });
+
+      await agent.prompt('Hello');
+
+      expect(during).toBe(true);
+      expect(agent.isRunning).toBe(false);
+    });
+
     it('onTurnComplete fires with AgentTextOutput', async () => {
       piAgent.promptResult = 'Hello <working>internal</working> world';
       const agent = createTestAgentLoop(piAgent, config);

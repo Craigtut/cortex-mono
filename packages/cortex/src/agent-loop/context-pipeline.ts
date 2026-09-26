@@ -322,7 +322,7 @@ export class ContextPipeline {
     return {
       systemPrompt: state.systemPrompt ?? '',
       model: state.model ?? null,
-      messages: this.ports.agentState().messages,
+      messages: state.messages,
       tools: (state.tools ?? []) as unknown[],
       thinkingLevel: typeof state.thinkingLevel === 'string'
         ? state.thinkingLevel

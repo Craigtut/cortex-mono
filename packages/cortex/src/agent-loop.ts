@@ -23,17 +23,11 @@ import type { AgentContext, AgentMessage } from './context-manager.js';
 import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-breakpoints.js';
 import { EventBridge } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
-import { classifyError, toError } from './error-classifier.js';
-import {
-  resolveRetryPolicy,
-  backoffForAttempt,
-  shouldRetry,
-  isRetryableCategory,
-} from './retry-policy.js';
+import { classifyError } from './error-classifier.js';
+import { resolveRetryPolicy } from './retry-policy.js';
 import { withPlaceholderContent } from './pi-message.js';
 import type { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
-import { isContextOverflow } from './compaction/failsafe.js';
 import type { ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './compaction/observational/types.js';
 import { createRecallTool } from './compaction/observational/recall-tool.js';
 import { SubAgentManager } from './sub-agent-manager.js';
@@ -52,6 +46,7 @@ import { createBuiltinTools } from './agent-loop/builtin-tools.js';
 import { ToolRegistry } from './agent-loop/tool-registry.js';
 import { McpAttachment } from './agent-loop/mcp-attachment.js';
 import { DeliveryQueues } from './agent-loop/delivery-queues.js';
+import { TurnRunner } from './agent-loop/turn-runner.js';
 import { ContextPipeline } from './agent-loop/context-pipeline.js';
 import type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
 import { BackgroundDelivery } from './agent-loop/background-delivery.js';
@@ -66,7 +61,6 @@ import {
   isAbortShapedError,
   LoopGate,
   raceTimeout,
-  sleepUnlessAborted,
 } from './agent-loop/run-control.js';
 import { CHILD_SEED_CONTEXT_SLOT, prepareChildLoop } from './agent-loop/child-loop-config.js';
 import type { ChildLoopParams } from './agent-loop/child-loop-config.js';
@@ -119,10 +113,6 @@ import type {
 } from './types.js';
 import { DEFAULT_LOOP_PATH } from './types.js';
 import {
-  isResumableAfterTrim,
-  trimTrailingFailures,
-} from './agent-loop/transcript-repair.js';
-import {
   clampToSupported,
   fromPiThinkingLevel,
   modelThinkingCapabilities,
@@ -130,7 +120,6 @@ import {
 } from './agent-loop/pi-agent.js';
 import type {
   AgentLoopConstructorOptions,
-  CacheRetention,
   PiAgent,
   QueueDrainMode,
   RegisteredTool,
@@ -209,8 +198,6 @@ export class AgentLoop {
   private lifecycleState: CortexLifecycleState = 'created';
   private readonly systemPrompt: SystemPromptState;
 
-  private _activePromptCacheRetention: CacheRetention | null = null;
-
   // Primary and utility models, context window limit, cache retention, session key.
   private readonly models: ModelSettings;
 
@@ -224,9 +211,6 @@ export class AgentLoop {
   // Event handlers (consumer-registered callbacks)
   private readonly loopCompleteHandlers: HandlerList<[LoopOriginContext]>;
   private readonly errorHandlers: HandlerList<[ClassifiedError, LoopOriginContext]>;
-  private readonly retryScheduledHandlers: HandlerList<[RetryScheduledInfo, LoopOriginContext]>;
-  private readonly retrySucceededHandlers: HandlerList<[RetrySucceededInfo, LoopOriginContext]>;
-  private readonly retryExhaustedHandlers: HandlerList<[RetryExhaustedInfo, LoopOriginContext]>;
   private readonly turnCompleteHandlers: HandlerList<[AgentTextOutput, LoopOriginContext]>;
   // Finished background work waiting to be delivered to the loop
   private readonly background: BackgroundDelivery;
@@ -251,29 +235,12 @@ export class AgentLoop {
   // The current run's abort controller and the abort epoch (run-control.ts)
   private readonly abortState = new AbortState();
 
-  // Whether a prompt() call is currently in progress
-  private _isPrompting = false;
-
-  // Cause tags of the run currently holding the gate (see
-  // DeliverOptions.causeTag): computed in the same synchronous frame that
-  // takes the delivery batches at run start, assigned as the first statement
-  // of the try owning the clearing finally, so the set and the clear are
-  // paired by construction and a reader can never observe a dead or previous
-  // run's tags from a later run.
-  private _activeRunCauseTags: readonly unknown[] = [];
-  // Tag handoff for the deliver() prompted branch: deliver() sets it
-  // immediately before calling prompt() with the gate empty, so the very
-  // next run task (that prompt's own) is the one that consumes it.
-  private pendingPromptCauseTag: unknown = undefined;
+  // Runs a logical turn (with retries) and owns the turn-scoped state
+  private readonly runner: TurnRunner;
 
   // Serializes every loop-owning task (run-control.ts)
   private readonly gate = new LoopGate();
 
-  // Resolves when the current turn's unwind (catch/finally of runPromptOnce)
-  // has completed. abort() awaits this so its controller reset can never land
-  // before the cancelled turn's error classification observes the abort.
-  private turnUnwound: Promise<void> = Promise.resolve();
-  private resolveTurnUnwound: (() => void) | null = null;
 
   // In-flight destroy(). Concurrent destroy() calls share one teardown.
   private destroyPromise: Promise<void> | null = null;
@@ -291,12 +258,6 @@ export class AgentLoop {
   // Skill registry, the load_skill tool, and the loaded-skill buffer
   private readonly skills: SkillBinding;
 
-  // Cache breakpoint optimization: boundary tracking and API index state.
-  // _prePromptMessageCount records agent.state.messages.length BEFORE each
-  // prompt() call, marking the boundary between "old history" (stable,
-  // cacheable) and "new tick content" (varies per tick). This enables
-  // cross-tick prefix caching of conversation history.
-  private _prePromptMessageCount: number = 0;
 
 
   // Session-lifetime usage plus the last direct completion's usage.
@@ -323,9 +284,6 @@ export class AgentLoop {
     this.logger = prefixLoggerWithLoopPath(config.logger ?? NOOP_LOGGER, this.loopPath);
     this.loopCompleteHandlers = new HandlerList('onLoopComplete', this.logger);
     this.errorHandlers = new HandlerList('onError', this.logger);
-    this.retryScheduledHandlers = new HandlerList('onRetryScheduled', this.logger);
-    this.retrySucceededHandlers = new HandlerList('onRetrySucceeded', this.logger);
-    this.retryExhaustedHandlers = new HandlerList('onRetryExhausted', this.logger);
     this.turnCompleteHandlers = new HandlerList('onTurnComplete', this.logger);
     this.deadLetters = new DeadLetterStore(this.logger);
     this.queues = new DeliveryQueues({
@@ -335,20 +293,18 @@ export class AgentLoop {
       isShuttingDown: () => this.isShuttingDown(),
       assertNotShuttingDown: () => this.assertNotShuttingDown(),
       hasSystemPrompt: () => this.systemPrompt.isConfigured(),
-      isPrompting: () => this._isPrompting,
+      isPrompting: () => this.runner.isPrompting,
       budgetBreached: () => this.budgetGuard.isBreached(),
       startPrompt: (content, options, causeTag) => {
-        this.pendingPromptCauseTag = causeTag;
+        this.runner.stagePromptCauseTag(causeTag);
         return this.prompt(content, options);
       },
       runDeliveryTurn: (message, retryPolicy, causeTags) =>
-        this.runPromptOnce(message, undefined, true, retryPolicy, causeTags),
-      appendActiveCauseTags: (tags) => {
-        this._activeRunCauseTags = [...this._activeRunCauseTags, ...tags];
-      },
+        this.runner.run(message, undefined, true, retryPolicy, causeTags),
+      appendActiveCauseTags: (tags) => this.runner.appendActiveCauseTags(tags),
       transcript: {
         messages: () => this.agent.state.messages,
-        boundary: () => this._prePromptMessageCount,
+        boundary: () => this.runner.boundary,
         notifyTailTrimmed: () => this.notifySourceHistoryTailTrimmed(),
       },
       piQueues: this.agent,
@@ -364,7 +320,7 @@ export class AgentLoop {
       isShuttingDown: () => this.isShuttingDown(),
       isCancelled: (taskId) => this.subAgentManager.isCancelled(taskId),
       runDeliveryTurn: (message, retryPolicy) =>
-        this.runPromptOnce(message, undefined, true, retryPolicy),
+        this.runner.run(message, undefined, true, retryPolicy),
       unwindFailedDelivery: (preDeliveryCount, runAbortEpoch) =>
         this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch),
       messages: () => this.agent.state.messages,
@@ -380,7 +336,7 @@ export class AgentLoop {
       config.diagnostics?.promptWatchdog,
       this.logger,
       {
-        isPrompting: () => this._isPrompting,
+        isPrompting: () => this.runner.isPrompting,
         isAbortRequested: () => this.isAborted(),
       },
       this.loopPath,
@@ -552,6 +508,36 @@ export class AgentLoop {
       }),
     );
 
+    this.runner = new TurnRunner({
+      agent: this.agent,
+      config,
+      retryPolicy: this.retryPolicy,
+      abort: this.abortState,
+      isAborted: () => this.isAborted(),
+      activate: () => {
+        if (this.lifecycleState === 'created') this.lifecycleState = 'active';
+      },
+      assertNotShuttingDown: () => this.assertNotShuttingDown(),
+      emitError: (error, wasAborted) => this.emitError(error, wasAborted),
+      cacheRetention: () => this.models.cacheRetention,
+      model: () => this.models.primary,
+      queues: this.queues,
+      toolRuntime: this.tools.runtime,
+      budget: this.budgetGuard,
+      diagnostics: this.promptDiagnostics,
+      compaction: () => this.compactionManager,
+      handleOverflow: () => this.compactionManager.handleOverflowError(
+        () => this.getConversationHistory(),
+        (history) => this.restoreConversationHistory(history),
+      ),
+      slotCount: () => this.contextManager.slotCount,
+      notifyTailTrimmed: () => this.notifySourceHistoryTailTrimmed(),
+      pendingBackgroundCount: () => this.background.pending.length,
+      drainBackground: () => this.background.drain(),
+      origin: this.originContext,
+      logger: this.logger,
+    });
+
     // Attach to the MCP client manager (private, or a shared external one).
     this.mcp = new McpAttachment(config, this.logger, {
       onSubprocessSpawned: (pid) => this.processes.track(pid),
@@ -592,11 +578,11 @@ export class AgentLoop {
         const background = this.buildBackgroundTaskState();
         return { stable, volatile: background ? [background] : [] };
       },
-      boundary: () => this._prePromptMessageCount,
+      boundary: () => this.runner.boundary,
       setBoundary: (boundary) => {
-        this._prePromptMessageCount = boundary;
+        this.runner.boundary = boundary;
       },
-      isPrompting: () => this._isPrompting,
+      isPrompting: () => this.runner.isPrompting,
       gate: this.gate,
       assertNotShuttingDown: () => this.assertNotShuttingDown(),
       isShuttingDown: () => this.isShuttingDown(),
@@ -746,7 +732,7 @@ export class AgentLoop {
     // running to completion un-aborted.
     this.abortState.renewIfAborted();
 
-    return this.enqueueLoopTask(() => this.runPromptCycle(input, options));
+    return this.enqueueLoopTask(() => this.runner.runCycle(input, options));
   }
 
   /** Whether teardown has started (no new loops may start). */
@@ -798,7 +784,7 @@ export class AgentLoop {
    * turn is in flight waits for whatever run starts next.
    */
   get isPrompting(): boolean {
-    return this._isPrompting;
+    return this.runner.isPrompting;
   }
 
   /**
@@ -813,7 +799,7 @@ export class AgentLoop {
    * consent to those stamps, docs/cortex/duplex/log-and-context.md).
    */
   get activeRunCauseTags(): readonly unknown[] {
-    return this._activeRunCauseTags;
+    return this.runner.activeCauseTags;
   }
 
   /**
@@ -836,415 +822,9 @@ export class AgentLoop {
     return this.gate.waitForIdle();
   }
 
-  /**
-   * One gate-owned loop cycle: run the logical turn, then deliver any
-   * background completions that arrived while it ran. Lifecycle is
-   * re-checked here (at dequeue time) so a destroy() that lands between
-   * enqueue and dequeue can never start a new loop.
-   */
-  private async runPromptCycle(input: string, options?: DirectCompletionOptions): Promise<unknown> {
-    this.assertNotShuttingDown();
-    try {
-      return await this.runPromptOnce(input, options);
-    } finally {
-      // Deliver background results that arrived while prompting. This runs
-      // before the consumer's await resolves, keeping its UI state
-      // consistent, and still under the same gate acquisition. A terminal
-      // delivery failure is a background concern: it surfaces through
-      // onError (once, at this chain root), never by rejecting a consumer
-      // turn that already succeeded or replacing that turn's own error.
-      try {
-        await this.background.drain();
-      } catch (err) {
-        this.emitError(toError(err));
-      }
-    }
-  }
-
-  /**
-   * Run one logical prompt turn (first attempt plus transparent background
-   * retries). Must be called while holding the loop gate; all mutation of
-   * shared loop state (tool runtime, history boundary, prompting flag)
-   * happens here, after the gate has been acquired.
-   *
-   * @param fromDrain - True for the background-completion delivery path,
-   *   which deliberately starts a fresh loop after an abort. The consumer
-   *   path (false) instead cancels a turn whose controller was aborted
-   *   before it dequeued (e.g. a same-frame prompt()+abort()).
-   * @param retryPolicyOverride - Per-run retry policy. The drain passes a
-   *   policy whose elapsed ceiling is its remaining delivery budget, so a
-   *   re-queued delivery cannot re-enter the full retry ladder.
-   * @param causeTags - Cause tags for content a drain-started run carries
-   *   itself (the sweep passes its batch's tags; the non-drain path derives
-   *   tags from the spliced wake batch and the pending prompt tag instead).
-   */
-  private async runPromptOnce(
-    input: string,
-    options?: DirectCompletionOptions,
-    fromDrain = false,
-    retryPolicyOverride?: RetryPolicy,
-    causeTags?: unknown[],
-  ): Promise<unknown> {
-    // Transition to ACTIVE on first loop
-    if (this.lifecycleState === 'created') {
-      this.lifecycleState = 'active';
-    }
-
-    // Consume the deliver()-prompted cause tag first thing, even on paths
-    // that cancel before the run starts: the tag belongs to THIS cycle, and
-    // leaving it pending would mislabel a later, unrelated run.
-    let directCauseTag: unknown;
-    if (!fromDrain) {
-      directCauseTag = this.pendingPromptCauseTag;
-      this.pendingPromptCauseTag = undefined;
-    }
-
-    // Abort visibility at dequeue. prompt() installs a fresh (non-aborted)
-    // controller synchronously, so if THIS controller is aborted here an
-    // abort() must have landed between enqueue and dequeue.
-    if (this.abortState.signal.aborted) {
-      if (fromDrain) {
-        // A scheduled drain delivers background results by starting a fresh
-        // loop even after an abort, so replace the aborted controller and
-        // proceed.
-        this.abortState.renewIfAborted();
-      } else {
-        // A consumer turn cancelled before it ever reached pi. Surface it
-        // like any other cancellation and never start the run.
-        const abortErr = new Error('Prompt aborted before it started');
-        abortErr.name = 'AbortError';
-        this.emitError(abortErr, true);
-        throw abortErr;
-      }
-    }
-
-    const effectiveRetention = options?.cacheRetention ?? this.models.cacheRetention;
-    this._activePromptCacheRetention = effectiveRetention ?? null;
-
-    // Flush queued silent deliveries into this prompt's message batch. Only
-    // real prompts flush (never drain-started delivery runs): the queue's
-    // contract is "available in context at the next real prompt", and the
-    // drain's failure unwind counts messages from its own pre-delivery
-    // boundary, which flushed extras would corrupt. Taken AFTER the abort
-    // check above so a turn cancelled before it started leaves the queue
-    // intact for the next prompt.
-    const silentBatch = fromDrain ? [] : this.queues.takeSilent();
-    // Parked wake deliveries ride ahead of the prompt in the same batch,
-    // taken in this same synchronous frame (before pi pushes the batch at
-    // run start) so a sweep task that fires later finds nothing and cannot
-    // re-deliver content this run consumed. Items an abort cancelled are
-    // dropped by the take, not spliced into a post-abort prompt. If the
-    // run fails terminally without progressing past the batch, the catch
-    // below unwinds the wake portion and re-parks it: content the caller
-    // was told was 'parked' must end in a run that answers it, never
-    // silently demote to inert transcript context.
-    const wakeBatch = fromDrain ? [] : this.queues.takeDeliverableWake();
-
-    // Compute this run's cause tags in the same synchronous frame the
-    // batches were taken: caller-supplied tags (sweep runs), tags riding the
-    // spliced wake batch, and the deliver()-prompted input's own tag. The
-    // ASSIGNMENT happens as the first statement of the try below, so the
-    // clearing finally is paired with the set by construction: a throwing
-    // consumer logger (or diagnostics sink) between here and the try leaves
-    // the tags untouched instead of live for a run that never happened,
-    // where the next error entry would read the dead run's stamp (the fault
-    // class the interceptor site fixed the same way). Nothing between the
-    // batch take and the try awaits, so the same-frame property holds.
-    const runCauseTags: readonly unknown[] = [
-      ...(causeTags ?? []),
-      ...wakeBatch.map((item) => item.causeTag).filter((tag) => tag !== undefined),
-      ...(directCauseTag !== undefined ? [directCauseTag] : []),
-    ];
-
-    // Long-lived mode keeps workspace state (cwd, read-before-edit registry,
-    // undo history) across prompts; transient state resets regardless.
-    this.tools.runtime.resetForLoop(
-      this.config.persistentRuntime ? { preserveWorkspaceState: true } : undefined,
-    );
-    // Budget limits cover the whole logical turn: reset here (once per
-    // prompt) instead of on loop_start, which pi-agent-core emits again for
-    // every background-retry continuation. Under a lifetime budget scope the
-    // guard is never reset, so limits bound the loop's whole life.
-    if ((this.config.budgetGuard?.scope ?? 'prompt') === 'prompt') {
-      this.budgetGuard.reset();
-    }
-    this._isPrompting = true;
-    const loopStartMs = Date.now();
-
-    // Record the message count before this prompt so the transformContext
-    // hook knows where "old history" ends and "new tick content" begins.
-    // This enables cache breakpoint optimization: old history is stable
-    // across ticks and can be cached, while new content changes each tick.
-    this._prePromptMessageCount = this.agent.state.messages.length;
-
-    this.logger.debug('loop start', {
-      messageCount: this._prePromptMessageCount,
-      inputLength: input.length,
-    });
-
-    this.promptDiagnostics.startPrompt({
-      inputLength: input.length,
-      messageCount: this._prePromptMessageCount,
-      provider: this.models.primary.provider,
-      modelId: this.models.primary.modelId,
-    });
-
-    // Created immediately before the try so every code path that leaves a
-    // pending turnUnwound is guaranteed to hit the finally that resolves it
-    // (abort() awaits this promise and must never hang).
-    this.turnUnwound = new Promise<void>((resolve) => {
-      this.resolveTurnUnwound = resolve;
-    });
-
-    let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
-    try {
-      this._activeRunCauseTags = runCauseTags;
-      return await this.runTurnWithRetry(
-        input, fromDrain, retryPolicyOverride, silentBatch, wakeBatch,
-      );
-    } catch (err) {
-      const error = toError(err);
-      promptStatus = this.isAborted() ? 'cancelled' : 'rejected';
-      // A wake delivery spliced into a failed consumer prompt would
-      // otherwise sit in the transcript with no run ever answering it.
-      // Unwind and re-park it so a sweep re-delivers it with a run of its
-      // own. An aborted turn instead cancels its spliced deliveries, the
-      // same way abort() cancels parked ones.
-      if (promptStatus !== 'cancelled') {
-        this.queues.reparkAfterFailedPrompt(wakeBatch, silentBatch.length, error.message);
-      }
-      // Classification, overflow handling, retry orchestration, and the onError
-      // emission all happen inside runTurnWithRetry. Here we only record status
-      // for diagnostics and re-throw to the consumer.
-      throw error;
-    } finally {
-      this._activePromptCacheRetention = null;
-      this._isPrompting = false;
-      this._activeRunCauseTags = [];
-
-      this.logger.debug('loop complete', {
-        durationMs: Date.now() - loopStartMs,
-        turns: this.budgetGuard.getTurnCount(),
-        totalCost: this.budgetGuard.getTotalCost(),
-        currentContextTokens: this.compactionManager.currentContextTokenCount,
-      });
-
-      this.promptDiagnostics.finishPrompt({
-        status: promptStatus,
-        durationMs: Date.now() - loopStartMs,
-        turns: this.budgetGuard.getTurnCount(),
-        totalCost: this.budgetGuard.getTotalCost(),
-        currentContextTokens: this.compactionManager.currentContextTokenCount,
-        pendingBackgroundResults: this.background.pending.length,
-      });
-
-      // Signal that this turn has fully unwound (status classified, flags
-      // cleared). abort() waits on this before resetting the controller.
-      this.resolveTurnUnwound?.();
-      this.resolveTurnUnwound = null;
-    }
-  }
-
   // -----------------------------------------------------------------------
   // Background retry
   // -----------------------------------------------------------------------
-
-  /**
-   * Run one user turn, transparently retrying transient failures in the
-   * background per the configured RetryPolicy.
-   *
-   * The first attempt uses `agent.prompt(input)`. Each retry resumes the failed
-   * turn with `agent.continue()` after trimming pi-agent-core's synthetic
-   * failure message, so completed tool calls do not re-run and the user message
-   * is never duplicated. The returned promise stays pending across the whole
-   * backoff window; an abort during a backoff wait cancels it.
-   *
-   * On a non-retryable failure (auth, a 404 classified as unknown, context
-   * overflow, abort) or once retries are exhausted, it emits onError and throws
-   * exactly as the non-retrying path did, so the consumer's existing handling
-   * is unchanged for those cases.
-   *
-   * @param fromDrain - True for background-completion deliveries. The drain
-   *   chain re-queues a failed delivery and re-attempts it, so per-attempt
-   *   onError emission is deferred to the chain root: a later attempt that
-   *   succeeds surfaces no error at all, and a terminal failure surfaces
-   *   exactly once (mirroring how an in-run retry that recovers reports
-   *   onRetrySucceeded rather than onError).
-   */
-  private async runTurnWithRetry(
-    input: string,
-    fromDrain = false,
-    retryPolicyOverride?: RetryPolicy,
-    silentBatch: QueuedDelivery[] = [],
-    wakeBatch: QueuedDelivery[] = [],
-  ): Promise<unknown> {
-    const policy = retryPolicyOverride ?? this.retryPolicy;
-    let retryIndex = 0;
-    let firstFailureAt: number | undefined;
-
-    // Parked wake deliveries and queued silent deliveries ride ahead of the
-    // prompt in one message batch; pi pushes every batch message into the
-    // transcript at run start, so after the first attempt they are durable
-    // history and retries (continue()) see them without re-sending. Both
-    // queues are spliced by runPromptOnce in the same synchronous frame as
-    // this call, so a sweep task that fires later finds nothing and cannot
-    // re-deliver content this run consumed. Drain-started runs splice
-    // neither queue: their failure unwind counts messages from the
-    // pre-delivery boundary, which flushed extras would corrupt, and the
-    // sweep delivers parked wake content with a run of its own.
-    const leadingBatch = [...wakeBatch, ...silentBatch];
-    const promptInput: string | AgentMessage[] = leadingBatch.length > 0
-      ? [
-          ...leadingBatch.map((item): AgentMessage => ({
-            role: 'user',
-            content: item.content,
-            timestamp: item.timestamp,
-          })),
-          { role: 'user', content: input, timestamp: Date.now() },
-        ]
-      : input;
-
-    // Resolves to the turn result, or throws after onError has been emitted.
-    for (;;) {
-      try {
-        const result =
-          retryIndex === 0 ? await this.agent.prompt(promptInput) : await this.agent.continue();
-
-        // Pi-agent-core catches streaming/provider errors internally and stores
-        // them in state.errorMessage without re-throwing. Surface these so
-        // Cortex's error classification and consumer handlers can process them.
-        const agentState = this.agent.state as Record<string, unknown>;
-        const stateError = agentState['errorMessage'] ?? agentState['error'];
-        if (stateError) {
-          throw new Error(String(stateError));
-        }
-
-        // An abort can end the run cleanly: the stream returns a message with
-        // stopReason 'aborted' (no error state) and prompt() resolves. Trim
-        // the aborted assistant stub so it does not linger in history and get
-        // rewritten to "(no output)" on a later turn. No-op when the last
-        // message is a normal assistant turn.
-        if (this.isAborted()) {
-          this.trimTrailingFailureMessages();
-        }
-
-        if (retryIndex > 0) {
-          this.fireRetrySucceeded({ attempts: retryIndex });
-        }
-        return result;
-      } catch (err) {
-        const error = toError(err);
-        const aborted = this.isAborted();
-        const classified = classifyError(error, { wasAborted: aborted });
-
-        // Reactive overflow detection: emergency truncation, then surface (not
-        // retried by default; context_overflow is not a retryable category).
-        if (isContextOverflow(error)) {
-          this.compactionManager.handleOverflowError(
-            () => this.getConversationHistory(),
-            (history) => this.restoreConversationHistory(history),
-          );
-        }
-
-        if (firstFailureAt === undefined) firstFailureAt = Date.now();
-        const elapsedMs = Date.now() - firstFailureAt;
-
-        // Only retry when the policy allows AND the transcript can actually be
-        // resumed (last message after trimming is a user/tool-result, never a
-        // dangling assistant turn that continue() would reject).
-        const policyAllowsRetry = shouldRetry(
-          classified,
-          { retryIndex, elapsedMs, aborted },
-          policy,
-        );
-        const willRetry = policyAllowsRetry && this.peekResumableAfterTrim();
-
-        if (!willRetry) {
-          // Signal "gave up" only when the retry budget was genuinely exhausted
-          // (not when the transcript simply could not be resumed), and only if
-          // we had actually been retrying a transient failure. Never for a
-          // drain delivery: its ladder ending is not terminal (the batch is
-          // re-queued and the next attempt may succeed), so like onError the
-          // give-up signal is the chain root's to make (dead-letter).
-          if (
-            !fromDrain &&
-            retryIndex > 0 &&
-            !aborted &&
-            !policyAllowsRetry &&
-            isRetryableCategory(classified.category, policy)
-          ) {
-            this.fireRetryExhausted({ attempts: retryIndex, category: classified.category });
-          }
-          // A user abort is a cancellation, not a failure to keep: remove the
-          // aborted assistant stub pi appended, exactly as the retry path
-          // does, so it cannot linger in history and later be rewritten to
-          // "(no output)". Non-abort failures keep their stub (unchanged).
-          if (aborted) {
-            this.trimTrailingFailureMessages();
-          }
-          if (!fromDrain) {
-            this.emitError(error, aborted);
-          }
-          throw error;
-        }
-
-        const delayMs = backoffForAttempt(policy, retryIndex);
-        const attemptNumber = retryIndex + 1;
-        const scheduled: RetryScheduledInfo = {
-          category: classified.category,
-          attempt: attemptNumber,
-          maxAttempts: policy.maxAttempts,
-          delayMs,
-          nextAttemptAt: Date.now() + delayMs,
-          originalMessage: classified.originalMessage,
-        };
-        if (classified.causeDetail !== undefined) {
-          scheduled.causeDetail = classified.causeDetail;
-        }
-        this.fireRetryScheduled(scheduled);
-        this.logger.warn('scheduling background retry', {
-          category: classified.category,
-          attempt: attemptNumber,
-          maxAttempts: policy.maxAttempts,
-          delayMs,
-        });
-
-        const completed = await sleepUnlessAborted(delayMs, this.abortState.signal);
-        if (!completed) {
-          // Aborted during the wait: surface as cancelled, do not retry. Throw a
-          // fresh AbortError rather than the original transient failure so the
-          // consumer's catch sees a cancellation (matching the in-run abort
-          // path) instead of a stale network/rate-limit message. The synthetic
-          // failure stub that was awaiting this retry is trimmed like any
-          // other aborted turn.
-          this.trimTrailingFailureMessages();
-          if (!fromDrain) {
-            this.emitError(error, true);
-          }
-          const abortErr = new Error('Prompt aborted during retry backoff');
-          abortErr.name = 'AbortError';
-          throw abortErr;
-        }
-
-        // Remove pi-agent-core's synthetic failure message so continue() sees a
-        // user/tool-result as the last message and resumes cleanly.
-        this.trimTrailingFailureMessages();
-        retryIndex += 1;
-      }
-    }
-  }
-
-  /** Whether trimming the failure stubs leaves a transcript continue() can resume. */
-  private peekResumableAfterTrim(): boolean {
-    return isResumableAfterTrim(this.agent.state.messages, this.contextManager.slotCount);
-  }
-
-  /** Remove trailing synthetic failure messages so continue() can resume. */
-  private trimTrailingFailureMessages(): void {
-    if (trimTrailingFailures(this.agent.state.messages)) {
-      this.notifySourceHistoryTailTrimmed();
-    }
-  }
 
   /**
    * Tell the compaction manager the tail of the post-slot source history was
@@ -1265,15 +845,15 @@ export class AgentLoop {
 
 
   private fireRetryScheduled(info: RetryScheduledInfo): void {
-    this.retryScheduledHandlers.emit(info, this.originContext);
+    this.runner.retryScheduled.emit(info, this.originContext);
   }
 
   private fireRetrySucceeded(info: RetrySucceededInfo): void {
-    this.retrySucceededHandlers.emit(info, this.originContext);
+    this.runner.retrySucceeded.emit(info, this.originContext);
   }
 
   private fireRetryExhausted(info: RetryExhaustedInfo): void {
-    this.retryExhaustedHandlers.emit(info, this.originContext);
+    this.runner.retryExhausted.emit(info, this.originContext);
   }
 
   // -----------------------------------------------------------------------
@@ -1618,7 +1198,7 @@ export class AgentLoop {
       isToolPermissionExempt: (toolName) => this.isToolPermissionExempt(toolName),
       asks: this.asks,
       streamOptions: () => ({
-        retention: this._activePromptCacheRetention ?? this.models.cacheRetention ?? null,
+        retention: this.runner.activeCacheRetention ?? this.models.cacheRetention ?? null,
         sessionId: this.models.sessionId ?? null,
       }),
       syncActiveLoopTools: (ctx) => this.tools.syncActiveLoopTools(ctx),
@@ -2093,10 +1673,10 @@ export class AgentLoop {
     // Capture the current turn's unwind promise BEFORE aborting, so the
     // wait below is scoped to the turn being cancelled and never to a later
     // turn started by a background delivery.
-    const unwound = this.turnUnwound;
+    const unwound = this.runner.unwound;
 
     this.promptDiagnostics.recordAbortRequested();
-    this.logger.info('abort requested', { isPrompting: this._isPrompting });
+    this.logger.info('abort requested', { isPrompting: this.runner.isPrompting });
     this.queues.dropAllWakeForAbort();
     // A delivery can also park DURING the await windows below; it is
     // cancelled the same way. The live controller cannot express that (a
@@ -2207,7 +1787,7 @@ export class AgentLoop {
   get isRunning(): boolean {
     // Delegate to pi-agent-core's internal state check
     // The agent is "running" if it has an active streaming state
-    return this.lifecycleState === 'active' && !this.isIdle();
+    return this.lifecycleState === 'active' && this.runner.isPrompting;
   }
 
   /**
@@ -2223,7 +1803,7 @@ export class AgentLoop {
    * "old history" (cacheable) from "new tick content" (ephemeral).
    */
   get prePromptMessageCount(): number {
-    return this._prePromptMessageCount;
+    return this.runner.boundary;
   }
 
   // -----------------------------------------------------------------------
@@ -2259,7 +1839,7 @@ export class AgentLoop {
   onRetryScheduled(
     handler: (info: RetryScheduledInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.retryScheduledHandlers.add(handler);
+    this.runner.retryScheduled.add(handler);
   }
 
   /**
@@ -2269,7 +1849,7 @@ export class AgentLoop {
   onRetrySucceeded(
     handler: (info: RetrySucceededInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.retrySucceededHandlers.add(handler);
+    this.runner.retrySucceeded.add(handler);
   }
 
   /**
@@ -2280,7 +1860,7 @@ export class AgentLoop {
   onRetryExhausted(
     handler: (info: RetryExhaustedInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.retryExhaustedHandlers.add(handler);
+    this.runner.retryExhausted.add(handler);
   }
 
   /**
@@ -2815,14 +2395,6 @@ export class AgentLoop {
   }
 
   /**
-   * Check if the agent is currently idle (not running a loop).
-   * Tracked via a boolean flag set at prompt() entry and cleared in its finally block.
-   */
-  private isIdle(): boolean {
-    return !this._isPrompting;
-  }
-
-  /**
    * Perform ordered cleanup.
    */
   private async orderedCleanup(): Promise<void> {
@@ -3127,6 +2699,18 @@ export class AgentLoop {
 
   private settlePendingAsk(askId: string): void {
     this.asks.settle(askId);
+  }
+
+  private get _prePromptMessageCount(): number {
+    return this.runner.boundary;
+  }
+
+  private set _prePromptMessageCount(value: number) {
+    this.runner.boundary = value;
+  }
+
+  private get _isPrompting(): boolean {
+    return this.runner.isPrompting;
   }
 
   private get headlineProvider(): (() => string | null) | null {

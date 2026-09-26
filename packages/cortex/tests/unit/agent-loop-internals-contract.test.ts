@@ -48,6 +48,11 @@ type Kind = 'getter' | 'accessor' | 'method';
 const COMPAT: Record<string, Kind> = {
   trackedPids: 'getter',
   _abortEpoch: 'accessor',
+  _prePromptMessageCount: 'accessor',
+  _isPrompting: 'getter',
+  fireRetryScheduled: 'method',
+  fireRetrySucceeded: 'method',
+  fireRetryExhausted: 'method',
   pendingWakeDeliveries: 'getter',
   pendingBackgroundResults: 'getter',
   headlineProvider: 'getter',
@@ -122,6 +127,23 @@ describe('AgentLoop test-compat contract', () => {
     internals.pendingWakeDeliveries.splice(0);
     await new Promise((resolve) => setTimeout(resolve, 0));
     release();
+  });
+
+  it('_prePromptMessageCount writes through to the history boundary', () => {
+    const loop = createLoop();
+    (loop as unknown as { _prePromptMessageCount: number })._prePromptMessageCount = 5;
+    expect(loop.prePromptMessageCount).toBe(5);
+  });
+
+  it('_cacheBreakpointIndices writes through to what onPayload reads', () => {
+    const loop = createLoop();
+    const internals = loop as unknown as {
+      _cacheBreakpointIndices: unknown;
+      piHookHost(): { cacheBreakpointIndices(): unknown };
+    };
+    const indices = { bp2: 1, bp3: 2 };
+    internals._cacheBreakpointIndices = indices;
+    expect(internals.piHookHost().cacheBreakpointIndices()).toBe(indices);
   });
 
   it('trackedPids reads the process tracker', () => {
