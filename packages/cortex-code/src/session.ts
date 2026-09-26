@@ -20,19 +20,8 @@ import {
   ProviderManager,
   type CortexModel,
   type CortexAgentConfig,
-  type CortexEvent,
-  type AgentTextOutput,
-  type ClassifiedError,
-  type CompactionResult,
-  type RetryScheduledInfo,
-  type RetrySucceededInfo,
-  type RetryExhaustedInfo,
-  type LoopOriginContext,
   type ResolutionNote,
   type ThinkingLevel,
-  type ToolCallEndPayload,
-  type ToolCallStartPayload,
-  type ToolCallUpdatePayload,
 } from '@animus-labs/cortex';
 import { App, type AppCallbacks } from './tui/app.js';
 import { resolveAgentMode, type CortexCodeConfig } from './config/config.js';
@@ -42,7 +31,7 @@ import { PermissionBroker } from './permissions/prompt-broker.js';
 import { discoverProjectContext } from './discovery/context.js';
 import { generateSessionId, createToolResultPersistor } from './persistence/sessions.js';
 import { SessionCheckpoints } from './persistence/session-checkpoints.js';
-import { TranscriptWriter, extractToolResultText } from './persistence/transcript-writer.js';
+import { TranscriptWriter } from './persistence/transcript-writer.js';
 import { getCommand, registerBuiltinCommands } from './commands/index.js';
 import type { UpdateInfo } from './updates/checker.js';
 import { UpdatePrompt } from './updates/update-prompt.js';
@@ -51,7 +40,6 @@ import type { SandboxStatus, SandboxPolicy, SandboxRung } from '@animus-labs/cor
 import { workspaceSettingsPath } from './permissions/rules.js';
 import { log } from './logger.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
-import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
 import { FileSessionActivityReporter } from './activity/session-activity.js';
 import { McpReloadScheduler } from './mcp/reload-scheduler.js';
 import { applyPreTurnHooks } from './hooks/pre-turn.js';
@@ -62,6 +50,7 @@ import { LoopRouting } from './session/loop-routing.js';
 import { SubAgentActivity } from './session/sub-agent-activity.js';
 import { AssistantStream } from './session/assistant-stream.js';
 import { TurnRunner } from './session/turn-runner.js';
+import { wireAgentEvents } from './session/agent-events.js';
 import { SessionStatusView, readGitBranch } from './session/status-view.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
@@ -455,368 +444,21 @@ export class Session {
     this.mcpReload.schedule('manual');
   }
 
-  /** Wire all agent events to the TUI. */
+  /** Wire all agent events to the TUI, the activity stream and the durable transcript. */
   private wireEvents(): void {
     if (!this.agent || !this.app) return;
-    const bridge = this.agent.getEventBridge();
-    this.wireActivityEvents(bridge);
-
-    // Streaming response chunks
-    bridge.on('response_start', (event: CortexEvent) => {
-      if (event.childTaskId) return;
-      if (!this.routing.isConversationEvent(event)) return;
-      this.stream.begin();
-    });
-
-    bridge.on('response_chunk', (event: CortexEvent) => {
-      // Skip child agent streaming; only parent text goes to transcript
-      if (event.childTaskId) return;
-      // Skip the work loop's streaming too. The merged duplex bridge carries
-      // both resident loops and neither sets childTaskId, so without this
-      // the reasoner's private working prose streams into the assistant
-      // bubble and is then replaced by the talker's actual reply.
-      if (!this.routing.isConversationEvent(event)) return;
-
-      // Text flowing again means a pending retry reconnected.
-      this.retry.noteProgress();
-
-      this.stream.chunk(event.data as Record<string, unknown> | undefined);
-    });
-
-    // Tool call lifecycle (uses typed payloads from EventBridge)
-    bridge.on('tool_call_start', (event: CortexEvent) => {
-      // Child agent tool events update the parent sub-agent row instead of
-      // creating separate transcript rows.
-      if (event.childTaskId) {
-        this.subAgents.toolStarted(event);
-        return;
-      }
-      // The talker's control tools are routing plumbing, not work. See
-      // isTalkerEvent().
-      if (this.routing.isTalkerEvent(event)) return;
-
-      // A tool starting means the agent is making progress again.
-      this.retry.noteProgress();
-
-      const p = event.payload as ToolCallStartPayload | undefined;
-      const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
-
-      // SubAgent tool calls are displayed via the onSubAgentSpawned lifecycle hook
-      if (toolName === 'SubAgent') return;
-
-      const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? Math.random());
-      const args = p?.args ?? ((event.data as Record<string, unknown> | undefined)?.['args'] as Record<string, unknown> ?? {});
-      const displayArgs = buildToolDisplayArgs(toolName, args);
-      const summary = summarizeToolStartArgs(toolName, toolCallId, args);
-      const traceToolStarts = this.freezeDiagnostics.isEnabled;
-
-      if (traceToolStarts) {
-        log.debug('[TUI] tool_call_start received', summary);
-        this.app!.traceNextRender(`tool-start:${toolName}:${toolCallId}`);
-      }
-
-      try {
-        this.app!.transcript.startToolCall(toolCallId, toolName, displayArgs);
-        if (traceToolStarts) {
-          log.debug('[TUI] tool_call_start queued', {
-            ...summary,
-            displayArgKeys: Object.keys(displayArgs),
-          });
-        }
-      } catch (error) {
-        log.error('[TUI] tool_call_start failed', {
-          ...summary,
-          message: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-        });
-        throw error;
-      }
-    });
-
-    // Streaming tool updates (bash output, etc.)
-    bridge.on('tool_call_update', (event: CortexEvent) => {
-      if (event.childTaskId) return;
-      if (this.routing.isTalkerEvent(event)) return;
-
-      const p = event.payload as ToolCallUpdatePayload | undefined;
-      const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
-      const partialResult = p?.partialResult ?? (event.data as Record<string, unknown> | undefined)?.['partialResult'];
-
-      if (partialResult) {
-        this.app!.transcript.updateToolCall(toolCallId, partialResult);
-      }
-    });
-
-    bridge.on('tool_call_end', (event: CortexEvent) => {
-      // Child agent tool events update the parent sub-agent row instead of
-      // creating separate transcript rows.
-      if (event.childTaskId) {
-        this.subAgents.toolEnded(event);
-        return;
-      }
-      if (this.routing.isTalkerEvent(event)) return;
-
-      const p = event.payload as ToolCallEndPayload | undefined;
-      const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
-
-      // SubAgent tool_call_end is handled via onSubAgentCompleted/onSubAgentFailed
-      if (toolName === 'SubAgent') return;
-
-      const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
-      const durationMs = p?.durationMs ?? Number((event.data as Record<string, unknown> | undefined)?.['durationMs'] ?? 0);
-
-      if (p?.isError && p.error) {
-        this.app!.transcript.failToolCall(toolCallId, p.error, durationMs);
-      } else {
-        const result = p?.result ?? (event.data as Record<string, unknown> | undefined)?.['result'];
-        const details = (result as Record<string, unknown> | undefined)?.['details'];
-        this.app!.transcript.completeToolCall(toolCallId, result, details, durationMs);
-      }
-    });
-
-    // Turn complete (finalize assistant message). onTurnComplete fires once per
-    // LLM turn with the final user-facing text already assembled (working tags
-    // stripped), so it is the clean source for the durable transcript's
-    // assistant_message record. We record here rather than on the raw `turn_end`
-    // bridge event to avoid re-accumulating streamed response_chunks.
-    this.agent.onTurnComplete((output: AgentTextOutput) => {
-      this.stream.finish(output.userFacing);
-      this.transcriptWriter.addAssistantMessage(output.userFacing);
-    });
-
-    // A loop finished. Not "the agent is idle": this callback is registered
-    // on every resident loop and carries no origin, so under duplex the
-    // talker's sub-second turn fires it while the reasoner is minutes from
-    // done. Only the cheap per-loop refresh happens here; the end-of-work
-    // UI waits for the facade's settlement predicate.
-    this.agent.onLoopComplete(() => {
-      this.status.refreshContextUsage();
-      this.work.watchForSettled();
-    });
-
-    // Persistence trigger. Debounced by the facade and fired with a
-    // consistent composite snapshot (log plus both loops' histories and
-    // memory), which is why autosave hangs off this rather than off
-    // onLoopComplete and turn_end: those fire per loop and per turn, so one
-    // exchange used to write the session out three times, each time from a
-    // reasoner-only read that under duplex would silently drop the user's
-    // actual dialogue.
-    this.agent.onStateChanged((state) => {
-      this.checkpoints.record(state);
-    });
-
-    // Error handling with per-category display
-    this.agent.onError((error: ClassifiedError) => {
-      void this.activity.recordError(error, error.severity === 'fatal');
-      // The framework emits here and then re-throws out of prompt(); mark the
-      // failure handled so the prompt() catch does not render it a second time.
-      this.turns.markErrorHandled();
-      // Record the failure in the durable transcript so a turn that errored
-      // before completing is visible, cause chain included. Skip user aborts.
-      if (error.category !== 'cancelled') {
-        const transcriptMessage = error.causeDetail
-          ? `${error.originalMessage ?? String(error)} (${error.causeDetail})`
-          : (error.originalMessage ?? String(error));
-        this.transcriptWriter.addError(transcriptMessage, error.category);
-      }
-      switch (error.category) {
-        // Transient categories are managed by the background retry engine. When
-        // onError fires for one of these, retries are over (exhausted or
-        // disabled): collapse to a compact terminal line instead of a box.
-        case 'network':
-        case 'server_error':
-        case 'rate_limit': {
-          this.retry.fail(error.causeDetail);
-          break;
-        }
-        case 'authentication':
-          // The OAuth mechanics ("Failed to refresh token") are jargon and
-          // already in the durable transcript; the user just needs the fix.
-          this.retry.clear();
-          this.app!.transcript.addNotification('Authentication expired', '', {
-            severity: 'error',
-            action: 'run /login to reconnect',
-          });
-          break;
-        case 'context_overflow':
-          this.retry.clear();
-          this.app!.transcript.addNotification('Context limit reached', '', {
-            severity: 'error',
-            action: 'use /context-window or /clear',
-          });
-          break;
-        case 'cancelled':
-          // User-initiated abort; drop any pending retry line, no notification.
-          this.retry.clear();
-          break;
-        default:
-          this.retry.clear();
-          this.app!.transcript.addNotification(
-            error.originalMessage ?? String(error),
-            error.causeDetail ?? '',
-            { severity: 'error' },
-          );
-      }
-    });
-
-    // Background retry lifecycle: drive the compact, in-place status line.
-    // Every one of these is registered on both resident loops, so each keys
-    // on the origin: the line has one slot and two possible owners.
-    this.agent.onRetryScheduled((info: RetryScheduledInfo, origin: LoopOriginContext) => {
-      this.retry.start(info, origin.loopPath);
-    });
-    this.agent.onRetrySucceeded((_info: RetrySucceededInfo, origin: LoopOriginContext) => {
-      this.retry.clearFor(origin.loopPath);
-    });
-    this.agent.onRetryExhausted((_info: RetryExhaustedInfo, origin: LoopOriginContext) => {
-      // The matching fatal onError fires right after and renders the terminal
-      // 'failed' line; just stop the countdown here.
-      this.retry.stopFor(origin.loopPath);
-    });
-
-    // Compaction notification. The reasoner's only: the footer this updates
-    // reads the reasoner's context window, so a talker compaction would
-    // announce numbers that do not correspond to anything the user can see,
-    // about a context they do not own.
-    this.agent.onPostCompaction((result: CompactionResult, origin: LoopOriginContext) => {
-      if (!this.routing.isWorkLoop(origin)) return;
-      const beforeK = (result.tokensBefore / 1000).toFixed(1);
-      const afterK = (result.tokensAfter / 1000).toFixed(1);
-      // Mark in the durable transcript where context was summarized away. The
-      // full pre-compaction turns remain earlier in this transcript.
-      this.transcriptWriter.addCompaction({
-        beforeTokens: result.tokensBefore,
-        afterTokens: result.tokensAfter,
-      });
-      this.app!.transcript.addNotification(
-        'Context Compacted',
-        `Reduced from ${beforeK}k to ${afterK}k tokens`,
-      );
-      this.status.refreshContextUsage();
-    });
-
-    // The two failure notifications below deliberately fire for ANY loop,
-    // unlike the informational one above. A talker whose compaction degrades
-    // or runs out of layers is a conversation about to break, which the user
-    // needs to know even though the remedy text is written for the reasoner's
-    // context. A duplicated warning beats a swallowed one.
-
-    // Compaction degraded (Layer 2 failed, Layer 3 used as fallback)
-    this.agent.onCompactionDegraded((info) => {
-      this.app!.transcript.addNotification(
-        'Compaction Degraded',
-        `Layer 2 summarization failed (${info.layer2Failures} attempts). Emergency truncation dropped ${info.turnsDropped} turns.`,
-      );
-    });
-
-    // Compaction exhausted (all layers failed)
-    this.agent.onCompactionExhausted(() => {
-      this.app!.transcript.addNotification(
-        'Context Limit Reached',
-        'All compaction layers have failed. Use /context-window to increase the limit or /clear to start fresh.',
-      );
-    });
-
-    // Observational memory events (only fire when strategy is 'observational').
-    // The status they refresh is read off the reasoner's compaction manager,
-    // so a talker generation would only trigger a redundant re-read of a
-    // number that did not change.
-    this.agent.onObservation((_event, origin: LoopOriginContext) => {
-      if (!this.routing.isWorkLoop(origin)) return;
-      this.status.refreshObservationalMemory();
-    });
-    this.agent.onReflection((_event, origin: LoopOriginContext) => {
-      if (!this.routing.isWorkLoop(origin)) return;
-      this.status.refreshObservationalMemory();
-    });
-
-    // Sub-agent events: rendered as tool calls via the SubAgent renderer
-    this.agent.onSubAgentSpawned((taskId, instructions, background) => {
-      this.subAgents.open(taskId);
-      this.transcriptWriter.addSubAgent(taskId, 'spawned', { summary: instructions, background });
-      this.app!.transcript.startSubAgentCall(taskId, {
-        instructions,
-        background,
-        modelId: this.agent!.getModel().modelId,
-      });
-    });
-
-    this.agent.onSubAgentCompleted((taskId, result, status, usage) => {
-      this.transcriptWriter.addSubAgent(taskId, 'completed', { summary: result });
-      this.app!.transcript.completeSubAgentCall(taskId, result, status, usage);
-      this.subAgents.close(taskId);
-    });
-
-    this.agent.onSubAgentFailed((taskId, error) => {
-      this.transcriptWriter.addSubAgent(taskId, 'failed', { error });
-      this.app!.transcript.failSubAgentCall(taskId, error);
-      this.subAgents.close(taskId);
-    });
-
-    // Background sub-agent result delivery: Cortex restarts the agentic loop
-    // automatically; update TUI state so the user sees activity.
-    this.agent.onBackgroundResultDelivery(() => {
-      this.work.begin();
-      this.app!.showStatusSpinner('Processing background results...');
-      void this.activity.recordWorking();
-    });
-
-    // Update tokens on turn_end (fires after each LLM turn, including
-    // mid-loop turns between tool calls), and take a crash-recovery
-    // checkpoint. onStateChanged is the authoritative persistence trigger,
-    // but it cannot fire during a long task, so it is not on its own enough
-    // to keep one on disk. A child's turn boundary says nothing about the
-    // parent's history, so children are skipped.
-    bridge.on('turn_end', (event: CortexEvent) => {
-      this.status.refreshContextUsage();
-      this.status.refreshObservationalMemory();
-      if (event.childTaskId) return;
-      this.checkpoints.crashCheckpoint();
-    });
-  }
-
-  private wireActivityEvents(bridge: ReturnType<CortexAgent['getEventBridge']>): void {
-    bridge.on('turn_start', () => {
-      this.activity.recordTurnStarted();
-    });
-
-    bridge.on('turn_end', () => {
-      this.activity.recordTurnEnded();
-    });
-
-    bridge.on('tool_call_start', (event: CortexEvent) => {
-      const p = event.payload as ToolCallStartPayload | undefined;
-      const data = event.data as Record<string, unknown> | undefined;
-      const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
-      const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? data?.['id'] ?? Math.random());
-      const args = p?.args ?? (data?.['args'] as Record<string, unknown> | undefined) ?? {};
-      this.activity.recordToolStarted({
-        toolCallId,
-        toolName,
-        args,
-        ...(event.childTaskId ? { childTaskId: event.childTaskId } : {}),
-      });
-      this.transcriptWriter.addToolCall(toolCallId, toolName, args);
-    });
-
-    bridge.on('tool_call_end', (event: CortexEvent) => {
-      const p = event.payload as ToolCallEndPayload | undefined;
-      const data = event.data as Record<string, unknown> | undefined;
-      const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
-      const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? data?.['id'] ?? '');
-      const isError = p?.isError ?? Boolean(data?.['isError']);
-      this.activity.recordToolEnded({
-        toolCallId,
-        toolName,
-        durationMs: p?.durationMs ?? Number(data?.['durationMs'] ?? data?.['duration'] ?? 0),
-        isError,
-        ...(p?.error ? { error: p.error } : {}),
-        ...(event.childTaskId ? { childTaskId: event.childTaskId } : {}),
-      });
-      const output = isError && p?.error
-        ? p.error
-        : extractToolResultText(p?.result ?? data?.['result']);
-      this.transcriptWriter.addToolResult(toolCallId, isError, output);
+    wireAgentEvents(this.agent, this.app, {
+      routing: this.routing,
+      stream: this.stream,
+      subAgents: this.subAgents,
+      retry: this.retry,
+      work: this.work,
+      status: this.status,
+      checkpoints: this.checkpoints,
+      turns: this.turns,
+      activity: this.activity,
+      transcriptWriter: this.transcriptWriter,
+      freezeDiagnostics: this.freezeDiagnostics,
     });
   }
 
