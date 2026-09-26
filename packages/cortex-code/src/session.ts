@@ -81,8 +81,6 @@ import type {
   NetworkAccessRequest,
   NetworkAccessDecision,
 } from '@animus-labs/cortex';
-import { SandboxSettingsStore } from './config/sandbox-settings.js';
-import { detectContainer } from './utils/container.js';
 import {
   NetworkAccessController,
   NetworkGrantStore,
@@ -103,6 +101,7 @@ import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
+import { SessionSandbox } from './session/sandbox-state.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -138,22 +137,7 @@ export interface SessionOptions {
 
 export class Session {
   private agent: CortexAgent | null = null;
-  private sandboxOptions: SandboxOptions | undefined;
-  private sandboxStatus: SandboxStatus | undefined;
-  /**
-   * The policy handed to the provider. Kept even when OS enforcement is
-   * degraded or failed: it still projects into in-process egress (WebFetch),
-   * so the rung's network intent holds policy-only where the OS cannot.
-   */
-  private sandboxPolicy: SandboxPolicy | undefined;
-  /**
-   * The active trust rung. 'off' means no containment (user choice, config
-   * kill switch, or before initSandbox has resolved it). Changed only by a
-   * human through /sandbox; never exposed to the model.
-   */
-  private sandboxRung: SandboxRung = 'off';
-  /** Per-workspace remembered rung and one-time notice flags. */
-  private readonly sandboxSettings: SandboxSettingsStore;
+  private readonly sandbox: SessionSandbox;
   private readonly networkGrants: NetworkGrantStore;
   private readonly networkAccess: NetworkAccessController;
   private app: App | null = null;
@@ -277,9 +261,16 @@ export class Session {
     this.rules = new PermissionRuleManager(options.cwd);
     const settingsPath = workspaceSettingsPath(options.cwd);
     this.networkGrants = new NetworkGrantStore(settingsPath);
-    this.sandboxSettings = new SandboxSettingsStore(settingsPath);
+    this.sandbox = new SessionSandbox({
+      config: options.config,
+      cwd: options.cwd,
+      settingsPath,
+      getAgent: () => this.agent,
+      getApp: () => this.app,
+      onRungChanged: () => this.updateEphemeralContext(),
+    });
     this.networkAccess = new NetworkAccessController({
-      getPolicy: () => this.sandboxPolicy?.network,
+      getPolicy: () => this.sandbox.getPolicy()?.network,
       prompt: (req) => this.promptNetworkAccess(req),
       store: this.networkGrants,
     });
@@ -345,11 +336,11 @@ export class Session {
     // Initialize the OS sandbox (on by default at the Workspace rung) before the
     // agent so its Bash tool spawns are contained. Warn-and-continue if the host
     // cannot enforce; status is surfaced and the agent still runs.
-    this.sandboxOptions = await this.initSandbox();
+    await this.sandbox.init();
 
     // Create agent (built-in tools are auto-registered by Cortex)
     this.agent = await CortexAgent.create(this.buildAgentConfig());
-    this.applySandboxState(this.agent.getSandboxState());
+    this.sandbox.applyState(this.agent.getSandboxState());
 
     if (this.initialUtilityModelId) {
       await this.models.applyInitialUtilityModel(this.initialUtilityModelId);
@@ -436,7 +427,7 @@ export class Session {
     this.pushInitialFooterState(branch, initialEffort);
 
     // Recommend (never apply) /sandbox off when already inside a container.
-    void this.surfaceContainerRecommendation();
+    void this.sandbox.surfaceContainerRecommendation();
 
     // Put the session on disk before it can do any work. Everything after
     // this point can crash without the session becoming unlistable. A
@@ -1425,172 +1416,6 @@ export class Session {
    * rules are re-checked because a previous prompt may have created a
    * rule that now covers this request.
    */
-  /** Resolve product preferences; Cortex owns backend construction and policy setup. */
-  private async initSandbox(): Promise<SandboxOptions | undefined> {
-    if (this.config.sandbox?.enabled === false) {
-      this.sandboxRung = 'off';
-      return undefined;
-    }
-    await this.sandboxSettings.load();
-    this.sandboxRung = await this.resolveInitialRung();
-    const cortexHome = path.join(homedir(), '.cortex');
-    return {
-      rung: this.sandboxRung,
-      // Keep the CLI's availability choice explicit; the framework defaults to refusal.
-      requireEnforcement: this.config.sandbox?.requireEnforcement ?? false,
-      denyWrite: [cortexHome, path.join(this.cwd, '.cortex')],
-      denyRead: [path.join(cortexHome, 'credentials.json')],
-      ...(this.config.sandbox?.allowedDomains ? { allowedDomains: this.config.sandbox.allowedDomains } : {}),
-      onStatusChange: (state) => this.applySandboxState(state),
-    };
-  }
-
-  private applySandboxState(state: SandboxState | undefined): void {
-    this.sandboxRung = state?.rung ?? 'off';
-    this.sandboxPolicy = state?.policy;
-    this.sandboxStatus = state?.rung === 'off' ? undefined : state?.status;
-    this.app?.updateStatus(this.sandboxIndicatorState());
-  }
-
-  /**
-   * The rung this session starts at: the workspace's remembered rung when one
-   * exists, otherwise the configured default (Workspace unless config says
-   * otherwise), which is then remembered so the rung is a stable per-workspace
-   * fact from the first open on (the folder-trust pattern).
-   */
-  private async resolveInitialRung(): Promise<SandboxRung> {
-    const saved = this.sandboxSettings.getRung();
-    if (saved) return saved;
-
-    // An explicit consumer default is honored and remembered (folder-trust).
-    const configured = this.config.sandbox?.rung;
-    if (configured) {
-      await this.persistInitialRung(configured);
-      return configured;
-    }
-
-    // On Windows the Tier-1 helper is not yet code-signed, so it is opt-in:
-    // default to 'off' (no helper is ever spawned, so nothing can be flagged by
-    // antivirus). Do NOT persist that 'off' — leaving the remembered rung empty
-    // means a later consumer default (sandbox.rung, e.g. once a signed helper
-    // ships) or a future on-by-default flip still takes effect, while
-    // `/sandbox workspace` remains the explicit, remembered opt-in. Persisting
-    // it would make 'off' sticky and defeat the signed-helper rollout.
-    if (process.platform === 'win32') {
-      return 'off';
-    }
-
-    // Every other platform is on-by-default at Workspace, remembered per
-    // workspace (the folder-trust pattern).
-    await this.persistInitialRung('workspace');
-    return 'workspace';
-  }
-
-  private async persistInitialRung(rung: SandboxRung): Promise<void> {
-    try {
-      await this.sandboxSettings.setRung(rung);
-    } catch (err) {
-      log.warn('Could not persist initial sandbox rung', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  /**
-   * Change the trust rung for this session and remember it per-workspace.
-   *
-   * A HUMAN action only: the sole caller is the /sandbox slash command the user
-   * types. It is never registered as a tool or otherwise reachable by the
-   * model, matching the design rule that an agent cannot widen its own
-   * containment.
-   *
-   * 'off' stands the provider down (dispose) so commands run uncontained and
-   * drops the policy so in-process gating (WebFetch) opens up too. Moving from
-   * off back to a contained rung re-initializes the same provider object with
-   * a freshly built policy, which the agent's Bash tool already references.
-   */
-  async setSandboxRung(rung: SandboxRung): Promise<{ changed: boolean; reason?: string }> {
-    if (this.config.sandbox?.enabled === false || !this.agent) {
-      return {
-        changed: false,
-        reason:
-          'The sandbox is disabled by config (sandbox.enabled=false). Edit your config and restart to re-enable it.',
-      };
-    }
-    if (rung === this.sandboxRung) {
-      return { changed: false, reason: `Sandbox is already at the ${rung} rung.` };
-    }
-
-    try {
-      await this.agent.setSandboxRung(rung);
-      this.applySandboxState(this.agent.getSandboxState());
-    } catch (error) {
-      return { changed: false, reason: error instanceof Error ? error.message : String(error) };
-    }
-
-    try {
-      await this.sandboxSettings.setRung(rung);
-    } catch (err) {
-      log.warn('Could not persist sandbox rung', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    this.app?.updateStatus(this.sandboxIndicatorState());
-    // The model reads the rung from the ephemeral <environment> block; refresh
-    // it now so the change is visible mid-session, not at the next user prompt.
-    await this.updateEphemeralContext();
-    log.info('Sandbox rung changed', { rung, enforced: this.sandboxStatus?.backend ?? 'none' });
-    return { changed: true };
-  }
-
-  /** The status-bar fields for the always-visible sandbox indicator. */
-  private sandboxIndicatorState(): {
-    sandboxRung: string;
-    sandboxEnforcement: 'enforced' | 'partial' | 'none';
-  } {
-    const s = this.sandboxStatus;
-    const enforcement =
-      !s || s.backend === 'none'
-        ? 'none'
-        : s.filesystem === 'enforced' && s.network === 'enforced'
-          ? 'enforced'
-          : 'partial';
-    return { sandboxRung: this.sandboxRung, sandboxEnforcement: enforcement };
-  }
-
-  /**
-   * P1 container detection: when this session already runs inside a container,
-   * the OS sandbox stacks a second boundary that mostly adds friction. Surface
-   * a recommendation (log line always; transcript note once per workspace) that
-   * the user may prefer /sandbox off. Detection is heuristic, so this NEVER
-   * changes the rung automatically.
-   */
-  private async surfaceContainerRecommendation(): Promise<void> {
-    if (this.sandboxRung === 'off') return;
-    try {
-      const detection = await detectContainer();
-      if (!detection.inContainer) return;
-      log.info('Container detected; the OS sandbox is redundant inside an isolated environment', {
-        marker: detection.marker,
-      });
-      if (this.sandboxSettings.isContainerNoticeShown()) return;
-      this.app?.transcript.addNotification(
-        'Container detected',
-        `This session appears to be running inside a container (${detection.marker}).\n` +
-          'The environment is already an isolation boundary, so the OS sandbox is\n' +
-          'redundant here and can add friction. If that is intentional, keep it;\n' +
-          'otherwise you may prefer /sandbox off for this workspace.\n' +
-          'Detection is heuristic; nothing was changed automatically.',
-      );
-      await this.sandboxSettings.markContainerNoticeShown();
-    } catch (err) {
-      log.debug('Container detection failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
   /** Abnormal-exit teardown. Cortex owns its sandbox and temporary directory. */
   async disposeSandbox(): Promise<void> {
     await this.agent?.destroy();
@@ -1602,6 +1427,8 @@ export class Session {
     context?: ToolPermissionRequestContext,
   ): Promise<boolean | CortexToolPermissionResult> {
     const abortSignal = context?.signal;
+    const sandboxStatus = this.sandbox.getStatus();
+    const sandboxPolicy = this.sandbox.getPolicy();
     const preflightDeps: PreflightDeps = {
       yoloMode: this.yoloMode,
       cwd: this.cwd,
@@ -1612,8 +1439,8 @@ export class Session {
       // a filesystem-only backend (e.g. future Windows Tier 1, fs enforced but
       // network none) must keep prompting rather than auto-run with open egress.
       sandboxBashEnforced:
-        this.sandboxStatus?.filesystem === 'enforced' &&
-        this.sandboxStatus?.network === 'enforced',
+        sandboxStatus?.filesystem === 'enforced' &&
+        sandboxStatus?.network === 'enforced',
       // Broad read auto-approve for Read/Grep/Glob, matching the sandboxed
       // shell's view: reads are broad by policy design, denyRead is the only
       // read-side restriction. Requires FULL filesystem enforcement, not
@@ -1622,23 +1449,23 @@ export class Session {
       // ripgrep. Network enforcement is irrelevant to reads, so this is
       // deliberately looser than sandboxBashEnforced's both-axes gate.
       sandboxReadsBroad:
-        this.sandboxStatus?.filesystem === 'enforced' &&
-        this.sandboxPolicy !== undefined,
+        sandboxStatus?.filesystem === 'enforced' &&
+        sandboxPolicy !== undefined,
       // With an active sandbox policy, WebFetch is gated per host by the same
       // network decision as shell egress; that gate replaces the per-call tool
       // prompt. Purely policy-level, so it applies even where OS enforcement
       // is degraded (the gate runs in-process).
-      webFetchNetworkGated: this.sandboxPolicy !== undefined,
+      webFetchNetworkGated: sandboxPolicy !== undefined,
       // Project the policy's filesystem deny sets onto the in-process file
       // tools (Write/Edit/UndoEdit/Read/Glob), which bypass the OS boundary the
       // shell is contained by. writableRoots is the positive floor: the shell
       // may write only inside it, so an in-process write escaping it must not
       // auto-approve either. Absent when the sandbox is off.
-      ...(this.sandboxPolicy
+      ...(sandboxPolicy
         ? {
-            sandboxDenyWrite: this.sandboxPolicy.filesystem.denyWrite,
-            sandboxDenyRead: this.sandboxPolicy.filesystem.denyRead,
-            sandboxWritableRoots: this.sandboxPolicy.filesystem.writableRoots,
+            sandboxDenyWrite: sandboxPolicy.filesystem.denyWrite,
+            sandboxDenyRead: sandboxPolicy.filesystem.denyRead,
+            sandboxWritableRoots: sandboxPolicy.filesystem.writableRoots,
           }
         : {}),
     };
@@ -2082,15 +1909,15 @@ export class Session {
       enforced: 'OS-enforced',
       partial: 'partially OS-enforced',
       none: 'not OS-enforced',
-    }[this.sandboxIndicatorState().sandboxEnforcement];
+    }[this.sandbox.indicatorState().sandboxEnforcement];
     const lines = [
       `Current date: ${new Date().toISOString().split('T')[0]}`,
       `Current working directory: ${this.cwd}`,
       branch ? `Git branch: ${branch}` : '',
       `Model: ${this.models.provider}/${this.models.modelId}`,
       this.yoloMode ? 'YOLO mode is active: all tools auto-approved' : '',
-      this.sandboxRung !== 'off'
-        ? `Sandbox: ${this.sandboxRung} rung, ${enforcementLabel}`
+      this.sandbox.getRung() !== 'off'
+        ? `Sandbox: ${this.sandbox.getRung()} rung, ${enforcementLabel}`
         : '',
       currentContextTokens > 0
         ? `Current context usage: ${(currentContextTokens / 1000).toFixed(1)}k / ${(this.agent.effectiveContextWindow / 1000).toFixed(0)}k`
@@ -2112,6 +1939,7 @@ export class Session {
    */
   private buildAgentConfig(): CortexAgentConfig {
     const diagnostics = this.buildDiagnosticsConfig();
+    const sandboxOptions = this.sandbox.getAgentOptions();
     return {
       // No `duplex.maxTotalCost`, and that is a decision rather than an
       // omission. The facade's aggregate guard is uncapped without it, so a
@@ -2138,7 +1966,7 @@ export class Session {
       // proxy consults for shell commands, so one grant covers both paths.
       resolveNetworkAccess: (req) => this.resolveNetworkAccess(req),
       isAutoApprove: () => this.yoloMode,
-      ...(this.sandboxOptions ? { sandbox: this.sandboxOptions } : {}),
+      ...(sandboxOptions ? { sandbox: sandboxOptions } : {}),
       getApiKey: (provider) => this.apiKeys.getApiKey(provider),
       contextWindowLimit: this.config.contextWindowLimit ?? null,
       compaction: { strategy: this.compactionStrategy },
@@ -2177,7 +2005,7 @@ export class Session {
       yoloMode: this.yoloMode,
       effortLevel,
       observationalMode: this.compactionStrategy === 'observational',
-      ...this.sandboxIndicatorState(),
+      ...this.sandbox.indicatorState(),
       ...this.resolutionIndicatorState(),
     });
   }
@@ -2548,11 +2376,18 @@ export class Session {
   getSessionId(): string { return this.sessionId; }
   /** Reset the terminal title on a fresh-start signal (e.g. /clear). */
   resetTitle(): void { this.titleManager?.reset(); }
-  getSandboxRung(): SandboxRung { return this.sandboxRung; }
-  getSandboxStatus(): SandboxStatus | undefined { return this.sandboxStatus; }
-  getSandboxPolicy(): SandboxPolicy | undefined { return this.sandboxPolicy; }
-  /** False when the config kill switch (sandbox.enabled=false) is set. */
-  isSandboxConfigEnabled(): boolean { return this.config.sandbox?.enabled !== false; }
+  getSandboxRung(): SandboxRung { return this.sandbox.getRung(); }
+  getSandboxStatus(): SandboxStatus | undefined { return this.sandbox.getStatus(); }
+  getSandboxPolicy(): SandboxPolicy | undefined { return this.sandbox.getPolicy(); }
+  isSandboxConfigEnabled(): boolean { return this.sandbox.isConfigEnabled(); }
+  /**
+   * Change the trust rung. A HUMAN action only: the sole caller is the
+   * /sandbox slash command, never a tool, so an agent cannot widen its own
+   * containment.
+   */
+  setSandboxRung(rung: SandboxRung): Promise<{ changed: boolean; reason?: string }> {
+    return this.sandbox.setRung(rung);
+  }
   /** Domain grants for transparency surfaces (/sandbox status). */
   getNetworkGrantInfo(): { persisted: readonly string[]; session: readonly string[] } {
     return {

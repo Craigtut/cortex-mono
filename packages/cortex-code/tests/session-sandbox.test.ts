@@ -72,6 +72,16 @@ function readPersistedRung(): unknown {
   }
 }
 
+interface SandboxInternals {
+  applyState(state: SandboxState | undefined): void;
+  settings: { load(): Promise<void> };
+  resolveInitialRung(): Promise<SandboxRung>;
+}
+
+function sandboxOf(session: Session): SandboxInternals {
+  return (session as unknown as { sandbox: SandboxInternals }).sandbox;
+}
+
 /** The consumer delegates lifecycle to Cortex and owns preferences and display. */
 function attachAgent(session: Session, initial: SandboxRung = 'workspace') {
   let state: SandboxState = { enabled: true, rung: initial, status: {
@@ -87,7 +97,9 @@ function attachAgent(session: Session, initial: SandboxRung = 'workspace') {
     currentContextTokenCount: 0,
     estimateCurrentContextTokens: () => 0,
   };
-  Object.assign(session, { agent, sandboxRung: initial });
+  Object.assign(session, { agent });
+  // The same path start() takes once the agent exists: adopt Cortex's state.
+  sandboxOf(session).applyState(state);
   return { agent, setEphemeral };
 }
 
@@ -145,12 +157,9 @@ describe('Session sandbox integration', () => {
 
 describe('Session.resolveInitialRung (folder-trust default)', () => {
   async function resolveRung(session: Session): Promise<SandboxRung> {
-    const s = session as unknown as {
-      sandboxSettings: { load(): Promise<void> };
-      resolveInitialRung(): Promise<SandboxRung>;
-    };
-    await s.sandboxSettings.load();
-    return s.resolveInitialRung();
+    const sandbox = sandboxOf(session);
+    await sandbox.settings.load();
+    return sandbox.resolveInitialRung();
   }
 
   it('defaults a fresh workspace to the platform default', async () => {
