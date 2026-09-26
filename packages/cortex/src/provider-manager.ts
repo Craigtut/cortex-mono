@@ -7,9 +7,10 @@
  * about the other. The consumer creates both, uses ProviderManager for
  * auth/discovery, and provides a getApiKey callback to AgentLoop.
  *
- * Pi-ai is loaded dynamically so consumers never import it directly.
- * If the dependency is missing or unavailable, methods that require it
- * throw clear errors.
+ * The class is the public surface only. Each capability lives in its own
+ * module under provider-manager/ (pi-ai loading, OAuth contract, callback
+ * page shim, OAuth flows, model catalog, API key validation, model
+ * creation), and this file re-exports their public types.
  *
  * Reference: provider-manager.md
  */
@@ -19,10 +20,8 @@ import {
   OAUTH_PROVIDER_IDS,
 } from './provider-registry.js';
 import type { ProviderInfo, ModelInfo } from './provider-registry.js';
-import { wrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import type { OllamaModelConfig } from './providers/ollama/runtime.js';
-import { loadPiAi } from './provider-manager/pi-ai.js';
 import type {
   OAuthCallbacks,
   OAuthResult,
@@ -34,6 +33,12 @@ import { OAuthFlows } from './provider-manager/oauth-flows.js';
 import { listProviderModels } from './provider-manager/model-catalog.js';
 import { validateProviderApiKey } from './provider-manager/api-key-validation.js';
 import type { ApiKeyValidationResult } from './provider-manager/api-key-validation.js';
+import {
+  createCustomModel,
+  createOllamaModel,
+  resolveCatalogModel,
+} from './provider-manager/model-factory.js';
+import type { CustomModelConfig } from './provider-manager/model-factory.js';
 
 export { OAuthError } from './provider-manager/oauth-types.js';
 export type {
@@ -54,25 +59,7 @@ export type {
   ApiKeyValidationResult,
   ApiKeyValidationStatus,
 } from './provider-manager/api-key-validation.js';
-
-/** Configuration for creating a custom model endpoint. */
-export interface CustomModelConfig {
-  /** Base URL of the OpenAI-compatible API (e.g., 'http://localhost:11434/v1'). */
-  baseUrl: string;
-  /** Model identifier to send in API requests. */
-  modelId: string;
-  /** Context window size (default: 128,000). */
-  contextWindow?: number | undefined;
-  /** Optional API key (some local servers don't require one). */
-  apiKey?: string | undefined;
-  /** Compatibility settings for non-standard servers. */
-  compat?: {
-    /** Whether the server supports the 'developer' role (default: true). */
-    supportsDeveloperRole?: boolean | undefined;
-    /** Whether the server supports reasoning_effort (default: true). */
-    supportsReasoningEffort?: boolean | undefined;
-  } | undefined;
-}
+export type { CustomModelConfig } from './provider-manager/model-factory.js';
 
 // ---------------------------------------------------------------------------
 // IProviderManager interface
@@ -270,26 +257,7 @@ export class ProviderManager implements IProviderManager {
    * @throws Error if the provider/model is unknown to pi-ai
    */
   async resolveModel(provider: string, modelId: string): Promise<CortexModel> {
-    const piAi = await loadPiAi();
-    const piModel = piAi.getModel(provider, modelId);
-    // pi-ai's getModel returns undefined for ids it has no definition for.
-    // Fail loudly instead of wrapping undefined into a fake-valid model that
-    // would later crash deep inside the agentic loop with an opaque error.
-    if (piModel == null) {
-      throw new Error(
-        `Unknown model "${modelId}" for provider "${provider}". ` +
-          `Use ProviderManager.createCustomModel() for endpoints pi-ai has no built-in definition for.`,
-      );
-    }
-    let contextWindow: number | undefined;
-    if (typeof piModel === 'object') {
-      const raw = piModel as Record<string, unknown>;
-      const cw = raw['contextWindow'];
-      if (typeof cw === 'number') {
-        contextWindow = cw;
-      }
-    }
-    return wrapModel(piModel, provider, modelId, contextWindow);
+    return resolveCatalogModel(provider, modelId);
   }
 
   /**
@@ -300,45 +268,11 @@ export class ProviderManager implements IProviderManager {
    * @throws Error if pi-ai is not installed
    */
   async createCustomModel(config: CustomModelConfig): Promise<CortexModel> {
-    const piAi = await loadPiAi();
-    // Clone an OpenAI model as a base for streaming/format compatibility,
-    // then override to use the Chat Completions API. The base model
-    // (openai/gpt-4.1) uses the newer Responses API which most
-    // OpenAI-compatible endpoints (Ollama, vLLM, etc.) do not support.
-    const baseModel = piAi.getModel('openai', 'gpt-4.1');
-    const piModel = {
-      ...(baseModel as Record<string, unknown>),
-      id: config.modelId,
-      name: config.modelId,
-      api: 'openai-completions',
-      baseUrl: config.baseUrl,
-      provider: 'custom',
-      contextWindow: config.contextWindow ?? 128_000,
-      // Conservative compat for OpenAI-compatible endpoints: disable
-      // features that are OpenAI-specific or may not be supported.
-      // Consumer-provided compat overrides are merged on top.
-      compat: {
-        supportsStore: false,
-        supportsDeveloperRole: false,
-        supportsStrictMode: false,
-        maxTokensField: 'max_tokens' as const,
-        ...config.compat,
-      },
-    };
-    // Set API key, using a placeholder for keyless endpoints (e.g., Ollama).
-    // The OpenAI SDK client requires a non-empty apiKey value.
-    (piModel as Record<string, unknown>)['apiKey'] = config.apiKey ?? 'sk-no-key-required';
-    return wrapModel(
-      piModel,
-      'custom',
-      config.modelId,
-      config.contextWindow ?? 128_000,
-    );
+    return createCustomModel(config);
   }
 
   /** Resolve the selected local model's capabilities and actual runtime allocation. */
   async createOllamaModel(config: OllamaModelConfig): Promise<CortexModel> {
-    const { createOllamaModel } = await import('./providers/ollama/model.js');
     return createOllamaModel(config);
   }
 }
