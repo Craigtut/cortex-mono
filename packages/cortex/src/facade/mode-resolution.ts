@@ -10,16 +10,9 @@
 
 import { resolveUtilityModels } from '../agent-loop/model-settings.js';
 import type { PiModel } from '../agent-loop/pi-agent.js';
-import { isCortexModel, modelConcurrency, unwrapModel } from '../model-wrapper.js';
-import type { CortexModel, ModelConcurrency } from '../model-wrapper.js';
+import { describeModel, isCortexModel, unwrapModel } from '../model-wrapper.js';
+import type { CortexModel, ModelDescription } from '../model-wrapper.js';
 import type { CortexAgentMode, ResolvedCortexAgentConfig } from './config.js';
-
-/** One loop's model as the decision saw it. */
-export interface ModeResolutionModel {
-  provider: string;
-  modelId: string;
-  concurrency: ModelConcurrency;
-}
 
 /** The mode an assembly runs and what it was decided from. */
 export type ModeResolution =
@@ -28,15 +21,10 @@ export type ModeResolution =
     mode: CortexAgentMode;
     /** Omitted by the consumer: resolved from the models below. */
     requested: undefined;
-    reasoner: ModeResolutionModel;
+    reasoner: ModelDescription;
     /** The talker duplex would run; null when the reasoner model is unusable. */
-    talker: ModeResolutionModel | null;
+    talker: ModelDescription | null;
   };
-
-/** A model reduced to what the mode decision and its notes read. */
-export function describeModel(model: CortexModel): ModeResolutionModel {
-  return { provider: model.provider, modelId: model.modelId, concurrency: modelConcurrency(model) };
-}
 
 /**
  * The talker model duplex assembly would pick: `talker.model` when pinned,

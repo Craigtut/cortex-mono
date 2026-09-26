@@ -115,6 +115,17 @@ export function modelConcurrency(model: CortexModel): ModelConcurrency {
   return model.capabilities?.concurrency ?? 'unknown';
 }
 
+/** A model reduced to what mode resolution and its notes read. */
+export interface ModelDescription {
+  provider: string;
+  modelId: string;
+  concurrency: ModelConcurrency;
+}
+
+export function describeModel(model: CortexModel): ModelDescription {
+  return { provider: model.provider, modelId: model.modelId, concurrency: modelConcurrency(model) };
+}
+
 /**
  * Unwrap a CortexModel to retrieve the underlying pi-ai Model object.
  *

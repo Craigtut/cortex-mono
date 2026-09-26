@@ -22,9 +22,9 @@
  * here; it reaches all three surfaces by construction.
  */
 
-import type { CortexModel } from './model-wrapper.js';
-import { describeModel } from './facade/mode-resolution.js';
-import type { ModeResolution, ModeResolutionModel } from './facade/mode-resolution.js';
+import { describeModel } from './model-wrapper.js';
+import type { CortexModel, ModelDescription } from './model-wrapper.js';
+import type { ModeResolution } from './facade/mode-resolution.js';
 
 /**
  * How much a note matters.
@@ -255,7 +255,7 @@ export function collectAssemblyResolutionNotes(
 }
 
 /** Flat note data for one loop's model (notes are copied one level deep). */
-function modelData(role: string, model: ModeResolutionModel): Record<string, unknown> {
+function modelData(role: string, model: ModelDescription): Record<string, unknown> {
   return {
     [`${role}Provider`]: model.provider,
     [`${role}ModelId`]: model.modelId,
@@ -268,7 +268,7 @@ function modelData(role: string, model: ModeResolutionModel): Record<string, unk
  * ("ollama") serves one request at a time"), or null when every one is.
  */
 function describeNonParallel(
-  roles: Array<{ role: string; model: ModeResolutionModel }>,
+  roles: Array<{ role: string; model: ModelDescription }>,
 ): string | null {
   const blocking = roles.filter(({ model }) => model.concurrency !== 'parallel');
   if (blocking.length === 0) return null;
