@@ -51,8 +51,11 @@ export class ConversationDeltas {
     }
   }
 
-  /** Take everything buffered as one conversation block, or null when empty. */
-  consumeBlock(): string | null {
+  /**
+   * Take everything buffered as one conversation block, or null when empty.
+   * The trailer defaults to the dispatch one (a directive follows).
+   */
+  consumeBlock(trailer?: string): string | null {
     if (this.buffer.length === 0) return null;
     const deltas = this.buffer.splice(0);
     this.chars = 0;
@@ -60,7 +63,7 @@ export class ConversationDeltas {
       deltas.unshift({ speaker: 'consumer', text: DELTA_OVERFLOW_MARKER });
       this.overflowed = false;
     }
-    return buildConversationBlock(deltas);
+    return buildConversationBlock(deltas, trailer);
   }
 
   /** Drop everything buffered; returns how many deltas went. */

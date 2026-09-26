@@ -504,7 +504,7 @@ export class CortexAgent extends LoopSurface {
         'CortexAgent.restore() rejected: a loop is running. Await workSettled before restoring.',
       );
     }
-    this.composite.apply(state);
+    this.resolution.recordRestore(this.composite.apply(state));
   }
 
   /**

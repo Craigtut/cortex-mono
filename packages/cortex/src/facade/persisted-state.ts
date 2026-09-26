@@ -10,6 +10,7 @@ import type { SessionLogEntry } from '../session-log.js';
 import type { SessionUsage } from '../types.js';
 import { cloneSessionUsage, zeroSessionUsage } from '../session-usage.js';
 import type { DuplexRouterState } from '../duplex/router-contract.js';
+import type { CortexAgentMode } from './config.js';
 
 type AssertExtends<A extends B, B> = A;
 
@@ -45,6 +46,12 @@ export interface CortexAgentUsageBreakdown {
  */
 export interface CortexAgentStateV2 {
   version: 2;
+  /**
+   * The mode of the agent that wrote the artifact. Optional, so artifacts
+   * written before it existed still restore (their mode is read off their
+   * shape, persistedMode()).
+   */
+  mode?: CortexAgentMode;
   log: SessionLogEntry[];
   /** Post-slot talker history. Empty for passthrough sessions. */
   talkerHistory: AgentMessage[];
@@ -142,6 +149,20 @@ export function normalizePersistedState(state: CortexAgentPersistedState): Corte
   throw new Error(
     `Unsupported CortexAgent state version: ${String((state as { version: unknown }).version)}`,
   );
+}
+
+/**
+ * The mode that wrote an artifact: its own record, or for an older
+ * artifact its shape (a duplex agent always writes router state and talker
+ * usage; a passthrough agent that never restored a duplex artifact writes
+ * neither).
+ */
+export function persistedMode(state: CortexAgentStateV2): CortexAgentMode {
+  if (state.mode === 'duplex' || state.mode === 'passthrough') return state.mode;
+  const talkerSide = state.router !== undefined
+    || state.usage.perLoop.talker !== null
+    || state.talkerHistory.length > 0;
+  return talkerSide ? 'duplex' : 'passthrough';
 }
 
 /** A v1 artifact restores into the reasoner with an empty talker and log. */

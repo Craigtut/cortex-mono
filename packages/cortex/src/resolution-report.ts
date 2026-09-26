@@ -26,6 +26,7 @@ import { describeModel } from './model-wrapper.js';
 import { servedConcurrently } from './model-backend.js';
 import type { CortexModel, ModelDescription } from './model-wrapper.js';
 import type { ModeResolution } from './facade/mode-resolution.js';
+import type { ModeCrossingRestore } from './facade/cross-mode-restore.js';
 
 /**
  * How much a note matters.
@@ -50,6 +51,7 @@ export const RESOLUTION_NOTE_CODES = [
   'duplex-cost-cap-unset',
   'mode-resolved-passthrough',
   'duplex-not-concurrent',
+  'restore-mode-mismatch',
 ] as const;
 
 export type ResolutionNoteCode = (typeof RESOLUTION_NOTE_CODES)[number];
@@ -338,5 +340,57 @@ export function networkResolverUnwiredNote(): ResolutionNote {
       'to have shell egress voiced like WebFetch is. Ignore this if the sandbox is ' +
       'deliberately wired to your own permission UI.',
     data: { observedAt: 'first-prompt' },
+  };
+}
+
+/**
+ * A restore across a mode boundary (facade/cross-mode-restore.ts). Not an
+ * assembly fact either: it is earned by restore(), so it is recorded then,
+ * and replaced by the next restore.
+ */
+export function restoreModeMismatchNote(restore: ModeCrossingRestore): ResolutionNote {
+  const data = {
+    artifactMode: restore.artifactMode,
+    agentMode: restore.agentMode,
+    conversationLinesHandedOver: restore.conversationLinesHandedOver,
+    talkerHistoryLength: restore.talkerHistoryLength,
+    resultsNotRelayed: restore.resultsNotRelayed,
+  };
+  if (restore.artifactMode === 'duplex') {
+    const handedOver = restore.conversationLinesHandedOver > 0
+      ? `; the ${restore.conversationLinesHandedOver} most recent conversation lines, which the ` +
+        'reasoner had not seen yet, were queued for it as context'
+      : '';
+    const unrelayed = restore.resultsNotRelayed > 0
+      ? ` That includes ${restore.resultsNotRelayed} result(s) the talker had not yet relayed to the user.`
+      : '';
+    return {
+      code: 'restore-mode-mismatch',
+      severity: 'degraded',
+      summary: "Restored a duplex session into a passthrough agent: the talker's side is carried but inactive.",
+      detail:
+        'The artifact was written by a duplex agent and this agent runs passthrough. Its single ' +
+        "loop continues from the reasoner's history, which holds the conversation up to the last " +
+        `delegation${handedOver}. The talker's history and memory, the task state and the ` +
+        "talker's queued deliveries are carried unchanged through getState(), but nothing reads " +
+        `them in passthrough.${unrelayed} They come back if the artifact is restored into a duplex agent.`,
+      remedy: "Set mode: 'duplex' explicitly for sessions persisted from a duplex agent, so a change of backend cannot change the mode under a saved session.",
+      data,
+    };
+  }
+  const talkerStart = restore.talkerHistoryLength > 0
+    ? 'starts from the history an earlier duplex run left it, which lacks the conversation since'
+    : 'starts with no history';
+  return {
+    code: 'restore-mode-mismatch',
+    severity: 'degraded',
+    summary: 'Restored a passthrough session into a duplex agent: the talker starts without the recent conversation.',
+    detail:
+      'The artifact was written by a passthrough agent and this agent runs duplex. The reasoner ' +
+      "continues from the single loop's history, which holds the whole conversation. The talker, " +
+      `which speaks to the user, ${talkerStart}, so it knows the earlier conversation only through ` +
+      'what the reasoner delivers.',
+    remedy: "Set mode: 'passthrough' explicitly for sessions persisted from a passthrough agent, so a change of backend cannot change the mode under a saved session.",
+    data,
   };
 }

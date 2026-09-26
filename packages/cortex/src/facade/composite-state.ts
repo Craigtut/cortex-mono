@@ -10,8 +10,11 @@ import type { SessionUsage } from '../types.js';
 import type { LoopTopology } from './loop-surface.js';
 import type { LogRecorder } from './log-recorder.js';
 import type { SessionMode } from './session-mode.js';
-import { normalizePersistedState } from './persisted-state.js';
+import { normalizePersistedState, persistedMode } from './persisted-state.js';
 import type { CortexAgentPersistedState, CortexAgentStateV2 } from './persisted-state.js';
+import { handOverPendingConversation } from './cross-mode-restore.js';
+import type { ModeCrossingRestore } from './cross-mode-restore.js';
+import type { CortexAgentMode } from './config.js';
 import { CompositeUsage } from './composite-usage.js';
 import type { UsageReadings } from './composite-usage.js';
 
@@ -47,6 +50,7 @@ export class CompositeState {
     const reasonerQueued = work.getQueuedDeliveries();
     return {
       version: 2,
+      mode: this.mode(),
       log: this.recorder.log.getLog(),
       talkerHistory: session.talkerHistory,
       reasonerHistory: work.getConversationHistory(),
@@ -63,8 +67,9 @@ export class CompositeState {
   /**
    * Apply an artifact, all or nothing: the caller has checked nothing is
    * running, and there is no await in here, so it lands in one frame.
+   * Returns what crossed a mode boundary, for the caller to report.
    */
-  apply(state: CortexAgentPersistedState): void {
+  apply(state: CortexAgentPersistedState): ModeCrossingRestore {
     const session = this.session();
     const { work } = this.topology;
     const v2 = normalizePersistedState(state);
@@ -98,13 +103,31 @@ export class CompositeState {
     this.recorder.recordDroppedQueue(work, 'restore', work.clearAllQueues());
     // The artifact's own queued content is the restored session's.
     requeueSilent(work, queued?.reasoner, this.recorder);
+    // A duplex artifact in a passthrough agent: the single loop takes the
+    // conversation the reasoner had not seen yet (cross-mode-restore.ts).
+    const artifactMode = persistedMode(v2);
+    const agentMode = this.mode();
+    const handOver = artifactMode === 'duplex' && agentMode === 'passthrough'
+      ? handOverPendingConversation(routerState, work)
+      : { router: routerState, handedOver: 0 };
     // Everything the mode holds describes the replaced session too; what
     // the artifact carries of the router's state and the talker's queue
     // comes back (passthrough carries both through untouched).
     session.resetForRestore({
-      ...(routerState ? { router: routerState } : {}),
+      ...(handOver.router ? { router: handOver.router } : {}),
       ...(Array.isArray(queued?.talker) ? { talkerQueuedDeliveries: queued.talker } : {}),
     });
+    return {
+      artifactMode,
+      agentMode,
+      conversationLinesHandedOver: handOver.handedOver,
+      talkerHistoryLength: talkerHistory.length,
+      resultsNotRelayed: Array.isArray(routerState?.pendingDeliveries) ? routerState.pendingDeliveries.length : 0,
+    };
+  }
+
+  private mode(): CortexAgentMode {
+    return this.topology.conversation !== this.topology.work ? 'duplex' : 'passthrough';
   }
 
   /** Each usage producer's live reading, for the ledger. */

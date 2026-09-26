@@ -15,6 +15,7 @@ import {
   collectAssemblyResolutionNotes,
   networkResolverUnwiredNote,
   resolutionWarnText,
+  restoreModeMismatchNote,
 } from '../resolution-report.js';
 import type {
   AssemblyResolution,
@@ -26,6 +27,7 @@ import type { LoopTopology } from './loop-surface.js';
 import type { ResolvedCortexAgentConfig } from './config.js';
 import { redecideForLoop } from './mode-resolution.js';
 import type { ModeResolution } from './mode-resolution.js';
+import type { ModeCrossingRestore } from './cross-mode-restore.js';
 import type { BudgetGuard } from '../budget-guard.js';
 
 /**
@@ -161,6 +163,19 @@ export class ResolutionRecorder {
       }
       if (next) this.record(next);
     }
+  }
+
+  /**
+   * Record what a restore carried across a mode boundary, replacing the
+   * previous restore's note. Called after the log is restored, so the
+   * lifecycle entry lands in the log the restored session continues; no
+   * cleared entry is written for the old note, whose own entry went with
+   * the log it was in.
+   */
+  recordRestore(restore: ModeCrossingRestore): void {
+    const index = this.notes.findIndex((note) => note.code === 'restore-mode-mismatch');
+    if (index >= 0) this.notes.splice(index, 1);
+    if (restore.artifactMode !== restore.agentMode) this.record(restoreModeMismatchNote(restore));
   }
 
   /** Someone took the egress resolver to wire into a sandbox. */
