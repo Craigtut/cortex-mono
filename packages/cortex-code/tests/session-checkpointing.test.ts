@@ -95,7 +95,7 @@ describe('checkpointing during a long task', () => {
 
     // Still working: settlement has not happened and cannot have.
     expect(reasonerPi.running).toBe(true);
-    expect(internals.isRunning).toBe(true);
+    expect(internals.work.isRunning).toBe(true);
 
     const state = readState(sessionId);
     expect(JSON.stringify(state.reasonerHistory)).toContain('rename the payments module');

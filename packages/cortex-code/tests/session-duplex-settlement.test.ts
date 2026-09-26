@@ -60,11 +60,11 @@ describe('duplex: the TUI must not report idle while the reasoner works', () => 
     await internals.handleInput('how is it going?');
 
     expect(harness.reasonerPi.running).toBe(true);
-    expect(internals.isRunning).toBe(true);
+    expect(internals.work.isRunning).toBe(true);
     expect(app.spinnerVisible).toBe(true);
 
     harness.reasonerPi.releaseRun();
-    await waitUntil(() => !internals.isRunning, 2000, 'session settles');
+    await waitUntil(() => !internals.work.isRunning, 2000, 'session settles');
     expect(app.spinnerVisible).toBe(false);
   });
 
@@ -97,7 +97,7 @@ describe('duplex: the TUI must not report idle while the reasoner works', () => 
     }];
     await internals.handleInput('refactor the payments module');
     await waitUntil(() => harness.reasonerPi.running, 2000, 'reasoner run started');
-    expect(internals.isRunning).toBe(true);
+    expect(internals.work.isRunning).toBe(true);
 
     // The user types again while the reasoner is still working. The talker is
     // free and is who they are talking to, so this is a fresh prompt. Keying
@@ -134,12 +134,12 @@ describe('passthrough: the mode cortex-code actually ships is unchanged', () => 
     reasonerPi.hold = true;
     const turn = internals.handleInput('list the files');
     await waitUntil(() => reasonerPi.running, 2000, 'reasoner run started');
-    expect(internals.isRunning).toBe(true);
+    expect(internals.work.isRunning).toBe(true);
     expect(app.spinnerVisible).toBe(true);
 
     reasonerPi.releaseRun();
     await turn;
-    await waitUntil(() => !internals.isRunning, 2000, 'session settles');
+    await waitUntil(() => !internals.work.isRunning, 2000, 'session settles');
     expect(app.spinnerVisible).toBe(false);
     expect(app.calls).toContain('transcript.closeActiveToolGroups');
   });

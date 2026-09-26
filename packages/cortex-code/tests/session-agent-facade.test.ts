@@ -60,7 +60,7 @@ afterEach(async () => {
 interface SessionInternals {
   agent: CortexAgent | null;
   app: unknown;
-  isRunning: boolean;
+  work: { readonly isRunning: boolean; begin(): void };
   compactionStrategy: 'observational' | 'classic';
   buildAgentConfig: () => CortexAgentConfig;
 }
@@ -255,7 +255,7 @@ describe('Session.abort against the facade', () => {
     const { session, internals } = makeSession();
     const agent = await agentFromSessionConfig(internals);
     internals.agent = agent;
-    internals.isRunning = true;
+    internals.work.begin();
     internals.app = null;
 
     await agent.destroy();
@@ -263,6 +263,6 @@ describe('Session.abort against the facade', () => {
     // The editor discards this promise, so a rejection here would be an
     // unhandled rejection rather than a visible error.
     await expect(session.abort()).resolves.toBeUndefined();
-    expect(internals.isRunning).toBe(false);
+    expect(internals.work.isRunning).toBe(false);
   });
 });

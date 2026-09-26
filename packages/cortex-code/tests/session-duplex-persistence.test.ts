@@ -110,7 +110,7 @@ describe('duplex: the saved artifact carries the conversation', () => {
     await waitUntil(() => ctx.harness.reasonerPi.running, 2000, 'reasoner run started');
     await ctx.internals.handleInput('how is it going?');
     ctx.harness.reasonerPi.releaseRun();
-    await waitUntil(() => !ctx.internals.isRunning, 2000, 'session settles');
+    await waitUntil(() => !ctx.internals.work.isRunning, 2000, 'session settles');
     await waitUntil(() => save.mock.calls.length > 0, 3000, 'a save landed');
     await ctx.internals.saver.flush();
 

@@ -430,8 +430,8 @@ export interface SessionInternals {
   app: unknown;
   sessionId: string;
   agentMode: 'passthrough' | 'duplex';
-  isRunning: boolean;
-  promptInFlight: boolean;
+  /** Busy state keyed on work settlement. */
+  work: { readonly isRunning: boolean; readonly promptInFlight: boolean; begin(): void };
   saver: { save: (...args: unknown[]) => void; flush: () => Promise<void> };
   buildAgentConfig: () => CortexAgentConfig;
   wireEvents: () => void;
