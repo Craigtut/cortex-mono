@@ -37,6 +37,8 @@ export async function createOllamaModel(config: OllamaModelConfig) {
       promptCaching: 'automatic-prefix',
       ...(runtime.trainedContextWindow ? { trainedContextWindow: runtime.trainedContextWindow } : {}),
       structuredOutput: 'json-schema',
+      // One request per model by default (OLLAMA_NUM_PARALLEL=1).
+      concurrency: config.parallelRequests === true ? 'parallel' : 'serial',
     },
   };
   return wrapModel(model, 'ollama', model.id, runtime.contextWindow);

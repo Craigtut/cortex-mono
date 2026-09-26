@@ -28,6 +28,15 @@ export interface OllamaModelConfig extends OllamaConnection {
   keepAlive?: string | number | undefined;
   thinking?: OllamaThinking | undefined;
   maxOutputTokens?: number | undefined;
+  /**
+   * Declare that this server runs this model's requests in parallel with
+   * other in-flight requests: `OLLAMA_NUM_PARALLEL` raised above 1, and any
+   * second model (a distinct duplex talker) fits in memory alongside this
+   * one. Ollama's API does not expose either, so Cortex cannot detect it.
+   * Default false: the model is `serial`, and an omitted CortexAgent `mode`
+   * resolves to passthrough.
+   */
+  parallelRequests?: boolean | undefined;
   onMetrics?: ((metrics: OllamaMetrics) => void) | undefined;
 }
 
@@ -51,6 +60,7 @@ const settingsSchema = z.object({
   contextWindowLimit: z.number().int().positive().optional(),
   maxOutputTokens: z.number().int().positive().optional(),
   thinking: z.enum(['binary', 'levels', 'default']).optional(),
+  parallelRequests: z.boolean().optional(),
   keepAlive: z.union([z.number().finite(), z.string().regex(/^-?\d+(?:\.\d+)?(?:ms|s|m|h)$/)])
     .refine(value => Number.parseFloat(String(value)) !== 0,
       'Ollama keepAlive must be nonzero: zero unloads the model and prevents a stable runtime allocation').optional(),

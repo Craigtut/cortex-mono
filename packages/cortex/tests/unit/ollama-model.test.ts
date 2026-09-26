@@ -29,6 +29,17 @@ describe('Ollama model resolution', () => {
     expect(getOllamaRuntimeInfo(model)).toMatchObject({ thinking: 'binary', contextWindow: 8192 });
   });
 
+  it('is serial by default and parallel only on the explicit opt-in', async () => {
+    const pm = new ProviderManager();
+    const serial = await pm.createOllamaModel({ modelId: 'test', fetch: ollamaServer().fetch });
+    const parallel = await pm.createOllamaModel({ modelId: 'test', fetch: ollamaServer().fetch, parallelRequests: true });
+    expect(serial.capabilities?.concurrency).toBe('serial');
+    expect(parallel.capabilities?.concurrency).toBe('parallel');
+    await expect(pm.createOllamaModel({
+      modelId: 'test', fetch: ollamaServer().fetch, parallelRequests: 'yes' as never,
+    })).rejects.toThrow();
+  });
+
   it('preserves the loaded allocation when server defaults differ', async () => {
     const server = ollamaServer({ context: 32768, defaultContext: 8192 });
     const model = await new ProviderManager().createOllamaModel({ modelId: 'test', fetch: server.fetch });

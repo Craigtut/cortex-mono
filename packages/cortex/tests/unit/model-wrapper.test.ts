@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { wrapModel, unwrapModel, isCortexModel } from '../../src/model-wrapper.js';
+import { wrapModel, unwrapModel, isCortexModel, modelConcurrency } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 
 describe('model-wrapper', () => {
@@ -55,6 +55,21 @@ describe('model-wrapper', () => {
       const wrapped = wrapModel('some-string', 'test', 'test-model', 10_000);
 
       expect(wrapped.__brand).toBe('CortexModel');
+    });
+
+    it('derives concurrency from the provider registry', () => {
+      expect(wrapModel({}, 'anthropic', 'claude-sonnet-4').capabilities?.concurrency).toBe('parallel');
+      expect(wrapModel({}, 'amazon-bedrock', 'model').capabilities?.concurrency).toBe('parallel');
+      expect(wrapModel({}, 'custom', 'my-model').capabilities?.concurrency).toBe('unknown');
+      expect(wrapModel({}, 'ollama', 'qwen3:32b').capabilities?.concurrency).toBe('unknown');
+      expect(modelConcurrency(wrapModel({}, 'self-hosted-vllm', 'm'))).toBe('unknown');
+    });
+
+    it('lets a creator that knows its backend declare concurrency', () => {
+      const inner = { cortexCapabilities: { concurrency: 'serial', promptCaching: 'automatic-prefix' } };
+      const wrapped = wrapModel(inner, 'openai', 'gpt-4o');
+
+      expect(wrapped.capabilities).toEqual({ concurrency: 'serial', promptCaching: 'automatic-prefix' });
     });
   });
 

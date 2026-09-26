@@ -465,5 +465,5 @@ export type { SandboxConfig, SandboxOptions, SandboxState, CreateSandboxProvider
 export { getOllamaHost, detectOllama, getOllamaContextWindow } from './providers/ollama/discovery.js';
 export { getOllamaRuntimeInfo } from './providers/ollama/model.js';
 export type { OllamaModelConfig, OllamaMetrics } from './providers/ollama/runtime.js';
-export type { ModelCapabilities } from './model-wrapper.js';
+export type { ModelCapabilities, ModelConcurrency } from './model-wrapper.js';
 export { structuredCompletionRequest, parseSchemaCompletion } from './structured-completion.js';

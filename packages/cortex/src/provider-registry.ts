@@ -5,6 +5,7 @@
  * 1. PROVIDER_REGISTRY: metadata for all known providers (auth methods, env vars, key prefixes)
  * 2. OAUTH_PROVIDER_IDS: the subset of providers that support OAuth
  * 3. UTILITY_MODEL_OVERRIDES: per-provider utility model overrides for inference exceptions
+ * 4. providerConcurrency(): which providers serve concurrent requests
  *
  * OAuth flows are resolved through pi-ai's OAuth provider registry at runtime.
  *
@@ -12,6 +13,7 @@
  */
 
 import type { ThinkingLevel } from './types.js';
+import type { ModelConcurrency } from './model-wrapper.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -310,6 +312,37 @@ export const UTILITY_MODEL_OVERRIDES: Record<string, string> = {};
 
 /** Backwards-compatible alias. Prefer UTILITY_MODEL_OVERRIDES for new code. */
 export const UTILITY_MODEL_DEFAULTS = UTILITY_MODEL_OVERRIDES;
+
+// ---------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------
+
+/**
+ * Hosted providers pi-ai resolves that the discovery registry does not list
+ * (their auth does not fit the registry's OAuth/API-key shape).
+ */
+const UNLISTED_HOSTED_PROVIDER_IDS: readonly string[] = [
+  'amazon-bedrock',
+  'baseten',
+  'nvidia',
+  'together',
+];
+
+const HOSTED_PROVIDER_IDS: ReadonlySet<string> = new Set([
+  ...PROVIDER_REGISTRY.map((provider) => provider.id),
+  ...UNLISTED_HOSTED_PROVIDER_IDS,
+]);
+
+/**
+ * Concurrency of a provider's backend, judged by provider id alone. Every
+ * provider here is a hosted API that serves concurrent requests, including
+ * two for the same model. Anything else (`custom`, `ollama`, an id Cortex
+ * does not know) is `unknown`: a creator that knows its backend better,
+ * like the native Ollama model, declares its own.
+ */
+export function providerConcurrency(provider: string): ModelConcurrency {
+  return HOSTED_PROVIDER_IDS.has(provider) ? 'parallel' : 'unknown';
+}
 
 // ---------------------------------------------------------------------------
 // Cache Retention

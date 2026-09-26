@@ -13,6 +13,8 @@
  * Reference: provider-manager.md
  */
 
+import { providerConcurrency } from './provider-registry.js';
+
 // ---------------------------------------------------------------------------
 // Branded type
 // ---------------------------------------------------------------------------
@@ -28,7 +30,19 @@ export interface ModelCapabilities {
   promptCaching?: 'automatic-prefix' | undefined;
   structuredOutput?: 'json-schema' | undefined;
   trainedContextWindow?: number | undefined;
+  /** Whether the backend serves this model while another request is in flight. */
+  concurrency?: ModelConcurrency | undefined;
 }
+
+/**
+ * Whether a model's backend serves a request while another is in flight,
+ * which is what decides whether duplex can overlap its talker and reasoner.
+ *
+ * - `parallel`: concurrent requests are served concurrently (hosted APIs).
+ * - `serial`: requests queue behind each other (Ollama by default).
+ * - `unknown`: Cortex cannot tell (custom endpoints, unregistered providers).
+ */
+export type ModelConcurrency = 'parallel' | 'serial' | 'unknown';
 
 export interface CortexModel {
   /** @internal Brand tag for nominal type safety. */
@@ -86,10 +100,19 @@ export function wrapModel(
     modelId,
     contextWindow: contextWindow ?? extractContextWindow(model) ?? 200_000,
     [INNER_MODEL]: model,
-    ...((model as { cortexCapabilities?: ModelCapabilities }).cortexCapabilities
-      ? { capabilities: (model as { cortexCapabilities: ModelCapabilities }).cortexCapabilities } : {}),
+    // Concurrency always resolves: a model creator that knows its backend
+    // (Ollama) states it, and everything else is judged by provider id.
+    capabilities: {
+      concurrency: providerConcurrency(provider),
+      ...(model as { cortexCapabilities?: ModelCapabilities }).cortexCapabilities,
+    },
   };
   return wrapped;
+}
+
+/** The model's concurrency capability; `unknown` when nothing declared one. */
+export function modelConcurrency(model: CortexModel): ModelConcurrency {
+  return model.capabilities?.concurrency ?? 'unknown';
 }
 
 /**
