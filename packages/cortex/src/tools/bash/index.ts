@@ -129,6 +129,11 @@ export interface BashToolConfig {
    * its loop and deliver the result, so it does not have to poll repeatedly.
    */
   onBackgroundTaskComplete?: ((taskId: string) => void) | undefined;
+  /**
+   * Fired when a command goes to the background (explicitly or by
+   * auto-yield), inside the tool call that backgrounded it.
+   */
+  onBackgroundTaskStarted?: ((taskId: string) => void) | undefined;
   /** Utility model completion function for Layer 7 safety classifier. */
   utilityComplete?: ((context: unknown) => Promise<unknown>) | undefined;
   /** Whether the consumer is currently auto-approving tool calls. */
@@ -370,6 +375,7 @@ export function createBashTool(config: BashToolConfig): {
           startTime: Date.now(),
         };
         backgroundTasks.set(task);
+        config.onBackgroundTaskStarted?.(taskId);
 
         proc.stdout?.setEncoding('utf8');
         proc.stderr?.setEncoding('utf8');
@@ -476,6 +482,7 @@ export function createBashTool(config: BashToolConfig): {
               startTime: Date.now(),
             };
             backgroundTasks.set(task);
+            config.onBackgroundTaskStarted?.(taskId);
 
             // Remove original foreground listeners to prevent memory leak
             proc.stdout?.removeAllListeners('data');

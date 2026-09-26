@@ -39,6 +39,8 @@ export interface BuiltinToolDeps {
   /** Resolved at call time, so it follows setModel changes to the utility model. */
   utilityComplete(context: UtilityContext, usageCategory: string): Promise<string>;
   processes: Pick<ProcessTracker, 'track' | 'untrack'>;
+  /** A Bash task went to the background (inside the tool call). */
+  onBackgroundTaskStarted(taskId: string): void;
   onBackgroundTaskComplete(taskId: string): void;
   /** Present when deferred tool loading is on: ToolSearch loads from it. */
   deferred?: { registry: DeferredToolRegistry; onAfterDiscovery(): void };
@@ -88,6 +90,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps, disabled: ReadonlySet<
       onProcessExited: (pid) => {
         deps.processes.untrack(pid);
       },
+      onBackgroundTaskStarted: (taskId) => deps.onBackgroundTaskStarted(taskId),
       onBackgroundTaskComplete: (taskId) => deps.onBackgroundTaskComplete(taskId),
       sandbox: config.sandbox,
       // Escalation is authorized only by the permission gate; without a

@@ -94,3 +94,24 @@ describe('BackgroundDelivery', () => {
     expect(t.delivery.pending).toHaveLength(0);
   });
 });
+
+describe('BackgroundDelivery causation', () => {
+  it('runs the drain with the causation of every completion it delivers', async () => {
+    const t = setup();
+    t.delivery.pending.push({ ...item('a'), causeTags: ['x'] }, item('b'), { ...item('c'), causeTags: ['y', 'z'] });
+    await t.delivery.drain();
+    expect(t.runDeliveryTurn.mock.calls[0]![2]).toEqual(['x', 'y', 'z']);
+  });
+
+  it('attributes a Bash completion to the run that backgrounded it, once', async () => {
+    const t = setup();
+    t.delivery.noteBashStarted('task_1', ['origin']);
+    const enqueue = vi.spyOn(t.delivery, 'enqueue').mockResolvedValue();
+    await t.delivery.bashCompleted('task_1');
+    await t.delivery.bashCompleted('task_1');
+    expect(enqueue.mock.calls.map((call) => call[0])).toEqual([
+      { kind: 'bash', taskId: 'task_1', causeTags: ['origin'] },
+      { kind: 'bash', taskId: 'task_1' },
+    ]);
+  });
+});

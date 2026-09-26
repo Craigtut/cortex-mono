@@ -191,7 +191,7 @@ export function assembleLoop(params: {
     isAborted: () => host.isAborted(),
     isShuttingDown: () => lifecycle.isShuttingDown,
     isCancelled: (taskId) => subAgentManager.isCancelled(taskId),
-    runDeliveryTurn: (message, policy) => runner.run(message, undefined, true, policy),
+    runDeliveryTurn: (message, policy, causeTags) => runner.run(message, undefined, true, policy, causeTags),
     unwindFailedDelivery: (preDeliveryCount, runAbortEpoch) =>
       queues.unwindFailedDelivery(preDeliveryCount, runAbortEpoch),
     messages: transcript,
@@ -267,8 +267,10 @@ export function assembleLoop(params: {
     config,
     utilityComplete: (context, usageCategory) => host.utilityComplete(context, { usageCategory }),
     processes,
+    // Inside the tool call, so the live run is the one backgrounding it.
+    onBackgroundTaskStarted: (taskId) => background.noteBashStarted(taskId, runner.activeCauseTags),
     onBackgroundTaskComplete: (taskId) => {
-      void background.enqueue({ kind: 'bash', taskId });
+      void background.bashCompleted(taskId);
     },
     ...(tools.deferredEnabled
       ? { deferred: { registry: tools.deferredRegistry, onAfterDiscovery: () => host.refreshTools() } }
@@ -405,7 +407,8 @@ export function assembleLoop(params: {
   if (options?.enableSubAgentTool !== false) {
     tools.registerInternal(createSubAgentTool({
       spawnSubAgent: (spawn) => subAgents.spawnForeground(spawn),
-      spawnBackgroundSubAgent: (spawn) => subAgents.spawnBackground(spawn),
+      // A tool call, so the live run is the one spawning it.
+      spawnBackgroundSubAgent: (spawn) => subAgents.spawnBackground(spawn, runner.activeCauseTags),
       // Tool spawns count against the default pool.
       canSpawn: () => subAgentManager.canSpawn(),
       checkConsumerSpawn: () => {

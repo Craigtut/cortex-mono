@@ -10,6 +10,7 @@ import {
   entriesOfType,
   lifecycleEvents,
   promptTexts,
+  stubChildAgents,
   waitUntil,
 } from './duplex-scenario-harness.js';
 import type { AgentMessage } from '../../src/context-manager.js';
@@ -196,5 +197,50 @@ describe('cancel_task during a live reasoner run', () => {
     )).toBe(true);
     expect(entriesOfType(h.facade, 'delivery').map((entry) => entry.content))
       .toEqual(['Imports tidied.', 'Version bumped to 2.1.0.']);
+  });
+});
+
+describe('cancel_task and background work the cancelled task started', () => {
+  it('withholds a background sub-agent result that arrives after its task was cancelled', async () => {
+    const h = createDuplexScenario();
+    const spawned = stubChildAgents(h.reasonerLoop, (pi) => {
+      pi.hold = true;
+      pi.defaultText = 'The index has 40 stale shards.';
+    });
+    h.talkerPi.script = [{
+      text: 'On it.',
+      calls: [{ name: 'spawn_task', args: { instructions: 'audit the search index' } }],
+    }];
+    h.reasonerPi.script = [
+      { calls: [{ name: 'SubAgent', args: { instructions: 'count stale shards', background: true } }] },
+      { text: 'Started a helper to count stale shards.' },
+    ];
+    await h.facade.prompt('audit the search index');
+    await waitUntil(() => spawned.children.length === 1, 2000, 'helper spawned');
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'spawning run over');
+    expect(entriesOfType(h.facade, 'delivery').map((entry) => entry.content))
+      .toEqual(['Started a helper to count stale shards.']);
+
+    h.reasonerPi.script = [{ text: 'Noted, dropping the audit.' }];
+    h.talkerPi.script = [{
+      text: 'Cancelling it.',
+      calls: [{ name: 'cancel_task', args: { taskAlias: 'task-1' } }],
+    }];
+    await h.facade.prompt('forget the audit');
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 2, 2000, 'cancel delivered');
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'cancel run over');
+
+    // The helper finishes after the cancel; its result opens a drain run.
+    h.reasonerPi.script = [{ text: 'The helper found 40 stale shards.' }];
+    spawned.children[0]!.pi.releaseRun();
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 3, 2000, 'drain run');
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'drain run over');
+
+    // Precondition: the drain run's reply did reach the router's intake.
+    const dropped = lifecycleEvents(h.facade, 'delivery_dropped_cancelled')
+      .map((entry) => (entry.data as { content?: string }).content);
+    expect(dropped).toContain('The helper found 40 stale shards.');
+    expect(entriesOfType(h.facade, 'delivery').map((entry) => entry.content))
+      .not.toContain('The helper found 40 stale shards.');
   });
 });

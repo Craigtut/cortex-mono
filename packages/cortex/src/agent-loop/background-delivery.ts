@@ -37,6 +37,12 @@ export type PendingBackgroundCompletion = (
   firstDeliveryAttemptAt?: number;
   /** Formatted on the first attempt; formatting marks Bash tasks notified, so it runs once. */
   formattedMessage?: string;
+  /**
+   * Cause tags of the run that started the task. The drain run delivering
+   * the completion carries them, so the result is attributed to the work
+   * that asked for it rather than to nothing.
+   */
+  causeTags?: readonly unknown[];
 };
 
 export interface BackgroundDeliveryPorts {
@@ -46,8 +52,11 @@ export interface BackgroundDeliveryPorts {
   isShuttingDown(): boolean;
   /** Whether a sub-agent was cancelled (its result is discarded, not delivered). */
   isCancelled(taskId: string): boolean;
-  /** A drain run: delivers `message` even after an abort, flushing no silent content. */
-  runDeliveryTurn(message: string, retryPolicy: RetryPolicy): Promise<unknown>;
+  /**
+   * A drain run: delivers `message` even after an abort, flushing no
+   * silent content, and carrying `causeTags` as its causation.
+   */
+  runDeliveryTurn(message: string, retryPolicy: RetryPolicy, causeTags: unknown[]): Promise<unknown>;
   /** Unwind a failed delivery run (true: the content must be re-queued). */
   unwindFailedDelivery(preDeliveryCount: number, runAbortEpoch: number): boolean;
   messages(): AgentMessage[];
@@ -62,6 +71,8 @@ export class BackgroundDelivery {
   readonly deliveryHandlers: HandlerList<[taskIds: string[]]>;
   /** Completions awaiting delivery (mutated in place; tests hold the array). */
   readonly pending: PendingBackgroundCompletion[] = [];
+  /** Causation of the run that backgrounded each Bash task still running. */
+  private readonly bashOrigins = new Map<string, readonly unknown[]>();
 
   constructor(private readonly ports: BackgroundDeliveryPorts) {
     this.deliveryHandlers = new HandlerList('onBackgroundResultDelivery', ports.logger);
@@ -94,6 +105,18 @@ export class BackgroundDelivery {
     await this.schedule();
   }
 
+  /** A run backgrounded a Bash task: its completion carries that run's causation. */
+  noteBashStarted(taskId: string, causeTags: readonly unknown[]): void {
+    if (causeTags.length > 0) this.bashOrigins.set(taskId, causeTags);
+  }
+
+  /** A backgrounded Bash task finished (killed and polled ones too). */
+  bashCompleted(taskId: string): Promise<void> {
+    const causeTags = this.bashOrigins.get(taskId);
+    this.bashOrigins.delete(taskId);
+    return this.enqueue({ kind: 'bash', taskId, ...(causeTags ? { causeTags } : {}) });
+  }
+
   /** Enqueue a gated drain. No caller can catch its failure, so it goes to onError. */
   schedule(): Promise<void> {
     return this.ports.gate.enqueue(async () => {
@@ -118,6 +141,7 @@ export class BackgroundDelivery {
     const pending = this.pending.splice(0);
     const batch: PendingBackgroundCompletion[] = [];
     const parts: string[] = [];
+    const causeTags: unknown[] = [];
     const firstAttemptTaskIds: string[] = [];
     for (const item of pending) {
       if (item.kind === 'subagent' && this.ports.isCancelled(item.taskId)) {
@@ -129,6 +153,7 @@ export class BackgroundDelivery {
       item.firstDeliveryAttemptAt ??= Date.now();
       batch.push(item);
       parts.push(message);
+      causeTags.push(...(item.causeTags ?? []));
       if (!item.deliveryAttempts) firstAttemptTaskIds.push(item.taskId);
     }
     if (batch.length === 0) return;
@@ -148,7 +173,7 @@ export class BackgroundDelivery {
     let attemptError: Error | null = null;
     let requeuedForRetry = false;
     try {
-      await this.ports.runDeliveryTurn(message, boundedRetryPolicy);
+      await this.ports.runDeliveryTurn(message, boundedRetryPolicy, causeTags);
     } catch (err) {
       // Re-queue only content the unwind removed; content the run
       // progressed past is already history.
@@ -216,6 +241,7 @@ export class BackgroundDelivery {
 
   /** Teardown: queued drains no-op now, so record what will never be delivered. */
   deadLetterAllPending(reason: string): void {
+    this.bashOrigins.clear();
     for (const item of this.pending.splice(0)) {
       this.deadLetter(item, reason);
     }

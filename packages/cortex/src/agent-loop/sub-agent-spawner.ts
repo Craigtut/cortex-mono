@@ -62,7 +62,9 @@ export interface SubAgentSpawnerPorts {
   createChild(params: ChildLoopParams): Promise<ChildLoop>;
   eventBridge: EventBridge;
   /** A background child finished: hand its result to background delivery. */
-  onBackgroundComplete(item: { kind: 'subagent'; taskId: string; result: SubAgentResult }): Promise<void>;
+  onBackgroundComplete(
+    item: { kind: 'subagent'; taskId: string; result: SubAgentResult; causeTags?: readonly unknown[] },
+  ): Promise<void>;
   /** Drop a cancelled child's result that is already queued for delivery. */
   purgePendingResult(taskId: string): void;
   logger: CortexLogger;
@@ -165,10 +167,14 @@ export class SubAgentSpawner {
 
   /**
    * Spawn a background sub-agent and return its task ID immediately; the
-   * result is delivered to the loop when the child settles. Throws when
-   * the concurrency limit rejects the child.
+   * result is delivered to the loop when the child settles, carrying
+   * `causeTags` (the causation of the run that spawned it). Throws when the
+   * concurrency limit rejects the child.
    */
-  async spawnBackground(params: SubAgentSpawnParams): Promise<{ taskId: string }> {
+  async spawnBackground(
+    params: SubAgentSpawnParams,
+    causeTags: readonly unknown[] = [],
+  ): Promise<{ taskId: string }> {
     const { taskId, startTime } = this.announce(params, true);
     const childAgent = await this.createTracked(params, taskId, startTime, true);
     if (!childAgent) throw new Error('Concurrency limit reached');
@@ -189,7 +195,12 @@ export class SubAgentSpawner {
           cost: result.usage.cost,
           durationMs: result.usage.durationMs,
         });
-        return this.ports.onBackgroundComplete({ kind: 'subagent', taskId, result });
+        return this.ports.onBackgroundComplete({
+          kind: 'subagent',
+          taskId,
+          result,
+          ...(causeTags.length > 0 ? { causeTags } : {}),
+        });
       })
       .catch((err) => {
         unsubForward();
