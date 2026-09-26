@@ -1017,12 +1017,29 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     if (now - this.lastReasonerOutputAt < this.options.watchdogIntervalMs) return;
     const elapsedS = Math.max(1, Math.round((now - this.reasonerRunStartAt) / 1000));
     const aliases = this.activeAliases();
-    const text = aliases.length > 0
-      ? `Background work (${aliases.join(', ')}) is still running, about ${elapsedS}s so far; no update from it yet.`
-      : `Background work is still running, about ${elapsedS}s so far; no update from it yet.`;
+    const subject = aliases.length > 0
+      ? `Background work (${aliases.join(', ')})`
+      : 'Background work';
+    // A run blocked on a permission ask is silent because it is waiting on
+    // the user, not because it is slow or hung. Saying "no update yet" there
+    // tells the talker to reassure instead of to ask again for the answer.
+    const waitingOn = this.oldestPendingAsk();
+    const text = waitingOn
+      ? `${subject} is paused waiting for the user's permission answer (${waitingOn.toolName}), ` +
+        `about ${Math.max(1, Math.round((now - waitingOn.requestedAt) / 1000))}s so far. ` +
+        'It cannot continue until the user answers.'
+      : `${subject} is still running, about ${elapsedS}s so far; no update from it yet.`;
     // Rides the normal intake (log entry, dedup, spacing); marks itself
     // synthetic and resets the silence clock through lastReasonerOutputAt.
     this.deliverFromReasoner(text, 'when_idle', { synthetic: true });
+  }
+
+  private oldestPendingAsk(): { toolName: string; requestedAt: number } | null {
+    let oldest: { toolName: string; requestedAt: number } | null = null;
+    for (const ask of this.broker.getPendingAsks()) {
+      if (oldest === null || ask.requestedAt < oldest.requestedAt) oldest = ask;
+    }
+    return oldest;
   }
 
   // -------------------------------------------------------------------------

@@ -915,6 +915,31 @@ describe('liveness watchdog', () => {
     expect(entry.wake).toBe('when_idle');
   });
 
+  it('says a run blocked on a permission ask is waiting on the user', async () => {
+    const h = createHarness({ watchdogIntervalMs: 200 });
+    h.setTalkerIdle(true);
+    h.router.noteReasonerRunStart();
+    void h.router.permissionBroker.requestDecision({
+      askId: 'ask-1',
+      loopPath: 'reasoner',
+      toolName: 'Bash',
+      renderedRequest: 'Bash: npm publish',
+      kind: 'tool',
+    });
+    // Precondition: the ask is pending, so the run really is blocked on it.
+    expect(h.router.permissionBroker.getPendingAsks()).toHaveLength(1);
+    h.advance(250);
+    await waitUntil(() => h.log.some(
+      (entry) => entry.type === 'delivery' && (entry.data as { synthetic?: boolean }).synthetic === true,
+    ));
+    const entry = h.log.find(
+      (item) => item.type === 'delivery' && (item.data as { synthetic?: boolean }).synthetic === true,
+    )!;
+    expect(entry.content).toMatch(/waiting for the user's permission answer \(Bash\)/);
+    expect(entry.content).not.toMatch(/no update/);
+    h.router.destroy();
+  });
+
   it('stays quiet while the reasoner is idle or recently productive', async () => {
     const h = createHarness({ watchdogIntervalMs: 200 });
     // Idle: no run in flight.
