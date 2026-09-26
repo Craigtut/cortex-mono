@@ -1396,6 +1396,12 @@ export class CortexAgent {
    */
   private reasonerCancelAbort: Promise<void> | null = null;
   /**
+   * Set while the facade itself is aborting the reasoner (a user abort, a
+   * cancel), so the run end that abort produces is not mistaken for a stop
+   * nobody asked for. Budget stops are read off the guards instead.
+   */
+  private reasonerAbortCause: 'user' | 'cancel' | null = null;
+  /**
    * Whether the reasoner's current terminal failure already produced a
    * delivery. See deliverReasonerFailure for why a per-run reset is the
    * right unit for this and would not be for anything announced mid-ladder.
@@ -1758,6 +1764,9 @@ export class CortexAgent {
       markAskVoiced: (askId) => {
         this.reasoner.markAskVoiced(askId);
       },
+      workRefusal: () => (this.aggregateGuard?.isBreached()
+        ? "the session's spending limit has been reached"
+        : null),
       idleSignal: config.idleSignal,
       logger: this.logger,
       talkerLoopPath: talker.loopPath,
@@ -1999,6 +2008,7 @@ export class CortexAgent {
         data: { event: 'cancelled_run_stopped' },
         causedBy: causeSeq,
       });
+      this.reasonerAbortCause = 'cancel';
       this.reasonerCancelAbort = this.reasoner.abort()
         .catch((err: unknown) => {
           this.logger.warn('cancel abort of the reasoner run failed', {
@@ -2006,6 +2016,8 @@ export class CortexAgent {
           });
         })
         .then(() => {
+          // The aborted run has unwound; the next run is the cancel's own.
+          if (this.reasonerAbortCause === 'cancel') this.reasonerAbortCause = null;
           this.deliverDispatchAfterCancel(message, deliverOptions, causeSeq);
         })
         .finally(() => {
@@ -2129,7 +2141,6 @@ export class CortexAgent {
    */
   private handleReasonerRunEnd(event: CortexEvent): void {
     this.router?.noteReasonerRunEnd();
-    if (this.reasonerDeliveredResultThisRun) return;
     const messages = (event.data as { messages?: unknown[] } | undefined)?.messages;
     if (!Array.isArray(messages)) return;
     let last: { stopReason?: unknown; content?: unknown; errorMessage?: unknown } | null = null;
@@ -2139,6 +2150,13 @@ export class CortexAgent {
       }
     }
     if (!last) return;
+    // Ahead of the delivered-result check: a run that reported one result
+    // and was then stopped mid-way through more work was still stopped.
+    if (last.stopReason === 'aborted') {
+      this.handleReasonerStopped();
+      return;
+    }
+    if (this.reasonerDeliveredResultThisRun) return;
     if (last.stopReason === 'error') {
       // Only when nothing else in the system is going to speak.
       //
@@ -2166,12 +2184,41 @@ export class CortexAgent {
       );
       return;
     }
-    // An abort is the user's own doing, already acknowledged on the
-    // conversation surface; announcing it back to them is noise.
-    if (last.stopReason === 'aborted') return;
     const spoken = extractSpokenText(last);
     if (spoken.length === 0) return;
     this.router?.deliverFromReasoner(spoken, 'when_idle', { implicit: true });
+  }
+
+  /**
+   * The reasoner's run was aborted. Reached from the run end (a run pi ended
+   * as aborted) and from onError (an abort that surfaced as a cancelled
+   * failure, including one landing in retry backoff, which produces no run
+   * end at all), so everything here is idempotent per run.
+   *
+   * The work the run served is no longer in progress whoever stopped it, so
+   * its delegations retire; before this they stayed listed as live until
+   * the age-out, and the talker kept telling the user it was working. Only
+   * a stop the user did not ask for is announced: a user abort or a cancel
+   * was acknowledged when it was asked for, a budget stop was not.
+   */
+  private handleReasonerStopped(): void {
+    if (this.destroyed || !this.router) return;
+    this.router.retireRunDelegations();
+    if (this.reasonerAbortCause !== null) return;
+    // The aggregate breach announces itself once for the whole session
+    // (handleAggregateBreach); a run it stops needs no second notice.
+    if (this.aggregateGuard?.isBreached()) return;
+    if (this.reasonerBudgetBreached()) {
+      this.deliverReasonerFailure(
+        'The background work was stopped because it reached its spending limit for this ' +
+        'request. It produced no result. Tell the user plainly; it will not continue on its own.',
+      );
+    }
+  }
+
+  /** Whether a spending guard over the reasoner has tripped. */
+  private reasonerBudgetBreached(): boolean {
+    return this.reasoner.getBudgetGuard().isBreached() || this.aggregateGuard?.isBreached() === true;
   }
 
   /**
@@ -2256,8 +2303,12 @@ export class CortexAgent {
       // during a backoff window produces neither a run start nor a run end,
       // and neither onRetrySucceeded nor onRetryExhausted, so nothing else
       // would ever take "Retrying, attempt 2 of 3" back down.
-      if (error.category === 'cancelled') {
+      // A breached budget guard is the reason the run died, whatever the
+      // abort surfaced as (the abort comes from the guard, not the loop's
+      // own controller, so it is not always classified as a cancellation).
+      if (error.category === 'cancelled' || this.reasonerBudgetBreached()) {
         headlines.clearRetry();
+        this.handleReasonerStopped();
         return;
       }
 
@@ -2312,6 +2363,7 @@ export class CortexAgent {
    */
   private handleAggregateBreach(): void {
     if (this.destroyed) return;
+    const firstBreach = !this.aggregateBreachLogged;
     if (!this.aggregateBreachLogged) {
       this.aggregateBreachLogged = true;
       this.appendEntry({
@@ -2331,12 +2383,29 @@ export class CortexAgent {
         error: err instanceof Error ? err.message : String(err),
       });
     };
-    if (this.talker) void this.talker.abort().catch(swallow);
-    void this.reasoner.abort().catch(swallow);
+    const stops: Array<Promise<unknown>> = [];
+    if (this.talker) stops.push(this.talker.abort().catch(swallow));
+    stops.push(this.reasoner.abort().catch(swallow));
     for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
-      void this.reasoner.cancelSubAgent(taskId).catch(swallow);
+      stops.push(this.reasoner.cancelSubAgent(taskId).catch(swallow));
     }
-    if (this.lookups) void this.lookups.cancelAll().catch(swallow);
+    if (this.lookups) stops.push(this.lookups.cancelAll().catch(swallow));
+    if (!firstBreach || !this.router) return;
+    // Every piece of work is stopped, so none of it is live any more, and
+    // the user has to be told why: nothing else will ever say it, and the
+    // refusals that follow (workRefusal) only speak when the talker next
+    // tries to delegate. Delivered once the aborts have unwound: the
+    // talker's own abort would otherwise cancel the notice parked behind it.
+    this.router.retireAllDelegations();
+    void Promise.all(stops).then(() => {
+      if (this.destroyed || !this.router) return;
+      this.router.deliverFromReasoner(
+        "The session's spending limit has been reached, so all background work was " +
+        'stopped and no new work can start. Tell the user plainly.',
+        'interrupt',
+        { synthetic: true, terminal: true },
+      );
+    });
   }
 
   /**
@@ -3021,10 +3090,16 @@ export class CortexAgent {
         // result from the stopped work would degrade and still be voiced.
         this.router!.dropPendingDeliveries();
         this.recordDroppedQueueContent(this.reasoner, 'abort', this.reasoner.clearAllQueues());
+        this.reasonerAbortCause = 'user';
         work.push(this.reasoner.abort());
         for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
           work.push(this.reasoner.cancelSubAgent(taskId));
         }
+        // All work is stopped, parked dispatches included, so no task may
+        // go on being described as in progress. The user asked for this
+        // and it was acknowledged on the conversation surface: retired
+        // quietly, never announced back.
+        this.router!.retireAllDelegations();
         // Pending asks belong to the stopped work and settle as deny: tool
         // asks through each aborted run's own signal race, network asks
         // (which carry no signal) here. Double settlement is guarded.
@@ -3036,7 +3111,11 @@ export class CortexAgent {
         // is nothing pending. Retract the voicings with their asks.
         this.dropMootAskVoicings('abort');
       }
-      await Promise.all(work);
+      try {
+        await Promise.all(work);
+      } finally {
+        if (this.reasonerAbortCause === 'user') this.reasonerAbortCause = null;
+      }
       if (scope === 'conversation') {
         this.holdVoicingForReopen();
       }

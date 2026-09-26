@@ -139,7 +139,9 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
   let eventHandler: ((event: PiEvent) => void) | null = null;
   let releaseRun: (() => void) | null = null;
   let rejectRun: ((err: Error) => void) | null = null;
-  let idleResolve: (() => void) | null = null;
+  // Every waiter, like pi's shared run promise: two concurrent aborts both
+  // wait on the same run, and a single slot would strand the first.
+  let idleResolvers: Array<() => void> = [];
   let abortController: AbortController | null = null;
   let running = false;
   let callCounter = 0;
@@ -338,8 +340,7 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
         running = false;
         agent.runSignal = null;
         abortController = null;
-        idleResolve?.();
-        idleResolve = null;
+        for (const resolve of idleResolvers.splice(0)) resolve();
       }
       }
 
@@ -402,7 +403,7 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
 
     async waitForIdle(): Promise<void> {
       if (!running) return;
-      return new Promise<void>((resolve) => { idleResolve = resolve; });
+      return new Promise<void>((resolve) => { idleResolvers.push(resolve); });
     },
 
     reset(): void {
@@ -582,6 +583,7 @@ export function createDuplexScenario(
     // out; scenarios that exercise retries override this with something
     // short. Left at the default a scripted ladder simply never runs.
     ...(overrides?.retryPolicy !== undefined ? { retryPolicy: overrides.retryPolicy } : {}),
+    ...(overrides?.budgetGuard !== undefined ? { budgetGuard: overrides.budgetGuard } : {}),
   });
   const talkerLoop = new AgentLoopCtor(talkerPi, {
     model: testModel(),

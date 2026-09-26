@@ -125,6 +125,14 @@ export interface DuplexRouterPorts {
    * the same dispatch.
    */
   spawnLookup(question: string, causeSeq: number | null): QuickLookupRequestResult;
+  /**
+   * Why new work cannot be dispatched right now, or null when it can. Set
+   * after the session's aggregate spending limit is breached: a spawn,
+   * steer or lookup would only start a run the guard stops at once, so the
+   * talker gets a receipt it can relay instead. Cancels and permission
+   * answers stay open (they reduce work, or unblock it being wound down).
+   */
+  workRefusal?(): string | null;
   /** Consumer idle signal (advisory, facade-api.md). */
   idleSignal?: (() => boolean) | undefined;
   logger?: CortexLogger;
@@ -538,6 +546,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   dispatchSpawn(instructionsRaw: unknown): string {
     this.maybeRolloverExchange();
+    const refused = this.refuseWhenWorkBlocked('spawn_task');
+    if (refused !== null) return refused;
     const instructions = asTrimmedString(instructionsRaw);
     if (!instructions) {
       return this.refuseDispatch('spawn_task', 'missing instructions',
@@ -582,6 +592,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   dispatchSteer(taskAliasRaw: unknown, messageRaw: unknown): string {
     this.maybeRolloverExchange();
+    const refused = this.refuseWhenWorkBlocked('steer_task');
+    if (refused !== null) return refused;
     const message = asTrimmedString(messageRaw);
     if (!message) {
       return this.refuseDispatch('steer_task', 'missing message',
@@ -674,6 +686,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   dispatchLookup(questionRaw: unknown): string {
     this.maybeRolloverExchange();
+    const refused = this.refuseWhenWorkBlocked('quick_lookup');
+    if (refused !== null) return refused;
     const question = asTrimmedString(questionRaw);
     if (!question) {
       return this.refuseDispatch('quick_lookup', 'missing question',
@@ -1149,6 +1163,32 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   }
 
   /**
+   * The reasoner's live run was stopped (an abort of any origin): the work
+   * it served is no longer in progress, so it stops being described as
+   * live. Nothing is delivered here; whether the user hears about it is the
+   * caller's decision (a user abort is already acknowledged, a budget stop
+   * is not).
+   */
+  retireRunDelegations(): void {
+    this.retireDelegationsFor(this.ports.currentReasonerCauseTags());
+  }
+
+  /**
+   * All work was stopped (a work-scope abort, a breached session budget):
+   * every outstanding delegation stops being live, including ones whose
+   * dispatch was still parked and was dropped with the run. Marked, not
+   * removed, like result-driven retirement: the aliases stay steerable.
+   */
+  retireAllDelegations(): void {
+    const now = this.now();
+    for (const delegation of this.delegations.values()) {
+      if (delegation.completedAt !== null) continue;
+      delegation.completedAt = now;
+      delegation.lastActivityAt = now;
+    }
+  }
+
+  /**
    * Drop delegations past the age bound, measured from their last spawn,
    * steer, or result so live work is never dropped mid-flight. The backstop
    * behind result-driven retirement: work can end without any delivery the
@@ -1292,6 +1332,13 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       });
       return false;
     }
+  }
+
+  private refuseWhenWorkBlocked(tool: string): string | null {
+    const reason = this.ports.workRefusal?.() ?? null;
+    if (reason === null) return null;
+    return this.refuseDispatch(tool, reason,
+      `Could not do that: ${reason}. Tell the user plainly; no more background work can run in this session.`);
   }
 
   /**
