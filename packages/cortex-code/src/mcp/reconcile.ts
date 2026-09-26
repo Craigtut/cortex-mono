@@ -5,14 +5,17 @@
  *
  * Two callers use this:
  *
- * - The MCP config watcher (file change observed → reconcile after next turn).
+ * - The MCP config watcher (file change observed → reconcile once work settles).
  * - The `/mcp-reload` slash command (manual trigger).
+ *
+ * Both go through McpReloadScheduler (reload-scheduler.ts).
  *
  * Reconciliation is **idempotent** and safe to run on an idle agent. It MUST
  * NOT run while the agentic loop is mid-prompt: pi-agent-core snapshots the
  * tool set at `prompt()` entry, and removing a tool mid-turn risks the model
- * choosing a tool that has just been disconnected. Callers gate on
- * `session.isRunning` and queue until `onLoopComplete`.
+ * choosing a tool that has just been disconnected. McpReloadScheduler gates
+ * on the session's work tracker (`isBusy`) and runs a queued pass when the
+ * work settles (`runIfPending`, from the session's work-settled UI).
  */
 
 import type { CortexAgent } from '@animus-labs/cortex';

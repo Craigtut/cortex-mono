@@ -54,7 +54,7 @@ interface WatchHandle {
  * ```ts
  * const watcher = new McpConfigWatcher({
  *   cwd: process.cwd(),
- *   onChange: (reason) => session.scheduleMcpReload(reason),
+ *   onChange: (reason) => reloadScheduler.schedule(reason),
  * });
  * await watcher.start();
  * // ... later ...
