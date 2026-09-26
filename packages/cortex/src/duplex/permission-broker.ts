@@ -54,10 +54,12 @@ import type {
 import type { NetworkAccessRequest, ResolveNetworkAccess } from '../sandbox/types.js';
 import type { WakeClass } from '../session-log.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
+import { errorMessageOf } from '../error-classifier.js';
 import { BASH_ESCALATION_PERMISSION_NAME } from '../tools/bash/index.js';
 import { clampRenderedRequest } from '../permission-rendering.js';
 import type { CauseTag } from './cause-tags.js';
 import { stripAskFence } from './ask-fence.js';
+import { asTrimmedString } from './control-tools.js';
 import { buildAskVoicing } from './prompts.js';
 
 // ---------------------------------------------------------------------------
@@ -268,12 +270,6 @@ const DROP_REASONS: Record<'abort' | 'restore' | 'destroy', string> = {
 
 /** Cap on the relayed reason so a runaway argument cannot bloat the log. */
 const MAX_REASON_CHARS = 400;
-
-function asTrimmedString(value: unknown): string | null {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
 
 /** Fence-strip an unvalidated tool argument, leaving non-strings alone. */
 function stripAskFenceFromReason(value: unknown): unknown {
@@ -740,7 +736,7 @@ export class PermissionBroker {
         this.ports.markAskVoiced?.(ask.request.askId);
       } catch (err) {
         this.logger.warn('markAskVoiced port threw', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     }
@@ -800,7 +796,7 @@ export class PermissionBroker {
       ask.lastVoicingText = null;
       this.logger.error('ask voicing delivery failed', {
         askId: ask.request.askId,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
       return false;
     }

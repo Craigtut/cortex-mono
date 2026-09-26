@@ -24,6 +24,7 @@
 import type { CortexLogger } from '../types.js';
 import type { WakeClass } from '../session-log.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
+import { errorMessageOf } from '../error-classifier.js';
 import {
   buildCancelDirective,
   buildConversationBlock,
@@ -37,6 +38,7 @@ import {
 } from './prompts.js';
 import type { ConversationDelta } from './prompts.js';
 import type { CauseTag } from './cause-tags.js';
+import { asTrimmedString } from './control-tools.js';
 import type { ControlDispatchTarget } from './control-tools.js';
 import { PERMISSION_BROKER_DEFAULTS, PermissionBroker } from './permission-broker.js';
 import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
@@ -341,12 +343,6 @@ function fnv1a(input: string): number {
     hash = Math.imul(hash, 0x01000193);
   }
   return hash >>> 0;
-}
-
-function asTrimmedString(value: unknown): string | null {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +741,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       spawn = this.ports.spawnLookup(question, seq);
     } catch (err) {
       this.logger.error('quick lookup spawn threw', {
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
       spawn = { accepted: false, reason: 'spawn failed' };
     }
@@ -956,7 +952,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         this.ports.deliverToTalker(wrapDeliveryForTalker(content), false);
       } catch (err) {
         this.logger.error('silent delivery to talker failed', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
       return { delivered: true, wake };
@@ -1039,7 +1035,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       // failure is loop-owned territory (its deliver() never throws while
       // healthy, so this is teardown or a bug).
       this.logger.error('delivery to talker failed', {
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
     }
   }
@@ -1051,7 +1047,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         return signal() === true;
       } catch (err) {
         this.logger.warn('idle signal threw; treating as not idle', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
         return false;
       }
@@ -1367,7 +1363,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         this.ports.deliverToTalker(wrapDeliveryForTalker(content), false);
       } catch (err) {
         this.logger.error('restoring a held delivery to the talker failed', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     }
@@ -1437,7 +1433,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       return true;
     } catch (err) {
       this.logger.error('dispatch to reasoner failed', {
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
       this.ports.appendLog({
         type: 'lifecycle',
@@ -1445,7 +1441,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         content: 'Dispatch to the reasoner failed',
         data: {
           event: 'dispatch_failed',
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         },
         ...(causeSeq !== null ? { causedBy: causeSeq } : {}),
       });

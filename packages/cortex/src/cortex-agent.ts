@@ -87,6 +87,7 @@ import type {
   WakeClass,
 } from './session-log.js';
 import { NOOP_LOGGER } from './noop-logger.js';
+import { errorMessageOf } from './error-classifier.js';
 import {
   cloneResolutionNote,
   collectAssemblyResolutionNotes,
@@ -1926,7 +1927,7 @@ export class CortexAgent {
       this.reasonerCancelAbort = this.reasoner.abort()
         .catch((err: unknown) => {
           this.logger.warn('cancel abort of the reasoner run failed', {
-            error: err instanceof Error ? err.message : String(err),
+            error: errorMessageOf(err),
           });
         })
         .then(() => {
@@ -1957,7 +1958,7 @@ export class CortexAgent {
       this.reasoner.deliver(message, deliverOptions);
     } catch (err) {
       this.logger.error('dispatch to reasoner failed after a cancel abort', {
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
       this.appendEntry({
         type: 'lifecycle',
@@ -1965,7 +1966,7 @@ export class CortexAgent {
         content: 'Dispatch to the reasoner failed',
         data: {
           event: 'dispatch_failed',
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         },
         causedBy: causeSeq,
       });
@@ -2038,7 +2039,7 @@ export class CortexAgent {
           });
         } catch (err) {
           this.logger.warn('truncation repair delivery failed', {
-            error: err instanceof Error ? err.message : String(err),
+            error: errorMessageOf(err),
           });
         }
       }
@@ -2294,7 +2295,7 @@ export class CortexAgent {
     }
     const swallow = (err: unknown): void => {
       this.logger.warn('budget-breach abort failed', {
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
     };
     const stops: Array<Promise<unknown>> = [];
@@ -2355,7 +2356,7 @@ export class CortexAgent {
         if (!this.talker.isLoopActive) await this.talker.digestIdle({ signal: preempt.signal });
       } catch (err) {
         this.logger.warn('talker idle digestion failed', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
       if (this.destroyed || preempt.signal.aborted) return;
@@ -2365,7 +2366,7 @@ export class CortexAgent {
         }
       } catch (err) {
         this.logger.warn('reasoner idle digestion failed', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     } finally {
@@ -2658,7 +2659,7 @@ export class CortexAgent {
       loopPath: this.reasoner.loopPath,
     }).catch((err: unknown) => {
       this.logger.warn('session log spill failed', {
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
         entries: evicted.length,
       });
     });
@@ -2986,7 +2987,7 @@ export class CortexAgent {
       // digestion, and opening (or joining) the next talker run.
       void this.prompt(message).catch((err: unknown) => {
         this.logger.warn('steer delivered as a prompt failed', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       });
       return;
@@ -3664,7 +3665,7 @@ export class CortexAgent {
       // debounce timer. Route it to the consumer's logger instead.
       this.emitStateChanged().catch((err: unknown) => {
         this.logger.error('onStateChanged snapshot failed', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       });
     }, this.stateDebounceMs);
@@ -3694,7 +3695,7 @@ export class CortexAgent {
           handler(state);
         } catch (err) {
           this.logger.error('onStateChanged handler threw', {
-            error: err instanceof Error ? err.message : String(err),
+            error: errorMessageOf(err),
           });
         }
       }

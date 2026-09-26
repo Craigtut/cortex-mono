@@ -21,6 +21,7 @@
 import type { AgentLoop } from '../agent-loop.js';
 import type { CortexLogger, SessionUsage } from '../types.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
+import { errorMessageOf } from '../error-classifier.js';
 import { spokenText } from '../working-tags.js';
 
 // ---------------------------------------------------------------------------
@@ -168,7 +169,7 @@ export class QuickLookupManager {
       // bookkeeping so a bug cannot strand the entry as forever-active.
       this.logger.error('quick lookup run threw past its own handling', {
         alias,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
     }).finally(() => {
       this.active.delete(alias);
@@ -300,7 +301,7 @@ export class QuickLookupManager {
       causeSeq: entry.causeSeq,
       durationMs: Date.now() - entry.startedAt,
       ...(error !== undefined && error !== null
-        ? { error: error instanceof Error ? error.message : String(error) }
+        ? { error: errorMessageOf(error) }
         : {}),
     };
     try {
@@ -308,7 +309,7 @@ export class QuickLookupManager {
     } catch (err) {
       this.logger.error('quick lookup outcome handler threw', {
         alias: entry.alias,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
     }
   }

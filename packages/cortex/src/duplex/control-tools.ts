@@ -64,6 +64,17 @@ export interface ControlDispatchTarget {
   dispatchAnswerAsk(askId: unknown, decision: unknown, reason: unknown): string;
 }
 
+/**
+ * A control-tool argument as a non-empty trimmed string, or null. The
+ * schemas accept anything (see the module header), so every dispatch reads
+ * its arguments through this one rule.
+ */
+export function asTrimmedString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 // ---------------------------------------------------------------------------
 // Result shape
 // ---------------------------------------------------------------------------
