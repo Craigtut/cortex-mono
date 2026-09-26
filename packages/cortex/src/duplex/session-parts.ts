@@ -37,23 +37,36 @@ import { ReasonerOutcomeReporter } from './reasoner-outcomes.js';
 import { ReasonerRunTracker } from './reasoner-run.js';
 import { LivenessWatchdog } from './watchdog.js';
 
+/**
+ * The parts DuplexSession holds after assembly: what its surface reaches
+ * (the rest, such as the run tracker and the headline block, are wired to
+ * these and to the loops here and need no handle afterwards).
+ */
 export interface DuplexParts {
   readonly router: DuplexRouter;
   /** The consent boundary for every permission ask in the session (D16). */
   readonly broker: PermissionBroker;
   /** The facade-owned quick-lookup fleet (D13). */
   readonly lookups: QuickLookupManager;
-  readonly headlines: DuplexHeadlines;
-  /** The single owner of "is the reasoner running, and since when". */
-  readonly run: ReasonerRunTracker;
   readonly outcomes: ReasonerOutcomeReporter;
   readonly watchdog: LivenessWatchdog;
   readonly digestion: IdleDigestion;
-  readonly dispatcher: ReasonerDispatcher;
   readonly input: ConversationInput;
   readonly guards: TalkerGuards;
   readonly merged: MergedEvents;
   readonly aggregate: AggregateBudget;
+}
+
+/** What the ordered wiring pass connects to the loops. */
+interface WiredParts {
+  readonly router: DuplexRouter;
+  readonly headlines: DuplexHeadlines;
+  readonly outcomes: ReasonerOutcomeReporter;
+  /** The single owner of "is the reasoner running, and since when". */
+  readonly run: ReasonerRunTracker;
+  readonly digestion: IdleDigestion;
+  readonly broker: PermissionBroker;
+  readonly guards: TalkerGuards;
 }
 
 /** Build every part, then wire them to the loops in order. */
@@ -67,17 +80,17 @@ export function assembleSessionParts(
   const { recorder, logger } = services;
   const destroyed = (): boolean => services.destroyed();
   const routerOptions = routerOptionsFrom(config.duplex);
-  // Parts refer to each other only through closures, so every part exists
-  // by the time any port is called.
-  const parts = {} as { -readonly [K in keyof DuplexParts]: DuplexParts[K] };
+  // Each part is a const built once, in order. A part that needs a later
+  // one reaches it only through a closure, which no constructor calls, so
+  // every part exists by the time any port runs.
 
   // Ephemeral read-only loops on the talker's fast model, spawned on the
   // talker's behalf, with their own small pool.
-  parts.lookups = new QuickLookupManager(
+  const lookups = new QuickLookupManager(
     {
       createLoop: async (alias) => {
         const loop = await AgentLoop.create(buildQuickLookupConfig(config, talker.getModel(), alias));
-        return { loop, cleanup: parts.merged.forwardLookup(loop) };
+        return { loop, cleanup: merged.forwardLookup(loop) };
       },
       onOutcome: (outcome) => handleLookupOutcome(outcome),
       logger,
@@ -87,26 +100,26 @@ export function assembleSessionParts(
       timeoutMs: config.duplex?.lookupTimeoutMs,
     },
   );
-  parts.digestion = new IdleDigestion(
+  const digestion = new IdleDigestion(
     {
       talker,
       reasoner,
-      quiet: () => services.conversationIdle() && parts.router.pendingDeliveryCount === 0,
+      quiet: () => services.conversationIdle() && router.pendingDeliveryCount === 0,
       destroyed,
       logger,
     },
     config.duplex?.idleDigestionDelayMs ?? 10_000,
   );
-  parts.dispatcher = new ReasonerDispatcher({
+  const dispatcher = new ReasonerDispatcher({
     reasoner,
     append: (input) => recorder.append(input),
-    beforeInput: () => parts.digestion.preempt(),
-    cancelAbortStarting: () => parts.outcomes.expectAbort('cancel'),
-    cancelAbortFinished: () => parts.outcomes.abortUnwound('cancel'),
+    beforeInput: () => digestion.preempt(),
+    cancelAbortStarting: () => outcomes.expectAbort('cancel'),
+    cancelAbortFinished: () => outcomes.abortUnwound('cancel'),
     destroyed,
     logger,
   });
-  parts.broker = new PermissionBroker(
+  const broker = new PermissionBroker(
     {
       appendLog: (input) => recorder.appendAttributed(input),
       // The reserved ask lane: a real wake delivery carrying the ask-kind
@@ -116,8 +129,8 @@ export function assembleSessionParts(
       // clock so queued ordinary deliveries hold off behind a fresh ask
       // instead of talking over it.
       voiceToTalker: (content, causeTag) => {
-        parts.router.stampReservedLane();
-        parts.digestion.preempt();
+        router.stampReservedLane();
+        digestion.preempt();
         return talker.deliver(content, { wake: true, causeTag }).deliveryId;
       },
       currentTalkerCauseTags: () => causation.tags('conversation'),
@@ -132,22 +145,22 @@ export function assembleSessionParts(
       settleVoiceDelayMs: routerOptions.settleVoiceDelayMs,
     },
   );
-  parts.router = new DuplexRouter(
+  const router = new DuplexRouter(
     {
       deliverToTalker: (content, wake) => {
-        if (wake) parts.digestion.preempt();
+        if (wake) digestion.preempt();
         talker.deliver(content, { wake });
       },
       talkerIdle: () => !talker.isLoopActive,
-      spawnLookup: (question, causeSeq) => parts.lookups.request(question, causeSeq),
+      spawnLookup: (question, causeSeq) => lookups.request(question, causeSeq),
       dispatchToReasoner: (message, causeSeq, options) =>
-        parts.dispatcher.dispatch(message, causeSeq, options),
+        dispatcher.dispatch(message, causeSeq, options),
       appendLog: (input) => recorder.appendAttributed(input),
       currentTalkerCauseTags: () => causation.tags('conversation'),
       currentReasonerCauseTags: () => causation.tags('work'),
-      answerAsk: (askId, decision, reason) => parts.broker.answer(askId, decision, reason),
-      reasonerAttemptKey: () => parts.run.attemptKey(),
-      workRefusal: () => parts.aggregate.workRefusal(),
+      answerAsk: (askId, decision, reason) => broker.answer(askId, decision, reason),
+      reasonerAttemptKey: () => run.attemptKey(),
+      workRefusal: () => aggregate.workRefusal(),
       idleSignal: config.idleSignal,
       logger,
       talkerLoopPath: talker.loopPath,
@@ -155,69 +168,69 @@ export function assembleSessionParts(
     },
     routerOptions,
   );
-  parts.run = new ReasonerRunTracker(reasoner);
-  parts.headlines = new DuplexHeadlines({
-    reasonerRun: parts.run,
+  const run = new ReasonerRunTracker(reasoner);
+  const headlines = new DuplexHeadlines({
+    reasonerRun: run,
     reasonerUsage: () => reasoner.getSessionUsage(),
     activeSubAgents: () => reasoner.getActiveSubAgents(),
-    delegations: () => parts.router.getDelegations(),
+    delegations: () => router.getDelegations(),
     // The BROKER, not the facade's merged consumer view: it holds every
     // ask (tool, escalation, network), and its consent anchor, not the
     // sticky `voiced` flag, says whether one could have been heard.
-    pendingAsks: () => parts.broker.getPendingAsks(),
+    pendingAsks: () => broker.getPendingAsks(),
   });
-  parts.outcomes = new ReasonerOutcomeReporter({
+  const outcomes = new ReasonerOutcomeReporter({
     reasoner,
-    runId: () => parts.run.runId(),
-    router: parts.router,
-    headlines: parts.headlines,
-    aggregateBreached: () => parts.aggregate.guard.isBreached(),
+    runId: () => run.runId(),
+    router: router,
+    headlines: headlines,
+    aggregateBreached: () => aggregate.guard.isBreached(),
     destroyed,
     now: Date.now,
   });
-  parts.watchdog = new LivenessWatchdog(
+  const watchdog = new LivenessWatchdog(
     {
-      runStartedAt: () => parts.run.attempt()?.startedAt ?? null,
-      lastOutputAt: () => parts.outcomes.lastOutputAt(),
-      activeAliases: () => parts.router.activeAliases(),
-      pendingAsks: () => parts.broker.getPendingAsks(),
-      reportProgress: (text) => parts.outcomes.reportProgress(text),
+      runStartedAt: () => run.attempt()?.startedAt ?? null,
+      lastOutputAt: () => outcomes.lastOutputAt(),
+      activeAliases: () => router.activeAliases(),
+      pendingAsks: () => broker.getPendingAsks(),
+      reportProgress: (text) => outcomes.reportProgress(text),
     },
     {
       intervalMs: routerOptions.watchdogIntervalMs ?? DUPLEX_ROUTER_DEFAULTS.watchdogIntervalMs,
       now: Date.now,
     },
   );
-  parts.input = new ConversationInput({
+  const input = new ConversationInput({
     talker,
     reasoner,
-    router: parts.router,
+    router: router,
     recorder,
     prompts: services.prompts,
-    beforeInput: () => parts.digestion.preempt(),
-    reopenVoicing: () => parts.broker.reopenVoicing(),
+    beforeInput: () => digestion.preempt(),
+    reopenVoicing: () => broker.reopenVoicing(),
     noteInputArriving: () => services.noteInputArriving(),
     promptThroughFacade: (text) => services.prompt(text),
     logger,
   });
-  parts.guards = new TalkerGuards(logger);
-  wire(loops, parts, services);
+  const guards = new TalkerGuards(logger);
+  wire(loops, { router, headlines, outcomes, run, digestion, broker, guards }, services);
   // The merged stream forwards through catch-all listeners, which a bridge
   // runs after every typed handler: consumers see an event only once the
   // session has handled it, whatever the registration order.
-  parts.merged = new MergedEvents(talker, reasoner, logger);
-  parts.aggregate = new AggregateBudget(config.duplex?.maxTotalCost, parts.merged.bridge, {
+  const merged = new MergedEvents(talker, reasoner, logger);
+  const aggregate = new AggregateBudget(config.duplex?.maxTotalCost, merged.bridge, {
     append: (input) => recorder.append(input),
     stopAllWork: () => stopAllWork(),
-    retireAllDelegations: () => parts.router.retireAllDelegations(),
+    retireAllDelegations: () => router.retireAllDelegations(),
     announce: (text) => {
-      parts.outcomes.notify(text, 'interrupt', { synthetic: true, terminal: true });
+      outcomes.notify(text, 'interrupt', { synthetic: true, terminal: true });
     },
     destroyed,
     workLoopPath: reasoner.loopPath,
     logger,
   });
-  return parts;
+  return { router, broker, lookups, outcomes, watchdog, digestion, input, guards, merged, aggregate };
 
   /**
    * A quick lookup settled. Non-cancelled outcomes (including timeouts and
@@ -242,7 +255,7 @@ export function assembleSessionParts(
       });
       return;
     }
-    parts.router.deliverLookupResult(outcome);
+    router.deliverLookupResult(outcome);
     services.markStateDirty();
   }
 
@@ -259,7 +272,7 @@ export function assembleSessionParts(
     for (const taskId of reasoner.getSubAgentManager().getActiveTaskIds()) {
       stops.push(reasoner.cancelSubAgent(taskId).catch(swallow));
     }
-    stops.push(parts.lookups.cancelAll().catch(swallow));
+    stops.push(lookups.cancelAll().catch(swallow));
     return Promise.all(stops);
   }
 }
@@ -267,7 +280,7 @@ export function assembleSessionParts(
 /** Every handler the session installs, in the order they must run. */
 function wire(
   loops: { reasoner: AgentLoop; talker: AgentLoop },
-  parts: Omit<DuplexParts, 'merged' | 'aggregate'>,
+  parts: WiredParts,
   services: FacadeServices,
 ): void {
   const { talker, reasoner } = loops;
