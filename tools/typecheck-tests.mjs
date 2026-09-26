@@ -37,7 +37,7 @@ const PACKAGES = ['cortex', 'cortex-code', 'brand'];
  * A snapshot taken on a branch several agents were writing at once, so
  * treat small movements as noise and large ones as signal.
  */
-const BASELINE = { cortex: 449, 'cortex-code': 25: 1, brand: 0 };
+const BASELINE = { cortex: 449, 'cortex-code': 25, brand: 0 };
 
 /** Count `error TSxxxx` lines, and prove the run actually compiled tests. */
 function check(pkg) {
