@@ -37,11 +37,7 @@ import type {
 export type ConversationLoop = LoopDeliveryApi & LoopContextApi & LoopEventApi & LoopRunApi
   & LoopPromptApi & LoopModelApi & LoopCompletionApi;
 
-/**
- * A resident loop as the session-wide operations reach it: waits,
- * persistence triggers, and the settings that fan out to every loop
- * (models, prompt, context).
- */
+/** A resident loop as session-wide waits, triggers and fan-out settings reach it. */
 export type ResidentLoop = LoopRunApi & LoopEventApi & LoopContextApi & LoopModelApi & LoopPromptApi;
 import type {
   DirectCompletionOptions,
