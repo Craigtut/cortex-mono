@@ -18,7 +18,6 @@
  *   - cross-platform-considerations.md
  */
 
-import { resolveContextBudget } from './context-budget.js';
 import { ContextManager } from './context-manager.js';
 import type { AgentContext, AgentMessage } from './context-manager.js';
 import {
@@ -48,12 +47,6 @@ import {
 } from './pi-message.js';
 import { renderPermissionRequest } from './permission-rendering.js';
 import { toolCallSubject } from './tools/tool-call-subject.js';
-// pi-ai 0.80 moved the static catalog reads off the root to the durable
-// `providers/all` entrypoint (`getModel`/`getModels` on root are deprecated
-// compat aliases). These are the non-deprecated replacements.
-import { getBuiltinModel as getPiModel, getBuiltinModels as getPiModels } from '@earendil-works/pi-ai/providers/all';
-import { UTILITY_MODEL_OVERRIDES } from './provider-registry.js';
-import { inferUtilityModel } from './utility-model-inference.js';
 import { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
 import { isContextOverflow } from './compaction/failsafe.js';
@@ -80,7 +73,7 @@ import { createWebFetchTool } from './tools/web-fetch/index.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DeferredToolRegistry } from './tools/tool-search/registry.js';
 import { createToolSearchTool } from './tools/tool-search/index.js';
-import { wrapModel, unwrapModel } from './model-wrapper.js';
+import { unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import { SystemPromptState } from './agent-loop/system-prompt.js';
 import { HandlerList } from './agent-loop/handler-list.js';
@@ -88,6 +81,7 @@ import { ProcessTracker } from './agent-loop/process-tracker.js';
 import { UsageLedger } from './agent-loop/usage-ledger.js';
 import { wireLoopEvents } from './agent-loop/event-wiring.js';
 import { DirectCompletions } from './agent-loop/direct-completion.js';
+import { ModelSettings } from './agent-loop/model-settings.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { estimateTokens } from './token-estimator.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
@@ -510,23 +504,10 @@ export class AgentLoop {
   private lifecycleState: CortexLifecycleState = 'created';
   private readonly systemPrompt: SystemPromptState;
 
-  // Cache retention resolved by the consumer via resolveCacheRetention().
-  // null = not yet resolved (pi-ai uses its own default).
-  // Set at agent creation via setCacheRetention() and updated dynamically
-  // on interval changes (sleep/wake transitions).
-  private _cacheRetention: CacheRetention | null = null;
   private _activePromptCacheRetention: CacheRetention | null = null;
 
-  // Stable cache/session key forwarded to the provider as prompt_cache_key
-  // (see AgentLoopConfig.sessionId). null = not set (provider generates one).
-  private _sessionId: string | null = null;
-
-  // Public model handles and internal pi-ai model objects.
-  private primaryModel: CortexModel;
-  private primaryPiModel: PiModel;
-  private resolvedUtilityModel: CortexModel;
-  private resolvedUtilityPiModel: PiModel;
-  private utilityModelManualOverride = false;
+  // Primary and utility models, context window limit, cache retention, session key.
+  private readonly models: ModelSettings;
 
   // Built-in tools registered at construction (distinct from MCP-discovered tools)
   private readonly registeredTools: RegisteredTool[];
@@ -555,11 +536,6 @@ export class AgentLoop {
   // Compaction Manager
   private readonly compactionManager: CompactionManager;
 
-  // User-configured context window limit (null = no limit, use model's full window)
-  private _contextWindowLimit: number | null = null;
-  // Last "configured:effective" pair warned about, so the override notice
-  // fires once per distinct outcome rather than on every recompute.
-  private _warnedContextWindowOverride: string | null = null;
 
   // Event handlers (consumer-registered callbacks)
   private readonly loopCompleteHandlers: HandlerList<[LoopOriginContext]>;
@@ -774,21 +750,25 @@ export class AgentLoop {
     if (!config.model) {
       throw new Error('AgentLoopConfig.model is required but was undefined. Pass a CortexModel.');
     }
-    const { primaryModel, primaryPiModel, utilityModel, utilityPiModel } = this.resolveModels(config);
-    this.primaryModel = primaryModel;
-    this.primaryPiModel = primaryPiModel;
-    this.resolvedUtilityModel = utilityModel;
-    this.resolvedUtilityPiModel = utilityPiModel;
+    this.models = new ModelSettings(config, {
+      writeAgentModel: (model) => {
+        (this.agent.state as Record<string, unknown>)['model'] = model;
+      },
+      // Undefined until built below; the settings sync it once it exists.
+      compaction: () => this.compactionManager ?? null,
+      onModelChanged: () => this.rebuildLoadSkillDescription(),
+      logger: this.logger,
+    });
     this.completions = new DirectCompletions({
       models: () => ({
-        primary: this.primaryModel,
-        primaryPi: this.primaryPiModel,
-        utility: this.resolvedUtilityModel,
-        utilityPi: this.resolvedUtilityPiModel,
+        primary: this.models.primary,
+        primaryPi: this.models.primaryPi,
+        utility: this.models.utility,
+        utilityPi: this.models.utilityPi,
       }),
       getApiKey: config.getApiKey,
-      cacheRetention: () => this._cacheRetention,
-      sessionId: () => this._sessionId,
+      cacheRetention: () => this.models.cacheRetention,
+      sessionId: () => this.models.sessionId,
       isAborted: () => this.isAborted(),
       emitError: (error, wasAborted) => this.emitError(error, wasAborted),
       emitUtilityUsage: (category, usage) => this.eventBridge.emitUtilityUsage(category, usage),
@@ -808,7 +788,7 @@ export class AgentLoop {
     const disabledSet = new Set(config.disableTools ?? []);
     const builtinTools = this.createBuiltinTools(disabledSet);
     this.registeredTools = this.normalizeRegisteredTools([...builtinTools, ...(tools ?? [])]);
-    (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
+    this.models.applyToAgent();
 
     // Build the slot list. When using observational memory, append the
     // internal observation slot so it occupies the last slot position.
@@ -838,9 +818,6 @@ export class AgentLoop {
     }
     if (config.toolResultThresholds) {
       this.toolResultThresholds = config.toolResultThresholds;
-    }
-    if (config.sessionId) {
-      this._sessionId = config.sessionId;
     }
 
     const compactionStrategy = compactionConfig.strategy ?? 'observational';
@@ -989,7 +966,7 @@ export class AgentLoop {
           active: this.subAgentManager.activeCount,
           limit: this.subAgentManager.limit,
         }),
-        getModelId: () => this.primaryModel.modelId,
+        getModelId: () => this.models.primary.modelId,
       });
       this.registeredTools.push(subAgentTool as RegisteredTool);
     }
@@ -1016,18 +993,8 @@ export class AgentLoop {
       slots.length,
     );
     this.compactionManager.setLogger(this.logger);
-    // Wire cache info into CompactionManager so L1 can gate trimming on
-    // whether the prompt cache has gone cold. Initial retention defaults to
-    // 'none' until the consumer calls setCacheRetention().
-    this.compactionManager.setCacheInfo(
-      this.primaryModel.provider,
-      this._cacheRetention ?? 'none',
-      this.primaryModel.capabilities?.promptCaching,
-    );
-
-    // Apply context window limit from config and model
-    this._contextWindowLimit = config.contextWindowLimit ?? null;
-    this._updateEffectiveContextWindow();
+    // Context windows and cache TTL follow the model settings from here on.
+    this.models.syncCompaction();
 
     if (typeof config.initialBasePrompt === 'string') {
       this.setBasePrompt(config.initialBasePrompt);
@@ -1302,7 +1269,7 @@ export class AgentLoop {
       }
     }
 
-    const effectiveRetention = options?.cacheRetention ?? this._cacheRetention;
+    const effectiveRetention = options?.cacheRetention ?? this.models.cacheRetention;
     this._activePromptCacheRetention = effectiveRetention ?? null;
 
     // Flush queued silent deliveries into this prompt's message batch. Only
@@ -1372,8 +1339,8 @@ export class AgentLoop {
     this.promptDiagnostics.startPrompt({
       inputLength: input.length,
       messageCount: this._prePromptMessageCount,
-      provider: this.primaryModel.provider,
-      modelId: this.primaryModel.modelId,
+      provider: this.models.primary.provider,
+      modelId: this.models.primary.modelId,
     });
 
     // Created immediately before the try so every code path that leaves a
@@ -2564,9 +2531,9 @@ export class AgentLoop {
       // streamSimple lives on pi-ai 0.80's temporary /compat shim (Phase 2 migrates this).
       const { streamSimple } = await import('@earendil-works/pi-ai/compat');
       const retention = cacheBreakpointState.agentLoop?._activePromptCacheRetention
-        ?? cacheBreakpointState.agentLoop?._cacheRetention
+        ?? cacheBreakpointState.agentLoop?.models.cacheRetention
         ?? null;
-      const sessionId = cacheBreakpointState.agentLoop?._sessionId ?? null;
+      const sessionId = cacheBreakpointState.agentLoop?.models.sessionId ?? null;
       let streamOptions = options;
       if (retention || sessionId) {
         streamOptions = { ...options };
@@ -3056,14 +3023,14 @@ export class AgentLoop {
    * Get the primary model.
    */
   getModel(): CortexModel {
-    return this.primaryModel;
+    return this.models.primary;
   }
 
   /**
    * Get the resolved utility model.
    */
   getUtilityModel(): CortexModel {
-    return this.resolvedUtilityModel;
+    return this.models.utility;
   }
 
   /**
@@ -3077,11 +3044,7 @@ export class AgentLoop {
    * run, instead of re-deriving it from a model list that the agent never sees.
    */
   getAutoResolvedUtilityModel(): CortexModel {
-    return this.resolveUtilityModels(
-      this.primaryModel,
-      this.primaryPiModel,
-      this.config.utilityModel,
-    ).utilityModel;
+    return this.models.autoResolvedUtility();
   }
 
   /**
@@ -3091,24 +3054,7 @@ export class AgentLoop {
    * @param model - The new CortexModel to use
    */
   setModel(model: CortexModel): void {
-    this.primaryModel = model;
-    this.primaryPiModel = unwrapModel(model) as PiModel;
-    // Only auto-resolve utility model if the user hasn't manually overridden it
-    if (!this.utilityModelManualOverride) {
-      const utilityModels = this.resolveUtilityModels(this.primaryModel, this.primaryPiModel, this.config.utilityModel);
-      this.resolvedUtilityModel = utilityModels.utilityModel;
-      this.resolvedUtilityPiModel = utilityModels.utilityPiModel;
-    }
-    (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
-    // Recompute effective context window (applies limit if set)
-    this._updateEffectiveContextWindow();
-    this.rebuildLoadSkillDescription();
-    // Update L1 cache-aware gating with the new provider's TTL.
-    this.compactionManager.setCacheInfo(
-      this.primaryModel.provider,
-      this._cacheRetention ?? 'none',
-      this.primaryModel.capabilities?.promptCaching,
-    );
+    this.models.setModel(model);
   }
 
   /**
@@ -3120,17 +3066,7 @@ export class AgentLoop {
    * @param model - The CortexModel to use as the utility model
    */
   setUtilityModel(model: CortexModel): void {
-    if (model.provider !== this.primaryModel.provider) {
-      throw new Error(
-        `Utility model provider "${model.provider}" does not match ` +
-        `primary model provider "${this.primaryModel.provider}". ` +
-        `The utility model must be from the same provider as the primary model.`,
-      );
-    }
-    this.resolvedUtilityModel = model;
-    this.resolvedUtilityPiModel = unwrapModel(model) as PiModel;
-    this.utilityModelManualOverride = true;
-    this.compactionManager.setUtilityModelContextWindow(model.contextWindow);
+    this.models.setUtilityModel(model);
   }
 
   /**
@@ -3138,22 +3074,14 @@ export class AgentLoop {
    * Clears any manual override set by setUtilityModel().
    */
   resetUtilityModel(): void {
-    this.utilityModelManualOverride = false;
-    const utilityModels = this.resolveUtilityModels(
-      this.primaryModel,
-      this.primaryPiModel,
-      this.config.utilityModel,
-    );
-    this.resolvedUtilityModel = utilityModels.utilityModel;
-    this.resolvedUtilityPiModel = utilityModels.utilityPiModel;
-    this.compactionManager.setUtilityModelContextWindow(utilityModels.utilityModel.contextWindow);
+    this.models.resetUtilityModel();
   }
 
   /**
    * Whether the utility model has been manually overridden.
    */
   isUtilityModelOverridden(): boolean {
-    return this.utilityModelManualOverride;
+    return this.models.isUtilityOverridden;
   }
 
   /**
@@ -3201,7 +3129,7 @@ export class AgentLoop {
    * @returns Capabilities object describing thinking support
    */
   async getModelThinkingCapabilities(): Promise<ModelThinkingCapabilities> {
-    return modelThinkingCapabilities(this.primaryPiModel);
+    return modelThinkingCapabilities(this.models.primaryPi);
   }
 
   /**
@@ -3231,9 +3159,7 @@ export class AgentLoop {
    * stream options for each provider request.
    */
   setCacheRetention(value: 'none' | 'short' | 'long'): void {
-    this._cacheRetention = value;
-    // Update L1 cache-aware gating with the new TTL.
-    this.compactionManager.setCacheInfo(this.primaryModel.provider, value, this.primaryModel.capabilities?.promptCaching);
+    this.models.setCacheRetention(value);
   }
 
   /**
@@ -3241,7 +3167,7 @@ export class AgentLoop {
    * Returns null if not yet resolved (pi-ai will use its own default).
    */
   getCacheRetention(): 'none' | 'short' | 'long' | null {
-    return this._cacheRetention;
+    return this.models.cacheRetention;
   }
 
   /**
@@ -3250,14 +3176,14 @@ export class AgentLoop {
    * Pass null to clear (the provider then generates its own per-request key).
    */
   setSessionId(value: string | null): void {
-    this._sessionId = value;
+    this.models.setSessionId(value);
   }
 
   /**
    * Get the current cache/session key, or null if unset.
    */
   getSessionId(): string | null {
-    return this._sessionId;
+    return this.models.sessionId;
   }
 
   /**
@@ -3924,19 +3850,7 @@ export class AgentLoop {
    * min(limit, contextWindow).
    */
   setContextWindow(contextWindow: number): void {
-    this.primaryPiModel = {
-      ...this.primaryPiModel,
-      contextWindow,
-    };
-    this.primaryModel = wrapModel(
-      this.primaryPiModel,
-      this.primaryModel.provider,
-      this.primaryModel.modelId,
-      contextWindow,
-    );
-    (this.agent.state as Record<string, unknown>)['model'] = this.primaryPiModel;
-    this._updateEffectiveContextWindow();
-    this.rebuildLoadSkillDescription();
+    this.models.setContextWindow(contextWindow);
   }
 
   /**
@@ -3946,17 +3860,14 @@ export class AgentLoop {
    * Pass null to remove the limit and use the model's full context window.
    */
   setContextWindowLimit(limit: number | null): void {
-    resolveContextBudget(this.primaryModel.contextWindow, limit);
-    this._contextWindowLimit = limit;
-    this._updateEffectiveContextWindow();
-    this.rebuildLoadSkillDescription();
+    this.models.setContextWindowLimit(limit);
   }
 
   /**
    * Get the raw user-configured context window limit (null = no limit).
    */
   get contextWindowLimit(): number | null {
-    return this._contextWindowLimit;
+    return this.models.contextWindowLimit;
   }
 
   /**
@@ -3971,46 +3882,6 @@ export class AgentLoop {
    */
   get modelContextWindow(): number {
     return this.compactionManager.modelContextWindow;
-  }
-
-  /**
-   * Recompute and apply the effective context window from the model
-   * and the user-configured limit.
-   */
-  private _updateEffectiveContextWindow(): void {
-    const budget = resolveContextBudget(this.primaryModel.contextWindow, this._contextWindowLimit);
-    // Hard overflow protection uses backend capacity. Proactive compaction uses
-    // the loop budget. Neither value changes the provider's runtime allocation.
-    this.compactionManager.setModelContextWindow(budget.capacity);
-    this.compactionManager.setContextWindow(budget.effective);
-    if (budget.adjustmentReason) {
-      this.warnContextWindowOverride(this._contextWindowLimit, budget.effective, budget.adjustmentReason);
-    }
-
-    // Set utility model context window for observational memory clamps
-    const utilityModel = this.getUtilityModel();
-    if (utilityModel) {
-      this.compactionManager.setUtilityModelContextWindow(utilityModel.contextWindow);
-    }
-  }
-
-  /**
-   * Report a budget clamped by backend capacity, once per distinct outcome.
-   */
-  private warnContextWindowOverride(
-    configured: number | null,
-    effective: number,
-    reason: string,
-  ): void {
-    if (configured === null || configured === effective) return;
-    const key = `${configured}:${effective}`;
-    if (this._warnedContextWindowOverride === key) return;
-    this._warnedContextWindowOverride = key;
-    this.logger.warn('configured contextWindowLimit is not the value in force', {
-      configured,
-      effective,
-      reason,
-    });
   }
 
   /**
@@ -4721,100 +4592,6 @@ export class AgentLoop {
     });
   }
 
-  private resolveModels(config: AgentLoopConfig): {
-    primaryModel: CortexModel;
-    primaryPiModel: PiModel;
-    utilityModel: CortexModel;
-    utilityPiModel: PiModel;
-  } {
-    const primaryModel = config.model;
-    const primaryPiModel = unwrapModel(primaryModel) as PiModel;
-    const { utilityModel, utilityPiModel } = this.resolveUtilityModels(
-      primaryModel,
-      primaryPiModel,
-      config.utilityModel,
-    );
-
-    return {
-      primaryModel,
-      primaryPiModel,
-      utilityModel,
-      utilityPiModel,
-    };
-  }
-
-  /**
-   * Resolve the utility model from the public CortexModel boundary.
-   * If 'default' or undefined, look up the provider default and preserve
-   * the raw provider-specific fields from the primary pi-ai model.
-   */
-  private inferDefaultUtilityModel(provider: string): PiModel | null {
-    const overrideModelId = UTILITY_MODEL_OVERRIDES[provider];
-    if (overrideModelId) {
-      try {
-        const overrideModel = (getPiModel as unknown as (provider: string, modelId: string) => unknown)(provider, overrideModelId);
-        if (overrideModel) return overrideModel as PiModel;
-      } catch {
-        return null;
-      }
-    }
-
-    try {
-      const models = (getPiModels as unknown as (provider: string) => PiModel[])(provider);
-      return inferUtilityModel(models as unknown as Array<Record<string, unknown>>) as PiModel | null;
-    } catch {
-      return null;
-    }
-  }
-
-  private resolveUtilityModels(
-    primaryModel: CortexModel,
-    primaryPiModel: PiModel,
-    utilityModelConfig?: CortexModel | 'default',
-  ): {
-    utilityModel: CortexModel;
-    utilityPiModel: PiModel;
-  } {
-    const primaryProvider = primaryModel.provider;
-
-    if (!utilityModelConfig || utilityModelConfig === 'default') {
-      const utilityPiModel = this.inferDefaultUtilityModel(primaryProvider);
-      if (!utilityPiModel) {
-        return {
-          utilityModel: primaryModel,
-          utilityPiModel: primaryPiModel,
-        };
-      }
-
-      const rawUtilityId = utilityPiModel['id'];
-      const rawUtilityName = utilityPiModel['name'];
-      const utilityModelId = typeof rawUtilityId === 'string' ? rawUtilityId : String(rawUtilityId ?? rawUtilityName);
-
-      return {
-        utilityPiModel,
-        utilityModel: wrapModel(
-          utilityPiModel,
-          primaryProvider,
-          utilityModelId,
-          utilityPiModel.contextWindow ?? primaryModel.contextWindow,
-        ),
-      };
-    }
-
-    if (utilityModelConfig.provider !== primaryProvider) {
-      throw new Error(
-        `Utility model provider "${utilityModelConfig.provider}" does not match ` +
-        `primary model provider "${primaryProvider}". ` +
-        `The utility model must be from the same provider as the primary model.`,
-      );
-    }
-
-    return {
-      utilityModel: utilityModelConfig,
-      utilityPiModel: unwrapModel(utilityModelConfig) as PiModel,
-    };
-  }
-
   // -----------------------------------------------------------------------
   // Private: Lifecycle helpers
   // -----------------------------------------------------------------------
@@ -5174,8 +4951,8 @@ export class AgentLoop {
 
   private buildAvailableSkillsSummary(): string {
     const effectiveContextWindow = this.compactionManager?.contextWindow ?? Math.min(
-      this.primaryModel.contextWindow,
-      this._contextWindowLimit ?? this.primaryModel.contextWindow,
+      this.models.primary.contextWindow,
+      this.models.contextWindowLimit ?? this.models.primary.contextWindow,
     );
     const maxTokens = Math.max(128, Math.floor(effectiveContextWindow * 0.02));
     return this.skillRegistry.getAvailableSkillsSummary(maxTokens);
@@ -6029,14 +5806,14 @@ export class AgentLoop {
     const childCortexConfig: AgentLoopConfig = {
       // Per-spawn model override; the child's utility model re-resolves from
       // this model's provider, so a fast-model spawn stays fast end to end.
-      model: params.model ?? this.primaryModel,
+      model: params.model ?? this.models.primary,
       workingDirectory: this.workingDirectory,
       workingTags: { enabled: this.workingTagsEnabled },
       budgetGuard: {
         maxTurns: childConfig.maxTurns,
         maxCost: childConfig.maxCost,
       },
-      contextWindowLimit: this._contextWindowLimit,
+      contextWindowLimit: this.models.contextWindowLimit,
       // Each sub-agent is its own logical session for prefix-cache routing.
       sessionId: params.taskId,
       // The child's identity extends this loop's path, so its asks, errors,
