@@ -118,11 +118,12 @@ export function assembleSessionParts(
       voiceToTalker: (content, causeTag) => {
         parts.router.stampReservedLane();
         parts.digestion.preempt();
-        talker.deliver(content, { wake: true, causeTag });
+        return talker.deliver(content, { wake: true, causeTag }).deliveryId;
       },
       currentTalkerCauseTags: () => causation.tags('conversation'),
       talkerLoopPath: talker.loopPath,
-      dropParkedDeliveries: (matches) => talker.dropPendingWakeDeliveries(matches),
+      dropParkedDeliveries: (matches) =>
+        talker.dropPendingWakeDeliveries((_content, delivery) => matches(delivery.id)),
       logger,
     },
     {
@@ -302,7 +303,7 @@ function wire(
     // the broker still counts as read out: it withdraws the consent anchor
     // and reads it again (D16 anchor rules).
     if (result.kind === 'wake_delivery') {
-      broker.voicing.noteDestroyed(result.message);
+      broker.voicing.noteDestroyed(result.deliveryId);
     }
   });
 

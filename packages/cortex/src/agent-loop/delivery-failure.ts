@@ -85,6 +85,17 @@ export function partitionExhausted<T extends DeliveryAttempts>(
   return { retry, exhausted };
 }
 
+/** A loop-owned delivery, as its dead-letter entry identifies it. */
+interface LoopOwnedDelivery {
+  id: string;
+  content: string;
+  causeTag?: unknown;
+}
+
+function handleOf(item: LoopOwnedDelivery): { deliveryId: string; causeTag?: unknown } {
+  return { deliveryId: item.id, ...(item.causeTag !== undefined ? { causeTag: item.causeTag } : {}) };
+}
+
 /** Dead-lettered completions retained for consumer inspection. */
 const DEFAULT_DEAD_LETTER_CAP = 50;
 
@@ -124,7 +135,7 @@ export class DeadLetterStore {
   }
 
   /** One entry per dropped wake delivery, so a reply-less utterance has an explanation. */
-  recordWake(dropped: ReadonlyArray<{ content: string } & DeliveryAttempts>, lastError: string): void {
+  recordWake(dropped: ReadonlyArray<LoopOwnedDelivery & DeliveryAttempts>, lastError: string): void {
     for (const item of dropped) {
       this.record({
         kind: 'wake_delivery',
@@ -133,12 +144,13 @@ export class DeadLetterStore {
         lastError,
         deadLetteredAt: Date.now(),
         message: item.content,
+        ...handleOf(item),
       });
     }
   }
 
   /** One entry per silent delivery a teardown dropped before any prompt took it. */
-  recordSilent(dropped: ReadonlyArray<{ content: string }>, lastError: string): void {
+  recordSilent(dropped: ReadonlyArray<LoopOwnedDelivery>, lastError: string): void {
     for (const item of dropped) {
       this.record({
         kind: 'silent_delivery',
@@ -147,6 +159,7 @@ export class DeadLetterStore {
         lastError,
         deadLetteredAt: Date.now(),
         message: item.content,
+        ...handleOf(item),
       });
     }
   }

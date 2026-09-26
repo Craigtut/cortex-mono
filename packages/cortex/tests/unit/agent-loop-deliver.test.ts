@@ -1224,6 +1224,66 @@ describe('AgentLoop.deliver cause tags', () => {
   });
 });
 
+describe('AgentLoop.deliver handles', () => {
+  it('returns a stable id on every branch, and honors a supplied one', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const silent = loop.deliver('later', { wake: false });
+    const prompted = loop.deliver('now');
+    const parked = loop.deliver('next', { deliveryId: 'mine' });
+    expect(silent.deliveryId).toEqual(expect.any(String));
+    expect(prompted.deliveryId).toEqual(expect.any(String));
+    expect(new Set([silent.deliveryId, prompted.deliveryId]).size).toBe(2);
+    expect(parked).toMatchObject({ outcome: 'parked', deliveryId: 'mine' });
+    await prompted.turn;
+    await waitUntil(() => !loop.isLoopActive);
+  });
+
+  it('shows the retraction predicate each parked delivery handle', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    const keep = loop.deliver('same words', { causeTag: 'user' });
+    const drop = loop.deliver('same words', { causeTag: 'voicing' });
+
+    const seen: Array<{ id: string; causeTag?: unknown }> = [];
+    const dropped = loop.dropPendingWakeDeliveries((_content, delivery) => {
+      seen.push({ id: delivery.id, causeTag: delivery.causeTag });
+      return delivery.id === drop.deliveryId;
+    });
+    expect(dropped).toEqual(['same words']);
+    expect(seen).toEqual(expect.arrayContaining([
+      { id: keep.deliveryId, causeTag: 'user' },
+      { id: drop.deliveryId, causeTag: 'voicing' },
+    ]));
+    expect(loop.pendingWakeDeliveryCount).toBe(1);
+
+    piAgent.releaseRun();
+    await turn;
+    await waitUntil(() => !loop.isLoopActive);
+  });
+
+  it('dead-letters a wake delivery with its handle and cause tag', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const deadLettered = vi.fn();
+    loop.onBackgroundResultDeadLettered(deadLettered);
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    const { deliveryId } = loop.deliver('cancelled with the turn', { causeTag: { seq: 4 } });
+
+    await loop.abort();
+    await turn.catch(() => {});
+    await waitUntil(() => !loop.isLoopActive);
+    expect(deadLettered.mock.calls[0]![0]).toMatchObject({
+      kind: 'wake_delivery', deliveryId, causeTag: { seq: 4 },
+    });
+  });
+});
+
 describe('AgentLoop follow-up and queue surfaces', () => {
   it('followUp forwards to pi follow-up queue', () => {
     const piAgent = createMockPiAgent();

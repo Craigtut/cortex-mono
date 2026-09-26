@@ -35,7 +35,7 @@ interface Harness {
   broker: PermissionBroker;
   log: Array<RouterLogInput & { seq: number }>;
   talkerDeliveries: Array<{ content: string; wake: boolean }>;
-  askVoicings: Array<{ content: string; causeTag: CauseTag }>;
+  askVoicings: Array<{ content: string; causeTag: CauseTag; deliveryId: string }>;
   setTalkerCauseTags: (tags: readonly CauseTag[]) => void;
   /**
    * Feed the talker's raw (unvalidated) cause-tag slot, exactly as the loop
@@ -58,7 +58,7 @@ function createHarness(options?: DuplexRouterOptions): Harness {
   const dispatchedCauseSeqs: number[] = [];
   const log: Array<RouterLogInput & { seq: number }> = [];
   const talkerDeliveries: Array<{ content: string; wake: boolean }> = [];
-  const askVoicings: Array<{ content: string; causeTag: CauseTag }> = [];
+  const askVoicings: Array<{ content: string; causeTag: CauseTag; deliveryId: string }> = [];
   let nextSeq = 1;
   let voicingFails = false;
 
@@ -70,7 +70,9 @@ function createHarness(options?: DuplexRouterOptions): Harness {
     deliverToTalker: (content, wake) => talkerDeliveries.push({ content, wake }),
     voiceAskToTalker: (content, causeTag) => {
       if (voicingFails) throw new Error('talker is shutting down');
-      askVoicings.push({ content, causeTag });
+      const deliveryId = `voicing-${askVoicings.length + 1}`;
+      askVoicings.push({ content, causeTag, deliveryId });
+      return deliveryId;
     },
     talkerIdle: () => true,
     dispatchToReasoner: (_message, causeSeq) => {
@@ -390,7 +392,7 @@ describe('unheard voicings', () => {
     const h = createHarness();
     const { decisions } = requestAsk(h);
     const firstAnchor = h.lastVoicedSeq();
-    const voicing = h.askVoicings[0]!.content;
+    const voicing = h.askVoicings[0]!.deliveryId;
 
     expect(h.broker.voicing.noteDestroyed(voicing)).toBe(true);
     expect(h.askVoicings).toHaveLength(2);
@@ -413,8 +415,8 @@ describe('unheard voicings', () => {
     const h = createHarness();
     requestAsk(h);
     const anchor = h.lastVoicedSeq();
-    expect(h.broker.voicing.noteDestroyed('<background-update>\nbuild done\n</background-update>'))
-      .toBe(false);
+    expect(h.broker.voicing.noteDestroyed('some-other-delivery')).toBe(false);
+    expect(h.broker.voicing.noteDestroyed(undefined)).toBe(false);
     expect(h.askVoicings).toHaveLength(1);
     expect(h.lastVoicedSeq()).toBe(anchor);
   });

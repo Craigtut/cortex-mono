@@ -68,7 +68,7 @@ import type { LoopParts } from './agent-loop/assembly.js';
 import { CHILD_SEED_CONTEXT_SLOT, prepareChildLoop } from './agent-loop/child-loop-config.js';
 import type { ChildLoopParams } from './agent-loop/child-loop-config.js';
 import type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
-import type { DeliverOptions, DeliverResult } from './agent-loop/delivery-queues.js';
+import type { DeliverOptions, DeliverResult, PendingWakeDelivery } from './agent-loop/api/delivery.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { mirrorChildPermissionResolver } from './agent-loop/permissions.js';
 import {
@@ -90,7 +90,12 @@ import { isAbortShapedError } from './agent-loop/run-control.js';
 
 export type { PiAgent, PiModel, QueueDrainMode } from './agent-loop/pi-agent.js';
 export type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
-export type { DeliverOptions, DeliverOutcome, DeliverResult } from './agent-loop/delivery-queues.js';
+export type {
+  DeliverOptions,
+  DeliverOutcome,
+  DeliverResult,
+  PendingWakeDelivery,
+} from './agent-loop/api/delivery.js';
 export type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
 export { TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop/pi-hooks.js';
 export type {
@@ -331,7 +336,9 @@ export class AgentLoop implements
   // -----------------------------------------------------------------------
 
   steer(message: string): void { this.parts.queues.steer(message); }
-  deliver(content: string, options?: DeliverOptions): DeliverResult { return this.parts.queues.deliver(content, options); }
+  deliver(content: string, options?: DeliverOptions): DeliverResult & { readonly deliveryId: string } {
+    return this.parts.queues.deliver(content, options);
+  }
   followUp(message: string): void { this.parts.queues.followUp(message); }
   setSteeringQueueMode(mode: QueueDrainMode): void { this.parts.queues.setSteeringQueueMode(mode); }
   setFollowUpQueueMode(mode: QueueDrainMode): void { this.parts.queues.setFollowUpQueueMode(mode); }
@@ -342,7 +349,7 @@ export class AgentLoop implements
   get pendingWakeDeliveryCount(): number { return this.parts.queues.wakeCount; }
   clearQueuedDeliveries(): string[] { return this.parts.queues.clearSilent(); }
   getQueuedDeliveries(): string[] { return this.parts.queues.silentContents(); }
-  dropPendingWakeDeliveries(predicate: (content: string) => boolean): string[] {
+  dropPendingWakeDeliveries(predicate: (content: string, delivery: PendingWakeDelivery) => boolean): string[] {
     return this.parts.queues.dropWake(predicate);
   }
   getPendingAsks(): PendingAsk[] { return this.parts.asks.list(); }

@@ -111,8 +111,12 @@ export function makeTestRouterPorts(
  * "nothing parked", since these harnesses have no talker queue.
  */
 export interface TestVoicingPorts {
-  voiceAskToTalker(content: string, causeTag: CauseTag): void;
-  dropParkedDeliveries?(matches: (content: string) => boolean): string[];
+  /**
+   * Returns the talker delivery id the voicing got; a harness that does not
+   * care returns nothing (or anything else) and gets a minted one.
+   */
+  voiceAskToTalker(content: string, causeTag: CauseTag): unknown;
+  dropParkedDeliveries?(matches: (deliveryId: string) => boolean): string[];
 }
 
 /**
@@ -134,6 +138,7 @@ export function makeTestRouter(
   const voiceAskToTalker = voiceDescriptor?.value as TestVoicingPorts['voiceAskToTalker'] | undefined;
   const dropParked = dropDescriptor?.value as TestVoicingPorts['dropParkedDeliveries'] | undefined;
   const brokerRef: { broker: PermissionBroker | null } = { broker: null };
+  let mintedVoicings = 0;
   const ports = makeTestRouterPorts({
     answerAsk: (askId, decision, reason) => brokerRef.broker!.answer(askId, decision, reason),
   });
@@ -156,7 +161,9 @@ export function makeTestRouter(
       if (!voiceAskToTalker) {
         throw new Error('test broker port "voiceAskToTalker" was called but this harness did not stub it.');
       }
-      voiceAskToTalker(content, causeTag);
+      const deliveryId = voiceAskToTalker(content, causeTag);
+      mintedVoicings += 1;
+      return typeof deliveryId === 'string' ? deliveryId : `test-voicing-${mintedVoicings}`;
     },
     currentTalkerCauseTags: () => ports.currentTalkerCauseTags(),
     talkerLoopPath: ports.talkerLoopPath ?? 'talker',

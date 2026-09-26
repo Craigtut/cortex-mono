@@ -120,9 +120,10 @@ export interface PermissionBrokerPorts {
    * Wake-deliver an ask voicing to the talker, carrying its ask-kind cause
    * tag. This is the reserved ask lane (communication.md): it must bypass
    * the delivery token bucket, dedup, and queues, because the loop that
-   * raised the ask blocks for as long as the voicing is delayed.
+   * raised the ask blocks for as long as the voicing is delayed. Returns the
+   * talker's delivery id for it.
    */
-  voiceToTalker(content: string, causeTag: CauseTag): void;
+  voiceToTalker(content: string, causeTag: CauseTag): string;
   /**
    * The FULL discriminated cause set of the talker's live run. The set
    * carries no ordering guarantee; the consent check scans all of it.
@@ -131,10 +132,10 @@ export interface PermissionBrokerPorts {
   /** Loop path the voicing's own lifecycle entries are filed under. */
   talkerLoopPath: string;
   /**
-   * Remove the talker's parked wake deliveries whose content matches;
-   * returns what was removed (moot voicings, see AskVoicing.retractParked).
+   * Remove the talker's parked wake deliveries whose delivery id matches;
+   * returns the removed content (moot voicings, see AskVoicing.retractParked).
    */
-  dropParkedDeliveries(matches: (content: string) => boolean): string[];
+  dropParkedDeliveries(matches: (deliveryId: string) => boolean): string[];
   logger?: CortexLogger;
 }
 

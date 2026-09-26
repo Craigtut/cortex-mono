@@ -6,8 +6,84 @@
  */
 
 import type { PendingAsk } from '../../types.js';
-import type { DeliverOptions, DeliverResult } from '../delivery-queues.js';
+import type { DirectCompletionOptions } from '../direct-completion.js';
 import type { QueueDrainMode } from '../pi-agent.js';
+
+/** Options for {@link AgentLoop.deliver}. */
+export interface DeliverOptions {
+  /**
+   * Whether the delivery may wake an idle loop by starting a turn. Default
+   * true. When false, the content is queued on the AgentLoop and flushed
+   * into the next real prompt's message batch; it never starts a run.
+   */
+  wake?: boolean;
+  /**
+   * Options for the turn this delivery starts on an idle loop ('prompted'
+   * only). Parked and queued content rides a later run whose options belong
+   * to that run's initiator, so these are ignored there.
+   */
+  promptOptions?: DirectCompletionOptions;
+  /**
+   * Opaque causation tag that travels with the content: exposed through
+   * {@link AgentLoop.activeRunCauseTags} for exactly the run that consumes
+   * this delivery (the turn it starts, the prompt batch it rides, or the
+   * sweep run). Bound to the content, so a parked delivery keeps its
+   * causation and a later run never inherits a previous run's tag. Wake
+   * deliveries only.
+   */
+  causeTag?: unknown;
+  /**
+   * Let a run already in flight take this wake delivery at its next turn
+   * boundary instead of waiting for the next run. For content that
+   * redirects the live run's work (a steer, a stop).
+   *
+   * The content is handed over only at the turn_end of a live, non-failed
+   * turn while pi's queues are empty. Otherwise (no live run, backoff,
+   * digestion, a failed turn, steer() content queued, an ordinary delivery
+   * parked ahead) it stays parked for the next run. Wake deliveries only.
+   */
+  atTurnBoundary?: boolean;
+  /**
+   * The handle this delivery is known by (DeliverResult.deliveryId, and the
+   * `id` a dead-letter entry or a dropPendingWakeDeliveries predicate sees).
+   * Supply one to correlate before the call returns; otherwise the loop
+   * mints a unique one. Uniqueness of a supplied id is the caller's.
+   */
+  deliveryId?: string;
+}
+
+/** Which branch of the deliver() state machine handled a delivery. */
+export type DeliverOutcome = 'prompted' | 'parked' | 'queued';
+
+/** Result of {@link AgentLoop.deliver}. */
+export interface DeliverResult {
+  outcome: DeliverOutcome;
+  /**
+   * Present only for 'prompted': the promise prompt() would return. A
+   * 'parked' delivery opens the next run (a queued prompt's batch or the
+   * sweep run), whose failures surface through onError. A 'queued' delivery
+   * has no turn until the next real prompt flushes it.
+   */
+  turn?: Promise<unknown>;
+  /**
+   * The delivery's stable handle (see DeliverOptions.deliveryId): a
+   * dead-letter entry for this content, and the parked delivery a
+   * dropPendingWakeDeliveries predicate is shown, carry the same id, so a
+   * producer recognizes its own content by identity rather than by text.
+   * Always set by AgentLoop.deliver; absent only where a facade absorbed the
+   * content without handing it to a loop.
+   */
+  deliveryId?: string;
+}
+
+/** A parked wake delivery, as dropPendingWakeDeliveries shows it. */
+export interface PendingWakeDelivery {
+  readonly id: string;
+  readonly content: string;
+  /** Its DeliverOptions.causeTag, when it has one. */
+  readonly causeTag?: unknown;
+}
+
 
 export interface LoopDeliveryApi {
   /**
@@ -48,7 +124,7 @@ export interface LoopDeliveryApi {
    * @param content - Non-whitespace message content (user role)
    * @param options - Wake behavior; default wakes an idle loop
    */
-  deliver(content: string, options?: DeliverOptions): DeliverResult;
+  deliver(content: string, options?: DeliverOptions): DeliverResult & { readonly deliveryId: string };
 
   /**
    * Queue a follow-up message on pi's follow-up queue. Unlike steer(), which
@@ -104,9 +180,11 @@ export interface LoopDeliveryApi {
   getQueuedDeliveries(): string[];
 
   /**
-   * Retract parked wake deliveries whose content matches `predicate`,
-   * returning the dropped content in queue order. Silent deliveries and pi's
-   * queues are untouched.
+   * Retract parked wake deliveries `predicate` matches, returning the
+   * dropped content in queue order. The predicate sees each delivery's
+   * content and its handle ({@link PendingWakeDelivery}: id and cause tag),
+   * so a producer can match its own deliveries by the id deliver()
+   * returned. Silent deliveries and pi's queues are untouched.
    *
    * Use this instead of {@link clearAllQueues} plus re-delivery to retract
    * one class of parked content (say, voicings of an already-settled ask):
@@ -116,7 +194,9 @@ export interface LoopDeliveryApi {
    * Nothing is dead-lettered: the drop is the caller's deliberate decision,
    * not a delivery failure.
    */
-  dropPendingWakeDeliveries(predicate: (content: string) => boolean): string[];
+  dropPendingWakeDeliveries(
+    predicate: (content: string, delivery: PendingWakeDelivery) => boolean,
+  ): string[];
 
   /**
    * Snapshot of permission asks currently blocked on a resolver decision,

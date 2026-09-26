@@ -34,6 +34,7 @@ import type { AgentMessage } from '../../src/context-manager.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
 import type { NetworkAccessRequest } from '../../src/sandbox/types.js';
 import type { CortexLogger } from '../../src/types.js';
+import { partsOf } from './agent-loop/parts.js';
 
 afterEach(async () => {
   await destroyLiveFacades();
@@ -810,5 +811,33 @@ describe('duplex abort and parked ask voicings', () => {
     const sweep = promptTexts(talkerPi).join('\n');
     expect(sweep).toContain('actually, also check the logs');
     expect(sweep).not.toContain('<permission-request');
+  });
+
+  it('tells its own voicing from other parked content with the same text', async () => {
+    const { facade, talkerLoop, talkerPi } = await createRealDuplexScenario(ASKING_NETWORK);
+    const resolver = facade.getNetworkAccessResolver();
+    if (!resolver) throw new Error('duplex did not wire a network resolver');
+
+    talkerPi.hold = true;
+    const spoken = facade.prompt('kick something off');
+    await waitUntil(() => talkerPi.promptCalls.length === 1, 2000, 'talker busy');
+    const blocked = resolver(EGRESS);
+    await waitUntil(() => talkerLoop.pendingWakeDeliveryCount === 1, 2000, 'voicing parked');
+
+    // Another producer parks content that happens to read exactly like it.
+    const voicingText = partsOf(talkerLoop).queues.wake[0]!.content;
+    facade.deliver(voicingText, { speaker: 'user' });
+    expect(talkerLoop.pendingWakeDeliveryCount).toBe(2);
+    expect(partsOf(talkerLoop).queues.wake[1]!.content).toBe(voicingText);
+
+    await facade.abort('work');
+    expect(await blocked).toEqual({ decision: 'deny' });
+    // Only the session's own delivery went; the look-alike stays parked.
+    expect(talkerLoop.pendingWakeDeliveryCount).toBe(1);
+    expect(lifecycleEvents(facade, 'ask_voicing_dropped')).toHaveLength(1);
+
+    talkerPi.releaseRun();
+    await spoken;
+    await waitUntil(() => facade.conversationIdle, 2000, 'talker idle');
   });
 });

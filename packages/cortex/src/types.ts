@@ -1641,6 +1641,15 @@ export interface DeadLetteredBackgroundResult {
   deadLetteredAt: number;
   /** The formatted delivery message that never reached the loop. */
   message: string;
+  /**
+   * Loop-owned deliveries only: the handle deliver() returned for this
+   * content (DeliverResult.deliveryId). Content pi drained inside a failed
+   * run and the loop re-parked has an id the loop minted, which no caller
+   * saw. Absent for background completions.
+   */
+  deliveryId?: string;
+  /** Loop-owned deliveries only: the DeliverOptions.causeTag it carried. */
+  causeTag?: unknown;
 }
 
 /**

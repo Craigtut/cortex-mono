@@ -5,8 +5,9 @@
  * Exactly one ask is voiced at a time; the rest queue behind it. For each
  * ask this owns the consent anchor (the `ask_voiced` entry a qualifying
  * utterance must follow) and the sticky "was ever voiced" flag. For the
- * conversation surface it owns the ledger of voicing texts handed to the
- * talker, which is how a destroyed delivery is recognized as a lost voicing
+ * conversation surface it owns the ledger of voicing deliveries handed to
+ * the talker, by delivery id, which is how a destroyed delivery is
+ * recognized as a lost voicing
  * and how a voicing parked behind a busy talker is found and retracted once
  * its ask is gone, and the hold a conversation abort puts on reading a
  * request out. The broker owns the asks and their settlement; it asks this
@@ -45,9 +46,9 @@ const REVOICE_MIN_INTERVAL_MS = 3_000;
 const MAX_REVOICES_PER_ASK = 2;
 
 /**
- * Cap on the voicing-text ledger. It exists only to recognize the session's
- * own voicings among the talker's PARKED deliveries, which a run drains at
- * the next turn, so the live window is a handful at most. An evicted text
+ * Cap on the voicing ledger. It exists only to recognize the session's own
+ * voicings among the talker's PARKED deliveries, which a run drains at the
+ * next turn, so the live window is a handful at most. An evicted entry
  * degrades to "not recognized as a voicing", which leaves a moot request
  * readable rather than dropping something else: the safe direction for a
  * bounded cache to fail in.
@@ -92,16 +93,17 @@ export interface AskVoicingPorts {
   appendLog(input: BrokerLogInput): number;
   /**
    * Wake-deliver a voicing to the talker through the reserved ask lane,
-   * carrying its ask-kind cause tag. A throw means nothing reached the user.
+   * carrying its ask-kind cause tag; returns the talker's delivery id. A
+   * throw means nothing reached the user.
    */
-  voiceToTalker(content: string, causeTag: CauseTag): void;
+  voiceToTalker(content: string, causeTag: CauseTag): string;
   /** Loop path the voicing's own lifecycle entries are filed under. */
   talkerLoopPath: string;
   /**
-   * Remove the talker's parked wake deliveries whose content matches;
-   * returns what was removed.
+   * Remove the talker's parked wake deliveries whose delivery id matches;
+   * returns the removed content.
    */
-  dropParked(matches: (content: string) => boolean): string[];
+  dropParked(matches: (deliveryId: string) => boolean): string[];
 }
 
 export interface AskVoicingOptions {
@@ -126,9 +128,8 @@ export class AskVoicing {
   /** Re-entrancy guard for lost-voicing recovery (see noteLost). */
   private revoicingLostVoicing = false;
   /**
-   * Voicing texts handed to the talker and the ask each voices, FIFO and
-   * bounded (Maps iterate in insertion order). Keyed by exact text because
-   * the loop's surfaces carry no delivery id.
+   * Voicing deliveries handed to the talker, by delivery id, and the ask
+   * each voices; FIFO and bounded (Maps iterate in insertion order).
    */
   private readonly ledger = new Map<string, string>();
   /**
@@ -252,15 +253,15 @@ export class AskVoicing {
   }
 
   /**
-   * Destroyed delivery content reported by the loop's dead-letter surface.
-   * The surface carries no delivery id, so correlation is by exact content:
-   * a dropped wake delivery whose text is the voicing we handed over IS
-   * that voicing. Anything else is another producer's content and is
-   * ignored. Returns whether it matched the current voicing.
+   * A talker delivery was destroyed (the loop's dead-letter surface reports
+   * its id). If it is the current voicing, the user never heard it; any
+   * other delivery is another producer's content and is ignored. Returns
+   * whether it matched the current voicing.
    */
-  noteDestroyed(content: string): boolean {
-    if (this.voicedAskId === null || this.ledger.get(content) !== this.voicedAskId) return false;
-    this.ledger.delete(content);
+  noteDestroyed(deliveryId: string | undefined): boolean {
+    if (deliveryId === undefined) return false;
+    if (this.voicedAskId === null || this.ledger.get(deliveryId) !== this.voicedAskId) return false;
+    this.ledger.delete(deliveryId);
     return this.noteLost();
   }
 
@@ -312,13 +313,13 @@ export class AskVoicing {
 
   /**
    * Retract voicings still parked on the talker after their asks were
-   * settled wholesale. Only the session's own voicing texts are matched, so
-   * a parked user utterance (and the cause tag that makes it able to grant
-   * consent) is left exactly where it is.
+   * settled wholesale. Only the session's own voicing deliveries are
+   * matched, by id, so a parked user utterance (and the cause tag that makes
+   * it able to grant consent) is left exactly where it is, whatever it says.
    */
   retractParked(reason: 'abort' | 'restore'): void {
     if (this.ledger.size === 0) return;
-    const dropped = this.ports.dropParked((content) => this.ledger.has(content));
+    const dropped = this.ports.dropParked((deliveryId) => this.ledger.has(deliveryId));
     // Every ask is gone, so every remembered voicing is moot whether or not
     // it was still parked.
     this.ledger.clear();
@@ -431,8 +432,9 @@ export class AskVoicing {
       kind: ask.kind,
       revoiced,
     });
+    let deliveryId: string;
     try {
-      this.ports.voiceToTalker(text, { kind: 'ask', seq: ask.entrySeq });
+      deliveryId = this.ports.voiceToTalker(text, { kind: 'ask', seq: ask.entrySeq });
     } catch (err) {
       // Nothing reached the user, so nothing about this voicing may stand.
       // Withdrawing the anchor is what keeps an unheard request out of
@@ -447,15 +449,14 @@ export class AskVoicing {
       return false;
     }
     if (anchoring) record.voicedAtSeq = anchorSeq;
-    this.remember(text, ask.askId);
+    this.remember(deliveryId, ask.askId);
     // A voicing reached the talker, so nothing is being held any more.
     this.held = false;
     return true;
   }
 
-  private remember(text: string, askId: string): void {
-    this.ledger.delete(text);
-    this.ledger.set(text, askId);
+  private remember(deliveryId: string, askId: string): void {
+    this.ledger.set(deliveryId, askId);
     while (this.ledger.size > MAX_LEDGER_ENTRIES) {
       const oldest = this.ledger.keys().next().value;
       if (oldest === undefined) break;

@@ -24,60 +24,12 @@ import type { DirectCompletionOptions } from './direct-completion.js';
 import type { PiAgent, QueueDrainMode } from './pi-agent.js';
 import type { AbortState, LoopGate } from './run-control.js';
 import { unwindFailedDelivery, unwindSplicedBatch } from './transcript-repair.js';
-
-/** Options for {@link AgentLoop.deliver}. */
-export interface DeliverOptions {
-  /**
-   * Whether the delivery may wake an idle loop by starting a turn. Default
-   * true. When false, the content is queued on the AgentLoop and flushed
-   * into the next real prompt's message batch; it never starts a run.
-   */
-  wake?: boolean;
-  /**
-   * Options for the turn this delivery starts on an idle loop ('prompted'
-   * only). Parked and queued content rides a later run whose options belong
-   * to that run's initiator, so these are ignored there.
-   */
-  promptOptions?: DirectCompletionOptions;
-  /**
-   * Opaque causation tag that travels with the content: exposed through
-   * {@link AgentLoop.activeRunCauseTags} for exactly the run that consumes
-   * this delivery (the turn it starts, the prompt batch it rides, or the
-   * sweep run). Bound to the content, so a parked delivery keeps its
-   * causation and a later run never inherits a previous run's tag. Wake
-   * deliveries only.
-   */
-  causeTag?: unknown;
-  /**
-   * Let a run already in flight take this wake delivery at its next turn
-   * boundary instead of waiting for the next run. For content that
-   * redirects the live run's work (a steer, a stop).
-   *
-   * The content is handed over only at the turn_end of a live, non-failed
-   * turn while pi's queues are empty. Otherwise (no live run, backoff,
-   * digestion, a failed turn, steer() content queued, an ordinary delivery
-   * parked ahead) it stays parked for the next run. Wake deliveries only.
-   */
-  atTurnBoundary?: boolean;
-}
-
-/** Which branch of the deliver() state machine handled a delivery. */
-export type DeliverOutcome = 'prompted' | 'parked' | 'queued';
-
-/** Result of {@link AgentLoop.deliver}. */
-export interface DeliverResult {
-  outcome: DeliverOutcome;
-  /**
-   * Present only for 'prompted': the promise prompt() would return. A
-   * 'parked' delivery opens the next run (a queued prompt's batch or the
-   * sweep run), whose failures surface through onError. A 'queued' delivery
-   * has no turn until the next real prompt flushes it.
-   */
-  turn?: Promise<unknown>;
-}
+import type { DeliverOptions, DeliverResult, PendingWakeDelivery } from './api/delivery.js';
 
 /** A delivery held on a loop-owned queue until a run consumes it. */
 export interface QueuedDelivery {
+  /** The delivery's handle (DeliverResult.deliveryId). */
+  id: string;
   content: string;
   timestamp: number;
   /** Failed delivery-run attempts so far (wake parking only). */
@@ -140,7 +92,7 @@ export class DeliveryQueues {
   }
 
   /** See AgentLoop.deliver: the silent / parked / prompted state machine. */
-  deliver(content: string, options?: DeliverOptions): DeliverResult {
+  deliver(content: string, options?: DeliverOptions): DeliverResult & { deliveryId: string } {
     this.ports.assertNotShuttingDown();
     if (typeof content !== 'string' || content.trim().length === 0) {
       // Provider conversion drops whitespace-only content. Fail loudly.
@@ -155,20 +107,22 @@ export class DeliveryQueues {
       );
     }
     const wake = options?.wake ?? true;
+    const deliveryId = options?.deliveryId ?? crypto.randomUUID();
 
     if (!wake) {
       // Queued in every run state: steered into a live run it would surface
       // at the next tool batch as an unprompted response.
-      this.silent.push({ content, timestamp: Date.now() });
+      this.silent.push({ id: deliveryId, content, timestamp: Date.now() });
       this.ports.logger.debug('silent delivery queued', {
         queued: this.silent.length,
       });
-      return { outcome: 'queued' };
+      return { outcome: 'queued', deliveryId };
     }
 
     if (this.ports.gate.isActive) {
       // Gate held, with or without a live run. The sweep guarantees a run.
       this.wake.push({
+        id: deliveryId,
         content,
         timestamp: Date.now(),
         abortEpoch: this.ports.abort.epoch,
@@ -179,7 +133,7 @@ export class DeliveryQueues {
       this.ports.logger.debug('wake delivery parked for the next run', {
         parked: this.wake.length,
       });
-      return { outcome: 'parked' };
+      return { outcome: 'parked', deliveryId };
     }
 
     // The gate is empty in this frame, so the run prompt() enqueues is the
@@ -191,7 +145,7 @@ export class DeliveryQueues {
         error: errorMessageOf(err),
       });
     });
-    return { outcome: 'prompted', turn };
+    return { outcome: 'prompted', turn, deliveryId };
   }
 
   /**
@@ -414,6 +368,8 @@ export class DeliveryQueues {
       // Content pi injected inside the failed run opens the next run.
       for (const content of unwind.injectedUserTexts) {
         this.wake.push({
+          // Content pi drained, not a deliver() call: a handle of its own.
+          id: crypto.randomUUID(),
           content,
           timestamp: Date.now(),
           // The run's start epoch: read now, it could already be past an
@@ -492,10 +448,16 @@ export class DeliveryQueues {
   }
 
   /** Retract parked wake deliveries matching `predicate` (see AgentLoop.dropPendingWakeDeliveries). */
-  dropWake(predicate: (content: string) => boolean): string[] {
+  dropWake(predicate: (content: string, delivery: PendingWakeDelivery) => boolean): string[] {
     const dropped: string[] = [];
     for (let i = this.wake.length - 1; i >= 0; i--) {
-      if (predicate(this.wake[i]!.content)) dropped.unshift(this.wake.splice(i, 1)[0]!.content);
+      const item = this.wake[i]!;
+      const delivery: PendingWakeDelivery = {
+        id: item.id,
+        content: item.content,
+        ...(item.causeTag !== undefined ? { causeTag: item.causeTag } : {}),
+      };
+      if (predicate(item.content, delivery)) dropped.unshift(this.wake.splice(i, 1)[0]!.content);
     }
     return dropped;
   }
