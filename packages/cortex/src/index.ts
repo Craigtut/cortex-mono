@@ -189,6 +189,7 @@ export type {
   CortexAgentPersistedState,
   CortexAgentUsageBreakdown,
 } from './cortex-agent.js';
+export type { DuplexRouterState } from './duplex/router.js';
 
 // Resolution report (what a CortexAgent assembly resolved to, where that
 // differs from what the consumer asked for)

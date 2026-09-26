@@ -126,6 +126,7 @@ The persisted artifact becomes a versioned composite:
   talkerMemory:     {...},          // observational state, order-coupled to its history
   reasonerMemory:   {...},
   usage:            {...},          // single aggregate; restore is idempotent, not additive
+  router:           {...},          // optional: alias counter, tasks, held results, pending deltas
 }
 ```
 
@@ -136,7 +137,7 @@ Rules carried over from the audits:
 - Usage restore stops being additive so a composite restore cannot double-count.
 - A version-1 artifact (today's single history) restores into the reasoner with an empty talker and a log synthesized from nothing; sessions upgrade transparently.
 
-Sub-agent state remains non-persistent (tasks are re-derivable from the log's directive/lifecycle entries; resumable tasks are out of scope for launch).
+Sub-agent state remains non-persistent (tasks are re-derivable from the log's directive/lifecycle entries; resumable tasks are out of scope for launch). The router's session state is persisted (`router`, optional so earlier artifacts still restore): the task alias counter, the tracked tasks, results logged but not yet handed to the talker, and conversation deltas the reasoner has not seen. Tasks still outstanding at restore are reported as interrupted, not resumed.
 
 ## What Consumers Should Notice
 

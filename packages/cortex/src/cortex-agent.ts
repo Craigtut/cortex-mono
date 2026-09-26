@@ -98,7 +98,12 @@ import type { ResolutionNote, ResolutionNoteCode } from './resolution-report.js'
 import { stripWorkingTags, WorkingTagStreamFilter } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
-import type { DuplexRouterOptions, DuplexRouterPorts, ReasonerDispatchOptions } from './duplex/router.js';
+import type {
+  DuplexRouterOptions,
+  DuplexRouterPorts,
+  DuplexRouterState,
+  ReasonerDispatchOptions,
+} from './duplex/router.js';
 import { collectCauseTags, latestCauseSeq } from './duplex/cause-tags.js';
 import { FanOutContextManager } from './duplex/fanout-context-manager.js';
 import { DuplexHeadlines } from './duplex/headlines.js';
@@ -1048,6 +1053,15 @@ export interface CortexAgentStateV2 {
   /** Reasoner observational state, order-coupled to reasonerHistory. */
   reasonerMemory: ObservationalMemoryState | null;
   usage: CortexAgentUsageBreakdown;
+  /**
+   * Duplex router state that must outlive a restore: the task alias
+   * counter, tracked tasks, results logged but not yet handed to the
+   * talker, and conversation the reasoner has not seen yet. Optional, so
+   * artifacts written before it existed still restore (the alias counter
+   * is then recovered from the log). Absent for sessions that never ran
+   * duplex.
+   */
+  router?: DuplexRouterState;
 }
 
 /**
@@ -1202,6 +1216,21 @@ function diffUsage(live: SessionUsage, baseline: SessionUsage): SessionUsage {
     }
   }
   return delta;
+}
+
+/**
+ * The highest `task-N` alias the log's directives mention, or 0. The floor
+ * for the alias counter after a restore, whatever the artifact carried.
+ */
+function highestTaskAliasInLog(log: readonly SessionLogEntry[]): number {
+  let highest = 0;
+  for (const entry of log) {
+    if (entry.type !== 'directive') continue;
+    const alias = (entry.data as { alias?: unknown } | undefined)?.alias;
+    const match = typeof alias === 'string' ? /^task-(\d+)$/.exec(alias) : null;
+    if (match) highest = Math.max(highest, Number(match[1]));
+  }
+  return highest;
 }
 
 /** Normalize any accepted persisted shape to v2. */
@@ -1503,6 +1532,8 @@ export class CortexAgent {
    * duplex artifact must round-trip getState() without losing that side.
    */
   private retainedTalkerHistory: AgentMessage[] = [];
+  /** A restored duplex artifact's router state, carried through passthrough. */
+  private retainedRouterState: DuplexRouterState | null = null;
   private retainedTalkerMemory: ObservationalMemoryState | null = null;
 
   private readonly stateChangedHandlers: Array<(state: CortexAgentStateV2) => void> = [];
@@ -3546,6 +3577,11 @@ export class CortexAgent {
           ...(lookupUsage ? { lookups: lookupUsage } : {}),
         },
       },
+      // Passthrough carries a restored duplex artifact's router state
+      // through, like the talker side.
+      ...(this.router
+        ? { router: this.router.exportState() }
+        : this.retainedRouterState ? { router: structuredClone(this.retainedRouterState) } : {}),
     };
   }
 
@@ -3631,6 +3667,7 @@ export class CortexAgent {
     // never half-applied.
     const talkerHistory = structuredClone(v2.talkerHistory);
     const talkerMemory = structuredClone(v2.talkerMemory);
+    const routerState = v2.router ? structuredClone(v2.router) : undefined;
 
     // History before observational state (restore ordering), per loop.
     this.reasoner.restoreConversationHistory(v2.reasonerHistory);
@@ -3671,8 +3708,13 @@ export class CortexAgent {
       this.recordDroppedQueueContent(this.talker, 'restore', this.talker.clearAllQueues());
     }
     // Router state (delegations, deltas, held deliveries, dedup) describes
-    // the replaced session too.
-    this.router?.resetForRestore();
+    // the replaced session too; what the artifact carries of it comes back.
+    if (this.router) {
+      this.router.resetForRestore();
+      this.restoreRouterState(routerState);
+    } else {
+      this.retainedRouterState = routerState ?? null;
+    }
     // The aggregate guard's counters describe the replaced session's spend;
     // without a reset a lifetime breach would keep aborting the restored
     // session forever and re-log a breach against a pre-restore total.
@@ -3684,6 +3726,37 @@ export class CortexAgent {
     // is nothing left for a deferred read-out to be about.
     this.trackedAskVoicings.clear();
     this.deferredAskVoicing = false;
+  }
+
+  /**
+   * Re-apply the artifact's router state. Tasks that were still outstanding
+   * lost the run serving them, so they are reported as interrupted instead
+   * of left listed as live work: a lifecycle entry each, and one silent
+   * note for the talker, which surfaces with the user's next turn rather
+   * than waking the conversation on restore.
+   */
+  private restoreRouterState(state: DuplexRouterState | undefined): void {
+    const router = this.router!;
+    const interrupted = router.restoreState(state, highestTaskAliasInLog(this.log.getLog()));
+    if (interrupted.length === 0) return;
+    for (const delegation of interrupted) {
+      this.appendEntry({
+        type: 'lifecycle',
+        loopPath: this.reasoner.loopPath,
+        content: `Task ${delegation.alias} interrupted by the session restore`,
+        data: { event: 'delegation_interrupted', alias: delegation.alias },
+        causedBy: delegation.seq,
+      });
+    }
+    const list = interrupted
+      .map((delegation) => `${delegation.alias} (${delegation.instructions})`)
+      .join(', ');
+    router.deliverFromReasoner(
+      `The session was restored. Background work that was in progress is no longer running: ${list}. ` +
+      'If the user asks about it, say it was interrupted and offer to start it again.',
+      'silent',
+      { synthetic: true },
+    );
   }
 
   /**

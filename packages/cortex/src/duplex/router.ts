@@ -266,6 +266,33 @@ export function deliveryConcludes(
   return wake !== 'silent';
 }
 
+/**
+ * The router state that has to survive a persist/restore round trip
+ * (CortexAgentStateV2.router). Everything else the router holds (caps,
+ * dedup, the token bucket, spacing) describes the moment, not the session,
+ * and restarts clean.
+ */
+export interface DuplexRouterState {
+  /**
+   * The next task alias number. Aliases are how the talker, the transcript
+   * and the user refer to work, so they never restart at task-1 over a
+   * transcript that already says task-1.
+   */
+  nextAliasNumber: number;
+  /** Tracked delegations, including the directive seqs that identify results. */
+  delegations: Array<DelegationSnapshot & { directiveSeqs: number[]; lastActivityAt: number }>;
+  /**
+   * Talker-waking deliveries already logged but not yet handed to the
+   * talker. The log records them as delivered content, so dropping them at
+   * restore would leave a result the user never heard looking delivered.
+   */
+  pendingDeliveries: string[];
+  /** Conversation the reasoner has not seen yet, flushed with the next dispatch. */
+  conversationDeltas: ConversationDelta[];
+  /** Whether that buffer already dropped lines (the next flush says so). */
+  conversationDeltasOverflowed: boolean;
+}
+
 /** One tracked delegation (a spawn_task dispatch), keyed by alias. */
 export interface DelegationSnapshot {
   alias: string;
@@ -301,6 +328,10 @@ interface PendingDelivery {
   content: string;
   enqueuedAt: number;
 }
+
+const DELTA_SPEAKERS: ReadonlySet<string> = new Set<ConversationDelta['speaker']>([
+  'user', 'assistant', 'consumer', 'lookup',
+]);
 
 /** FNV-1a 32-bit; cheap content identity for dedup, not security. */
 function fnv1a(input: string): number {
@@ -1256,6 +1287,93 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     return dropped;
   }
 
+  /**
+   * The session-scoped part of the router's state, for the persisted
+   * artifact. Copies throughout: the snapshot never aliases live state.
+   */
+  exportState(): DuplexRouterState {
+    return {
+      nextAliasNumber: this.nextAliasNumber,
+      delegations: [...this.delegations.values()].map((delegation) => ({
+        ...delegation,
+        directiveSeqs: [...delegation.directiveSeqs],
+      })),
+      pendingDeliveries: [...this.interruptQueue, ...this.whenIdleQueue].map((item) => item.content),
+      conversationDeltas: this.deltaBuffer.map((delta) => ({ ...delta })),
+      conversationDeltasOverflowed: this.deltaOverflowed,
+    };
+  }
+
+  /**
+   * Re-apply persisted router state after {@link resetForRestore}. Returns
+   * the delegations that were still outstanding: whatever run served them
+   * did not survive the restore, so they are retired here rather than left
+   * listed as live, and the caller decides how to tell the conversation.
+   *
+   * `logAliasFloor` is the highest task alias number the restored log
+   * mentions: an artifact written before this state was persisted (or with
+   * it stripped) still never reissues an alias its transcript already uses.
+   *
+   * Held deliveries come back silent: they reach the talker's context and
+   * surface with the user's next turn. A restore is a state operation, so
+   * it never starts a talker turn on its own (the consumer may not even
+   * have wired its event handlers yet), and whatever urgency the results
+   * had belonged to the moment they were produced.
+   */
+  restoreState(state: DuplexRouterState | undefined, logAliasFloor: number): DelegationSnapshot[] {
+    const persistedNext = typeof state?.nextAliasNumber === 'number' && Number.isInteger(state.nextAliasNumber)
+      ? state.nextAliasNumber
+      : 1;
+    this.nextAliasNumber = Math.max(persistedNext, logAliasFloor + 1, 1);
+    if (!state) return [];
+
+    const now = this.now();
+    const interrupted: DelegationSnapshot[] = [];
+    for (const persisted of Array.isArray(state.delegations) ? state.delegations : []) {
+      if (typeof persisted?.alias !== 'string' || typeof persisted.seq !== 'number') continue;
+      const delegation: TrackedDelegation = {
+        alias: persisted.alias,
+        instructions: typeof persisted.instructions === 'string' ? persisted.instructions : '',
+        seq: persisted.seq,
+        createdAt: typeof persisted.createdAt === 'number' ? persisted.createdAt : now,
+        cancelled: persisted.cancelled === true,
+        completedAt: typeof persisted.completedAt === 'number' ? persisted.completedAt : null,
+        directiveSeqs: new Set(
+          (Array.isArray(persisted.directiveSeqs) ? persisted.directiveSeqs : [persisted.seq])
+            .filter((seq): seq is number => typeof seq === 'number'),
+        ),
+        // Restarted from now: the age-out measures inactivity in this
+        // session, and a restore is activity.
+        lastActivityAt: now,
+      };
+      if (!delegation.cancelled && delegation.completedAt === null) {
+        delegation.completedAt = now;
+        const { directiveSeqs: _seqs, lastActivityAt: _at, ...snapshot } = delegation;
+        interrupted.push(snapshot);
+      }
+      this.delegations.set(delegation.alias, delegation);
+    }
+
+    for (const delta of Array.isArray(state.conversationDeltas) ? state.conversationDeltas : []) {
+      if (typeof delta?.text === 'string' && DELTA_SPEAKERS.has(delta.speaker)) {
+        this.pushDelta({ speaker: delta.speaker, text: delta.text });
+      }
+    }
+    if (state.conversationDeltasOverflowed === true) this.deltaOverflowed = true;
+
+    for (const content of Array.isArray(state.pendingDeliveries) ? state.pendingDeliveries : []) {
+      if (typeof content !== 'string' || content.trim().length === 0) continue;
+      try {
+        this.ports.deliverToTalker(wrapDeliveryForTalker(content), false);
+      } catch (err) {
+        this.logger.error('restoring a held delivery to the talker failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return interrupted;
+  }
+
   /** Reset the router wholesale (facade restore()). */
   resetForRestore(): void {
     // Pending asks belong to the replaced session; every resolver settles
@@ -1264,6 +1382,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.dropPendingDeliveries();
     this.dropWorkContext();
     this.delegations.clear();
+    this.nextAliasNumber = 1;
     this.dispatchDedup.clear();
     this.recentDeliveryHashes = [];
     this.dispatchesThisTurn = 0;

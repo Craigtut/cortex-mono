@@ -158,6 +158,13 @@ Retention: the log holds at most `sessionLog.maxEntries` entries (default 10,000
     total:   {...},         // aggregate across every loop
     perLoop: { talker, reasoner },
   },
+  router: {                 // duplex only; optional (older artifacts omit it)
+    nextAliasNumber,        // task aliases never restart under a transcript that uses them
+    delegations,            // tracked tasks
+    pendingDeliveries,      // results logged but not yet handed to the talker
+    conversationDeltas,     // conversation the reasoner has not seen yet
+    conversationDeltasOverflowed,
+  },
 }
 ```
 
@@ -169,6 +176,7 @@ Restore rules:
 - Per-loop ordering holds internally: history first, then observational state (the observation watermark aligns to the post-slot history length).
 - Usage restore is a baseline: the facade reports `restoredBaseline + live deltas`, so repeated restores are idempotent and `getSessionUsage()` totals survive restores without double-counting. Note `SessionUsage.totalCost` includes direct/utility completion spend (observer, reflector, summarization, WebFetch, Bash utility calls).
 - A v2 artifact with talker content restored into a passthrough facade carries the talker side through opaquely: `getState()` round-trips it unchanged, and restored talker spend stays in the aggregate.
+- Router state comes back with the rest, and a restore never starts a turn. Results the router was still holding reach the talker silently and surface with the user's next turn. A task that was still outstanding lost the run serving it, so it is retired, recorded as a `delegation_interrupted` lifecycle entry, and described to the talker in a silent note (interrupted, offer to restart) rather than listed as live work. The alias counter resumes after the highest alias the restored log uses even when the artifact has no `router` field, so aliases never collide with ones the transcript already mentions.
 
 `onStateChanged(handler)` is the persistence trigger: debounced (`stateChangeDebounceMs`, default 500 ms), fired with a consistent `getState()` snapshot after state-changing activity settles (log appends, run completions, compaction, observation). Consumers persist on this rather than on `onLoopComplete`, which becomes ambiguous once multiple loops exist.
 
