@@ -170,7 +170,9 @@ describe('terminated batch: cache-breakpoint simulation', () => {
    * free of the content-empty messages the converter would also skip, so the
    * merge is the only rule in play.
    */
-  function expectedApiMessages(messages: AgentMessage[]): AgentMessage[][] {
+  function expectedApiMessages(transcriptMessages: AgentMessage[]): AgentMessage[][] {
+    // The system head becomes the request's system field, not a message.
+    const messages = transcriptMessages.filter((message) => message.role !== 'system');
     for (const message of messages) {
       const empty = typeof message.content === 'string'
         ? message.content.trim().length === 0
@@ -211,25 +213,27 @@ describe('terminated batch: cache-breakpoint simulation', () => {
     }];
     await facade.prompt('audit the tests and the docs');
 
-    // The loop keeps slot messages at the head of the same array the payload
-    // is built from, so this IS the array the converter would see.
-    const slotCount = talkerLoop.getContextManager().slotCount;
+    // The loop keeps the system head and slot messages at the front of the
+    // same array the payload is built from, so this IS the array the
+    // converter would see.
+    const { slotCount, historyStart } = talkerLoop.getContextManager();
     expect(slotCount).toBeGreaterThan(0);
     const messages = transcript(talkerPi);
+    const turns = messages.filter((message) => message.role !== 'system');
     const api = expectedApiMessages(messages);
     // The two control-tool results really do collapse into one API message.
-    expect(api).toHaveLength(messages.length - 1);
+    expect(api).toHaveLength(turns.length - 1);
     expect(api[api.length - 1]).toHaveLength(2);
 
     const indices = computeCacheBreakpointIndices(messages, {
-      slotCount,
+      slotEnd: historyStart,
       boundary: messages.length,
     });
     expect(indices.bp2ApiIndex).toBe(slotCount - 1);
     // Not messages.length - 1: the merge has to be accounted for, or the
     // breakpoint index runs off the end of the API array and is dropped.
     expect(indices.bp3ApiIndex).toBe(api.length - 1);
-    expect(messages.length - 1).toBeGreaterThan(api.length - 1);
+    expect(turns.length - 1).toBeGreaterThan(api.length - 1);
   });
 
   it('stamps the breakpoint onto the merged toolResult rather than dropping it', async () => {
@@ -242,7 +246,7 @@ describe('terminated batch: cache-breakpoint simulation', () => {
 
     const messages = transcript(talkerPi);
     const indices = computeCacheBreakpointIndices(messages, {
-      slotCount: talkerLoop.getContextManager().slotCount,
+      slotEnd: talkerLoop.getContextManager().historyStart,
       boundary: messages.length,
     });
 
@@ -287,7 +291,7 @@ describe('terminated batch: cache-breakpoint simulation', () => {
       makeToolResultMsg('c1', 'spawn_task', 'Started task-1.'),
     ];
     const indices = computeCacheBreakpointIndices(messages, {
-      slotCount: 1,
+      slotEnd: 1,
       boundary: messages.length,
     });
     // slot=0, user=1, assistant=2, toolResult=3, (empty assistant skipped,

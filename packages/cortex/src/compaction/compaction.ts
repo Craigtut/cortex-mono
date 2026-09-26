@@ -19,6 +19,7 @@ import type { AgentMessage } from '../context-manager.js';
 import type { CompactionConfig, CompactionResult, CompactionTarget } from '../types.js';
 import { estimateTokens } from '../token-estimator.js';
 import { extractTextContent } from './microcompaction.js';
+import { withoutSystemMessages } from '../system-transcript.js';
 import { findToolCallGroups } from './tool-call-groups.js';
 
 // ---------------------------------------------------------------------------
@@ -177,7 +178,8 @@ export function formatTurnsForSummarization(turns: AgentMessage[]): string {
   // partitionHistory (everything minus the preserved tail), and the
   // summarizer needs access to full turn content for high-quality
   // compression. See compaction-strategy.md Layer 2.
-  return turns
+  // System messages are prompt and tool declarations, not conversation.
+  return withoutSystemMessages(turns)
     .map((msg, i) => {
       const text = extractTextContent(msg);
       // Label tool results with their tool name so the summarizer can

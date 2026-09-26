@@ -23,6 +23,7 @@ import type { McpClientManager } from './mcp-client.js';
 import type { CortexModel } from './model-wrapper.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { withPlaceholderContent } from './pi-message.js';
+import { isSystemMessage, spliceHistory } from './system-transcript.js';
 import type { SkillRegistry } from './skill-registry.js';
 import type { SubAgentManager } from './sub-agent-manager.js';
 import type { CortexTool } from './tool-contract.js';
@@ -252,7 +253,6 @@ export class AgentLoop implements
     const cacheBreakpointState = { agentLoop: null as AgentLoop | null };
     const piAgent = new AgentClass(AgentLoop.buildPiAgentConfig({
       cortexConfig,
-      ...(initialSystemPrompt !== undefined ? { initialSystemPrompt } : {}),
       cacheBreakpointState,
     }));
     const agentLoop = new AgentLoop(piAgent, cortexConfig, params.tools ?? [], params.constructorOptions);
@@ -269,13 +269,11 @@ export class AgentLoop implements
 
   private static buildPiAgentConfig(params: {
     cortexConfig: AgentLoopConfig;
-    initialSystemPrompt?: string;
     cacheBreakpointState: { agentLoop: AgentLoop | null };
   }): Record<string, unknown> {
     const { cacheBreakpointState } = params;
     return buildPiAgentConfig({
       cortexConfig: params.cortexConfig,
-      ...(params.initialSystemPrompt !== undefined ? { initialSystemPrompt: params.initialSystemPrompt } : {}),
       host: () => cacheBreakpointState.agentLoop?.piHookHost() ?? null,
     });
   }
@@ -295,6 +293,9 @@ export class AgentLoop implements
         sessionId: parts.models.sessionId ?? null,
       }),
       syncActiveLoopTools: (ctx) => parts.tools.syncActiveLoopTools(ctx),
+      syncSystemTranscript: (transcript) => {
+        parts.systemPrompt.syncTranscript(transcript);
+      },
       finalizer: parts.finalizer,
       cacheBreakpointIndices: () => parts.pipeline.cacheBreakpointIndices,
     };
@@ -375,18 +376,27 @@ export class AgentLoop implements
   getContextManager(): ContextManager { return this.parts.contextManager; }
 
   getConversationHistory(): AgentMessage[] {
-    return this.agent.state.messages.slice(this.parts.contextManager.slotCount);
+    // Everything after the slots, system messages included: they declare
+    // the prompt and tools in effect at their point, and the observational
+    // watermark counts them. A restore replays them; the loop then patches
+    // the prompt and pi the tools to what is live now.
+    return this.agent.state.messages.slice(this.parts.contextManager.historyStart);
   }
 
   restoreConversationHistory(messages: AgentMessage[]): void {
-    // Replace everything after the slots; empty content gets a placeholder
-    // and messages without a timestamp are stamped now.
-    this.agent.state.messages.splice(this.parts.contextManager.slotCount);
+    // Replace everything after the slots, folding the replaced history's
+    // system messages into the head so the transcript still declares the
+    // loop's tools. Empty turn content gets a placeholder and messages
+    // without a timestamp are stamped now.
     const now = Date.now();
-    this.agent.state.messages.push(...messages.map((msg) => {
-      const patched = withPlaceholderContent(msg);
-      return patched.timestamp == null ? { ...patched, timestamp: now } : patched;
-    }));
+    spliceHistory(
+      this.agent.state.messages,
+      this.parts.contextManager.historyStart,
+      messages.map((msg) => {
+        const patched = isSystemMessage(msg) ? msg : withPlaceholderContent(msg);
+        return patched.timestamp == null ? { ...patched, timestamp: now } : patched;
+      }),
+    );
   }
 
   setHeadlineProvider(provider: (() => string | null) | null, options?: { maxTokens?: number }): void {
@@ -417,7 +427,7 @@ export class AgentLoop implements
     const { compactionManager, contextManager } = this.parts;
     // History is restored first, so the post-slot length is what the
     // buffer watermark must align with.
-    const historyLength = Math.max(0, this.agent.state.messages.length - contextManager.slotCount);
+    const historyLength = Math.max(0, this.agent.state.messages.length - contextManager.historyStart);
     compactionManager.restoreObservationalMemoryState(state, historyLength);
     // Fill the slot only for real observations (its content always has a
     // preamble). The observer catches up on the next turn_end.
@@ -428,7 +438,7 @@ export class AgentLoop implements
 
   async triggerObservation(): Promise<void> {
     const { compactionManager, contextManager } = this.parts;
-    await compactionManager.triggerObservation(this.agent.state.messages, contextManager.slotCount);
+    await compactionManager.triggerObservation(this.agent.state.messages, contextManager.historyStart);
     const slotContent = compactionManager.getObservationSlotContent();
     if (slotContent) contextManager.setSlot('_observations', slotContent);
   }

@@ -11,6 +11,7 @@ import type { CortexTool } from '../../src/tool-contract.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 import { partsOf } from './agent-loop/parts.js';
 import { backgroundTaskState } from '../../src/agent-loop/background-task-text.js';
+import { getCurrentSystemPrompt } from '@earendil-works/pi-ai/utils/transcript';
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent factory
@@ -778,7 +779,12 @@ You have 12 emotions.`;
       expect(prompt).toContain('Base prompt');
       expect(agent.getBasePrompt()).toBe('Base prompt');
       expect(agent.getCurrentSystemPrompt()).toContain('Base prompt');
-      expect(piAgent.state.systemPrompt).toContain('Base prompt');
+
+      // pi reads the prompt from the transcript, where the loop writes it
+      // before each request (pi's prepareRequest).
+      expect(getCurrentSystemPrompt(piAgent.state.messages)).not.toContain('Base prompt');
+      partsOf(agent).systemPrompt.syncTranscript(piAgent.state.messages);
+      expect(getCurrentSystemPrompt(piAgent.state.messages)).toBe(agent.getCurrentSystemPrompt());
     });
   });
 
@@ -869,14 +875,15 @@ You have 12 emotions.`;
         { role: 'user', content: 'Restored message 2' },
       ]);
 
-      // Slots should be intact
-      expect(piAgent.state.messages[0]!.content).toBe('Slot 1');
-      expect(piAgent.state.messages[1]!.content).toBe('Slot 2');
+      // The head and slots should be intact
+      expect(piAgent.state.messages[0]!.role).toBe('system');
+      expect(piAgent.state.messages[1]!.content).toBe('Slot 1');
+      expect(piAgent.state.messages[2]!.content).toBe('Slot 2');
 
       // Conversation should be after slots
-      expect(piAgent.state.messages[2]!.content).toBe('Restored message 1');
-      expect(piAgent.state.messages[3]!.content).toBe('Restored response 1');
-      expect(piAgent.state.messages[4]!.content).toBe('Restored message 2');
+      expect(piAgent.state.messages[3]!.content).toBe('Restored message 1');
+      expect(piAgent.state.messages[4]!.content).toBe('Restored response 1');
+      expect(piAgent.state.messages[5]!.content).toBe('Restored message 2');
     });
 
     it('restoreConversationHistory replaces existing conversation', () => {
@@ -1509,18 +1516,22 @@ You have 12 emotions.`;
       cm.setEphemeral('Ephemeral data');
 
       const hook = agent.getTransformContextHook();
+      const historyStart = cm.historyStart;
+      piAgent.state.messages.push({ role: 'user', content: 'Hello', timestamp: 1 });
       const context = {
         systemPrompt: 'test',
         model: {},
-        messages: [{ role: 'user' as const, content: 'Hello' }],
+        messages: piAgent.state.messages,
         tools: [],
         thinkingLevel: 'medium',
       };
 
+      // Injected at the boundary, which never precedes the head and slots.
       const result = await hook(context);
-      expect(result.messages.length).toBe(2);
-      expect(result.messages[0]!.content).toBe('Ephemeral data');
-      expect(result.messages[1]!.content).toBe('Hello');
+      expect(result.messages.length).toBe(historyStart + 2);
+      expect(result.messages[0]!.role).toBe('system');
+      expect(result.messages[historyStart]!.content).toBe('Ephemeral data');
+      expect(result.messages[historyStart + 1]!.content).toBe('Hello');
     });
 
     it('persists compaction source mutations into the active transform context', async () => {
@@ -1530,13 +1541,16 @@ You have 12 emotions.`;
         compaction: { strategy: 'classic' },
       });
 
-      const sourceMessages = [
+      const head = piAgent.state.messages[0]!;
+      const history = [
         { role: 'user' as const, content: 'old message' },
         { role: 'assistant' as const, content: 'old response' },
       ];
+      const sourceMessages = [head, ...history];
       piAgent.state.messages = [...sourceMessages];
 
-      const compacted = [{ role: 'assistant' as const, content: 'summary' }];
+      const summary = { role: 'assistant' as const, content: 'summary' };
+      const compacted = [head, summary];
       const manager = agent.getCompactionManager();
       vi.spyOn(manager, 'applyInsertionCap').mockResolvedValue();
       vi.spyOn(manager, 'applyInTransformContext').mockImplementation(async (
@@ -1546,9 +1560,9 @@ You have 12 emotions.`;
         getSourceHistory,
         setSourceHistory,
       ) => {
-        expect(getSourceHistory?.()).toEqual(sourceMessages);
-        setSourceHistory?.(compacted);
-        return setHistory(ctx, compacted);
+        expect(getSourceHistory?.()).toEqual(history);
+        setSourceHistory?.([summary]);
+        return setHistory(ctx, [summary]);
       });
 
       const hook = agent.getTransformContextHook();

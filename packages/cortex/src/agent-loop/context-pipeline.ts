@@ -25,6 +25,7 @@ import { DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS } from '../compaction/observ
 import type { AgentContext, AgentMessage, ContextManager } from '../context-manager.js';
 import { errorMessageOf } from '../error-classifier.js';
 import { withPlaceholderContent } from '../pi-message.js';
+import { isSystemMessage, spliceHistory } from '../system-transcript.js';
 import { estimateTokens } from '../token-estimator.js';
 import type { CortexLogger } from '../types.js';
 import { ABORTED, raceAbort, raceTimeout } from './run-control.js';
@@ -137,7 +138,7 @@ export interface ContextPipelinePorts {
     thinkingLevel?: unknown;
   };
   setAgentMessages(messages: AgentMessage[]): void;
-  slots: Pick<ContextManager, 'slotCount' | 'setSlot'>;
+  slots: Pick<ContextManager, 'historyStart' | 'setSlot'>;
   compaction(): CompactionManager;
   /**
    * View injections for the next call: `stable` content (ephemeral context,
@@ -185,7 +186,7 @@ export class ContextPipeline {
   }
 
   hook(): (context: AgentContext) => Promise<AgentContext> {
-    const slotCount = this.ports.slots.slotCount;
+    const historyStart = this.ports.slots.historyStart;
 
     return async (context: AgentContext): Promise<AgentContext> => {
       const sourceMessages = context.messages;
@@ -198,7 +199,7 @@ export class ContextPipeline {
       // cap awaits a consumer persistResult.
       await this.ports.compaction().applyInsertionCap(
         sourceMessages,
-        slotCount,
+        historyStart,
         passIsStale,
       );
       if (passIsStale()) return context;
@@ -212,15 +213,23 @@ export class ContextPipeline {
 
       // Step 2: Compaction. Source-history rewrites land in pi's loop
       // transcript and agent.state; the returned context only affects this
-      // call.
+      // call. Both rewrites fold the system messages they drop into the head
+      // (spliceHistory), so this call and every later one still declare the
+      // tools and prompt those messages carried.
       result = await this.ports.compaction().applyInTransformContext(
         result,
-        (ctx) => ctx.messages.slice(slotCount),
-        (ctx, history) => ({
-          ...ctx,
-          messages: [...ctx.messages.slice(0, slotCount), ...history],
-        }),
-        () => sourceMessages.slice(slotCount),
+        (ctx) => ctx.messages.slice(historyStart),
+        (ctx, history) => {
+          // The source head is canonical (a source rewrite may have just
+          // folded into it); folding the view's own drops on top is
+          // idempotent, since Cortex and pi write system updates with empty
+          // content.
+          const messages = [...ctx.messages];
+          messages[0] = sourceMessages[0]!;
+          spliceHistory(messages, historyStart, history);
+          return { ...ctx, messages };
+        },
+        () => sourceMessages.slice(historyStart),
         // setSourceHistory: every compaction rewrite lands here.
         (history) => {
           if (passIsStale()) {
@@ -232,10 +241,10 @@ export class ContextPipeline {
           // as a contiguous suffix of `history`; a strategy that breaks that
           // skews the boundary silently.
           const currentTickCount = sourceMessages.length - this.ports.boundary();
-          sourceMessages.splice(slotCount, sourceMessages.length - slotCount, ...history);
+          spliceHistory(sourceMessages, historyStart, history);
           this.ports.setAgentMessages([...sourceMessages]);
           this.ports.setBoundary(Math.max(
-            slotCount,
+            historyStart,
             sourceMessages.length - currentTickCount,
           ));
         },
@@ -253,7 +262,8 @@ export class ContextPipeline {
         if (slotContent) {
           this.ports.slots.setSlot('_observations', slotContent);
           if (this.ports.compaction().hasObservations()) {
-            const obsSlotIndex = this.ports.slots.slotCount - 1;
+            // The observation slot is the last one, right before history.
+            const obsSlotIndex = this.ports.slots.historyStart - 1;
             if (obsSlotIndex >= 0 && obsSlotIndex < result.messages.length) {
               result.messages[obsSlotIndex] = { role: 'user', content: slotContent, timestamp: Date.now() };
             }
@@ -265,7 +275,7 @@ export class ContextPipeline {
       // injections sit after it, outside the cached prefix.
       const stableInjectionCount = this.ports.injections().stable.length;
       this.breakpointIndices = computeCacheBreakpointIndices(result.messages, {
-        slotCount,
+        slotEnd: historyStart,
         boundary: this.ports.boundary() + stableInjectionCount,
       });
 
@@ -305,15 +315,19 @@ export class ContextPipeline {
 
     if (injections.length > 0) {
       const messages = [...result.messages];
-      // boundary may exceed array length on first tick or after reset
-      const insertIdx = Math.min(boundary, messages.length);
+      // Never ahead of history: the system head must stay first (pi reads
+      // the prompt only from index 0) and the slots right behind it. The
+      // boundary may also exceed the array on the first tick or after reset.
+      const insertIdx = Math.min(Math.max(boundary, this.ports.slots.historyStart), messages.length);
       messages.splice(insertIdx, 0, ...injections);
       result = { ...result, messages };
     }
 
+    // System messages are declarations, not turns: an empty one is valid.
     return {
       ...result,
-      messages: result.messages.map(withPlaceholderContent),
+      messages: result.messages.map((message) =>
+        isSystemMessage(message) ? message : withPlaceholderContent(message)),
     };
   }
 
@@ -348,7 +362,7 @@ export class ContextPipeline {
         const outcome = await raceAbort(
           this.ports.compaction().digestPendingObservationBuffers(
             this.ports.agentState().messages,
-            this.ports.slots.slotCount,
+            this.ports.slots.historyStart,
             options?.observerTimeoutMs,
           ),
           signal,

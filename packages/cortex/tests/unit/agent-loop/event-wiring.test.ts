@@ -28,7 +28,7 @@ function setup(options?: { workingTags?: boolean; strategy?: 'observational' | '
     diagnostics: { recordEvent: vi.fn() },
     ledger,
     agentState: () => state,
-    slotCount: () => 0,
+    historyStart: () => 0,
     compaction: () => compaction as unknown as CompactionManager,
     effectiveContextWindow: () => 100_000,
     budgetSummary: () => ({ turns: 1, totalCost: 0 }),

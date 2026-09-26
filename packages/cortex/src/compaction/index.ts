@@ -183,7 +183,7 @@ export function computeAdaptiveThreshold(
 export class CompactionManager {
   private readonly config: CortexCompactionConfig;
   private readonly microcompaction: MicrocompactionEngine;
-  private readonly slotCount: number;
+  private readonly historyStart: number;
   private readonly _strategy: 'observational' | 'classic';
   private observationalEngine: ObservationalMemoryEngine | null = null;
 
@@ -249,17 +249,18 @@ export class CompactionManager {
 
   constructor(
     config: CortexCompactionConfig,
-    slotCount: number,
+    historyStart: number,
   ) {
     this.config = config;
-    this.slotCount = slotCount;
+    this.historyStart = historyStart;
     this.microcompaction = new MicrocompactionEngine(config.microcompaction);
     this._strategy = config.strategy ?? 'observational';
 
     if (this._strategy === 'observational') {
+      // The observation slot is the last slot, right before history.
       this.observationalEngine = new ObservationalMemoryEngine(
         config.observational ?? {},
-        slotCount - 1,
+        historyStart - 1,
       );
     }
   }
@@ -533,8 +534,8 @@ export class CompactionManager {
   /**
    * Called at turn_end to trigger async buffer checks.
    */
-  onTurnEnd(totalTokens: number, contextWindow: number, messages: AgentMessage[], slotCount: number): void {
-    this.observationalEngine?.onTurnEnd(totalTokens, contextWindow, messages, slotCount);
+  onTurnEnd(totalTokens: number, contextWindow: number, messages: AgentMessage[], historyStart: number): void {
+    this.observationalEngine?.onTurnEnd(totalTokens, contextWindow, messages, historyStart);
   }
 
   /**
@@ -586,8 +587,8 @@ export class CompactionManager {
   /**
    * Force a synchronous observation cycle.
    */
-  async triggerObservation(messages: AgentMessage[], slotCount: number): Promise<void> {
-    await this.observationalEngine?.triggerObservation(messages, slotCount);
+  async triggerObservation(messages: AgentMessage[], historyStart: number): Promise<void> {
+    await this.observationalEngine?.triggerObservation(messages, historyStart);
   }
 
   /**
@@ -599,10 +600,10 @@ export class CompactionManager {
    */
   async digestPendingObservationBuffers(
     messages: AgentMessage[],
-    slotCount: number,
+    historyStart: number,
     observerTimeoutMs?: number,
   ): Promise<boolean> {
-    return this.observationalEngine?.digestPendingBuffers(messages, slotCount, observerTimeoutMs)
+    return this.observationalEngine?.digestPendingBuffers(messages, historyStart, observerTimeoutMs)
       ?? false;
   }
 
@@ -687,7 +688,7 @@ export class CompactionManager {
    * capped content (containing the insertion marker) is skipped.
    *
    * @param messages - The source messages array (mutated in place)
-   * @param slotCount - Number of slot messages to skip at the start
+   * @param historyStart - Index of the first history message (past the system head and slots)
    * @param isStale - When provided and true, the pass has been abandoned
    *   (digestIdle timed out and advanced the generation) and no further
    *   mutation may land: the aggregate phase awaits a consumer
@@ -696,13 +697,13 @@ export class CompactionManager {
    */
   async applyInsertionCap(
     messages: AgentMessage[],
-    slotCount: number,
+    historyStart: number,
     isStale?: () => boolean,
   ): Promise<void> {
     const config = this.microcompaction.getConfig();
 
     // Phase 1: Individual per-result cap
-    for (let i = slotCount; i < messages.length; i++) {
+    for (let i = historyStart; i < messages.length; i++) {
       const msg = messages[i]!;
       if (!isToolResultMessage(msg)) continue;
       if (typeof msg.content === 'string') continue;
@@ -735,7 +736,7 @@ export class CompactionManager {
     const aggregateLimit = config.maxAggregateTurnTokens ?? 150_000;
     if (aggregateLimit <= 0) return;
 
-    for (let i = slotCount; i < messages.length; i++) {
+    for (let i = historyStart; i < messages.length; i++) {
       const msg = messages[i]!;
       if (!isToolResultMessage(msg)) continue;
       if (typeof msg.content === 'string') continue;
@@ -899,7 +900,7 @@ export class CompactionManager {
       // cache-aware mode on the unobserved tail to trim large tool results
       // before they hit the LLM.
       context = await this.observationalEngine.applyInTransformContext(
-        context, utilization, this.slotCount, getHistory, setHistory, getSourceHistory, setSourceHistory,
+        context, utilization, this.historyStart, getHistory, setHistory, getSourceHistory, setSourceHistory,
         { allowSync: allowBlocking, ...(isStale ? { isStale } : {}) },
       );
       history = getHistory(context);
@@ -1052,7 +1053,7 @@ export class CompactionManager {
     // not the user's artificial budget. Layer 1/2 handle the budget.
     // When observational memory is active, L3 operates on the post-slot
     // history (raw messages only). The observation slot lives in the slot
-    // region and is naturally protected by slotCount.
+    // region and is naturally protected by historyStart.
     {
       const failsafeWindow = this._modelContextWindow > 0 ? this._modelContextWindow : this._contextWindow;
       const postLayerTokens = this.estimateHistoryTokens(history);
@@ -1061,7 +1062,7 @@ export class CompactionManager {
       if (shouldTruncate(totalNow, failsafeWindow, this.config.failsafe.threshold)) {
         // Force sync observation before L3 truncation to capture unobserved
         // content before it is dropped. The source history from getSourceHistory
-        // is already post-slot, so pass 0 as slotCount. Skipped under the
+        // is already post-slot, so pass 0 as historyStart. Skipped under the
         // non-blocking posture: truncation must be the ONLY in-band path
         // there, even at the cost of dropping unobserved content.
         if (

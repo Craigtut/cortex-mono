@@ -557,13 +557,15 @@ describe('scenario: the persistent reasoner across a compaction', () => {
     assertTranscriptShape(h.reasonerLoop.getConversationHistory());
     assertTranscriptShape(h.talkerLoop.getConversationHistory());
 
-    // And on the wire the early fact is genuinely reachable: the message
-    // array pi would send opens with the observations slot carrying it,
-    // even though the raw exchange that stated it is gone from the
-    // transcript. That is the whole "controlled forgetting" claim.
+    // And on the wire the early fact is genuinely reachable: right after the
+    // system head, the message array pi would send opens with the
+    // observations slot carrying it, even though the raw exchange that
+    // stated it is gone from the transcript. That is the whole "controlled
+    // forgetting" claim.
     const wire = h.reasonerPi.state.messages;
-    expect(String(wire[0]?.role)).toBe('user');
-    expect(JSON.stringify(wire[0]?.content)).toContain(EARLY_FACT);
+    expect(String(wire[0]?.role)).toBe('system');
+    expect(String(wire[1]?.role)).toBe('user');
+    expect(JSON.stringify(wire[1]?.content)).toContain(EARLY_FACT);
     expect(JSON.stringify(h.reasonerLoop.getConversationHistory())).not.toContain(EARLY_FACT);
   });
 });

@@ -20,6 +20,20 @@ import {
 } from '../../src/cache-breakpoints.js';
 
 describe('computeCacheBreakpointIndices', () => {
+  it('counts no system message: the head becomes the system field, later ones separate entries', () => {
+    const messages = [
+      { role: 'system', content: '', sections: { Rules: 'r' } },
+      { role: 'user', content: 'slot' },
+      { role: 'user', content: 'old question' },
+      { role: 'assistant', content: [{ type: 'text', text: 'old answer' }] },
+      { role: 'system', content: '', toolsAdded: [{ name: 'later' }] },
+      { role: 'user', content: 'new question' },
+    ];
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 5 });
+    // slot=0, old question=1, old answer=2 (the update is not an API message)
+    expect(result).toEqual({ bp2ApiIndex: 0, bp3ApiIndex: 2 });
+  });
+
   it('computes BP2 for the last slot (2 slots)', () => {
     const messages = [
       { role: 'user', content: 'slot A' },
@@ -28,7 +42,7 @@ describe('computeCacheBreakpointIndices', () => {
       { role: 'assistant', content: [{ type: 'text', text: 'reply' }] },
     ];
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 4 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 4 });
     // slot A = API index 0, slot B = API index 1 => BP2 = 1
     expect(result.bp2ApiIndex).toBe(1);
   });
@@ -44,7 +58,7 @@ describe('computeCacheBreakpointIndices', () => {
     ];
 
     // prePromptMessageCount = 4, ephemeral injection extends boundary to 5
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 5 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 5 });
 
     // slot A=0, slot B=1, old history=2, old reply=3, ephemeral=4
     expect(result.bp3ApiIndex).toBe(4);
@@ -62,7 +76,7 @@ describe('computeCacheBreakpointIndices', () => {
     ];
 
     // prePromptMessageCount = 4, 2 stable injections => boundary 6
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 6 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 6 });
 
     // slot A=0, slot B=1, old history=2, old reply=3, ephemeral=4, skill=5
     expect(result.bp3ApiIndex).toBe(5);
@@ -75,7 +89,7 @@ describe('computeCacheBreakpointIndices', () => {
       { role: 'user', content: 'history' },
     ];
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 3 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 3 });
 
     // Empty slot A is skipped, so BP2 = apiIndex of slot B = 0
     expect(result.bp2ApiIndex).toBe(0);
@@ -89,7 +103,7 @@ describe('computeCacheBreakpointIndices', () => {
       { role: 'user', content: 'prompt' },
     ];
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 3 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 3 });
 
     // slot A = 0 survives; BP2 must not be lost
     expect(result.bp2ApiIndex).toBe(0);
@@ -104,7 +118,7 @@ describe('computeCacheBreakpointIndices', () => {
       { role: 'user', content: 'prompt' },
     ];
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 2 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 2 });
     expect(result.bp2ApiIndex).toBe(-1);
     expect(result.bp3ApiIndex).toBe(-1);
   });
@@ -122,7 +136,7 @@ describe('computeCacheBreakpointIndices', () => {
     ];
 
     // 2 slots + 4 history messages = prePrompt 6, + 1 ephemeral => boundary 7
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 7 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 7 });
 
     // API: slotA=0, slotB=1, user=2, assistant=3, merged toolResults=4,
     // ephemeral=5, prompt=6
@@ -141,7 +155,7 @@ describe('computeCacheBreakpointIndices', () => {
     ];
 
     // slot=0, merged run=1, assistant=2, second run=3, prompt=4
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 1, boundary: 5 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 1, boundary: 5 });
     expect(result.bp2ApiIndex).toBe(0);
     expect(result.bp3ApiIndex).toBe(3);
   });
@@ -156,7 +170,7 @@ describe('computeCacheBreakpointIndices', () => {
 
     // transformMessages removes the errored assistant, so the two
     // toolResults become adjacent and merge: merged=0, prompt=1
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 0, boundary: 3 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 0, boundary: 3 });
     expect(result.bp3ApiIndex).toBe(0);
   });
 
@@ -170,7 +184,7 @@ describe('computeCacheBreakpointIndices', () => {
 
     // The empty user message emits nothing but stops the merge lookahead:
     // run1=0, run2=1, prompt=2
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 0, boundary: 3 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 0, boundary: 3 });
     expect(result.bp3ApiIndex).toBe(1);
   });
 
@@ -183,19 +197,19 @@ describe('computeCacheBreakpointIndices', () => {
     ];
 
     // slot=0, (assistant skipped), history=1, prompt=2
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 1, boundary: 3 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 1, boundary: 3 });
     expect(result.bp2ApiIndex).toBe(0);
     expect(result.bp3ApiIndex).toBe(1);
   });
 
-  it('returns -1 for BP3 when boundary equals slotCount (no history)', () => {
+  it('returns -1 for BP3 when boundary equals slotEnd (no history)', () => {
     const messages = [
       { role: 'user', content: 'slot A' },
       { role: 'user', content: 'slot B' },
       { role: 'user', content: 'new tick' },
     ];
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 2 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 2 });
     expect(result.bp3ApiIndex).toBe(-1);
   });
 
@@ -207,7 +221,7 @@ describe('computeCacheBreakpointIndices', () => {
       { role: 'user', content: 'prompt' },
     ];
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 2, boundary: 3 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 2, boundary: 3 });
     expect(result.bp2ApiIndex).toBe(1);
     expect(result.bp3ApiIndex).toBe(-1);
   });
@@ -218,7 +232,7 @@ describe('computeCacheBreakpointIndices', () => {
       { role: 'user', content: 'history' },
     ];
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 1, boundary: 10 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 1, boundary: 10 });
     expect(result.bp3ApiIndex).toBe(-1);
   });
 
@@ -228,12 +242,12 @@ describe('computeCacheBreakpointIndices', () => {
       { role: 'assistant', content: [{ type: 'text', text: 'reply 1' }] },
     ];
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount: 0, boundary: 2 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: 0, boundary: 2 });
     expect(result.bp2ApiIndex).toBe(-1);
   });
 
   it('returns both -1 for an empty message array', () => {
-    const result = computeCacheBreakpointIndices([], { slotCount: 2, boundary: 0 });
+    const result = computeCacheBreakpointIndices([], { slotEnd: 2, boundary: 0 });
     expect(result.bp2ApiIndex).toBe(-1);
     expect(result.bp3ApiIndex).toBe(-1);
   });
@@ -256,7 +270,7 @@ describe('computeCacheBreakpointIndices', () => {
     messages.push({ role: 'user', content: '<ephemeral>tick context</ephemeral>' });
     messages.push({ role: 'user', content: 'New tick prompt' });
 
-    const result = computeCacheBreakpointIndices(messages, { slotCount, boundary: 30 });
+    const result = computeCacheBreakpointIndices(messages, { slotEnd: slotCount, boundary: 30 });
 
     // Slots: API 0..8 => BP2 = 8
     expect(result.bp2ApiIndex).toBe(8);
@@ -338,6 +352,25 @@ describe('addCacheControlToMessage', () => {
 });
 
 describe('applyCacheBreakpoints', () => {
+  it('stamps by user/assistant position, skipping the payload\'s system entries', () => {
+    const cacheControl = { type: 'ephemeral' };
+    const payload: Record<string, unknown> = {
+      system: [{ type: 'text', text: 'sys', cache_control: cacheControl }],
+      messages: [
+        { role: 'user', content: 'slot' },
+        { role: 'user', content: 'old' },
+        // pi-ai holds a later system update back to just before the next assistant message.
+        { role: 'system', content: [{ type: 'tool_addition', tool: { type: 'tool_reference', name: 'later' } }] },
+        { role: 'assistant', content: 'answer' },
+        { role: 'user', content: 'new' },
+      ],
+    };
+    applyCacheBreakpoints(payload, { bp2ApiIndex: 0, bp3ApiIndex: 2 });
+    const messages = payload['messages'] as Array<{ content: unknown }>;
+    const stamped = messages.map((message) => JSON.stringify(message.content).includes('cache_control'));
+    expect(stamped).toEqual([true, false, false, true, false]);
+  });
+
   const cacheControl = { type: 'ephemeral' };
 
   function buildPayload(): Record<string, unknown> {

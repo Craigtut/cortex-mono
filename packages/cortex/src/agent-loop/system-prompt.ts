@@ -1,10 +1,20 @@
 /**
  * System prompt assembly: Cortex's operational sections, appended after
- * the consumer's base prompt, and the state that keeps pi's prompt in sync.
+ * the consumer's base prompt, and the state that keeps the transcript's
+ * system messages (where pi reads the prompt) in sync with it.
  *
  * Reference: system-prompt.md
  */
 
+import type { AgentMessage } from '../context-manager.js';
+import {
+  emptySystemHead,
+  foldSystemMessages,
+  isSystemMessage,
+  replayContent,
+  replaySections,
+} from '../system-transcript.js';
+import type { PromptSection, SystemTranscriptMessage } from '../system-transcript.js';
 import { TOOL_NAMES } from '../tools/tool-names.js';
 
 // ---------------------------------------------------------------------------
@@ -247,9 +257,16 @@ function detectShell(): string {
 // SystemPromptState
 // ---------------------------------------------------------------------------
 
+/**
+ * The section the consumer's prompt occupies: the base prompt once one is
+ * set, or a whole adopted prompt before that. Models that read section
+ * updates see this name when it changes.
+ */
+export const INSTRUCTIONS_SECTION = 'Instructions';
+
 export interface SystemPromptPorts {
-  /** The pi agent's live state, which carries the prompt pi sends. */
-  agentState(): { systemPrompt?: string };
+  /** The prompt pi's state carried when the loop was built, adopted until a base is set. */
+  initialPrompt(): string;
   hasTool(name: string): boolean;
   workingTagsEnabled(): boolean;
   workingDirectory: string;
@@ -257,15 +274,19 @@ export interface SystemPromptPorts {
 
 /**
  * The loop's system prompt: the consumer's base prompt (null until set)
- * composed with Cortex's operational sections, mirrored into pi's state.
+ * composed with Cortex's operational sections. This class holds the prompt
+ * the loop wants; {@link syncTranscript} writes it into the transcript's
+ * system messages, which is where pi reads it from.
  */
 export class SystemPromptState {
   private basePrompt: string | null = null;
-  private currentPrompt: string;
+  private desired: PromptSection[];
 
   constructor(private readonly ports: SystemPromptPorts) {
-    const existing = ports.agentState().systemPrompt;
-    this.currentPrompt = typeof existing === 'string' ? existing : '';
+    const existing = ports.initialPrompt();
+    this.desired = existing.length > 0
+      ? [{ name: INSTRUCTIONS_SECTION, content: existing }]
+      : [];
   }
 
   compose(basePrompt: string): string {
@@ -280,11 +301,11 @@ export class SystemPromptState {
    * built-ins (the duplex talker) gets no Tool Usage or Executing with Care;
    * refreshTools() recomposes through refresh() when the toolset changes.
    */
-  sections(): Array<{ name: string; content: string }> {
+  sections(): PromptSection[] {
     const has = this.ports.hasTool;
     const hasAnyBuiltIn = Object.values(TOOL_NAMES).some(has);
 
-    const sections: Array<{ name: string; content: string }> = [];
+    const sections: PromptSection[] = [];
     if (this.ports.workingTagsEnabled()) {
       sections.push({ name: 'Response Delivery', content: RESPONSE_DELIVERY_SECTION });
     }
@@ -303,7 +324,8 @@ export class SystemPromptState {
 
   setBase(basePrompt: string): string {
     this.basePrompt = basePrompt;
-    return this.apply(this.compose(basePrompt));
+    this.desired = [{ name: INSTRUCTIONS_SECTION, content: basePrompt }, ...this.sections()];
+    return this.current();
   }
 
   /** The base prompt, or null when none was ever set. */
@@ -311,30 +333,115 @@ export class SystemPromptState {
     return this.basePrompt;
   }
 
+  /** The prompt as the model reads it: every non-empty section, in order. */
   current(): string {
-    return this.currentPrompt;
+    return this.desired
+      .map((section) => section.content)
+      .filter((content) => content.length > 0)
+      .join('\n\n');
   }
 
+  /** Adopt a whole prompt written outside the base-plus-sections composition. */
   apply(systemPrompt: string): string {
-    this.currentPrompt = systemPrompt;
-    const state = this.ports.agentState();
-    if ('systemPrompt' in state) {
-      state.systemPrompt = systemPrompt;
-    }
+    this.desired = systemPrompt.length > 0
+      ? [{ name: INSTRUCTIONS_SECTION, content: systemPrompt }]
+      : [];
     return systemPrompt;
   }
 
-  /** Recompose after a toolset or mode change (or adopt pi's prompt when no base is set). */
+  /** Recompose after a toolset or mode change (a no-op until a base is set). */
   refresh(): void {
-    if (this.basePrompt !== null) {
-      this.apply(this.compose(this.basePrompt));
-      return;
-    }
-    const existing = this.ports.agentState().systemPrompt;
-    this.currentPrompt = typeof existing === 'string' ? existing : '';
+    if (this.basePrompt !== null) this.setBase(this.basePrompt);
   }
 
   isConfigured(): boolean {
-    return this.currentPrompt.trim().length > 0;
+    return this.current().trim().length > 0;
   }
+
+  /**
+   * Bring `transcript`'s system messages in line with the desired prompt,
+   * in place. Returns whether anything changed.
+   *
+   * Until the model has answered in this transcript nothing of it is
+   * cached, so the head is rebuilt with every other system message (pi's
+   * first tool declarations) folded in: the initial tools then live in the
+   * head, where native tool-change transports anchor later additions. After
+   * that, messages are never removed (history indices, such as the
+   * observational watermark, must hold), and changed sections go out as one
+   * appended patch, which a model that accepts mid-conversation system
+   * messages reads in place, keeping its cached prefix; pi collapses it into
+   * the head for every other model.
+   */
+  syncTranscript(transcript: AgentMessage[]): boolean {
+    if (!isSystemMessage(transcript[0])) transcript.unshift(emptySystemHead());
+    if (!transcript.some((message) => message.role === 'assistant')) {
+      return this.rebuildHead(transcript);
+    }
+
+    // A head the loop has not written (a restored transcript, a prompt pi
+    // was built with) is written now, in place. Free-form head content
+    // cannot be patched: later content appends to it.
+    let changed = false;
+    const head = transcript[0] as SystemTranscriptMessage;
+    if (contentText(head) !== '' || (this.desired.length > 0 && head.sections === undefined)) {
+      transcript[0] = this.headMessage(foldSystemMessages(transcript));
+      changed = true;
+    }
+
+    const declared = replaySections(transcript);
+    const patch: Record<string, string | null> = {};
+    const wanted = new Set<string>();
+    for (const { name, content } of this.desired) {
+      wanted.add(name);
+      if (declared.get(name) !== content) patch[name] = content;
+    }
+    for (const name of declared.keys()) {
+      if (!wanted.has(name)) patch[name] = null;
+    }
+    if (Object.keys(patch).length === 0) return changed;
+    transcript.push({ role: 'system', content: '', sections: patch, timestamp: Date.now() });
+    return true;
+  }
+
+  /** Fold every system message into a head that declares exactly the desired sections. */
+  private rebuildHead(transcript: AgentMessage[]): boolean {
+    const head = transcript[0] as SystemTranscriptMessage;
+    const laterSystemMessages = transcript.some((message, index) => index > 0 && isSystemMessage(message));
+    if (!laterSystemMessages && contentText(head) === '' && sameSections(head.sections, this.desired)) {
+      return false;
+    }
+    const rebuilt = this.headMessage(foldSystemMessages(transcript));
+    for (let i = transcript.length - 1; i > 0; i--) {
+      if (isSystemMessage(transcript[i])) transcript.splice(i, 1);
+    }
+    transcript[0] = rebuilt;
+    return true;
+  }
+
+  /** A head declaring the desired sections and `folded`'s tools. */
+  private headMessage(folded: SystemTranscriptMessage): AgentMessage {
+    return {
+      role: 'system',
+      content: '',
+      ...(this.desired.length > 0
+        ? { sections: Object.fromEntries(this.desired.map(({ name, content }) => [name, content])) }
+        : {}),
+      ...(folded.toolsAdded && folded.toolsAdded.length > 0 ? { toolsAdded: folded.toolsAdded } : {}),
+      timestamp: folded.timestamp,
+    };
+  }
+}
+
+function contentText(message: SystemTranscriptMessage): string {
+  return replayContent([message]);
+}
+
+function sameSections(
+  declared: Record<string, string | null> | undefined,
+  desired: readonly PromptSection[],
+): boolean {
+  const entries = Object.entries(declared ?? {});
+  return entries.length === desired.length
+    && entries.every(([name, value], index) =>
+      name === desired[index]!.name && value === desired[index]!.content);
 }

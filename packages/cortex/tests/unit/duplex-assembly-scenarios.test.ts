@@ -32,6 +32,7 @@ import {
   destroyLiveFacades,
   entriesOfType,
   getBroker,
+  nextRequestSystemPrompt,
   promptTexts,
   settle,
   talkerHeadline,
@@ -123,16 +124,17 @@ describe('assembled duplex: the talker\'s hard turn cap bounds a real exchange',
 describe('assembled duplex: each loop carries its own role prompt', () => {
   /**
    * Pins: appendRolePrompt being applied by create() and reaching the string
-   * the provider would actually receive. Asserted on pi's own state, which
-   * is what a request is built from, rather than on a Cortex-side getter.
+   * the provider would actually receive. Asserted on the transcript pi's
+   * next request is built from, after the loop's real pre-request sync,
+   * rather than on a Cortex-side getter.
    */
   it('the talker prompt pi would send carries the consumer prompt then the talker role', async () => {
     const h = await createRealDuplexScenario({
       initialBasePrompt: 'You are Ada, the house assistant.',
     });
 
-    const talkerPrompt = String(h.talkerPi.state.systemPrompt);
-    const reasonerPrompt = String(h.reasonerPi.state.systemPrompt);
+    const talkerPrompt = nextRequestSystemPrompt(h.talkerPi);
+    const reasonerPrompt = nextRequestSystemPrompt(h.reasonerPi);
 
     // Consumer identity first, role prompt after (system-prompt.md ordering).
     expect(talkerPrompt).toContain('You are Ada, the house assistant.');
@@ -154,9 +156,9 @@ describe('assembled duplex: each loop carries its own role prompt', () => {
     const h = await createRealDuplexScenario();
     h.facade.setBasePrompt('You are Bea now.');
 
-    expect(String(h.talkerPi.state.systemPrompt)).toContain('You are Bea now.');
-    expect(String(h.talkerPi.state.systemPrompt)).toContain(TALKER_ROLE_PROMPT);
-    expect(String(h.reasonerPi.state.systemPrompt)).toContain(REASONER_ROLE_PROMPT);
+    expect(nextRequestSystemPrompt(h.talkerPi)).toContain('You are Bea now.');
+    expect(nextRequestSystemPrompt(h.talkerPi)).toContain(TALKER_ROLE_PROMPT);
+    expect(nextRequestSystemPrompt(h.reasonerPi)).toContain(REASONER_ROLE_PROMPT);
   });
 });
 

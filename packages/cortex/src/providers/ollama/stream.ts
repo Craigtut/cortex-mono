@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import type { AssistantMessage, Context, Model, SimpleStreamOptions, ToolCall } from '@earendil-works/pi-ai';
+import type {
+  AssistantMessage, JsonObject, Model, SimpleStreamOptions, ToolCall, TranscriptContext,
+} from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
 import { estimateContextTokens } from '@earendil-works/pi-ai/utils/estimate';
+import { collapseSystemMessages, getInitialSystemMessage } from '@earendil-works/pi-ai/utils/transcript';
 import { encodeOllamaMessages } from './messages.js';
 import { checkOllamaAllocation } from './runtime.js';
 import type { OllamaMetrics, OllamaPiModel } from './runtime.js';
@@ -59,7 +62,15 @@ export interface OllamaStreamOptions extends Omit<SimpleStreamOptions, 'reasonin
   jsonSchema?: Record<string, unknown>;
 }
 
-export function streamOllama(rawModel: Model<string>, context: Context, options: OllamaStreamOptions = {}) {
+/** `transcript` without its head's tool declarations (a request with tools disabled). */
+function withoutTools(transcript: TranscriptContext): TranscriptContext {
+  const [head, ...rest] = transcript.messages;
+  if (head?.role !== 'system' || !head.toolsAdded) return transcript;
+  const { toolsAdded: _disabled, ...bare } = head;
+  return { messages: [bare, ...rest] } as unknown as TranscriptContext;
+}
+
+export function streamOllama(rawModel: Model<string>, context: TranscriptContext, options: OllamaStreamOptions = {}) {
   const model = rawModel as OllamaPiModel;
   const runtime = model.ollamaRuntime;
   const stream = createAssistantMessageEventStream();
@@ -78,8 +89,12 @@ export function streamOllama(rawModel: Model<string>, context: Context, options:
       if (options.toolChoice && options.toolChoice !== 'auto' && options.toolChoice !== 'none') {
         throw new Error('Ollama does not support forced tool choice; use structuredComplete() for schema output');
       }
-      const requestContext = options.toolChoice === 'none' ? { ...context, tools: [] } : context;
-      if (requestContext.tools?.length && !runtime.capabilities.includes('tools')) throw new Error('The selected Ollama model does not support tools');
+      // Ollama has no mid-conversation system messages: the replayed prompt
+      // and tool set lead the request.
+      const collapsed = collapseSystemMessages(context);
+      const requestContext = options.toolChoice === 'none' ? withoutTools(collapsed) : collapsed;
+      const tools = getInitialSystemMessage(requestContext.messages)?.toolsAdded ?? [];
+      if (tools.length && !runtime.capabilities.includes('tools')) throw new Error('The selected Ollama model does not support tools');
       await checkOllamaAllocation(runtime, signal);
       const estimated = estimateContextTokens(requestContext).tokens;
       const headroom = runtime.contextWindow - estimated - Math.min(1024, Math.ceil(runtime.contextWindow * 0.05));
@@ -89,7 +104,7 @@ export function streamOllama(rawModel: Model<string>, context: Context, options:
       const think = resolveOllamaThinking(runtime.thinking, options.reasoning);
       if (think !== undefined) output.providerThinkingLevel = String(think);
       let payload: unknown = {
-        model: model.id, messages: encodeOllamaMessages(context, model.input.includes('image')), stream: true,
+        model: model.id, messages: encodeOllamaMessages(requestContext.messages, model.input.includes('image')), stream: true,
         truncate: false, shift: false,
         ...(options.jsonSchema ? { format: options.jsonSchema } : {}),
         ...(think === undefined ? {} : { think }),
@@ -99,8 +114,8 @@ export function streamOllama(rawModel: Model<string>, context: Context, options:
           ...(options.temperature === undefined ? {} : { temperature: options.temperature }),
           num_ctx: runtime.contextWindow, num_predict: Math.min(Math.floor(requested), headroom),
         },
-        ...(!requestContext.tools?.length ? {} : {
-          tools: requestContext.tools.map(tool => ({ type: 'function', function: {
+        ...(!tools.length ? {} : {
+          tools: tools.map(tool => ({ type: 'function', function: {
             name: tool.name, description: tool.description, parameters: tool.parameters,
           } })),
         }),
@@ -150,7 +165,9 @@ export function streamOllama(rawModel: Model<string>, context: Context, options:
         for (const call of chunk.message?.tool_calls ?? []) {
           finishBlock();
           metrics.firstOutputMs ??= performance.now() - started;
-          const toolCall: ToolCall = { type: 'toolCall', id: call.id ?? randomUUID(), name: call.function.name, arguments: call.function.arguments };
+          const toolCall: ToolCall = { type: 'toolCall', id: call.id ?? randomUUID(), name: call.function.name,
+            // Decoded from the NDJSON frame, so JSON-valued by construction.
+            arguments: call.function.arguments as JsonObject };
           const contentIndex = output.content.length;
           output.content.push(toolCall);
           stream.push({ type: 'toolcall_start', contentIndex, partial: output });

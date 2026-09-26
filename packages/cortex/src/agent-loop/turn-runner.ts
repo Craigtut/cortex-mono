@@ -54,7 +54,8 @@ export interface TurnRunnerPorts {
   compaction(): CompactionManager;
   /** Reactive context-overflow handling (emergency truncation). */
   handleOverflow(): void;
-  slotCount(): number;
+  /** Index of the first history message (past the system head and slots). */
+  historyStart(): number;
   notifyTailTrimmed(): void;
   pendingBackgroundCount(): number;
   /** Deliver background completions that arrived while the turn ran. */
@@ -444,7 +445,7 @@ export class TurnRunner {
 
   /** Whether trimming the failure stubs leaves a transcript continue() can resume. */
   private resumableAfterTrim(): boolean {
-    return isResumableAfterTrim(this.ports.agent.state.messages as AgentMessage[], this.ports.slotCount());
+    return isResumableAfterTrim(this.ports.agent.state.messages as AgentMessage[], this.ports.historyStart());
   }
 
   /** Remove trailing synthetic failure messages so continue() can resume. */

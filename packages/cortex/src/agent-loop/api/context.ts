@@ -35,10 +35,14 @@ export interface LoopContextApi {
   getContextManager(): ContextManager;
 
   /**
-   * Get conversation history, excluding the slot region.
+   * Get conversation history: everything after the system head and slots.
    *
-   * Returns messages from position slotCount through the end of the array.
-   * The consumer snapshots this to their storage.
+   * Includes the `role: 'system'` messages inline in history (pi's tool
+   * declarations and Cortex's prompt section updates). They carry no
+   * conversation; a consumer rendering history skips them, and one
+   * persisting it keeps them, so a restore lines up with the observational
+   * watermark and the cached prefix. The consumer snapshots this to their
+   * storage.
    *
    * @returns Conversation history messages (everything after slots)
    */
@@ -47,8 +51,9 @@ export interface LoopContextApi {
   /**
    * Restore conversation history after the slot region.
    *
-   * Splices saved messages into the array starting at position slotCount,
-   * replacing any existing conversation history.
+   * Replaces any existing conversation history. System messages in the
+   * saved history replay as declared; the loop then brings the prompt and
+   * tools up to date on its next request.
    *
    * @param messages - Previously saved conversation history
    */

@@ -28,7 +28,8 @@ export interface LoopEventDeps {
   ledger: LoopUsage;
   /** pi's live state: the transcript plus the error of the run that just ended. */
   agentState(): { messages: AgentMessage[]; errorMessage?: unknown };
-  slotCount(): number;
+  /** Index of the first history message (past the system head and slots). */
+  historyStart(): number;
   /** Resolved per event: the manager is built after the wiring. */
   compaction(): CompactionManager;
   effectiveContextWindow(): number;
@@ -101,7 +102,7 @@ export function wireLoopEvents(bridge: EventBridge, deps: LoopEventDeps): () => 
       if (!isChildEvent) {
         const now = Date.now();
         const messages = deps.agentState().messages;
-        for (let i = deps.slotCount(); i < messages.length; i++) {
+        for (let i = deps.historyStart(); i < messages.length; i++) {
           const msg = messages[i];
           if (msg && msg.timestamp == null) {
             msg.timestamp = now;
@@ -125,7 +126,7 @@ export function wireLoopEvents(bridge: EventBridge, deps: LoopEventDeps): () => 
             inputTokens,
             deps.effectiveContextWindow(),
             deps.agentState().messages,
-            deps.slotCount(),
+            deps.historyStart(),
           );
         }
       }

@@ -21,6 +21,24 @@ describe('native Ollama protocol', () => {
     expect(result.stopReason).toBe('stop');
     expect(server.requests.at(-1)?.body).not.toHaveProperty('tools');
   });
+  it('sends later system updates collapsed into one leading prompt with the current tools', async () => {
+    const { model, server } = await setup();
+    const probe = (name: string) => ({ name, description: name, parameters: { type: 'object' as const } });
+    await complete(model, { messages: [
+      { role: 'system', content: '', sections: { Rules: 'Old rules.', Env: 'Env.' }, toolsAdded: [probe('first')], timestamp: 0 },
+      { role: 'user', content: 'Hello', timestamp: 1 },
+      { role: 'system', content: '', sections: { Rules: 'New rules.' }, toolsAdded: [probe('second')], timestamp: 2 },
+      { role: 'user', content: 'Again', timestamp: 3 },
+    ] } as unknown as Context);
+    const body = server.requests.at(-1)?.body as { messages: Array<{ role: string; content: string }>; tools: Array<{ function: { name: string } }> };
+    expect(body.messages).toEqual([
+      { role: 'system', content: 'New rules.\n\nEnv.' },
+      { role: 'user', content: 'Hello' },
+      { role: 'user', content: 'Again' },
+    ]);
+    expect(body.tools.map((tool) => tool.function.name)).toEqual(['first', 'second']);
+  });
+
   it('decodes split UTF-8 frames, emits ordered events, and records cached usage and timings', async () => {
     const { model, server, onMetrics } = await setup();
     const bytes = new TextEncoder().encode([
@@ -124,10 +142,10 @@ describe('native Ollama protocol', () => {
   });
 
   it('repairs missing results without replaying aborted thinking or orphan results', () => {
-    const messages = encodeOllamaMessages({ messages: [
+    const messages = encodeOllamaMessages([
       { role: 'assistant', content: [{ type: 'toolCall', id: 'x', name: 'read', arguments: {} }], stopReason: 'toolUse' } as never,
       { role: 'user', content: 'Continue', timestamp: 1 },
-    ] }, false);
+    ], false);
     expect(messages[1]).toMatchObject({ role: 'tool', tool_call_id: 'x', content: 'Tool execution was interrupted.' });
   });
 });

@@ -50,6 +50,10 @@ export class FanOutContextManager extends ContextManager {
     return this.readManager.slotCount;
   }
 
+  override get historyStart(): number {
+    return this.readManager.historyStart;
+  }
+
   override get slots(): readonly string[] {
     return this.readManager.slots;
   }

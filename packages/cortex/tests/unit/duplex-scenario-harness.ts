@@ -35,6 +35,7 @@ import { DuplexSession } from '../../src/duplex/session.js';
 import type { SessionLogEntry } from '../../src/session-log.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 import { partsOf } from './agent-loop/parts.js';
+import { getCurrentSystemPrompt } from '@earendil-works/pi-ai/utils/transcript';
 
 // ---------------------------------------------------------------------------
 // Scripted mock pi agent
@@ -93,6 +94,12 @@ export interface ScriptedPiAgent extends PiAgent {
    * exactly where pi consults it.
    */
   beforeToolCall?: BeforeToolCallHook;
+  /**
+   * The real Cortex prepareRequest hook (the system prompt sync), installed
+   * by the real-duplex harness. Run before every scripted model call,
+   * exactly where pi runs it.
+   */
+  prepareRequest?: PrepareRequestHook;
   /** Fail the next run with this error instead of producing a turn. */
   failWith: Error | null;
   /** Abort signal of the live run, or null when idle. */
@@ -106,6 +113,19 @@ export type AfterToolCallHook = (ctx: {
   result: { content: unknown };
   isError: boolean;
 }) => Promise<{ content?: unknown; terminate?: boolean } | undefined>;
+
+export type PrepareRequestHook = (request: { context: { messages: AgentMessage[] } }) => unknown;
+
+/**
+ * The system prompt `pi` would send on its next request: its transcript
+ * after the loop's pre-request sync, replayed. Runs the sync on a copy, so
+ * the live transcript is untouched.
+ */
+export function nextRequestSystemPrompt(pi: ScriptedPiAgent): string {
+  const transcript = [...pi.state.messages];
+  pi.prepareRequest?.({ context: { messages: transcript } });
+  return getCurrentSystemPrompt(transcript);
+}
 
 export type BeforeToolCallHook = (
   ctx: { toolCall: { name: string }; args: unknown },
@@ -191,6 +211,7 @@ export function createScriptedPiAgent(): ScriptedPiAgent {
         for (let turn = 0; turn < MAX_SCRIPTED_TURNS_PER_RUN; turn++) {
           const scripted: ScriptedTurn = agent.script.shift()
             ?? { text: agent.defaultText };
+          agent.prepareRequest?.({ context: { messages: agent.state.messages } });
           agent.modelCalls += 1;
           const calls = scripted.calls ?? [];
           const text = scripted.text ?? agent.defaultText;
@@ -677,6 +698,7 @@ export async function createRealDuplexScenario(
     });
     pi.afterToolCall = agentConfig['afterToolCall'] as AfterToolCallHook;
     pi.beforeToolCall = agentConfig['beforeToolCall'] as BeforeToolCallHook | undefined;
+    pi.prepareRequest = agentConfig['prepareRequest'] as PrepareRequestHook;
     statics.wireManagedPiAgent(loop, pi);
     loopConfigs.push(loopConfig);
     builtLoops.set(loopConfig.loopPath ?? 'main', { loop, pi });

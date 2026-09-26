@@ -1,4 +1,5 @@
-import type { Context, Message } from '@earendil-works/pi-ai';
+import type { Message } from '@earendil-works/pi-ai';
+import { getSystemMessageText } from '@earendil-works/pi-ai/utils/text';
 
 export interface OllamaMessage {
   role: string;
@@ -10,16 +11,24 @@ export interface OllamaMessage {
   tool_call_id?: string;
 }
 
-/** Preserve native thinking and call identities, including restored legacy custom-provider turns. */
-export function encodeOllamaMessages(context: Context, vision: boolean): OllamaMessage[] {
+/**
+ * Preserve native thinking and call identities, including restored legacy
+ * custom-provider turns. `transcript` is collapsed: at most one system
+ * message, leading.
+ */
+export function encodeOllamaMessages(transcript: readonly Message[], vision: boolean): OllamaMessage[] {
   const messages: OllamaMessage[] = [];
-  if (context.systemPrompt) messages.push({ role: 'system', content: context.systemPrompt });
   const pending = new Map<string, string>();
   const closePending = () => {
     for (const [id, name] of pending) messages.push({ role: 'tool', content: 'Tool execution was interrupted.', tool_name: name, tool_call_id: id });
     pending.clear();
   };
-  for (const message of context.messages as Message[]) {
+  for (const message of transcript) {
+    if (message.role === 'system') {
+      const prompt = getSystemMessageText(message);
+      if (prompt) messages.push({ role: 'system', content: prompt });
+      continue;
+    }
     if (message.role === 'assistant' && ['error', 'aborted'].includes(message.stopReason)) continue;
     if (message.role !== 'toolResult') closePending();
     if (message.role === 'assistant') {

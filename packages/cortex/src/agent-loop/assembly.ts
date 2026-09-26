@@ -159,7 +159,7 @@ export function assembleLoop(params: {
     // The observational buffer watermark (and any in-flight observer's end
     // index) is clamped to the surviving post-slot length: pi emits
     // turn_end for trimmed messages before Cortex removes them.
-    const postSlotLength = Math.max(0, agent.state.messages.length - contextManager.slotCount);
+    const postSlotLength = Math.max(0, agent.state.messages.length - contextManager.historyStart);
     compactionManager.onSourceHistoryTailTrimmed(postSlotLength);
   };
 
@@ -232,7 +232,10 @@ export function assembleLoop(params: {
     logger,
   });
   const systemPrompt = new SystemPromptState({
-    agentState: () => agent.state,
+    initialPrompt: () => {
+      const existing = agent.state.systemPrompt;
+      return typeof existing === 'string' ? existing : '';
+    },
     hasTool: (name) => tools.has(name),
     workingTagsEnabled: () => host.workingTagsEnabled(),
     workingDirectory: config.workingDirectory,
@@ -302,7 +305,7 @@ export function assembleLoop(params: {
     diagnostics,
     ledger: usage,
     agentState: () => agent.state as unknown as { messages: AgentMessage[]; errorMessage?: unknown },
-    slotCount: () => contextManager.slotCount,
+    historyStart: () => contextManager.historyStart,
     compaction: () => compactionManager,
     effectiveContextWindow: () => compactionManager.contextWindow,
     budgetSummary: () => ({
@@ -344,7 +347,7 @@ export function assembleLoop(params: {
       () => host.getConversationHistory(),
       (history) => host.restoreConversationHistory(history),
     ),
-    slotCount: () => contextManager.slotCount,
+    historyStart: () => contextManager.historyStart,
     notifyTailTrimmed,
     pendingBackgroundCount: () => background.pending.length,
     drainBackground: () => background.drain(),
@@ -439,7 +442,7 @@ export function assembleLoop(params: {
   // refresh goes through the host.
   tools.refresh();
 
-  const compactionManager = new CompactionManager(compactionConfig, slots.length);
+  const compactionManager = new CompactionManager(compactionConfig, contextManager.historyStart);
   compactionManager.setLogger(logger);
   // Summarization runs on the primary model, observation and reflection on
   // the utility model; each is tagged so its spend lands in its own

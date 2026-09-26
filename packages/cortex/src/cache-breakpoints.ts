@@ -33,9 +33,10 @@
 
 /**
  * API-level message indices where cache_control breakpoints are stamped.
- * Indices refer to positions in the final Anthropic `messages` array (after
- * pi-ai's convertMessages), not Cortex's internal message array. -1 means
- * the breakpoint does not apply.
+ * Indices count the user and assistant messages of the final Anthropic
+ * `messages` array (after pi-ai's convertMessages), skipping its `system`
+ * entries, not Cortex's internal message array. -1 means the breakpoint
+ * does not apply.
  */
 export interface CacheBreakpointIndices {
   bp2ApiIndex: number;
@@ -44,13 +45,14 @@ export interface CacheBreakpointIndices {
 
 /**
  * Region boundaries in the Cortex-side message array.
- * - slotCount: messages [0, slotCount) are slot messages; BP2 lands on the
- *   last one that survives API conversion.
+ * - slotEnd: messages [0, slotEnd) are the fixed prefix (the system head,
+ *   when present, and the slots); BP2 lands on the last one that survives
+ *   API conversion.
  * - boundary: messages [0, boundary) are the stable prefix; BP3 lands on the
  *   last surviving message before the boundary.
  */
 export interface CacheBreakpointRegions {
-  slotCount: number;
+  slotEnd: number;
   boundary: number;
 }
 
@@ -142,6 +144,11 @@ function isRemovedByTransform(msg: LooseMessage): boolean {
 function isSkippedByConversion(msg: LooseMessage): boolean {
   const { role, content } = msg;
 
+  // The leading system message becomes the request's `system` field; later
+  // ones are collapsed into it or emitted as `system` entries, which
+  // stamping skips (see applyCacheBreakpoints).
+  if (role === 'system') return true;
+
   if (role === 'user') {
     if (typeof content === 'string') {
       return content.trim().length === 0;
@@ -207,7 +214,7 @@ export function computeCacheBreakpointIndices(
   messages: readonly unknown[],
   regions: CacheBreakpointRegions,
 ): CacheBreakpointIndices {
-  const { slotCount } = regions;
+  const { slotEnd } = regions;
   // A boundary beyond the array means the stable prefix is inconsistent with
   // the messages being sent; produce no BP3 rather than stamping churning content.
   const boundary = regions.boundary > messages.length ? -1 : regions.boundary;
@@ -246,7 +253,7 @@ export function computeCacheBreakpointIndices(
       apiIndex++;
     }
 
-    if (i < slotCount) {
+    if (i < slotEnd) {
       bp2ApiIndex = apiIndex;
     }
     if (i < boundary) {
@@ -328,8 +335,12 @@ export function applyCacheBreakpoints(
     }
   }
 
-  const messages = payload['messages'] as Array<Record<string, unknown>> | undefined;
-  if (!messages) return undefined;
+  const payloadMessages = payload['messages'] as Array<Record<string, unknown>> | undefined;
+  if (!payloadMessages) return undefined;
+  // Mid-conversation system updates (and managed-effort markers) are
+  // emitted as `system` entries wherever pi-ai places them; indices count
+  // around them.
+  const messages = payloadMessages.filter((message) => message['role'] !== 'system');
 
   if (indices.bp2ApiIndex >= 0 && indices.bp2ApiIndex < messages.length) {
     addCacheControlToMessage(messages[indices.bp2ApiIndex]!, cacheControl);
@@ -411,7 +422,7 @@ export function resolveDirectCompletionContext(
   messages.push({ role: 'user' as const, content: prompt });
 
   const indices = computeCacheBreakpointIndices(messages, {
-    slotCount: slotMessages.length,
+    slotEnd: slotMessages.length,
     boundary,
   });
 

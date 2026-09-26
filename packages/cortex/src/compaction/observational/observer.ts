@@ -16,6 +16,7 @@ import type { AgentMessage } from '../../context-manager.js';
 import type { ObserverOutput } from './types.js';
 import { OBSERVER_SYSTEM_PROMPT } from './constants.js';
 import { estimateTokens } from '../../token-estimator.js';
+import { isSystemMessage } from '../../system-transcript.js';
 
 // ---------------------------------------------------------------------------
 // Message Formatting
@@ -41,6 +42,8 @@ export function formatMessagesForObserver(messages: AgentMessage[]): string {
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
+    // Prompt and tool declarations, not conversation.
+    if (isSystemMessage(msg)) continue;
     const roleLabel = msg.role;
 
     // Build the timestamp label from message metadata

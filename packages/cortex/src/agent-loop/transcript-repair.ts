@@ -11,6 +11,7 @@
 
 import type { AgentMessage } from '../context-manager.js';
 import { messageHasText, messageHasToolCalls, userMessageText } from '../pi-message.js';
+import { isSystemMessage } from '../system-transcript.js';
 
 type RawMessage = Record<string, unknown>;
 
@@ -48,12 +49,15 @@ export function trailingFailureCount(messages: readonly AgentMessage[], floor = 
 
 /**
  * Whether trimming trailing failure stubs would leave a transcript that
- * continue() can resume: the last message is a user or tool-result past the
+ * continue() can resume: the last turn is a user or tool-result past the
  * slot region (a failure with only slots present must surface instead).
+ * System messages declare, they are not turns: one trailing (a tool or
+ * prompt update pi or Cortex wrote after the results) is looked past.
  */
-export function isResumableAfterTrim(messages: readonly AgentMessage[], slotCount: number): boolean {
-  const lastIndex = messages.length - trailingFailureCount(messages) - 1;
-  if (lastIndex < slotCount) return false;
+export function isResumableAfterTrim(messages: readonly AgentMessage[], historyStart: number): boolean {
+  let lastIndex = messages.length - trailingFailureCount(messages) - 1;
+  while (lastIndex >= historyStart && isSystemMessage(messages[lastIndex])) lastIndex -= 1;
+  if (lastIndex < historyStart) return false;
   return raw(messages[lastIndex])['role'] !== 'assistant';
 }
 

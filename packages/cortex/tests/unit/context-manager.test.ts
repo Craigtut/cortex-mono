@@ -30,8 +30,20 @@ describe('ContextManager', () => {
         slots: ['credentials', 'contacts', 'goals'],
       });
 
-      expect(agent.state.messages.length).toBe(3);
+      // The system head, then the three slots.
+      expect(agent.state.messages.length).toBe(4);
+      expect(agent.state.messages[0]!.role).toBe('system');
       expect(cm.slotCount).toBe(3);
+      expect(cm.historyStart).toBe(4);
+    });
+
+    it('keeps a system head pi already created instead of adding another', () => {
+      agent.state.messages.push({ role: 'system', content: 'from pi', timestamp: 0 });
+      const cm = new ContextManager(agent, { slots: ['a'] });
+
+      expect(agent.state.messages.map((message) => message.role)).toEqual(['system', 'user']);
+      expect(agent.state.messages[0]!.content).toBe('from pi');
+      expect(cm.historyStart).toBe(2);
     });
 
     it('creates slots with empty content', () => {
@@ -66,7 +78,8 @@ describe('ContextManager', () => {
       });
 
       expect(cm.slotCount).toBe(0);
-      expect(agent.state.messages.length).toBe(0);
+      expect(agent.state.messages.length).toBe(1);
+      expect(cm.historyStart).toBe(1);
     });
   });
 
@@ -82,25 +95,26 @@ describe('ContextManager', () => {
 
       cm.setSlot('second', 'Hello from second slot');
 
-      expect(agent.state.messages[1]).toMatchObject({
+      expect(agent.state.messages[2]).toMatchObject({
         role: 'user',
         content: 'Hello from second slot',
       });
-      expect(agent.state.messages[1]!.timestamp).toEqual(expect.any(Number));
+      expect(agent.state.messages[2]!.timestamp).toEqual(expect.any(Number));
     });
 
-    it('updates position 0 for the first slot', () => {
+    it('updates the position right after the head for the first slot', () => {
       const cm = new ContextManager(agent, {
         slots: ['alpha', 'beta'],
       });
 
       cm.setSlot('alpha', 'First slot content');
 
-      expect(agent.state.messages[0]).toMatchObject({
+      expect(agent.state.messages[0]!.role).toBe('system');
+      expect(agent.state.messages[1]).toMatchObject({
         role: 'user',
         content: 'First slot content',
       });
-      expect(agent.state.messages[0]!.timestamp).toEqual(expect.any(Number));
+      expect(agent.state.messages[1]!.timestamp).toEqual(expect.any(Number));
     });
 
     it('overwrites previous content when called multiple times', () => {
@@ -134,9 +148,9 @@ describe('ContextManager', () => {
       cm.setSlot('a', 'first');
       cm.setSlot('b', 'second');
 
-      expect(agent.state.messages[0]!.content).toBe('first');
-      expect(agent.state.messages[1]!.content).toBe('second');
-      expect(agent.state.messages[2]!.content).toBe('third');
+      expect(agent.state.messages[1]!.content).toBe('first');
+      expect(agent.state.messages[2]!.content).toBe('second');
+      expect(agent.state.messages[3]!.content).toBe('third');
     });
 
     it('does not affect conversation history after slots', () => {
@@ -153,10 +167,10 @@ describe('ContextManager', () => {
       // Update slot should not touch conversation history
       cm.setSlot('slot1', 'updated slot');
 
-      expect(agent.state.messages.length).toBe(3);
-      expect(agent.state.messages[0]!.content).toBe('updated slot');
-      expect(agent.state.messages[1]!.content).toBe('Hello');
-      expect(agent.state.messages[2]!.content).toBe('Hi there!');
+      expect(agent.state.messages.length).toBe(4);
+      expect(agent.state.messages[1]!.content).toBe('updated slot');
+      expect(agent.state.messages[2]!.content).toBe('Hello');
+      expect(agent.state.messages[3]!.content).toBe('Hi there!');
     });
   });
 
@@ -198,7 +212,7 @@ describe('ContextManager', () => {
       });
 
       // Simulate a content array message (e.g., from manual manipulation)
-      agent.state.messages[0] = {
+      agent.state.messages[1] = {
         role: 'user',
         content: [
           { type: 'text', text: 'Part one. ' },
@@ -427,12 +441,12 @@ describe('ContextManager', () => {
       cm.setSlot('goals', 'goals');
       cm.setSlot('tasks', 'tasks');
 
-      expect(agent.state.messages[0]!.content).toBe('creds');
-      expect(agent.state.messages[1]!.content).toBe('contacts');
-      expect(agent.state.messages[2]!.content).toBe('self');
-      expect(agent.state.messages[3]!.content).toBe('memory');
-      expect(agent.state.messages[4]!.content).toBe('goals');
-      expect(agent.state.messages[5]!.content).toBe('tasks');
+      expect(agent.state.messages[1]!.content).toBe('creds');
+      expect(agent.state.messages[2]!.content).toBe('contacts');
+      expect(agent.state.messages[3]!.content).toBe('self');
+      expect(agent.state.messages[4]!.content).toBe('memory');
+      expect(agent.state.messages[5]!.content).toBe('goals');
+      expect(agent.state.messages[6]!.content).toBe('tasks');
     });
   });
 });

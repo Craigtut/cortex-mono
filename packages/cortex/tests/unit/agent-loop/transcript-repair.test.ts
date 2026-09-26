@@ -37,6 +37,14 @@ describe('failure stubs', () => {
     expect(isResumableAfterTrim([user('slot'), stub()], 1)).toBe(false);
     expect(isResumableAfterTrim([user('slot'), user('q'), toolCallTurn(), stub()], 1)).toBe(false);
   });
+
+  it('looks past a trailing system update to the last turn', () => {
+    const update = { role: 'system', content: '', toolsAdded: [], timestamp: 1 } as unknown as AgentMessage;
+    const result = { role: 'toolResult', content: [{ type: 'text', text: 'r' }] } as unknown as AgentMessage;
+    expect(isResumableAfterTrim([user('slot'), toolCallTurn(), result, update], 1)).toBe(true);
+    expect(isResumableAfterTrim([user('slot'), user('q'), answer('done'), update], 1)).toBe(false);
+    expect(isResumableAfterTrim([user('slot'), update], 1)).toBe(false);
+  });
 });
 
 describe('unwindFailedDelivery', () => {

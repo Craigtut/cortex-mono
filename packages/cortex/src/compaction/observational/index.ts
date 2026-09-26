@@ -191,7 +191,7 @@ export class ObservationalMemoryEngine {
    *
    * @param context - The AgentContext from transformContext
    * @param utilization - Current total context utilization (0-1)
-   * @param slotCount - Number of slot messages at the start of the array
+   * @param historyStart - Index of the first history message (past the system head and slots)
    * @param getHistory - Get conversation history from the context (post-slot)
    * @param setHistory - Set conversation history in the context (post-slot)
    * @param getSourceHistory - Get the original transcript history (agent.state.messages post-slot)
@@ -210,7 +210,7 @@ export class ObservationalMemoryEngine {
   async applyInTransformContext(
     context: AgentContext,
     utilization: number,
-    slotCount: number,
+    historyStart: number,
     getHistory: (ctx: AgentContext) => AgentMessage[],
     setHistory: (ctx: AgentContext, history: AgentMessage[]) => AgentContext,
     getSourceHistory: () => AgentMessage[],
@@ -353,7 +353,7 @@ export class ObservationalMemoryEngine {
     const newMessages: AgentMessage[] = [
       ...slotRegion,
       observationSlotMessage,
-      ...context.messages.slice(this.slotIndex + 1, slotCount),
+      ...context.messages.slice(this.slotIndex + 1, historyStart),
       ...postSlotMessages,
     ];
 
@@ -376,13 +376,13 @@ export class ObservationalMemoryEngine {
    * @param totalTokens - Total tokens from the last LLM response
    * @param contextWindow - Current context window size
    * @param messages - Current conversation messages (post-slot)
-   * @param slotCount - Number of slot messages
+   * @param historyStart - Index of the first history message (past the system head and slots)
    */
   onTurnEnd(
     totalTokens: number,
     contextWindow: number,
     messages: AgentMessage[],
-    slotCount: number,
+    historyStart: number,
   ): void {
     if (!this.completeFn || contextWindow <= 0) return;
 
@@ -400,7 +400,7 @@ export class ObservationalMemoryEngine {
     });
 
     // Skip slot messages to avoid processing them as conversation content
-    const history = messages.slice(slotCount);
+    const history = messages.slice(historyStart);
 
     // Compute unobserved tokens (messages after buffer watermark)
     const watermark = this.buffering.getWatermark();
@@ -450,13 +450,13 @@ export class ObservationalMemoryEngine {
    * settles; only the waiting is abandoned.
    *
    * @param messages - The full message array (slot messages included)
-   * @param slotCount - Number of slot messages to skip
+   * @param historyStart - Index of the first history message (past the system head and slots)
    * @param timeoutMs - Wall-clock budget for observer waits (default 60s)
    * @returns true when an observer call ran to completion in this digestion
    */
   async digestPendingBuffers(
     messages: AgentMessage[],
-    slotCount: number,
+    historyStart: number,
     timeoutMs: number = DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS,
   ): Promise<boolean> {
     if (!this.completeFn) return false;
@@ -470,7 +470,7 @@ export class ObservationalMemoryEngine {
       return false;
     }
 
-    const history = messages.slice(slotCount);
+    const history = messages.slice(historyStart);
     const watermark = this.buffering.getWatermark();
     const unobserved = history.slice(watermark);
     if (unobserved.length === 0) return false;
@@ -567,13 +567,13 @@ export class ObservationalMemoryEngine {
    * log captures the correction immediately.
    *
    * @param messages - The full message array (may include slot messages)
-   * @param slotCount - Number of slot messages to skip
+   * @param historyStart - Index of the first history message (past the system head and slots)
    */
   async triggerObservation(
     messages: AgentMessage[],
-    slotCount: number,
+    historyStart: number,
   ): Promise<void> {
-    const history = messages.slice(slotCount);
+    const history = messages.slice(historyStart);
     if (!this.completeFn || history.length === 0) return;
 
     const output = await runObserver(

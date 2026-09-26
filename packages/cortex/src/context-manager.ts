@@ -9,11 +9,17 @@
  *   Never stored in agent.state.messages. Rebuilt every LLM call.
  *
  * Message array layout:
- *   [SLOT REGION (0..N-1)] [CONVERSATION HISTORY] [EPHEMERAL (in transformContext)] [PROMPT]
+ *   [SYSTEM HEAD (0)] [SLOT REGION (1..N)] [CONVERSATION HISTORY] [EPHEMERAL (in transformContext)] [PROMPT]
+ *
+ * The head is pi's leading system message (prompt and initial tools). History
+ * may carry later system messages inline (see system-transcript.ts), so the
+ * history region starts at {@link ContextManager.historyStart}, not at the
+ * slot count.
  *
  * Reference: context-manager.md
  */
 
+import { emptySystemHead, isSystemMessage } from './system-transcript.js';
 import type { ContextManagerConfig } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -26,12 +32,18 @@ import type { ContextManagerConfig } from './types.js';
  * only what we need to avoid a hard dependency.
  */
 export interface AgentMessage {
-  role: 'user' | 'assistant' | 'toolResult';
+  role: 'user' | 'assistant' | 'toolResult' | 'system';
   content: string | Array<{ type: string; text?: string; [key: string]: unknown }>;
   toolCallId?: string;
   toolName?: string;
   details?: unknown;
   isError?: boolean;
+  /** System messages only: named prompt sections (see system-transcript.ts). */
+  sections?: Record<string, string | null>;
+  /** System messages only: tool declarations that become available here. */
+  toolsAdded?: unknown[];
+  /** System messages only: tools that stop being available here. */
+  toolsRemoved?: unknown[];
   /** Epoch milliseconds when this message was created. Stamped by Cortex at turn boundaries. */
   timestamp: number;
 }
@@ -43,7 +55,8 @@ export interface AgentMessage {
 export interface AgentStateAccessor {
   state: {
     messages: AgentMessage[];
-    systemPrompt?: string;
+    /** Read-only in pi: the prompt replayed from the transcript's system messages. */
+    readonly systemPrompt?: string;
     model?: unknown;
     thinkingLevel?: string;
     tools?: unknown[];
@@ -68,6 +81,9 @@ export interface AgentContext {
 // ContextManager
 // ---------------------------------------------------------------------------
 
+/** Where pi's leading system message sits; the slots follow it. */
+export const SYSTEM_HEAD_INDEX = 0;
+
 export class ContextManager {
   private readonly agent: AgentStateAccessor;
   private readonly slotNames: readonly string[];
@@ -84,20 +100,20 @@ export class ContextManager {
     this.agent = agent;
     this.slotNames = Object.freeze([...config.slots]);
 
-    // Build index map: slot name -> position in messages array
+    // Build index map: slot name -> position in messages array (behind the head)
     const indexMap = new Map<string, number>();
     for (let i = 0; i < config.slots.length; i++) {
       const name = config.slots[i]!;
       if (indexMap.has(name)) {
         throw new Error(`Duplicate slot name: "${name}"`);
       }
-      indexMap.set(name, i);
+      indexMap.set(name, SYSTEM_HEAD_INDEX + 1 + i);
     }
     this.slotIndexMap = indexMap;
 
-    // Initialize slot positions in the messages array with empty user-role messages.
-    // This ensures the array has the correct length from the start.
-    this.initializeSlots();
+    // Put the head and the slot positions in place so every index is fixed
+    // from construction on.
+    this.initializeLayout();
   }
 
   /**
@@ -105,6 +121,14 @@ export class ContextManager {
    */
   get slotCount(): number {
     return this.slotNames.length;
+  }
+
+  /**
+   * Index of the first history message: past the system head and the slots.
+   * Everything before it is the fixed prefix.
+   */
+  get historyStart(): number {
+    return SYSTEM_HEAD_INDEX + 1 + this.slotNames.length;
   }
 
   /**
@@ -221,13 +245,19 @@ export class ContextManager {
   }
 
   /**
-   * Initialize slot positions with empty user-role messages.
-   * Ensures the messages array has the correct length from construction.
+   * Ensure the system head at index 0 (pi creates one only for a non-empty
+   * initial prompt) and empty user-role messages at every slot position.
    */
-  private initializeSlots(): void {
-    // Ensure the messages array exists and has at least slotCount entries
-    while (this.agent.state.messages.length < this.slotNames.length) {
-      this.agent.state.messages.push({
+  private initializeLayout(): void {
+    const messages = this.agent.state.messages;
+    if (!isSystemMessage(messages[SYSTEM_HEAD_INDEX])) {
+      messages.unshift(emptySystemHead());
+    }
+    // Not the historyStart getter: this runs inside the constructor, where
+    // a subclass override (the duplex fan-out view) is not initialized yet.
+    const historyStart = SYSTEM_HEAD_INDEX + 1 + this.slotNames.length;
+    while (messages.length < historyStart) {
+      messages.push({
         role: 'user',
         content: '',
         timestamp: 0,

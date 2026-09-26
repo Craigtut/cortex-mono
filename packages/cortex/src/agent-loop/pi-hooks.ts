@@ -1,8 +1,9 @@
 /**
  * The seam between AgentLoop and pi's Agent: the Agent's construction
  * config and the hooks Cortex runs inside pi's loop (stream options, the
- * permission gate, tool-result finalization, and cache-breakpoint payload
- * stamping), plus the public tool-result interceptor contract.
+ * pre-request system prompt sync, the permission gate, tool-result
+ * finalization, and cache-breakpoint payload stamping), plus the public
+ * tool-result interceptor contract.
  */
 
 import { applyCacheBreakpoints } from '../cache-breakpoints.js';
@@ -67,6 +68,8 @@ export interface PiHookHost extends PermissionHost {
   /** Cache retention and session key for the next provider request. */
   streamOptions(): { retention: CacheRetention | null; sessionId: string | null };
   syncActiveLoopTools(ctx: unknown): void;
+  /** Write the loop's system prompt into pi's in-loop transcript before a request. */
+  syncSystemTranscript(transcript: AgentMessage[]): void;
   finalizer: ToolResultFinalizer;
   cacheBreakpointIndices(): CacheBreakpointIndices | null;
 }
@@ -82,18 +85,18 @@ export async function loadAgentClass(errorMessage: string): Promise<new (config:
 
 /**
  * The config pi's Agent is constructed with. `host` is resolved per call
- * because the Agent is built before the loop that owns it exists.
+ * because the Agent is built before the loop that owns it exists. No
+ * system prompt: the loop owns the transcript's system head and writes it
+ * before each request (prepareRequest below).
  */
 export function buildPiAgentConfig(params: {
   cortexConfig: AgentLoopConfig;
-  initialSystemPrompt?: string;
   host: () => PiHookHost | null;
 }): Record<string, unknown> {
-  const { cortexConfig, initialSystemPrompt = '', host } = params;
+  const { cortexConfig, host } = params;
   const rawModel = unwrapModel(cortexConfig.model) as PiModel;
   const agentConfig: Record<string, unknown> = {
     initialState: {
-      systemPrompt: initialSystemPrompt,
       model: rawModel,
       tools: [],
       messages: [],
@@ -116,6 +119,15 @@ export function buildPiAgentConfig(params: {
       if (sessionId) (streamOptions as Record<string, unknown>)['sessionId'] = sessionId;
     }
     return streamSimple(model as any, context as any, streamOptions as any);
+  };
+
+  // Runs before every provider request, the first included, after pi has
+  // appended the request's queued messages and tool declarations. The
+  // context is pi's live in-loop one, so writes here persist for the run;
+  // the transform hook mirrors them into agent.state right after.
+  agentConfig['prepareRequest'] = (request: { context: { messages: AgentMessage[] } }) => {
+    host()?.syncSystemTranscript(request.context.messages);
+    return undefined;
   };
 
   const beforeToolCall = createBeforeToolCall(cortexConfig, host);
