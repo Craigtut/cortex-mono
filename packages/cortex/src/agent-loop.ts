@@ -38,7 +38,6 @@ import {
   isRetryableCategory,
   withElapsedCeiling,
 } from './retry-policy.js';
-import { parseWorkingTags } from './working-tags.js';
 import {
   assistantText,
   assistantUsage,
@@ -47,18 +46,9 @@ import {
   messageHasToolCalls,
   toolCallArguments,
   toolCallNames,
-  turnInputTokens,
-  turnText,
   userMessageText,
   withPlaceholderContent,
 } from './pi-message.js';
-import {
-  accumulateTurn,
-  accumulateUtility,
-  addSessionUsage,
-  cloneSessionUsage,
-  zeroSessionUsage,
-} from './session-usage.js';
 import { renderPermissionRequest } from './permission-rendering.js';
 import { toolCallSubject } from './tools/tool-call-subject.js';
 // pi-ai 0.80 moved the static catalog reads off the root to the durable
@@ -98,6 +88,8 @@ import type { CortexModel } from './model-wrapper.js';
 import { SystemPromptState } from './agent-loop/system-prompt.js';
 import { HandlerList } from './agent-loop/handler-list.js';
 import { ProcessTracker } from './agent-loop/process-tracker.js';
+import { UsageLedger } from './agent-loop/usage-ledger.js';
+import { wireLoopEvents } from './agent-loop/event-wiring.js';
 import { estimateTokens } from './token-estimator.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
@@ -142,7 +134,6 @@ import type {
   ToolExecuteContext,
   PersistResultFn,
   ToolCategory,
-  UtilityUsagePayload,
 } from './types.js';
 import { structuredCompletionRequest, parseSchemaCompletion } from './structured-completion.js';
 import { processToolResult } from './tool-result-persistence.js';
@@ -753,16 +744,8 @@ export class AgentLoop {
   // should be injected (BP2 = after last slot, BP3 = old history boundary).
   private _cacheBreakpointIndices: CacheBreakpointIndices | null = null;
 
-  // Usage from the most recent directComplete() or structuredComplete() call.
-  // Reset to null before each call. Consumers read this after a call to
-  // capture per-phase usage for persistence.
-  private _lastDirectUsage: CortexUsage | null = null;
-
-  // Session-lifetime usage accumulation. Unlike BudgetGuard (which resets
-  // per agentic loop for enforcement), this accumulates across all loops
-  // for reporting and persistence. Consumers can snapshot via getSessionUsage()
-  // and restore via restoreSessionUsage().
-  private _sessionUsage: SessionUsage = zeroSessionUsage();
+  // Session-lifetime usage plus the last direct completion's usage.
+  private readonly usage = new UsageLedger();
 
   /**
    * Create an AgentLoop. Prefer AgentLoop.create().
@@ -896,7 +879,25 @@ export class AgentLoop {
     this.eventBridge.wire(agent);
 
     // Wire internal event handlers
-    this.wireInternalEvents();
+    this.eventUnsubscribers.push(wireLoopEvents(this.eventBridge, {
+      logger: this.logger,
+      diagnostics: this.promptDiagnostics,
+      ledger: this.usage,
+      agentState: () => this.agent.state as unknown as { messages: AgentMessage[]; errorMessage?: unknown },
+      slotCount: () => this.contextManager.slotCount,
+      compaction: () => this.compactionManager,
+      effectiveContextWindow: () => this.effectiveContextWindow,
+      budgetSummary: () => ({
+        turns: this.budgetGuard.getTurnCount(),
+        totalCost: this.budgetGuard.getTotalCost(),
+      }),
+      onLoopEnd: () => {
+        this.skillBuffer = [];
+      },
+      loopComplete: this.loopCompleteHandlers,
+      turnComplete: this.turnCompleteHandlers,
+      origin: this.originContext,
+    }));
 
     // Set up BudgetGuard
     const budgetGuardConfig: {
@@ -2592,7 +2593,7 @@ export class AgentLoop {
       }
     }
 
-    this._lastDirectUsage = null;
+    this.usage.lastDirect = null;
 
     const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
 
@@ -2618,12 +2619,12 @@ export class AgentLoop {
       this.checkForSilentError(result);
 
       // Capture usage from the AssistantMessage response
-      this._lastDirectUsage = assistantUsage(result);
-      this.recordUtilityUsage(options?.usageCategory ?? 'direct', this._lastDirectUsage);
+      this.usage.lastDirect = assistantUsage(result);
+      this.recordUtilityUsage(options?.usageCategory ?? 'direct', this.usage.lastDirect);
 
       this.logger.debug('directComplete', {
         durationMs: Date.now() - directStartMs,
-        usage: this._lastDirectUsage,
+        usage: this.usage.lastDirect,
       });
 
       // Extract text from the AssistantMessage response
@@ -2689,7 +2690,7 @@ export class AgentLoop {
       }
     }
 
-    this._lastDirectUsage = null;
+    this.usage.lastDirect = null;
     const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
 
     const structuredRequest = structuredCompletionRequest(this.primaryModel, schema, tool);
@@ -2720,13 +2721,13 @@ export class AgentLoop {
       this.checkForSilentError(result);
 
       // Capture usage from the AssistantMessage response
-      this._lastDirectUsage = assistantUsage(result);
-      this.recordUtilityUsage(options?.usageCategory ?? 'structured', this._lastDirectUsage);
+      this.usage.lastDirect = assistantUsage(result);
+      this.recordUtilityUsage(options?.usageCategory ?? 'structured', this.usage.lastDirect);
 
       this.logger.debug('structuredComplete', {
         toolName,
         durationMs: Date.now() - structStartMs,
-        usage: this._lastDirectUsage,
+        usage: this.usage.lastDirect,
       });
 
       // Extract tool call arguments from the response
@@ -3758,7 +3759,7 @@ export class AgentLoop {
       }
     }
 
-    this._lastDirectUsage = null;
+    this.usage.lastDirect = null;
 
     const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
 
@@ -3780,12 +3781,12 @@ export class AgentLoop {
       this.checkForSilentError(result);
 
       // Capture usage from utility model calls
-      this._lastDirectUsage = assistantUsage(result);
-      this.recordUtilityUsage(options?.usageCategory ?? 'utility', this._lastDirectUsage);
+      this.usage.lastDirect = assistantUsage(result);
+      this.recordUtilityUsage(options?.usageCategory ?? 'utility', this.usage.lastDirect);
 
       this.logger.debug('utilityComplete', {
         durationMs: Date.now() - utilStartMs,
-        usage: this._lastDirectUsage,
+        usage: this.usage.lastDirect,
       });
 
       return assistantText(result);
@@ -4169,7 +4170,7 @@ export class AgentLoop {
    * at the start of each directComplete/structuredComplete call.
    */
   getLastDirectUsage(): CortexUsage | null {
-    return this._lastDirectUsage;
+    return this.usage.lastDirect;
   }
 
   /**
@@ -4180,7 +4181,7 @@ export class AgentLoop {
    * and restore it via restoreSessionUsage() after loading a saved session.
    */
   getSessionUsage(): SessionUsage {
-    return cloneSessionUsage(this._sessionUsage);
+    return this.usage.snapshot();
   }
 
   /**
@@ -4191,13 +4192,13 @@ export class AgentLoop {
    * before the restore call).
    */
   restoreSessionUsage(usage: SessionUsage): void {
-    this._sessionUsage = addSessionUsage(this._sessionUsage, usage);
+    this.usage.restore(usage);
   }
 
   /**
    * Emit a utility_usage event for a completed direct/utility call. The
    * session-usage accumulation happens in the event listener (see
-   * wireInternalEvents), one code path for this loop's own completions and
+   * event-wiring.ts), one code path for this loop's own completions and
    * forwarded child ones alike.
    */
   private recordUtilityUsage(category: string, usage: CortexUsage | null): void {
@@ -5148,172 +5149,6 @@ export class AgentLoop {
   }
 
   // -----------------------------------------------------------------------
-  // Private: Event wiring
-  // -----------------------------------------------------------------------
-
-  /**
-   * Wire internal event handlers to the EventBridge.
-   * Maps bridge events to consumer-registered callbacks.
-   */
-  private wireInternalEvents(): void {
-    this.eventUnsubscribers.push(
-      this.eventBridge.onAll((event) => {
-        this.promptDiagnostics.recordEvent(event);
-      }),
-    );
-
-    // Accumulate direct/utility completion spend into session usage. One
-    // listener covers this loop's own completions (emitted by
-    // recordUtilityUsage) and forwarded child completions (childTaskId set),
-    // mirroring how child turn_end usage rolls into the parent totals.
-    this.eventUnsubscribers.push(
-      this.eventBridge.on('utility_usage', (event) => {
-        const usage = event.usage;
-        if (!usage) return;
-        const category =
-          (event.payload as UtilityUsagePayload | undefined)?.category ?? 'utility';
-
-        accumulateUtility(this._sessionUsage, category, usage);
-
-        this.logger.debug('utility usage', {
-          category,
-          cost: usage.cost.total,
-          input: usage.input,
-          output: usage.output,
-          childTaskId: event.childTaskId,
-          sessionTotalCost: this._sessionUsage.totalCost,
-        });
-      }),
-    );
-
-    // Map loop_end -> onLoopComplete
-    this.eventUnsubscribers.push(
-      this.eventBridge.on('loop_end', () => {
-        // pi-agent-core emits agent_end for EVERY run that ends, including a run
-        // that failed (it stores the failure in state.errorMessage and emits
-        // agent_end from handleRunFailure). Background retry means one logical
-        // turn can span several such runs: fail -> backoff -> continue() -> ...
-        // onLoopComplete must fire once per logical turn, not once per attempt.
-        // Firing it on a failed attempt would let a consumer mark the turn idle
-        // while runTurnWithRetry is still retrying, desyncing its run-state
-        // (e.g. routing the user's next message to prompt(), which throws
-        // "already processing", instead of steer()). Suppress it here; a turn
-        // that fails for good still surfaces via onError plus the prompt()
-        // rejection, and a retried turn fires onLoopComplete on the run that
-        // finally succeeds (errorMessage is cleared at the start of each run).
-        const agentState = this.agent.state as Record<string, unknown>;
-        if (agentState['errorMessage']) {
-          this.logger.info('loop_end suppressed (run ended in error; retry may follow)');
-          return;
-        }
-        this.logger.info('loop_end', {
-          turns: this.budgetGuard.getTurnCount(),
-          totalCost: this.budgetGuard.getTotalCost(),
-          currentContextTokens: this.compactionManager.currentContextTokenCount,
-        });
-        this.skillBuffer = [];
-        this.loopCompleteHandlers.emit(this.originContext);
-      }),
-    );
-
-    // Map turn_end -> onTurnComplete with AgentTextOutput
-    this.eventUnsubscribers.push(
-      this.eventBridge.on('turn_end', (event) => {
-        const isChildEvent = Boolean(event.childTaskId);
-
-        // Stamp any new messages that lack a timestamp. Messages are added
-        // by pi-agent-core during the agentic loop (user prompts, assistant
-        // responses, tool results). Cortex stamps them here at the turn
-        // boundary so they carry temporal metadata for observational memory.
-        if (!isChildEvent) {
-          const now = Date.now();
-          const messages = this.agent.state.messages;
-          const slotCount = this.contextManager.slotCount;
-          for (let i = slotCount; i < messages.length; i++) {
-            const msg = messages[i];
-            if (msg && msg.timestamp == null) {
-              msg.timestamp = now;
-            }
-          }
-        }
-
-        // Read typed usage from EventBridge (centralized extraction).
-        // CompactionManager only gets parent events (child tokens don't
-        // affect this agent's context window). Session usage accumulates
-        // from both parent and child events (total cost reporting).
-        if (event.usage) {
-          if (!isChildEvent) {
-            const inputTokens = event.usage.input + event.usage.cacheRead + event.usage.cacheWrite;
-            if (inputTokens > 0) {
-              this.compactionManager.updateCurrentContextTokenCount(inputTokens);
-            }
-
-            // Trigger observational memory buffer check
-            if (this.compactionManager.strategy === 'observational') {
-              const totalInput = event.usage.input + event.usage.cacheRead + event.usage.cacheWrite;
-              this.compactionManager.onTurnEnd(
-                totalInput,
-                this.effectiveContextWindow,
-                this.agent.state.messages,
-                this.contextManager.slotCount,
-              );
-            }
-          }
-
-          // Accumulate session-lifetime usage (does not reset per loop)
-          accumulateTurn(this._sessionUsage, event.usage);
-
-          this.logger.debug('turn_end usage', {
-            input: event.usage.input,
-            output: event.usage.output,
-            cacheRead: event.usage.cacheRead,
-            cost: event.usage.cost.total,
-            sessionTotalCost: this._sessionUsage.totalCost,
-            childTaskId: event.childTaskId,
-          });
-        } else if (!isChildEvent) {
-          // Fallback: extract input tokens from raw event data if EventBridge
-          // could not build typed usage (e.g., provider returned partial data).
-          // Only for parent events (child context is irrelevant here).
-          const inputTokens = turnInputTokens(event.data);
-          if (inputTokens > 0) {
-            this.compactionManager.updateCurrentContextTokenCount(inputTokens);
-
-            // Trigger observational memory buffer check (fallback path)
-            if (this.compactionManager.strategy === 'observational') {
-              this.compactionManager.onTurnEnd(
-                inputTokens,
-                this.effectiveContextWindow,
-                this.agent.state.messages,
-                this.contextManager.slotCount,
-              );
-            }
-          }
-          this._sessionUsage.totalTurns += 1;
-        }
-
-        // Only dispatch onTurnComplete for parent events. Child turn_end
-        // events are forwarded by EventBridge.forwardFrom() but must not
-        // surface in the parent's TUI; doing so leaks raw subagent text
-        // (including XML tags and metadata) into the main chat thread.
-        if (!isChildEvent) {
-          if (event.textOutput) {
-            this.turnCompleteHandlers.emit(event.textOutput, { loopPath: this.loopPath });
-          } else {
-            // If the bridge did not parse (working tags disabled), still emit
-            // with raw text for non-tag scenarios
-            const text = turnText(event.data);
-            if (text) {
-              const output = parseWorkingTags(text);
-              this.turnCompleteHandlers.emit(output, { loopPath: this.loopPath });
-            }
-          }
-        }
-      }),
-    );
-  }
-
-  // -----------------------------------------------------------------------
   // Private: Lifecycle helpers
   // -----------------------------------------------------------------------
 
@@ -6025,7 +5860,7 @@ export class AgentLoop {
     // Forward child events to the parent's EventBridge, exactly like the
     // foreground path: this is what makes background children visible live
     // (tool activity for the headline block, usage accounting) instead of
-    // only via a post-completion summary. Note _sessionUsage accumulates
+    // only via a post-completion summary. Note session usage accumulates
     // forwarded child turn usage, so background child spend now lands in
     // getSessionUsage() just as foreground child spend always has.
     const unsubForward = this.eventBridge.forwardFrom(
