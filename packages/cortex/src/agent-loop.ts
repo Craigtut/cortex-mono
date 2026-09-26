@@ -54,8 +54,8 @@ import type { ObservationalMemoryState, ObservationEvent, ReflectionEvent } from
 import { DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS } from './compaction/observational/index.js';
 import { createRecallTool } from './compaction/observational/recall-tool.js';
 import { SubAgentManager } from './sub-agent-manager.js';
-import { SkillRegistry } from './skill-registry.js';
-import { createLoadSkillTool, buildLoadSkillDescription, LOAD_SKILL_TOOL_NAME } from './skill-tool.js';
+import type { SkillRegistry } from './skill-registry.js';
+import { LOAD_SKILL_TOOL_NAME } from './skill-tool.js';
 import { createSubAgentTool, SUB_AGENT_TOOL_NAME } from './tools/sub-agent.js';
 import { createReadTool } from './tools/read.js';
 import { createWriteTool } from './tools/write.js';
@@ -82,6 +82,7 @@ import { UsageLedger } from './agent-loop/usage-ledger.js';
 import { wireLoopEvents } from './agent-loop/event-wiring.js';
 import { DirectCompletions } from './agent-loop/direct-completion.js';
 import { ModelSettings } from './agent-loop/model-settings.js';
+import { SkillBinding } from './agent-loop/skills.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { estimateTokens } from './token-estimator.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
@@ -668,14 +669,8 @@ export class AgentLoop {
   // Sub-Agent Manager for tracking active sub-agents
   private readonly subAgentManager: SubAgentManager;
 
-  // Skill Registry for managing available skills
-  private readonly skillRegistry: SkillRegistry;
-
-  // The load_skill tool instance (held for description rebuilds)
-  private loadSkillTool!: { name: string; description: string; parameters: unknown; execute: (args: unknown) => Promise<unknown> };
-
-  // Skill buffer: loaded skill content for ephemeral injection
-  private skillBuffer: LoadedSkill[] = [];
+  // Skill registry, the load_skill tool, and the loaded-skill buffer
+  private readonly skills: SkillBinding;
 
   // Cache breakpoint optimization: boundary tracking and API index state.
   // _prePromptMessageCount records agent.state.messages.length BEFORE each
@@ -756,7 +751,7 @@ export class AgentLoop {
       },
       // Undefined until built below; the settings sync it once it exists.
       compaction: () => this.compactionManager ?? null,
-      onModelChanged: () => this.rebuildLoadSkillDescription(),
+      onModelChanged: () => this.skills.rebuildDescription(),
       logger: this.logger,
     });
     this.completions = new DirectCompletions({
@@ -856,9 +851,7 @@ export class AgentLoop {
         turns: this.budgetGuard.getTurnCount(),
         totalCost: this.budgetGuard.getTotalCost(),
       }),
-      onLoopEnd: () => {
-        this.skillBuffer = [];
-      },
+      onLoopEnd: () => this.skills.clear(),
       loopComplete: this.loopCompleteHandlers,
       turnComplete: this.turnCompleteHandlers,
       origin: this.originContext,
@@ -941,8 +934,14 @@ export class AgentLoop {
     });
 
     // Set up Skill Registry with auto-rebuild callback
-    this.skillRegistry = new SkillRegistry();
-    this.skillRegistry.addChangeListener(() => this.rebuildLoadSkillDescription());
+    this.skills = new SkillBinding({
+      contextWindow: () => this.compactionManager?.contextWindow ?? Math.min(
+        this.models.primary.contextWindow,
+        this.models.contextWindowLimit ?? this.models.primary.contextWindow,
+      ),
+      refreshTools: () => this.refreshTools(),
+      logger: this.logger,
+    });
 
     // Wire sub-agent manager hooks to AgentLoop event handlers
     // (must be after subAgentManager is initialized)
@@ -972,15 +971,9 @@ export class AgentLoop {
     }
 
     // Create and register the load_skill tool.
-    // Must be after skillRegistry is initialized.
+    // Must be after the skill binding exists.
     if (options?.enableLoadSkillTool !== false) {
-      this.loadSkillTool = createLoadSkillTool({
-        registry: this.skillRegistry,
-        getAvailableSkillsSummary: () => this.buildAvailableSkillsSummary(),
-        getSkillBuffer: () => this.skillBuffer,
-        pushToSkillBuffer: (skill) => this.pushToSkillBuffer(skill),
-      });
-      this.registeredTools.push(this.loadSkillTool as RegisteredTool);
+      this.registeredTools.push(this.skills.createLoadSkillTool());
     }
 
     // Adapt the normalized Cortex tool set to pi-agent-core's raw execute
@@ -4396,7 +4389,7 @@ export class AgentLoop {
       // and stays outside the cached prefix.
       const stableInjectionCount =
         (this.contextManager.getEphemeral() ? 1 : 0) +
-        (this.skillBuffer.length > 0 ? 1 : 0);
+        (this.skills.loadedCount > 0 ? 1 : 0);
       this._cacheBreakpointIndices = computeCacheBreakpointIndices(result.messages, {
         slotCount,
         boundary: this._prePromptMessageCount + stableInjectionCount,
@@ -4433,11 +4426,9 @@ export class AgentLoop {
     if (ephemeralContent) {
       injections.push({ role: 'user' as const, content: ephemeralContent, timestamp: Date.now() });
     }
-    if (this.skillBuffer.length > 0) {
-      const formatted = this.skillBuffer.map(s =>
-        `<skill-instructions name="${s.name}">\n${s.content}\n</skill-instructions>`,
-      ).join('\n\n');
-      injections.push({ role: 'user' as const, content: formatted, timestamp: Date.now() });
+    const skills = this.skills.renderInjection();
+    if (skills) {
+      injections.push({ role: 'user' as const, content: skills, timestamp: Date.now() });
     }
 
     // Inject background task state so the agent has visibility into
@@ -4702,8 +4693,7 @@ export class AgentLoop {
     }
 
     // 5. Clear skill buffer and registry
-    this.skillBuffer = [];
-    this.skillRegistry.clear();
+    this.skills.destroy();
     this.subAgentManager.destroy();
 
     // 6. Unsubscribe all event listeners
@@ -4755,7 +4745,7 @@ export class AgentLoop {
    * Get the SkillRegistry for add/remove/query operations.
    */
   getSkillRegistry(): SkillRegistry {
-    return this.skillRegistry;
+    return this.skills.registry;
   }
 
   /**
@@ -4764,13 +4754,7 @@ export class AgentLoop {
    * No LLM turn is consumed.
    */
   async loadSkill(name: string, args?: string): Promise<void> {
-    const callArgs = {
-      args: args ? args.split(/\s+/) : [],
-      rawArgs: args ?? '',
-    };
-
-    const body = await this.skillRegistry.getSkillBody(name, callArgs);
-    this.pushToSkillBuffer({ name, content: body });
+    await this.skills.load(name, args);
   }
 
   /**
@@ -4780,14 +4764,14 @@ export class AgentLoop {
    * and clearing at prompt() start would wipe consumer pre-loaded skills.
    */
   clearSkillBuffer(): void {
-    this.skillBuffer = [];
+    this.skills.clear();
   }
 
   /**
    * Get the current skill buffer contents.
    */
   getSkillBuffer(): LoadedSkill[] {
-    return [...this.skillBuffer];
+    return this.skills.snapshot();
   }
 
   /**
@@ -4797,7 +4781,7 @@ export class AgentLoop {
    * Call this each tick during GATHER to update runtime values.
    */
   setPreprocessorVariables(variables: Record<string, string>): void {
-    this.skillRegistry.setPreprocessorVariables(variables);
+    this.skills.registry.setPreprocessorVariables(variables);
   }
 
   /**
@@ -4807,7 +4791,7 @@ export class AgentLoop {
    * Call this each tick during GATHER to update runtime values.
    */
   setScriptContext(context: Record<string, unknown>): void {
-    this.skillRegistry.setScriptContext(context);
+    this.skills.registry.setScriptContext(context);
   }
 
   // -----------------------------------------------------------------------
@@ -4925,65 +4909,6 @@ export class AgentLoop {
       });
     }
     return snapshots;
-  }
-
-  // -----------------------------------------------------------------------
-  // Private: Skill buffer
-  // -----------------------------------------------------------------------
-
-  /**
-   * Rebuild the load_skill tool's description with the current available
-   * skills summary. Called automatically when skills are added/removed
-   * via the registry's onChange callback.
-   */
-  private rebuildLoadSkillDescription(): void {
-    if (this.loadSkillTool) {
-      this.loadSkillTool.description = buildLoadSkillDescription(
-        this.skillRegistry,
-        this.buildAvailableSkillsSummary(),
-      );
-      // Re-sync tools to pi-agent-core so the updated description is visible
-      // to the LLM. refreshTools() creates shallow copies, so mutating the
-      // description on this.loadSkillTool doesn't propagate without a re-sync.
-      this.refreshTools();
-    }
-  }
-
-  private buildAvailableSkillsSummary(): string {
-    const effectiveContextWindow = this.compactionManager?.contextWindow ?? Math.min(
-      this.models.primary.contextWindow,
-      this.models.contextWindowLimit ?? this.models.primary.contextWindow,
-    );
-    const maxTokens = Math.max(128, Math.floor(effectiveContextWindow * 0.02));
-    return this.skillRegistry.getAvailableSkillsSummary(maxTokens);
-  }
-
-  /**
-   * Push a loaded skill to the buffer with deduplication.
-   * If the same skill is loaded twice, the second replaces the first.
-   */
-  private pushToSkillBuffer(skill: LoadedSkill): void {
-    const existingIdx = this.skillBuffer.findIndex(s => s.name === skill.name);
-    if (existingIdx >= 0) {
-      this.skillBuffer[existingIdx] = skill;
-    } else {
-      this.skillBuffer.push(skill);
-    }
-    this.logger.info('skill loaded', {
-      name: skill.name,
-      contentLength: skill.content.length,
-      bufferSize: this.skillBuffer.length,
-    });
-  }
-
-  /**
-   * Skill injection is now handled inline in getTransformContextHook()
-   * at the boundary position for cache optimization. This method is
-   * retained as a no-op for backward compatibility.
-   * @deprecated Skill injection moved to getTransformContextHook() boundary insertion
-   */
-  private injectSkillBuffer(context: AgentContext): AgentContext {
-    return context;
   }
 
   // -----------------------------------------------------------------------
