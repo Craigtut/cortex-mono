@@ -95,7 +95,7 @@ import {
   resolutionWarnText,
 } from './resolution-report.js';
 import type { ResolutionNote, ResolutionNoteCode } from './resolution-report.js';
-import { stripWorkingTags, WorkingTagStreamFilter } from './working-tags.js';
+import { spokenText, WorkingTagStreamFilter } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
 import type {
@@ -1328,27 +1328,6 @@ function yieldMacrotask(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-/**
- * User-facing text of a pi assistant message: text blocks joined, working
- * tags stripped, trimmed. Empty means the message spoke nothing.
- */
-function extractSpokenText(assistantMessage: unknown): string {
-  const content = (assistantMessage as { content?: unknown } | null | undefined)?.content;
-  let raw = '';
-  if (typeof content === 'string') {
-    raw = content;
-  } else if (Array.isArray(content)) {
-    raw = content
-      .filter((block): block is { type: string; text: string } =>
-        (block as { type?: string } | null)?.type === 'text' &&
-        typeof (block as { text?: unknown }).text === 'string')
-      .map((block) => block.text)
-      .join('');
-  }
-  if (raw.length === 0) return '';
-  return stripWorkingTags(raw).trim();
-}
-
 /** Chars of a provider error message carried into a failure delivery. */
 const MAX_FAILURE_DETAIL_CHARS = 300;
 
@@ -2114,7 +2093,7 @@ export class CortexAgent {
       // recovery turn (bounded by the talker's hard maxTurns).
       return undefined;
     }
-    const spoken = extractSpokenText(info.assistantMessage);
+    const spoken = spokenText(info.assistantMessage);
     if (spoken.length === 0) {
       // Open question (review N3): a model that keeps answering the nudge
       // with another silent tool call oscillates here until the talker's
@@ -2224,7 +2203,7 @@ export class CortexAgent {
       );
       return;
     }
-    const spoken = extractSpokenText(last);
+    const spoken = spokenText(last);
     if (spoken.length === 0) return;
     this.router?.deliverFromReasoner(spoken, 'when_idle', { implicit: true });
   }

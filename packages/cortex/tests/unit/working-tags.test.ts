@@ -3,6 +3,7 @@ import {
   stripWorkingTags,
   extractWorkingContent,
   parseWorkingTags,
+  spokenText,
   WorkingTagStreamFilter,
 } from '../../src/working-tags.js';
 
@@ -74,6 +75,24 @@ Line three.</working> After.`;
     const result = stripWorkingTags(text);
     expect(result).toContain('Before.');
     expect(result).toContain('After.');
+  });
+});
+
+describe('spokenText', () => {
+  it('strips working content from an assistant message\'s text parts', () => {
+    expect(spokenText({
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'plan' },
+        { type: 'text', text: ' <working>notes</working>Hello ' },
+        { type: 'toolCall', name: 'Bash', arguments: {} },
+      ],
+    })).toBe('Hello');
+  });
+
+  it('is empty for a message that spoke nothing', () => {
+    expect(spokenText({ role: 'assistant', content: [{ type: 'text', text: '<working>x</working>' }] })).toBe('');
+    expect(spokenText(undefined)).toBe('');
   });
 });
 

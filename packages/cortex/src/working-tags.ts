@@ -23,6 +23,7 @@
  */
 
 import type { AgentTextOutput } from './types.js';
+import { assistantText } from './pi-message.js';
 
 /**
  * Tag names treated as internal-reasoning delimiters. `working` is the
@@ -75,6 +76,14 @@ export function stripWorkingTags(text: string): string {
     .trim();
 
   return result;
+}
+
+/**
+ * User-facing text of a pi assistant message: its text with working content
+ * stripped. Empty means the message spoke nothing.
+ */
+export function spokenText(assistantMessage: unknown): string {
+  return stripWorkingTags(assistantText(assistantMessage));
 }
 
 /**

@@ -21,7 +21,7 @@
 import type { AgentLoop } from '../agent-loop.js';
 import type { CortexLogger, SessionUsage } from '../types.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
-import { stripWorkingTags } from '../working-tags.js';
+import { spokenText } from '../working-tags.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -84,26 +84,14 @@ interface ActiveLookup {
   completion: Promise<void>;
 }
 
-/** Text of the last assistant message in a loop's history, tags stripped. */
+/** Spoken text of the latest assistant message in a loop's history that has any. */
 function extractAnswer(loop: AgentLoop): string {
   const history = loop.getConversationHistory();
   for (let i = history.length - 1; i >= 0; i--) {
-    const message = history[i] as unknown as { role?: string; content?: unknown };
+    const message = history[i] as unknown as { role?: string };
     if (message?.role !== 'assistant') continue;
-    const content = message.content;
-    let raw = '';
-    if (typeof content === 'string') {
-      raw = content;
-    } else if (Array.isArray(content)) {
-      raw = content
-        .filter((block): block is { type: string; text: string } =>
-          (block as { type?: string } | null)?.type === 'text' &&
-          typeof (block as { text?: unknown }).text === 'string')
-        .map((block) => block.text)
-        .join('');
-    }
-    const stripped = stripWorkingTags(raw).trim();
-    if (stripped.length > 0) return stripped;
+    const spoken = spokenText(message);
+    if (spoken.length > 0) return spoken;
   }
   return '';
 }
