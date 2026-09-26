@@ -35,6 +35,8 @@ packages/cortex/
     session-log.ts              # Append-only session log owned by the facade
     context-manager.ts          # Slot-based context management
     provider-manager.ts         # Provider discovery, OAuth login/refresh, API key validation
+    provider-manager/           # ProviderManager parts: pi-ai loading, OAuth flows and callback page,
+                                #   model catalog, API key validation, model creation
     provider-registry.ts        # Static provider metadata and utility model defaults
     model-wrapper.ts            # Model resolution and CortexModel opaque type
     error-classifier.ts         # Regex-based error classification

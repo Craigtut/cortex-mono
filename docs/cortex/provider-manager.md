@@ -314,6 +314,8 @@ interface ApiKeyValidationResult {
 
 ### Default Implementation
 
+A sketch of the behavior. In the source, `ProviderManager` is a thin class that forwards to the modules under `src/provider-manager/` (see Package Structure).
+
 ```typescript
 // packages/cortex/src/provider-manager.ts
 
@@ -664,7 +666,7 @@ function extractDisplayName(credentials: Record<string, unknown>): string | unde
 Pi-ai does not flag models as deprecated, so `ProviderManager` maintains a `LEGACY_MODEL_PREFIXES` map to keep the model picker clean. These prefixes identify older model generations that produce poor results with modern tool-use patterns. Models matching any prefix are excluded from `listModels()` results.
 
 ```typescript
-// packages/cortex/src/provider-manager.ts
+// packages/cortex/src/provider-manager/model-catalog.ts
 
 const LEGACY_MODEL_PREFIXES: Record<string, string[]> = {
   anthropic: [
@@ -736,8 +738,15 @@ agent.setModel(model);
 ```
 packages/cortex/
   src/
-    provider-manager.ts       # ProviderManager class (IProviderManager implementation)
-                              # OAuth types, API key validation types, custom model config
+    provider-manager.ts       # ProviderManager class (IProviderManager implementation), re-exports public types
+    provider-manager/
+      pi-ai.ts                # Dynamic pi-ai loading and the pi shapes Cortex reads
+      oauth-types.ts          # OAuth contract types and OAuthError
+      oauth-callback-page.ts  # Callback page shim, fixed callback routes, loopback port probe
+      oauth-flows.ts          # OAuthFlows: login race, cancellation, API key refresh
+      model-catalog.ts        # listModels mapping and legacy filtering
+      api-key-validation.ts   # validateApiKey and its result classification
+      model-factory.ts        # resolveModel, createCustomModel, createOllamaModel, CustomModelConfig
     provider-registry.ts      # Static provider metadata (PROVIDER_REGISTRY), ProviderInfo, ModelInfo
     model-wrapper.ts          # CortexModel wrapping/unwrapping utilities
     types.ts                  # AgentLoop config and shared agent/runtime types
