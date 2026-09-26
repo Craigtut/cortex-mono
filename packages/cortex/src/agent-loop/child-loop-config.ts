@@ -56,16 +56,23 @@ export interface ChildLoopParent {
 /**
  * Everything the managed factory needs to build the child, plus the
  * background seed to place in its leading slot once built.
+ *
+ * `readParent` is read again once the consumer's hook returns: the hook can
+ * take a while, and the parent's model, prompt, working tags and window
+ * may change meanwhile. The child is built from the parent as it is then,
+ * not as it was when the spawn began.
  */
 export async function prepareChildLoop(
-  parent: ChildLoopParent,
+  readParent: () => ChildLoopParent,
   params: ChildLoopParams,
 ): Promise<{ createParams: ManagedLoopParams; seedContext: string | undefined }> {
+  // Fixed for the loop's lifetime, so reading them before the hook is safe.
+  const { config, logger } = readParent();
   // onBeforeSubAgentSpawn curates the child's starting context; errors are swallowed.
   let augmentation: SubAgentSpawnAugmentation | void = undefined;
-  if (parent.config.onBeforeSubAgentSpawn) {
+  if (config.onBeforeSubAgentSpawn) {
     try {
-      augmentation = await parent.config.onBeforeSubAgentSpawn({
+      augmentation = await config.onBeforeSubAgentSpawn({
         taskId: params.taskId,
         instructions: params.instructions,
         background: params.background ?? false,
@@ -73,7 +80,7 @@ export async function prepareChildLoop(
         ...(params.systemPrompt ? { requestedSystemPrompt: params.systemPrompt } : {}),
       });
     } catch (err) {
-      parent.logger.error('onBeforeSubAgentSpawn handler threw', {
+      logger.error('onBeforeSubAgentSpawn handler threw', {
         taskId: params.taskId,
         error: errorMessageOf(err),
       });
@@ -82,6 +89,7 @@ export async function prepareChildLoop(
   const effectiveSystemPrompt = augmentation?.systemPrompt ?? params.systemPrompt;
   const effectiveTools = augmentation?.tools ?? params.tools;
   const seedContext = augmentation?.seedContext;
+  const parent = readParent();
   const promptSeed = resolveChildPromptSeed(parent.prompt, effectiveSystemPrompt);
 
   const createParams: ManagedLoopParams = {

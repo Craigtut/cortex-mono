@@ -600,7 +600,7 @@ export class AgentLoop implements
   /** Build a sub-agent's loop (the spawner's factory; tests stand in for it). */
   private async createChildAgent(params: ChildLoopParams): Promise<AgentLoop> {
     const { models, systemPrompt, tools } = this.parts;
-    const { createParams, seedContext } = await prepareChildLoop({
+    const { createParams, seedContext } = await prepareChildLoop(() => ({
       config: this.config,
       model: models.primary,
       workingTagsEnabled: this.workingTagsEnabled,
@@ -614,7 +614,7 @@ export class AgentLoop implements
         ? this.wrapChildPermissionResolver(this.config.resolvePermission, taskId)
         : undefined,
       logger: this.logger,
-    }, params);
+    }), params);
     const childAgent = await AgentLoop.createManagedAgent(createParams);
     // Background context seeds the child's leading slot: reference material,
     // not its objective, positioned before history for prefix-cache stability.

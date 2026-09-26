@@ -178,3 +178,46 @@ describe('AgentLoop tool config threading', () => {
     expect(captured!.webFetch).toEqual({ maxPerLoop: 3 });
   });
 });
+
+describe('child loop configuration reads the parent after onBeforeSubAgentSpawn', () => {
+  let parent: AgentLoop | null = null;
+  afterEach(async () => {
+    await parent?.destroy();
+    parent = null;
+  });
+
+  it('takes the model, prompt, working tags and window the parent has once the hook returns', async () => {
+    const later = makeModel({ provider: 'anthropic', name: 'claude-opus-4-20250514', contextWindow: 200_000 } as PiModel);
+    parent = createTestAgentLoop(os.tmpdir(), {
+      onBeforeSubAgentSpawn: async () => {
+        // The parent changes while the consumer's hook is still running.
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        parent!.setModel(later);
+        parent!.setBasePrompt('Prompt set during the hook');
+        parent!.setWorkingTagsEnabled(true);
+        parent!.setContextWindowLimit(90_000);
+        return undefined;
+      },
+    });
+    const statics = AgentLoop as unknown as {
+      createManagedAgent: (params: { cortexConfig: AgentLoopConfig; initialBasePrompt?: string }) => Promise<unknown>;
+    };
+    const original = statics.createManagedAgent;
+    let captured: { cortexConfig: AgentLoopConfig; initialBasePrompt?: string } | null = null;
+    statics.createManagedAgent = async (params) => {
+      captured = params;
+      return { setCacheRetention: () => {} };
+    };
+    try {
+      await (parent as unknown as {
+        createChildAgent: (params: { taskId: string; instructions: string }) => Promise<unknown>;
+      }).createChildAgent({ taskId: 't1', instructions: 'child work' });
+    } finally {
+      statics.createManagedAgent = original;
+    }
+    expect(captured!.cortexConfig.model.modelId).toBe('claude-opus-4-20250514');
+    expect(captured!.initialBasePrompt).toBe('Prompt set during the hook');
+    expect(captured!.cortexConfig.workingTags).toEqual({ enabled: true });
+    expect(captured!.cortexConfig.contextWindowLimit).toBe(90_000);
+  });
+});
