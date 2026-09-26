@@ -28,6 +28,7 @@ import type {
 import { UsageLedger } from './facade/usage-ledger.js';
 import { StateEmitter } from './facade/state-emitter.js';
 import { LogRecorder } from './facade/log-recorder.js';
+import { ResolutionRecorder } from './facade/resolution-recorder.js';
 import type { UsageReadings } from './facade/usage-ledger.js';
 import type {
   CortexAgentConfig,
@@ -96,13 +97,7 @@ import type {
 } from './session-log.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { errorMessageOf } from './error-classifier.js';
-import {
-  cloneResolutionNote,
-  collectAssemblyResolutionNotes,
-  networkResolverUnwiredNote,
-  resolutionWarnText,
-} from './resolution-report.js';
-import type { ResolutionNote, ResolutionNoteCode } from './resolution-report.js';
+import type { ResolutionNote } from './resolution-report.js';
 import { spokenText, WorkingTagStreamFilter } from './working-tags.js';
 import { toolCallSubject } from './tools/tool-call-subject.js';
 import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
@@ -463,22 +458,6 @@ export interface CortexDeliverOptions {
 
 const DEFAULT_STATE_DEBOUNCE_MS = 500;
 
-/**
- * Producer identity on a resolution note's lifecycle entry. Not a loop: the
- * facade resolved the configuration, and attributing it to the reasoner or
- * the talker would claim a loop said something about its own assembly.
- */
-const RESOLUTION_LOOP_PATH = 'facade';
-
-/**
- * Notes read off the talker's model, re-evaluated when the facade itself
- * re-resolves that model (setModel on an unpinned talker).
- */
-const MODEL_RESOLUTION_NOTE_CODES: ReadonlySet<ResolutionNoteCode> = new Set<ResolutionNoteCode>([
-  'talker-model-fallback',
-  'talker-utility-model-skipped',
-]);
-
 /** One macrotask yield: lets pending microtask cascades finish. */
 function yieldMacrotask(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
@@ -597,8 +576,6 @@ export class CortexAgent {
    * ask-callback wiring.
    */
   private readonly networkResolver: ResolveNetworkAccess | null;
-  /** Whether a sandbox was configured (for the egress-wiring warning). */
-  private readonly sandboxConfigured: boolean;
   /**
    * Whether the consumer pinned `talker.model`. An unpinned talker mirrors
    * the reasoner's auto-resolved fast tier, at assembly and again on every
@@ -606,9 +583,6 @@ export class CortexAgent {
    */
   private readonly talkerModelPinned: boolean;
   private ownedSandbox: SandboxSession | undefined;
-  /** Whether anyone took the resolver to wire into a sandbox. */
-  private networkResolverHandedOut = false;
-  private unwiredNetworkResolverWarned = false;
   /** Lazily-built D6 fan-out view over both loops' context managers. */
   private fanOutContextManager: FanOutContextManager | null = null;
   private digestionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -658,24 +632,7 @@ export class CortexAgent {
   private destroyPromise: Promise<void> | null = null;
   private destroyed = false;
 
-  /**
-   * What this assembly resolved to where it differs from what was asked for
-   * (resolution-report.ts). Computed once at construction, plus the one
-   * condition that cannot be known then (the unwired egress resolver). The
-   * warns and the lifecycle log entries are both derived from these, never
-   * written alongside them.
-   */
-  private readonly resolutionNotes: ResolutionNote[] = [];
-  /**
-   * The consumer-supplied inputs the model-derived notes are read against,
-   * kept so a talker re-mirror (setModel) can re-evaluate them against the
-   * loops as they now are.
-   */
-  private readonly resolutionInputs: {
-    requestedTalkerModel: CortexModel | undefined;
-    configuredUtilityModel: CortexModel | 'default' | undefined;
-    perPromptMaxCost: number | undefined;
-  };
+  private readonly resolution: ResolutionRecorder;
 
   private constructor(reasoner: AgentLoop, config: ResolvedCortexAgentConfig, talker?: AgentLoop) {
     this.mode = config.mode ?? DEFAULT_MODE;
@@ -718,13 +675,24 @@ export class CortexAgent {
     this.idleDigestionDelayMs = config.duplex?.idleDigestionDelayMs ?? 10_000;
     // In duplex, create() has already wrapped this in the broker pipeline.
     this.networkResolver = config.resolveNetworkAccess ?? null;
-    this.sandboxConfigured = config.sandbox !== undefined;
     this.talkerModelPinned = config.talker?.model !== undefined;
-    this.resolutionInputs = {
-      requestedTalkerModel: config.talker?.model,
-      configuredUtilityModel: config.utilityModel,
-      perPromptMaxCost: config.budgetGuard?.maxCost,
-    };
+    this.resolution = new ResolutionRecorder({
+      observe: () => ({
+        mode: this.mode,
+        requestedTalkerModel: config.talker?.model,
+        talkerModel: this.talker?.getModel() ?? null,
+        reasonerModel: this.reasoner.getModel(),
+        configuredUtilityModel: config.utilityModel,
+        talkerUtilityModel: this.talker?.getUtilityModel() ?? null,
+        aggregateCostCap: this.aggregateGuard?.getMaxCost() ?? null,
+        perPromptMaxCost: config.budgetGuard?.maxCost,
+      }),
+      brokeredEgressResolver: this.mode === 'duplex'
+        && config.sandbox !== undefined
+        && this.networkResolver !== null,
+      append: (input) => this.recorder.append(input),
+      logger: this.logger,
+    });
 
     if (this.mode === 'duplex') {
       this.wireDuplex(config);
@@ -735,7 +703,7 @@ export class CortexAgent {
     // Last, because it reads the assembly back: the loops are built, the
     // aggregate guard exists, and every note below is a statement about what
     // this constructor just produced.
-    this.collectAssemblyResolution();
+    this.resolution.collectAssembly();
   }
 
   /**
@@ -769,7 +737,7 @@ export class CortexAgent {
     if ((config.mode ?? DEFAULT_MODE) === 'duplex') {
       const loops = await assembleDuplexLoops(config, managed);
       const agent = new CortexAgent(loops.reasoner, loops.config, loops.talker);
-      if (managed) agent.networkResolverHandedOut = true;
+      if (managed) agent.resolution.handOutNetworkResolver();
       loops.bindBroker(agent.router?.permissionBroker ?? null);
       if (loops.ownedMcp) agent.ownedMcpManager = loops.ownedMcp;
       return agent;
@@ -1671,7 +1639,7 @@ export class CortexAgent {
     if (this.mode === 'duplex') {
       return this.promptDuplex(input, options);
     }
-    this.noteUnwiredNetworkResolver();
+    this.resolution.noteUnwiredIfNeeded();
 
     this.pendingFacadePrompts += 1;
     const run = this.promptChain.then(async () => {
@@ -1716,7 +1684,7 @@ export class CortexAgent {
   /** Duplex prompt path: talker deliver(), never talker prompt() (F15). */
   private async promptDuplex(input: string, options?: DirectCompletionOptions): Promise<unknown> {
     const talker = this.talker!;
-    this.noteUnwiredNetworkResolver();
+    this.resolution.noteUnwiredIfNeeded();
     this.preemptIdleDigestion();
     this.pendingFacadePrompts += 1;
     try {
@@ -2224,92 +2192,7 @@ export class CortexAgent {
    * not during it.
    */
   getResolutionReport(): ResolutionNote[] {
-    return this.resolutionNotes.map(cloneResolutionNote);
-  }
-
-  /**
-   * Read the assembly back and record what it resolved to. Eager rather than
-   * lazy on first read: a report built on demand would observe post-assembly
-   * mutation (a setModel(), a setUtilityModel()) and present it as an
-   * assembly fact, and would also mean the log entries appeared whenever the
-   * consumer happened to look.
-   */
-  private collectAssemblyResolution(): void {
-    for (const note of this.currentResolutionNotes()) this.recordResolutionNote(note);
-  }
-
-  private currentResolutionNotes(): ResolutionNote[] {
-    return collectAssemblyResolutionNotes({
-      mode: this.mode,
-      requestedTalkerModel: this.resolutionInputs.requestedTalkerModel,
-      talkerModel: this.talker?.getModel() ?? null,
-      reasonerModel: this.reasoner.getModel(),
-      configuredUtilityModel: this.resolutionInputs.configuredUtilityModel,
-      talkerUtilityModel: this.talker?.getUtilityModel() ?? null,
-      aggregateCostCap: this.aggregateGuard?.getMaxCost() ?? null,
-      perPromptMaxCost: this.resolutionInputs.perPromptMaxCost,
-    });
-  }
-
-  /**
-   * Re-evaluate the notes that describe the talker's model after the facade
-   * re-resolved it (setModel re-mirrors an unpinned talker). This is not the
-   * lazy report the eager design rules out: the facade itself just redid
-   * part of the assembly, so the model notes are assembly facts again, and
-   * leaving them would report a fallback that no longer exists or miss one
-   * that now does (switching onto a provider Cortex cannot enumerate).
-   * Mutation the facade did not make (a direct loop setModel) still changes
-   * nothing here. A note that stops applying is removed from the report and
-   * its clearing is logged, so the log still explains the report.
-   */
-  private refreshModelResolutionNotes(): void {
-    const fresh = this.currentResolutionNotes()
-      .filter((note) => MODEL_RESOLUTION_NOTE_CODES.has(note.code));
-    for (const code of MODEL_RESOLUTION_NOTE_CODES) {
-      const index = this.resolutionNotes.findIndex((note) => note.code === code);
-      const current = index >= 0 ? this.resolutionNotes[index]! : null;
-      const next = fresh.find((note) => note.code === code) ?? null;
-      if (current && next && JSON.stringify(current) === JSON.stringify(next)) continue;
-      if (current) {
-        this.resolutionNotes.splice(index, 1);
-        if (!next) {
-          this.recorder.append({
-            type: 'lifecycle',
-            loopPath: RESOLUTION_LOOP_PATH,
-            content: `Resolution note cleared: ${code}`,
-            causedBy: null,
-            data: { event: 'resolution_note_cleared', code },
-          });
-        }
-      }
-      if (next) this.recordResolutionNote(next);
-    }
-  }
-
-  /**
-   * The single write path for a note, and the reason the surfaces cannot
-   * drift: the log line and the lifecycle entry are both built from the note
-   * here, so there is no second place where the same fact is described.
-   *
-   * Every note warns regardless of severity. `info` is a classification for
-   * the consumer's renderer, not a log level: the warn is the surface a
-   * headless consumer has, and demoting the uncapped-session note to
-   * `logger.info` would silently withdraw a warning consumers are
-   * documented to receive.
-   */
-  private recordResolutionNote(note: ResolutionNote): void {
-    this.resolutionNotes.push(cloneResolutionNote(note));
-    this.logger.warn(resolutionWarnText(note));
-    this.recorder.append({
-      type: 'lifecycle',
-      loopPath: RESOLUTION_LOOP_PATH,
-      content: note.summary,
-      // Assembly is nobody's turn: there is no causing entry to point at,
-      // and the fallback stamp would attach it to whatever run happened to
-      // be live when a late note landed.
-      causedBy: null,
-      data: { event: 'resolution_note', note: cloneResolutionNote(note) },
-    });
+    return this.resolution.report();
   }
 
   // -------------------------------------------------------------------------
@@ -2820,7 +2703,7 @@ export class CortexAgent {
     this.reasoner.setModel(model);
     if (!this.talker || this.talkerModelPinned) return;
     this.talker.setModel(this.reasoner.getAutoResolvedUtilityModel());
-    this.refreshModelResolutionNotes();
+    this.resolution.refreshModelNotes();
   }
 
   getUtilityModel(): CortexModel {
@@ -3151,36 +3034,8 @@ export class CortexAgent {
    * of blocking a loop invisibly.
    */
   getNetworkAccessResolver(): ResolveNetworkAccess | undefined {
-    this.networkResolverHandedOut = true;
+    this.resolution.handOutNetworkResolver();
     return this.networkResolver ?? undefined;
-  }
-
-  /**
-   * Record, once, that this agent brokered an egress resolver that nobody
-   * ever took to wire into the sandbox, so shell egress asks cannot become
-   * conversation the way WebFetch's do.
-   *
-   * The one resolution note that is not an assembly fact. It cannot be: a
-   * consumer wires the resolver on the line after create() returns, so the
-   * only honest moment to look is the first prompt.
-   *
-   * **Duplex only, and the gate is the correctness fix rather than a
-   * narrowing.** In passthrough there is no broker: getNetworkAccessResolver()
-   * hands back the consumer's own function unchanged, so calling it would
-   * change nothing and never calling it proves nothing. The check has no
-   * information content there, and it fired anyway, telling the first real
-   * consumer that its egress was broken when that consumer had wired the
-   * sandbox to its own decision function and was answering every ask through
-   * its own UI. Both call sites still call in; this guard is the single
-   * statement of the rule.
-   */
-  private noteUnwiredNetworkResolver(): void {
-    if (this.mode !== 'duplex') return;
-    if (this.unwiredNetworkResolverWarned) return;
-    if (this.networkResolverHandedOut) return;
-    if (!this.sandboxConfigured || this.networkResolver === null) return;
-    this.unwiredNetworkResolverWarned = true;
-    this.recordResolutionNote(networkResolverUnwiredNote());
   }
 
   // The pi queue surface targets the conversation loop: the single
