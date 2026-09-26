@@ -193,7 +193,7 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
       // The discriminator is the stub's own errorMessage. pi mirrors an
       // assistant message's errorMessage into state.errorMessage
       // (pi-agent-core agent.js:394), and the loop turns a recorded
-      // state.errorMessage into a throw (agent-loop.ts runTurnWithRetry), so
+      // state.errorMessage into a throw (TurnRunner.runWithRetry), so
       // a stub carrying one is guaranteed to reach the retry ladder and then
       // either onRetryExhausted or onError. Those own it, and they fire when
       // the ladder is DONE rather than per attempt.
@@ -248,7 +248,7 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
       // direct and utility completion paths (an observation call failing,
       // say), which are not the user's work dying and must not be announced
       // as such. Inside a run the loop is still prompting here: the flag is
-      // cleared in runPromptOnce's finally, well after this fires.
+      // cleared in TurnRunner.runOnce's finally, well after this fires.
       if (!reasoner.isPrompting) return;
 
       // An abort has to clear the retry line: an abort during a backoff
@@ -265,7 +265,7 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
       }
 
       // Everything else here is terminal by construction: the loop emits
-      // onError from runTurnWithRetry only on the path where it has decided
+      // onError from TurnRunner.runWithRetry only on the path where it has decided
       // NOT to retry, so reaching this point means the ladder is over (or
       // never ran). Severity picks the wording, not whether to speak: a
       // 'recoverable' classification that still ended the turn with no
