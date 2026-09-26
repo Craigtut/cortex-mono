@@ -79,6 +79,9 @@ export type {
   ToolCallStartPayload,
   ToolCallUpdatePayload,
   ToolCallEndPayload,
+  TurnEndPayload,
+  LoopEndPayload,
+  LoopMessageView,
   PromptWatchdogDiagnosticsConfig,
 } from './types.js';
 // Value export: consumers building an effort picker need the canonical
@@ -142,7 +145,7 @@ export type {
 } from './cache-breakpoints.js';
 
 // Event Bridge (Phase 1B)
-export { EventBridge, extractResponseChunkText } from './event-bridge.js';
+export { EventBridge, extractResponseChunkText, payloadOf } from './event-bridge.js';
 export type {
   CortexEventType,
   CortexEvent,
@@ -150,6 +153,7 @@ export type {
   PiEventType,
   PiEvent,
   PiEventSource,
+  CortexEventPayloads,
 } from './event-bridge.js';
 
 // Budget Guard (Phase 1B)

@@ -10,6 +10,7 @@
  */
 
 import { errorMessageOf } from '../error-classifier.js';
+import { payloadOf } from '../event-bridge.js';
 import type { EventBridge } from '../event-bridge.js';
 import type { CortexModel } from '../model-wrapper.js';
 import { assistantText, findLastAssistant, toolCallNames } from '../pi-message.js';
@@ -95,7 +96,7 @@ export class SubAgentSpawner {
 
     ports.eventBridge.on('tool_call_start', (event) => {
       if (!event.childTaskId) return;
-      const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
+      const payload = payloadOf(event, 'tool_call_start');
       const toolName = payload?.toolName ?? 'unknown';
       const args = payload?.args ?? {};
       const summary = summarizeToolActivity(toolName, args);

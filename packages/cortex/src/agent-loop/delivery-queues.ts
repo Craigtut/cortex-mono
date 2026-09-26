@@ -12,6 +12,7 @@
 
 import type { AgentMessage } from '../context-manager.js';
 import { classifyError, errorMessageOf, toError } from '../error-classifier.js';
+import { payloadOf } from '../event-bridge.js';
 import type { CortexEvent } from '../event-bridge.js';
 import type { CortexLogger, RetryPolicy } from '../types.js';
 import {
@@ -187,8 +188,7 @@ export class DeliveryQueues {
     if (!this.ports.isPrompting() || this.ports.isShuttingDown()) return;
     if (this.ports.abort.inFlight) return;
     if (this.ports.budgetBreached()) return;
-    const message = (event.data as { message?: { stopReason?: unknown; errorMessage?: unknown } } | undefined)
-      ?.message;
+    const message = payloadOf(event, 'turn_end')?.message;
     if (!message) return;
     if (message.stopReason === 'error' || message.stopReason === 'aborted' || message.errorMessage != null) {
       return;

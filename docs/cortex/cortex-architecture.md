@@ -382,6 +382,8 @@ Pi-agent-core emits 10 events across 4 scopes. Cortex normalizes these into a co
 | `tool_execution_update` | *(none)* | New; tool progress, can be added or omitted |
 | `tool_execution_end` | `tool_call_end` | Direct mapping |
 
+**Typed payloads.** The bridge extracts a typed `payload` once from pi's raw event (`src/event-payloads.ts`), so no subscriber casts `event.data`: `tool_call_start` / `tool_call_update` / `tool_call_end` carry the tool call, `turn_end` carries the assistant message the turn ended with (`{ message?: { role, content, stopReason, errorMessage } }`), `loop_end` carries the run's messages in the same shape, and `utility_usage` its category. Read them with `payloadOf(event, type)`, which narrows by event type and returns undefined for any other. The raw pi event stays on `data` for logging.
+
 **Additional notes:**
 
 - Cortex additionally emits one synthetic event of its own: `utility_usage`, fired once per direct/utility completion with the typed usage and a category tag (see Token Tracking below). It propagates through `forwardFrom` with `childTaskId` set, exactly like pi events.

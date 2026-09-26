@@ -895,6 +895,30 @@ export interface ToolCallStartPayload {
 }
 
 /**
+ * A message of the run as turn_end and loop_end payloads carry it, typed to
+ * the fields Cortex reads (the raw pi message, with everything else, stays
+ * on `event.data`). A failed or aborted attempt ends with pi's synthetic
+ * assistant stub: stopReason 'error' or 'aborted', or an errorMessage.
+ */
+export interface LoopMessageView {
+  role?: string;
+  content?: unknown;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
+/** Typed payload for turn_end events. */
+export interface TurnEndPayload {
+  /** The assistant message the turn ended with; absent when pi's event carried none. */
+  message?: LoopMessageView;
+}
+
+/** Typed payload for loop_end events: the messages the run added, in order. */
+export interface LoopEndPayload {
+  messages: LoopMessageView[];
+}
+
+/**
  * Typed payload for tool_call_update events.
  */
 export interface ToolCallUpdatePayload {

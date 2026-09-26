@@ -16,6 +16,7 @@
  */
 
 import type { SessionUsage, SubAgentSnapshot } from '../types.js';
+import { payloadOf } from '../event-bridge.js';
 import type { EventBridge } from '../event-bridge.js';
 import type { DelegationSnapshot } from './delegations.js';
 import { clipHeadTail } from '../permission-rendering.js';
@@ -168,7 +169,7 @@ export class DuplexHeadlines {
     run.onAttemptEnd(() => this.noteAttemptBoundary());
     reasonerBridge.on('tool_call_start', (event) => {
       if (event.childTaskId) return;
-      const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
+      const payload = payloadOf(event, 'tool_call_start');
       if (!payload?.toolName) return;
       this.noteToolStart(payload.toolName, summarizeHeadlineArgs(payload.toolName, payload.args));
     });

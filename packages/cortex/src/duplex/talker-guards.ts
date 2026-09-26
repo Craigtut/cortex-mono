@@ -7,6 +7,7 @@
 
 import type { AgentLoop, ToolResultInterceptorInfo, ToolResultInterceptorResult } from '../agent-loop.js';
 import type { CortexLogger } from '../types.js';
+import { payloadOf } from '../event-bridge.js';
 import type { CortexEvent } from '../event-bridge.js';
 import { spokenText } from '../working-tags.js';
 import { errorMessageOf } from '../error-classifier.js';
@@ -91,7 +92,7 @@ export class TalkerGuards {
    * streak.
    */
   private auditTurnEnd(event: CortexEvent): void {
-    const message = (event.data as { message?: { stopReason?: unknown; content?: unknown } } | undefined)?.message;
+    const message = payloadOf(event, 'turn_end')?.message;
     const truncated = message?.stopReason === 'length';
     const content = message?.content;
     const hasToolCall = Array.isArray(content) &&

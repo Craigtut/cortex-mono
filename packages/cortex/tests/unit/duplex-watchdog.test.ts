@@ -120,7 +120,7 @@ describe('ReasonerOutcomeReporter silence clock and outcome', () => {
     return {
       type: 'loop_end',
       timestamp: 0,
-      data: { messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text }] }] },
+      payload: { messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text }] }] },
     } as never;
   }
 

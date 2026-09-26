@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { EventBridge } from '../../src/event-bridge.js';
+import { EventBridge, payloadOf } from '../../src/event-bridge.js';
 import type { PiEvent, PiEventSource, CortexEvent, CortexEventType } from '../../src/event-bridge.js';
 
 /**
@@ -477,6 +477,56 @@ describe('EventBridge', () => {
   // -----------------------------------------------------------------------
 
   describe('typed payloads', () => {
+    it('populates turn_end with the typed assistant message', () => {
+      const listener = vi.fn();
+      bridge.on('turn_end', listener);
+      source.emit({
+        type: 'turn_end',
+        message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'boom', usage: {} },
+      });
+      const event: CortexEvent = listener.mock.calls[0][0];
+      expect(payloadOf(event, 'turn_end')).toEqual({
+        message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'boom' },
+      });
+      // Narrowed by type: the wrong type reads nothing.
+      expect(payloadOf(event, 'loop_end')).toBeUndefined();
+    });
+
+    it('populates turn_end with no message when pi sent none', () => {
+      const listener = vi.fn();
+      bridge.on('turn_end', listener);
+      source.emit({ type: 'turn_end' });
+      expect(payloadOf(listener.mock.calls[0][0] as CortexEvent, 'turn_end')).toEqual({});
+    });
+
+    it('populates loop_end with the run messages', () => {
+      const listener = vi.fn();
+      bridge.on('loop_end', listener);
+      source.emit({
+        type: 'agent_end',
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: [{ type: 'text', text: 'hello' }], stopReason: 'stop' },
+          'not a message',
+        ],
+      });
+      expect(payloadOf(listener.mock.calls[0][0] as CortexEvent, 'loop_end')).toEqual({
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'assistant', content: [{ type: 'text', text: 'hello' }], stopReason: 'stop' },
+        ],
+      });
+    });
+
+    it('reads a tool_call_start payload typed', () => {
+      const listener = vi.fn();
+      bridge.on('tool_call_start', listener);
+      source.emit({ type: 'tool_execution_start', toolCallId: 'tc-9', toolName: 'Grep', args: { pattern: 'x' } });
+      const payload = payloadOf(listener.mock.calls[0][0] as CortexEvent, 'tool_call_start');
+      expect(payload?.toolName).toBe('Grep');
+      expect(payload?.args).toEqual({ pattern: 'x' });
+    });
+
     it('populates payload for tool_call_start', () => {
       const listener = vi.fn();
       bridge.on('tool_call_start', listener);

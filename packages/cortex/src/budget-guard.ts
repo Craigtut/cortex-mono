@@ -15,6 +15,7 @@
 
 import type { BudgetGuardConfig, BudgetScope, CortexLogger } from './types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
+import { payloadOf } from './event-bridge.js';
 import type { CortexEvent, EventBridge } from './event-bridge.js';
 
 // ---------------------------------------------------------------------------
@@ -27,14 +28,12 @@ import type { CortexEvent, EventBridge } from './event-bridge.js';
  * per failed or cancelled attempt and must not count toward maxTurns.
  */
 function isFailureTurnEnd(event: CortexEvent): boolean {
-  const data = event.data as Record<string, unknown> | undefined;
-  const message = data?.['message'] as Record<string, unknown> | undefined;
+  const message = payloadOf(event, 'turn_end')?.message;
   if (!message) return false;
-  const stopReason = message['stopReason'];
   return (
-    stopReason === 'error' ||
-    stopReason === 'aborted' ||
-    message['errorMessage'] != null
+    message.stopReason === 'error' ||
+    message.stopReason === 'aborted' ||
+    message.errorMessage !== undefined
   );
 }
 

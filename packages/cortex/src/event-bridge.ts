@@ -30,15 +30,16 @@ import type {
   CortexLogger,
   CortexUsage,
   TalkerDeltaPayload,
-  ToolCallStartPayload,
-  ToolCallUpdatePayload,
-  ToolCallEndPayload,
-  ToolContentDetails,
   UtilityUsagePayload,
 } from './types.js';
+import { extractPayload } from './event-payloads.js';
+import type { CortexEventPayloads } from './event-payloads.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { parseWorkingTags } from './working-tags.js';
 import { assistantUsage, readUsage, turnText } from './pi-message.js';
+
+export { payloadOf } from './event-payloads.js';
+export type { CortexEventPayloads } from './event-payloads.js';
 
 // ---------------------------------------------------------------------------
 // Normalized event types emitted to consumers
@@ -69,15 +70,11 @@ export interface CortexEvent {
   textOutput?: AgentTextOutput;
   /**
    * Typed payload for tool events (tool_call_start, tool_call_update,
-   * tool_call_end), utility_usage events, and the duplex facade's
-   * talker_delta events. Provides typed access without casting `data`.
+   * tool_call_end), turn_end and loop_end, utility_usage events, and the
+   * duplex facade's talker_delta events. Read it with {@link payloadOf},
+   * which narrows by event type, instead of casting `data`.
    */
-  payload?:
-    | ToolCallStartPayload
-    | ToolCallUpdatePayload
-    | ToolCallEndPayload
-    | UtilityUsagePayload
-    | TalkerDeltaPayload;
+  payload?: CortexEventPayloads[keyof CortexEventPayloads];
   /**
    * Extracted usage data from the LLM response, present on turn_end events
    * (from pi-ai's AssistantMessage.usage) and on utility_usage events (from
@@ -373,8 +370,7 @@ export class EventBridge {
       data: piEvent,
     };
 
-    // Populate typed payload for tool events
-    const payload = this.extractToolPayload(cortexType, piEvent);
+    const payload = extractPayload(cortexType, piEvent);
     if (payload) {
       cortexEvent.payload = payload;
     }
@@ -395,76 +391,6 @@ export class EventBridge {
     }
 
     this.emit(cortexEvent);
-  }
-
-  /**
-   * Extract a typed payload from a pi-agent-core tool event.
-   * Returns undefined for non-tool events.
-   */
-  private extractToolPayload(
-    cortexType: CortexEventType,
-    piEvent: PiEvent,
-  ): CortexEvent['payload'] {
-    if (cortexType === 'tool_call_start') {
-      return {
-        toolCallId: String(piEvent['toolCallId'] ?? piEvent['id'] ?? ''),
-        toolName: String(piEvent['toolName'] ?? piEvent['name'] ?? 'unknown'),
-        args: (piEvent['args'] ?? piEvent['input'] ?? {}) as Record<string, unknown>,
-      } satisfies ToolCallStartPayload;
-    }
-
-    if (cortexType === 'tool_call_update') {
-      const partialResult = piEvent['partialResult'] as ToolContentDetails<unknown> | undefined;
-      return {
-        toolCallId: String(piEvent['toolCallId'] ?? piEvent['id'] ?? ''),
-        toolName: String(piEvent['toolName'] ?? piEvent['name'] ?? 'unknown'),
-        args: (piEvent['args'] ?? piEvent['input'] ?? {}) as Record<string, unknown>,
-        partialResult: partialResult ?? { content: [], details: {} },
-      } satisfies ToolCallUpdatePayload;
-    }
-
-    if (cortexType === 'tool_call_end') {
-      const result = piEvent['result'] as ToolContentDetails<unknown> | undefined;
-      const isError = Boolean(piEvent['isError']);
-      const explicitError = piEvent['error'];
-      const payload: ToolCallEndPayload = {
-        toolCallId: String(piEvent['toolCallId'] ?? piEvent['id'] ?? ''),
-        toolName: String(piEvent['toolName'] ?? piEvent['name'] ?? 'unknown'),
-        result: result ?? { content: [], details: {} },
-        durationMs: Number(piEvent['durationMs'] ?? piEvent['duration'] ?? 0),
-        isError,
-      };
-      if (isError) {
-        // Extract error text from multiple possible sources:
-        // 1. Explicit error string field
-        // 2. Error object with message
-        // 3. Result content text (pi-agent-core puts error details here)
-        // 4. Fallback
-        let errorText: string | undefined;
-        if (typeof explicitError === 'string') {
-          errorText = explicitError;
-        } else if (explicitError instanceof Error) {
-          errorText = explicitError.message;
-        } else if (typeof explicitError === 'object' && explicitError !== null && 'message' in (explicitError as Record<string, unknown>)) {
-          errorText = String((explicitError as Record<string, unknown>)['message']);
-        }
-
-        // If no explicit error, extract from result content
-        if (!errorText && result?.content) {
-          const textParts = result.content
-            .filter((c): c is { type: 'text'; text: string } => c.type === 'text')
-            .map(c => c.text);
-          if (textParts.length > 0) {
-            errorText = textParts.join('\n');
-          }
-        }
-
-        payload.error = errorText ?? 'unknown error';
-      }
-      return payload;
-    }
-
-    return undefined;
   }
 
   /**

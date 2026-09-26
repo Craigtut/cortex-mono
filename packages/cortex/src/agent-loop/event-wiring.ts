@@ -9,6 +9,7 @@
 
 import type { AgentMessage } from '../context-manager.js';
 import type { CompactionManager } from '../compaction/index.js';
+import { payloadOf } from '../event-bridge.js';
 import type { EventBridge } from '../event-bridge.js';
 import { turnInputTokens, turnText } from '../pi-message.js';
 import type { PromptWatchdogDiagnostics } from '../prompt-diagnostics.js';
@@ -16,7 +17,6 @@ import type {
   AgentTextOutput,
   CortexLogger,
   LoopOriginContext,
-  UtilityUsagePayload,
 } from '../types.js';
 import { parseWorkingTags } from '../working-tags.js';
 import type { HandlerList } from './handler-list.js';
@@ -57,8 +57,7 @@ export function wireLoopEvents(bridge: EventBridge, deps: LoopEventDeps): () => 
     bridge.on('utility_usage', (event) => {
       const usage = event.usage;
       if (!usage) return;
-      const category =
-        (event.payload as UtilityUsagePayload | undefined)?.category ?? 'utility';
+      const category = payloadOf(event, 'utility_usage')?.category ?? 'utility';
 
       ledger.recordUtility(category, usage);
 

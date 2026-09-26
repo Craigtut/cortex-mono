@@ -23,8 +23,10 @@ import type {
   RetryExhaustedInfo,
   RetryScheduledInfo,
 } from '../types.js';
+import { payloadOf } from '../event-bridge.js';
 import type { CortexEvent } from '../event-bridge.js';
 import type { WakeClass } from '../session-log.js';
+import { findLastAssistant } from '../pi-message.js';
 import { spokenText } from '../working-tags.js';
 import type { DuplexHeadlines } from './headlines.js';
 import type { DuplexRouter } from './router.js';
@@ -165,14 +167,7 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
    * delivery so results always surface (review-findings F1).
    */
   noteAttemptEnd(event: CortexEvent): void {
-    const messages = (event.data as { messages?: unknown[] } | undefined)?.messages;
-    if (!Array.isArray(messages)) return;
-    let last: { stopReason?: unknown; content?: unknown; errorMessage?: unknown } | null = null;
-    for (const message of messages) {
-      if ((message as { role?: string } | null)?.role === 'assistant') {
-        last = message as { stopReason?: unknown; content?: unknown; errorMessage?: unknown };
-      }
-    }
+    const last = findLastAssistant(payloadOf(event, 'loop_end')?.messages ?? []);
     if (!last) return;
     // Ahead of the delivered-result check: a run that reported one result
     // and was then stopped mid-way through more work was still stopped.
@@ -201,7 +196,7 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
       // A stub with an error stop reason and NO errorMessage is the other
       // case: prompt() resolved, no throw, no ladder, no onError. This branch
       // is the only thing that can speak for it.
-      if (last.errorMessage != null) return;
+      if (last.errorMessage !== undefined) return;
       this.deliverFailure(
         'The background work stopped with an error before producing a result. ' +
         'Tell the user plainly and offer to try again.',
