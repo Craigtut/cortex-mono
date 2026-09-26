@@ -59,8 +59,6 @@ export class LogRecorder {
   /** Spawn lifecycle seq per live task, for completion causation. */
   private readonly spawnSeqByTaskId = new Map<string, number>();
   private readonly appendListeners: Array<(entry: SessionLogEntry) => void> = [];
-  /** Waiters released on the next log append (see waitForNextAppend). */
-  private appendWaiters: Array<() => void> = [];
 
   constructor(options: LogRecorderOptions) {
     this.options = options;
@@ -93,25 +91,12 @@ export class LogRecorder {
       ...(input.data !== undefined ? { data: input.data } : {}),
     });
     for (const listener of this.appendListeners) listener(entry);
-    if (this.appendWaiters.length > 0) {
-      for (const resolve of this.appendWaiters.splice(0)) resolve();
-    }
     return entry;
   }
 
   /** Run after every append, in registration order. */
   onAppend(listener: (entry: SessionLogEntry) => void): void {
     this.appendListeners.push(listener);
-  }
-
-  /**
-   * Resolve on the next log append. The settlement wait uses this as the
-   * event signal for broker-minted asks, which have no registry of their
-   * own to wake it: every path that settles one appends its entry first, so
-   * an append is guaranteed before the blocked resolver resumes.
-   */
-  waitForNextAppend(): Promise<void> {
-    return new Promise((resolve) => this.appendWaiters.push(resolve));
   }
 
   /**
@@ -291,14 +276,9 @@ export class LogRecorder {
     this.spawnSeqByTaskId.clear();
   }
 
-  /**
-   * Teardown: drop subscribers and release append waiters, since nothing
-   * appends after teardown and a wait blocked on the next append would
-   * never resume on its own.
-   */
+  /** Teardown: drop the log's subscribers. */
   destroy(): void {
     this.log.clearSubscribers();
-    for (const resolve of this.appendWaiters.splice(0)) resolve();
   }
 
   /** Spill retention-evicted entries through persistResult when configured. */

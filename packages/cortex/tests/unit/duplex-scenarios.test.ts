@@ -18,7 +18,7 @@ import type { AgentMessage } from '../../src/context-manager.js';
 import type { CompleteFn } from '../../src/compaction/compaction.js';
 import type { CortexTool } from '../../src/tool-contract.js';
 import type { ToolPermissionRequestContext } from '../../src/types.js';
-import { buildBrokeredPermissionResolver } from '../../src/duplex/permission-broker.js';
+import { buildBrokeredPermissionResolver } from '../../src/duplex/brokered-resolvers.js';
 import {
   createDuplexScenario,
   createPassthroughScenario,

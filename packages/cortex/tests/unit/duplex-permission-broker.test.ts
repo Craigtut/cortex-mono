@@ -19,11 +19,11 @@ import { collectCauseTags } from '../../src/duplex/cause-tags.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
 import type { BrokeredAskDecision, BrokeredAskRequest } from '../../src/duplex/permission-broker.js';
+import { PERMISSION_BROKER_DEFAULTS } from '../../src/duplex/permission-broker.js';
 import {
-  PERMISSION_BROKER_DEFAULTS,
   buildBrokeredNetworkResolver,
   buildBrokeredPermissionResolver,
-} from '../../src/duplex/permission-broker.js';
+} from '../../src/duplex/brokered-resolvers.js';
 
 interface Harness {
   router: DuplexRouter;
@@ -870,6 +870,23 @@ describe('the settle-to-voice coalescing window', () => {
 // ---------------------------------------------------------------------------
 
 describe('ask timeouts and settlement', () => {
+  it('signals settlement when an ask settles, and at once with none pending', async () => {
+    const h = createHarness();
+    const broker = h.router.permissionBroker;
+    await broker.waitForSettlement();
+
+    const ask = requestAsk(h, { askId: 'ask-net', kind: 'network', toolName: 'NetworkAccess' });
+    let signalled = false;
+    const wait = broker.waitForSettlement().then(() => { signalled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(signalled).toBe(false);
+
+    await answerAskById(h, 'ask-net', 'deny');
+    await wait;
+    expect(signalled).toBe(true);
+    expect(ask.decisions).toHaveLength(1);
+  });
+
   it('a tool ask times out to deny with a reason; escalations wait far longer', async () => {
     const h = createHarness({ askTimeoutMs: 40 });
     const tool = requestAsk(h, { askId: 'ask-tool' });

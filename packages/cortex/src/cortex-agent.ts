@@ -2249,16 +2249,13 @@ export class CortexAgent extends LoopSurface {
     // Pending asks block on a settlement signal, never on a polling
     // yield: an ask can outlive the child that raised it, and a
     // setImmediate spin would otherwise run hot for as long as it stays
-    // unanswered. Two registries, two signals. Loop asks have the loop's
-    // own; broker-minted network asks have none, so they wait on the next
-    // log append, which every broker settlement path (answer, timeout,
-    // abort, drain) performs before resolving the blocked resolver.
-    const asks: SettlementTerm = {
-      name: 'permission-asks',
-      pending: () => this.getPendingAsks().length > 0,
-      settled: () => (this.reasoner.getPendingAsks().length > 0
-        ? this.reasoner.waitForAskSettlement()
-        : this.recorder.waitForNextAppend()),
+    // unanswered. Two registries, each with its own signal: the reasoner's
+    // (its own and its sub-agents' asks), and the broker's, which alone
+    // holds network and quick-lookup asks.
+    const reasonerAsks: SettlementTerm = {
+      name: 'reasoner-asks',
+      pending: () => this.reasoner.getPendingAsks().length > 0,
+      settled: () => this.reasoner.waitForAskSettlement(),
     };
     const conversation = [this.prompts.term(), gate(this.topology.conversation)];
     const talker = this.talker;
@@ -2292,7 +2289,14 @@ export class CortexAgent extends LoopSurface {
               },
             }]
           : []),
-        asks,
+        reasonerAsks,
+        ...(router
+          ? [{
+              name: 'broker-asks',
+              pending: () => router.permissionBroker.pendingAskCount > 0,
+              settled: () => router.permissionBroker.waitForSettlement(),
+            }]
+          : []),
         parkedWakes(this.reasoner),
         ...(talker ? [parkedWakes(talker)] : []),
       ],

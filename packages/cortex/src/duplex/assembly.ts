@@ -19,7 +19,7 @@ import type { ResolvedCortexAgentConfig } from '../facade/config.js';
 import {
   buildBrokeredNetworkResolver,
   buildBrokeredPermissionResolver,
-} from './permission-broker.js';
+} from './brokered-resolvers.js';
 import type { PermissionBroker } from './permission-broker.js';
 import {
   buildQuickLookupPrompt,

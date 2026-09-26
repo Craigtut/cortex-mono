@@ -34,7 +34,7 @@ import {
 import {
   buildBrokeredNetworkResolver,
   buildBrokeredPermissionResolver,
-} from '../../src/duplex/permission-broker.js';
+} from '../../src/duplex/brokered-resolvers.js';
 import type { BrokeredAskDecision, PermissionBroker } from '../../src/duplex/permission-broker.js';
 import type { CortexAgentConfig, CortexAgentStateV2 } from '../../src/cortex-agent.js';
 

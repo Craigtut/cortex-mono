@@ -17,7 +17,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { Type } from 'typebox';
 import type { CortexTool } from '../../src/tool-contract.js';
 import type { AgentLoopConfig, SubAgentResult } from '../../src/types.js';
-import { buildBrokeredPermissionResolver } from '../../src/duplex/permission-broker.js';
+import { buildBrokeredPermissionResolver } from '../../src/duplex/brokered-resolvers.js';
 import {
   REASONER_ROLE_PROMPT,
   SPEAK_NOW_APPENDIX,
