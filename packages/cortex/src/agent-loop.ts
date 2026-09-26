@@ -2030,8 +2030,6 @@ export class AgentLoop {
     return !messageHasText(msg) || messageHasToolCalls(msg);
   }
 
-  /** Whether an assistant message carries non-empty text content. */
-  /** Whether an assistant message contains tool-call content parts. */
   /**
    * Whether trimming trailing failure messages would leave a transcript that
    * `agent.continue()` can resume (last message is a user or tool-result, not a
@@ -4674,7 +4672,6 @@ export class AgentLoop {
     this.eventBridge.emitUtilityUsage(category, usage);
   }
 
-  /** Get (or create) the session-usage bucket for a utility category. */
   // -----------------------------------------------------------------------
   // Token Tracking and Pipeline Phase
   // -----------------------------------------------------------------------
