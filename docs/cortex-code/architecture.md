@@ -114,20 +114,29 @@ Three-layer separation. Each layer has a single concern:
 
 ### Session Controller
 
-The central orchestrator. Owns the lifecycle of a Cortex agent session:
+The composition root for one interactive session (`src/session.ts`). It creates the `CortexAgent` and the TUI, owns the lifecycle (start, input dispatch, resume, abort, shutdown), and delegates each concern to a collaborator that owns it:
 
-- Creates and configures the `AgentLoop` with the active mode's settings
-- Provides the `getApiKey` callback, backed by the credential store
-- Provides the `transformContext` callback for ephemeral context injection
-- Streams agent output to the TUI
-- Routes user input to the agent
-- Manages session persistence (save on exit, restore on resume)
-- Manages permission rules (allow/deny/ask lists, session-scoped and persisted)
-- Hooks into `onLoopComplete`, `onBeforeCompaction`, `onPostCompaction` for observability
+| Concern | Owner |
+|---------|-------|
+| Agent config handed to `CortexAgent.create()` | `session/agent-config.ts` |
+| Model, provider, utility model, thinking effort | `session/model-selection.ts` |
+| `getApiKey` credentials and single-flight OAuth refresh | `providers/api-key-resolver.ts` |
+| Tool and network permission prompts, one prompt at a time | `permissions/prompt-broker.ts` |
+| Sandbox rung and status | `session/sandbox-state.ts` |
+| Trust gates for project MCP servers, hooks and skills | `session/trust-gates.ts` |
+| MCP config hot reload between turns | `mcp/reload-scheduler.ts` |
+| Busy state, keyed on the facade's work settlement | `session/work-tracker.ts` |
+| Submitting a turn (steer vs fresh prompt, pre_turn hooks) | `session/turn-runner.ts` |
+| Routing agent events to the TUI, activity stream and transcript | `session/agent-events.ts`, `session/tool-events.ts` |
+| Which resident loop an event came from (duplex) | `session/loop-routing.ts` |
+| Composite persistence, startup and turn-boundary checkpoints, resume loading | `persistence/session-checkpoints.ts` |
+| Footer state and the model's `<environment>` block | `session/status-view.ts` |
+
+Collaborators are built in the constructor and read the agent and the TUI through getters, because both are created later by `start()`.
 
 The session controller lives inside Cortex Code, not in a separate package. Cortex itself is the shared abstraction; it provides the consumer-agnostic hooks (`getApiKey`, `transformContext`, `getConversationHistory`, etc.) and each consumer wires them to its own world. A hypothetical web consumer would need entirely different orchestration (HTTP transport, multi-user sessions, server-side auth).
 
-**Session resume** uses a create-fresh-and-hydrate pattern: spin up a new agent instance, load saved history via `restoreConversationHistory()`, and continue. This avoids partial state corruption that can occur when mutating a live session in place.
+**Session resume** uses a create-fresh-and-hydrate pattern: start a new agent, then hand the saved composite state to the facade's all-or-nothing `restore()`. `restore()` refuses while a loop is running, so a `/resume` typed mid-turn fails loudly instead of splicing history out from under it.
 
 ### Session Activity Surface
 
@@ -524,7 +533,8 @@ Multiple Cortex Code instances can run concurrently in the same project director
 packages/cortex-code/
   src/
     index.ts              # Entry point, CLI arg parsing
-    session.ts            # Session controller
+    session.ts            # Session composition root and lifecycle
+    session/              # Session collaborators (see Session Controller)
     tui/
       app.ts              # Top-level TUI layout
       transcript.ts       # Conversation display (streaming markdown)
@@ -606,7 +616,7 @@ These exercise pure logic with no TUI or Cortex agent involved. Mock filesystem 
 | `discovery/mcp.ts` | MCP config parsing, server entry validation | Pure functions |
 | `commands/index.ts` | Command registry, fuzzy search filtering | Pure functions |
 | `persistence/sessions.ts` | Save/restore round-trip, debouncing, stale session cleanup | Mock `fs` |
-| `session.ts` | Agent lifecycle (create, prompt, abort, destroy), auto-save triggers, model switch flow | Mock `AgentLoop` |
+| `session.ts` and `session/` | Agent lifecycle, settlement-keyed busy state, checkpointing, duplex event routing, model switch flow | Real `CortexAgent` over a scripted pi agent (`tests/helpers/duplex-harness.ts`) |
 
 ### Component Render Tests
 
