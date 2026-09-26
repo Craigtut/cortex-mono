@@ -11,61 +11,38 @@ import type { QueueDrainMode } from '../pi-agent.js';
 
 export interface LoopDeliveryApi {
   /**
-   * Inject a steering message into the running agentic loop.
-   * Queues the message for pi-agent-core to inject after the current
-   * assistant turn and any current tool batch finish.
-   * Only effective while a prompt() call is in progress or queued.
-   *
-   * No-op if the agent is not currently prompting.
+   * Inject a steering message into the running agentic loop, after the
+   * current assistant turn and any current tool batch finish. Only effective
+   * while a prompt() call is in progress or queued; a no-op otherwise.
    *
    * @param message - The message content to inject
    */
   steer(message: string): void;
 
   /**
-   * Deliver a message to this loop regardless of its run state. The delivery
-   * primitive behind facade routing (docs/cortex/duplex/log-and-context.md):
-   * a state machine over (loop-gate depth, pi run state, abort state) with
-   * three actions:
+   * Deliver a message to this loop regardless of its run state. Three
+   * outcomes (design: "Delivery and Steering" in
+   * docs/cortex/cortex-architecture.md):
    *
-   * - `wake: false` (silent class), in EVERY run state: queue on the
-   *   AgentLoop itself, flushed into the next real prompt's message batch.
-   *   Never pi's steering queue: during a live run pi polls steering after
-   *   every tool batch (including terminated ones) and continues the loop if
-   *   anything is queued, and while idle a queued steer drains into whatever
-   *   run starts next (including a background-completion delivery). Either
-   *   way silent content would surface as an unprompted response.
-   * - Wake wanted, gate held (a turn is running, queued, in retry backoff,
-   *   or in the end-of-cycle drain window): park on the loop-owned wake
-   *   queue and enqueue a sweep task behind every gate task present now.
-   *   The content opens the NEXT run, not the one in flight: either as
-   *   leading batch messages of a prompt that dequeues ahead of the sweep,
-   *   or through the sweep's own run once the tasks ahead of it finish.
-   *   Cortex owns wake parking end to end; the content never enters pi's
-   *   steering queue (that queue belongs to the public steer() API alone,
-   *   and it cannot be inspected or selectively drained, so reconciling a
-   *   steered delivery after the fact either duplicated content a run had
-   *   already drained or destroyed steer() content). The cost is a bounded
-   *   one-run delay for a delivery that lands during a live run; the gain
-   *   is that delivery is exact rather than probabilistic.
-   * - Wake wanted, idle: start a turn with this content as the prompt; the
+   * - `wake: false` (silent), in every run state: queued on the AgentLoop
+   *   and flushed into the next real prompt's message batch. It never
+   *   starts a run or surfaces as an unprompted response.
+   * - Wake wanted, gate held (a turn running, queued, in retry backoff, or
+   *   in the drain window): parked. The content opens the next run, not the
+   *   one in flight, either in the batch of a prompt queued ahead or through
+   *   a sweep run of its own. It never enters pi's steering queue, so
+   *   delivery is exact: nothing duplicated, nothing destroyed.
+   * - Wake wanted, idle: a turn starts with this content as the prompt; the
    *   returned `turn` promise settles with it.
    *
-   * The branch decision and its action happen in one synchronous frame, so
-   * there is no time-of-check race against prompt() (which throws whenever
-   * the gate is held): nothing can acquire the gate between the depth check
-   * and the action taken here.
+   * The decision and its action happen in one synchronous frame, so there
+   * is no time-of-check race against prompt().
    *
-   * Queued silent deliveries are dropped on destroy(); a facade that needs
-   * them durable should drain them into its own state before teardown (see
-   * {@link clearQueuedDeliveries}). Parked wake deliveries share that
-   * contract (see {@link clearAllQueues}) and are additionally dropped by
-   * abort(): a parked delivery is cancelled like the turn it was waiting
-   * behind, never delivered by a run that starts after the user stopped
-   * the agent. That includes a delivery that parks while an abort is
-   * completing (the parked queue is gated on an abort epoch, so neither a
-   * mid-abort drain replacing the controller nor the skipped gate wait
-   * lets it through to a post-abort run).
+   * Silent and parked content is dropped on destroy(); a facade that needs
+   * it durable drains it first ({@link clearQueuedDeliveries},
+   * {@link clearAllQueues}). abort() also cancels parked content, including
+   * content that parks while the abort is completing, so it never rides a
+   * run that starts after the user stopped the agent.
    *
    * @param content - Non-whitespace message content (user role)
    * @param options - Wake behavior; default wakes an idle loop
@@ -124,18 +101,13 @@ export interface LoopDeliveryApi {
    * returning the dropped content in queue order. Silent deliveries and pi's
    * queues are untouched.
    *
-   * The narrow form exists because the broad one destroys information. An
-   * owner that needs to retract ONE class of parked content (a facade
-   * dropping permission voicings whose ask has already been settled, so a
-   * dead request is never read out) would otherwise have to call
-   * {@link clearAllQueues} and re-deliver the survivors, which loses their
-   * cause tags: a parked user utterance re-delivered without its tag can no
-   * longer satisfy a permission ask, so retracting one delivery would
-   * silently revoke the consent value of another.
+   * Use this instead of {@link clearAllQueues} plus re-delivery to retract
+   * one class of parked content (say, voicings of an already-settled ask):
+   * re-delivered survivors lose their cause tags, and a user utterance
+   * without its tag can no longer satisfy a permission ask.
    *
-   * Nothing is dead-lettered here. The drop is the caller's deliberate
-   * decision about content it produced, not a delivery failure, and the
-   * caller is the one holding the context to record it.
+   * Nothing is dead-lettered: the drop is the caller's deliberate decision,
+   * not a delivery failure.
    */
   dropPendingWakeDeliveries(predicate: (content: string) => boolean): string[];
 
@@ -158,12 +130,10 @@ export interface LoopDeliveryApi {
   markAskVoiced(askId: string): boolean;
 
   /**
-   * Resolve once the pending-ask set next shrinks: an ask settled (however
-   * it settled: answered, blocked, or aborted) or teardown cleared the
-   * registry. Resolves immediately when no ask is pending. This is the
-   * event-driven form settlement predicates wait on instead of polling
-   * getPendingAsks(), which can otherwise spin for as long as an ask
-   * outlives the work that raised it.
+   * Resolve once the pending-ask set next shrinks: an ask settled
+   * (answered, blocked, or aborted) or teardown cleared the registry.
+   * Resolves immediately when no ask is pending. Wait on this instead of
+   * polling getPendingAsks().
    */
   waitForAskSettlement(): Promise<void>;
 }

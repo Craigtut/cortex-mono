@@ -1,18 +1,14 @@
 /**
- * What happens when the loop cannot deliver content: the bounded
- * redelivery budgets for parked wake deliveries and background
- * completions, and the dead-letter store that records whatever the loop
- * gives up on.
+ * The redelivery budgets for parked wake deliveries and background
+ * completions, and the dead-letter store for what the loop gives up on.
+ * See "Background delivery budgets and dead letters" in
+ * docs/cortex/cortex-architecture.md.
  *
- * Both delivery paths re-attempt a failed run a bounded number of times.
- * Each attempt runs an in-run retry ladder for transient failures, so the
- * attempt cap alone would let re-attempts re-enter the full ladder (~3h
- * under the default policy) back-to-back while holding the loop gate
- * through a sustained outage; the elapsed budget also caps each attempt's
- * ladder (see boundedPolicyFor). Content given up on is dead-lettered, never
- * dropped silently: the store keeps it for inspection and
- * onBackgroundResultDeadLettered handlers fire (the CortexAgent facade
- * turns those into session-log lifecycle entries).
+ * Each delivery attempt runs an in-run retry ladder, so an attempt cap
+ * alone would let re-attempts re-enter the full ladder (~3h by default)
+ * back-to-back while holding the gate through an outage. The elapsed
+ * budget also caps each attempt's ladder (boundedPolicyFor). Nothing given
+ * up on is dropped silently: it is dead-lettered and handlers fire.
  */
 
 import { withElapsedCeiling } from '../retry-policy.js';
@@ -64,12 +60,9 @@ export function boundedPolicyFor(
 }
 
 /**
- * After a failed delivery run: charge each item the attempt (unless
- * `countAttempt` is false, as for an abort, which is the user stopping
- * the agent rather than the delivery failing) and split the items into
- * those with budget left and those exhausted. `fatal` exhausts
- * everything: an immediate identical re-attempt of, say, an
- * authentication failure is futile.
+ * After a failed delivery run, charge each item the attempt (unless
+ * `countAttempt` is false) and split off the exhausted ones. `fatal`
+ * exhausts everything.
  */
 export function partitionExhausted<T extends DeliveryAttempts>(
   items: readonly T[],
@@ -95,16 +88,13 @@ export function partitionExhausted<T extends DeliveryAttempts>(
 /** Dead-lettered completions retained for consumer inspection. */
 const DEFAULT_DEAD_LETTER_CAP = 50;
 
-/**
- * Synthetic taskId for dead-lettered wake deliveries, which have no task
- * behind them (see DeadLetteredBackgroundResult.taskId).
- */
+/** Synthetic taskId for dead-lettered wake deliveries, which have no task. */
 const WAKE_DELIVERY_DEAD_LETTER_ID = 'wake-delivery';
 
 /**
- * The bounded record of content the loop gave up on. Deliberately NOT
- * cleared on destroy: it is the consumer's post-mortem record of
- * undelivered work, and teardown itself dead-letters anything pending.
+ * The bounded record of content the loop gave up on. Not cleared on
+ * destroy: it is the consumer's post-mortem record, and teardown itself
+ * dead-letters anything pending.
  */
 export class DeadLetterStore {
   readonly handlers: HandlerList<[result: DeadLetteredBackgroundResult]>;
@@ -132,11 +122,7 @@ export class DeadLetterStore {
     this.handlers.emit(entry);
   }
 
-  /**
-   * Record wake deliveries the loop gives up on or cancels, one entry per
-   * item. Without these, the session log shows a user utterance with no
-   * reply and nothing saying why.
-   */
+  /** One entry per dropped wake delivery, so a reply-less utterance has an explanation. */
   recordWake(dropped: ReadonlyArray<{ content: string } & DeliveryAttempts>, lastError: string): void {
     for (const item of dropped) {
       this.record({
