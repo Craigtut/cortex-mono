@@ -23,6 +23,8 @@
  */
 
 import type { CortexModel } from './model-wrapper.js';
+import { describeModel } from './facade/mode-resolution.js';
+import type { ModeResolution, ModeResolutionModel } from './facade/mode-resolution.js';
 
 /**
  * How much a note matters.
@@ -45,6 +47,8 @@ export const RESOLUTION_NOTE_CODES = [
   'talker-utility-model-skipped',
   'network-resolver-unwired',
   'duplex-cost-cap-unset',
+  'mode-resolved-passthrough',
+  'duplex-not-concurrent',
 ] as const;
 
 export type ResolutionNoteCode = (typeof RESOLUTION_NOTE_CODES)[number];
@@ -94,6 +98,8 @@ export function resolutionWarnText(note: ResolutionNote): string {
  */
 export interface AssemblyResolution {
   mode: 'duplex' | 'passthrough';
+  /** How the mode was decided, before any loop existed. */
+  modeResolution: ModeResolution;
   /** `talker.model` as the consumer supplied it (undefined means auto). */
   requestedTalkerModel: CortexModel | undefined;
   /** The model the talker loop holds; null in passthrough. */
@@ -196,7 +202,82 @@ export function collectAssemblyResolutionNotes(
     });
   }
 
+  const decided = resolution.modeResolution;
+  if (decided.requested === undefined && resolution.mode === 'passthrough') {
+    const roles = [
+      { role: 'reasoner', model: decided.reasoner },
+      ...(decided.talker ? [{ role: 'talker', model: decided.talker }] : []),
+    ];
+    const blocking = describeNonParallel(roles);
+    notes.push({
+      code: 'mode-resolved-passthrough',
+      severity: 'info',
+      summary: 'Running passthrough: the backend is not known to serve the talker and reasoner concurrently.',
+      detail:
+        'mode was not set, so it was resolved from backend concurrency. Duplex only helps ' +
+        "when the talker's request runs while the reasoner's is in flight, and " +
+        `${blocking ?? 'the talker model could not be resolved'}, so the agent runs a single loop.`,
+      remedy:
+        'If the backend does serve concurrent requests (for Ollama, OLLAMA_NUM_PARALLEL above 1 ' +
+        'and both models fitting in memory), set parallelRequests: true in createOllamaModel(), ' +
+        "or set mode: 'duplex'.",
+      data: {
+        ...modelData('reasoner', decided.reasoner),
+        ...(decided.talker ? modelData('talker', decided.talker) : {}),
+      },
+    });
+  }
+
+  if (resolution.mode === 'duplex' && talkerModel !== null) {
+    const talker = describeModel(talkerModel);
+    const reasoner = describeModel(reasonerModel);
+    const blocking = describeNonParallel([
+      { role: 'talker', model: talker },
+      { role: 'reasoner', model: reasoner },
+    ]);
+    if (blocking !== null) {
+      notes.push({
+        code: 'duplex-not-concurrent',
+        severity: 'degraded',
+        summary: 'Duplex on a backend not known to serve concurrent requests: the talker may queue behind the reasoner.',
+        detail:
+          `mode is 'duplex', but ${blocking}. The talker only stays responsive while ` +
+          'the reasoner works if the backend serves both requests at once.',
+        remedy:
+          'Use a backend that serves concurrent requests (for Ollama, raise OLLAMA_NUM_PARALLEL and ' +
+          "set parallelRequests: true in createOllamaModel()), or use mode: 'passthrough'.",
+        data: { ...modelData('talker', talker), ...modelData('reasoner', reasoner) },
+      });
+    }
+  }
+
   return notes;
+}
+
+/** Flat note data for one loop's model (notes are copied one level deep). */
+function modelData(role: string, model: ModeResolutionModel): Record<string, unknown> {
+  return {
+    [`${role}Provider`]: model.provider,
+    [`${role}ModelId`]: model.modelId,
+    [`${role}Concurrency`]: model.concurrency,
+  };
+}
+
+/**
+ * The loops whose model is not `parallel`, as prose ("the talker model "x"
+ * ("ollama") serves one request at a time"), or null when every one is.
+ */
+function describeNonParallel(
+  roles: Array<{ role: string; model: ModeResolutionModel }>,
+): string | null {
+  const blocking = roles.filter(({ model }) => model.concurrency !== 'parallel');
+  if (blocking.length === 0) return null;
+  return blocking.map(({ role, model }) => {
+    const state = model.concurrency === 'serial'
+      ? 'serves one request at a time'
+      : 'is not known to serve concurrent requests';
+    return `the ${role} model "${model.modelId}" ("${model.provider}") ${state}`;
+  }).join(' and ');
 }
 
 /**

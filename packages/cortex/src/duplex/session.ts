@@ -330,8 +330,9 @@ export class DuplexSession implements SessionMode {
    */
   setModel(model: CortexModel): void {
     this.reasoner.setModel(model);
-    if (this.talkerModelPinned) return;
-    this.talker.setModel(this.reasoner.getAutoResolvedUtilityModel());
+    if (!this.talkerModelPinned) this.talker.setModel(this.reasoner.getAutoResolvedUtilityModel());
+    // Pinned or not, the reasoner's model changed, and its concurrency is
+    // one of the model notes.
     this.services.refreshModelNotes();
   }
 

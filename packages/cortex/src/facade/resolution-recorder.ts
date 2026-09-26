@@ -6,7 +6,7 @@
  *
  * Computed once at construction, plus the one condition that cannot be
  * known then (the unwired egress resolver) and the model notes the facade
- * re-resolves itself (setModel re-mirroring an unpinned talker).
+ * re-resolves itself (setModel swapping the loops' models).
  */
 
 import type { CortexLogger } from '../types.js';
@@ -24,6 +24,7 @@ import type {
 import type { LogEntryInput } from './log-recorder.js';
 import type { LoopTopology } from './loop-surface.js';
 import type { ResolvedCortexAgentConfig } from './config.js';
+import type { ModeResolution } from './mode-resolution.js';
 import type { BudgetGuard } from '../budget-guard.js';
 
 /**
@@ -34,12 +35,13 @@ import type { BudgetGuard } from '../budget-guard.js';
 const RESOLUTION_LOOP_PATH = 'facade';
 
 /**
- * Notes read off the talker's model, re-evaluated when the facade itself
- * re-resolves that model (setModel on an unpinned talker).
+ * Notes read off the loops' models, re-evaluated when the facade itself
+ * changes them (setModel).
  */
 const MODEL_RESOLUTION_NOTE_CODES: ReadonlySet<ResolutionNoteCode> = new Set<ResolutionNoteCode>([
   'talker-model-fallback',
   'talker-utility-model-skipped',
+  'duplex-not-concurrent',
 ]);
 
 export interface ResolutionRecorderOptions {
@@ -72,6 +74,7 @@ export class ResolutionRecorder {
    */
   static forAssembly(parts: {
     config: ResolvedCortexAgentConfig;
+    modeResolution: ModeResolution;
     topology: LoopTopology;
     aggregateGuard: () => BudgetGuard | null;
     append: (input: LogEntryInput) => void;
@@ -82,6 +85,7 @@ export class ResolutionRecorder {
     return new ResolutionRecorder({
       observe: () => ({
         mode: talker ? 'duplex' : 'passthrough',
+        modeResolution: parts.modeResolution,
         requestedTalkerModel: config.talker?.model,
         talkerModel: talker?.getModel() ?? null,
         reasonerModel: topology.work.getModel(),
@@ -115,8 +119,12 @@ export class ResolutionRecorder {
   }
 
   /**
-   * Re-evaluate the notes that describe the talker's model after the facade
-   * re-resolved it (setModel re-mirrors an unpinned talker). This is not the
+   * Re-evaluate the notes that describe the loops' models after the facade
+   * changed them (setModel swaps the reasoner's and re-mirrors an unpinned
+   * talker). The mode itself is not re-decided: loops are assembled from it,
+   * so a switch onto a serial backend earns a duplex-not-concurrent note
+   * rather than a mode change, and a passthrough agent stays passthrough
+   * (decisions.md D21). This is not the
    * lazy report the eager design rules out: the facade itself just redid
    * part of the assembly, so the model notes are assembly facts again, and
    * leaving them would report a fallback that no longer exists or miss one

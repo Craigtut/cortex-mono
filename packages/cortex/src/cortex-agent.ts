@@ -7,13 +7,17 @@
  * the resolution report, and teardown. What depends on the mode is a
  * SessionMode (facade/session-mode.ts):
  *
- * - `duplex` (the default, decisions.md D14): a fast talker loop fronting
- *   the persistent reasoner (DuplexSession). The talker carries the fixed
- *   control toolset only; the reasoner does all real work and reports back
- *   through the router's wake policy.
+ * - `duplex` (decisions.md D14): a fast talker loop fronting the persistent
+ *   reasoner (DuplexSession). The talker carries the fixed control toolset
+ *   only; the reasoner does all real work and reports back through the
+ *   router's wake policy.
  * - `passthrough`: a single reasoner loop, reproducing direct AgentLoop
  *   behavior exactly (PassthroughSession). This is the consumer opt-out and
  *   the parity baseline for tests.
+ *
+ * An omitted `mode` resolves to duplex when both loops' models are served
+ * concurrently, and to passthrough otherwise (facade/mode-resolution.ts,
+ * decisions.md D21).
  *
  * The talker/reasoner split is never exposed in this API; consumer config
  * is routed internally per CONFIG_ROUTING (facade/config.ts), and the
@@ -34,7 +38,7 @@ import type { ResolveNetworkAccess, SandboxRung } from './sandbox/types.js';
 import type { SandboxState } from './sandbox/options.js';
 import { isSandboxProvider } from './sandbox/options.js';
 import { SandboxSession } from './sandbox/session.js';
-import { buildReasonerConfig, DEFAULT_MODE } from './facade/config.js';
+import { buildReasonerConfig } from './facade/config.js';
 import type { CortexAgentConfig, ResolvedCortexAgentConfig } from './facade/config.js';
 import { LoopSurface, loopTopology } from './facade/loop-surface.js';
 import type { ForwardedLoopMember } from './facade/loop-delegation.js';
@@ -43,6 +47,8 @@ import { CompositeState } from './facade/composite-state.js';
 import { StateEmitter } from './facade/state-emitter.js';
 import { LogRecorder } from './facade/log-recorder.js';
 import { ResolutionRecorder } from './facade/resolution-recorder.js';
+import { resolveFacadeMode } from './facade/mode-resolution.js';
+import type { ModeResolution } from './facade/mode-resolution.js';
 import { PromptTracker, Settlement } from './facade/settlement.js';
 import { PassthroughSession } from './facade/passthrough-session.js';
 import type {
@@ -56,7 +62,7 @@ import { DuplexSession } from './duplex/session.js';
 
 // The facade's public types live with their owners; re-exported here so the
 // facade module stays the one import site for them.
-export { CONFIG_ROUTING, DEFAULT_MODE, buildReasonerConfig } from './facade/config.js';
+export { CONFIG_ROUTING, buildReasonerConfig } from './facade/config.js';
 export type {
   CortexAgentConfig,
   CortexAgentMode,
@@ -111,8 +117,13 @@ export class CortexAgent extends LoopSurface {
 
   private readonly resolution: ResolutionRecorder;
 
-  private constructor(reasoner: AgentLoop, config: ResolvedCortexAgentConfig, talker?: AgentLoop) {
-    const mode = config.mode ?? DEFAULT_MODE;
+  private constructor(
+    reasoner: AgentLoop,
+    config: ResolvedCortexAgentConfig,
+    talker?: AgentLoop,
+    modeResolution: ModeResolution = resolveFacadeMode(config),
+  ) {
+    const { mode } = modeResolution;
     if (mode === 'duplex' && !talker) {
       throw new Error('CortexAgent duplex mode requires a talker loop.');
     }
@@ -152,6 +163,7 @@ export class CortexAgent extends LoopSurface {
     this.networkResolver = config.resolveNetworkAccess ?? null;
     this.resolution = ResolutionRecorder.forAssembly({
       config,
+      modeResolution,
       topology: this.topology,
       aggregateGuard: () => this.session.aggregateBudgetGuard,
       append: (input) => this.recorder.append(input),
@@ -209,9 +221,11 @@ export class CortexAgent extends LoopSurface {
   }
 
   private static async createResolved(config: ResolvedCortexAgentConfig, managed?: SandboxSession): Promise<CortexAgent> {
-    if ((config.mode ?? DEFAULT_MODE) === 'duplex') {
+    // Decided once, before any loop exists: the loops are built from it.
+    const modeResolution = resolveFacadeMode(config);
+    if (modeResolution.mode === 'duplex') {
       const loops = await assembleDuplexLoops(config, managed);
-      const agent = new CortexAgent(loops.reasoner, loops.config, loops.talker);
+      const agent = new CortexAgent(loops.reasoner, loops.config, loops.talker, modeResolution);
       if (managed) agent.resolution.handOutNetworkResolver();
       const session = agent.session as DuplexSession;
       loops.bindBroker(session.broker);
@@ -219,7 +233,7 @@ export class CortexAgent extends LoopSurface {
       return agent;
     }
     const reasoner = await AgentLoop.create(buildReasonerConfig(config));
-    return new CortexAgent(reasoner, config);
+    return new CortexAgent(reasoner, config, undefined, modeResolution);
   }
 
   // -------------------------------------------------------------------------

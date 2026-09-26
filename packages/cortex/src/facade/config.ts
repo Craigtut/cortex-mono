@@ -11,18 +11,12 @@ import type { SandboxConfig } from '../sandbox/options.js';
 import type { DuplexRouterOptions } from '../duplex/router-contract.js';
 
 /**
- * Facade mode. `duplex` (talker + reasoner) is the default.
- * `passthrough` is the opt-out: it routes everything to the single reasoner
- * loop and reproduces direct AgentLoop behavior exactly (decisions.md D14).
+ * Facade mode. `duplex` runs a talker fronting the reasoner; `passthrough`
+ * routes everything to the single reasoner loop and reproduces direct
+ * AgentLoop behavior exactly (decisions.md D14). An omitted mode is resolved
+ * from backend concurrency (facade/mode-resolution.ts, decisions.md D21).
  */
 export type CortexAgentMode = 'passthrough' | 'duplex';
-
-/**
- * The mode a consumer gets without asking. One constant rather than two
- * defaulted reads, so the construction check and the stored mode can never
- * disagree about what an omitted `mode` means.
- */
-export const DEFAULT_MODE: CortexAgentMode = 'duplex';
 
 /** Talker-loop overrides (duplex mode). */
 export interface TalkerConfig {
@@ -141,7 +135,13 @@ export interface CortexAgentConfig extends Omit<AgentLoopConfig, 'sandbox'> {
   sandbox?: SandboxConfig;
   /** Consumer tools. Routed to the reasoner only (decisions.md D5). */
   tools?: CortexTool[];
-  /** Facade mode. Default: 'duplex'; 'passthrough' is the opt-out (D14). */
+  /**
+   * Facade mode. Default: duplex when both the talker's and the reasoner's
+   * models are served concurrently (`capabilities.concurrency: 'parallel'`,
+   * every hosted provider), passthrough otherwise, with a
+   * 'mode-resolved-passthrough' resolution note (D21). An explicit value
+   * always wins.
+   */
   mode?: CortexAgentMode;
   /** Talker overrides (duplex mode). */
   talker?: TalkerConfig;

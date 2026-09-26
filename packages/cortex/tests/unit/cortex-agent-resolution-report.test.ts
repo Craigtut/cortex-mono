@@ -325,7 +325,11 @@ describe('resolution report: one source, three surfaces', () => {
     const report = facade.getResolutionReport();
     // More than one note, so an accidental single-element coincidence cannot
     // carry the equality.
-    expect(codes(report)).toEqual(['talker-model-fallback', 'duplex-cost-cap-unset']);
+    expect(codes(report)).toEqual([
+      'talker-model-fallback',
+      'duplex-cost-cap-unset',
+      'duplex-not-concurrent',
+    ]);
 
     // Asserted as an equality between the surfaces. A hand-written expected
     // shape here would be a second description of the same fact, which is the
@@ -344,7 +348,7 @@ describe('resolution report: one source, three surfaces', () => {
     report[0]!.data['provider'] = 'rewritten';
     report.length = 0;
 
-    expect(facade.getResolutionReport()).toHaveLength(2);
+    expect(facade.getResolutionReport()).toHaveLength(3);
     expect(facade.getResolutionReport()[0]!.summary).not.toBe('rewritten');
     expect(loggedNotes(facade)[0]!.data['provider']).toBe('self-hosted-vllm');
   });

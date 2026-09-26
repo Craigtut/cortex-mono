@@ -90,17 +90,18 @@ describe('setModel on a duplex facade', () => {
     });
     expect(h.facade.getResolutionReport()).toEqual([]);
 
-    // Onto a provider with no fast tier: the talker is now the primary.
+    // Onto a provider with no fast tier: the talker is now the primary, and
+    // the mode stays duplex on a backend not known to be concurrent.
     h.facade.setModel(UNENUMERABLE);
     expect(h.talkerLoop.getModel().modelId).toBe('internal-70b');
     expect(h.facade.getResolutionReport().map((note) => note.code))
-      .toEqual(['talker-model-fallback']);
+      .toEqual(['talker-model-fallback', 'duplex-not-concurrent']);
 
-    // And back: the fallback is gone, and the clearing is on the record.
+    // And back: both notes are gone, and the clearings are on the record.
     h.facade.setModel(SONNET);
     expect(h.talkerLoop.getModel().modelId).toBe('claude-haiku-4-5');
     expect(h.facade.getResolutionReport()).toEqual([]);
-    expect(lifecycleEvents(h.facade, 'resolution_note_cleared')).toHaveLength(1);
+    expect(lifecycleEvents(h.facade, 'resolution_note_cleared')).toHaveLength(2);
   });
 });
 
