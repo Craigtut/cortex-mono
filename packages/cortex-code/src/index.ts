@@ -179,6 +179,9 @@ async function main(): Promise<void> {
   } catch (err) {
     uninstallSignalHandlers?.();
     await session?.recordFatalActivityError(err);
+    // Tear down whatever start() already built (agent, MCP, sandbox runtime)
+    // so a failed launch leaves no runtime process or temp directory behind.
+    await session?.disposeSandbox().catch(() => {});
     throw err;
   }
 }
