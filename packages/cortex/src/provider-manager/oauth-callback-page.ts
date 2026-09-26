@@ -58,8 +58,8 @@ let oauthCallbackResultNotified = false;
 /**
  * Probe whether something is already listening on a loopback port. Used to
  * fail an OAuth flow fast (before opening a browser) when the provider's
- * fixed callback port is occupied — otherwise pi-ai binds the other stack /
- * the browser hits the wrong listener and the user gets a dead page while
+ * fixed callback port is occupied. Otherwise pi-ai binds the other stack,
+ * the browser hits the wrong listener, and the user gets a dead page while
  * pi-ai waits forever.
  */
 export function probeCallbackPortInUse(port: number, host: string): Promise<boolean> {

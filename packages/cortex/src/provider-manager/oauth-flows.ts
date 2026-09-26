@@ -197,7 +197,7 @@ export class OAuthFlows {
       );
     }
 
-    // (A) Fail fast — before opening a browser — if the provider's fixed
+    // Fail fast, before opening a browser, if the provider's fixed
     // callback port is already taken. Otherwise pi-ai binds the other
     // stack, the browser hits the wrong listener, and pi-ai waits forever.
     await assertOAuthCallbackPortAvailable(
@@ -209,9 +209,9 @@ export class OAuthFlows {
     const abort = new AbortController();
     this.activeOAuthAbort = abort;
 
-    // (C) pi-ai only settles its callback wait on success; on a failed
+    // pi-ai only settles its callback wait on success; on a failed
     // callback (e.g. state mismatch) it hangs. The render shim already sees
-    // that response — use it to fail the flow immediately with the reason.
+    // that response, so use it to fail the flow immediately with the reason.
     let failFromCallback!: (err: OAuthError) => void;
     const callbackFailure = new Promise<never>((_, reject) => {
       failFromCallback = reject;
@@ -237,7 +237,7 @@ export class OAuthFlows {
       this.oauthCallbackRoutes,
     );
 
-    // (B) pi-ai callback servers ignore the abort signal, so cancellation
+    // pi-ai callback servers ignore the abort signal, so cancellation
     // and timeout are enforced here. Without this the flow hangs forever.
     const timeoutMs = callbacks.timeoutMs ?? DEFAULT_OAUTH_FLOW_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -259,10 +259,9 @@ export class OAuthFlows {
       )), { once: true });
     });
 
-    // pi replaced the callbacks bag with a single interaction object: every
-    // out-bound message is notify(AuthEvent) and every in-bound answer is
-    // prompt(AuthPrompt). Adapt here so Cortex's consumer-facing
-    // OAuthCallbacks contract is unchanged by the pi restructure.
+    // pi's login takes one interaction object: every out-bound message is
+    // notify(AuthEvent) and every in-bound answer is prompt(AuthPrompt).
+    // Adapt it to Cortex's consumer-facing OAuthCallbacks.
     const interaction: PiAuthInteraction = {
       signal: abort.signal,
       notify: (event: PiAuthEvent) => {
@@ -274,8 +273,7 @@ export class OAuthFlows {
             return;
           case 'device_code':
             // pi hands us the code as structured data, so pass it straight
-            // through rather than re-deriving it from a prose instruction
-            // (which is what the old string-parsing path had to do).
+            // through rather than re-deriving it from a prose instruction.
             callbacks.onAuth({
               url: event.verificationUri,
               flowType: 'device_code',
@@ -363,8 +361,8 @@ export class OAuthFlows {
     // Security: spread first so a stored blob cannot override Cortex's 'type'.
     const current = { ...rawCredentials, type: 'oauth' as const } as PiOAuthCredential;
 
-    // pi removed getOAuthApiKey without a replacement, splitting it into
-    // refresh (network, may rotate the token) and toAuth (pure derivation).
+    // pi splits key derivation into refresh (network, may rotate the token)
+    // and toAuth (pure derivation).
     // Refresh slightly early: a token that expires mid-flight fails the
     // request it was fetched for.
     let settled = current;

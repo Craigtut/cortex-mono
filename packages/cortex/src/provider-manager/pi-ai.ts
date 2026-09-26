@@ -11,7 +11,7 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Shape of the pi-ai functions ProviderManager uses. pi-ai 0.80 split these
+ * Shape of the pi-ai functions ProviderManager uses. pi-ai spreads these
  * across entrypoints: catalog reads live on `providers/all`, thinking-level
  * helpers on the root, and completion on the temporary `/compat` shim.
  * `loadPiAi()` composes them back into this single object.
@@ -41,13 +41,8 @@ interface PiModelAuth {
 
 /**
  * pi's per-provider OAuth implementation, reached through
- * `builtinProviders()` rather than a global registry.
- *
- * The registry pi used to export (`getOAuthProvider`, `getOAuthApiKey`, ...)
- * is gone: its entrypoint is a types-only shim now, so those reads yielded
- * undefined rather than failing. Notably there is no `getOAuthApiKey`
- * replacement; deriving a usable key is now the app's job, which is what
- * {@link ProviderManager.resolveOAuthApiKey} reimplements on top of
+ * `builtinProviders()`: pi has no global OAuth registry. Nor does it turn a
+ * credential into an API key, so OAuthFlows.resolveApiKey derives one from
  * refresh + toAuth.
  */
 export interface PiOAuthAuth {
@@ -96,11 +91,10 @@ interface PiBuiltinProvider {
  */
 export async function loadPiAi(): Promise<PiAiModule> {
   try {
-    // pi-ai 0.80 split the old root "global API" across entrypoints. Compose
-    // the subset ProviderManager needs from their durable homes: catalog reads
-    // from `providers/all`, thinking-level helpers from root, and completion
-    // from the temporary `/compat` shim (pinned pending the Phase 2
-    // createModels() migration). String-literal paths avoid bundler resolution.
+    // Compose the subset ProviderManager needs from each entrypoint: catalog
+    // reads from `providers/all`, thinking-level helpers from root, and
+    // completion from the temporary `/compat` shim. String-literal paths
+    // avoid bundler resolution.
     const catalogPath = '@earendil-works/pi-ai/providers/all';
     const rootPath = '@earendil-works/pi-ai';
     const compatPath = '@earendil-works/pi-ai/compat';
@@ -137,11 +131,9 @@ export async function loadPiAi(): Promise<PiAiModule> {
  * The assertion is the point. A dynamic import of a module that exports
  * nothing SUCCEEDS and yields `{}`, so a try/catch around the import cannot
  * detect an emptied entrypoint, and a cast to a hand-written all-optional
- * interface makes `{}` typecheck. That combination is exactly how pi-ai
- * gutting its `/oauth` entrypoint reached users as the false message
- * "provider does not support OAuth". Check for the function, and name it when
- * it is missing, so the next pi reshape fails loudly here instead of being
- * laundered into a plausible lie downstream.
+ * interface makes `{}` typecheck. Unchecked, a pi release that moves this
+ * export reaches users as the false "provider does not support OAuth". Name
+ * the missing function so it fails loudly here instead.
  */
 async function loadPiBuiltinProviders(): Promise<PiBuiltinProvider[]> {
   let mod: Record<string, unknown>;

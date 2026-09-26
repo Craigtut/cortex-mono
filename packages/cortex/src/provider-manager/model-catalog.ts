@@ -39,8 +39,8 @@ const LEGACY_MODEL_PREFIXES: Record<string, string[]> = {
 
 /**
  * Narrow a pi level name to Cortex's union. Identity apart from the
- * membership check: Cortex's names are pi's names. This used to fold "xhigh"
- * into "max", which made a model advertising both report a single top level.
+ * membership check: Cortex's names are pi's names, and folding two of them
+ * (xhigh into max, say) would hide one of a model's levels.
  */
 function mapPiThinkingLevel(level: string): ThinkingLevel | null {
   return (THINKING_LEVEL_ORDER as readonly string[]).includes(level)
