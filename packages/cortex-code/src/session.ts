@@ -66,8 +66,8 @@ import {
 } from './persistence/sessions.js';
 import { TranscriptWriter, extractToolResultText } from './persistence/transcript-writer.js';
 import { getCommand, registerBuiltinCommands } from './commands/index.js';
-import { dismissVersion, type UpdateInfo } from './updates/checker.js';
-import { runNpmUpgrade } from './updates/upgrade.js';
+import type { UpdateInfo } from './updates/checker.js';
+import { UpdatePrompt } from './updates/update-prompt.js';
 import type { Mode } from './modes/types.js';
 import { AVAILABLE_MODES } from './modes/index.js';
 import path from 'node:path';
@@ -251,8 +251,7 @@ export class Session {
   private readonly initialUtilityModelId: string | undefined;
   private readonly compactionStrategy: 'observational' | 'classic';
   private updateInfo: UpdateInfo | null;
-  /** Guards against stacking a second update overlay (startup + /update, or double /update). */
-  private updatePromptOpen = false;
+  private readonly updatePrompt: UpdatePrompt;
 
   constructor(options: SessionOptions) {
     this.config = options.config;
@@ -305,6 +304,11 @@ export class Session {
     });
     // Durable append-only conversation log, separate from the lossy history.json
     // snapshot. Read by sibling apps to summarize where a session left off.
+    this.updatePrompt = new UpdatePrompt({
+      getApp: () => this.app,
+      activity: this.activity,
+      flushTranscript: () => this.transcriptWriter.flush(),
+    });
     this.transcriptWriter = new TranscriptWriter(this.sessionId, this.cwd, {
       cliVersion: PKG_VERSION,
       provider: this.models.provider,
@@ -452,80 +456,9 @@ export class Session {
     }
   }
 
-  /**
-   * Show the interactive "update available" overlay. The user can update now
-   * (runs npm and exits) or skip this version (recorded so it won't prompt
-   * again until a newer version ships).
-   */
-  async promptForUpdate(info: UpdateInfo): Promise<void> {
-    // Ignore if no TUI, or an update overlay is already showing (avoids stacking
-    // two overlays from startup + /update, or a double /update).
-    if (!this.app || this.updatePromptOpen) return;
-    this.updatePromptOpen = true;
-    await new Promise<void>((resolve) => {
-      const items: SelectItem[] = [
-        {
-          value: 'update',
-          label: 'Update now',
-          description: `Install ${info.packageName}@${info.latestVersion} and restart`,
-        },
-        {
-          value: 'skip',
-          label: 'Skip this version',
-          description: 'Continue; remind me when a newer version ships',
-        },
-      ];
-
-      const list = new SelectList(items, 2, selectListTheme);
-      const overlayBox = new OverlayBox(
-        list,
-        `Update available: ${info.currentVersion} → ${info.latestVersion}`,
-      );
-      const handle = this.app!.tui.showOverlay(overlayBox, {
-        anchor: 'center',
-        width: '60%',
-        maxHeight: 10,
-      });
-
-      // Guard against the SelectList firing onSelect/onCancel more than once
-      // (e.g. a rapid double Enter) before the overlay is removed: the "update"
-      // branch spawns npm and exits, so a double-fire must not run twice.
-      let done = false;
-      const finish = async (value: string) => {
-        if (done) return;
-        done = true;
-        handle.hide();
-        if (value === 'update') {
-          await this.runUpgrade(info); // tears down the TUI and exits the process
-          return; // not reached on success
-        }
-        await dismissVersion(info.latestVersion);
-        this.updatePromptOpen = false;
-        this.app!.focusEditor();
-        resolve();
-      };
-
-      list.onSelect = (item) => { void finish(item.value); };
-      list.onCancel = () => { void finish('skip'); };
-    });
-  }
-
-  /** Tear down the TUI, run the global npm upgrade, and exit. */
-  private async runUpgrade(info: UpdateInfo): Promise<void> {
-    this.app?.stop();
-    console.log(`\nUpdating ${info.packageName} to ${info.latestVersion}...\n`);
-    const code = await runNpmUpgrade(info.packageName);
-    if (code === 0) {
-      await this.activity.recordDone({ code: 0, signal: null, reason: 'upgrade_completed' });
-      await this.activity.flush();
-      await this.transcriptWriter.flush();
-      console.log(`\n✓ Updated to ${info.latestVersion}. Restart with: cortex\n`);
-      process.exit(0);
-    }
-    await this.activity.recordError(new Error(`Upgrade failed with exit code ${code}`), true);
-    await this.activity.flush();
-    console.log(`\nUpdate failed. Run it manually:\n  npm i -g ${info.packageName}@latest\n`);
-    process.exit(1);
+  /** Show the interactive "update available" overlay (startup and /update). */
+  promptForUpdate(info: UpdateInfo): Promise<void> {
+    return this.updatePrompt.show(info);
   }
 
   /** Handle user input (slash command or agent prompt). */
