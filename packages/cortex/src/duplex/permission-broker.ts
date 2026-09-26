@@ -51,11 +51,10 @@ import type {
 } from '../types.js';
 import type { WakeClass } from '../session-log.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
-import { errorMessageOf } from '../error-classifier.js';
 import type { CauseTag } from './cause-tags.js';
 import { stripAskFence } from './ask-fence.js';
 import { asTrimmedString } from './control-tools.js';
-import { buildAskVoicing } from './prompts.js';
+import { AskVoicing } from './ask-voicing.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -203,20 +202,6 @@ export const PERMISSION_BROKER_DEFAULTS = {
   settleVoiceDelayMs: 250,
 } as const;
 
-/**
- * Minimum ms between re-voicings of the same ask. One assistant message can
- * carry many refused answer_ask calls (the N4 shape); without damping each
- * refusal would re-deliver the voicing and the ask would talk over itself.
- * The ask stays answerable the whole time; only the re-delivery is damped.
- *
- * Deliberately larger than the router's default inter-delivery spacing
- * (2s): every voicing stamps that spacing clock, so at equal values the
- * re-voice becomes eligible exactly as the queued ordinary deliveries do,
- * and the margin the damping is supposed to provide is zero by
- * construction.
- */
-const REVOICE_MIN_INTERVAL_MS = 3_000;
-
 /** Cap on {@link PermissionBroker.settledAskIds}. */
 const MAX_SETTLED_ASK_IDS = 64;
 
@@ -280,23 +265,6 @@ interface BrokeredAsk {
   /** Seq of the 'ask' log entry; also the seq the voicing cause tag carries. */
   entrySeq: number;
   requestedAt: number;
-  voiced: boolean;
-  /**
-   * Seq anchor for consent: the ask_voiced lifecycle entry appended at the
-   * moment of (re-)voicing. A qualifying utterance must be strictly newer.
-   * Null until a voicing is accepted by the talker, so an ask nobody could
-   * have heard can never be allowed.
-   */
-  voicedAtSeq: number | null;
-  /**
-   * The exact text of the last voicing handed to the talker, so a
-   * destroyed delivery reported back by the loop's dead-letter surface can
-   * be recognized as THIS ask's voicing ({@link
-   * PermissionBroker.noteDeliveryDestroyed}). Null while unvoiced.
-   */
-  lastVoicingText: string | null;
-  /** Clock stamp of the last voicing delivery, for revoice damping. */
-  lastVoicedAtMs: number;
   settled: boolean;
   resolve: (decision: BrokeredAskDecision) => void;
   timer: ReturnType<typeof setTimeout> | null;
@@ -309,13 +277,10 @@ export class PermissionBroker {
   private readonly now: () => number;
   private readonly askTimeoutMs: number | null;
   private readonly escalationAskTimeoutMs: number | null;
-  private readonly settleVoiceDelayMs: number;
+  /** What the user has heard: queue, voiced ask, consent anchors. */
+  private readonly voicing: AskVoicing;
 
   private readonly asks = new Map<string, BrokeredAsk>();
-  /** Ask ids awaiting their first voicing, FIFO. */
-  private voiceQueue: string[] = [];
-  /** Pending coalesced voice-the-next-ask timer (see {@link settle}). */
-  private settleVoiceTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Recently settled ask ids, bounded and FIFO-evicted. Only used to tell
    * "you already answered that" from "no such request" in the answer_ask
@@ -323,14 +288,8 @@ export class PermissionBroker {
    * and re-reads: never a grant, so the cap is safe to be small.
    */
   private readonly settledAskIds = new Set<string>();
-  /** The most recently voiced, still-pending ask (exactly one at a time). */
-  private voicedAskId: string | null = null;
-  /** True while settleAll drains, so settlement never voices a doomed ask. */
-  private draining = false;
   /** Released whenever an ask settles (see waitForSettlement). */
   private settlementWaiters: Array<() => void> = [];
-  /** Re-entrancy guard for lost-voicing recovery (see noteVoicingLost). */
-  private revoicingLostVoicing = false;
   private destroyed = false;
 
   constructor(ports: PermissionBrokerPorts, options?: PermissionBrokerOptions) {
@@ -343,8 +302,21 @@ export class PermissionBroker {
     this.escalationAskTimeoutMs = options?.escalationAskTimeoutMs !== undefined
       ? options.escalationAskTimeoutMs
       : PERMISSION_BROKER_DEFAULTS.escalationAskTimeoutMs;
-    this.settleVoiceDelayMs = options?.settleVoiceDelayMs
-      ?? PERMISSION_BROKER_DEFAULTS.settleVoiceDelayMs;
+    this.voicing = new AskVoicing(
+      {
+        appendLog: (input) => this.ports.appendLog(input),
+        voiceToTalker: (content, causeTag) => this.ports.voiceToTalker(content, causeTag),
+        ...(ports.markAskVoiced
+          ? { markAskVoiced: (askId: string) => this.ports.markAskVoiced!(askId) }
+          : {}),
+      },
+      {
+        settleVoiceDelayMs: options?.settleVoiceDelayMs
+          ?? PERMISSION_BROKER_DEFAULTS.settleVoiceDelayMs,
+        now: this.now,
+        logger: this.logger,
+      },
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -387,17 +359,12 @@ export class PermissionBroker {
         request,
         entrySeq,
         requestedAt: this.now(),
-        voiced: false,
-        voicedAtSeq: null,
-        lastVoicingText: null,
-        lastVoicedAtMs: 0,
         settled: false,
         resolve,
         timer: null,
         abortListener: null,
       };
       this.asks.set(request.askId, ask);
-      this.voiceQueue.push(request.askId);
 
       const timeoutMs = request.kind === 'escalation'
         ? this.escalationAskTimeoutMs
@@ -411,7 +378,13 @@ export class PermissionBroker {
         ask.abortListener = () => this.handleAbort(request.askId);
         request.signal.addEventListener('abort', ask.abortListener, { once: true });
       }
-      this.voiceNext();
+      this.voicing.enqueue({
+        askId: request.askId,
+        loopPath: request.loopPath,
+        renderedRequest: request.renderedRequest,
+        kind: request.kind,
+        entrySeq,
+      });
     });
   }
 
@@ -473,7 +446,7 @@ export class PermissionBroker {
       : rawReason;
 
     if (decisionText !== 'allow' && decisionText !== 'deny') {
-      this.revoiceCurrent();
+      this.voicing.revoiceCurrent();
       return { receipt: INVALID_DECISION_RECEIPT, refusal: 'unreadable decision' };
     }
 
@@ -489,16 +462,17 @@ export class PermissionBroker {
         // fabrication, with the real request still pending. Reported as
         // "no longer pending" it tells the user the request went away while
         // it sits there waiting, so it refuses and re-reads instead.
-        this.revoiceCurrent();
+        this.voicing.revoiceCurrent();
         return { receipt: UNKNOWN_ASK_RECEIPT, refusal: 'unknown ask id' };
       }
-    } else if (this.voicedAskId !== null) {
+    } else {
       // A bare answer binds to the one voiced ask; with exactly one voiced
       // at a time there is nothing else it could honestly mean.
-      ask = this.asks.get(this.voicedAskId);
+      const voicedAskId = this.voicing.voiced()?.askId;
+      if (voicedAskId !== undefined) ask = this.asks.get(voicedAskId);
     }
     if (!ask) {
-      this.revoiceCurrent();
+      this.voicing.revoiceCurrent();
       return { receipt: UNBOUND_RECEIPT, refusal: 'no ask bindable without an id' };
     }
 
@@ -519,8 +493,9 @@ export class PermissionBroker {
     }
 
     // allow
-    if (ask.request.askId !== this.voicedAskId || ask.voicedAtSeq === null) {
-      this.revoiceCurrent();
+    const voiced = this.voicing.voiced();
+    if (voiced?.askId !== ask.request.askId || voiced.voicedAtSeq === null) {
+      this.voicing.revoiceCurrent();
       return {
         receipt: NOT_VOICED_RECEIPT,
         refusal: 'allow for an ask that is not the most recently voiced',
@@ -529,7 +504,7 @@ export class PermissionBroker {
     let qualifyingSeq: number | null = null;
     let voicingInThisRun = false;
     for (const tag of this.ports.currentTalkerCauseTags()) {
-      if (tag.kind === 'utterance' && tag.seq > ask.voicedAtSeq) {
+      if (tag.kind === 'utterance' && tag.seq > voiced.voicedAtSeq) {
         if (qualifyingSeq === null || tag.seq > qualifyingSeq) qualifyingSeq = tag.seq;
       }
       if (tag.kind === 'ask' && tag.seq === ask.entrySeq) {
@@ -537,7 +512,7 @@ export class PermissionBroker {
       }
     }
     if (qualifyingSeq === null || voicingInThisRun) {
-      this.revoiceCurrent();
+      this.voicing.revoiceCurrent();
       return {
         receipt: CONSENT_REFUSED_RECEIPT,
         refusal: voicingInThisRun
@@ -570,61 +545,27 @@ export class PermissionBroker {
 
   /**
    * Re-read the currently voiced ask to the user (refusal recovery). The
-   * consent anchor does NOT move: the user already heard this request, and
-   * a re-read must not invalidate an answer they have already given. Damped
-   * to one re-delivery per interval, so a turn spraying refused answers
-   * cannot flood the voice channel. Use {@link noteVoicingLost} instead
-   * when the previous voicing never reached the user: that case is not
-   * damped and does take a fresh anchor.
+   * anchor does not move; damped (AskVoicing.revoiceCurrent).
    */
   revoiceCurrent(): void {
-    if (this.destroyed || this.voicedAskId === null) return;
-    const ask = this.asks.get(this.voicedAskId);
-    if (!ask) return;
-    if (this.now() - ask.lastVoicedAtMs < REVOICE_MIN_INTERVAL_MS) return;
-    this.voiceAsk(ask);
+    this.voicing.revoiceCurrent();
   }
 
   /**
-   * The current voicing never reached the user: the delivery was destroyed
-   * (a facade abort clearing the talker's queues, a parked item dropped on
-   * a stale abort epoch, a sweep giving up past the re-park cap) or the
-   * hand-off threw. Withdraw the anchor, because it records only that
-   * voicing began, and read the request out again with a fresh one.
-   * Returns whether an ask was affected.
+   * The current voicing never reached the user: withdraw its anchor and
+   * read it out again (AskVoicing.noteLost). Returns whether an ask was
+   * affected.
    */
   noteVoicingLost(): boolean {
-    if (this.destroyed || this.draining || this.voicedAskId === null) return false;
-    const ask = this.asks.get(this.voicedAskId);
-    if (!ask || ask.settled) return false;
-    ask.voicedAtSeq = null;
-    ask.lastVoicingText = null;
-    // Re-entrancy guard: the re-delivery below can itself be destroyed
-    // synchronously (a re-voice landing inside an abort that is still
-    // draining), and an un-anchored ask is already safe, so the recovery
-    // must never recurse.
-    if (this.revoicingLostVoicing) return true;
-    this.revoicingLostVoicing = true;
-    try {
-      this.voiceAsk(ask);
-    } finally {
-      this.revoicingLostVoicing = false;
-    }
-    return true;
+    return this.voicing.noteLost();
   }
 
   /**
-   * Destroyed delivery content reported by the loop's dead-letter surface.
-   * The surface carries no delivery id, so correlation is by exact content:
-   * a dropped wake delivery whose text is the voicing we handed over IS
-   * that voicing. Anything else is another producer's content and is
-   * ignored. Returns whether it matched the current voicing.
+   * Destroyed delivery content from the loop's dead-letter surface; a match
+   * with the current voicing is a lost voicing (AskVoicing.noteDestroyed).
    */
   noteDeliveryDestroyed(content: string): boolean {
-    if (this.voicedAskId === null) return false;
-    const ask = this.asks.get(this.voicedAskId);
-    if (!ask || ask.lastVoicingText === null || ask.lastVoicingText !== content) return false;
-    return this.noteVoicingLost();
+    return this.voicing.noteDestroyed(content);
   }
 
   /**
@@ -637,9 +578,7 @@ export class PermissionBroker {
     // asks to settle, and a late abort or restore must not re-enter the
     // drain.
     if (this.destroyed) return;
-    this.clearSettleVoiceTimer();
-    this.draining = true;
-    try {
+    this.voicing.drain(() => {
       for (const ask of [...this.asks.values()]) {
         this.ports.appendLog({
           type: 'lifecycle',
@@ -650,11 +589,7 @@ export class PermissionBroker {
         });
         this.settle(ask, { decision: 'deny', reason: DROP_REASONS[cause] });
       }
-    } finally {
-      this.draining = false;
-    }
-    this.voiceQueue = [];
-    this.voicedAskId = null;
+    });
   }
 
   /** Facade restore(): the pending asks belong to the replaced session. */
@@ -666,7 +601,7 @@ export class PermissionBroker {
     if (this.destroyed) return;
     this.settleAll('destroy');
     this.destroyed = true;
-    this.clearSettleVoiceTimer();
+    this.voicing.destroy();
   }
 
   /**
@@ -690,8 +625,7 @@ export class PermissionBroker {
       toolName: ask.request.toolName,
       renderedRequest: ask.request.renderedRequest,
       requestedAt: ask.requestedAt,
-      voiced: ask.voiced,
-      voicedAtSeq: ask.voicedAtSeq,
+      ...this.voicing.stateOf(ask.request.askId),
       kind: ask.request.kind,
     }));
   }
@@ -714,103 +648,6 @@ export class PermissionBroker {
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
-
-  private voiceNext(): void {
-    if (this.destroyed || this.draining || this.voicedAskId !== null) return;
-    for (;;) {
-      const nextId = this.voiceQueue.shift();
-      if (nextId === undefined) return;
-      const ask = this.asks.get(nextId);
-      if (!ask || ask.settled) continue;
-      this.voicedAskId = nextId;
-      this.voiceAsk(ask);
-      return;
-    }
-  }
-
-  /**
-   * Voice (or re-voice) one ask and commit the voiced state only once the
-   * talker has accepted the hand-off. `voiced`, the loop-registry sync, and
-   * the consent anchor all assert "the user could have heard this", so a
-   * delivery that threw must set none of them.
-   */
-  private voiceAsk(ask: BrokeredAsk): boolean {
-    const firstVoicing = !ask.voiced;
-    if (!this.deliverVoicing(ask, !firstVoicing)) return false;
-    if (firstVoicing) {
-      ask.voiced = true;
-      try {
-        this.ports.markAskVoiced?.(ask.request.askId);
-      } catch (err) {
-        this.logger.warn('markAskVoiced port threw', {
-          error: errorMessageOf(err),
-        });
-      }
-    }
-    return true;
-  }
-
-  /**
-   * Append the ask_voiced anchor entry and hand the voicing to the talker.
-   * The anchor entry is appended BEFORE the delivery, so any utterance that
-   * qualifies is provably newer than the moment voicing began; the voicing
-   * delivery carries the ask-kind cause tag that lets the consent check
-   * refuse answers from the very run that introduced the request.
-   *
-   * The anchor is PROVISIONAL until the hand-off returns. An entry says
-   * only that voicing was attempted, and every consent rule downstream
-   * reads it as "the user could have heard the request", so a throw
-   * withdraws it. Returns whether the talker took the voicing.
-   *
-   * An ask that is ALREADY anchored keeps its anchor across a re-read. The
-   * anchor means "after the user could have heard this request", and a
-   * re-read does not un-hear it, so moving it would silently discard
-   * consent already given: the user says yes, the talker fumbles the
-   * decision field, the refusal re-reads the request, and the yes is now
-   * permanently stale. Only an unheard voicing (never delivered, or
-   * destroyed, both of which null the anchor) takes a fresh one.
-   */
-  private deliverVoicing(ask: BrokeredAsk, revoiced: boolean): boolean {
-    const anchoring = ask.voicedAtSeq === null;
-    const anchorSeq = this.ports.appendLog({
-      type: 'lifecycle',
-      loopPath: ask.request.loopPath,
-      content: revoiced ? 'Permission request re-voiced' : 'Permission request voiced',
-      causedBy: ask.entrySeq,
-      data: {
-        event: 'ask_voiced',
-        askId: ask.request.askId,
-        ...(revoiced ? { revoiced: true } : {}),
-        ...(anchoring ? {} : { anchorUnchanged: true }),
-      },
-    });
-    ask.lastVoicedAtMs = this.now();
-    const text = buildAskVoicing({
-      askId: ask.request.askId,
-      renderedRequest: ask.request.renderedRequest,
-      kind: ask.request.kind,
-      revoiced,
-    });
-    try {
-      this.ports.voiceToTalker(text, { kind: 'ask', seq: ask.entrySeq });
-    } catch (err) {
-      // Nothing reached the user, so nothing about this voicing may stand.
-      // Withdrawing the anchor is what keeps an unheard request out of
-      // allow range: left anchored, a later utterance plus a persuaded
-      // talker would grant a request nobody ever read out. The ask itself
-      // stays pending and answerable, and timeout/abort still bound it.
-      ask.voicedAtSeq = null;
-      ask.lastVoicingText = null;
-      this.logger.error('ask voicing delivery failed', {
-        askId: ask.request.askId,
-        error: errorMessageOf(err),
-      });
-      return false;
-    }
-    if (anchoring) ask.voicedAtSeq = anchorSeq;
-    ask.lastVoicingText = text;
-    return true;
-  }
 
   private handleTimeout(askId: string): void {
     const ask = this.asks.get(askId);
@@ -859,34 +696,9 @@ export class PermissionBroker {
     }
     this.asks.delete(ask.request.askId);
     this.rememberSettled(ask.request.askId);
-    this.voiceQueue = this.voiceQueue.filter((id) => id !== ask.request.askId);
-    if (this.voicedAskId === ask.request.askId) {
-      this.voicedAskId = null;
-    }
     ask.resolve(decision);
     for (const release of this.settlementWaiters.splice(0)) release();
-    this.scheduleVoiceNext();
-  }
-
-  /**
-   * Voice the next queued ask after a coalescing window rather than inline
-   * with this settlement. See {@link PERMISSION_BROKER_DEFAULTS}
-   * settleVoiceDelayMs: settling several asks in one talker turn must leave
-   * exactly one voicing in flight, not one per settlement.
-   */
-  private scheduleVoiceNext(): void {
-    if (this.destroyed || this.draining) return;
-    if (this.settleVoiceTimer !== null) return;
-    if (this.settleVoiceDelayMs <= 0) {
-      this.voiceNext();
-      return;
-    }
-    const timer = setTimeout(() => {
-      this.settleVoiceTimer = null;
-      this.voiceNext();
-    }, this.settleVoiceDelayMs);
-    timer.unref?.();
-    this.settleVoiceTimer = timer;
+    this.voicing.forget(ask.request.askId);
   }
 
   private rememberSettled(askId: string): void {
@@ -897,11 +709,5 @@ export class PermissionBroker {
       if (oldest === undefined) break;
       this.settledAskIds.delete(oldest);
     }
-  }
-
-  private clearSettleVoiceTimer(): void {
-    if (this.settleVoiceTimer === null) return;
-    clearTimeout(this.settleVoiceTimer);
-    this.settleVoiceTimer = null;
   }
 }
