@@ -20,7 +20,7 @@
  */
 
 import type { BudgetGuard } from './budget-guard.js';
-import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-breakpoints.js';
+import type { DirectCompletionContext } from './cache-breakpoints.js';
 import type { CompactionManager } from './compaction/index.js';
 import type { ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './compaction/observational/types.js';
 import type { AgentContext, AgentMessage, ContextManager } from './context-manager.js';
@@ -33,7 +33,6 @@ import { withPlaceholderContent } from './pi-message.js';
 import type { SkillRegistry } from './skill-registry.js';
 import type { SubAgentManager } from './sub-agent-manager.js';
 import type { CortexTool } from './tool-contract.js';
-import type { CortexToolRuntime } from './tools/runtime.js';
 import type {
   AgentLoopConfig,
   AgentTextOutput,
@@ -71,13 +70,12 @@ import type { LoopPromptApi } from './agent-loop/api/prompt.js';
 import type { LoopRunApi } from './agent-loop/api/run.js';
 import type { LoopSubAgentApi } from './agent-loop/api/sub-agents.js';
 import type { LoopToolApi } from './agent-loop/api/tools.js';
-import { assembleLoop, backgroundTaskState } from './agent-loop/assembly.js';
+import { assembleLoop } from './agent-loop/assembly.js';
 import type { LoopParts } from './agent-loop/assembly.js';
-import type { PendingBackgroundCompletion } from './agent-loop/background-delivery.js';
 import { CHILD_SEED_CONTEXT_SLOT, prepareChildLoop } from './agent-loop/child-loop-config.js';
 import type { ChildLoopParams } from './agent-loop/child-loop-config.js';
 import type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
-import type { DeliverOptions, DeliverResult, QueuedDelivery } from './agent-loop/delivery-queues.js';
+import type { DeliverOptions, DeliverResult } from './agent-loop/delivery-queues.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { mirrorChildPermissionResolver } from './agent-loop/permissions.js';
 import {
@@ -96,7 +94,6 @@ import type {
 import { buildPiAgentConfig, loadAgentClass, wirePiTransformContext } from './agent-loop/pi-hooks.js';
 import type { PiHookHost, ToolResultInterceptor } from './agent-loop/pi-hooks.js';
 import { isAbortShapedError } from './agent-loop/run-control.js';
-import type { ForegroundSpawnResult, SubAgentSpawnParams } from './agent-loop/sub-agent-spawner.js';
 
 export type { PiAgent, PiModel, QueueDrainMode } from './agent-loop/pi-agent.js';
 export type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
@@ -704,69 +701,5 @@ export class AgentLoop implements
   private isAborted(): boolean {
     return this.parts.abortState.signal.aborted ||
       isAbortShapedError(this.agent.state as Record<string, unknown>);
-  }
-
-  // -----------------------------------------------------------------------
-  // TEMPORARY test compat: old private names that tests still reach
-  // through casts, forwarding to the owning module. Pinned by
-  // tests/unit/agent-loop-internals-contract.test.ts; removed once the
-  // tests move onto the modules.
-  // -----------------------------------------------------------------------
-
-  private fireRetryScheduled(info: RetryScheduledInfo): void {
-    this.parts.runner.retryScheduled.emit(info, this.parts.origin);
-  }
-  private fireRetrySucceeded(info: RetrySucceededInfo): void {
-    this.parts.runner.retrySucceeded.emit(info, this.parts.origin);
-  }
-  private fireRetryExhausted(info: RetryExhaustedInfo): void {
-    this.parts.runner.retryExhausted.emit(info, this.parts.origin);
-  }
-  private get compactionManager(): CompactionManager { return this.parts.compactionManager; }
-  private get subAgentManager(): SubAgentManager { return this.parts.subAgentManager; }
-  private buildBackgroundTaskState(): string | null {
-    return backgroundTaskState(this.parts.subAgentManager, this.parts.tools);
-  }
-  private unwindFailedDelivery(preDeliveryCount: number, runAbortEpoch: number): boolean {
-    return this.parts.queues.unwindFailedDelivery(preDeliveryCount, runAbortEpoch);
-  }
-  private spawnForegroundSubAgentInternal(params: SubAgentSpawnParams): Promise<ForegroundSpawnResult> {
-    return this.parts.subAgents.spawnForeground(params);
-  }
-  private spawnBackgroundSubAgentInternal(params: SubAgentSpawnParams): Promise<{ taskId: string }> {
-    return this.parts.subAgents.spawnBackground(params);
-  }
-  private registerPendingAsk(ask: PendingAsk): void { this.parts.asks.register(ask); }
-  private settlePendingAsk(askId: string): void { this.parts.asks.settle(askId); }
-  private get _prePromptMessageCount(): number { return this.parts.runner.boundary; }
-  private set _prePromptMessageCount(value: number) { this.parts.runner.boundary = value; }
-  private get _isPrompting(): boolean { return this.parts.runner.isPrompting; }
-  private get headlineProvider(): (() => string | null) | null { return this.parts.pipeline.headline.current; }
-  private get _cacheBreakpointIndices(): CacheBreakpointIndices | null {
-    return this.parts.pipeline.cacheBreakpointIndices;
-  }
-  private set _cacheBreakpointIndices(indices: CacheBreakpointIndices | null) {
-    this.parts.pipeline.cacheBreakpointIndices = indices;
-  }
-  private get pendingBackgroundResults(): PendingBackgroundCompletion[] { return this.parts.background.pending; }
-  private deliverOrQueueBackgroundCompletion(item: PendingBackgroundCompletion): Promise<void> {
-    return this.parts.background.enqueue(item);
-  }
-  private schedulePendingResultDelivery(): Promise<void> { return this.parts.background.schedule(); }
-  private drainPendingBackgroundResults(): Promise<void> { return this.parts.background.drain(); }
-  private requeueOrDeadLetter(batch: PendingBackgroundCompletion[], err: unknown): void {
-    this.parts.background.requeueOrDeadLetter(batch, err);
-  }
-  private batchRecoveredAfterRequeue(batch: PendingBackgroundCompletion[]): boolean {
-    return this.parts.background.batchRecoveredAfterRequeue(batch);
-  }
-  private get pendingWakeDeliveries(): QueuedDelivery[] { return this.parts.queues.wake; }
-  private get _abortEpoch(): number { return this.parts.abortState.epoch; }
-  private set _abortEpoch(value: number) { this.parts.abortState.epoch = value; }
-  private get trackedPids(): ReadonlySet<number> { return this.parts.processes.pids; }
-  private get registeredTools(): RegisteredTool[] { return this.parts.tools.registered; }
-  private get toolRuntime(): CortexToolRuntime { return this.parts.tools.runtime; }
-  private buildChildToolSet(requestedTools?: string[]): RegisteredTool[] {
-    return this.parts.tools.childInheritable(requestedTools);
   }
 }
