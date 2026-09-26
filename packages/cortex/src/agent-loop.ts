@@ -181,6 +181,7 @@ export class AgentLoop implements
         emitError: (error, wasAborted) => this.emitError(error, wasAborted),
         getConversationHistory: () => this.getConversationHistory(),
         restoreConversationHistory: (messages) => this.restoreConversationHistory(messages),
+        getTransformContextHook: () => this.getTransformContextHook(),
         createChildAgent: (params) => this.createChildAgent(params),
       },
     });

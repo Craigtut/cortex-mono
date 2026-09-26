@@ -595,3 +595,21 @@ describe('digestIdle abandoned pass event suppression', () => {
     expect(postCompaction).toHaveBeenCalled();
   });
 });
+
+describe('digestIdle and the loop transform hook', () => {
+  it('runs its threshold pass through getTransformContextHook, so a wrapper sees it', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const original = loop.getTransformContextHook.bind(loop);
+    const wrapped = vi.fn();
+    vi.spyOn(loop, 'getTransformContextHook').mockImplementation(() => {
+      const hook = original();
+      return async (context) => {
+        wrapped();
+        return hook(context);
+      };
+    });
+    await loop.digestIdle();
+    expect(wrapped).toHaveBeenCalledTimes(1);
+  });
+});

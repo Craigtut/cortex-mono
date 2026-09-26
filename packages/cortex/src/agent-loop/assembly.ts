@@ -18,7 +18,9 @@
  *
  * Ports resolve through `host` at call time wherever a consumer or test
  * may spy on or replace the loop's own method (prompt, refreshTools, the
- * completions, restoreConversationHistory, isAborted, createChildAgent).
+ * completions, restoreConversationHistory, isAborted, createChildAgent,
+ * getTransformContextHook). The tool syncs during construction are the
+ * exception: they run before the loop has parts to resolve through.
  */
 
 import { BudgetGuard } from '../budget-guard.js';
@@ -26,7 +28,7 @@ import type { DirectCompletionContext } from '../cache-breakpoints.js';
 import { CompactionManager, buildCompactionConfig } from '../compaction/index.js';
 import { createRecallTool } from '../compaction/observational/recall-tool.js';
 import { ContextManager } from '../context-manager.js';
-import type { AgentMessage } from '../context-manager.js';
+import type { AgentContext, AgentMessage } from '../context-manager.js';
 import { EventBridge } from '../event-bridge.js';
 import { PromptWatchdogDiagnostics } from '../prompt-diagnostics.js';
 import { resolveRetryPolicy } from '../retry-policy.js';
@@ -40,10 +42,9 @@ import type {
   CortexLogger,
   LoopOriginContext,
   RetryPolicy,
-  TrackedSubAgent,
 } from '../types.js';
 import { BackgroundDelivery } from './background-delivery.js';
-import { buildBackgroundTaskState } from './background-task-text.js';
+import { backgroundTaskState } from './background-task-text.js';
 import { createBuiltinTools } from './builtin-tools.js';
 import type { ChildLoopParams } from './child-loop-config.js';
 import { ContextPipeline } from './context-pipeline.js';
@@ -81,6 +82,7 @@ export interface LoopHost {
   emitError(error: Error, wasAborted?: boolean): ClassifiedError;
   getConversationHistory(): AgentMessage[];
   restoreConversationHistory(messages: AgentMessage[]): void;
+  getTransformContextHook(): (context: AgentContext) => Promise<AgentContext>;
   createChildAgent(params: ChildLoopParams): Promise<ChildLoop>;
 }
 
@@ -394,6 +396,7 @@ export function assembleLoop(params: {
     gate,
     assertNotShuttingDown: () => lifecycle.assertNotShuttingDown(),
     isShuttingDown: () => lifecycle.isShuttingDown,
+    transformHook: () => host.getTransformContextHook(),
     logger,
   });
   const subAgents = new SubAgentSpawner({
@@ -430,6 +433,10 @@ export function assembleLoop(params: {
   }
 
   // First sync of the adapted tool set to pi (compaction not built yet).
+  // Direct, not through host.refreshTools(): the loop's parts are not
+  // assigned until this function returns, and nothing can have replaced the
+  // loop's refreshTools before its constructor finished. Every later
+  // refresh goes through the host.
   tools.refresh();
 
   const compactionManager = new CompactionManager(compactionConfig, slots.length);
@@ -466,21 +473,6 @@ export function assembleLoop(params: {
     tools.refresh();
   }
   return parts;
-}
-
-/** The <background-tasks> block for the next call, or null when nothing runs. */
-export function backgroundTaskState(
-  subAgentManager: SubAgentManager,
-  tools: Pick<ToolRegistry, 'runtime'>,
-): string | null {
-  const subAgents = subAgentManager.getActiveTaskIds()
-    .map((taskId) => subAgentManager.get(taskId))
-    .filter((entry): entry is TrackedSubAgent => entry !== undefined);
-  return buildBackgroundTaskState({
-    subAgents,
-    bashTasks: tools.runtime.backgroundTasks.getAll(),
-    now: Date.now(),
-  });
 }
 
 /** BudgetGuard's config from the loop's (only the fields the consumer set). */

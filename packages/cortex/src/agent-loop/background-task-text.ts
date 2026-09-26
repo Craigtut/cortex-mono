@@ -7,7 +7,9 @@
 
 import { toolCallSubject } from '../tools/tool-call-subject.js';
 import type { BackgroundTask } from '../tools/runtime.js';
+import type { SubAgentManager } from '../sub-agent-manager.js';
 import type { SubAgentResult, TrackedSubAgent } from '../types.js';
+import type { ToolRegistry } from './tool-registry.js';
 
 /**
  * Escape text interpolated into the <background-tasks> block. Task
@@ -145,4 +147,19 @@ export function formatSubAgentCompletion(taskId: string, result: SubAgentResult)
     return `${header} ${usage}\n\n${result.output}`;
   }
   return `${header} ${usage}\n\nNo output was produced.`;
+}
+
+/** The <background-tasks> block for the next call, or null when nothing runs. */
+export function backgroundTaskState(
+  subAgentManager: SubAgentManager,
+  tools: Pick<ToolRegistry, 'runtime'>,
+): string | null {
+  const subAgents = subAgentManager.getActiveTaskIds()
+    .map((taskId) => subAgentManager.get(taskId))
+    .filter((entry): entry is TrackedSubAgent => entry !== undefined);
+  return buildBackgroundTaskState({
+    subAgents,
+    bashTasks: tools.runtime.backgroundTasks.getAll(),
+    now: Date.now(),
+  });
 }

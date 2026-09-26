@@ -152,6 +152,12 @@ export interface ContextPipelinePorts {
   gate: LoopGate;
   assertNotShuttingDown(): void;
   isShuttingDown(): boolean;
+  /**
+   * The loop's transform hook as the loop hands it out (its
+   * getTransformContextHook, resolved per call), so a wrapper installed there
+   * sees idle digestion too, not only pi's calls.
+   */
+  transformHook(): (context: AgentContext) => Promise<AgentContext>;
   logger: CortexLogger;
 }
 
@@ -372,7 +378,7 @@ export class ContextPipeline {
     // 2. The transformContext pipeline over live history: source mutations
     // persist, the view is discarded.
     const lengthBefore = this.ports.agentState().messages.length;
-    const hook = this.hook();
+    const hook = this.ports.transformHook();
     const passGeneration = this.digestionGeneration;
     this.forceBlockingCompaction = true;
     const thresholdPass = (async () => {

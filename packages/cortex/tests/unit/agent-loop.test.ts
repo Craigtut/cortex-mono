@@ -10,7 +10,7 @@ import { fromPiAgentTool } from '../../src/tool-contract.js';
 import type { CortexTool } from '../../src/tool-contract.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 import { partsOf } from './agent-loop/parts.js';
-import { backgroundTaskState } from '../../src/agent-loop/assembly.js';
+import { backgroundTaskState } from '../../src/agent-loop/background-task-text.js';
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent factory
