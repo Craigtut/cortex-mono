@@ -1318,6 +1318,24 @@ describe('AgentLoop.deliver handles', () => {
     await waitUntil(() => !loop.isLoopActive);
   });
 
+  it('leaves the parked queue untouched when the retraction predicate throws', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    loop.deliver('first');
+    loop.deliver('second');
+    expect(() => loop.dropPendingWakeDeliveries((content) => {
+      if (content === 'first') throw new Error('predicate bug');
+      return true;
+    })).toThrow('predicate bug');
+    expect(loop.pendingWakeDeliveryCount).toBe(2);
+    piAgent.releaseRun();
+    await turn;
+    await waitUntil(() => !loop.isLoopActive);
+  });
+
   it('dead-letters a wake delivery with its handle and cause tag', async () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);

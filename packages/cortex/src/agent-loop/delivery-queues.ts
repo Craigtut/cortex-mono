@@ -470,16 +470,17 @@ export class DeliveryQueues {
 
   /** Retract parked wake deliveries matching `predicate` (see AgentLoop.dropPendingWakeDeliveries). */
   dropWake(predicate: (content: string, delivery: PendingWakeDelivery) => boolean): string[] {
-    const dropped: string[] = [];
-    for (let i = this.wake.length - 1; i >= 0; i--) {
-      const item = this.wake[i]!;
-      const delivery: PendingWakeDelivery = {
-        id: item.id,
-        content: item.content,
-        ...(item.causeTag !== undefined ? { causeTag: item.causeTag } : {}),
-      };
-      if (predicate(item.content, delivery)) dropped.unshift(this.wake.splice(i, 1)[0]!.content);
-    }
+    // Decide for every item before removing any, so a throwing predicate
+    // leaves the queue exactly as it was.
+    const drop = new Set(this.wake.filter((item) => predicate(item.content, {
+      id: item.id,
+      content: item.content,
+      ...(item.causeTag !== undefined ? { causeTag: item.causeTag } : {}),
+    })));
+    if (drop.size === 0) return [];
+    const kept = this.wake.filter((item) => !drop.has(item));
+    const dropped = this.wake.filter((item) => drop.has(item)).map((item) => item.content);
+    this.wake.splice(0, this.wake.length, ...kept);
     this.releaseIfDrained();
     return dropped;
   }
