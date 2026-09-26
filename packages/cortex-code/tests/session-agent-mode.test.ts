@@ -107,7 +107,7 @@ async function openPassthroughSession(overrides: Record<string, unknown> = {}): 
   const app = createFakeApp();
   internals.agent = agent;
   internals.app = app;
-  internals.pushInitialFooterState('', 'medium');
+  internals.status.pushInitialFooter('', 'medium');
   return { session, internals, app, agent };
 }
 

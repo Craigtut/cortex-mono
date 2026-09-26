@@ -439,7 +439,8 @@ export interface SessionInternals {
   };
   buildAgentConfig: () => CortexAgentConfig;
   wireEvents: () => void;
-  pushInitialFooterState: (branch: string, effortLevel: string) => void;
+  /** The footer and environment views over the session's state. */
+  status: { pushInitialFooter: (branch: string, effortLevel: string) => void };
   handleInput: (text: string) => Promise<void>;
 }
 
@@ -497,7 +498,7 @@ export async function createDuplexSession(
   internals.wireEvents();
   // Stands in for start()'s opening footer push, by calling the same method,
   // so the state a test reads is the state a real session opens with.
-  internals.pushInitialFooterState?.('', 'medium');
+  internals.status.pushInitialFooter('', 'medium');
   // Stands in for start(), which checkpoints the session before it can do any
   // work and skips that for a resumed one so the saved artifact survives
   // until resume() reads it.

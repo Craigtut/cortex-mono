@@ -49,11 +49,8 @@ import { getCommand, registerBuiltinCommands } from './commands/index.js';
 import type { UpdateInfo } from './updates/checker.js';
 import { UpdatePrompt } from './updates/update-prompt.js';
 import type { Mode } from './modes/types.js';
-import { AVAILABLE_MODES } from './modes/index.js';
 import type { SandboxStatus, SandboxPolicy, SandboxRung } from '@animus-labs/cortex';
 import { workspaceSettingsPath } from './permissions/rules.js';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { log } from './logger.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
 import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
@@ -63,12 +60,11 @@ import { applyPreTurnHooks } from './hooks/pre-turn.js';
 import type { HookEvent, HookHandler } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 import { WorkTracker } from './session/work-tracker.js';
+import { SessionStatusView, readGitBranch } from './session/status-view.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
 import { SessionSandbox } from './session/sandbox-state.js';
 import { ProjectTrustGates } from './session/trust-gates.js';
-
-const execFileAsync = promisify(execFile);
 
 export interface SessionOptions {
   config: CortexCodeConfig;
@@ -96,6 +92,7 @@ export interface SessionOptions {
 export class Session {
   private agent: CortexAgent | null = null;
   private readonly sandbox: SessionSandbox;
+  private readonly status: SessionStatusView;
   private app: App | null = null;
   private readonly permissions: PermissionBroker;
   private yoloMode: boolean;
@@ -184,11 +181,22 @@ export class Session {
       settingsPath,
       getAgent: () => this.agent,
       getApp: () => this.app,
-      onRungChanged: () => this.updateEphemeralContext(),
+      onRungChanged: () => this.status.refreshEnvironment(),
     });
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.isResume = options.resumeSessionId !== undefined;
     this.compactionStrategy = options.compactionStrategy ?? 'observational';
+    this.status = new SessionStatusView({
+      cwd: options.cwd,
+      modeName: options.mode.name,
+      agentMode: this.agentMode,
+      compactionStrategy: this.compactionStrategy,
+      models: this.models,
+      sandbox: this.sandbox,
+      getYoloMode: () => this.yoloMode,
+      getAgent: () => this.agent,
+      getApp: () => this.app,
+    });
     this.checkpoints = new SessionCheckpoints({
       sessionId: this.sessionId,
       agentMode: this.agentMode,
@@ -199,7 +207,7 @@ export class Session {
         provider: this.models.provider,
         model: this.models.modelId,
         cwd: this.cwd,
-        contextTokenCount: this.getDisplayedCurrentContextTokens(),
+        contextTokenCount: this.status.displayedContextTokens(),
       }),
     });
     this.updateInfo = options.updateInfo ?? null;
@@ -293,7 +301,7 @@ export class Session {
     }
 
     // Set up ephemeral context
-    await this.updateEphemeralContext();
+    await this.status.refreshEnvironment();
 
     // Terminal title: name the tab after what the user is working on. Runs on
     // the utility model and is best-effort, so a failure never disrupts the
@@ -347,7 +355,7 @@ export class Session {
 
     // Show banner. The split-flap settle plays only for a fresh session; a
     // resumed session opens straight to the settled logo.
-    const branch = await this.getGitBranch();
+    const branch = await readGitBranch(this.cwd);
     // Settle the transcript header now that the git branch is known, before any
     // turn events can fire. session_meta is the first line of a fresh transcript.
     await this.transcriptWriter.initialize({ gitBranch: branch });
@@ -357,7 +365,7 @@ export class Session {
     });
 
     // Update footer
-    this.pushInitialFooterState(branch, initialEffort);
+    this.status.pushInitialFooter(branch, initialEffort);
 
     // Recommend (never apply) /sandbox off when already inside a container.
     void this.sandbox.surfaceContainerRecommendation();
@@ -433,7 +441,7 @@ export class Session {
     this.titleManager?.recordUserPrompt(text);
 
     // Update ephemeral context
-    await this.updateEphemeralContext();
+    await this.status.refreshEnvironment();
 
     // Show spinner
     this.app!.showStatusSpinner(randomThinkingLabel());
@@ -718,7 +726,7 @@ export class Session {
     // done. Only the cheap per-loop refresh happens here; the end-of-work
     // UI waits for the facade's settlement predicate.
     this.agent.onLoopComplete(() => {
-      this.updateFooterContextUsage();
+      this.status.refreshContextUsage();
       this.work.watchForSettled();
     });
 
@@ -820,7 +828,7 @@ export class Session {
         'Context Compacted',
         `Reduced from ${beforeK}k to ${afterK}k tokens`,
       );
-      this.updateFooterContextUsage();
+      this.status.refreshContextUsage();
     });
 
     // The two failure notifications below deliberately fire for ANY loop,
@@ -851,11 +859,11 @@ export class Session {
     // number that did not change.
     this.agent.onObservation((_event, origin: LoopOriginContext) => {
       if (!this.isWorkLoop(origin)) return;
-      this.updateObservationalMemoryStatus();
+      this.status.refreshObservationalMemory();
     });
     this.agent.onReflection((_event, origin: LoopOriginContext) => {
       if (!this.isWorkLoop(origin)) return;
-      this.updateObservationalMemoryStatus();
+      this.status.refreshObservationalMemory();
     });
 
     // Sub-agent events: rendered as tool calls via the SubAgent renderer
@@ -896,8 +904,8 @@ export class Session {
     // to keep one on disk. A child's turn boundary says nothing about the
     // parent's history, so children are skipped.
     bridge.on('turn_end', (event: CortexEvent) => {
-      this.updateFooterContextUsage();
-      this.updateObservationalMemoryStatus();
+      this.status.refreshContextUsage();
+      this.status.refreshObservationalMemory();
       if (event.childTaskId) return;
       this.checkpoints.crashCheckpoint();
     });
@@ -995,7 +1003,7 @@ export class Session {
       return;
     }
     this.checkpoints.adoptCreatedAt(loaded.meta.createdAt);
-    this.updateObservationalMemoryStatus();
+    this.status.refreshObservationalMemory();
 
     // Replay message history into the transcript so the user sees the
     // previous conversation. Cortex already has the history in context; this
@@ -1008,7 +1016,7 @@ export class Session {
       );
       replayHistoryToTranscript(loaded.dialogue, this.app.transcript);
     }
-    this.updateFooterContextUsage();
+    this.status.refreshContextUsage();
     // Re-baseline: start() checkpointed an empty agent, so without this the
     // crash checkpoint's base would still be that empty snapshot and would
     // blank the restored talker side on the first turn.
@@ -1099,41 +1107,6 @@ export class Session {
     await this.activity.flush();
   }
 
-  // -------------------------------------------------------------------------
-  // Helpers
-  // -------------------------------------------------------------------------
-
-  private async updateEphemeralContext(): Promise<void> {
-    if (!this.agent) return;
-
-    const branch = await this.getGitBranch();
-    const currentContextTokens = this.getDisplayedCurrentContextTokens();
-    // The rung is stated so the model can adapt to denials instead of blindly
-    // retrying; changing it stays human-only (there is no tool for it).
-    const enforcementLabel = {
-      enforced: 'OS-enforced',
-      partial: 'partially OS-enforced',
-      none: 'not OS-enforced',
-    }[this.sandbox.indicatorState().sandboxEnforcement];
-    const lines = [
-      `Current date: ${new Date().toISOString().split('T')[0]}`,
-      `Current working directory: ${this.cwd}`,
-      branch ? `Git branch: ${branch}` : '',
-      `Model: ${this.models.provider}/${this.models.modelId}`,
-      this.yoloMode ? 'YOLO mode is active: all tools auto-approved' : '',
-      this.sandbox.getRung() !== 'off'
-        ? `Sandbox: ${this.sandbox.getRung()} rung, ${enforcementLabel}`
-        : '',
-      currentContextTokens > 0
-        ? `Current context usage: ${(currentContextTokens / 1000).toFixed(1)}k / ${(this.agent.effectiveContextWindow / 1000).toFixed(0)}k`
-        : '',
-    ].filter(Boolean);
-
-    this.agent.getContextManager().setEphemeral(
-      `<environment>\n${lines.join('\n')}\n</environment>`,
-    );
-  }
-
   /**
    * The config handed to CortexAgent.create(). Separate from start() so the
    * mode is assertable without standing up a TUI and a sandbox.
@@ -1188,87 +1161,6 @@ export class Session {
     if (freeze.promptWatchdogIntervalMs !== undefined) watchdog.heartbeatIntervalMs = freeze.promptWatchdogIntervalMs;
     if (freeze.abortWaitWarningMs !== undefined) watchdog.abortWaitWarningMs = freeze.abortWaitWarningMs;
     return { promptWatchdog: watchdog };
-  }
-
-  /**
-   * The footer's full opening state. Separate from start() so a test can put
-   * the footer in the state a real session opens with by calling the same
-   * code, rather than by assembling a state object of its own and proving
-   * only that the renderer works.
-   */
-  private pushInitialFooterState(branch: string, effortLevel: ThinkingLevel): void {
-    if (!this.agent || !this.app) return;
-    this.app.updateStatus({
-      mode: this.mode.name,
-      modeCount: AVAILABLE_MODES.length,
-      agentMode: this.agentMode,
-      provider: this.models.provider,
-      model: this.models.modelId,
-      contextTokenCount: this.getDisplayedCurrentContextTokens(),
-      contextTokenLimit: this.agent.effectiveContextWindow,
-      gitBranch: branch,
-      yoloMode: this.yoloMode,
-      effortLevel,
-      observationalMode: this.compactionStrategy === 'observational',
-      ...this.sandbox.indicatorState(),
-      ...this.resolutionIndicatorState(),
-    });
-  }
-
-  private updateFooterContextUsage(): void {
-    if (!this.agent || !this.app) return;
-    this.app.updateStatus({
-      contextTokenCount: this.getDisplayedCurrentContextTokens(),
-      contextTokenLimit: this.agent.effectiveContextWindow,
-      ...this.resolutionIndicatorState(),
-    });
-  }
-
-  /**
-   * The footer's degraded marker. Recomputed on every footer refresh rather
-   * than set once: `network-resolver-unwired` is appended at the first
-   * prompt, so a flag written only at startup would never light for it.
-   *
-   * `info` notes are excluded deliberately. `duplex-cost-cap-unset` is an
-   * info note that fires on every default duplex session, so counting info
-   * here would leave the marker permanently on and carrying no information.
-   */
-  private resolutionIndicatorState(): { resolutionDegraded: boolean } {
-    return {
-      resolutionDegraded: this.getResolutionReport()
-        .some((note) => note.severity === 'degraded'),
-    };
-  }
-
-  private updateObservationalMemoryStatus(): void {
-    if (!this.agent || !this.app) return;
-    if (this.compactionStrategy !== 'observational') return;
-    const cm = this.agent.getCompactionManager();
-    this.app.updateStatus({
-      observationTokenCount: cm.getObservationTokenCount(),
-      observerActive: cm.isObserverInFlight(),
-      reflectorActive: cm.isReflectorInFlight(),
-    });
-  }
-
-  private getDisplayedCurrentContextTokens(): number {
-    if (!this.agent) return 0;
-    return Math.max(
-      this.agent.currentContextTokenCount,
-      this.agent.estimateCurrentContextTokens(),
-    );
-  }
-
-  private async getGitBranch(): Promise<string> {
-    try {
-      const { stdout } = await execFileAsync('git', ['branch', '--show-current'], {
-        cwd: this.cwd,
-        timeout: 2000,
-      });
-      return stdout.trim();
-    } catch {
-      return '';
-    }
   }
 
   /** Extract text delta from a pi-agent-core message_update event. */
@@ -1415,18 +1307,8 @@ export class Session {
   getAgent(): CortexAgent | null { return this.agent; }
   getApp(): App | null { return this.app; }
 
-  /**
-   * The session's resolution report: what the assembly actually resolved to
-   * where that differs from what was configured.
-   *
-   * Read live rather than snapshotted at startup. Most notes are assembly
-   * facts, but `network-resolver-unwired` is recorded when the check first
-   * runs, which is at the first prompt, so a report captured once at startup
-   * would permanently miss the one note this CLI can currently produce.
-   */
-  getResolutionReport(): ResolutionNote[] {
-    return this.agent?.getResolutionReport() ?? [];
-  }
+  /** What the assembly resolved to where it differs from the config. Read live. */
+  getResolutionReport(): ResolutionNote[] { return this.status.resolutionReport(); }
   getYoloMode(): boolean { return this.yoloMode; }
   /** The facade mode in force, resolved at construction. See {@link agentMode}. */
   getAgentMode(): NonNullable<CortexAgentConfig['mode']> { return this.agentMode; }
