@@ -47,6 +47,7 @@ import { ToolRegistry } from './agent-loop/tool-registry.js';
 import { McpAttachment } from './agent-loop/mcp-attachment.js';
 import { DeliveryQueues } from './agent-loop/delivery-queues.js';
 import { TurnRunner } from './agent-loop/turn-runner.js';
+import { LoopLifecycle } from './agent-loop/lifecycle.js';
 import { ContextPipeline } from './agent-loop/context-pipeline.js';
 import type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
 import { BackgroundDelivery } from './agent-loop/background-delivery.js';
@@ -60,7 +61,6 @@ import {
   AbortState,
   isAbortShapedError,
   LoopGate,
-  raceTimeout,
 } from './agent-loop/run-control.js';
 import { CHILD_SEED_CONTEXT_SLOT, prepareChildLoop } from './agent-loop/child-loop-config.js';
 import type { ChildLoopParams } from './agent-loop/child-loop-config.js';
@@ -195,7 +195,8 @@ export class AgentLoop {
   private readonly workingDirectory: string;
   private readonly envOverrides: Record<string, string> | undefined;
 
-  private lifecycleState: CortexLifecycleState = 'created';
+  // CREATED -> ACTIVE -> DESTROYING -> DESTROYED, and the abort/destroy protocols
+  private readonly lifecycle: LoopLifecycle;
   private readonly systemPrompt: SystemPromptState;
 
   // Primary and utility models, context window limit, cache retention, session key.
@@ -230,7 +231,7 @@ export class AgentLoop {
   private readonly pipeline: ContextPipeline;
 
   // Event bridge unsubscribers (for cleanup)
-  private eventUnsubscribers: Array<() => void> = [];
+  private readonly eventUnsubscribers: Array<() => void> = [];
 
   // The current run's abort controller and the abort epoch (run-control.ts)
   private readonly abortState = new AbortState();
@@ -241,9 +242,6 @@ export class AgentLoop {
   // Serializes every loop-owning task (run-control.ts)
   private readonly gate = new LoopGate();
 
-
-  // In-flight destroy(). Concurrent destroy() calls share one teardown.
-  private destroyPromise: Promise<void> | null = null;
 
   // Tracked subprocess PIDs for synchronous exit cleanup (Level 3 safety net)
   private readonly processes = new ProcessTracker();
@@ -282,6 +280,34 @@ export class AgentLoop {
     this.retryPolicy = resolveRetryPolicy(config.retryPolicy);
     this.loopPath = config.loopPath ?? DEFAULT_LOOP_PATH;
     this.logger = prefixLoggerWithLoopPath(config.logger ?? NOOP_LOGGER, this.loopPath);
+    this.lifecycle = new LoopLifecycle(() => ({
+      agent: this.agent,
+      diagnostics: this.promptDiagnostics,
+      runner: this.runner,
+      queues: this.queues,
+      abortState: this.abortState,
+      gate: this.gate,
+      background: this.background,
+      subAgentManager: this.subAgentManager,
+      subAgents: this.subAgents,
+      mcp: this.mcp,
+      processes: this.processes,
+      skills: this.skills,
+      budgetGuard: this.budgetGuard,
+      eventBridge: this.eventBridge,
+      unsubscribeEvents: () => {
+        for (const unsub of this.eventUnsubscribers.splice(0)) unsub();
+      },
+      compactionManager: this.compactionManager,
+      tools: this.tools,
+      loopComplete: this.loopCompleteHandlers,
+      errorHandlers: this.errorHandlers,
+      turnComplete: this.turnCompleteHandlers,
+      deadLetters: this.deadLetters,
+      asks: this.asks,
+      origin: this.originContext,
+      logger: this.logger,
+    }));
     this.loopCompleteHandlers = new HandlerList('onLoopComplete', this.logger);
     this.errorHandlers = new HandlerList('onError', this.logger);
     this.turnCompleteHandlers = new HandlerList('onTurnComplete', this.logger);
@@ -514,9 +540,7 @@ export class AgentLoop {
       retryPolicy: this.retryPolicy,
       abort: this.abortState,
       isAborted: () => this.isAborted(),
-      activate: () => {
-        if (this.lifecycleState === 'created') this.lifecycleState = 'active';
-      },
+      activate: () => this.lifecycle.activate(),
       assertNotShuttingDown: () => this.assertNotShuttingDown(),
       emitError: (error, wasAborted) => this.emitError(error, wasAborted),
       cacheRetention: () => this.models.cacheRetention,
@@ -737,17 +761,12 @@ export class AgentLoop {
 
   /** Whether teardown has started (no new loops may start). */
   private isShuttingDown(): boolean {
-    return this.lifecycleState === 'destroying' || this.lifecycleState === 'destroyed';
+    return this.lifecycle.isShuttingDown;
   }
 
   /** Throw the consumer-facing lifecycle error when teardown has started. */
   private assertNotShuttingDown(): void {
-    if (this.lifecycleState === 'destroying') {
-      throw new Error('Agent is being destroyed');
-    }
-    if (this.lifecycleState === 'destroyed') {
-      throw new Error('Agent has been destroyed');
-    }
+    this.lifecycle.assertNotShuttingDown();
   }
 
   /**
@@ -1670,61 +1689,7 @@ export class AgentLoop {
    * The agent remains usable for subsequent prompts.
    */
   async abort(): Promise<void> {
-    // Capture the current turn's unwind promise BEFORE aborting, so the
-    // wait below is scoped to the turn being cancelled and never to a later
-    // turn started by a background delivery.
-    const unwound = this.runner.unwound;
-
-    this.promptDiagnostics.recordAbortRequested();
-    this.logger.info('abort requested', { isPrompting: this.runner.isPrompting });
-    this.queues.dropAllWakeForAbort();
-    // A delivery can also park DURING the await windows below; it is
-    // cancelled the same way. The live controller cannot express that (a
-    // drain that starts mid-abort replaces it, and the gate wait is
-    // skipped entirely when background deliveries are pending), so the
-    // parked queue is epoch-gated instead: while this abort is in flight
-    // every take of the queue drops its items, and the epoch advance in
-    // the finally below marks anything stamped earlier as cancelled.
-    const abort = this.abortState.begin();
-    try {
-      this.agent.abort();
-      this.promptDiagnostics.startAbortWait();
-      try {
-        await this.agent.waitForIdle();
-        // waitForIdle() only covers pi-agent-core's run promise (it resolves,
-        // never rejects). The Cortex-side unwind (retry classification, the
-        // prompt finally block) may not have observed the abort yet, so wait
-        // for it too. Resetting the controller before that classification ran
-        // used to reclassify a cancelled turn as a retryable failure and
-        // resurrect it as a background retry.
-        await unwound;
-      } finally {
-        this.promptDiagnostics.finishAbortWait();
-      }
-
-      // When no background delivery is pending, also wait for the gate to
-      // release the aborted cycle so a follow-up prompt() cannot spuriously
-      // fail fast on a stale gate. This is bounded: a queued task is either
-      // the just-unwound running turn (its finally drain is an empty no-op
-      // before release), a same-frame prompt() that has not started yet
-      // (it sees the aborted controller at dequeue and cancels without ever
-      // reaching pi), or a wake sweep that finds the parked list dropped
-      // above (one parked during this window is dropped by the epoch gate
-      // on every take of the parked queue) and never starts a run. When
-      // deliveries ARE pending they start a fresh (non-aborted) loop, so
-      // return immediately rather than blocking on it.
-      if (this.background.pending.length === 0) {
-        await this.gate.settled;
-      }
-
-      // Reset so the agent is reusable, unless teardown owns the controller
-      // now or a newer turn (e.g. a background delivery that started during
-      // the wait) already installed its own controller.
-      if (!this.isShuttingDown()) abort.renew();
-    } finally {
-      abort.end();
-    }
-    this.logger.info('abort complete');
+    return this.lifecycle.abort();
   }
 
   /**
@@ -1745,56 +1710,21 @@ export class AgentLoop {
    * @param timeoutMs - Maximum time to wait for cleanup (default: 8000ms)
    */
   async destroy(timeoutMs = 8000): Promise<void> {
-    if (this.lifecycleState === 'destroyed') {
-      return; // Already destroyed, idempotent
-    }
-    if (this.destroyPromise) {
-      return this.destroyPromise; // Teardown already in progress, share it
-    }
-
-    this.logger.info('destroy start', {
-      activeSubAgents: this.subAgentManager.activeCount,
-      mcpConnections: this.mcp.manager.connectionCount,
-    });
-
-    // Transition BEFORE any await so nothing can start a new loop while
-    // teardown runs: prompt() rejects, queued gate tasks no-op, background
-    // completions are dropped, and the end-of-cycle drain is skipped.
-    this.lifecycleState = 'destroying';
-    // Cancel Cortex-side waits immediately: a pending retry-backoff timer is
-    // cleared by its abort listener, and the current turn's unwind is
-    // classified as cancelled instead of scheduling further retries.
-    this.abortState.abortCurrent();
-
-    this.destroyPromise = (async () => {
-      try {
-        // Race the cleanup against a force-kill deadline.
-        if (await raceTimeout(this.orderedCleanup(), timeoutMs) === 'timeout') {
-          this.processes.killAll();
-        }
-      } finally {
-        this.promptDiagnostics.stop();
-        this.lifecycleState = 'destroyed';
-        this.logger.info('destroy complete');
-      }
-    })();
-    return this.destroyPromise;
+    return this.lifecycle.destroy(timeoutMs);
   }
 
   /**
    * Whether the agent is currently running an agentic loop.
    */
   get isRunning(): boolean {
-    // Delegate to pi-agent-core's internal state check
-    // The agent is "running" if it has an active streaming state
-    return this.lifecycleState === 'active' && this.runner.isPrompting;
+    return this.lifecycle.state === 'active' && this.runner.isPrompting;
   }
 
   /**
    * Get the current lifecycle state.
    */
   get state(): CortexLifecycleState {
-    return this.lifecycleState;
+    return this.lifecycle.state;
   }
 
   /**
@@ -2392,86 +2322,6 @@ export class AgentLoop {
   private isAborted(): boolean {
     return this.abortState.signal.aborted ||
       isAbortShapedError(this.agent.state as Record<string, unknown>);
-  }
-
-  /**
-   * Perform ordered cleanup.
-   */
-  private async orderedCleanup(): Promise<void> {
-    // 1. Abort any in-progress agentic loop
-    this.agent.abort();
-
-    try {
-      await this.agent.waitForIdle();
-    } catch {
-      // Ignore errors during wait (agent may already be idle)
-    }
-
-    // 1b. Wait for the loop gate to drain: the aborted cycle's Cortex-side
-    // unwind plus any queued delivery tasks (which no-op now that the
-    // lifecycle is 'destroying'). Bounded by destroy()'s force-kill race.
-    await this.gate.settled;
-
-    // 1c. Dead-letter completions still awaiting delivery. The queued drain
-    // tasks above no-oped once teardown began, so anything still pending
-    // will never be delivered; record it (and notify handlers, which are
-    // still registered at this point) rather than letting completed work
-    // vanish with the shutdown.
-    this.background.deadLetterAllPending('agent shut down before delivery');
-
-    // 2. Cancel all sub-agents. Full child destroy(), not just a pi-level
-    // abort: an abort alone left the child's MCP connections, event
-    // subscriptions, and compaction timers alive until (and unless) its
-    // completion continuation got around to destroying it. Bounded by this
-    // destroy()'s own force-kill deadline.
-    try {
-      await this.subAgentManager.cancelAll(async (agent) => {
-        await agent.destroy();
-      });
-    } catch {
-      // Best-effort sub-agent cleanup
-    }
-
-    // 3. Emit onLoopComplete for final checkpoint (best-effort: a throwing
-    // handler is logged and teardown continues)
-    this.loopCompleteHandlers.emit(this.originContext);
-
-    // 4. Detach from the MCP manager; close connections only when owned (a
-    // shared manager's connections belong to its owner and outlive this loop)
-    await this.mcp.detach();
-
-    // 5. Clear skill buffer and registry
-    this.skills.destroy();
-    this.subAgentManager.destroy();
-
-    // 6. Unsubscribe all event listeners
-    this.budgetGuard.destroy();
-    this.eventBridge.destroy();
-    for (const unsub of this.eventUnsubscribers) {
-      unsub();
-    }
-    this.eventUnsubscribers = [];
-
-    // 7. Clear agent state
-    this.agent.reset();
-
-    // 8. Clean up compaction manager
-    this.compactionManager.destroy();
-    this.tools.runtime.destroy();
-
-    // 9. Clear all handler arrays
-    this.loopCompleteHandlers.clear();
-    this.errorHandlers.clear();
-    this.turnCompleteHandlers.clear();
-    this.subAgents.spawnedHandlers.clear();
-    this.subAgents.completedHandlers.clear();
-    this.subAgents.failedHandlers.clear();
-    this.background.deliveryHandlers.clear();
-    this.deadLetters.handlers.clear();
-    this.queues.clearForTeardown();
-    this.asks.clear();
-    // The dead-letter store itself is deliberately kept: it must still
-    // answer after destroy() (which itself dead-letters anything pending).
   }
 
   // -----------------------------------------------------------------------
