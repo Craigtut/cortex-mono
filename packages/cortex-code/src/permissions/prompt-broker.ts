@@ -45,12 +45,54 @@ export interface PermissionBrokerDeps {
   getYoloMode: () => boolean;
 }
 
+/** A single-holder lock over the on-screen prompt. */
+class PromptLock {
+  private held: Promise<void> | null = null;
+  private release: (() => void) | null = null;
+
+  get isHeld(): boolean {
+    return this.held !== null;
+  }
+
+  /** Resolve once no prompt holds the lock. Does not take it. */
+  async waitUntilFree(): Promise<void> {
+    while (this.held) {
+      await this.held;
+    }
+  }
+
+  /**
+   * Wait for the lock and take it. The free check and the take run in one
+   * synchronous step: a release wakes every waiter, and a waiter that took
+   * the lock one microtask after seeing it free could collide with another.
+   */
+  async acquire(): Promise<() => void> {
+    for (;;) {
+      await this.waitUntilFree();
+      if (!this.held) return this.take();
+    }
+  }
+
+  /** Take the lock; the returned function releases it and wakes the waiters. */
+  take(): () => void {
+    this.held = new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
+    return () => {
+      const release = this.release;
+      this.held = null;
+      this.release = null;
+      release?.();
+    };
+  }
+}
+
 export class PermissionBroker {
   private readonly rules: PermissionRuleManager;
   private readonly networkGrants: NetworkGrantStore;
   private readonly networkAccess: NetworkAccessController;
-  private permissionLockPromise: Promise<void> | null = null;
-  private permissionLockRelease: (() => void) | null = null;
+  /** One prompt on screen at a time, tool and network asks alike. */
+  private readonly promptLock = new PromptLock();
   private readonly cwd: string;
   private readonly activity: PermissionBrokerDeps['activity'];
   private readonly sandbox: PermissionBrokerDeps['sandbox'];
@@ -155,9 +197,7 @@ export class PermissionBroker {
     if (!app) return { decision: 'block', reason: 'TUI not initialized' };
 
     // Serialize: wait for any active permission prompt to finish
-    while (this.permissionLockPromise) {
-      await this.permissionLockPromise;
-    }
+    await this.promptLock.waitUntilFree();
 
     // The asking run may have been aborted while this ask waited behind
     // another prompt (or before it arrived). Cortex has already stopped
@@ -176,9 +216,7 @@ export class PermissionBroker {
     }
 
     // Acquire lock and show the prompt
-    this.permissionLockPromise = new Promise<void>((resolve) => {
-      this.permissionLockRelease = resolve;
-    });
+    const releaseLock = this.promptLock.take();
 
     const permission = this.activity.recordPermissionRequested(
       toolName,
@@ -202,7 +240,7 @@ export class PermissionBroker {
     // Dismiss the prompt when the asking run is aborted. Cortex races the
     // resolver against the run's abort signal and proceeds with a block, so
     // an unanswered prompt would sit on screen for dead work while holding
-    // permissionLockPromise, serializing the next live ask behind it. The
+    // the prompt lock, serializing the next live ask behind it. The
     // abort settles the prompt through the same external-decision channel a
     // companion app uses, which removes it from the TUI and releases the lock.
     let abortDismissed = false;
@@ -213,7 +251,7 @@ export class PermissionBroker {
       // the awaited state write, and addEventListener never fires for a
       // signal that is already aborted. An abort landing inside that window
       // must settle the decision here, or the prompt sits on screen for
-      // dead work holding permissionLockPromise forever, serializing every
+      // dead work holding the prompt lock forever, serializing every
       // later ask behind it.
       let abortDecision: Promise<'deny'>;
       if (abortSignal.aborted) {
@@ -262,10 +300,7 @@ export class PermissionBroker {
       }
       externalController.abort();
       await this.activity.recordPermissionResolved(permission.id, toolName, permissionResolution);
-      const release = this.permissionLockRelease;
-      this.permissionLockPromise = null;
-      this.permissionLockRelease = null;
-      release?.();
+      releaseLock();
     }
   }
 
@@ -292,12 +327,7 @@ export class PermissionBroker {
     if (!app) return 'deny';
 
     // Serialize: wait for any active permission or network prompt to finish.
-    while (this.permissionLockPromise) {
-      await this.permissionLockPromise;
-    }
-    this.permissionLockPromise = new Promise<void>((resolve) => {
-      this.permissionLockRelease = resolve;
-    });
+    const releaseLock = await this.promptLock.acquire();
 
     const permission = this.activity.recordPermissionRequested('NetworkAccess', {
       host: req.host,
@@ -324,10 +354,7 @@ export class PermissionBroker {
     } finally {
       externalController.abort();
       await this.activity.recordPermissionResolved(permission.id, 'NetworkAccess', permissionResolution);
-      const release = this.permissionLockRelease;
-      this.permissionLockPromise = null;
-      this.permissionLockRelease = null;
-      release?.();
+      releaseLock();
     }
   }
 

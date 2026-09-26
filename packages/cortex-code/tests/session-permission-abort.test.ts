@@ -2,7 +2,7 @@
  * Drives the REAL permission resolver a Session hands Cortex (its permission
  * broker) with the ask context Cortex threads through resolvePermission
  * (signal, askId), so a wiring bug (discarding the context, leaving an aborted
- * run's prompt on screen while it holds permissionLockPromise, dropping the
+ * run's prompt on screen while it holds the prompt lock, dropping the
  * askId before the activity record) is caught. Only the TUI prompt is
  * stubbed; it mirrors the real App.showPermissionPrompt contract: unsettled
  * until the user answers or the external-decision promise resolves.
@@ -50,7 +50,7 @@ interface SessionInternals {
   app: unknown;
   /** The session's permission broker; the lock and the resolver live there. */
   permissions: {
-    permissionLockPromise: Promise<void> | null;
+    promptLock: { readonly isHeld: boolean };
     resolvePermission: ResolvePermissionFn;
   };
   activity: {
@@ -131,8 +131,9 @@ describe('Session.resolvePermission ask context', () => {
       { signal: controller.signal, askId: 'ask-test-1', loopPath: 'main' },
     );
 
-    // The prompt must be pending (nothing answered it yet).
+    // The prompt must be pending (nothing answered it yet), holding the lock.
     expect((await settledWithin(resultPromise, 50)).settled).toBe(false);
+    expect(internals.permissions.promptLock.isHeld).toBe(true);
 
     controller.abort();
 
@@ -144,7 +145,7 @@ describe('Session.resolvePermission ask context', () => {
     });
     // The lock is released so the next gated tool call is not serialized
     // behind a prompt for dead work.
-    expect(internals.permissions.permissionLockPromise).toBeNull();
+    expect(internals.permissions.promptLock.isHeld).toBe(false);
     // The activity stream records the dismissal as a cancellation, not a denial.
     const lastCall = resolved.mock.calls.at(-1);
     expect(lastCall?.[2]).toBe('cancelled');
@@ -186,7 +187,7 @@ describe('Session.resolvePermission ask context', () => {
     // pre-shown abort check at the top of the ask, before the abort
     // listener is registered. addEventListener never fires for an
     // already-aborted signal, so without the aborted-signal branch the
-    // prompt never settles and permissionLockPromise is held forever.
+    // prompt never settles and the prompt lock is held forever.
     const originalRequested = internals.activity.recordPermissionRequested.bind(
       internals.activity,
     );
@@ -210,7 +211,7 @@ describe('Session.resolvePermission ask context', () => {
       decision: 'block',
       reason: 'Run aborted before the permission prompt was answered',
     });
-    expect(internals.permissions.permissionLockPromise).toBeNull();
+    expect(internals.permissions.promptLock.isHeld).toBe(false);
     const lastCall = resolved.mock.calls.at(-1);
     expect(lastCall?.[2]).toBe('cancelled');
   });
