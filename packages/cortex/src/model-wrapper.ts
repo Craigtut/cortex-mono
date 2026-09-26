@@ -14,6 +14,7 @@
  */
 
 import { backendConcurrency, modelBackend } from './model-backend.js';
+import type { ModelBackend } from './model-backend.js';
 
 // ---------------------------------------------------------------------------
 // Branded type
@@ -116,14 +117,17 @@ export function modelConcurrency(model: CortexModel): ModelConcurrency {
 }
 
 /** A model reduced to what mode resolution and its notes read. */
-export interface ModelDescription {
-  provider: string;
+export interface ModelDescription extends ModelBackend {
   modelId: string;
   concurrency: ModelConcurrency;
 }
 
 export function describeModel(model: CortexModel): ModelDescription {
-  return { provider: model.provider, modelId: model.modelId, concurrency: modelConcurrency(model) };
+  return {
+    ...modelBackend(model.provider, baseUrlOf(unwrapModel(model))),
+    modelId: model.modelId,
+    concurrency: modelConcurrency(model),
+  };
 }
 
 /**

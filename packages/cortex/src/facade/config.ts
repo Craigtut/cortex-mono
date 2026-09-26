@@ -14,7 +14,7 @@ import type { DuplexRouterOptions } from '../duplex/router-contract.js';
  * Facade mode. `duplex` runs a talker fronting the reasoner; `passthrough`
  * routes everything to the single reasoner loop and reproduces direct
  * AgentLoop behavior exactly (decisions.md D14). An omitted mode is resolved
- * from backend concurrency (facade/mode-resolution.ts, decisions.md D21).
+ * from the loops' backends (facade/mode-resolution.ts, decisions.md D21).
  */
 export type CortexAgentMode = 'passthrough' | 'duplex';
 
@@ -136,11 +136,11 @@ export interface CortexAgentConfig extends Omit<AgentLoopConfig, 'sandbox'> {
   /** Consumer tools. Routed to the reasoner only (decisions.md D5). */
   tools?: CortexTool[];
   /**
-   * Facade mode. Default: duplex when both the talker's and the reasoner's
-   * models are served concurrently (`capabilities.concurrency: 'parallel'`,
-   * every hosted provider), passthrough otherwise, with a
-   * 'mode-resolved-passthrough' resolution note (D21). An explicit value
-   * always wins.
+   * Facade mode. Default: passthrough when the talker and the reasoner
+   * would share one backend that is not served concurrently
+   * (`capabilities.concurrency: 'parallel'`, every hosted provider), with a
+   * 'mode-resolved-passthrough' resolution note, and duplex otherwise
+   * (D21). An explicit value always wins.
    */
   mode?: CortexAgentMode;
   /** Talker overrides (duplex mode). */

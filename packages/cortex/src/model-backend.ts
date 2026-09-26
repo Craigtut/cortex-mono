@@ -34,6 +34,42 @@ export function modelBackend(provider: string, baseUrl: unknown): ModelBackend {
 }
 
 /**
+ * Whether two models' requests reach one server. Judged by the endpoint's
+ * origin, not the provider id: a custom OpenAI-compatible model on Ollama's
+ * `/v1` is the same server as a native Ollama model on that port, and
+ * `localhost` and `127.0.0.1` are one host. The provider id decides only
+ * when a model declares no base URL.
+ */
+export function sameBackend(a: ModelBackend, b: ModelBackend): boolean {
+  return serverKey(a) === serverKey(b);
+}
+
+/**
+ * Whether a talker and a reasoner on these backends can have requests in
+ * flight at once, which is duplex's premise: always on two backends, and
+ * on one only when it serves concurrent requests for both models.
+ */
+export function servedConcurrently(
+  a: ModelBackend & { concurrency: ModelConcurrency },
+  b: ModelBackend & { concurrency: ModelConcurrency },
+): boolean {
+  if (!sameBackend(a, b)) return true;
+  return a.concurrency === 'parallel' && b.concurrency === 'parallel';
+}
+
+function serverKey(backend: ModelBackend): string {
+  if (backend.endpoint === '') return `provider:${backend.provider}`;
+  try {
+    const url = new URL(backend.endpoint);
+    const host = isLoopbackHost(url.hostname) ? 'localhost' : url.hostname;
+    const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+    return `${host}:${port}`;
+  } catch {
+    return backend.endpoint;
+  }
+}
+
+/**
  * Concurrency judged from the backend alone. A creator that knows its
  * server better (the native Ollama model) declares its own value, which
  * wins over this one (wrapModel).
@@ -84,10 +120,17 @@ export function isLocalEndpoint(endpoint: string): boolean {
     return false;
   }
   if (host.startsWith('[') && host.endsWith(']')) return isLocalIPv6(host.slice(1, -1));
+  if (isLoopbackHost(host)) return true;
   const v4 = parseIPv4(host);
   if (v4) return isLocalIPv4(v4);
   if (host === 'localhost' || LOCAL_SUFFIXES.some((suffix) => host.endsWith(suffix))) return true;
   return host !== '' && !host.includes('.');
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === 'localhost' || host === '[::1]' || host === '::1') return true;
+  return parseIPv4(host)?.[0] === 127;
 }
 
 function parseIPv4(host: string): number[] | null {

@@ -15,11 +15,13 @@ Duplex only helps when the talker's request runs while the reasoner's is in flig
 
 | `mode` | Result |
 |---|---|
-| omitted | `duplex` when both the talker's and the reasoner's models have `capabilities.concurrency: 'parallel'`; otherwise `passthrough`, with a `mode-resolved-passthrough` note saying which model blocked it. |
-| `'duplex'` | Always duplex. If either model is not `parallel`, a `duplex-not-concurrent` note warns that the responsiveness gain needs a concurrent backend. |
+| omitted | `passthrough` when the talker and the reasoner would share one backend that is not `parallel` for both models, with a `mode-resolved-passthrough` note naming the backend and the models; otherwise `duplex`. |
+| `'duplex'` | Always duplex. If the talker and the reasoner share a backend that is not `parallel`, a `duplex-not-concurrent` note warns that the talker can queue behind the reasoner. |
 | `'passthrough'` | Always passthrough. |
 
-The talker model judged is the one assembly would build: `talker.model` when set, otherwise the reasoner's auto-resolved fast tier (which falls back to the primary model itself on a provider Cortex cannot enumerate).
+The talker model judged is the one assembly would build: `talker.model` when set, otherwise the reasoner's auto-resolved fast tier or the `utilityModel` you set (which falls back to the primary model itself on a provider Cortex cannot enumerate).
+
+Duplex fails only when both loops' requests go to one server that cannot serve them at once. So the question is whether the two models share a backend, judged by the base URL's host and port (loopback spellings count as one host, and a custom OpenAI-compatible model on Ollama's `/v1` is the same server as the native Ollama model), and only then whether that backend is `parallel` for both. Two backends always overlap: an Ollama reasoner with a talker pinned to a hosted model runs duplex, and so does the reverse. Two distinct models on one serial Ollama server block, because whether both fit in memory is what Ollama does not expose; `parallelRequests: true` on both models opts in.
 
 `concurrency` is stamped when the model is created:
 
@@ -28,7 +30,7 @@ The talker model judged is the one assembly would build: `talker.model` when set
 - **Custom endpoints** (`createCustomModel()`) and any provider id pi-ai does not know: `unknown`.
 - **Any model whose base URL is local**: `unknown`, whatever its provider id. Loopback, private-network addresses (RFC 1918, link-local, IPv6 unique-local, the `100.64/10` space tailnets use) and private-use names (`.local`, `.internal`, `.lan`, a single-label host) all count, so a catalog provider id aimed at a local proxy or vLLM is not mistaken for the hosted API.
 
-The mode is fixed at construction, because the loops are assembled from it. A later `setModel()` onto a backend that is not `parallel` keeps a duplex agent duplex and records a `duplex-not-concurrent` note (and clears it if you switch back); a passthrough agent stays passthrough. To change mode, create a new agent.
+The mode is fixed at construction, because the loops are assembled from it. A later `setModel()` that leaves the talker and reasoner sharing a backend that is not `parallel` keeps a duplex agent duplex and records a `duplex-not-concurrent` note (and clears it if you switch back); a passthrough agent stays passthrough. To change mode, create a new agent.
 
 `AgentLoop` remains exported and remains the loop primitive. Nothing about direct `AgentLoop` use changes.
 
@@ -100,8 +102,8 @@ Assembly resolves a configuration that can quietly differ from what the consumer
 | `talker-utility-model-skipped` | degraded | A configured `utilityModel` is from a different provider than the talker's model, so the talker runs its observational memory on its own auto-resolved model. |
 | `network-resolver-unwired` | degraded | **Duplex only.** A sandbox and `resolveNetworkAccess` are configured but nobody took `getNetworkAccessResolver()`, so shell egress asks cannot reach the broker and are never voiced, while WebFetch's still are. |
 | `duplex-cost-cap-unset` | info | Duplex assembled with no `duplex.maxTotalCost`, so there is no session-level cost ceiling. |
-| `mode-resolved-passthrough` | info | `mode` was omitted and the talker's or the reasoner's model is not `parallel`, so the agent runs passthrough. `data` carries each model's provider, id and concurrency. |
-| `duplex-not-concurrent` | degraded | The agent runs duplex but the talker's or the reasoner's model is not `parallel`, so the talker can queue behind the reasoner. Earned at assembly only by an explicit `mode: 'duplex'`; re-evaluated on `setModel()`. |
+| `mode-resolved-passthrough` | info | `mode` was omitted and the talker and the reasoner would share a backend that is not `parallel`, so the agent runs passthrough. `data` carries each model's provider, id, endpoint and concurrency. |
+| `duplex-not-concurrent` | degraded | The agent runs duplex but the talker and the reasoner share a backend that is not `parallel`, so the talker can queue behind the reasoner. A talker on another backend never earns it. Earned at assembly only by an explicit `mode: 'duplex'`; re-evaluated on `setModel()`. |
 
 **A note claims only what Cortex can observe.** `network-resolver-unwired` first said that egress "fails closed", which was an inference about consumer wiring Cortex has no way to see: a consumer that hands its sandbox its own decision function answers those asks perfectly well, and the first consumer to read the note did exactly that. It is duplex-only for the same reason. In passthrough there is no broker, `getNetworkAccessResolver()` returns the consumer's own function unchanged, and whether anyone called it is evidence of nothing. A marker that lights on a healthy session costs more than the condition it was meant to catch, so the rule for any new note is: state the observation and the consequence that follows from it necessarily, and stop there.
 

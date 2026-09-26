@@ -68,7 +68,7 @@ Set `talker: { model }` to pick the talker's model. The default is the fast tier
 
 ### Local and custom backends
 
-The talker only helps if it can answer while the reasoner's request is in flight. Ollama serves one request per model by default, and Cortex cannot see what a custom endpoint does. So when you omit `mode`, the agent resolves it from each model's `capabilities.concurrency`: duplex when both the talker's and the reasoner's models are `'parallel'`, passthrough otherwise, with a `mode-resolved-passthrough` note in the report saying why. Hosted providers are `'parallel'`, native Ollama models are `'serial'`, and custom endpoints are `'unknown'`.
+The talker only helps if it can answer while the reasoner's request is in flight. Ollama serves one request per model by default, and Cortex cannot see what a custom endpoint does. So when you omit `mode`, the agent resolves it from the backends: passthrough when the talker and the reasoner would share one backend that is not `'parallel'` (with a `mode-resolved-passthrough` note in the report saying why), duplex otherwise. Hosted providers are `'parallel'`, native Ollama models are `'serial'`, and custom endpoints are `'unknown'`. A talker on a different backend from the reasoner always runs duplex, so an Ollama reasoner with `talker.model` pinned to a hosted model gets the full benefit.
 
 If your Ollama server does run requests in parallel (`OLLAMA_NUM_PARALLEL` above 1, and your talker and reasoner models fit in memory together), declare it:
 
@@ -76,7 +76,7 @@ If your Ollama server does run requests in parallel (`OLLAMA_NUM_PARALLEL` above
 const model = await providers.createOllamaModel({ modelId: 'qwen3:32b', parallelRequests: true });
 ```
 
-Or pass `mode: 'duplex'` yourself: an explicit mode always wins, and on a backend that is not `'parallel'` the report carries a `duplex-not-concurrent` warning. The mode is fixed when the agent is created; `setModel()` does not switch it (see [cortex-agent.md](./cortex-agent.md#mode-resolution)).
+Or pass `mode: 'duplex'` yourself: an explicit mode always wins, and when the talker and reasoner share a backend that is not `'parallel'` the report carries a `duplex-not-concurrent` warning. The mode is fixed when the agent is created; `setModel()` does not switch it (see [cortex-agent.md](./cortex-agent.md#mode-resolution)).
 
 The design lives in [`duplex/`](./duplex/README.md): [architecture](./duplex/architecture.md), [the facade API contract](./duplex/facade-api.md), [communication and the permission broker](./duplex/communication.md), and [the decision record](./duplex/decisions.md).
 

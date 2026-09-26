@@ -122,7 +122,8 @@ export class ResolutionRecorder {
    * Re-evaluate the notes that describe the loops' models after the facade
    * changed them (setModel swaps the reasoner's and re-mirrors an unpinned
    * talker). The mode itself is not re-decided: loops are assembled from it,
-   * so a switch onto a serial backend earns a duplex-not-concurrent note
+   * so a switch that leaves both loops on one serial backend earns a
+   * duplex-not-concurrent note
    * rather than a mode change, and a passthrough agent stays passthrough
    * (decisions.md D21). This is not the
    * lazy report the eager design rules out: the facade itself just redid

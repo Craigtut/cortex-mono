@@ -1,9 +1,9 @@
 /**
- * An omitted CortexAgent mode is resolved from backend concurrency
- * (decisions.md D21): duplex when both loops' models are served
- * concurrently, passthrough otherwise, with a note saying why. An explicit
- * mode always wins, and duplex on a backend not known to be concurrent
- * carries a warning note.
+ * An omitted CortexAgent mode is resolved from the backends (decisions.md
+ * D21): passthrough only when the talker and the reasoner would share one
+ * backend that cannot serve them concurrently, with a note saying why, and
+ * duplex otherwise. An explicit mode always wins, and duplex on such a
+ * shared backend carries a warning note.
  *
  * Models come from the real creation paths (ProviderManager against a
  * synthetic Ollama server, pi-ai's catalog), so the capability each path
@@ -68,10 +68,13 @@ function note(facade: CortexAgent, code: string): ResolutionNote | undefined {
   return facade.getResolutionReport().find((candidate) => candidate.code === code);
 }
 
-function ollamaModel(options: { parallelRequests?: boolean } = {}): Promise<CortexModel> {
+function ollamaModel(
+  options: { parallelRequests?: boolean; modelId?: string; baseUrl?: string } = {},
+): Promise<CortexModel> {
   return new ProviderManager().createOllamaModel({
     modelId: 'test',
-    fetch: ollamaServer().fetch,
+    baseUrl: 'http://localhost:11434',
+    fetch: ollamaServer({ name: options.modelId ?? 'test' }).fetch,
     ...options,
   });
 }
@@ -152,6 +155,99 @@ describe('omitted mode', () => {
   });
 });
 
+describe('omitted mode across backends', () => {
+  it('resolves to duplex with a serial reasoner and a talker pinned to a hosted provider', async () => {
+    const reasoner = await ollamaModel();
+    const talker = await new ProviderManager().resolveModel('anthropic', 'claude-haiku-4-5');
+    expect(reasoner.capabilities?.concurrency).toBe('serial');
+
+    const { facade, loopPaths } = await create({ model: reasoner, talker: { model: talker } });
+
+    // The talker's requests go to Anthropic, so nothing queues behind the reasoner.
+    expect(loopPaths).toEqual(['reasoner', 'talker']);
+    expect(note(facade, 'mode-resolved-passthrough')).toBeUndefined();
+    expect(note(facade, 'duplex-not-concurrent')).toBeUndefined();
+  });
+
+  it('resolves to duplex with a hosted reasoner and a talker pinned to a serial server', async () => {
+    const reasoner = await new ProviderManager().resolveModel('anthropic', 'claude-sonnet-4-6');
+    const talker = await ollamaModel();
+    expect(talker.capabilities?.concurrency).toBe('serial');
+
+    const { facade, loopPaths } = await create({ model: reasoner, talker: { model: talker } });
+
+    expect(loopPaths).toEqual(['reasoner', 'talker']);
+    expect(note(facade, 'mode-resolved-passthrough')).toBeUndefined();
+    expect(note(facade, 'duplex-not-concurrent')).toBeUndefined();
+  });
+
+  it('resolves to duplex when an explicit utilityModel puts the talker on another server', async () => {
+    const reasoner = await ollamaModel({ baseUrl: 'http://gpu-a.local:11434' });
+    const utility = await ollamaModel({ modelId: 'small', baseUrl: 'http://gpu-b.local:11434' });
+
+    const { facade, loopPaths, loops } = await create({ model: reasoner, utilityModel: utility });
+
+    expect(loopPaths).toEqual(['reasoner', 'talker']);
+    expect(loops.get('talker')!.getModel().modelId).toBe('small');
+    expect(note(facade, 'mode-resolved-passthrough')).toBeUndefined();
+  });
+
+  it('resolves to passthrough when an explicit utilityModel shares the serial server', async () => {
+    const reasoner = await ollamaModel();
+    // 127.0.0.1 and localhost are one server.
+    const utility = await ollamaModel({ modelId: 'small', baseUrl: 'http://127.0.0.1:11434' });
+
+    const { facade, loopPaths } = await create({ model: reasoner, utilityModel: utility });
+
+    expect(loopPaths).toEqual(['main']);
+    expect(note(facade, 'mode-resolved-passthrough')!.data).toMatchObject({
+      reasonerModelId: 'test',
+      talkerModelId: 'small',
+    });
+  });
+
+  it('resolves to passthrough for two distinct models on one serial server, and says how to opt in', async () => {
+    const reasoner = await ollamaModel();
+    const talker = await ollamaModel({ modelId: 'small' });
+
+    const { facade, loopPaths } = await create({ model: reasoner, talker: { model: talker } });
+
+    // Ollama runs two models at once only if both fit in memory, which it
+    // does not expose, so a shared serial server blocks by default.
+    expect(loopPaths).toEqual(['main']);
+    const resolved = note(facade, 'mode-resolved-passthrough')!;
+    expect(resolved.data).toMatchObject({
+      reasonerEndpoint: 'http://localhost:11434',
+      talkerEndpoint: 'http://localhost:11434',
+      talkerModelId: 'small',
+    });
+    expect(resolved.detail).toContain('the talker model "small" and the reasoner model "test" both run on');
+    expect(resolved.remedy).toContain('both models fitting in memory together');
+    expect(resolved.remedy).toContain('parallelRequests: true');
+  });
+
+  it('resolves to duplex for two distinct models on one server that opted into parallel requests', async () => {
+    const reasoner = await ollamaModel({ parallelRequests: true });
+    const talker = await ollamaModel({ modelId: 'small', parallelRequests: true });
+
+    const { loopPaths } = await create({ model: reasoner, talker: { model: talker } });
+
+    expect(loopPaths).toEqual(['reasoner', 'talker']);
+  });
+
+  it('resolves to passthrough when a custom endpoint is the same server as the native model', async () => {
+    const reasoner = await ollamaModel();
+    const talker = await new ProviderManager().createCustomModel({
+      baseUrl: 'http://localhost:11434/v1',
+      modelId: 'test',
+    });
+
+    const { loopPaths } = await create({ model: reasoner, talker: { model: talker } });
+
+    expect(loopPaths).toEqual(['main']);
+  });
+});
+
 describe('explicit mode', () => {
   it('runs duplex on a serial backend when asked, with a warning note', async () => {
     const model = await ollamaModel();
@@ -167,6 +263,17 @@ describe('explicit mode', () => {
     expect(note(facade, 'mode-resolved-passthrough')).toBeUndefined();
   });
 
+  it('does not warn when a duplex talker is on another backend than a serial reasoner', async () => {
+    const reasoner = await new ProviderManager().resolveModel('anthropic', 'claude-sonnet-4-6');
+    const talker = await ollamaModel();
+    expect(talker.capabilities?.concurrency).toBe('serial');
+
+    const { facade, loopPaths } = await create({ model: reasoner, talker: { model: talker }, mode: 'duplex' });
+
+    expect(loopPaths).toEqual(['reasoner', 'talker']);
+    expect(note(facade, 'duplex-not-concurrent')).toBeUndefined();
+  });
+
   it('runs passthrough on a hosted provider when asked, with no mode notes', async () => {
     const model = await new ProviderManager().resolveModel('anthropic', 'claude-sonnet-4-6');
 
@@ -178,20 +285,31 @@ describe('explicit mode', () => {
 });
 
 describe('setModel after assembly', () => {
-  it('keeps the mode and warns when a pinned-talker duplex moves onto a serial reasoner', async () => {
-    const pm = new ProviderManager();
-    const hosted = await pm.resolveModel('anthropic', 'claude-sonnet-4-6');
-    const talker = await pm.resolveModel('anthropic', 'claude-haiku-4-5');
-    const { facade, loops } = await create({ model: hosted, talker: { model: talker } });
+  it('keeps the mode and warns when an unpinned duplex moves onto a serial server', async () => {
+    const hosted = await new ProviderManager().resolveModel('anthropic', 'claude-sonnet-4-6');
+    const { facade, loops } = await create({ model: hosted });
     expect(note(facade, 'duplex-not-concurrent')).toBeUndefined();
 
     facade.setModel(await ollamaModel());
 
-    // Still duplex: the loops were assembled from the mode.
-    expect(loops.get('talker')!.getModel().modelId).toBe('claude-haiku-4-5');
+    // Still duplex, the unpinned talker mirrored onto the same server.
+    expect(loops.get('talker')!.getModel().provider).toBe('ollama');
     expect(note(facade, 'duplex-not-concurrent')!.data).toMatchObject({
-      talkerConcurrency: 'parallel',
+      talkerConcurrency: 'serial',
       reasonerConcurrency: 'serial',
     });
+  });
+
+  it('does not warn when a pinned hosted talker stays on another backend', async () => {
+    const pm = new ProviderManager();
+    const hosted = await pm.resolveModel('anthropic', 'claude-sonnet-4-6');
+    const talker = await pm.resolveModel('anthropic', 'claude-haiku-4-5');
+    const { facade, loops } = await create({ model: hosted, talker: { model: talker } });
+
+    facade.setModel(await ollamaModel());
+
+    expect(loops.get('reasoner')!.getModel().capabilities?.concurrency).toBe('serial');
+    expect(loops.get('talker')!.getModel().modelId).toBe('claude-haiku-4-5');
+    expect(note(facade, 'duplex-not-concurrent')).toBeUndefined();
   });
 });

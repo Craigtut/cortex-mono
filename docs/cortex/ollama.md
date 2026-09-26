@@ -117,10 +117,16 @@ changes by another client.
 
 Ollama serves one request per model by default (`OLLAMA_NUM_PARALLEL=1`) and
 runs two different models at once only if both fit in memory. Its API exposes
-neither, so an Ollama model's `capabilities.concurrency` is `'serial'`, and a
-`CortexAgent` created with `mode` omitted runs passthrough with a
-`mode-resolved-passthrough` resolution note. If your server does run requests
-in parallel, declare it and the omitted mode resolves to duplex:
+neither, so an Ollama model's `capabilities.concurrency` is `'serial'`. A
+`CortexAgent` created with `mode` omitted runs passthrough, with a
+`mode-resolved-passthrough` resolution note, when its talker would run on the
+same Ollama server as its reasoner: the reasoner's model itself (Ollama has no
+auto-resolved fast tier), a `utilityModel` on that server, or a pinned
+`talker.model` on it. Two different models on one serial server count too,
+because whether both fit in memory is exactly what Cortex cannot see. A talker
+on another backend (a second Ollama host, or a hosted provider) runs duplex,
+since nothing queues. If your server does run requests in parallel, declare
+it on both models and the omitted mode resolves to duplex:
 
 ```typescript
 const model = await providers.createOllamaModel({
@@ -130,7 +136,8 @@ const model = await providers.createOllamaModel({
 ```
 
 An explicit `mode: 'duplex'` runs duplex either way and records a
-`duplex-not-concurrent` note when the model is `'serial'`. See
+`duplex-not-concurrent` note when the talker and reasoner share a `'serial'`
+server. See
 [cortex-agent.md](cortex-agent.md#mode-resolution).
 
 ## Thinking and structured output

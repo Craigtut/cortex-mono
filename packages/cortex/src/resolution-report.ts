@@ -23,6 +23,7 @@
  */
 
 import { describeModel } from './model-wrapper.js';
+import { servedConcurrently } from './model-backend.js';
 import type { CortexModel, ModelDescription } from './model-wrapper.js';
 import type { ModeResolution } from './facade/mode-resolution.js';
 
@@ -204,23 +205,16 @@ export function collectAssemblyResolutionNotes(
 
   const decided = resolution.modeResolution;
   if (decided.requested === undefined && resolution.mode === 'passthrough') {
-    const roles = [
-      { role: 'reasoner', model: decided.reasoner },
-      ...(decided.talker ? [{ role: 'talker', model: decided.talker }] : []),
-    ];
-    const blocking = describeNonParallel(roles);
+    const shared = decided.talker ? describeSharedBackend(decided.talker, decided.reasoner) : null;
     notes.push({
       code: 'mode-resolved-passthrough',
       severity: 'info',
-      summary: 'Running passthrough: the backend is not known to serve the talker and reasoner concurrently.',
+      summary: 'Running passthrough: the talker and reasoner would share a backend not known to serve them concurrently.',
       detail:
-        'mode was not set, so it was resolved from backend concurrency. Duplex only helps ' +
+        'mode was not set, so it was resolved from the backends. Duplex only helps ' +
         "when the talker's request runs while the reasoner's is in flight, and " +
-        `${blocking ?? 'the talker model could not be resolved'}, so the agent runs a single loop.`,
-      remedy:
-        'If the backend does serve concurrent requests (for Ollama, OLLAMA_NUM_PARALLEL above 1 ' +
-        'and both models fitting in memory), set parallelRequests: true in createOllamaModel(), ' +
-        "or set mode: 'duplex'.",
+        `${shared ?? 'the talker model could not be resolved'}, so the agent runs a single loop.`,
+      remedy: sharedBackendRemedy(decided.talker, decided.reasoner, "or set mode: 'duplex'."),
       data: {
         ...modelData('reasoner', decided.reasoner),
         ...(decided.talker ? modelData('talker', decided.talker) : {}),
@@ -231,21 +225,17 @@ export function collectAssemblyResolutionNotes(
   if (resolution.mode === 'duplex' && talkerModel !== null) {
     const talker = describeModel(talkerModel);
     const reasoner = describeModel(reasonerModel);
-    const blocking = describeNonParallel([
-      { role: 'talker', model: talker },
-      { role: 'reasoner', model: reasoner },
-    ]);
-    if (blocking !== null) {
+    // Two backends always overlap, so only a shared one can queue the
+    // talker behind the reasoner.
+    if (!servedConcurrently(talker, reasoner)) {
       notes.push({
         code: 'duplex-not-concurrent',
         severity: 'degraded',
-        summary: 'Duplex on a backend not known to serve concurrent requests: the talker may queue behind the reasoner.',
+        summary: 'Duplex on a shared backend not known to serve concurrent requests: the talker may queue behind the reasoner.',
         detail:
-          `mode is 'duplex', but ${blocking}. The talker only stays responsive while ` +
-          'the reasoner works if the backend serves both requests at once.',
-        remedy:
-          'Use a backend that serves concurrent requests (for Ollama, raise OLLAMA_NUM_PARALLEL and ' +
-          "set parallelRequests: true in createOllamaModel()), or use mode: 'passthrough'.",
+          `mode is 'duplex', but ${describeSharedBackend(talker, reasoner)}. The talker only stays ` +
+          'responsive while the reasoner works if that backend serves both requests at once.',
+        remedy: sharedBackendRemedy(talker, reasoner, "or use mode: 'passthrough'."),
         data: { ...modelData('talker', talker), ...modelData('reasoner', reasoner) },
       });
     }
@@ -259,25 +249,39 @@ function modelData(role: string, model: ModelDescription): Record<string, unknow
   return {
     [`${role}Provider`]: model.provider,
     [`${role}ModelId`]: model.modelId,
+    [`${role}Endpoint`]: model.endpoint,
     [`${role}Concurrency`]: model.concurrency,
   };
 }
 
 /**
- * The loops whose model is not `parallel`, as prose ("the talker model "x"
- * ("ollama") serves one request at a time"), or null when every one is.
+ * The two loops on one backend, as prose ("the talker model "x" and the
+ * reasoner model "y" both run on http://localhost:11434, which serves one
+ * request at a time").
  */
-function describeNonParallel(
-  roles: Array<{ role: string; model: ModelDescription }>,
-): string | null {
-  const blocking = roles.filter(({ model }) => model.concurrency !== 'parallel');
-  if (blocking.length === 0) return null;
-  return blocking.map(({ role, model }) => {
-    const state = model.concurrency === 'serial'
-      ? 'serves one request at a time'
-      : 'is not known to serve concurrent requests';
-    return `the ${role} model "${model.modelId}" ("${model.provider}") ${state}`;
-  }).join(' and ');
+function describeSharedBackend(talker: ModelDescription, reasoner: ModelDescription): string {
+  const where = reasoner.endpoint !== '' ? reasoner.endpoint : `provider "${reasoner.provider}"`;
+  const models = talker.modelId === reasoner.modelId
+    ? `the talker and the reasoner both run "${reasoner.modelId}" on ${where}`
+    : `the talker model "${talker.modelId}" and the reasoner model "${reasoner.modelId}" both run on ${where}`;
+  const serial = talker.concurrency === 'serial' || reasoner.concurrency === 'serial';
+  return `${models}, which ${serial ? 'serves one request at a time' : 'is not known to serve concurrent requests'}`;
+}
+
+/** What to set when one backend serves both loops, ending with the mode option. */
+function sharedBackendRemedy(
+  talker: ModelDescription | null,
+  reasoner: ModelDescription,
+  modeOption: string,
+): string {
+  const ollama = reasoner.provider === 'ollama' || talker?.provider === 'ollama';
+  const distinct = talker !== null && talker.modelId !== reasoner.modelId;
+  const optIn = ollama
+    ? 'If the server does serve them at once (OLLAMA_NUM_PARALLEL above 1' +
+      `${distinct ? ', and both models fitting in memory together' : ''}), set parallelRequests: true ` +
+      'in createOllamaModel() for both models. '
+    : '';
+  return `${optIn}${optIn ? 'Otherwise pin' : 'Pin'} talker.model to a model on another backend, ${modeOption}`;
 }
 
 /**

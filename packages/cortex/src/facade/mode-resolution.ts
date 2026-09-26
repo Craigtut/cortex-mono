@@ -3,13 +3,15 @@
  * any loop exists, because the loops are built from it (decisions.md D21).
  *
  * Duplex only pays off when the talker's request runs while the reasoner's
- * is in flight. An explicit `mode` always wins; an omitted one resolves to
- * duplex when both loops' models are `parallel`, and to passthrough
- * otherwise.
+ * is in flight. That fails only when both loops reach one backend that
+ * cannot serve them at once, so an omitted mode resolves to passthrough
+ * exactly then and to duplex otherwise (model-backend.ts owns the test).
+ * An explicit `mode` always wins.
  */
 
 import { resolveUtilityModels } from '../agent-loop/model-settings.js';
 import type { PiModel } from '../agent-loop/pi-agent.js';
+import { servedConcurrently } from '../model-backend.js';
 import { describeModel, isCortexModel, unwrapModel } from '../model-wrapper.js';
 import type { CortexModel, ModelDescription } from '../model-wrapper.js';
 import type { CortexAgentMode, ResolvedCortexAgentConfig } from './config.js';
@@ -50,12 +52,12 @@ export function resolveFacadeMode(config: ResolvedCortexAgentConfig): ModeResolu
     return {
       mode: 'passthrough',
       requested: undefined,
-      reasoner: { provider: '', modelId: '', concurrency: 'unknown' },
+      reasoner: { provider: '', endpoint: '', modelId: '', concurrency: 'unknown' },
       talker: null,
     };
   }
   const reasoner = describeModel(config.model);
   const talker = describeModel(defaultTalkerModel(config));
-  const concurrent = reasoner.concurrency === 'parallel' && talker.concurrency === 'parallel';
-  return { mode: concurrent ? 'duplex' : 'passthrough', requested: undefined, reasoner, talker };
+  const mode = servedConcurrently(reasoner, talker) ? 'duplex' : 'passthrough';
+  return { mode, requested: undefined, reasoner, talker };
 }

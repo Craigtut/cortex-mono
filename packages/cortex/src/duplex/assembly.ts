@@ -408,8 +408,8 @@ export async function assembleDuplexLoops(
   try {
     // Default talker model: the fast tier resolved from the primary
     // provider, which is exactly what the reasoner's utility-model
-    // auto-resolution computes (and what mode resolution judged
-    // concurrency on). That resolution cannot fail; for a provider Cortex
+    // auto-resolution computes (and what mode resolution judged the
+    // backends on). That resolution cannot fail; for a provider Cortex
     // cannot enumerate (Ollama, custom OpenAI-compatible endpoints) it
     // falls back to the primary model, so duplex still assembles and runs
     // but the talker is as slow as the reasoner, which is the whole
