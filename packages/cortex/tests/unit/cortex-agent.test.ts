@@ -200,6 +200,11 @@ type TestCortexAgentConstructor = new (
   config: ResolvedFacadeConfig,
 ) => CortexAgent;
 
+/** Whether the facade's debounced onStateChanged emission is armed. */
+function stateEmissionScheduled(facade: CortexAgent): boolean {
+  return (facade as unknown as { stateEmitter: { scheduled: boolean } }).stateEmitter.scheduled;
+}
+
 function testModel(): CortexModel {
   return wrapModel(
     { provider: 'anthropic', name: 'claude-sonnet-4-20250514' } as PiModel,
@@ -922,7 +927,7 @@ describe('CortexAgent delegation', () => {
     // onLoopComplete checkpoint must not schedule a debounce timer that
     // holds its handle for the window and then snapshots a dead loop.
     await loop.destroy();
-    expect((facade as unknown as { stateTimer: unknown }).stateTimer).toBeNull();
+    expect(stateEmissionScheduled(facade)).toBe(false);
   });
 });
 

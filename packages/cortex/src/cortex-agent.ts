@@ -26,6 +26,7 @@ import type {
   CortexAgentStateV2,
 } from './facade/persisted-state.js';
 import { UsageLedger } from './facade/usage-ledger.js';
+import { StateEmitter } from './facade/state-emitter.js';
 import type { UsageReadings } from './facade/usage-ledger.js';
 import type {
   CortexAgentConfig,
@@ -657,11 +658,7 @@ export class CortexAgent {
   private retainedRouterState: DuplexRouterState | null = null;
   private retainedTalkerMemory: ObservationalMemoryState | null = null;
 
-  private readonly stateChangedHandlers: Array<(state: CortexAgentStateV2) => void> = [];
-  private readonly stateDebounceMs: number;
-  private stateDirty = false;
-  private stateTimer: ReturnType<typeof setTimeout> | null = null;
-  private emittingState = false;
+  private readonly stateEmitter: StateEmitter;
 
   private destroyPromise: Promise<void> | null = null;
   private destroyed = false;
@@ -711,7 +708,14 @@ export class CortexAgent {
       onEvict: (evicted) => this.spillEvictedEntries(evicted, config),
     });
 
-    this.stateDebounceMs = config.stateChangeDebounceMs ?? DEFAULT_STATE_DEBOUNCE_MS;
+    this.stateEmitter = new StateEmitter({
+      snapshot: () => this.getState(),
+      shuttingDown: () => this.residentLoops.some(
+        (loop) => loop.state === 'destroying' || loop.state === 'destroyed',
+      ),
+      debounceMs: config.stateChangeDebounceMs ?? DEFAULT_STATE_DEBOUNCE_MS,
+      logger: this.logger,
+    });
     this.consumerBasePrompt = config.initialBasePrompt ?? null;
     this.idleDigestionDelayMs = config.duplex?.idleDigestionDelayMs ?? 10_000;
     // In duplex, create() has already wrapped this in the broker pipeline.
@@ -1461,7 +1465,7 @@ export class CortexAgent {
       return;
     }
     this.router?.deliverLookupResult(outcome);
-    this.markStateDirty();
+    this.stateEmitter.markDirty();
   }
 
   /**
@@ -1772,10 +1776,10 @@ export class CortexAgent {
    */
   private wireStateTriggers(): void {
     for (const loop of this.talker ? [this.reasoner, this.talker] : [this.reasoner]) {
-      loop.onLoopComplete(() => this.markStateDirty());
-      loop.onPostCompaction(() => this.markStateDirty());
-      loop.onObservation(() => this.markStateDirty());
-      loop.onReflection(() => this.markStateDirty());
+      loop.onLoopComplete(() => this.stateEmitter.markDirty());
+      loop.onPostCompaction(() => this.stateEmitter.markDirty());
+      loop.onObservation(() => this.stateEmitter.markDirty());
+      loop.onReflection(() => this.stateEmitter.markDirty());
     }
   }
 
@@ -1806,7 +1810,7 @@ export class CortexAgent {
       ...(input.wake !== undefined ? { wake: input.wake } : {}),
       ...(input.data !== undefined ? { data: input.data } : {}),
     });
-    this.markStateDirty();
+    this.stateEmitter.markDirty();
     if (this.logAppendWaiters.length > 0) {
       for (const resolve of this.logAppendWaiters.splice(0)) resolve();
     }
@@ -2383,10 +2387,7 @@ export class CortexAgent {
   async destroy(timeoutMs?: number): Promise<void> {
     if (this.destroyPromise) return this.destroyPromise;
     this.destroyed = true;
-    if (this.stateTimer !== null) {
-      clearTimeout(this.stateTimer);
-      this.stateTimer = null;
-    }
+    this.stateEmitter.destroy();
     if (this.digestionTimer !== null) {
       clearTimeout(this.digestionTimer);
       this.digestionTimer = null;
@@ -2783,70 +2784,7 @@ export class CortexAgent {
    * multiple loops exist.
    */
   onStateChanged(handler: (state: CortexAgentStateV2) => void): void {
-    this.stateChangedHandlers.push(handler);
-    if (this.stateDirty) {
-      this.scheduleStateEmit();
-    }
-  }
-
-  private markStateDirty(): void {
-    this.stateDirty = true;
-    this.scheduleStateEmit();
-  }
-
-  private scheduleStateEmit(): void {
-    if (this.destroyed || this.stateTimer !== null || this.emittingState) return;
-    if (this.stateChangedHandlers.length === 0) return;
-    if (this.isReasonerShuttingDown()) return;
-    this.stateTimer = setTimeout(() => {
-      this.stateTimer = null;
-      // No awaiter exists here: a getState() rejection escaping this timer
-      // would be an unhandled rejection and, under Node's default
-      // --unhandled-rejections=throw, kill the host process from a
-      // debounce timer. Route it to the consumer's logger instead.
-      this.emitStateChanged().catch((err: unknown) => {
-        this.logger.error('onStateChanged snapshot failed', {
-          error: errorMessageOf(err),
-        });
-      });
-    }, this.stateDebounceMs);
-  }
-
-  /**
-   * Whether a resident loop is tearing down without the facade knowing (a
-   * direct AgentLoop.destroy()). Its final onLoopComplete checkpoint would
-   * otherwise schedule a debounce timer that holds its handle for the full
-   * window and then snapshots a torn-down loop.
-   */
-  private isReasonerShuttingDown(): boolean {
-    const states = [this.reasoner.state, ...(this.talker ? [this.talker.state] : [])];
-    return states.some((loopState) => loopState === 'destroying' || loopState === 'destroyed');
-  }
-
-  private async emitStateChanged(): Promise<void> {
-    if (this.destroyed || this.stateChangedHandlers.length === 0) return;
-    if (this.isReasonerShuttingDown()) return;
-    this.emittingState = true;
-    try {
-      this.stateDirty = false;
-      const state = await this.getState();
-      if (this.destroyed) return;
-      for (const handler of this.stateChangedHandlers) {
-        try {
-          handler(state);
-        } catch (err) {
-          this.logger.error('onStateChanged handler threw', {
-            error: errorMessageOf(err),
-          });
-        }
-      }
-    } finally {
-      this.emittingState = false;
-      // Changes that landed while snapshotting get their own cycle.
-      if (this.stateDirty) {
-        this.scheduleStateEmit();
-      }
-    }
+    this.stateEmitter.subscribe(handler);
   }
 
   // -------------------------------------------------------------------------
