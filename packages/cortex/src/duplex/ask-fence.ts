@@ -7,15 +7,16 @@
  * content inside it: knowing it, model-authored command text can close the
  * fence early and continue in text that reads as Cortex's own framing.
  *
- * The talker legitimately knows the nonce, because it has to call
- * answer_ask with it. So every channel carrying talker-authored text toward
- * the reasoner is a leak path, and each one sanitizes through here. Two
- * exist today (the buffered talker reply and the answer_ask reason); a
- * third would have to call this too, which is why the implementation is
- * here rather than inline at either site.
+ * The talker necessarily sees the nonce: it is stamped on the fence markers
+ * of every voicing the talker reads out (answer_ask itself takes no id, so
+ * the talker is never invited to repeat it). So every channel carrying
+ * talker-authored text toward the reasoner is a leak path, and each one
+ * sanitizes through here. Two exist today (the buffered talker reply and
+ * the answer_ask reason); a third would have to call this too, which is why
+ * the implementation is here rather than inline at either site.
  *
  * This is defense in depth, not the consent boundary. D16 is enforced
- * router-side and holds whether or not a nonce leaks: a leaked nonce buys
+ * by the broker and holds whether or not a nonce leaks: a leaked nonce buys
  * an attacker influence over what the talker says, never a granted ask.
  */
 

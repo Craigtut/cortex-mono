@@ -15,7 +15,7 @@ Control toolset (initial):
 | `spawn_task` | `{ instructions }` | deliver new work to the reasoner |
 | `steer_task` | `{ taskAlias?, message }` | deliver a redirect to the reasoner (always; no fast-path, D20); a live reasoner run takes it at its next turn boundary |
 | `cancel_task` | `{ taskAlias }` | mark the task cancelled and tell the reasoner; stop the live reasoner run if it serves only cancelled work, otherwise steer the stop into it at its next turn boundary |
-| `answer_ask` | `{ askId, decision: 'allow' \| 'deny', reason? }` | settle the pending ask, subject to the consent rules in D16 |
+| `answer_ask` | `{ decision: 'allow' \| 'deny', reason? }` | settle the ask read out to the user, subject to the consent rules in D16 (no id: an answer binds to the one voiced ask) |
 | `quick_lookup` | `{ question }` | spawn a read-only ephemeral sub-agent |
 
 Task references use short human-friendly aliases surfaced in the headline block, not the underlying UUIDs, so a fast-tier model is never asked to reproduce a UUID exactly.
@@ -26,7 +26,7 @@ Design properties:
 
 - **Zero extra round trips.** `terminate: true` on every control-tool result skips the follow-up call; the loop honors this today (`agent-loop.ts` `shouldTerminateToolBatch`).
 - **Pointer, not paraphrase.** The reasoner receives the conversation deltas anyway (log routing), so tool arguments do not need to restate the user's request accurately; the reasoner reads the user's own words.
-- **Injection-resistant by construction.** Untrusted text in the talker's context (tool output in deliveries, stdout in headlines, file contents in lookup results, users quoting syntax) cannot invoke a tool by being echoed; invocation requires a deliberate structured call, and `answer_ask` arguments validate against the live pending-ask set.
+- **Injection-resistant by construction.** Untrusted text in the talker's context (tool output in deliveries, stdout in headlines, file contents in lookup results, users quoting syntax) cannot invoke a tool by being echoed; invocation requires a deliberate structured call, and an `answer_ask` binds only to the ask actually read out.
 - **Standard machinery.** Schema validation, argument coercion, and structured retryable errors come from the existing tool path; there is no bespoke parser to build or maintain.
 - **Precedent.** Every production system at the API layer uses tool calls for the fast loop's control surface: OpenAI Realtime async function calling, Gemini Live `NON_BLOCKING` functions, LiveKit's auto-exposed `get_running_tasks`/`cancel_task`, Pipecat, ElevenLabs. AsyncFC formalizes the fire-and-forget contract.
 
@@ -40,7 +40,7 @@ Two speeds, mapped to the two context channels (log-and-context.md):
 
 **Deliveries** (discrete): the reasoner emits a delivery through a `Deliver` tool, `{content, wake}`, symmetric with the talker's control tools. Content is plain text with no schema (decisions.md D9); `wake` proposes a class the router may demote. A reasoner run that ends without delivering a result through `Deliver` produces an implicit `when_idle` delivery from its final assistant text, so results always surface even if the model forgets the tool. A `silent` delivery is a progress note, not a result: it neither suppresses the implicit delivery nor retires the delegation it belongs to. The talker decides phrasing; grounding rules forbid inventing anything beyond the delivered content.
 
-A facade watchdog synthesizes periodic `when_idle` progress deliveries when a reasoner run has produced nothing for an extended period, so a working reasoner is distinguishable from a hung one. When the run is blocked on a pending permission ask, the progress delivery says it is waiting for the user's answer rather than reporting no update.
+A liveness watchdog in the duplex session synthesizes periodic `when_idle` progress deliveries when a reasoner run has produced nothing for an extended period, so a working reasoner is distinguishable from a hung one. When the run is blocked on a pending permission ask, the progress delivery says it is waiting for the user's answer rather than reporting no update.
 
 **Failures.** A reasoner run that dies produces a delivery too, because otherwise the headline block still lists the delegation as live and the grounding rules have the talker honestly report "still working on it" for as long as the retry ladder runs, which on the default policy is hours. The split matters: **retrying is a headline fact, giving up is a delivery fact.** A retry in progress belongs in the status block, where it is churn that updates and expires; only an exhausted ladder or a terminal failure earns a delivery. Announcing mid-ladder hands the talker two contradictory facts about one event, and the delivery is the louder one.
 
@@ -98,10 +98,10 @@ Today a permission ask blocks the asking loop while the consumer's `resolvePermi
 sub-agent hits ask-gated tool
   -> resolver wrapper creates ask entry
        {askId (nonce), loopPath, toolName, renderedRequest, voiced: false}   (log, wake: interrupt)
-  -> router marks it voiced (one at a time) and the talker reads it out
+  -> broker voices it (one at a time) and the talker reads it out
   -> user answers in speech/text
-  -> talker calls answer_ask({askId, decision, reason})
-  -> router checks the D16 consent rules
+  -> talker calls answer_ask({decision, reason}), bound to the voiced ask
+  -> broker checks the D16 consent rules
   -> facade settles the pending resolver promise
   -> asking loop proceeds or receives the block
 ```
@@ -109,7 +109,7 @@ sub-agent hits ask-gated tool
 Required mechanics:
 
 - **Ask identity.** The current resolver signature `(toolName, args)` is anonymous; with N loops the consumer cannot attribute or correlate. The wrapper adds `{askId, loopPath}` context (P1 loop-identity work).
-- **Consent binding.** See D16. One ask voiced at a time; `allow` only for the most-recently-voiced ask, only once, only with a user utterance timestamped after the voicing. Enforced in the router.
+- **Consent binding.** See D16. One ask voiced at a time; `allow` only for the most-recently-voiced ask, only once, only with a user utterance timestamped after the voicing. Enforced in the broker (`duplex/ask-consent.ts`), never by prompt.
 - **Verbatim payload.** Ask entries carry `renderedRequest`: the tool name plus the actual command or path, truncated but never summarized. Without it the talker sees only a tool name (and for sandbox escalation, only the synthetic `Bash(escalate)`), which forces vague voicing regardless of model behavior. Destructive-verb and escalation asks are read verbatim.
 
   Truncation is head-and-tail, never head-only. A long command's payload usually sits at the end (`…&& rm -rf ~/work`), so dropping the tail lets a hostile or merely verbose command hide behind a wall of leading path while still reading as benign to the human approving it by voice.

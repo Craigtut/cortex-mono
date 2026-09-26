@@ -6,7 +6,7 @@
 
 The log is the facade-owned, append-only record of the session: every user utterance, talker reply, directive, delivery, permission ask and answer, and task lifecycle event, in one totally ordered sequence. It is:
 
-- the routing bus between loops
+- the ordering record of everything routed between loops (each directive and delivery is logged before it moves)
 - the wake policy's input
 - the consumer's persistence artifact
 - the audit trail of the session

@@ -28,6 +28,10 @@ packages/cortex/
       context-pipeline.ts       # transformContext hook and idle digestion
       ...                       # tools, permissions, sub-agents, models, system prompt, etc.
     cortex-agent.ts             # Composite facade over AgentLoop (see cortex-agent.md)
+    facade/                     # Facade parts: config routing, LoopSurface forwards, session log recorder,
+                                #   persistence, settlement, and the SessionMode contract with passthrough
+    duplex/                     # Duplex session: loop assembly, router and its parts, permission broker,
+                                #   ask voicing and consent, headlines, run tracking and outcomes, watchdog
     session-log.ts              # Append-only session log owned by the facade
     context-manager.ts          # Slot-based context management
     provider-manager.ts         # Provider discovery, OAuth login/refresh, API key validation

@@ -96,7 +96,7 @@ A green suite therefore means the mechanisms are right and the wiring is right. 
 
 The pattern across every phase is worth naming: the defects were never in the checks, they were in what the checks were attached to. Content drifting from the run that carried it, a stamp living in a field rather than on the thing it described, a cache boundary drifting from the content it bounded, a consent tag minted by a surface that could not vouch for it. Where the next one lives is probably the same kind of place.
 
-**Consumer migration checklist**, from the 2a verification pass. The facade is not a drop-in replacement for `AgentLoop`; `AGENT_LOOP_DELEGATION` in `src/cortex-agent.ts` is the authoritative disposition source, and these are the three places a real migration breaks:
+**Consumer migration checklist**, from the 2a verification pass. The facade is not a drop-in replacement for `AgentLoop`; `AGENT_LOOP_DELEGATION` in `src/facade/loop-delegation.ts` is the authoritative disposition source, and these are the three places a real migration breaks:
 
 - `packages/cortex-code/src/session.ts:1948-1963` calls all three subsumed `restore*` methods on a bare `AgentLoop`. This is a call-site rewrite into a single `restore()`, not a rename, because `restore()` is all-or-nothing and rejects while running.
 - There is no facade route to parked-wake content dropped by `abort()` or `restore()`. `clearAllQueues()` returns that content for re-routing and both facade call sites discard it. Either forward it or surface the dropped content on the abort log entry (this overlaps the wake dead-letter item in 2b's scope).

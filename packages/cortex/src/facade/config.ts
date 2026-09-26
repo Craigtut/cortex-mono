@@ -78,11 +78,10 @@ export interface DuplexTuningConfig extends Omit<DuplexRouterOptions, 'now'> {
  *
  * The mapped type is the whole point. `DuplexTuningConfig` extends
  * `Omit<DuplexRouterOptions, 'now'>`, so adding a router option instantly
- * makes it settable by consumers and typechecks at their call site; before
- * this, the copy was a hand-written string list, so the new option was
- * accepted and then silently dropped, which is worse than not offering it.
- * That is exactly how `delegationMaxAgeMs` shipped dead. Now the record fails
- * to compile until the new key is listed.
+ * makes it settable by consumers and typechecks at their call site; a
+ * hand-written key list would accept the new option and then silently drop
+ * it, which is worse than not offering it. The record fails to compile
+ * until the new key is listed.
  *
  * `now` is excluded deliberately: it is a test clock, not consumer tuning,
  * and `DuplexTuningConfig` omits it for the same reason.

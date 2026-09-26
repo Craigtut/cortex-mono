@@ -196,7 +196,7 @@ export function buildControlTools(router: ControlDispatchTarget): CortexTool[] {
   /**
    * No `askId` parameter, deliberately (decisions.md D16, communication.md).
    * The answer binds to the voiced ask, exactly one ask is voiced at a
-   * time, and the router refuses an allow for anything else, so an id could
+   * time, and the broker refuses an allow for anything else, so an id could
    * never make an accepted answer possible that a bare answer would not.
    * Taking one had a real cost and no benefit: the id is the nonce fencing
    * the untrusted request text, and a parameter for it put that nonce in

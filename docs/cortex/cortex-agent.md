@@ -40,7 +40,7 @@ const agent = await CortexAgent.create({
 });
 ```
 
-Config is routed per the table in `src/cortex-agent.ts` (`CONFIG_ROUTING`). The table is compile-time exhaustive: adding a config key without a routing destination is a type error. In passthrough every non-facade key flows to the reasoner unchanged, so behavior matches direct `AgentLoop` construction exactly.
+Config is routed per the table in `src/facade/config.ts` (`CONFIG_ROUTING`). The table is compile-time exhaustive: adding a config key without a routing destination is a type error. In passthrough every non-facade key flows to the reasoner unchanged, so behavior matches direct `AgentLoop` construction exactly.
 
 One routing caveat in duplex. There is no unresolvable-talker-model case: model resolution falls back to the primary model rather than failing, so on a provider whose model list cannot be enumerated (Ollama, custom OpenAI-compatible endpoints) duplex assembles with **talker = reasoner**. That configuration is healthy-looking and passes every test while delivering none of the latency benefit, so it is reported as a `talker-model-fallback` note in [the resolution report](#the-resolution-report).
 
@@ -103,7 +103,7 @@ Callback signatures are unchanged from `AgentLoop`, including the origin context
 
 The rule is: **forward everything that is pure delegation, and withhold only what has no single composite meaning.** An earlier draft of this document claimed everything a consumer uses was already exposed, which was wrong in both directions and left four members with live call sites in this repo unreachable.
 
-`AGENT_LOOP_DELEGATION` in `src/cortex-agent.ts` is the authoritative source, not this table. It is a compile-time-exhaustive record over `keyof AgentLoop`, so every member must carry a disposition or the package does not build, and a runtime test asserts both directions: forwarded members exist on the facade, withheld and subsumed members do not, so accidental exposure fails too.
+`AGENT_LOOP_DELEGATION` in `src/facade/loop-delegation.ts` is the authoritative source, not this table. It is a compile-time-exhaustive record over `keyof AgentLoop`, so every member must carry a disposition or the package does not build, and a runtime test asserts both directions: forwarded members exist on the facade, withheld and subsumed members do not, so accidental exposure fails too.
 
 **What that test does not assert is behavior.** `'forwarded'` means the name exists on the facade; it does not mean the call does the same thing. A whole-diff review found that a substantial fraction of forwarded members diverge in duplex, every one of them shipped, because presence was the only thing under test. The taxonomy below is the honest reading, and it is the Phase 3 migration checklist.
 
@@ -124,7 +124,7 @@ The rule is: **forward everything that is pure delegation, and withhold only wha
 
 ## The session log
 
-The facade keeps an append-only session log: the routing bus and audit trail of the session, and part of the persistence artifact. It is not a context surface; no prompt is ever built from it.
+The facade keeps an append-only session log: the ordering record and audit trail of the session, and part of the persistence artifact. It is not a context surface; no prompt is ever built from it.
 
 Entry types: `utterance`, `reply`, `directive`, `delivery`, `error`, `retrying`, `lifecycle`, `ask`, `ask_answer`, `lookup_result`. Passthrough produces a subset: `utterance` (consumer input), `reply` (user-facing turn text), `error` and `retrying` (from the error and retry handlers), and `lifecycle` (sub-agent spawns, completions, failures, dead-lettered deliveries, aborts, and resolution notes). Duplex adds `directive`, `delivery`, `ask`, `ask_answer` and `lookup_result` from the control tools, the permission broker and quick lookups. In duplex, `reply` entries are taken from the talker only, since the reasoner's final text is internal working prose rather than something the user was told.
 

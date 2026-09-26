@@ -49,13 +49,11 @@ export const AGENT_LOOP_DELEGATION = {
   clearQueuedDeliveries: 'forwarded',
   queuedDeliveryCount: 'forwarded',
   pendingWakeDeliveryCount: 'forwarded',
-  // Partially subsumed: facade abort() and restore() call clearAllQueues()
-  // internally but discard its return value (the cleared silent and
-  // parked-wake items, returned for re-routing). The facade surfaces
+  // Subsumed: facade abort() and restore() clear every queue themselves
+  // and record what they drop in the session log (queued_content_dropped),
+  // which is where dropped content is recoverable from. The facade surfaces
   // clearQueuedDeliveries() (silent only) and pendingWakeDeliveryCount (a
-  // count), so parked-wake content dropped by a facade abort or restore is
-  // currently unrecoverable and unrecorded; routing it to the session log
-  // is 2b delivery routing.
+  // count) for the rest.
   clearAllQueues: 'subsumed',
   // Withheld: a retraction primitive the facade uses to drop permission
   // voicings whose ask an abort already settled. It asks the caller to
@@ -204,7 +202,7 @@ type DelegationTable = typeof AGENT_LOOP_DELEGATION;
  * The keys the table marks 'forwarded'. Exported so the behavioural
  * delegation test can be exhaustive over it: the structural test only sees
  * that a forwarded member EXISTS on the facade, never that it behaves the
- * same, which is how the post-destroy divergence in steer()/abort() shipped.
+ * same.
  */
 export type ForwardedLoopMember = {
   [K in keyof DelegationTable]: DelegationTable[K] extends 'forwarded' ? K : never;

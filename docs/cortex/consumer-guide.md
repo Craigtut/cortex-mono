@@ -204,7 +204,7 @@ Loop configuration, routed for you:
 | `bash.shellPath` | Custom shell binary for the Bash tool | reasoner and sub-agents |
 | `webFetch.maxPerLoop` | WebFetch rate limit per agentic loop (default 300) | reasoner and sub-agents |
 
-The full routing table is `CONFIG_ROUTING` in `src/cortex-agent.ts`, and it is compile-time exhaustive: a config key with no routing destination is a type error rather than a silently ignored setting.
+The full routing table is `CONFIG_ROUTING` in `src/facade/config.ts`, and it is compile-time exhaustive: a config key with no routing destination is a type error rather than a silently ignored setting.
 
 Built-in tools are registered automatically on the reasoner and its sub-agents: `Bash`, `TaskOutput`, `Read`, `Write`, `Edit`, `UndoEdit`, `Glob`, `Grep`, `WebFetch`, and `SubAgent`. `ToolSearch` is registered automatically when `deferredTools.enabled` is true. The `load_skill` tool is registered automatically for parent agents. The talker gets none of these; it carries the control toolset only.
 
@@ -242,7 +242,7 @@ Registered on both loops: `onLoopComplete`, `onError`, `onRetryScheduled`, `onRe
 
 ## The Session Log
 
-The facade keeps an append-only log of the session: utterances, replies, deliveries, errors, retries, sub-agent lifecycle, permission asks and answers, and lookup results. It is the routing bus and the audit trail, and it is part of the persistence artifact. It is not a context surface; no prompt is ever built from it.
+The facade keeps an append-only log of the session: utterances, replies, deliveries, errors, retries, sub-agent lifecycle, permission asks and answers, and lookup results. It is the ordering record and the audit trail, and it is part of the persistence artifact. It is not a context surface; no prompt is ever built from it.
 
 A subscriber receives three kinds of event, and must handle all three:
 

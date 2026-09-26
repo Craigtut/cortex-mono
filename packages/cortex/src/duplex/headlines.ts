@@ -28,7 +28,7 @@ import { toolCallSubject } from '../tools/tool-call-subject.js';
  * boolean. `voiced` is sticky (set at hand-off, never cleared), so an ask
  * whose voicing was lost keeps reporting true while the broker has already
  * decided the user never heard it, and the block would read out a request as
- * answerable that the router would refuse an answer for. The anchor is the
+ * answerable that the broker would refuse an answer for. The anchor is the
  * broker's live answer to the only question this block is asking.
  */
 export interface HeadlineAsk {
@@ -353,7 +353,7 @@ export class DuplexHeadlines {
    * (spoken replies in the conversation-delta buffer, and the answer_ask
    * reason). "The block reaches the talker alone" is true of the block and
    * not of what the talker then says. It also buys nothing: a bare
-   * `answer_ask({decision})` binds to the voiced ask, and the router refuses
+   * `answer_ask({decision})` binds to the voiced ask, and the broker refuses
    * an allow for anything else, so an id can never make an accepted answer
    * possible that a bare answer would not.
    */

@@ -45,7 +45,7 @@ Rejected: injecting log-derived synthetic messages into each loop's prompt view 
 
 The context-pipeline audit killed the projection approach for durable content: view-only injections silently vanish on exactly the turns compaction fires, the observational-memory watermark requires the post-slot source array to be append-only, and insertions between a tool call and its results corrupt tool-call grouping, breakpoint simulation, and compaction atomicity simultaneously.
 
-Instead, the log is an append-only coordination record and routing bus. Content reaches models through exactly two sanctioned channels, split by durability:
+Instead, the log is an append-only coordination record: everything routed between loops is logged before it moves. Content reaches models through exactly two sanctioned channels, split by durability:
 
 - Durable entries (deliverables, directives, permission asks, conversation deltas) are delivered as real transcript messages at turn boundaries, via the same path background results use today.
 - Churn (task headlines, live activity) is view-injected outside the BP3 cache boundary, which is today's `<background-tasks>` mechanism.

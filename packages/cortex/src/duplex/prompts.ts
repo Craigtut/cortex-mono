@@ -370,13 +370,13 @@ export interface AskVoicingInput {
  * handed the talker the fence key in a form it was invited to repeat, and a
  * talker that simply narrated its own instructions leaked it to the
  * reasoner with no marker involved. Nothing needed it: `answer_ask` binds
- * to the voiced ask, exactly one ask is voiced at a time, and the router
+ * to the voiced ask, exactly one ask is voiced at a time, and the broker
  * refuses an allow for anything else, so an id could never make an accepted
  * answer possible that a bare answer would not. Asking a fast-tier model to
  * reproduce a UUID was pure cost with no authority attached to it.
  *
  * The instruction lines are a voicing aid only; the consent rules
- * themselves are enforced router-side and hold no matter what the talker
+ * themselves are enforced by the broker and hold no matter what the talker
  * does with this text.
  */
 export function buildAskVoicing(input: AskVoicingInput): string {
