@@ -61,6 +61,7 @@ import type { HookEvent, HookHandler } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 import { WorkTracker } from './session/work-tracker.js';
 import { LoopRouting } from './session/loop-routing.js';
+import { SubAgentActivity } from './session/sub-agent-activity.js';
 import { SessionStatusView, readGitBranch } from './session/status-view.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
@@ -111,7 +112,7 @@ export class Session {
    */
   private lastTurnErrorHandled = false;
   private readonly retry = new RetryStatusLine(() => this.app);
-  private subAgentActivity = new Map<string, Map<string, { name: string; status: string; summary?: string }>>();
+  private readonly subAgents = new SubAgentActivity(() => this.app);
   private readonly freezeDiagnostics: FreezeDiagnostics;
   private readonly activity: FileSessionActivityReporter;
   private readonly transcriptWriter: TranscriptWriter;
@@ -571,7 +572,7 @@ export class Session {
       // Child agent tool events update the parent sub-agent row instead of
       // creating separate transcript rows.
       if (event.childTaskId) {
-        this.recordSubAgentToolStart(event);
+        this.subAgents.toolStarted(event);
         return;
       }
       // The talker's control tools are routing plumbing, not work. See
@@ -634,7 +635,7 @@ export class Session {
       // Child agent tool events update the parent sub-agent row instead of
       // creating separate transcript rows.
       if (event.childTaskId) {
-        this.recordSubAgentToolEnd(event);
+        this.subAgents.toolEnded(event);
         return;
       }
       if (this.routing.isTalkerEvent(event)) return;
@@ -818,7 +819,7 @@ export class Session {
 
     // Sub-agent events: rendered as tool calls via the SubAgent renderer
     this.agent.onSubAgentSpawned((taskId, instructions, background) => {
-      this.subAgentActivity.set(taskId, new Map());
+      this.subAgents.open(taskId);
       this.transcriptWriter.addSubAgent(taskId, 'spawned', { summary: instructions, background });
       this.app!.transcript.startSubAgentCall(taskId, {
         instructions,
@@ -830,13 +831,13 @@ export class Session {
     this.agent.onSubAgentCompleted((taskId, result, status, usage) => {
       this.transcriptWriter.addSubAgent(taskId, 'completed', { summary: result });
       this.app!.transcript.completeSubAgentCall(taskId, result, status, usage);
-      this.subAgentActivity.delete(taskId);
+      this.subAgents.close(taskId);
     });
 
     this.agent.onSubAgentFailed((taskId, error) => {
       this.transcriptWriter.addSubAgent(taskId, 'failed', { error });
       this.app!.transcript.failSubAgentCall(taskId, error);
-      this.subAgentActivity.delete(taskId);
+      this.subAgents.close(taskId);
     });
 
     // Background sub-agent result delivery: Cortex restarts the agentic loop
@@ -1169,85 +1170,6 @@ export class Session {
       }
       setOpen(false);
     }
-  }
-
-  /** Create a short summary of tool args for display. */
-  private summarizeToolArgs(toolName: string, args: unknown): string {
-    const a = args as Record<string, unknown>;
-    switch (toolName) {
-      case 'Bash':
-        return String(a['command'] ?? '').slice(0, 80);
-      case 'Read':
-        return String(a['file_path'] ?? a['path'] ?? '');
-      case 'Write':
-        return String(a['file_path'] ?? a['path'] ?? '');
-      case 'Edit':
-        return String(a['file_path'] ?? a['path'] ?? '');
-      case 'Glob':
-        return String(a['pattern'] ?? '');
-      case 'Grep':
-        return `${String(a['pattern'] ?? '')}`;
-      case 'WebFetch':
-        return String(a['url'] ?? '').slice(0, 80);
-      case 'SubAgent': {
-        const desc = String(a['description'] ?? a['instructions'] ?? '');
-        return desc.slice(0, 60);
-      }
-      default:
-        return JSON.stringify(args).slice(0, 60);
-    }
-  }
-
-  private recordSubAgentToolStart(event: CortexEvent): void {
-    if (!event.childTaskId || !this.app) return;
-
-    const p = event.payload as import('@animus-labs/cortex').ToolCallStartPayload | undefined;
-    const data = event.data as Record<string, unknown> | undefined;
-    const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
-    const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? Math.random());
-    const args = p?.args ?? (data?.['args'] as Record<string, unknown> | undefined) ?? {};
-    const summary = this.summarizeToolArgs(toolName, args);
-
-    this.updateSubAgentActivity(event.childTaskId, toolCallId, {
-      name: toolName,
-      status: 'pending',
-      summary,
-    });
-  }
-
-  private recordSubAgentToolEnd(event: CortexEvent): void {
-    if (!event.childTaskId || !this.app) return;
-
-    const p = event.payload as import('@animus-labs/cortex').ToolCallEndPayload | undefined;
-    const data = event.data as Record<string, unknown> | undefined;
-    const toolName = p?.toolName ?? String(data?.['toolName'] ?? 'unknown');
-    const toolCallId = p?.toolCallId ?? String(data?.['toolCallId'] ?? Math.random());
-    const existing = this.subAgentActivity.get(event.childTaskId)?.get(toolCallId);
-
-    const isError = p?.isError ?? Boolean(data?.['isError']);
-
-    this.updateSubAgentActivity(event.childTaskId, toolCallId, {
-      name: existing?.name ?? toolName,
-      status: isError ? 'error' : 'success',
-      ...(existing?.summary ? { summary: existing.summary } : {}),
-    });
-  }
-
-  private updateSubAgentActivity(
-    taskId: string,
-    toolCallId: string,
-    activity: { name: string; status: string; summary?: string },
-  ): void {
-    let tools = this.subAgentActivity.get(taskId);
-    if (!tools) {
-      tools = new Map();
-      this.subAgentActivity.set(taskId, tools);
-    }
-
-    tools.set(toolCallId, activity);
-    this.app?.transcript.updateToolCall(taskId, {
-      toolCalls: [...tools.values()],
-    });
   }
 
   // -------------------------------------------------------------------------
