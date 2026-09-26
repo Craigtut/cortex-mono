@@ -35,12 +35,25 @@ export interface DeliverOptions {
   /**
    * Let a run already in flight take this wake delivery at its next turn
    * boundary instead of waiting for the next run. For content that
-   * redirects the live run's work (a steer, a stop).
+   * redirects the live run's work (a redirect, a stop, the user speaking
+   * mid-turn), where waiting for the run to end would deliver it after the
+   * work it was meant to change.
    *
-   * The content is handed over only at the turn_end of a live, non-failed
-   * turn while pi's queues are empty. Otherwise (no live run, backoff,
-   * digestion, a failed turn, steer() content queued, an ordinary delivery
-   * parked ahead) it stays parked for the next run. Wake deliveries only.
+   * It still parks like any wake delivery. The loop hands it to pi in the
+   * turn_end frame of the live run, immediately before pi's own steering
+   * poll, and only when that poll is guaranteed to take exactly this
+   * content: the turn did not fail or abort, no abort is in progress, the
+   * budget guard has not breached, pi's steering and follow-up queues are
+   * provably empty (hasQueuedMessages() returns false), and the item is at
+   * the head of the parked queue. Consecutive flagged items at the head go
+   * together; an ordinary delivery parked ahead is never overtaken. Under
+   * any other condition (no live run, a retry backoff, idle digestion, a
+   * failed turn, steer() content queued, an unknown queue state) it stays
+   * parked and opens the next run, exactly as without the flag.
+   *
+   * When the live run takes it, the delivery's causeTag joins that run's
+   * activeRunCauseTags from that moment, so whatever the run produces next
+   * carries its causation. Wake deliveries only; ignored for `wake: false`.
    */
   atTurnBoundary?: boolean;
   /**
