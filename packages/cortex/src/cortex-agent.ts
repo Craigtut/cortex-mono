@@ -95,6 +95,7 @@ import { isSandboxProvider } from './sandbox/options.js';
 import { SandboxSession } from './sandbox/session.js';
 import { buildDeliverTool, buildSteerSubAgentTool } from './duplex/reasoner-tools.js';
 import { QuickLookupManager } from './duplex/quick-lookups.js';
+import { highestTaskAlias } from './duplex/delegations.js';
 import {
   appendRolePrompt,
   assembleDuplexLoops,
@@ -176,21 +177,6 @@ export type {
   CortexAgentUsageBreakdown,
   _V1OptionalFieldsAcceptNull,
 } from './facade/persisted-state.js';
-
-/**
- * The highest `task-N` alias the log's directives mention, or 0. The floor
- * for the alias counter after a restore, whatever the artifact carried.
- */
-function highestTaskAliasInLog(log: readonly SessionLogEntry[]): number {
-  let highest = 0;
-  for (const entry of log) {
-    if (entry.type !== 'directive') continue;
-    const alias = (entry.data as { alias?: unknown } | undefined)?.alias;
-    const match = typeof alias === 'string' ? /^task-(\d+)$/.exec(alias) : null;
-    if (match) highest = Math.max(highest, Number(match[1]));
-  }
-  return highest;
-}
 
 // ---------------------------------------------------------------------------
 // Facade deliver options
@@ -2150,7 +2136,10 @@ export class CortexAgent extends LoopSurface {
    */
   private restoreRouterState(state: DuplexRouterState | undefined): void {
     const router = this.router!;
-    const interrupted = router.restoreState(state, highestTaskAliasInLog(this.recorder.log.getLog()));
+    const logAliases = this.recorder.log.getLog()
+      .filter((entry) => entry.type === 'directive')
+      .map((entry) => (entry.data as { alias?: unknown } | undefined)?.alias);
+    const interrupted = router.restoreState(state, highestTaskAlias(logAliases));
     if (interrupted.length === 0) return;
     for (const delegation of interrupted) {
       this.recorder.append({

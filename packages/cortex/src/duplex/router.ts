@@ -35,6 +35,8 @@ import {
   wrapDeliveryForTalker,
 } from './prompts.js';
 import type { CauseTag } from './cause-tags.js';
+import { DelegationRegistry } from './delegations.js';
+import type { DelegationRegistryState, DelegationSnapshot } from './delegations.js';
 import { ConversationDeltas } from './conversation-deltas.js';
 import type { ConversationDeltasState } from './conversation-deltas.js';
 import { asTrimmedString } from './control-tools.js';
@@ -273,51 +275,13 @@ export function deliveryConcludes(
  * dedup, the token bucket, spacing) describes the moment, not the session,
  * and restarts clean.
  */
-export interface DuplexRouterState extends ConversationDeltasState {
-  /**
-   * The next task alias number. Aliases are how the talker, the transcript
-   * and the user refer to work, so they never restart at task-1 over a
-   * transcript that already says task-1.
-   */
-  nextAliasNumber: number;
-  /** Tracked delegations, including the directive seqs that identify results. */
-  delegations: Array<DelegationSnapshot & { directiveSeqs: number[]; lastActivityAt: number }>;
+export interface DuplexRouterState extends DelegationRegistryState, ConversationDeltasState {
   /**
    * Talker-waking deliveries already logged but not yet handed to the
    * talker. The log records them as delivered content, so dropping them at
    * restore would leave a result the user never heard looking delivered.
    */
   pendingDeliveries: string[];
-}
-
-/** One tracked delegation (a spawn_task dispatch), keyed by alias. */
-export interface DelegationSnapshot {
-  alias: string;
-  instructions: string;
-  /** Log seq of the spawn directive. */
-  seq: number;
-  createdAt: number;
-  cancelled: boolean;
-  /**
-   * When the work last reported a result, or null while it is outstanding.
-   * A completed delegation stays resolvable (the reasoner is persistent and
-   * a user routinely steers a task that already reported) but stops being
-   * described as work in progress.
-   */
-  completedAt: number | null;
-}
-
-/** The registry's own record: a snapshot plus what identifies its results. */
-interface TrackedDelegation extends DelegationSnapshot {
-  /**
-   * Every directive seq that belongs to this delegation: the spawn, plus
-   * each steer aimed at it. A delivery whose cause set touches any of them
-   * is a result for this delegation. Steers count because a run consuming a
-   * redirect delivers under the redirect's causation, not the spawn's.
-   */
-  directiveSeqs: Set<number>;
-  /** Last spawn, steer, or result. The age-out clock, so live work is safe. */
-  lastActivityAt: number;
 }
 
 interface PendingDelivery {
@@ -340,6 +304,8 @@ function fnv1a(input: string): number {
 // DuplexRouter
 // ---------------------------------------------------------------------------
 
+export type { DelegationSnapshot } from './delegations.js';
+
 export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   private readonly ports: DuplexRouterPorts;
   private readonly options: ResolvedOptions;
@@ -350,8 +316,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   // Delegation registry: human-friendly aliases so a fast-tier model never
   // reproduces UUIDs (communication.md).
-  private readonly delegations = new Map<string, TrackedDelegation>();
-  private nextAliasNumber = 1;
+  private readonly delegations: DelegationRegistry;
 
   // Conversation deltas (D18), flushed into the next dispatch message.
   private readonly deltas: ConversationDeltas;
@@ -410,6 +375,10 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.talkerLoopPath = ports.talkerLoopPath ?? 'talker';
     this.reasonerLoopPath = ports.reasonerLoopPath ?? 'reasoner';
     this.deltas = new ConversationDeltas(this.options.deltaBufferMaxChars);
+    this.delegations = new DelegationRegistry({
+      now: this.now,
+      maxAgeMs: this.options.delegationMaxAgeMs,
+    });
     this.interruptTokens = this.options.interruptBucketCapacity;
     this.lastTokenRefillAt = this.now();
 
@@ -576,7 +545,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     const capRefusal = this.applyDispatchCaps('spawn_task');
     if (capRefusal) return capRefusal;
 
-    const alias = `task-${this.nextAliasNumber++}`;
+    const alias = this.delegations.reserveAlias();
     const seq = this.ports.appendLog({
       type: 'directive',
       loopPath: this.talkerLoopPath,
@@ -584,22 +553,12 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       data: { tool: 'spawn_task', alias, instructions },
       ...this.talkerCause(),
     });
-    const createdAt = this.now();
-    this.delegations.set(alias, {
-      alias,
-      instructions,
-      seq,
-      createdAt,
-      cancelled: false,
-      completedAt: null,
-      directiveSeqs: new Set([seq]),
-      lastActivityAt: createdAt,
-    });
+    this.delegations.open(alias, instructions, seq);
     if (!this.dispatch(buildSpawnDirective(alias, instructions), seq)) {
       // Never handed over: do not track it as live work (headlines and
       // steer/cancel must not target a task the reasoner never received),
       // and never memoize a success receipt for it.
-      this.delegations.delete(alias);
+      this.delegations.remove(alias);
       return 'Could not start that: the handoff failed. Tell the user and try again.';
     }
     const receipt = `Started ${alias}.`;
@@ -618,9 +577,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     }
     const aliasName = asTrimmedString(taskAliasRaw);
     let alias: string | null = null;
-    let steered: TrackedDelegation | undefined;
     if (aliasName) {
-      const delegation = this.resolveDelegation(aliasName);
+      const delegation = this.delegations.resolve(aliasName);
       if (!delegation) {
         return this.refuseDispatch('steer_task', `unknown task "${aliasName}"`,
           `No task called "${aliasName}" is tracked right now.`);
@@ -629,7 +587,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
         return `Task ${delegation.alias} was already cancelled; start a new task if the work is wanted again.`;
       }
       alias = delegation.alias;
-      steered = delegation;
     }
     const dedupKey = `${this.dispatchTurnIndex}:steer_task:${alias ?? ''}:${fnv1a(message)}`;
     const replay = this.dispatchDedup.get(dedupKey);
@@ -649,15 +606,10 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     if (!this.dispatch(buildSteerDirective(alias, message), seq, { atTurnBoundary: true })) {
       return 'The redirect did not go through. Tell the user and try again.';
     }
-    if (steered) {
-      // The redirected run will deliver under the STEER's causation, not the
-      // spawn's, so without this the result cannot be matched back to the
-      // task it belongs to and the delegation never retires.
-      steered.directiveSeqs.add(seq);
-      // A steered task is outstanding again, whatever it reported before.
-      steered.completedAt = null;
-      steered.lastActivityAt = this.now();
-    }
+    // The redirected run will deliver under the STEER's causation, not the
+    // spawn's, so without this the result cannot be matched back to the
+    // task it belongs to and the delegation never retires.
+    if (alias) this.delegations.addSteer(alias, seq);
     const receipt = `Redirect sent${alias ? ` to ${alias}` : ''}.`;
     this.dispatchDedup.set(dedupKey, receipt);
     return receipt;
@@ -670,7 +622,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       return this.refuseDispatch('cancel_task', 'missing task alias',
         'Could not cancel: no task named.');
     }
-    const delegation = this.resolveDelegation(aliasName);
+    const delegation = this.delegations.resolve(aliasName);
     if (!delegation) {
       return this.refuseDispatch('cancel_task', `unknown task "${aliasName}"`,
         `No task called "${aliasName}" is tracked right now.`);
@@ -680,7 +632,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     }
     // No delegation caps: a cancel reduces work, and refusing a user's stop
     // request on a rate cap would be the worse failure.
-    delegation.cancelled = true;
     const seq = this.ports.appendLog({
       type: 'directive',
       loopPath: this.talkerLoopPath,
@@ -688,12 +639,10 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       data: { tool: 'cancel_task', alias: delegation.alias },
       ...this.talkerCause(),
     });
-    // Whatever the reasoner says in answer to the cancel belongs to the
-    // cancelled task too, so it is dropped with the rest of its results.
-    delegation.directiveSeqs.add(seq);
+    this.delegations.markCancelled(delegation.alias, seq);
     // A live run doing nothing but cancelled work is stopped outright; one
     // that also serves live work gets the stop at its next turn boundary.
-    const liveRunCancelled = this.servesOnlyCancelledWork(this.ports.currentReasonerCauseTags());
+    const liveRunCancelled = this.delegations.servesOnlyCancelled(this.ports.currentReasonerCauseTags());
     this.dispatch(buildCancelDirective(delegation.alias, delegation.instructions), seq, {
       atTurnBoundary: true,
       ...(liveRunCancelled ? { abortLiveRun: true } : {}),
@@ -838,7 +787,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // whose causation is entirely cancelled work never reaches the user.
     // It is still recorded, so the audit trail shows what was withheld.
     const causeTags = this.ports.currentReasonerCauseTags();
-    if (this.servesOnlyCancelledWork(causeTags)) {
+    if (this.delegations.servesOnlyCancelled(causeTags)) {
       this.ports.appendLog({
         type: 'lifecycle',
         loopPath: this.reasonerLoopPath,
@@ -931,7 +880,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // stop calling finished work live. Read AFTER the log append and before
     // any queueing, while the producing run is still the live one.
     if (deliveryConcludes(wake, meta)) {
-      this.retireDelegationsFor(this.ports.currentReasonerCauseTags());
+      this.delegations.retireFor(this.ports.currentReasonerCauseTags());
     }
 
     if (wake === 'silent') {
@@ -1093,7 +1042,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     const now = this.now();
     if (now - this.lastReasonerOutputAt < this.options.watchdogIntervalMs) return;
     const elapsedS = Math.max(1, Math.round((now - this.reasonerRunStartAt) / 1000));
-    const aliases = this.activeAliases();
+    const aliases = this.delegations.activeAliases();
     const subject = aliases.length > 0
       ? `Background work (${aliases.join(', ')})`
       : 'Background work';
@@ -1125,58 +1074,12 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   /** Snapshot of tracked delegations (copies). */
   getDelegations(): DelegationSnapshot[] {
-    this.pruneDelegations();
-    return [...this.delegations.values()].map(
-      ({ directiveSeqs: _seqs, lastActivityAt: _at, ...delegation }) => delegation,
-    );
+    return this.delegations.snapshot();
   }
 
   /** The consent boundary for every permission ask in duplex (D16). */
   get permissionBroker(): PermissionBroker {
     return this.broker;
-  }
-
-  private activeAliases(): string[] {
-    this.pruneDelegations();
-    return [...this.delegations.values()]
-      .filter((delegation) => !delegation.cancelled && delegation.completedAt === null)
-      .map((delegation) => delegation.alias);
-  }
-
-  /**
-   * Retire the delegations a delivery just answered.
-   *
-   * Nothing else in the registry retires an entry: before this, a delegation
-   * was added on spawn and removed only by a failed handover or a restore, so
-   * a finished task stayed in the block beside `<work state="idle">` for the
-   * rest of the session. That is not merely untidy. `activeAliases()` feeds
-   * the watchdog text and the block, so the talker gets told hours-old work
-   * is in progress, and the block grows per delegation against a hard token
-   * cap it shares with everything else.
-   *
-   * Matching is on the FULL cause set (D16's rule about the collapsing
-   * helper applies to every causation consumer, not only to consent): a run
-   * that consumed a spawn and a steer parked behind it collapses to the
-   * steer alone, and the spawn's delegation would never retire.
-   *
-   * Marked, not deleted. The reasoner is persistent and a user routinely
-   * steers a task that already reported ("and make the eviction metric
-   * observable"), so the alias has to stay resolvable; a steer takes it back
-   * out of the completed state. What stops is describing it as live work.
-   */
-  private retireDelegationsFor(causeTags: readonly CauseTag[]): void {
-    if (causeTags.length === 0) return;
-    const now = this.now();
-    for (const delegation of this.delegations.values()) {
-      if (delegation.completedAt !== null) continue;
-      const answered = causeTags.some(
-        (tag) => tag.kind === 'directive' && delegation.directiveSeqs.has(tag.seq),
-      );
-      if (answered) {
-        delegation.completedAt = now;
-        delegation.lastActivityAt = now;
-      }
-    }
   }
 
   /**
@@ -1187,7 +1090,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * is not).
    */
   retireRunDelegations(): void {
-    this.retireDelegationsFor(this.ports.currentReasonerCauseTags());
+    this.delegations.retireFor(this.ports.currentReasonerCauseTags());
   }
 
   /**
@@ -1197,54 +1100,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * removed, like result-driven retirement: the aliases stay steerable.
    */
   retireAllDelegations(): void {
-    const now = this.now();
-    for (const delegation of this.delegations.values()) {
-      if (delegation.completedAt !== null) continue;
-      delegation.completedAt = now;
-      delegation.lastActivityAt = now;
-    }
-  }
-
-  /**
-   * Drop delegations past the age bound, measured from their last spawn,
-   * steer, or result so live work is never dropped mid-flight. The backstop
-   * behind result-driven retirement: work can end without any delivery the
-   * router can attribute (a run that died, a reasoner that answered in a way
-   * the cause set does not connect), and an entry with no retirement path at
-   * all is what makes the registry grow without limit.
-   */
-  private pruneDelegations(): void {
-    const cutoff = this.now() - this.options.delegationMaxAgeMs;
-    for (const [alias, delegation] of this.delegations) {
-      if (delegation.lastActivityAt < cutoff) this.delegations.delete(alias);
-    }
-  }
-
-  /**
-   * Whether a reasoner run's causation is entirely cancelled delegations:
-   * non-empty, and every tag a directive belonging to one. A tag the
-   * registry cannot place (consumer work input, an unaliased steer, an aged
-   * out delegation) means the run serves something else as well.
-   */
-  private servesOnlyCancelledWork(causeTags: readonly CauseTag[]): boolean {
-    if (causeTags.length === 0) return false;
-    return causeTags.every((tag) => {
-      if (tag.kind !== 'directive') return false;
-      for (const delegation of this.delegations.values()) {
-        if (delegation.directiveSeqs.has(tag.seq)) return delegation.cancelled;
-      }
-      return false;
-    });
-  }
-
-  private resolveDelegation(aliasName: string): TrackedDelegation | undefined {
-    const exact = this.delegations.get(aliasName);
-    if (exact) return exact;
-    const lower = aliasName.toLowerCase();
-    for (const delegation of this.delegations.values()) {
-      if (delegation.alias.toLowerCase() === lower) return delegation;
-    }
-    return undefined;
+    this.delegations.retireAll();
   }
 
   /** Number of buffered conversation deltas awaiting a dispatch flush. */
@@ -1275,11 +1131,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    */
   exportState(): DuplexRouterState {
     return {
-      nextAliasNumber: this.nextAliasNumber,
-      delegations: [...this.delegations.values()].map((delegation) => ({
-        ...delegation,
-        directiveSeqs: [...delegation.directiveSeqs],
-      })),
+      ...this.delegations.exportState(),
       pendingDeliveries: [...this.interruptQueue, ...this.whenIdleQueue].map((item) => item.content),
       ...this.deltas.exportState(),
     };
@@ -1302,38 +1154,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * had belonged to the moment they were produced.
    */
   restoreState(state: DuplexRouterState | undefined, logAliasFloor: number): DelegationSnapshot[] {
-    const persistedNext = typeof state?.nextAliasNumber === 'number' && Number.isInteger(state.nextAliasNumber)
-      ? state.nextAliasNumber
-      : 1;
-    this.nextAliasNumber = Math.max(persistedNext, logAliasFloor + 1, 1);
-    if (!state) return [];
-
-    const now = this.now();
-    const interrupted: DelegationSnapshot[] = [];
-    for (const persisted of Array.isArray(state.delegations) ? state.delegations : []) {
-      if (typeof persisted?.alias !== 'string' || typeof persisted.seq !== 'number') continue;
-      const delegation: TrackedDelegation = {
-        alias: persisted.alias,
-        instructions: typeof persisted.instructions === 'string' ? persisted.instructions : '',
-        seq: persisted.seq,
-        createdAt: typeof persisted.createdAt === 'number' ? persisted.createdAt : now,
-        cancelled: persisted.cancelled === true,
-        completedAt: typeof persisted.completedAt === 'number' ? persisted.completedAt : null,
-        directiveSeqs: new Set(
-          (Array.isArray(persisted.directiveSeqs) ? persisted.directiveSeqs : [persisted.seq])
-            .filter((seq): seq is number => typeof seq === 'number'),
-        ),
-        // Restarted from now: the age-out measures inactivity in this
-        // session, and a restore is activity.
-        lastActivityAt: now,
-      };
-      if (!delegation.cancelled && delegation.completedAt === null) {
-        delegation.completedAt = now;
-        const { directiveSeqs: _seqs, lastActivityAt: _at, ...snapshot } = delegation;
-        interrupted.push(snapshot);
-      }
-      this.delegations.set(delegation.alias, delegation);
-    }
+    const interrupted = this.delegations.restoreState(state, logAliasFloor);
+    if (!state) return interrupted;
 
     this.deltas.restoreState(state);
 
@@ -1358,7 +1180,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.dropPendingDeliveries();
     this.dropWorkContext();
     this.delegations.clear();
-    this.nextAliasNumber = 1;
     this.dispatchDedup.clear();
     this.recentDeliveryHashes = [];
     this.dispatchesThisTurn = 0;
