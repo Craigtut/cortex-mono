@@ -37,6 +37,7 @@ import {
 import type { CauseTag } from './cause-tags.js';
 import { DispatchPolicy } from './dispatch-policy.js';
 import { DeliveryScheduler } from './delivery-scheduler.js';
+import { LivenessWatchdog } from './watchdog.js';
 import { DelegationRegistry } from './delegations.js';
 import type { DelegationRegistryState, DelegationSnapshot } from './delegations.js';
 import { ConversationDeltas } from './conversation-deltas.js';
@@ -312,7 +313,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   private reasonerRunning = false;
   private reasonerRunStartAt = 0;
   private lastReasonerOutputAt = 0;
-  private readonly watchdogTimer: ReturnType<typeof setInterval>;
+  private readonly watchdog: LivenessWatchdog;
 
   // Permission broker (D16): the consent boundary for every ask in duplex.
   private readonly broker: PermissionBroker;
@@ -390,11 +391,20 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       },
     );
 
-    // The watchdog checks well inside its interval so a hung run is noticed
-    // at most ~1.25 intervals after its last output.
-    const checkEvery = Math.min(Math.max(50, Math.floor(this.options.watchdogIntervalMs / 4)), 15_000);
-    this.watchdogTimer = setInterval(() => this.watchdogTick(), checkEvery);
-    this.watchdogTimer.unref?.();
+    this.watchdog = new LivenessWatchdog(
+      {
+        runStartedAt: () => (this.reasonerRunning ? this.reasonerRunStartAt : null),
+        lastOutputAt: () => this.lastReasonerOutputAt,
+        activeAliases: () => this.delegations.activeAliases(),
+        pendingAsks: () => this.broker.getPendingAsks(),
+        // Rides the normal intake (log entry, dedup, spacing); marks itself
+        // synthetic and resets the silence clock through lastReasonerOutputAt.
+        reportProgress: (text) => {
+          this.deliverFromReasoner(text, 'when_idle', { synthetic: true });
+        },
+      },
+      { intervalMs: this.options.watchdogIntervalMs, now: this.now },
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -831,41 +841,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   }
 
   // -------------------------------------------------------------------------
-  // Watchdog (a working reasoner must be distinguishable from a hung one)
-  // -------------------------------------------------------------------------
-
-  private watchdogTick(): void {
-    if (this.destroyed || !this.reasonerRunning) return;
-    const now = this.now();
-    if (now - this.lastReasonerOutputAt < this.options.watchdogIntervalMs) return;
-    const elapsedS = Math.max(1, Math.round((now - this.reasonerRunStartAt) / 1000));
-    const aliases = this.delegations.activeAliases();
-    const subject = aliases.length > 0
-      ? `Background work (${aliases.join(', ')})`
-      : 'Background work';
-    // A run blocked on a permission ask is silent because it is waiting on
-    // the user, not because it is slow or hung. Saying "no update yet" there
-    // tells the talker to reassure instead of to ask again for the answer.
-    const waitingOn = this.oldestPendingAsk();
-    const text = waitingOn
-      ? `${subject} is paused waiting for the user's permission answer (${waitingOn.toolName}), ` +
-        `about ${Math.max(1, Math.round((now - waitingOn.requestedAt) / 1000))}s so far. ` +
-        'It cannot continue until the user answers.'
-      : `${subject} is still running, about ${elapsedS}s so far; no update from it yet.`;
-    // Rides the normal intake (log entry, dedup, spacing); marks itself
-    // synthetic and resets the silence clock through lastReasonerOutputAt.
-    this.deliverFromReasoner(text, 'when_idle', { synthetic: true });
-  }
-
-  private oldestPendingAsk(): { toolName: string; requestedAt: number } | null {
-    let oldest: { toolName: string; requestedAt: number } | null = null;
-    for (const ask of this.broker.getPendingAsks()) {
-      if (oldest === null || ask.requestedAt < oldest.requestedAt) oldest = ask;
-    }
-    return oldest;
-  }
-
-  // -------------------------------------------------------------------------
   // Registry and state surfaces
   // -------------------------------------------------------------------------
 
@@ -984,7 +959,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // Settle every pending ask first so no resolver promise outlives the
     // router: a hanging ask would block its loop into the force-kill path.
     this.broker.destroy();
-    clearInterval(this.watchdogTimer);
+    this.watchdog.destroy();
     this.scheduler.destroy();
   }
 
