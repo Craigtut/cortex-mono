@@ -1300,3 +1300,90 @@ describe('AgentLoop abort-cancelled wake deliveries are dead-lettered', () => {
     expect(entry.message).toBe('swept then aborted');
   });
 });
+
+// ---------------------------------------------------------------------------
+// atTurnBoundary fallback: when pi's queues are not provably empty at the
+// turn boundary, the hand-over would not be exact (pi's poll would drain
+// something else with it), so the delivery stays parked and opens the next
+// run instead, still carrying its cause tag.
+// ---------------------------------------------------------------------------
+
+describe('AgentLoop.deliver atTurnBoundary fallback to the next run', () => {
+  function boundarySetup(queueState: 'empty' | 'non-empty' | 'unknown') {
+    let emit!: (event: PiEvent) => void;
+    let release: (() => void) | null = null;
+    const runs: Array<{ input: string | AgentMessage[]; tags: readonly unknown[] }> = [];
+    let loop!: AgentLoop;
+    const steer = vi.fn();
+    const pi = {
+      state: { messages: [] as AgentMessage[], systemPrompt: '', tools: [] },
+      subscribe(handler: (event: PiEvent) => void) {
+        emit = handler;
+        return () => {};
+      },
+      async prompt(input: string | AgentMessage[]) {
+        runs.push({ input, tags: loop.activeRunCauseTags });
+        if (runs.length === 1) await new Promise<void>((resolve) => { release = resolve; });
+        pi.state.messages.push({ role: 'assistant', content: 'ok', timestamp: 0 } as AgentMessage);
+        return {};
+      },
+      abort() {},
+      async waitForIdle() {},
+      reset() {},
+      steer,
+      ...(queueState !== 'unknown' ? { hasQueuedMessages: () => queueState === 'non-empty' } : {}),
+    };
+    loop = createLoop(pi as unknown as PiAgent);
+    const endTurn = (): void => emit({
+      type: 'turn_end',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'working' }],
+        stopReason: 'toolUse',
+        usage: { input: 10, output: 5, totalTokens: 15, cost: { total: 0 } },
+      },
+    });
+    return { loop, runs, steer, endTurn, release: () => release?.() };
+  }
+
+  it.each(['non-empty', 'unknown'] as const)(
+    'defers to the next run when pi queue state is %s',
+    async (queueState) => {
+      const t = boundarySetup(queueState);
+      const turn = t.loop.prompt('do the work');
+      await waitUntil(() => t.loop.isPrompting);
+      expect(t.loop.deliver('change course', { atTurnBoundary: true, causeTag: 'redirect' }).outcome)
+        .toBe('parked');
+
+      t.endTurn();
+      // Not handed to the live run: pi's queue was left alone and the
+      // content is still parked, and the live run did not take its tag.
+      expect(t.steer).not.toHaveBeenCalled();
+      expect(t.loop.pendingWakeDeliveryCount).toBe(1);
+      expect(t.loop.activeRunCauseTags).toEqual([]);
+
+      t.release();
+      await turn;
+      await waitUntil(() => t.runs.length === 2);
+      await t.loop.waitForLoopIdle();
+      // The next run opens with it, exactly once, carrying its causation.
+      expect(t.runs[1]!.input).toBe('change course');
+      expect(t.runs[1]!.tags).toEqual(['redirect']);
+      expect(t.loop.pendingWakeDeliveryCount).toBe(0);
+      expect(t.steer).not.toHaveBeenCalled();
+    },
+  );
+
+  it('hands it to the live run when pi reports empty queues (the precondition path)', async () => {
+    // Same harness, queues reported empty: the boundary hand-over happens.
+    const t = boundarySetup('empty');
+    const turn = t.loop.prompt('do the work');
+    await waitUntil(() => t.loop.isPrompting);
+    t.loop.deliver('change course', { atTurnBoundary: true, causeTag: 'redirect' });
+    t.endTurn();
+    expect(t.steer).toHaveBeenCalledTimes(1);
+    expect(t.loop.activeRunCauseTags).toEqual(['redirect']);
+    t.release();
+    await turn;
+  });
+});
