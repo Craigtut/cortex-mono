@@ -6064,6 +6064,14 @@ export class AgentLoop {
       return message['content'];
     }
 
+    // pi's own shape: content as typed parts.
+    if (message && Array.isArray(message['content'])) {
+      const textParts = (message['content'] as Array<{ type?: unknown; text?: unknown }>)
+        .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+        .map((part) => part.text as string);
+      if (textParts.length > 0) return textParts.join('');
+    }
+
     return null;
   }
 

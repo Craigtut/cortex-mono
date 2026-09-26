@@ -1094,6 +1094,31 @@ You have 12 emotions.`;
       expect(output.raw).toBe('Hello <working>internal</working> world');
     });
 
+    it('onTurnComplete fires for array-content turns with working tags disabled', () => {
+      const agent = createTestAgentLoop(piAgent, { ...config, workingTags: { enabled: false } });
+      const handler = vi.fn();
+      agent.onTurnComplete(handler);
+
+      // pi-agent-core's real turn_end shape: the assistant message with its
+      // content as typed parts, no top-level text.
+      piAgent.emitEvent({
+        type: 'turn_end',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'hmm' },
+            { type: 'text', text: 'Hello ' },
+            { type: 'text', text: 'world' },
+          ],
+          stopReason: 'stop',
+        },
+        toolResults: [],
+      });
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler.mock.calls[0][0].raw).toBe('Hello world');
+    });
+
     it('onError fires for classified errors', async () => {
       piAgent.promptError = new Error('Rate limit exceeded');
       // Retry disabled: the mock leaves a resumable transcript, so a
