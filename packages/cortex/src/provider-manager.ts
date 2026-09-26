@@ -26,37 +26,16 @@ import { wrapModel } from './model-wrapper.js';
 import { inferUtilityModelId } from './utility-model-inference.js';
 import type { CortexModel } from './model-wrapper.js';
 import type { OllamaModelConfig } from './providers/ollama/runtime.js';
-import {
-  loadOAuthCapableProviderIds,
-  loadPiAi,
-  loadPiOAuth,
-} from './provider-manager/pi-ai.js';
+import { loadPiAi } from './provider-manager/pi-ai.js';
+import type { PiAiModule } from './provider-manager/pi-ai.js';
 import type {
-  PiAiModule,
-  PiAuthEvent,
-  PiAuthInteraction,
-  PiAuthPrompt,
-  PiOAuthCredential,
-} from './provider-manager/pi-ai.js';
-import { OAuthError } from './provider-manager/oauth-types.js';
-import type {
-  OAuthFlowType,
-  OAuthAuthInfo,
-  OAuthPromptInfo,
   OAuthCallbacks,
-  OAuthCallbackPageStatus,
-  OAuthCallbackPageContext,
-  OAuthMeta,
   OAuthResult,
   OAuthRefreshResult,
 } from './provider-manager/oauth-types.js';
-import {
-  assertOAuthCallbackPortAvailable,
-  maybeInstallOAuthCallbackShim,
-  OAUTH_CALLBACK_ROUTES,
-  probeCallbackPortInUse,
-} from './provider-manager/oauth-callback-page.js';
+import { OAUTH_CALLBACK_ROUTES, probeCallbackPortInUse } from './provider-manager/oauth-callback-page.js';
 import type { OAuthCallbackRoute } from './provider-manager/oauth-callback-page.js';
+import { OAuthFlows } from './provider-manager/oauth-flows.js';
 
 export { OAuthError } from './provider-manager/oauth-types.js';
 export type {
@@ -135,149 +114,6 @@ export interface IProviderManager {
   resolveModel(provider: string, modelId: string): Promise<CortexModel>;
   createCustomModel(config: CustomModelConfig): Promise<CortexModel>;
   createOllamaModel(config: OllamaModelConfig): Promise<CortexModel>;
-}
-
-const DEVICE_CODE_INSTRUCTIONS_RE = /\benter\s+code:\s*([A-Z0-9-]+)/i;
-
-/** Default overall OAuth flow timeout (pi-ai hangs without this). */
-const DEFAULT_OAUTH_FLOW_TIMEOUT_MS = 5 * 60_000;
-
-/**
- * Refresh this far ahead of expiry. A token that expires while the request
- * it was fetched for is still in flight fails that request, so treat
- * nearly-expired as expired.
- */
-const OAUTH_REFRESH_SKEW_MS = 5 * 60_000;
-
-/** Cap a token refresh so a stalled provider cannot wedge a turn. */
-const OAUTH_REFRESH_TIMEOUT_MS = 15_000;
-
-function normalizeOAuthPromptInfo(prompt: unknown): OAuthPromptInfo {
-  if (typeof prompt === 'string') {
-    return { message: prompt };
-  }
-
-  const raw = prompt as Record<string, unknown> | null | undefined;
-  const message = typeof raw?.['message'] === 'string' ? raw['message'] : String(prompt ?? '');
-  const normalized: OAuthPromptInfo = { message };
-
-  if (typeof raw?.['placeholder'] === 'string') {
-    normalized.placeholder = raw['placeholder'];
-  }
-
-  if (typeof raw?.['allowEmpty'] === 'boolean') {
-    normalized.allowEmpty = raw['allowEmpty'];
-  }
-
-  return normalized;
-}
-
-function isOAuthFlowType(value: unknown): value is OAuthFlowType {
-  return value === 'browser' || value === 'localhost_callback' || value === 'device_code';
-}
-
-function normalizeOAuthAuthInfo(
-  provider: string,
-  info: unknown,
-  legacyInstructions: string | undefined,
-  routes: Record<string, OAuthCallbackRoute>,
-): OAuthAuthInfo {
-  const raw = typeof info === 'string'
-    ? { url: info, instructions: legacyInstructions }
-    : (info as Record<string, unknown> | null | undefined);
-
-  const url = typeof raw?.['url'] === 'string' ? raw['url'] : String(info ?? '');
-  const instructions = typeof raw?.['instructions'] === 'string'
-    ? raw['instructions']
-    : legacyInstructions;
-  const callbackRoute = routes[provider];
-  const deviceCode = typeof raw?.['deviceCode'] === 'string'
-    ? raw['deviceCode']
-    : instructions?.match(DEVICE_CODE_INSTRUCTIONS_RE)?.[1];
-  const isDeviceCodeFlow = Boolean(deviceCode) || provider === 'github-copilot';
-  const flowType = isOAuthFlowType(raw?.['flowType'])
-    ? raw['flowType']
-    : isDeviceCodeFlow ? 'device_code'
-      : callbackRoute ? 'localhost_callback'
-      : 'browser';
-  const manualCodeRecommended = typeof raw?.['manualCodeRecommended'] === 'boolean'
-    ? raw['manualCodeRecommended']
-    : flowType === 'localhost_callback' && callbackRoute ? true : undefined;
-  const callbackPort = typeof raw?.['callbackPort'] === 'number'
-    ? raw['callbackPort']
-    : flowType === 'localhost_callback' ? callbackRoute?.port : undefined;
-  const callbackPath = typeof raw?.['callbackPath'] === 'string'
-    ? raw['callbackPath']
-    : flowType === 'localhost_callback' ? callbackRoute?.path : undefined;
-
-  return {
-    url,
-    ...(instructions ? { instructions } : {}),
-    flowType,
-    ...(deviceCode ? { deviceCode } : {}),
-    ...(manualCodeRecommended !== undefined ? { manualCodeRecommended } : {}),
-    ...(callbackPort !== undefined ? { callbackPort } : {}),
-    ...(callbackPath !== undefined ? { callbackPath } : {}),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Display name extraction
-// ---------------------------------------------------------------------------
-
-/**
- * Extract the best available display name from OAuth credentials.
- * Different providers include different identity information.
- */
-function extractDisplayName(credentials: Record<string, unknown>): string | undefined {
-  // Try common fields across providers
-  const email = credentials['email'];
-  if (typeof email === 'string') return email;
-
-  const accountId = credentials['accountId'];
-  if (typeof accountId === 'string') return accountId;
-
-  const idToken = credentials['idToken'];
-  if (typeof idToken === 'string') {
-    // JWT id_token may contain email in payload
-    try {
-      const parts = idToken.split('.');
-      if (parts.length >= 2) {
-        const payload = JSON.parse(atob(parts[1]!)) as Record<string, unknown>;
-        const payloadEmail = payload['email'];
-        if (typeof payloadEmail === 'string') return payloadEmail;
-      }
-    } catch {
-      // Ignore malformed tokens
-    }
-  }
-  return undefined;
-}
-
-/**
- * Build OAuthMeta from raw credential data.
- */
-function buildOAuthMeta(
-  provider: string,
-  rawCredentials: Record<string, unknown>,
-): OAuthMeta {
-  const displayName = extractDisplayName(rawCredentials);
-  const expiresAtRaw = rawCredentials['expiresAt'] ?? rawCredentials['expires'];
-  const expiresAt = typeof expiresAtRaw === 'number' ? expiresAtRaw : undefined;
-
-  const meta: OAuthMeta = {
-    provider,
-    refreshable: !!(rawCredentials['refreshToken'] ?? rawCredentials['refresh']),
-  };
-
-  if (displayName !== undefined) {
-    meta.displayName = displayName;
-  }
-  if (expiresAt !== undefined) {
-    meta.expiresAt = expiresAt;
-  }
-
-  return meta;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,18 +259,13 @@ export interface ProviderManagerOptions {
 }
 
 export class ProviderManager implements IProviderManager {
-  /** Active OAuth AbortController, if any. */
-  private activeOAuthAbort: AbortController | null = null;
-
-  /** Fixed loopback callback routes used by OAuth flows (injectable for tests). */
-  private readonly oauthCallbackRoutes: Record<string, OAuthCallbackRoute>;
-
-  /** Loopback port-in-use probe used before opening a browser (injectable for tests). */
-  private readonly probeOAuthCallbackPort: (port: number, host: string) => Promise<boolean>;
+  private readonly oauth: OAuthFlows;
 
   constructor(options: ProviderManagerOptions = {}) {
-    this.oauthCallbackRoutes = options.oauthCallbackRoutes ?? OAUTH_CALLBACK_ROUTES;
-    this.probeOAuthCallbackPort = options.probeCallbackPortInUse ?? probeCallbackPortInUse;
+    this.oauth = new OAuthFlows({
+      routes: options.oauthCallbackRoutes ?? OAUTH_CALLBACK_ROUTES,
+      probe: options.probeCallbackPortInUse ?? probeCallbackPortInUse,
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -507,166 +338,14 @@ export class ProviderManager implements IProviderManager {
    *   network/token-exchange failures from pi-ai) propagate as-is.
    */
   async initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult> {
-    const oauthProvider = await loadPiOAuth(provider);
-    if (!oauthProvider) {
-      throw new OAuthError(
-        'unsupported_provider',
-        provider,
-        `Provider "${provider}" does not support OAuth`,
-      );
-    }
-
-    // (A) Fail fast — before opening a browser — if the provider's fixed
-    // callback port is already taken. Otherwise pi-ai binds the other
-    // stack, the browser hits the wrong listener, and pi-ai waits forever.
-    await assertOAuthCallbackPortAvailable(
-      provider,
-      this.oauthCallbackRoutes,
-      this.probeOAuthCallbackPort,
-    );
-
-    const abort = new AbortController();
-    this.activeOAuthAbort = abort;
-
-    // (C) pi-ai only settles its callback wait on success; on a failed
-    // callback (e.g. state mismatch) it hangs. The render shim already sees
-    // that response — use it to fail the flow immediately with the reason.
-    let failFromCallback!: (err: OAuthError) => void;
-    const callbackFailure = new Promise<never>((_, reject) => {
-      failFromCallback = reject;
-    });
-    const handleCallbackResult = (
-      status: OAuthCallbackPageStatus,
-      ctx: OAuthCallbackPageContext,
-    ): void => {
-      if (status !== 'error') return;
-      const detail = ctx.details ? ` (${ctx.details})` : '';
-      failFromCallback(new OAuthError(
-        'callback_failed',
-        provider,
-        `OAuth callback for "${provider}" reported a failure: ${ctx.message}${detail}`,
-      ));
-    };
-
-    const releaseShim = maybeInstallOAuthCallbackShim(
-      provider,
-      oauthProvider.name,
-      callbacks.renderCallbackPage,
-      handleCallbackResult,
-      this.oauthCallbackRoutes,
-    );
-
-    // (B) pi-ai callback servers ignore the abort signal, so cancellation
-    // and timeout are enforced here. Without this the flow hangs forever.
-    const timeoutMs = callbacks.timeoutMs ?? DEFAULT_OAUTH_FLOW_TIMEOUT_MS;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
-        timer = setTimeout(() => reject(new OAuthError(
-          'timed_out',
-          provider,
-          `OAuth flow for "${provider}" timed out after ${timeoutMs}ms.`,
-        )), timeoutMs);
-        timer.unref?.();
-      }
-    });
-    const cancelled = new Promise<never>((_, reject) => {
-      abort.signal.addEventListener('abort', () => reject(new OAuthError(
-        'cancelled',
-        provider,
-        `OAuth flow for "${provider}" was cancelled.`,
-      )), { once: true });
-    });
-
-    // pi replaced the callbacks bag with a single interaction object: every
-    // out-bound message is notify(AuthEvent) and every in-bound answer is
-    // prompt(AuthPrompt). Adapt here so Cortex's consumer-facing
-    // OAuthCallbacks contract is unchanged by the pi restructure.
-    const interaction: PiAuthInteraction = {
-      signal: abort.signal,
-      notify: (event: PiAuthEvent) => {
-        switch (event.type) {
-          case 'auth_url':
-            callbacks.onAuth(
-              normalizeOAuthAuthInfo(provider, event, event.instructions, this.oauthCallbackRoutes),
-            );
-            return;
-          case 'device_code':
-            // pi hands us the code as structured data, so pass it straight
-            // through rather than re-deriving it from a prose instruction
-            // (which is what the old string-parsing path had to do).
-            callbacks.onAuth({
-              url: event.verificationUri,
-              flowType: 'device_code',
-              deviceCode: event.userCode,
-              instructions: `Enter code ${event.userCode}`,
-            });
-            return;
-          case 'info':
-          case 'progress':
-            callbacks.onProgress?.(event.message);
-            return;
-        }
-      },
-      prompt: async (prompt: PiAuthPrompt): Promise<string> => {
-        if (prompt.type === 'manual_code' && callbacks.onManualCodeInput) {
-          return await callbacks.onManualCodeInput();
-        }
-        if (prompt.type === 'select' && callbacks.onSelect) {
-          const chosen = await callbacks.onSelect({
-            message: prompt.message,
-            options: prompt.options.map(o => ({ id: o.id, label: o.label })),
-          });
-          // pi's prompt() contract is "resolve with the answer, reject on
-          // cancel". Cortex signals cancel as undefined, so translate rather
-          // than handing pi the string "undefined".
-          if (chosen === undefined) {
-            throw new OAuthError('cancelled', provider, `OAuth flow for "${provider}" was cancelled.`);
-          }
-          return chosen;
-        }
-        return await callbacks.onPrompt(normalizeOAuthPromptInfo(prompt));
-      },
-    };
-
-    const login = oauthProvider.login(interaction) as Promise<Record<string, unknown>>;
-    // Whichever promise loses the race may still settle later (pi-ai's
-    // login can hang or settle late; the aux promises can reject after the
-    // race is decided). Attach inert handlers so a late rejection never
-    // surfaces as an unhandled rejection. Promise.race still observes the
-    // first settlement independently.
-    login.catch(() => {});
-    cancelled.catch(() => {});
-    timeout.catch(() => {});
-    callbackFailure.catch(() => {});
-
-    try {
-      const rawCredentials = await Promise.race([
-        login,
-        cancelled,
-        timeout,
-        callbackFailure,
-      ]);
-
-      const credentials = JSON.stringify(rawCredentials);
-      const meta = buildOAuthMeta(provider, rawCredentials);
-
-      return { credentials, meta };
-    } finally {
-      if (timer) clearTimeout(timer);
-      releaseShim();
-      if (this.activeOAuthAbort === abort) this.activeOAuthAbort = null;
-    }
+    return this.oauth.initiate(provider, callbacks);
   }
 
   /**
    * Cancel any in-progress OAuth flow.
    */
   cancelOAuth(): void {
-    if (this.activeOAuthAbort) {
-      this.activeOAuthAbort.abort();
-      this.activeOAuthAbort = null;
-    }
+    this.oauth.cancel();
   }
 
   /**
@@ -678,52 +357,7 @@ export class ProviderManager implements IProviderManager {
    * @throws Error if pi-ai is not installed or resolution fails
    */
   async resolveOAuthApiKey(provider: string, credentials: string): Promise<OAuthRefreshResult> {
-    const oauth = await loadPiOAuth(provider);
-    if (!oauth) {
-      throw new OAuthError(
-        'unsupported_provider',
-        provider,
-        `Provider "${provider}" does not support OAuth`,
-      );
-    }
-
-    const rawCredentials = JSON.parse(credentials) as Record<string, unknown>;
-    // Security: spread first so a stored blob cannot override Cortex's 'type'.
-    const current = { ...rawCredentials, type: 'oauth' as const } as PiOAuthCredential;
-
-    // pi removed getOAuthApiKey without a replacement, splitting it into
-    // refresh (network, may rotate the token) and toAuth (pure derivation).
-    // Refresh slightly early: a token that expires mid-flight fails the
-    // request it was fetched for.
-    let settled = current;
-    if (typeof current.expires === 'number'
-      && Date.now() >= current.expires - OAUTH_REFRESH_SKEW_MS) {
-      const abort = new AbortController();
-      const timer = setTimeout(() => abort.abort(), OAUTH_REFRESH_TIMEOUT_MS);
-      timer.unref?.();
-      try {
-        settled = await oauth.refresh(current, abort.signal);
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-
-    const auth = await oauth.toAuth(settled);
-    if (!auth.apiKey) {
-      throw new Error(
-        `OAuth resolution failed for provider "${provider}": pi returned no apiKey`,
-      );
-    }
-
-    const newSerialized = JSON.stringify(settled);
-    const changed = newSerialized !== credentials;
-
-    return {
-      apiKey: auth.apiKey,
-      credentials: changed ? newSerialized : credentials,
-      meta: buildOAuthMeta(provider, settled),
-      changed,
-    };
+    return this.oauth.resolveApiKey(provider, credentials);
   }
 
   /**
@@ -734,17 +368,7 @@ export class ProviderManager implements IProviderManager {
    * the static list if pi cannot be loaded.
    */
   async listOAuthCapableProviders(): Promise<string[]> {
-    let fromPi: string[];
-    try {
-      fromPi = await loadOAuthCapableProviderIds();
-    } catch {
-      return [...OAUTH_PROVIDER_IDS];
-    }
-    // Intersect with what Cortex models. pi ships OAuth for gateways Cortex
-    // has no PROVIDER_REGISTRY entry for (radius today); advertising those
-    // would offer a login the rest of the stack cannot follow through on.
-    const known = new Set(PROVIDER_REGISTRY.map(p => p.id));
-    return fromPi.filter(id => known.has(id));
+    return this.oauth.listCapableProviders();
   }
 
   // -----------------------------------------------------------------------
