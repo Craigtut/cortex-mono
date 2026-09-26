@@ -48,6 +48,15 @@ const NOT_VOICED_RECEIPT =
   'It will be read again.';
 const INVALID_DECISION_RECEIPT =
   'Could not read that decision. Ask the user to allow or deny, then call answer_ask again.';
+/**
+ * A refusal once the request has been re-read as often as it will be
+ * (AskVoicing's per-ask cap). Replaces the receipts above, which promise a
+ * re-read that is no longer coming.
+ */
+export const REVOICE_EXHAUSTED_RECEIPT =
+  'Not accepted, and the request will not be read out again. Approval needs the user\'s own ' +
+  'answer, given after hearing the request: wait for the user to say allow or deny, then ' +
+  'call answer_ask.';
 const UNBOUND_RECEIPT =
   'Could not tell which pending request that answers; it will be read to the user again.';
 

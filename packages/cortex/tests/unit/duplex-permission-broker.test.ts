@@ -520,6 +520,42 @@ describe('D16 consent binding', () => {
     expect(h.lastVoicedSeq()).toBeGreaterThan(firstVoicedSeq);
   });
 
+  it('bounds re-voicing per ask when the talker keeps answering allow from the voicing run', async () => {
+    // The loop: every talker run that reads the request out carries its
+    // voicing tag, so an allow from it is refused; the refusal re-reads the
+    // request, which opens the next run carrying the tag again, and a talker
+    // still holding the user's earlier "yes" answers allow again. Only the
+    // ask timeout would end it.
+    const h = createHarness();
+    const { decisions } = requestAsk(h);
+    const askTag: CauseTag = { kind: 'ask', seq: h.askEntrySeq('ask-1') };
+    const earlierYes: CauseTag = { kind: 'utterance', seq: h.lastVoicedSeq() + 1 };
+    h.setTalkerCauseTags([askTag, earlierYes]);
+
+    const receipts: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      h.advance(3_001);
+      receipts.push((await callAnswerAsk(h, { decision: 'allow' })).content[0]!.text);
+    }
+    // The first voicing plus a bounded number of re-reads, not one per refusal.
+    expect(h.askVoicings).toHaveLength(1 + 2);
+    // Every refusal was a consent refusal (the precondition for the loop).
+    expect(decisions).toHaveLength(0);
+    expect(h.broker.pendingAskCount).toBe(1);
+    // Past the cap the talker is told the request will not be read again
+    // and needs a fresh answer, and the log says so once.
+    expect(receipts[1]).toContain('read to the user again');
+    expect(receipts[2]).toContain('will not be read out again');
+    expect(receipts.at(-1)).toContain('will not be read out again');
+    expect(h.log.filter((entry) => entry.data?.['event'] === 'ask_revoice_exhausted')).toHaveLength(1);
+
+    // A fresh answer after the last read-out still binds.
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: h.lastVoicedSeq() + 100 }]);
+    const allowed = await callAnswerAsk(h, { decision: 'allow' });
+    expect(allowed.content[0]!.text).toBe('Approval passed along.');
+    await waitUntil(() => decisions.length === 1);
+  });
+
   it('a refusal re-read does not make consent the user already gave stale', async () => {
     // The anchor answers "could the user have heard this yet", and a
     // re-read does not un-hear it. Moving it on every refusal costs the

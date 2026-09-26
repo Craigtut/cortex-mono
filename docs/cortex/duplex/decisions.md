@@ -106,7 +106,7 @@ Validating that an askId exists and is pending establishes well-formedness, not 
 - exactly one ask is voiced at a time;
 - `allow` is accepted only for the most-recently-voiced ask, only once, and **only from a talker turn whose causation chain includes a user utterance that arrived after the ask was voiced**. A turn triggered purely by a delivery, a headline refresh, or a lookup wake cannot grant permission, which is precisely the shape an injected-content persuasion attempt takes;
 - `deny` is unrestricted;
-- anything else returns a voiceable refusal and re-voices the pending ask. (The refusal costs one recovery turn and leaves the anomaly in the log.)
+- anything else returns a voiceable refusal and re-voices the pending ask. (The refusal costs one recovery turn and leaves the anomaly in the log.) Re-voices are capped per ask; past the cap the refusal says a fresh answer is needed instead (communication.md, Permission Brokering).
 
 This makes the log's causation stamps load-bearing for security, not just for observability, so they are built in P2 with the log rather than added later.
 

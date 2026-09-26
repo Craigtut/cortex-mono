@@ -34,6 +34,17 @@ import type { BrokeredAskKind, BrokerLogInput } from './permission-broker.js';
 const REVOICE_MIN_INTERVAL_MS = 3_000;
 
 /**
+ * Re-reads per ask that a refused answer may trigger. Damping alone does not
+ * bound them: a talker still holding an earlier "yes" in its context answers
+ * allow from every run that reads the request out, each of those runs carries
+ * the voicing's own tag so the allow is refused, and each refusal re-reads
+ * the request into the next such run. That repeats until the ask times out
+ * (minutes for tool asks, far longer for escalations). Past the cap the
+ * request stays pending and answerable; only the re-reading stops.
+ */
+const MAX_REVOICES_PER_ASK = 2;
+
+/**
  * Cap on the voicing-text ledger. It exists only to recognize the session's
  * own voicings among the talker's PARKED deliveries, which a run drains at
  * the next turn, so the live window is a handful at most. An evicted text
@@ -70,7 +81,12 @@ interface VoicingRecord extends AskVoicingState {
   ask: VoiceableAsk;
   /** Clock stamp of the last voicing delivery, for revoice damping. */
   lastVoicedAtMs: number;
+  /** Refusal re-reads delivered since the user could last have heard it fresh. */
+  revoices: number;
 }
+
+/** What a refusal's re-read did (see {@link AskVoicing.revoiceCurrent}). */
+export type RevoiceOutcome = 'revoiced' | 'damped' | 'exhausted' | 'none';
 
 export interface AskVoicingPorts {
   appendLog(input: BrokerLogInput): number;
@@ -135,6 +151,7 @@ export class AskVoicing {
       voiced: false,
       voicedAtSeq: null,
       lastVoicedAtMs: 0,
+      revoices: 0,
     });
     this.queue.push(ask.askId);
     this.voiceNext();
@@ -173,16 +190,37 @@ export class AskVoicing {
    * consent anchor does NOT move: the user already heard this request, and
    * a re-read must not invalidate an answer they have already given. Damped
    * to one re-delivery per interval, so a turn spraying refused answers
-   * cannot flood the voice channel. Use {@link noteLost} instead when the
-   * previous voicing never reached the user: that case is not damped and
-   * does take a fresh anchor.
+   * cannot flood the voice channel, and capped per ask
+   * (MAX_REVOICES_PER_ASK), so a talker that keeps answering from the run
+   * reading the request out cannot keep it talking until the timeout. At
+   * the cap nothing is re-read, the log records it once, and the caller
+   * tells the talker the request needs the user's fresh answer. Use
+   * {@link noteLost} instead when the previous voicing never reached the
+   * user: that case is neither damped nor capped, takes a fresh anchor, and
+   * restarts the count.
    */
-  revoiceCurrent(): void {
-    if (this.destroyed || this.voicedAskId === null) return;
+  revoiceCurrent(): RevoiceOutcome {
+    if (this.destroyed || this.voicedAskId === null) return 'none';
     const record = this.records.get(this.voicedAskId);
-    if (!record) return;
-    if (this.options.now() - record.lastVoicedAtMs < REVOICE_MIN_INTERVAL_MS) return;
-    this.voice(record);
+    if (!record) return 'none';
+    if (record.revoices >= MAX_REVOICES_PER_ASK) {
+      if (record.revoices === MAX_REVOICES_PER_ASK) {
+        // Counted past the cap so the entry is written once per ask.
+        record.revoices += 1;
+        this.ports.appendLog({
+          type: 'lifecycle',
+          loopPath: this.ports.talkerLoopPath,
+          content: 'Permission request not re-read again: it needs a fresh answer from the user',
+          causedBy: record.ask.entrySeq,
+          data: { event: 'ask_revoice_exhausted', askId: record.ask.askId, revoices: MAX_REVOICES_PER_ASK },
+        });
+      }
+      return 'exhausted';
+    }
+    if (this.options.now() - record.lastVoicedAtMs < REVOICE_MIN_INTERVAL_MS) return 'damped';
+    if (!this.voice(record)) return 'none';
+    record.revoices += 1;
+    return 'revoiced';
   }
 
   /**
@@ -198,6 +236,7 @@ export class AskVoicing {
     const record = this.records.get(this.voicedAskId);
     if (!record) return false;
     record.voicedAtSeq = null;
+    record.revoices = 0;
     // Re-entrancy guard: the re-delivery below can itself be destroyed
     // synchronously (a re-voice landing inside an abort that is still
     // draining), and an un-anchored ask is already safe, so the recovery

@@ -31,7 +31,7 @@ import type {
 import type { WakeClass } from '../session-log.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
 import type { CauseTag } from './cause-tags.js';
-import { ALLOW_RECEIPT, DENY_RECEIPT, judgeAnswer } from './ask-consent.js';
+import { ALLOW_RECEIPT, DENY_RECEIPT, judgeAnswer, REVOICE_EXHAUSTED_RECEIPT } from './ask-consent.js';
 import { AskVoicing } from './ask-voicing.js';
 
 // ---------------------------------------------------------------------------
@@ -366,7 +366,8 @@ export class PermissionBroker {
   /**
    * Settle an ask from the talker's answer_ask dispatch, as the D16 consent
    * rules allow (ask-consent.ts). A refused answer re-reads the pending ask
-   * (damped, so a spraying turn cannot flood the voice channel).
+   * (damped, so a spraying turn cannot flood the voice channel, and capped
+   * per ask, after which the talker is told a fresh answer is needed).
    */
   answer(askIdRaw: unknown, decisionRaw: unknown, reasonRaw: unknown): AskAnswerOutcome {
     const verdict = judgeAnswer(
@@ -384,8 +385,10 @@ export class PermissionBroker {
     );
     if (verdict.kind === 'receipt') return { receipt: verdict.receipt };
     if (verdict.kind === 'refused') {
-      this.voicing.revoiceCurrent();
-      return { receipt: verdict.receipt, refusal: verdict.refusal };
+      const receipt = this.voicing.revoiceCurrent() === 'exhausted'
+        ? REVOICE_EXHAUSTED_RECEIPT
+        : verdict.receipt;
+      return { receipt, refusal: verdict.refusal };
     }
     const ask = this.asks.get(verdict.askId)!;
     const { reason } = verdict;
