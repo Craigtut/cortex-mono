@@ -18,11 +18,9 @@ import type {
   ToolPermissionRequestContext,
 } from '../types.js';
 import { DEFAULT_LOOP_PATH } from '../types.js';
+import { ABORTED, raceAbort } from './run-control.js';
 
 type PermissionResolver = NonNullable<AgentLoopConfig['resolvePermission']>;
-
-/** Returned by the permission race when the run aborted before the consumer answered. */
-const PERMISSION_RACE_ABORTED = Symbol('permission-race-aborted');
 
 /** Block reason for a tool call whose permission ask was cut short by abort. */
 export const ABORTED_PERMISSION_REASON =
@@ -167,16 +165,16 @@ export function createBeforeToolCall(
     // pending human approval would hang abort/destroy into the force-kill
     // path. The signal is also passed to the resolver so the consumer UI
     // can dismiss the moot prompt.
-    let resolution: boolean | CortexToolPermissionResult | typeof PERMISSION_RACE_ABORTED;
+    let resolution: boolean | CortexToolPermissionResult | typeof ABORTED;
     try {
-      resolution = await raceResolutionAgainstAbort(
+      resolution = await raceAbort(
         resolver(permissionName, args, askContext),
         signal,
       );
     } finally {
       asks?.settle(askId);
     }
-    if (resolution === PERMISSION_RACE_ABORTED) {
+    if (resolution === ABORTED) {
       return { block: true, reason: ABORTED_PERMISSION_REASON };
     }
     const decision = normalizePermissionDecision(resolution);
@@ -263,38 +261,6 @@ export function normalizePermissionDecision(
     return { decision: resolution ? 'allow' : 'block' };
   }
   return resolution;
-}
-
-/**
- * Race a permission resolution against the run's abort signal. Resolves
- * with PERMISSION_RACE_ABORTED when the signal fires first, so a pending
- * consumer ask can never keep the loop from observing an abort. A late
- * settlement of the resolver promise is ignored (its rejection handled).
- */
-export function raceResolutionAgainstAbort<T>(
-  resolution: Promise<T>,
-  signal: AbortSignal | undefined,
-): Promise<T | typeof PERMISSION_RACE_ABORTED> {
-  if (!signal) return resolution;
-  if (signal.aborted) {
-    // Consume a possible late rejection so it never surfaces as unhandled.
-    resolution.catch(() => {});
-    return Promise.resolve(PERMISSION_RACE_ABORTED);
-  }
-  return new Promise<T | typeof PERMISSION_RACE_ABORTED>((resolve, reject) => {
-    const onAbort = (): void => resolve(PERMISSION_RACE_ABORTED);
-    signal.addEventListener('abort', onAbort, { once: true });
-    resolution.then(
-      (value) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(value);
-      },
-      (err) => {
-        signal.removeEventListener('abort', onAbort);
-        reject(err);
-      },
-    );
-  });
 }
 
 export function buildPermissionReason(

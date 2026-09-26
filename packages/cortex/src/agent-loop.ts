@@ -54,6 +54,15 @@ import { SkillBinding } from './agent-loop/skills.js';
 import { createBuiltinTools } from './agent-loop/builtin-tools.js';
 import { ToolRegistry } from './agent-loop/tool-registry.js';
 import { McpAttachment } from './agent-loop/mcp-attachment.js';
+import {
+  ABORTED,
+  AbortState,
+  isAbortShapedError,
+  LoopGate,
+  raceAbort,
+  raceTimeout,
+  sleepUnlessAborted,
+} from './agent-loop/run-control.js';
 import { CHILD_SEED_CONTEXT_SLOT, prepareChildLoop } from './agent-loop/child-loop-config.js';
 import type { ChildLoopParams } from './agent-loop/child-loop-config.js';
 import { SubAgentSpawner } from './agent-loop/sub-agent-spawner.js';
@@ -460,19 +469,8 @@ export class AgentLoop {
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
 
-  // AbortController for the current agentic loop
-  private abortController = new AbortController();
-
-  // Abort epoch for wake parking. abort() cancels parked wake deliveries,
-  // including ones that park during its own await windows; the live
-  // controller cannot express that (a drain that starts mid-abort replaces
-  // it, and abort() skips the gate wait when background deliveries are
-  // pending), so parked items are stamped with the epoch at park time and
-  // every take of the parked queue drops items stamped before the most
-  // recent abort completed. The in-progress counter covers the window
-  // before the epoch advances at abort()'s end.
-  private _abortEpoch = 0;
-  private _abortsInProgress = 0;
+  // The current run's abort controller and the abort epoch (run-control.ts)
+  private readonly abortState = new AbortState();
 
   // Whether a prompt() call is currently in progress
   private _isPrompting = false;
@@ -489,12 +487,8 @@ export class AgentLoop {
   // next run task (that prompt's own) is the one that consumes it.
   private pendingPromptCauseTag: unknown = undefined;
 
-  // Loop gate: every agentic loop start (consumer prompt() calls and
-  // background-completion deliveries) is serialized through this promise
-  // chain. Depth counts the running cycle plus any queued ones, so callers
-  // can fail fast before mutating shared loop state. The tail never rejects.
-  private loopGateTail: Promise<void> = Promise.resolve();
-  private loopGateDepth = 0;
+  // Serializes every loop-owning task (run-control.ts)
+  private readonly gate = new LoopGate();
 
   // Resolves when the current turn's unwind (catch/finally of runPromptOnce)
   // has completed. abort() awaits this so its controller reset can never land
@@ -886,7 +880,7 @@ export class AgentLoop {
         'or provide initialBasePrompt during creation.',
       );
     }
-    if (this.loopGateDepth > 0) {
+    if (this.gate.isActive) {
       // Spurious-fail-fast note: re-prompting synchronously inside the .then
       // of a just-resolved prompt() can land here while a no-op
       // background-drain task is still queued (depth briefly > 0). It clears
@@ -900,15 +894,13 @@ export class AgentLoop {
     }
 
     // Install a fresh controller SYNCHRONOUSLY when the current one is
-    // already aborted. The loopGateDepth === 0 guard above guarantees no
+    // already aborted. The empty-gate guard above guarantees no
     // loop currently owns it, so this is safe. It makes a same-frame abort()
     // (called after this prompt() but before the queued cycle dequeues) land
     // on THIS turn's controller, so the cycle sees the abort at dequeue and
     // cancels promptly instead of replacing a stale-aborted controller and
     // running to completion un-aborted.
-    if (this.abortController.signal.aborted) {
-      this.abortController = new AbortController();
-    }
+    this.abortState.renewIfAborted();
 
     return this.enqueueLoopTask(() => this.runPromptCycle(input, options));
   }
@@ -938,13 +930,7 @@ export class AgentLoop {
    * counter covers running plus queued tasks.
    */
   private enqueueLoopTask<T>(task: () => Promise<T>): Promise<T> {
-    this.loopGateDepth += 1;
-    const run = this.loopGateTail.then(task);
-    const release = (): void => {
-      this.loopGateDepth -= 1;
-    };
-    this.loopGateTail = run.then(release, release);
-    return run;
+    return this.gate.enqueue(task);
   }
 
   /**
@@ -954,7 +940,7 @@ export class AgentLoop {
    * instead of starting a turn.
    */
   get isLoopActive(): boolean {
-    return this.loopGateDepth > 0;
+    return this.gate.isActive;
   }
 
   /**
@@ -1003,9 +989,7 @@ export class AgentLoop {
    * again if the gate refilled.
    */
   async waitForLoopIdle(): Promise<void> {
-    while (this.loopGateDepth > 0) {
-      await this.loopGateTail;
-    }
+    return this.gate.waitForIdle();
   }
 
   /**
@@ -1074,12 +1058,12 @@ export class AgentLoop {
     // Abort visibility at dequeue. prompt() installs a fresh (non-aborted)
     // controller synchronously, so if THIS controller is aborted here an
     // abort() must have landed between enqueue and dequeue.
-    if (this.abortController.signal.aborted) {
+    if (this.abortState.signal.aborted) {
       if (fromDrain) {
         // A scheduled drain delivers background results by starting a fresh
-        // loop even after an abort (matching the pre-gate "deliver when
-        // idle" behavior), so replace the aborted controller and proceed.
-        this.abortController = new AbortController();
+        // loop even after an abort, so replace the aborted controller and
+        // proceed.
+        this.abortState.renewIfAborted();
       } else {
         // A consumer turn cancelled before it ever reached pi. Surface it
         // like any other cancellation and never start the run.
@@ -1381,7 +1365,7 @@ export class AgentLoop {
           delayMs,
         });
 
-        const completed = await this.abortableDelay(delayMs);
+        const completed = await sleepUnlessAborted(delayMs, this.abortState.signal);
         if (!completed) {
           // Aborted during the wait: surface as cancelled, do not retry. Throw a
           // fresh AbortError rather than the original transient failure so the
@@ -1434,27 +1418,7 @@ export class AgentLoop {
     this.compactionManager.onSourceHistoryTailTrimmed(postSlotLength);
   }
 
-  /**
-   * Sleep for `ms`, resolving early if the agent is aborted. Resolves true when
-   * the full delay elapsed, false when aborted. Used for abortable backoff so a
-   * user cancel during a multi-minute wait takes effect immediately.
-   */
-  private abortableDelay(ms: number): Promise<boolean> {
-    const signal = this.abortController.signal;
-    if (signal.aborted) return Promise.resolve(false);
-    return new Promise<boolean>((resolve) => {
-      let timer: ReturnType<typeof setTimeout>;
-      const onAbort = (): void => {
-        clearTimeout(timer);
-        resolve(false);
-      };
-      timer = setTimeout(() => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(true);
-      }, ms);
-      signal.addEventListener('abort', onAbort, { once: true });
-    });
-  }
+
 
   private fireRetryScheduled(info: RetryScheduledInfo): void {
     this.retryScheduledHandlers.emit(info, this.originContext);
@@ -1485,10 +1449,10 @@ export class AgentLoop {
   steer(message: string): void {
     // A turn started via prompt() is deferred one microtask (it dequeues
     // from the loop gate), so _isPrompting is still false in the same frame.
-    // Treat a non-empty gate (loopGateDepth > 0) as prompting too, so a
+    // Treat a non-empty gate as prompting too, so a
     // same-frame prompt()+steer() reaches pi's steering queue (drained at
     // loop start) instead of being silently dropped.
-    if (!this._isPrompting && this.loopGateDepth === 0) return;
+    if (!this._isPrompting && !this.gate.isActive) return;
     this.agent.steer({ role: 'user', content: message });
   }
 
@@ -1572,7 +1536,7 @@ export class AgentLoop {
       return { outcome: 'queued' };
     }
 
-    if (this.loopGateDepth > 0) {
+    if (this.gate.isActive) {
       // Covers both "pi running" and "gate held but pi idle" (retry backoff,
       // drain window, idle digestion, a cycle cancelled at dequeue). The
       // content is parked for the next run; the sweep task guarantees that
@@ -1580,7 +1544,7 @@ export class AgentLoop {
       this.pendingWakeDeliveries.push({
         content,
         timestamp: Date.now(),
-        abortEpoch: this._abortEpoch,
+        abortEpoch: this.abortState.epoch,
         ...(options?.causeTag !== undefined ? { causeTag: options.causeTag } : {}),
         ...(options?.atTurnBoundary ? { atTurnBoundary: true } : {}),
       });
@@ -1623,11 +1587,10 @@ export class AgentLoop {
   private takeDeliverableWakeDeliveries(): QueuedDelivery[] {
     const taken = this.pendingWakeDeliveries.splice(0);
     if (taken.length === 0) return taken;
-    const abortInFlight =
-      this._abortsInProgress > 0 || this.abortController.signal.aborted;
-    const deliverable = abortInFlight
+    const epoch = this.abortState.epoch;
+    const deliverable = this.abortState.inFlight
       ? []
-      : taken.filter((item) => (item.abortEpoch ?? this._abortEpoch) === this._abortEpoch);
+      : taken.filter((item) => (item.abortEpoch ?? epoch) === epoch);
     const dropped = taken.filter((item) => !deliverable.includes(item));
     if (dropped.length > 0) {
       this.logger.info('dropped wake deliveries parked during abort', {
@@ -1662,7 +1625,7 @@ export class AgentLoop {
     if (this.pendingWakeDeliveries.length === 0) return;
     if (!this.pendingWakeDeliveries[0]!.atTurnBoundary) return;
     if (!this._isPrompting || this.isShuttingDown()) return;
-    if (this._abortsInProgress > 0 || this.abortController.signal.aborted) return;
+    if (this.abortState.inFlight) return;
     if (this.budgetGuard.isBreached()) return;
     const message = (event.data as { message?: { stopReason?: unknown; errorMessage?: unknown } } | undefined)
       ?.message;
@@ -1678,7 +1641,7 @@ export class AgentLoop {
     while (
       count < this.pendingWakeDeliveries.length &&
       this.pendingWakeDeliveries[count]!.atTurnBoundary &&
-      (this.pendingWakeDeliveries[count]!.abortEpoch ?? this._abortEpoch) === this._abortEpoch
+      (this.pendingWakeDeliveries[count]!.abortEpoch ?? this.abortState.epoch) === this.abortState.epoch
     ) {
       count += 1;
     }
@@ -1748,7 +1711,7 @@ export class AgentLoop {
     // The abort epoch is captured beside it so unwind recovery stamps
     // re-parked content deterministically with the run's own epoch.
     const preDeliveryCount = this.agent.state.messages.length;
-    const runAbortEpoch = this._abortEpoch;
+    const runAbortEpoch = this.abortState.epoch;
     try {
       // Drain semantics: replace an aborted controller (parked deliveries
       // survive a prior abort, like background completions) and never flush
@@ -2654,10 +2617,9 @@ export class AgentLoop {
    * The agent remains usable for subsequent prompts.
    */
   async abort(): Promise<void> {
-    // Capture the controller and the current turn's unwind promise BEFORE
-    // aborting, so the wait below is scoped to the turn being cancelled and
-    // never to a later turn started by a background delivery.
-    const controller = this.abortController;
+    // Capture the current turn's unwind promise BEFORE aborting, so the
+    // wait below is scoped to the turn being cancelled and never to a later
+    // turn started by a background delivery.
     const unwound = this.turnUnwound;
 
     this.promptDiagnostics.recordAbortRequested();
@@ -2682,9 +2644,8 @@ export class AgentLoop {
     // parked queue is epoch-gated instead: while this abort is in flight
     // every take of the queue drops its items, and the epoch advance in
     // the finally below marks anything stamped earlier as cancelled.
-    this._abortsInProgress += 1;
+    const abort = this.abortState.begin();
     try {
-      controller.abort();
       this.agent.abort();
       this.promptDiagnostics.startAbortWait();
       try {
@@ -2712,18 +2673,15 @@ export class AgentLoop {
       // deliveries ARE pending they start a fresh (non-aborted) loop, so
       // return immediately rather than blocking on it.
       if (this.pendingBackgroundResults.length === 0) {
-        await this.loopGateTail;
+        await this.gate.settled;
       }
 
       // Reset so the agent is reusable, unless teardown owns the controller
       // now or a newer turn (e.g. a background delivery that started during
       // the wait) already installed its own controller.
-      if (!this.isShuttingDown() && this.abortController === controller) {
-        this.abortController = new AbortController();
-      }
+      if (!this.isShuttingDown()) abort.renew();
     } finally {
-      this._abortsInProgress -= 1;
-      this._abortEpoch += 1;
+      abort.end();
     }
     this.logger.info('abort complete');
   }
@@ -2765,28 +2723,15 @@ export class AgentLoop {
     // Cancel Cortex-side waits immediately: a pending retry-backoff timer is
     // cleared by its abort listener, and the current turn's unwind is
     // classified as cancelled instead of scheduling further retries.
-    this.abortController.abort();
+    this.abortState.abortCurrent();
 
     this.destroyPromise = (async () => {
-      // Set up a force-kill deadline
-      let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
-      const forceKillPromise = new Promise<void>((resolve) => {
-        forceKillTimer = setTimeout(() => {
-          this.processes.killAll();
-          resolve();
-        }, timeoutMs);
-      });
-
       try {
-        // Race the cleanup against the deadline
-        await Promise.race([
-          this.orderedCleanup(),
-          forceKillPromise,
-        ]);
-      } finally {
-        if (forceKillTimer) {
-          clearTimeout(forceKillTimer);
+        // Race the cleanup against a force-kill deadline.
+        if (await raceTimeout(this.orderedCleanup(), timeoutMs) === 'timeout') {
+          this.processes.killAll();
         }
+      } finally {
         this.promptDiagnostics.stop();
         this.lifecycleState = 'destroyed';
         this.logger.info('destroy complete');
@@ -3256,47 +3201,37 @@ export class AgentLoop {
       if (this.isShuttingDown()) {
         return { observerRan: false, historyCompacted: false };
       }
+      // Every wait below races the owner's preemption signal.
       const signal = options?.signal;
       if (signal?.aborted) {
         return { observerRan: false, historyCompacted: false, preempted: true };
       }
-      // Resolves when the owner preempts; every wait below races it.
-      let removePreemptListener = (): void => {};
-      const preempted = new Promise<'preempted'>((resolve) => {
-        if (!signal) return;
-        const onAbort = (): void => resolve('preempted');
-        signal.addEventListener('abort', onAbort, { once: true });
-        removePreemptListener = () => signal.removeEventListener('abort', onAbort);
-      });
 
-      try {
-        // 1. Buffer catch-up (observational only): make sure the expensive
-        // observer work over the unobserved tail is done and chunked, so the
-        // next activation is a cheap merge. Preempting abandons only the
-        // wait, like the timeout: the observer lands its chunk when it
-        // settles.
-        let observerRan = false;
-        if (this.compactionManager.strategy === 'observational') {
-          const catchUp = this.compactionManager.digestPendingObservationBuffers(
+      // 1. Buffer catch-up (observational only): make sure the expensive
+      // observer work over the unobserved tail is done and chunked, so the
+      // next activation is a cheap merge. Preempting abandons only the
+      // wait, like the timeout: the observer lands its chunk when it
+      // settles.
+      let observerRan = false;
+      if (this.compactionManager.strategy === 'observational') {
+        const outcome = await raceAbort(
+          this.compactionManager.digestPendingObservationBuffers(
             this.agent.state.messages,
             this.contextManager.slotCount,
             options?.observerTimeoutMs,
-          );
-          const outcome = await Promise.race([catchUp, preempted]);
-          if (outcome === 'preempted') {
-            catchUp.catch(() => {});
-            this.logger.debug('idle digestion preempted during observer catch-up');
-            return { observerRan: false, historyCompacted: false, preempted: true };
-          }
-          observerRan = outcome;
+          ),
+          signal,
+        );
+        if (outcome === ABORTED) {
+          this.logger.debug('idle digestion preempted during observer catch-up');
+          return { observerRan: false, historyCompacted: false, preempted: true };
         }
-        if (signal?.aborted) {
-          return { observerRan, historyCompacted: false, preempted: true };
-        }
-        return await this.runDigestionThresholdPass(observerRan, preempted, options);
-      } finally {
-        removePreemptListener();
+        observerRan = outcome;
       }
+      if (signal?.aborted) {
+        return { observerRan, historyCompacted: false, preempted: true };
+      }
+      return this.runDigestionThresholdPass(observerRan, options);
     });
   }
 
@@ -3307,7 +3242,6 @@ export class AgentLoop {
    */
   private async runDigestionThresholdPass(
     observerRan: boolean,
-    preempted: Promise<'preempted'>,
     options?: IdleDigestionOptions,
   ): Promise<IdleDigestionResult> {
     // 2. Threshold pass: run the same pipeline transformContext runs
@@ -3336,38 +3270,23 @@ export class AgentLoop {
       }
     })();
     const timeoutMs = options?.observerTimeoutMs ?? DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let wasPreempted = false;
-    try {
-      const abandoned = await Promise.race([
-        thresholdPass.then(() => false),
-        new Promise<boolean>((resolve) => {
-          timer = setTimeout(() => resolve(true), timeoutMs);
-        }),
-        preempted.then(() => {
-          wasPreempted = true;
-          return true;
-        }),
-      ]);
-      if (abandoned) {
-        // Abandoned (timed out or preempted), not cancelled: nothing can
-        // cancel the utility call, so it can still settle minutes from
-        // now, after the gate released and a real prompt appended live
-        // messages. Advance the generation so that late continuation
-        // discards itself instead of replacing live history from its stale
-        // snapshot, lower the flag for the pass (its own finally is now
-        // stale), and swallow the eventual settlement.
-        this._digestionGeneration += 1;
-        this._forceBlockingCompaction = false;
-        thresholdPass.catch(() => {});
-        if (wasPreempted) {
-          this.logger.debug('idle digestion threshold pass preempted');
-        } else {
-          this.logger.warn('idle digestion threshold pass timed out', { timeoutMs });
-        }
+    const outcome = await raceTimeout(thresholdPass, timeoutMs, options?.signal);
+    const wasPreempted = outcome === 'aborted';
+    if (outcome !== 'settled') {
+      // Abandoned (timed out or preempted), not cancelled: nothing can
+      // cancel the utility call, so it can still settle minutes from
+      // now, after the gate released and a real prompt appended live
+      // messages. Advance the generation so that late continuation
+      // discards itself instead of replacing live history from its stale
+      // snapshot, and lower the flag for the pass (its own finally is now
+      // stale). The race already swallows the eventual settlement.
+      this._digestionGeneration += 1;
+      this._forceBlockingCompaction = false;
+      if (wasPreempted) {
+        this.logger.debug('idle digestion threshold pass preempted');
+      } else {
+        this.logger.warn('idle digestion threshold pass timed out', { timeoutMs });
       }
-    } finally {
-      clearTimeout(timer);
     }
     const historyCompacted = this.agent.state.messages.length !== lengthBefore;
 
@@ -3727,30 +3646,8 @@ export class AgentLoop {
    * Only returns true for actual abort/cancel signals, not arbitrary errors.
    */
   private isAborted(): boolean {
-    // Check if the internal abort controller's signal has been triggered
-    if (this.abortController.signal.aborted) {
-      return true;
-    }
-
-    // Check if the agent's error looks like an abort/cancel
-    const state = this.agent.state as Record<string, unknown>;
-    const rawError = state['errorMessage'] ?? state['error'];
-    if (rawError) {
-      const errorMsg = typeof rawError === 'string'
-        ? rawError
-        : rawError instanceof Error
-          ? rawError.message
-          : typeof (rawError as Record<string, unknown>)['message'] === 'string'
-            ? (rawError as Record<string, unknown>)['message'] as string
-            : '';
-      // Match "abort"/"cancelled" only as its own word start, not inside a
-      // larger identifier: a provider error like ECONNABORTED is a network
-      // failure, and misreading it as an abort would trim its failure stub
-      // and mislabel the error as a cancellation.
-      return /(?<![a-z])abort/i.test(errorMsg) || /(?<![a-z])cancell?ed/i.test(errorMsg);
-    }
-
-    return false;
+    return this.abortState.signal.aborted ||
+      isAbortShapedError(this.agent.state as Record<string, unknown>);
   }
 
   /**
@@ -3777,7 +3674,7 @@ export class AgentLoop {
     // 1b. Wait for the loop gate to drain: the aborted cycle's Cortex-side
     // unwind plus any queued delivery tasks (which no-op now that the
     // lifecycle is 'destroying'). Bounded by destroy()'s force-kill race.
-    await this.loopGateTail;
+    await this.gate.settled;
 
     // 1c. Dead-letter completions still awaiting delivery. The queued drain
     // tasks above no-oped once teardown began, so anything still pending
@@ -4087,7 +3984,7 @@ export class AgentLoop {
     // here so the catch can unwind exactly what this attempt appended. The
     // abort epoch rides along for deterministic re-park stamping.
     const preDeliveryCount = this.agent.state.messages.length;
-    const runAbortEpoch = this._abortEpoch;
+    const runAbortEpoch = this.abortState.epoch;
     let attemptError: Error | null = null;
     let requeuedForRetry = false;
     try {
@@ -4328,6 +4225,14 @@ export class AgentLoop {
 
   private settlePendingAsk(askId: string): void {
     this.asks.settle(askId);
+  }
+
+  private get _abortEpoch(): number {
+    return this.abortState.epoch;
+  }
+
+  private set _abortEpoch(value: number) {
+    this.abortState.epoch = value;
   }
 
   private get trackedPids(): ReadonlySet<number> {

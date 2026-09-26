@@ -47,6 +47,7 @@ type Kind = 'getter' | 'accessor' | 'method';
 
 const COMPAT: Record<string, Kind> = {
   trackedPids: 'getter',
+  _abortEpoch: 'accessor',
   registeredTools: 'getter',
   toolRuntime: 'getter',
   buildChildToolSet: 'method',
@@ -92,6 +93,25 @@ describe('AgentLoop test-compat contract', () => {
     } as never);
     expect(internals.registeredTools).toBe(before);
     expect(before.some((tool) => tool.name === 'contract_probe')).toBe(true);
+  });
+
+  it('_abortEpoch writes through to the epoch parked deliveries are stamped with', async () => {
+    const loop = createLoop();
+    const internals = loop as unknown as {
+      _abortEpoch: number;
+      pendingWakeDeliveries: Array<{ abortEpoch?: number }>;
+    };
+    internals._abortEpoch = 7;
+    expect(internals._abortEpoch).toBe(7);
+    // Hold the gate so the delivery parks rather than prompting.
+    let release!: () => void;
+    void (loop as unknown as { enqueueLoopTask(task: () => Promise<void>): Promise<void> })
+      .enqueueLoopTask(() => new Promise<void>((resolve) => { release = resolve; }));
+    loop.deliver('parked');
+    expect(internals.pendingWakeDeliveries[0]!.abortEpoch).toBe(7);
+    internals.pendingWakeDeliveries.splice(0);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    release();
   });
 
   it('trackedPids reads the process tracker', () => {
