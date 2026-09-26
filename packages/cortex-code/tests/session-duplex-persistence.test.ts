@@ -63,10 +63,10 @@ function historyText(history: unknown[]): string {
  * describes the symptom.
  */
 async function persistOneExchange(ctx: DuplexSession, text: string): Promise<void> {
-  const save = vi.spyOn(ctx.internals.saver, 'save');
+  const save = vi.spyOn(ctx.internals.checkpoints.saver, 'save');
   await ctx.internals.handleInput(text);
   await waitUntil(() => save.mock.calls.length > 0, 3000, 'the session persisted');
-  await ctx.internals.saver.flush();
+  await ctx.internals.checkpoints.saver.flush();
 }
 
 describe('duplex: the saved artifact carries the conversation', () => {
@@ -103,7 +103,7 @@ describe('duplex: the saved artifact carries the conversation', () => {
 
   it('saves once per settled exchange, not once per loop and once per turn', async () => {
     const ctx = await createDuplexSession(cwd);
-    const save = vi.spyOn(ctx.internals.saver, 'save');
+    const save = vi.spyOn(ctx.internals.checkpoints.saver, 'save');
 
     ctx.harness.reasonerPi.hold = true;
     ctx.harness.agent.deliver('Refactor the payments module', { target: 'work' });
@@ -112,7 +112,7 @@ describe('duplex: the saved artifact carries the conversation', () => {
     ctx.harness.reasonerPi.releaseRun();
     await waitUntil(() => !ctx.internals.work.isRunning, 2000, 'session settles');
     await waitUntil(() => save.mock.calls.length > 0, 3000, 'a save landed');
-    await ctx.internals.saver.flush();
+    await ctx.internals.checkpoints.saver.flush();
 
     // The old wiring drove autosave from onLoopComplete (once per resident
     // loop) and from turn_end (once per LLM turn), so a single exchange wrote

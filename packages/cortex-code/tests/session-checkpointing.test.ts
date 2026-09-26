@@ -80,7 +80,7 @@ describe('checkpointing during a long task', () => {
   it('reaches disk at a turn boundary, before the task settles', async () => {
     const { internals, reasonerPi } = await createPassthroughSession(cwd);
     const sessionId = internals.sessionId;
-    const save = vi.spyOn(internals.saver, 'save');
+    const save = vi.spyOn(internals.checkpoints.saver, 'save');
 
     // A task that keeps going: it pauses after its first turn boundary and
     // stays there, which is where a ten-minute run spends its time.
@@ -91,7 +91,7 @@ describe('checkpointing during a long task', () => {
     ];
     const turn = internals.handleInput('rename the payments module');
     await waitUntil(() => save.mock.calls.length > 0, 3000, 'a checkpoint was taken mid-run');
-    await internals.saver.flush();
+    await internals.checkpoints.saver.flush();
 
     // Still working: settlement has not happened and cannot have.
     expect(reasonerPi.running).toBe(true);
@@ -114,11 +114,11 @@ describe('checkpointing during a long task', () => {
     // into a history that is not the one being saved.
     vi.spyOn(cm, 'isObserverInFlight').mockReturnValue(true);
 
-    const save = vi.spyOn(internals.saver, 'save');
+    const save = vi.spyOn(internals.checkpoints.saver, 'save');
     reasonerPi.holdAfterTurn = true;
     const turn = internals.handleInput('rename the payments module');
     await waitUntil(() => save.mock.calls.length > 0, 3000, 'a checkpoint was taken mid-run');
-    await internals.saver.flush();
+    await internals.checkpoints.saver.flush();
 
     expect(readState(sessionId).reasonerMemory).toBeNull();
 
@@ -129,7 +129,7 @@ describe('checkpointing during a long task', () => {
 
   it('takes no mid-run checkpoint under duplex, where it could not be consistent', async () => {
     const { internals, harness } = await createDuplexSession(cwd);
-    const save = vi.spyOn(internals.saver, 'save');
+    const save = vi.spyOn(internals.checkpoints.saver, 'save');
 
     harness.reasonerPi.holdAfterTurn = true;
     harness.agent.deliver('Refactor the payments module', { target: 'work' });
@@ -152,16 +152,15 @@ describe('a resumed session keeps its artifact', () => {
     const first = await createPassthroughSession(cwd);
     const sessionId = first.internals.sessionId;
     first.reasonerPi.defaultText = 'Renamed it.';
-    const save = vi.spyOn(first.internals.saver, 'save');
+    const save = vi.spyOn(first.internals.checkpoints.saver, 'save');
     await first.internals.handleInput('rename the payments module');
     await waitUntil(() => save.mock.calls.length > 0, 3000, 'the session persisted');
-    await first.internals.saver.flush();
+    await first.internals.checkpoints.saver.flush();
 
     // start() checkpoints before index.ts calls resume(), so an
     // unconditional write there would blank the session being resumed.
-    const second = await createPassthroughSession(cwd);
-    (second.internals as unknown as { sessionId: string }).sessionId = sessionId;
-    (second.internals as unknown as { isResume: boolean }).isResume = true;
+    const second = await createPassthroughSession(cwd, { resumeSessionId: sessionId });
+    expect(second.internals.sessionId).toBe(sessionId);
     await second.session.resume(sessionId);
 
     expect(JSON.stringify(second.agent.getConversationHistory()))

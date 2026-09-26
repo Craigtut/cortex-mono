@@ -21,8 +21,6 @@ import {
   INTERNAL_TAG_NAMES,
   type CortexModel,
   type CortexAgentConfig,
-  type CortexAgentStateV1,
-  type CortexAgentStateV2,
   type CortexEvent,
   type AgentTextOutput,
   type ClassifiedError,
@@ -33,7 +31,6 @@ import {
   type LoopOriginContext,
   type ResolutionNote,
   type ThinkingLevel,
-  type ObservationalMemoryState,
   type ToolCallEndPayload,
   type ToolCallStartPayload,
   type ToolCallUpdatePayload,
@@ -45,12 +42,8 @@ import { CredentialStore } from './config/credentials.js';
 import { ApiKeyResolver } from './providers/api-key-resolver.js';
 import { PermissionBroker } from './permissions/prompt-broker.js';
 import { discoverProjectContext } from './discovery/context.js';
-import {
-  generateSessionId,
-  createDebouncedStateSaver,
-  createToolResultPersistor,
-  type SessionMeta,
-} from './persistence/sessions.js';
+import { generateSessionId, createToolResultPersistor } from './persistence/sessions.js';
+import { SessionCheckpoints } from './persistence/session-checkpoints.js';
 import { TranscriptWriter, extractToolResultText } from './persistence/transcript-writer.js';
 import { getCommand, registerBuiltinCommands } from './commands/index.js';
 import type { UpdateInfo } from './updates/checker.js';
@@ -76,13 +69,6 @@ import { SessionSandbox } from './session/sandbox-state.js';
 import { ProjectTrustGates } from './session/trust-gates.js';
 
 const execFileAsync = promisify(execFile);
-
-/**
- * How long shutdown waits for a fresh composite snapshot before falling back
- * to the last one the facade published. getState() resolves at a quiescence
- * window, which a session that is still working may not reach.
- */
-const SHUTDOWN_SNAPSHOT_TIMEOUT_MS = 2000;
 
 export interface SessionOptions {
   config: CortexCodeConfig;
@@ -116,13 +102,7 @@ export class Session {
   private sessionId: string;
   /** True when this session was launched to resume a saved one. */
   private readonly isResume: boolean;
-  private saver: ReturnType<typeof createDebouncedStateSaver>;
-  /**
-   * The last composite snapshot the facade handed over. Shutdown falls back
-   * to it when a fresh `getState()` cannot settle in time, so a session that
-   * is still busy at exit is saved slightly stale rather than not at all.
-   */
-  private lastCompositeState: CortexAgentStateV2 | null = null;
+  private readonly checkpoints: SessionCheckpoints;
   private readonly work: WorkTracker;
   /**
    * True once the onError handler has surfaced the current turn's failure. The
@@ -132,7 +112,6 @@ export class Session {
    */
   private lastTurnErrorHandled = false;
   private readonly retry = new RetryStatusLine(() => this.app);
-  private createdAt: number;
   private subAgentActivity = new Map<string, Map<string, { name: string; status: string; summary?: string }>>();
   private readonly freezeDiagnostics: FreezeDiagnostics;
   private readonly activity: FileSessionActivityReporter;
@@ -209,15 +188,21 @@ export class Session {
     });
     this.sessionId = options.resumeSessionId ?? generateSessionId();
     this.isResume = options.resumeSessionId !== undefined;
-    // Shorter than the saver's 500 ms default. The facade already debounces
-    // onStateChanged by 500 ms, so a second full window there only delayed
-    // the settled write; and this window is now the crash exposure for
-    // turn-boundary checkpoints, where the whole point is bytes on disk
-    // sooner. Still long enough to coalesce a burst of turns.
-    this.saver = createDebouncedStateSaver(this.sessionId, 150);
     this.compactionStrategy = options.compactionStrategy ?? 'observational';
+    this.checkpoints = new SessionCheckpoints({
+      sessionId: this.sessionId,
+      agentMode: this.agentMode,
+      compactionStrategy: this.compactionStrategy,
+      getAgent: () => this.agent,
+      describe: () => ({
+        mode: this.mode.name,
+        provider: this.models.provider,
+        model: this.models.modelId,
+        cwd: this.cwd,
+        contextTokenCount: this.getDisplayedCurrentContextTokens(),
+      }),
+    });
     this.updateInfo = options.updateInfo ?? null;
-    this.createdAt = Date.now();
     this.freezeDiagnostics = new FreezeDiagnostics(this.config.diagnostics?.freeze);
     this.work = new WorkTracker({
       getAgent: () => this.agent,
@@ -381,7 +366,7 @@ export class Session {
     // this point can crash without the session becoming unlistable. A
     // resumed session already has an artifact and resume() has not read it
     // yet, so it checkpoints itself once the restore lands instead.
-    if (!this.isResume) await this.writeInitialCheckpoint();
+    if (!this.isResume) await this.checkpoints.writeInitial();
 
     // Start TUI event loop
     this.app.start();
@@ -745,7 +730,7 @@ export class Session {
     // reasoner-only read that under duplex would silently drop the user's
     // actual dialogue.
     this.agent.onStateChanged((state) => {
-      this.recordComposite(state);
+      this.checkpoints.record(state);
     });
 
     // Error handling with per-category display
@@ -914,7 +899,7 @@ export class Session {
       this.updateFooterContextUsage();
       this.updateObservationalMemoryStatus();
       if (event.childTaskId) return;
-      this.crashCheckpoint();
+      this.checkpoints.crashCheckpoint();
     });
   }
 
@@ -983,13 +968,13 @@ export class Session {
   async resume(sessionId: string): Promise<void> {
     if (!this.agent) return;
 
-    const loaded = await this.loadResumableSession(sessionId);
+    const loaded = await this.checkpoints.loadResumable(sessionId);
     if (!loaded) {
       this.app?.transcript.addNotification('Resume Failed', `Session ${sessionId} not found.`);
       // There was nothing under this id, so the session start() skipped a
       // checkpoint for is effectively a fresh one. Give it the artifact it
       // would have had, or it stays invisible to listSessions().
-      await this.writeInitialCheckpoint();
+      await this.checkpoints.writeInitial();
       return;
     }
 
@@ -1009,7 +994,7 @@ export class Session {
       );
       return;
     }
-    this.createdAt = loaded.meta.createdAt;
+    this.checkpoints.adoptCreatedAt(loaded.meta.createdAt);
     this.updateObservationalMemoryStatus();
 
     // Replay message history into the transcript so the user sees the
@@ -1027,56 +1012,7 @@ export class Session {
     // Re-baseline: start() checkpointed an empty agent, so without this the
     // crash checkpoint's base would still be that empty snapshot and would
     // blank the restored talker side on the first turn.
-    await this.writeInitialCheckpoint();
-  }
-
-  /**
-   * Load a saved session as something `restore()` accepts, plus the history
-   * the transcript should replay. The replayed half is the DIALOGUE, which
-   * under duplex is the talker's transcript, not the reasoner's work log.
-   */
-  private async loadResumableSession(sessionId: string): Promise<{
-    artifact: CortexAgentStateV1 | CortexAgentStateV2;
-    meta: SessionMeta;
-    dialogue: unknown[];
-  } | null> {
-    const {
-      loadSessionState,
-      loadSession: load,
-      loadObservationalState,
-    } = await import('./persistence/sessions.js');
-
-    const composite = await loadSessionState(sessionId);
-    if (composite) {
-      const { state } = composite;
-      return {
-        artifact: state,
-        meta: composite.meta,
-        dialogue: state.talkerHistory.length > 0 ? state.talkerHistory : state.reasonerHistory,
-      };
-    }
-
-    const saved = await load(sessionId);
-    if (!saved) return null;
-
-    // Observational memory state, loaded before the restore because history
-    // and memory now go in together (the buffer watermark indexes into the
-    // history, so the facade orders them itself rather than trusting the
-    // caller to).
-    const omState = this.compactionStrategy === 'observational'
-      ? await loadObservationalState(sessionId)
-      : null;
-
-    return {
-      artifact: {
-        version: 1,
-        history: saved.history as CortexAgentStateV1['history'],
-        memory: (omState ?? null) as ObservationalMemoryState | null,
-        ...(saved.meta.usage ? { usage: saved.meta.usage } : {}),
-      },
-      meta: saved.meta,
-      dialogue: saved.history,
-    };
+    await this.checkpoints.writeInitial();
   }
 
   /**
@@ -1119,22 +1055,13 @@ export class Session {
     await this.mcpReload.stop();
 
     // Flush pending saves
-    await this.saver.flush();
+    await this.checkpoints.flush();
     // Drain any queued transcript appends (best-effort; never throws).
     await this.transcriptWriter.flush();
 
     // Immediate final save
     if (this.agent) {
-      try {
-        const state = await this.finalCompositeState(this.agent);
-        if (state) {
-          const { saveSessionState } = await import('./persistence/sessions.js');
-          await saveSessionState(this.sessionId, state, this.buildSessionMeta());
-        }
-      } catch {
-        // Best-effort save during shutdown
-      }
-
+      await this.checkpoints.saveFinal(this.agent);
       await this.agent.destroy();
       this.agent = null;
     }
@@ -1330,145 +1257,6 @@ export class Session {
       this.agent.currentContextTokenCount,
       this.agent.estimateCurrentContextTokens(),
     );
-  }
-
-  /**
-   * Write the session out once, now, before it has done anything.
-   *
-   * Persistence is otherwise driven by `onStateChanged`, which the facade
-   * only emits from a `getState()` taken at gate quiescence. A session that
-   * starts work and never reaches quiescence therefore never wrote anything:
-   * a brand-new session killed during its first task left no `meta.json`, so
-   * `listSessions()` could not see it and `/resume` could not find it. Not
-   * stale, invisible.
-   *
-   * The agent is idle at both call sites, so the snapshot is a real
-   * consistent composite rather than a placeholder, and it gives
-   * {@link crashCheckpoint} the talker side it needs as a base.
-   *
-   * Callers must not invoke this on a resumed session before `resume()` has
-   * read the file: `start()` runs first, and an unconditional write there
-   * would overwrite the very session the user asked to resume with an empty
-   * agent.
-   */
-  private async writeInitialCheckpoint(): Promise<void> {
-    if (!this.agent) return;
-    try {
-      const state = await this.agent.getState();
-      this.lastCompositeState = state;
-      const { saveSessionState } = await import('./persistence/sessions.js');
-      await saveSessionState(this.sessionId, state, this.buildSessionMeta());
-    } catch (err) {
-      log.warn('Initial session checkpoint failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  /**
-   * A crash-recovery checkpoint taken at a turn boundary, mid-run.
-   *
-   * `getState()` cannot help here: it resolves only when the loop gate is
-   * empty, and a ten-minute task holds the gate for its whole duration, so
-   * settlement-driven persistence writes nothing until the task is over. That
-   * is a crash away from losing the task.
-   *
-   * Passthrough only, deliberately. A turn boundary is a coherent point for
-   * ONE loop (pi has appended the assistant message and every tool result of
-   * the batch before `turn_end` fires), and in passthrough that one loop is
-   * the whole agent, so this is a consistent snapshot rather than the mid-run
-   * partial the old `triggerAutoSave` was taking. Under duplex it would not
-   * be: the other loop can be mid-turn at this instant, and the consumer has
-   * no way to read its history except through the `getState()` that is
-   * blocked. Closing that gap needs a turn-boundary snapshot on the facade,
-   * not a workaround here.
-   *
-   * Observational memory rides along only when neither the observer nor the
-   * reflector is in flight. Its buffer watermark indexes into history, so a
-   * generation landing between the two reads would persist a watermark that
-   * does not match what was saved; omitting it costs observations on crash
-   * recovery and keeps the artifact coherent.
-   */
-  private crashCheckpoint(): void {
-    if (!this.agent || this.agentMode !== 'passthrough') return;
-    const base = this.lastCompositeState;
-    if (!base) return;
-
-    const memorySettled = this.compactionStrategy === 'observational'
-      ? !this.agent.getCompactionManager().isObserverInFlight()
-        && !this.agent.getCompactionManager().isReflectorInFlight()
-      : true;
-    const usage = this.agent.getSessionUsage();
-
-    this.recordComposite({
-      ...base,
-      log: this.agent.getLog(),
-      // Passthrough: the conversation loop IS the reasoner. The talker side
-      // comes from the base snapshot rather than being blanked, so a duplex
-      // artifact restored into this session round-trips instead of losing a
-      // half it cannot see.
-      reasonerHistory: this.agent.getConversationHistory(),
-      reasonerMemory: memorySettled ? this.agent.getObservationalMemoryState() : null,
-      usage: { ...base.usage, total: usage, perLoop: { ...base.usage.perLoop, reasoner: usage } },
-    });
-  }
-
-  /**
-   * The composite snapshot to write at exit. `getState()` resolves only at a
-   * quiescence window, so a session still mid-run at exit would block the
-   * shutdown path; bound the wait and fall back to the last snapshot the
-   * facade published, which is stale by at most one debounce rather than
-   * absent.
-   */
-  private async finalCompositeState(agent: CortexAgent): Promise<CortexAgentStateV2 | null> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const bound = new Promise<null>((resolve) => {
-      timer = setTimeout(() => resolve(null), SHUTDOWN_SNAPSHOT_TIMEOUT_MS);
-      timer.unref();
-    });
-    try {
-      const fresh = await Promise.race([agent.getState().catch(() => null), bound]);
-      return fresh ?? this.lastCompositeState;
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
-  /**
-   * Cache the composite snapshot and queue it for disk. The snapshot carries
-   * the session log, BOTH loops' histories and observational memory, and
-   * per-loop usage, so nothing that only exists on the conversation loop is
-   * lost. The reasoner-only trio (`getConversationHistory()` plus
-   * `getObservationalMemoryState()` plus `getSessionUsage()`) that used to
-   * build a v1 artifact here reads the work transcript under duplex, and the
-   * dialogue it omits was never written, so no later migration could get it
-   * back.
-   */
-  private recordComposite(state: CortexAgentStateV2): void {
-    this.lastCompositeState = state;
-    try {
-      this.saver.save(state, this.buildSessionMeta());
-    } catch {
-      // Swallow auto-save errors silently
-    }
-  }
-
-  private buildSessionMeta(): SessionMeta {
-    const meta: SessionMeta = {
-      id: this.sessionId,
-      mode: this.mode.name,
-      provider: this.models.provider,
-      model: this.models.modelId,
-      cwd: this.cwd,
-      createdAt: this.createdAt,
-      updatedAt: Date.now(),
-      contextTokenCount: this.getDisplayedCurrentContextTokens(),
-      compactionStrategy: this.compactionStrategy,
-    };
-    if (this.agent) {
-      meta.usage = this.agent.getSessionUsage();
-    }
-    return meta;
   }
 
   private async getGitBranch(): Promise<string> {

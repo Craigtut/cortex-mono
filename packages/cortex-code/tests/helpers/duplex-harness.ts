@@ -432,11 +432,14 @@ export interface SessionInternals {
   agentMode: 'passthrough' | 'duplex';
   /** Busy state keyed on work settlement. */
   work: { readonly isRunning: boolean; readonly promptInFlight: boolean; begin(): void };
-  saver: { save: (...args: unknown[]) => void; flush: () => Promise<void> };
+  /** What the session writes to disk, and when. */
+  checkpoints: {
+    saver: { save: (...args: unknown[]) => void; flush: () => Promise<void> };
+    writeInitial: () => Promise<void>;
+  };
   buildAgentConfig: () => CortexAgentConfig;
   wireEvents: () => void;
   pushInitialFooterState: (branch: string, effortLevel: string) => void;
-  writeInitialCheckpoint?: () => Promise<void>;
   handleInput: (text: string) => Promise<void>;
 }
 
@@ -497,10 +500,9 @@ export async function createDuplexSession(
   internals.pushInitialFooterState?.('', 'medium');
   // Stands in for start(), which checkpoints the session before it can do any
   // work and skips that for a resumed one so the saved artifact survives
-  // until resume() reads it. Optional-chained so a run against pre-checkpoint
-  // source fails on the assertion that names the symptom rather than here.
+  // until resume() reads it.
   if (overrides['resumeSessionId'] === undefined) {
-    await internals.writeInitialCheckpoint?.();
+    await internals.checkpoints.writeInitial();
   }
   return { session, internals, app, harness };
 }
@@ -518,8 +520,11 @@ export interface PassthroughSession {
  * state on a settlement predicate rather than on loop completion has to leave
  * the single-loop path behaving exactly as it did.
  */
-export async function createPassthroughSession(cwd: string): Promise<PassthroughSession> {
-  const { session, internals } = makeSession(cwd);
+export async function createPassthroughSession(
+  cwd: string,
+  overrides: Record<string, unknown> = {},
+): Promise<PassthroughSession> {
+  const { session, internals } = makeSession(cwd, overrides);
   const statics = AgentLoop as unknown as LoopStatics;
   const LoopCtor = AgentLoop as unknown as LoopCtor;
   let reasonerPi: ScriptedPi | null = null;
@@ -551,7 +556,9 @@ export async function createPassthroughSession(cwd: string): Promise<Passthrough
   internals.app = app;
   internals.wireEvents();
   // See createDuplexSession: stands in for start()'s startup checkpoint.
-  await internals.writeInitialCheckpoint?.();
+  if (overrides['resumeSessionId'] === undefined) {
+    await internals.checkpoints.writeInitial();
+  }
   return { session, internals, app, agent, reasonerPi };
 }
 
