@@ -81,10 +81,8 @@ export async function loadAgentClass(errorMessage: string): Promise<new (config:
 }
 
 /**
- * The config pi's Agent is constructed with: initial state, the stream
- * function (per-request cache retention and session key), and the three
- * hooks Cortex runs inside pi's loop. `host` is the loop the agent ends up
- * owned by, resolved per call: the Agent is built before the loop exists.
+ * The config pi's Agent is constructed with. `host` is resolved per call
+ * because the Agent is built before the loop that owns it exists.
  */
 export function buildPiAgentConfig(params: {
   cortexConfig: AgentLoopConfig;
@@ -108,7 +106,7 @@ export function buildPiAgentConfig(params: {
   };
 
   agentConfig['streamFn'] = async (model: unknown, context: unknown, options?: Record<string, unknown>) => {
-    // streamSimple lives on pi-ai 0.80's temporary /compat shim (Phase 2 migrates this).
+    // streamSimple lives in pi-ai's /compat shim until the createModels() migration.
     const { streamSimple } = await import('@earendil-works/pi-ai/compat');
     const { retention, sessionId } = host()?.streamOptions() ?? { retention: null, sessionId: null };
     let streamOptions = options;
@@ -188,11 +186,9 @@ export class ToolResultFinalizer {
       context: unknown;
     };
 
-    // Owner-installed interception runs first so it can suppress the
-    // reminder appendix below (control tools carry bare receipts, D17). A
-    // throwing interceptor is swallowed: pi wraps afterToolCall failures
-    // into error results WITHOUT terminate, which would reopen the loop
-    // the interceptor exists to bound.
+    // Runs first so it can suppress the reminder (bare receipts, D17). A
+    // throw is swallowed: pi turns afterToolCall failures into error results
+    // without terminate, reopening the loop the interceptor exists to bound.
     let intercept: ToolResultInterceptorResult | undefined;
     if (this.interceptor) {
       try {
@@ -204,10 +200,8 @@ export class ToolResultFinalizer {
           isError,
         }) ?? undefined;
       } catch (err) {
-        // The consumer's logger is itself untrusted here: if it throws,
-        // the error propagates out of afterToolCall and pi wraps it into
-        // an error result WITHOUT terminate, exactly the D17 shape this
-        // catch exists to prevent.
+        // The consumer's logger is untrusted too: a throw here would
+        // escape afterToolCall into the same D17 shape.
         try {
           this.ports.logger.error('tool result interceptor threw; ignoring', {
             toolName: toolCall.name,

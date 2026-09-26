@@ -3,7 +3,7 @@
  * load_skill tool whose description advertises it, and the buffer of
  * loaded skill bodies the context pipeline injects at the history
  * boundary. The buffer lives for one logical turn; the consumer may also
- * clear it at tick boundaries, which Cortex has no concept of.
+ * clear it at its own work-unit boundaries.
  */
 
 import { SkillRegistry } from '../skill-registry.js';
@@ -41,21 +41,14 @@ export class SkillBinding {
     return this.loadSkillTool as RegisteredTool;
   }
 
-  /**
-   * Rebuild the load_skill tool's description with the current available
-   * skills summary. Called automatically when skills are added/removed
-   * via the registry's onChange callback, and when the context window the
-   * summary is budgeted against changes.
-   */
+  /** Rebuild load_skill's description when skills or the context window change. */
   rebuildDescription(): void {
     if (this.loadSkillTool) {
       this.loadSkillTool.description = buildLoadSkillDescription(
         this.registry,
         this.availableSkillsSummary(),
       );
-      // Re-sync tools to pi-agent-core so the updated description is visible
-      // to the LLM. refreshTools() creates shallow copies, so mutating the
-      // description on the tool doesn't propagate without a re-sync.
+      // pi holds shallow copies, so the new description needs a re-sync.
       this.ports.refreshTools();
     }
   }
@@ -71,10 +64,7 @@ export class SkillBinding {
     this.push({ name, content: body });
   }
 
-  /**
-   * Push a loaded skill to the buffer with deduplication.
-   * If the same skill is loaded twice, the second replaces the first.
-   */
+  /** Loading the same skill twice replaces the first. */
   push(skill: LoadedSkill): void {
     const existingIdx = this.buffer.findIndex(s => s.name === skill.name);
     if (existingIdx >= 0) {

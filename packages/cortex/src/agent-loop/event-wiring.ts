@@ -52,10 +52,7 @@ export function wireLoopEvents(bridge: EventBridge, deps: LoopEventDeps): () => 
     }),
   );
 
-  // Accumulate direct/utility completion spend into session usage. One
-  // listener covers this loop's own completions and forwarded child
-  // completions (childTaskId set), mirroring how child turn_end usage rolls
-  // into the parent totals.
+  // Direct/utility spend, this loop's and forwarded children's alike.
   unsubscribers.push(
     bridge.on('utility_usage', (event) => {
       const usage = event.usage;
@@ -76,19 +73,12 @@ export function wireLoopEvents(bridge: EventBridge, deps: LoopEventDeps): () => 
     }),
   );
 
-  // Map loop_end -> onLoopComplete
   unsubscribers.push(
     bridge.on('loop_end', () => {
-      // pi-agent-core emits agent_end for EVERY run that ends, including a run
-      // that failed (it stores the failure in state.errorMessage). Background
-      // retry means one logical turn can span several such runs, and
-      // onLoopComplete must fire once per logical turn: firing it on a failed
-      // attempt would let a consumer mark the turn idle while a retry is
-      // still pending (and route its next message to prompt(), which throws,
-      // instead of steer()). A turn that fails for good still surfaces via
-      // onError plus the prompt() rejection; a retried turn fires
-      // onLoopComplete on the run that finally succeeds (errorMessage is
-      // cleared at the start of each run).
+      // pi ends every run with agent_end, failed ones included, and a retried
+      // turn spans several runs. onLoopComplete fires once per logical turn,
+      // so a failed attempt must not let a consumer mark the turn idle while
+      // a retry is pending. A final failure surfaces via onError instead.
       if (deps.agentState().errorMessage) {
         logger.info('loop_end suppressed (run ended in error; retry may follow)');
         return;
@@ -104,15 +94,11 @@ export function wireLoopEvents(bridge: EventBridge, deps: LoopEventDeps): () => 
     }),
   );
 
-  // Map turn_end -> context size, usage, and onTurnComplete
   unsubscribers.push(
     bridge.on('turn_end', (event) => {
       const isChildEvent = Boolean(event.childTaskId);
 
-      // Stamp any new messages that lack a timestamp. Messages are added
-      // by pi-agent-core during the agentic loop (user prompts, assistant
-      // responses, tool results). Cortex stamps them here at the turn
-      // boundary so they carry temporal metadata for observational memory.
+      // Stamp pi's new messages for observational memory.
       if (!isChildEvent) {
         const now = Date.now();
         const messages = deps.agentState().messages;
@@ -124,10 +110,8 @@ export function wireLoopEvents(bridge: EventBridge, deps: LoopEventDeps): () => 
         }
       }
 
-      // Context size and observation buffering track this loop's own turns
-      // only (child tokens don't fill this context window). The bridge's
-      // typed usage is preferred; raw event data is the fallback when the
-      // provider reported partial usage the bridge could not type.
+      // Context size tracks this loop's own turns only; raw event data is
+      // the fallback when partial usage could not be typed.
       const usage = event.usage;
       if (!isChildEvent) {
         const inputTokens = usage
@@ -162,12 +146,9 @@ export function wireLoopEvents(bridge: EventBridge, deps: LoopEventDeps): () => 
         ledger.recordUnmeteredTurn();
       }
 
-      // Only dispatch onTurnComplete for parent events. Child turn_end
-      // events are forwarded by EventBridge.forwardFrom() but must not
-      // surface in the parent's TUI; doing so leaks raw subagent text
-      // (including XML tags and metadata) into the main chat thread. With
-      // working tags disabled the bridge does not parse, so the raw text is
-      // parsed here.
+      // Forwarded child turns never reach onTurnComplete (raw sub-agent
+      // text would leak into the parent's chat). With working tags off the
+      // bridge does not parse, so the raw text is parsed here.
       if (!isChildEvent) {
         const text = event.textOutput ? null : turnText(event.data);
         const output = event.textOutput ?? (text ? parseWorkingTags(text) : null);

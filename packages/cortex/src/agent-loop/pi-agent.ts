@@ -50,8 +50,6 @@ export interface PiAgent extends AgentStateAccessor, PiEventSource {
   /**
    * Queue a message that pi injects only at a would-stop point: after the
    * model has produced what would otherwise be the run's final answer.
-   * Optional because older test doubles predate it; the real pi Agent
-   * always has it.
    */
   followUp?(message: { role: string; content: string }): void;
 
@@ -64,26 +62,20 @@ export interface PiAgent extends AgentStateAccessor, PiEventSource {
   /** Remove all queued follow-up messages. */
   clearFollowUpQueue?(): void;
   /**
-   * True when pi's steering or follow-up queue still holds messages.
-   * Unused by Cortex itself: wake parking is loop-owned precisely because
-   * this can only answer "is anything queued", never "is THIS content
-   * still queued". Kept for consumers and tests.
+   * True when pi's steering or follow-up queue still holds messages. Wake
+   * parking cannot use it: it answers "is anything queued", not "is this
+   * content still queued".
    */
   hasQueuedMessages?(): boolean;
 
-  /**
-   * Context transformation hook installed by Cortex.
-   */
+  /** Context transformation hook installed by Cortex. */
   transformContext?: (messages: unknown[]) => Promise<unknown[]>;
 }
 
 /** Drain mode for pi's steering and follow-up queues. */
 export type QueueDrainMode = 'all' | 'one-at-a-time';
 
-/**
- * Minimal Model interface matching pi-ai's Model type.
- * Only the fields we need for provider validation and utility model resolution.
- */
+/** The fields of pi-ai's Model that provider validation and utility model resolution need. */
 export interface PiModel {
   provider: string;
   name: string;
@@ -111,19 +103,12 @@ export interface ManagedLoopParams {
 }
 
 // ---------------------------------------------------------------------------
-// ThinkingLevel crossing to pi (names are identical; see toPiThinkingLevel)
+// ThinkingLevel crossing to pi
 // ---------------------------------------------------------------------------
 
 /**
- * Cortex's level names are pi's level names, so both directions are identity.
- *
- * These used to remap "max" <-> "xhigh", back when Cortex's vocabulary topped
- * out one rung below pi's. That collapse silently under-requested: on a model
- * exposing both xhigh and max, asking for Cortex "max" sent "xhigh". Worse,
- * when pi later re-keyed a model's thinkingLevelMap onto "max", the sent
- * "xhigh" missed the lookup entirely and fell through pi's `default` branch to
- * "high" — two rungs down, with nothing logged. Keep these as the single
- * documented crossing point rather than inlining casts at call sites.
+ * Cortex's level names are pi's, so this is identity. Keep it as the single
+ * crossing point: any remapping here silently changes the requested level.
  */
 export function toPiThinkingLevel(level: ThinkingLevel): string {
   return level;
@@ -137,13 +122,9 @@ export function fromPiThinkingLevel(level: string): ThinkingLevel | null {
 }
 
 /**
- * Strongest supported level that is no stronger than `level`.
- *
- * Falls back to the weakest supported level when the request sits below
- * everything the model offers, and to 'off' when the model offers nothing.
- * Ranking runs through THINKING_LEVEL_ORDER rather than the supported list's
- * own indices, so an out-of-order or sparse list from a provider still
- * compares correctly.
+ * Strongest supported level no stronger than `level`; the weakest supported
+ * level if the request is below all of them, 'off' if none. Ranks by
+ * THINKING_LEVEL_ORDER so an unordered provider list still compares correctly.
  */
 export function clampToSupported(
   level: ThinkingLevel,

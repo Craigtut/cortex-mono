@@ -1,11 +1,7 @@
 /**
- * A loop's attachment to an MCP client manager: a private one by default,
- * or an external shared one (config.mcpClientManager: one connection per
- * server total, multiplexed across loops). Listener registration is
- * additive either way; manager-level settings (logger, env overrides,
- * sandbox) are applied only to a manager this loop owns, since a shared
- * manager's owner configures those once, and only an owned manager's
- * connections are closed on detach.
+ * A loop's attachment to an MCP client manager: its own, or a shared one
+ * (config.mcpClientManager). Manager-level settings are applied, and
+ * connections closed on detach, only for a manager this loop owns.
  */
 
 import { McpClientManager } from '../mcp-client.js';
@@ -37,8 +33,7 @@ export class McpAttachment {
       if (config.envOverrides) {
         this.manager.envOverrides = config.envOverrides;
       }
-      // Contain stdio MCP server subprocesses in the same OS sandbox as shell
-      // commands (enforces denyRead over secrets). No-op when no provider is set.
+      // stdio servers run inside the same OS sandbox as shell commands.
       if (config.sandbox) {
         this.manager.sandbox = config.sandbox;
       }

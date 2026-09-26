@@ -112,34 +112,21 @@ export function createBeforeToolCall(
     const sandboxDenial = cortexConfig.sandbox?.checkToolCall?.(toolCall.name, args, cortexConfig.workingDirectory);
     if (sandboxDenial) return { block: true, reason: sandboxDenial };
     if (!resolver) return undefined;
-    // Spawning a sub-agent is an internal orchestration decision, not a
-    // side-effecting operation. Always allow without prompting.
+    // Orchestration tools (SubAgent, and permissionExempt tools like
+    // Deliver) are Cortex's own plumbing, not side effects to approve.
     if (toolCall.name === SUB_AGENT_TOOL_NAME) return undefined;
-    // Cortex-internal orchestration tools (permissionExempt on the
-    // registered tool) never consult the consumer's resolver: prompting
-    // a user to approve Deliver or recall is asking permission to run
-    // Cortex's own plumbing. The flag is read off the loop's registry,
-    // never off the call, and MCP tools are refused inside the lookup.
     if (host()?.isToolPermissionExempt(toolCall.name)) {
       return undefined;
     }
-    // An already-aborted run never consults the resolver: pi only checks
-    // the signal AFTER this hook, and a consumer prompt for a dead run
-    // would flash pointlessly.
+    // pi checks the signal only after this hook; don't prompt for a dead run.
     if (signal?.aborted) {
       return { block: true, reason: ABORTED_PERMISSION_REASON };
     }
-    // A Bash call requesting to run outside the sandbox reaches the
-    // resolver under a distinct synthetic name, so plain-Bash rules and
-    // auto-approve paths cannot silently authorize an uncontained run and
-    // the consumer can prompt the human distinctly. Only meaningful when a
-    // sandbox is configured; without one the flag changes nothing.
+    // Sandbox escalation asks under a distinct name, so plain-Bash rules
+    // and auto-approve paths cannot silently authorize an uncontained run.
     const escalation = sandboxConfigured && isBashEscalationRequest(toolCall.name, args);
     const permissionName = escalation ? BASH_ESCALATION_PERMISSION_NAME : toolCall.name;
-    // Each ask carries a fresh nonce plus the asking loop's identity, so
-    // a consumer fielding several concurrent loops can key prompt state
-    // per ask and attribute it. The nonce is security-relevant (consent
-    // binding keys on it): crypto-random, never reused, never derived.
+    // Consent binding keys on this nonce: crypto-random, never reused or derived.
     const askId = `ask-${crypto.randomUUID()}`;
     const renderedRequest = renderPermissionRequest(permissionName, args);
     const askContext: ToolPermissionRequestContext = {
@@ -148,9 +135,6 @@ export function createBeforeToolCall(
       renderedRequest,
       ...(signal ? { signal } : {}),
     };
-    // Track the ask in the loop's pending-ask registry for the lifetime
-    // of the resolver call, so a facade can enumerate what is currently
-    // blocked and voice it.
     const asks = host()?.asks;
     asks?.register({
       askId,
@@ -160,11 +144,8 @@ export function createBeforeToolCall(
       requestedAt: Date.now(),
       voiced: false,
     });
-    // Race the consumer's decision against the run's abort signal. pi
-    // awaits this hook before checking the signal, so without the race a
-    // pending human approval would hang abort/destroy into the force-kill
-    // path. The signal is also passed to the resolver so the consumer UI
-    // can dismiss the moot prompt.
+    // Without the race a pending human approval would hang abort and
+    // destroy into the force-kill path.
     let resolution: boolean | CortexToolPermissionResult | typeof ABORTED;
     try {
       resolution = await raceAbort(
@@ -191,17 +172,10 @@ export function createBeforeToolCall(
 }
 
 /**
- * Wrap the consumer's permission resolver for a child agent: mark the
- * tracked entry as waiting for permission while the ask is pending, and
- * clear the marker however the ask ends.
- *
- * When the child run aborts while the ask is pending, the race in the
- * child's beforeToolCall proceeds with a block WITHOUT settling this
- * resolver (the consumer may never answer the dismissed prompt), so the
- * finally alone is not enough: the marker AND the mirrored registry entry
- * are also cleared on the abort signal, or the entry lingers as
- * 'waiting-for-permission' in status surfaces and getPendingAsks() keeps
- * reporting an ask Cortex already blocked.
+ * Wrap the consumer's resolver for a child agent: mark the tracked entry as
+ * waiting for permission and mirror the ask into this loop's registry while
+ * it is pending. Both are also cleared on abort, because the child's gate
+ * blocks without waiting for a resolver the consumer may never answer.
  */
 export function mirrorChildPermissionResolver(
   parentResolver: PermissionResolver,
@@ -221,15 +195,8 @@ export function mirrorChildPermissionResolver(
     const clearPending = (): void => {
       const e = subAgentMgr.get(childTaskId);
       if (e) e.pendingPermission = null;
-      // Settle the mirrored registry entry here too: on the abort path
-      // Cortex proceeds with a block WITHOUT waiting for the consumer's
-      // resolver, so the finally below (which does wait) may not run for
-      // a long time, or ever. Without this, getPendingAsks() keeps
-      // reporting an ask the loop already blocked.
       if (askId !== undefined) asks.settle(askId);
     };
-    // Mirror the child's ask into this loop's registry so one
-    // getPendingAsks() query surfaces the whole subtree's blocked asks.
     if (askId !== undefined) {
       asks.register({
         askId,
@@ -244,8 +211,6 @@ export function mirrorChildPermissionResolver(
     const signal = context?.signal;
     signal?.addEventListener('abort', clearPending, { once: true });
     try {
-      // Forward the child run's abort signal so the consumer UI can
-      // dismiss a prompt made moot by the child being cancelled.
       return await parentResolver(toolName, toolArgs, context);
     } finally {
       signal?.removeEventListener('abort', clearPending);

@@ -9,19 +9,13 @@ import type { SubAgentManager } from '../../sub-agent-manager.js';
 import type { DeadLetteredBackgroundResult, SubAgentSnapshot, SubAgentSpawnConfig } from '../../types.js';
 
 export interface LoopSubAgentApi {
-  /**
-   * Register a handler for sub-agent spawn events.
-   */
+  /** Register a handler for sub-agent spawn events. */
   onSubAgentSpawned(handler: (taskId: string, instructions: string, background: boolean) => void): void;
 
-  /**
-   * Register a handler for sub-agent completion events.
-   */
+  /** Register a handler for sub-agent completion events. */
   onSubAgentCompleted(handler: (taskId: string, result: string, status: string, usage: unknown) => void): void;
 
-  /**
-   * Register a handler for sub-agent failure events.
-   */
+  /** Register a handler for sub-agent failure events. */
   onSubAgentFailed(handler: (taskId: string, error: string) => void): void;
 
   /**
@@ -44,9 +38,7 @@ export interface LoopSubAgentApi {
     handler: (result: DeadLetteredBackgroundResult) => void,
   ): void;
 
-  /**
-   * Get the SubAgentManager for direct sub-agent tracking.
-   */
+  /** Get the SubAgentManager for direct sub-agent tracking. */
   getSubAgentManager(): SubAgentManager;
 
   /**
@@ -65,22 +57,15 @@ export interface LoopSubAgentApi {
   cancelSubAgent(taskId: string): Promise<boolean>;
 
   /**
-   * Deliver a steering message to a running sub-agent by task ID. The
-   * redirect rides the child's public steering queue, so it lands at the
-   * next turn boundary of the child's in-flight run. Returns false when
-   * the task ID is not an active sub-agent, the child is tearing down, or
-   * no run is in flight on the child (not started yet, settle window, or
-   * the end-of-cycle drain after its run ended): a redirect accepted in
-   * those windows is never polled again and dies with the child, so it is
-   * reported undeliverable and the caller decides how to re-route it.
+   * Deliver a steering message to a running sub-agent by task ID. It lands
+   * at the next turn boundary of the child's in-flight run. Returns false
+   * when the task is not an active sub-agent, the child is tearing down, or
+   * no run is in flight on it; a redirect accepted then would never be
+   * polled, so the caller decides how to re-route it.
    *
-   * True means queued into a live run, not consumed: pi's last steering
-   * poll of a run precedes its decision to stop, so a message queued after
-   * that final poll (a near-run-end race the parent cannot detect) is
-   * never polled and dies with the child. The in-flight gate narrows the
-   * lost window to the tail of the final turn; it does not close it. A
-   * caller that cannot afford to lose the redirect should confirm the
-   * child acted on it rather than treat true as delivery.
+   * True means queued into a live run, not consumed: a message queued after
+   * the run's final steering poll still dies with the child. A caller that
+   * cannot afford to lose the redirect should confirm the child acted on it.
    */
   steerSubAgent(taskId: string, message: string): boolean;
 

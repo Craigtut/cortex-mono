@@ -6,8 +6,7 @@
  * (context windows, cache TTL) in step with them.
  */
 
-// pi-ai 0.80 moved the static catalog reads off the root to the durable
-// `providers/all` entrypoint; these are the non-deprecated forms.
+// Static catalog reads come from pi-ai's durable `providers/all` entrypoint.
 import { getBuiltinModel as getPiModel, getBuiltinModels as getPiModels } from '@earendil-works/pi-ai/providers/all';
 import type { CompactionManager } from '../compaction/index.js';
 import { resolveContextBudget } from '../context-budget.js';

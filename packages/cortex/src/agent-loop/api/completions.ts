@@ -10,10 +10,9 @@ import type { DirectCompletionOptions } from '../direct-completion.js';
 
 export interface LoopCompletionApi {
   /**
-   * Make a direct LLM completion call using the primary model.
-   * NOT an agentic tool-use loop. Used for structured output phases
-   * like THOUGHT and REFLECT where a single LLM response is needed
-   * without tool execution.
+   * Make a direct LLM completion call using the primary model. Not an
+   * agentic loop: one response, no tools run, nothing added to the
+   * transcript.
    *
    * Accepts either a raw context ({ systemPrompt, messages }) passed to
    * pi-ai verbatim, or a structured context ({ systemPrompt, slots?,
@@ -21,23 +20,17 @@ export interface LoopCompletionApi {
    * cache breakpoint strategy the agentic loop uses. See
    * StructuredCompletionContext for the caching contract.
    *
-   * Dynamically imports pi-ai's complete() function. If pi-ai is not
-   * installed, throws a clear error.
-   *
    * @param context - Raw or structured completion context
    * @returns The response text from the LLM
-   * @throws Error if pi-ai is not installed or the call fails
+   * @throws Error if pi-ai is not installed or the call fails; an Error named
+   *   'AbortError' when `options.signal` cancels it
    */
   directComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string>;
 
   /**
-   * Make a structured output LLM call using the tool-call-as-structured-output pattern.
-   *
-   * Defines a tool whose input_schema matches the desired output structure,
-   * passes it via pi-ai's complete() with tools, and extracts the tool call
-   * arguments as the structured result. This works across all providers that
-   * support tool use (Anthropic, OpenAI, Google, Mistral, etc.) without
-   * needing provider-specific structured output parameters.
+   * Make a structured output LLM call. Providers with native JSON-schema
+   * output use it; the rest get a forced tool whose input schema is the
+   * desired shape, and the tool call's arguments are the result.
    *
    * Accepts the same raw or structured contexts as directComplete(). Note
    * for cached structured contexts: tool definitions precede the system
@@ -53,13 +46,9 @@ export interface LoopCompletionApi {
   structuredComplete(context: DirectCompletionContext, schema: unknown, toolName?: string, toolDescription?: string, options?: DirectCompletionOptions): Promise<Record<string, unknown> | null>;
 
   /**
-   * Make a utility completion call using the utility model.
-   * Convenience wrapper for internal operations (WebFetch summarization,
-   * safety classification, etc.).
-   *
-   * Analogous to directComplete() but uses the utility model (smaller, cheaper)
-   * instead of the primary model. Accepts the same raw or structured contexts
-   * as directComplete(). Dynamically imports pi-ai's complete() function.
+   * Make a completion call using the utility model (smaller, cheaper).
+   * Same contexts and behavior as directComplete(); Cortex uses it for
+   * internal work such as WebFetch summarization.
    *
    * @param context - Raw or structured completion context
    * @returns The response text from the LLM
@@ -71,10 +60,8 @@ export interface LoopCompletionApi {
    * Get the usage data from the most recent directComplete() or
    * structuredComplete() call. Returns null if no usage was available
    * or no call has been made yet.
-   *
-   * This is the primary mechanism for consumers (like the backend pipeline)
-   * to capture per-phase usage for persistence. The value is reset to null
-   * at the start of each directComplete/structuredComplete call.
+   * Reset to null at the start of each call, so read it right after the
+   * call whose usage you want to persist.
    */
   getLastDirectUsage(): CortexUsage | null;
 

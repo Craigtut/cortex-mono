@@ -36,10 +36,7 @@ export interface BuiltinToolDeps {
     | 'resolveNetworkAccess'
     | 'webFetch'
   >;
-  /**
-   * The loop's utility completion, resolved at call time so it follows the
-   * current utility model (which may change at runtime via setModel).
-   */
+  /** Resolved at call time, so it follows setModel changes to the utility model. */
   utilityComplete(context: UtilityContext, usageCategory: string): Promise<string>;
   processes: Pick<ProcessTracker, 'track' | 'untrack'>;
   onBackgroundTaskComplete(taskId: string): void;
@@ -52,10 +49,8 @@ export function createBuiltinTools(deps: BuiltinToolDeps, disabled: ReadonlySet<
   const tools: RegisteredTool[] = [];
   const cwd = deps.workingDirectory;
   const runtime = deps.runtime;
-  // In-tool path allowlist for the read-surface tools (Read, Glob, Grep).
-  // Enforced in the tools themselves, never by prompt: restricted loops
-  // (duplex quick lookups) speak their answers, so an out-of-scope read is
-  // an exfiltration path regardless of what the model was told.
+  // Read-surface path allowlist, enforced in the tools, never by prompt:
+  // an out-of-scope read is an exfiltration path whatever the model was told.
   const allowedRoots = config.readPathAllowlist;
 
   if (!disabled.has(TOOL_NAMES.Read)) {
@@ -74,9 +69,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps, disabled: ReadonlySet<
     tools.push(createGlobTool({ defaultCwd: cwd, allowedRoots }) as RegisteredTool);
   }
   if (!disabled.has(TOOL_NAMES.Grep)) {
-    // Thread the sandbox so ripgrep content search runs inside the same OS
-    // boundary as shell commands (enforces denyRead over secrets). No-op when
-    // no provider is configured.
+    // ripgrep runs inside the same OS sandbox as shell commands (denyRead over secrets).
     tools.push(createGrepTool({
       defaultCwd: cwd,
       sandbox: config.sandbox,
@@ -88,9 +81,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps, disabled: ReadonlySet<
       runtime,
       utilityComplete: (context) => deps.utilityComplete(context as UtilityContext, 'bash_utility'),
       isAutoApprove: () => config.isAutoApprove?.() ?? false,
-      // Track spawned shell PIDs so destroy()'s force-kill deadline and
-      // the process-exit safety net cover background/auto-yielded
-      // commands, not just MCP subprocesses.
+      // So destroy()'s force-kill and the exit safety net cover background shells.
       onProcessSpawned: (pid) => {
         deps.processes.track(pid);
       },
@@ -99,12 +90,9 @@ export function createBuiltinTools(deps: BuiltinToolDeps, disabled: ReadonlySet<
       },
       onBackgroundTaskComplete: (taskId) => deps.onBackgroundTaskComplete(taskId),
       sandbox: config.sandbox,
-      // The resolvePermission adaptation (beforeToolCall) screens every call
-      // before execute(), presenting escalation requests under a distinct
-      // name. That gate is what authorizes escalateOutsideSandbox; without a
-      // resolver the tool refuses escalation (fail closed).
+      // Escalation is authorized only by the permission gate; without a
+      // resolver the tool refuses it (fail closed).
       permissionGated: config.resolvePermission !== undefined,
-      // Consumer tool tuning (AgentLoopConfig.bash).
       shellPath: config.bash?.shellPath,
       autoYieldThreshold: config.bash?.autoYieldThreshold,
     }) as RegisteredTool);
@@ -115,20 +103,13 @@ export function createBuiltinTools(deps: BuiltinToolDeps, disabled: ReadonlySet<
   if (!disabled.has(TOOL_NAMES.WebFetch)) {
     tools.push(createWebFetchTool({
       runtime,
-      // Wire the utility model for WebFetch summarization.
-      // Uses a lazy callback so it resolves against the current utility model
-      // (which may change at runtime via setModel).
       utilityComplete: (context) => deps.utilityComplete(context as UtilityContext, 'webfetch'),
-      // The consumer's unified egress gate, shared with sandboxed shell
-      // egress. Undefined = ungated, exactly as before.
+      // Shared with sandboxed shell egress; undefined means ungated.
       resolveNetworkAccess: config.resolveNetworkAccess,
-      // Consumer tool tuning (AgentLoopConfig.webFetch).
       maxPerLoop: config.webFetch?.maxPerLoop,
     }) as RegisteredTool);
   }
-  // ToolSearch is auto-registered when deferred tools are enabled. The
-  // consumer cannot disable it via disableTools (the agent has no other way
-  // to load deferred tool schemas).
+  // disableTools cannot remove ToolSearch: it is the only way to load deferred schemas.
   if (deps.deferred) {
     tools.push(createToolSearchTool({
       registry: deps.deferred.registry,

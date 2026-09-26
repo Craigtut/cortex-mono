@@ -4,11 +4,9 @@
  * later), plus cancel, steer, live snapshots, and the consumer's
  * onSubAgentSpawned/Completed/Failed fan-out.
  *
- * A child is its own AgentLoop, built by the host (so a test can stand in
- * for the factory) and tracked by the SubAgentManager. Its events are
- * forwarded onto this loop's EventBridge with childTaskId set, which is
- * what makes a running child visible live: tool activity for status
- * surfaces, and usage rolled into this loop's session totals.
+ * Child events are forwarded onto this loop's EventBridge with childTaskId
+ * set, which is what makes a running child visible live (tool activity,
+ * usage in this loop's session totals).
  */
 
 import { errorMessageOf } from '../error-classifier.js';
@@ -93,17 +91,13 @@ export class SubAgentSpawner {
       },
     });
 
-    // Track child tool activity for background state visibility.
-    // Forwarded child events arrive on the parent's EventBridge with childTaskId set.
     ports.eventBridge.on('tool_call_start', (event) => {
       if (!event.childTaskId) return;
       const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
       const toolName = payload?.toolName ?? 'unknown';
       const args = payload?.args ?? {};
       const summary = summarizeToolActivity(toolName, args);
-      // childTaskId is a path when the event was re-forwarded from a deeper
-      // descendant; attribute activity to this loop's direct child (the
-      // first segment), which is the task ID the manager tracks.
+      // A deeper descendant's childTaskId is a path; the manager tracks the first segment.
       const directChildId = event.childTaskId.split('/')[0]!;
       ports.manager.updateToolActivity(directChildId, toolName, summary);
     });
@@ -123,7 +117,6 @@ export class SubAgentSpawner {
         };
       }
 
-      // Forward child events to parent's EventBridge for real-time visibility
       const unsubForward = this.ports.eventBridge.forwardFrom(
         childAgent.getEventBridge(),
         taskId,
@@ -153,7 +146,6 @@ export class SubAgentSpawner {
           usage: result.usage,
         };
       } finally {
-        // Always stop forwarding, whether the sub-agent succeeded or failed
         unsubForward();
       }
     } catch (err) {
@@ -181,21 +173,13 @@ export class SubAgentSpawner {
     const childAgent = await this.createTracked(params, taskId, startTime, true);
     if (!childAgent) throw new Error('Concurrency limit reached');
 
-    // Forward child events to the parent's EventBridge, exactly like the
-    // foreground path: this is what makes background children visible live
-    // (tool activity for the headline block, usage accounting) instead of
-    // only via a post-completion summary.
     const unsubForward = this.ports.eventBridge.forwardFrom(
       childAgent.getEventBridge(),
       taskId,
     );
 
-    // Run the sub-agent in the background. When it completes, deliver the
-    // result back to the parent agent and restart its agentic loop.
     this.run(childAgent, params.instructions, taskId, startTime, params.timeoutMs)
       .then((result) => {
-        // The child has settled (and been destroyed by run); stop
-        // forwarding before delivery so listeners never leak per task.
         unsubForward();
         this.ports.logger.info('subagent complete', {
           taskId,
@@ -247,9 +231,8 @@ export class SubAgentSpawner {
       await agent.destroy();
     });
     if (cancelled) {
-      // Deliberately redundant with the drain's isCancelled() check (which
-      // alone keeps a cancelled result out of the loop): purging here makes
-      // cancellation prompt, and keeps that check from being the only guard.
+      // Deliberately redundant with the drain's isCancelled() check: purging
+      // makes cancellation prompt and keeps that check from being the only guard.
       this.ports.purgePendingResult(taskId);
       this.ports.logger.info('subagent cancelled', { taskId });
     }
@@ -304,11 +287,7 @@ export class SubAgentSpawner {
     return { taskId, startTime: Date.now() };
   }
 
-  /**
-   * Build the child and track it. Null when the concurrency limit rejects
-   * it, in which case the fully constructed child is torn down (it would
-   * otherwise leak event subscriptions, compaction timers, tool runtime).
-   */
+  /** Build and track the child; null (child destroyed) when the concurrency limit rejects it. */
   private async createTracked(
     params: SubAgentSpawnParams,
     taskId: string,
@@ -355,13 +334,9 @@ export class SubAgentSpawner {
   }
 
   /**
-   * Run a child to completion and report the outcome to the manager; the
-   * child is destroyed however the run ends.
-   *
-   * When `timeoutMs` is set, a wall-clock timer aborts the child on expiry
-   * and the result reports status 'timed_out' (with whatever partial output
-   * the child's transcript holds), whether the aborted run settles by
-   * resolving or by rejecting.
+   * Run a child to completion, report the outcome to the manager, and
+   * destroy it. On `timeoutMs` expiry the child is aborted and the result is
+   * 'timed_out' with its partial output, however the aborted run settles.
    */
   private async run(
     childAgent: ChildLoop,
@@ -377,8 +352,7 @@ export class SubAgentSpawner {
       timeoutTimer = setTimeout(() => {
         timedOut = true;
         logger.warn('subagent wall-clock timeout', { taskId, timeoutMs });
-        // Abort (not destroy) so the child unwinds cleanly; both settle
-        // paths below destroy it once the run ends.
+        // Abort, not destroy: both settle paths below destroy it.
         void childAgent.abort().catch(() => {});
       }, timeoutMs);
       timeoutTimer.unref?.();
@@ -406,15 +380,10 @@ export class SubAgentSpawner {
         };
         manager.complete(taskId, result);
       } catch (err) {
-        // A cancel destroys the child mid-run, which surfaces here as an
-        // abort-shaped prompt failure. The cancel already resolved the
-        // tracked completion as cancelled and fired its hooks; report the
-        // same status instead of overriding it with 'failed' (the foreground
-        // path returns this result directly to the SubAgent tool).
+        // A cancel surfaces here as an abort-shaped failure after it already
+        // resolved the completion as cancelled; report that, not 'failed'.
         const cancelled = manager.isCancelled(taskId);
         result = {
-          // A timed-out run rejects with an abort-shaped failure; salvage the
-          // partial output so the spawner sees what the child got done.
           output: timedOut && !cancelled
             ? assistantText(findLastAssistant(childAgent.getConversationHistory()))
             : '',
@@ -423,9 +392,7 @@ export class SubAgentSpawner {
         };
         if (!cancelled) {
           if (timedOut) {
-            // Timeout is a terminal outcome with a result, not an error:
-            // resolve the tracked completion with timed_out so the status
-            // reaches hooks and the background delivery path.
+            // A timeout is a result, not an error, so hooks and delivery see it.
             manager.complete(taskId, result);
           } else {
             manager.fail(taskId, errorMessageOf(err));

@@ -7,16 +7,9 @@
  * assembly.ts; the documented contract of each public member lives on the
  * slice interfaces in ./agent-loop/api/ that this class implements.
  *
- * Lifecycle: CREATED -> ACTIVE -> DESTROYED
- *   - CREATED: After construction. Slots can be set, but no loops have run.
- *   - ACTIVE: After first prompt(). The agent is running or idle between prompts.
- *   - DESTROYED: After destroy(). All resources released. prompt() throws.
+ * Lifecycle: CREATED -> ACTIVE (first prompt()) -> DESTROYED (destroy()).
  *
- * References:
- *   - cortex-architecture.md
- *   - system-prompt.md
- *   - model-tiers.md
- *   - cross-platform-considerations.md
+ * Reference: cortex-architecture.md
  */
 
 import type { BudgetGuard } from './budget-guard.js';
@@ -111,12 +104,7 @@ export type {
  */
 export { MINIMUM_CONTEXT_WINDOW } from './context-budget.js';
 
-/**
- * Wrap a logger so every message carries the loop's identity prefix. All
- * components logging through the loop's logger (the loop itself, the prompt
- * watchdog, the event bridge, budget guard, compaction, MCP) inherit it, so
- * concurrent loops stay distinguishable in shared log output.
- */
+/** Prefix every message with the loop's path so concurrent loops stay distinguishable in shared logs. */
 function prefixLoggerWithLoopPath(logger: CortexLogger, loopPath: string): CortexLogger {
   const prefix = `[AgentLoop:${loopPath}]`;
   return {
@@ -200,12 +188,8 @@ export class AgentLoop implements
   // -----------------------------------------------------------------------
 
   /**
-   * Create an AgentLoop with a pi-agent-core Agent constructed internally.
-   *
-   * This eliminates the consumer's need to import pi-agent-core directly.
-   * The factory dynamically imports pi-agent-core and pi-ai, resolves the
-   * model, creates the internal Agent, and returns a fully configured
-   * AgentLoop.
+   * Create an AgentLoop with a pi-agent-core Agent constructed internally,
+   * so consumers never import pi-agent-core themselves.
    *
    * @param config - AgentLoop configuration (model, tools, options)
    * @returns A new AgentLoop wrapping an internally-created pi-agent-core Agent
@@ -221,10 +205,8 @@ export class AgentLoop implements
      */
     tools?: CortexTool[];
     /**
-     * Whether to auto-register the SubAgent tool. Default true. An owner
-     * assembling a role loop that must not spawn (the duplex talker, a
-     * tier-capped child) sets false; combined with disableTools this yields
-     * a loop with no built-in toolset at all.
+     * Whether to auto-register the SubAgent tool. Default true. Set false
+     * for a loop that must not spawn; with disableTools it has no built-ins.
      */
     enableSubAgentTool?: boolean;
     /** Whether to auto-register the load_skill tool. Default true. */
@@ -318,20 +300,15 @@ export class AgentLoop implements
       );
     }
     if (gate.isActive) {
-      // Re-prompting synchronously inside the .then of a just-resolved
-      // prompt() can land here while a no-op background-drain task is still
-      // queued. It clears after one macrotask, so a caller chaining a
-      // follow-up should await a macrotask (or the delivery handler) first.
+      // A re-prompt chained synchronously on a resolved prompt() can hit a
+      // still-queued no-op drain task; it clears after one macrotask.
       throw new Error(
         'Agent is already processing a prompt. Use steer() to inject input into ' +
         'the running loop, or wait for the current turn to complete.',
       );
     }
-    // Install a fresh controller SYNCHRONOUSLY when the current one is
-    // already aborted (the empty gate guarantees no loop owns it). A
-    // same-frame abort() after this prompt() then lands on THIS turn's
-    // controller, so the cycle cancels at dequeue instead of replacing a
-    // stale-aborted controller and running to completion un-aborted.
+    // Renew synchronously so a same-frame abort() lands on this turn's
+    // controller (see "Loop gate, turn unwind, abort epoch").
     abortState.renewIfAborted();
     return gate.enqueue(() => runner.runCycle(input, options));
   }
@@ -382,9 +359,8 @@ export class AgentLoop implements
   }
 
   restoreConversationHistory(messages: AgentMessage[]): void {
-    // Replace everything after the slots. Restored messages are sanitized:
-    // empty content checkpointed by older sessions gets a placeholder, and
-    // messages predating the timestamp field are stamped now.
+    // Replace everything after the slots; empty content gets a placeholder
+    // and messages without a timestamp are stamped now.
     this.agent.state.messages.splice(this.parts.contextManager.slotCount);
     const now = Date.now();
     this.agent.state.messages.push(...messages.map((msg) => {
@@ -423,9 +399,8 @@ export class AgentLoop implements
     // buffer watermark must align with.
     const historyLength = Math.max(0, this.agent.state.messages.length - contextManager.slotCount);
     compactionManager.restoreObservationalMemoryState(state, historyLength);
-    // The slot content always carries a preamble; fill the slot only when
-    // there are real observations, so a never-observed session stays empty.
-    // No observer runs on resume: it catches up on the next turn_end.
+    // Fill the slot only for real observations (its content always has a
+    // preamble). The observer catches up on the next turn_end.
     if (compactionManager.hasObservations()) {
       contextManager.setSlot('_observations', compactionManager.getObservationSlotContent());
     }

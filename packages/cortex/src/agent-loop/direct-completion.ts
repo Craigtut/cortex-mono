@@ -77,25 +77,7 @@ interface CompletionSpec<T> {
 export class DirectCompletions {
   constructor(private readonly ports: DirectCompletionPorts) {}
 
-  /**
-   * Make a direct LLM completion call using the primary model.
-   * NOT an agentic tool-use loop. Used for structured output phases
-   * like THOUGHT and REFLECT where a single LLM response is needed
-   * without tool execution.
-   *
-   * Accepts either a raw context ({ systemPrompt, messages }) passed to
-   * pi-ai verbatim, or a structured context ({ systemPrompt, slots?,
-   * history?, ephemeral?, prompt }) that Cortex assembles with the same
-   * cache breakpoint strategy the agentic loop uses. See
-   * StructuredCompletionContext for the caching contract.
-   *
-   * Dynamically imports pi-ai's complete() function. If pi-ai is not
-   * installed, throws a clear error.
-   *
-   * @param context - Raw or structured completion context
-   * @returns The response text from the LLM
-   * @throws Error if pi-ai is not installed or the call fails
-   */
+  /** Primary model, text result. Contract: LoopCompletionApi.directComplete. */
   direct(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string> {
     return this.run({
       entry: 'directComplete',
@@ -108,26 +90,7 @@ export class DirectCompletions {
     }, context, options);
   }
 
-  /**
-   * Make a structured output LLM call using the tool-call-as-structured-output pattern.
-   *
-   * Defines a tool whose input_schema matches the desired output structure,
-   * passes it via pi-ai's complete() with tools, and extracts the tool call
-   * arguments as the structured result. This works across all providers that
-   * support tool use (Anthropic, OpenAI, Google, Mistral, etc.) without
-   * needing provider-specific structured output parameters.
-   *
-   * Accepts the same raw or structured contexts as directComplete(). Note
-   * for cached structured contexts: tool definitions precede the system
-   * prompt in Anthropic's cacheable prefix, so keep the schema byte-stable
-   * across calls or the whole prefix misses.
-   *
-   * @param context - Raw or structured completion context
-   * @param schema - Tool schema defining the structured output shape (TypeBox or JSON Schema)
-   * @param toolName - Name for the virtual tool (default: 'structured_output')
-   * @param toolDescription - Description for the virtual tool
-   * @returns The parsed tool call arguments, or null if the model didn't call the tool
-   */
+  /** Primary model, schema-shaped result. Contract: LoopCompletionApi.structuredComplete. */
   structured(
     context: DirectCompletionContext,
     schema: unknown,
@@ -155,19 +118,7 @@ export class DirectCompletions {
     }, context, options);
   }
 
-  /**
-   * Make a utility completion call using the utility model.
-   * Convenience wrapper for internal operations (WebFetch summarization,
-   * safety classification, etc.).
-   *
-   * Analogous to directComplete() but uses the utility model (smaller, cheaper)
-   * instead of the primary model. Accepts the same raw or structured contexts
-   * as directComplete(). Dynamically imports pi-ai's complete() function.
-   *
-   * @param context - Raw or structured completion context
-   * @returns The response text from the LLM
-   * @throws Error if pi-ai is not installed or the call fails
-   */
+  /** Utility model, text result. Contract: LoopCompletionApi.utilityComplete. */
   utility(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string> {
     return this.run({
       entry: 'utilityComplete',
@@ -185,8 +136,7 @@ export class DirectCompletions {
     context: DirectCompletionContext,
     options?: DirectCompletionOptions,
   ): Promise<T> {
-    // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
-    // here pending the planned createModels() migration (Phase 2).
+    // complete() lives in pi-ai's /compat shim until the createModels() migration.
     let completeFn: CompleteFn;
     try {
       const piAi = await import('@earendil-works/pi-ai/compat');
@@ -195,18 +145,15 @@ export class DirectCompletions {
       throw new Error(spec.missingDependencyMessage);
     }
 
-    // Validate and assemble the context. Structured contexts get the
-    // [slots][history][ephemeral][prompt] layout plus BP2/BP3 indices.
+    // Structured contexts get the [slots][history][ephemeral][prompt] layout plus BP2/BP3 indices.
     const resolved = resolveDirectCompletionContext(context);
 
     const models = this.ports.models();
     const model = spec.target === 'primary' ? models.primary : models.utility;
     const piModel = spec.target === 'primary' ? models.primaryPi : models.utilityPi;
 
-    // Resolve the API key for the model's provider. A resolution failure is
-    // remembered rather than swallowed: pi-ai may still succeed via env vars,
-    // but if the call below fails we surface this (more actionable) cause
-    // instead.
+    // A key-resolution failure is remembered, not thrown: pi-ai may still
+    // succeed, and if it fails this is the more actionable cause.
     let apiKey: string | undefined;
     let keyError: Error | undefined;
     if (this.ports.getApiKey) {
@@ -223,10 +170,7 @@ export class DirectCompletions {
 
     const startMs = Date.now();
     try {
-      // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
-      // provider-specific convertMessages() handle all format normalization:
-      // UserMessage (string or content blocks), AssistantMessage (content block
-      // arrays with text/thinking/toolCall), and ToolResultMessage.
+      // Messages pass through as-is; pi-ai normalizes formats per provider.
       const result = await completeFn(
         piModel as unknown as Parameters<CompleteFn>[0],
         {
@@ -241,8 +185,6 @@ export class DirectCompletions {
 
       // Caller-initiated cancellation takes precedence over error/usage handling.
       throwIfAborted(result, options?.signal);
-
-      // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
       checkForSilentError(result);
 
       const usage = assistantUsage(result);
@@ -264,14 +206,10 @@ export class DirectCompletions {
   }
 
   /**
-   * Handle an error thrown by a direct (non-agentic) completion path
-   * (directComplete / structuredComplete / utilityComplete).
-   *
-   * Prefers the original credential-resolution error as the cause when present,
-   * since "OAuth refresh failed" / "Vault is sealed" is more actionable than the
-   * downstream provider error that results from calling without a key. Classifies
-   * and emits the error through onError (so auth failures in THOUGHT/REFLECT/
-   * utility phases surface like loop failures), then returns the error to throw.
+   * Emits the error through onError, so direct-call auth failures surface
+   * like loop failures, and returns the error to throw. Prefers the
+   * credential-resolution error ("OAuth refresh failed") over the downstream
+   * provider error it caused, unless the call was aborted.
    */
   private surfaceError(
     err: unknown,
@@ -300,8 +238,7 @@ export class DirectCompletions {
     if (sessionId) completeOptions['sessionId'] = sessionId;
     if (options?.signal) completeOptions['signal'] = options.signal;
 
-    // Structured contexts carry BP2/BP3 indices; stamp them onto the payload
-    // via pi-ai's onPayload hook, same as the agentic loop does.
+    // Stamp structured contexts' BP2/BP3 indices onto the payload, as the agentic loop does.
     if (breakpointIndices) {
       completeOptions['onPayload'] = (
         payload: Record<string, unknown>,
@@ -316,15 +253,7 @@ export class DirectCompletions {
   }
 }
 
-/**
- * Check if a pi-ai result represents a silent error.
- *
- * Pi-ai's stream wrapper catches errors and resolves the promise with an
- * output object that has stopReason 'error' and errorMessage set, instead
- * of throwing. This means callers never see the error unless they check.
- * This method surfaces those silent errors as thrown exceptions so they
- * propagate properly (e.g., to retry logic).
- */
+/** pi-ai resolves failures with stopReason 'error' instead of throwing; rethrow them. */
 function checkForSilentError(result: unknown): void {
   if (!result || typeof result !== 'object') return;
   const msg = result as Record<string, unknown>;
@@ -337,16 +266,10 @@ function checkForSilentError(result: unknown): void {
 }
 
 /**
- * Surface a caller-aborted completion as a throwable `AbortError`.
- *
- * Pi-ai resolves (it does not throw) with stopReason 'aborted' when the
- * supplied AbortSignal fires mid-flight. We also check the signal directly
- * to cover the race where abortion lands just after a result resolved: the
- * caller signalled they no longer want this completion, so we discard it.
- * Throwing an Error named 'AbortError' lets callers distinguish caller
- * cancellation from genuine failure via the standard `err.name` idiom, and
- * must be checked before `checkForSilentError` so an abort is never
- * misreported as an LLM error.
+ * Throw an `AbortError` for a caller-aborted completion. pi-ai resolves with
+ * stopReason 'aborted' rather than throwing, and the signal check also covers
+ * an abort landing just after the result resolved. Runs before
+ * checkForSilentError so an abort is never reported as an LLM error.
  */
 function throwIfAborted(result: unknown, signal?: AbortSignal): void {
   const resultAborted =

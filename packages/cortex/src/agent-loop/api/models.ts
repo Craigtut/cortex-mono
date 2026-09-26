@@ -9,31 +9,25 @@ import type { CortexModel } from '../../model-wrapper.js';
 import type { ModelThinkingCapabilities, ThinkingLevel } from '../../types.js';
 
 export interface LoopModelApi {
-  /**
-   * Get the primary model.
-   */
+  /** Get the primary model. */
   getModel(): CortexModel;
 
-  /**
-   * Get the resolved utility model.
-   */
+  /** Get the resolved utility model. */
   getUtilityModel(): CortexModel;
 
   /**
    * Peek at the utility model that auto-resolution would produce for the
    * current primary model, without applying it or clearing a manual override.
    *
-   * For providers Cortex cannot enumerate (e.g. Ollama and custom
-   * OpenAI-compatible endpoints), this returns the primary model itself,
-   * mirroring the runtime fallback in resolveUtilityModels(). Consumers use
-   * this to label an "Auto" choice in a UI with the model that will actually
-   * run, instead of re-deriving it from a model list that the agent never sees.
+   * For providers Cortex cannot enumerate (e.g. Ollama, custom
+   * OpenAI-compatible endpoints) this is the primary model itself. Useful for
+   * labeling an "Auto" choice in a UI with the model that will actually run.
    */
   getAutoResolvedUtilityModel(): CortexModel;
 
   /**
-   * Hot-swap the primary model without restarting the agent.
-   * Used when the user changes their provider/model in settings.
+   * Hot-swap the primary model without restarting the agent. Re-resolves
+   * the utility model unless it was overridden.
    *
    * @param model - The new CortexModel to use
    */
@@ -55,9 +49,7 @@ export interface LoopModelApi {
    */
   resetUtilityModel(): void;
 
-  /**
-   * Whether the utility model has been manually overridden.
-   */
+  /** Whether the utility model has been manually overridden. */
   isUtilityModelOverridden(): boolean;
 
   /**
@@ -79,8 +71,8 @@ export interface LoopModelApi {
   getThinkingLevel(): ThinkingLevel;
 
   /**
-   * Get the thinking capabilities of the current primary model.
-   * Uses pi-ai model metadata to expose the exact supported thinking levels.
+   * Get the thinking capabilities of the current primary model, from pi-ai's
+   * per-model metadata.
    *
    * @returns Capabilities object describing thinking support
    */
@@ -90,24 +82,17 @@ export interface LoopModelApi {
    * Clamp a requested thinking level to the nearest level the current model
    * accepts, never exceeding what was asked for.
    *
-   * Deliberately does NOT delegate to pi's clampThinkingLevel. Pi clamps by
-   * position in its own global ladder, so a level its build does not know is
-   * not "too high", it is unrecognized: pi 0.80.3 answers clamp("max") with
-   * "off", turning a request for the most thinking into none at all. Since
-   * Cortex's vocabulary can legitimately run ahead of the installed pi (that
-   * is the whole point of naming levels per-model), that failure mode is
-   * reachable by ordinary config. Clamping against the model's own advertised
-   * list keeps the answer bounded by what the model actually accepts.
+   * Clamps against the model's own advertised levels rather than pi's
+   * global ladder, where a level the installed pi does not know can clamp
+   * to "off".
    *
    * Callers should surface a clamp to users when latency or cost changes.
    */
   clampThinkingLevel(level: ThinkingLevel): Promise<ThinkingLevel>;
 
   /**
-   * Set the cache retention policy for the agentic loop.
-   * Used by the consumer to switch between short/long cache based on
-   * tick interval and provider. Managed agents pass this through the pi-ai
-   * stream options for each provider request.
+   * Set the cache retention policy, applied to every provider request from
+   * the agentic loop and to direct completions that do not override it.
    */
   setCacheRetention(value: 'none' | 'short' | 'long'): void;
 
@@ -124,9 +109,7 @@ export interface LoopModelApi {
    */
   setSessionId(value: string | null): void;
 
-  /**
-   * Get the current cache/session key, or null if unset.
-   */
+  /** Get the current cache/session key, or null if unset. */
   getSessionId(): string | null;
 
   /**
@@ -144,18 +127,12 @@ export interface LoopModelApi {
    */
   setContextWindowLimit(limit: number | null): void;
 
-  /**
-   * Get the raw user-configured context window limit (null = no limit).
-   */
+  /** Get the raw user-configured context window limit (null = no limit). */
   readonly contextWindowLimit: number | null;
 
-  /**
-   * Get the effective context window after clamping the limit to backend capacity.
-   */
+  /** Get the effective context window after clamping the limit to backend capacity. */
   readonly effectiveContextWindow: number;
 
-  /**
-   * Get the model's actual context window (unaffected by consumer limits).
-   */
+  /** Get the model's actual context window (unaffected by consumer limits). */
   readonly modelContextWindow: number;
 }

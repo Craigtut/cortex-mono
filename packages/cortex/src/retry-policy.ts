@@ -1,8 +1,8 @@
 /**
  * Pure helpers for cortex's background retry loop.
  *
- * The loop itself lives in AgentLoop.prompt() (it drives agent.prompt /
- * agent.continue). Everything decidable without touching agent state lives
+ * The loop itself lives in TurnRunner.runWithRetry (agent-loop/turn-runner.ts),
+ * which drives agent.prompt / agent.continue. Everything decidable without touching agent state lives
  * here so it can be unit-tested in isolation: default policy, policy merge,
  * the backoff schedule, and the retry gate.
  *

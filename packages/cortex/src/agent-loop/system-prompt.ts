@@ -54,11 +54,7 @@ const TAKING_ACTION_FILE_BULLETS = `- Do not create files unless necessary. Pref
   files.
 - Do not modify files you haven't read. Read first, then modify.`;
 
-/**
- * Assemble the Taking Action section. The file-handling bullets only appear
- * when the loop can actually mutate files; on a loop with no file tools they
- * imply a capability it does not have.
- */
+/** File-handling bullets appear only when the loop can mutate files. */
 function buildTakingActionSection(has: (name: string) => boolean): string {
   return has(TOOL_NAMES.Write) || has(TOOL_NAMES.Edit)
     ? `${TAKING_ACTION_BASE_SECTION}\n${TAKING_ACTION_FILE_BULLETS}`
@@ -66,11 +62,8 @@ function buildTakingActionSection(has: (name: string) => boolean): string {
 }
 
 /**
- * Assemble the Tool Usage base rules from the tools the loop actually has.
- * A prompt that names an absent tool is an instruction to hallucinate it:
- * the duplex talker (all built-ins disabled) followed the old static
- * section's "use Glob" straight into an unknown-tool error and narrated the
- * failure to the user.
+ * Tool Usage rules naming only tools the loop has: a prompt that names an
+ * absent tool is an instruction to hallucinate it.
  */
 function buildToolUsageBaseSection(has: (name: string) => boolean): string {
   const bullets: string[] = [];
@@ -112,10 +105,7 @@ function buildToolUsageBaseSection(has: (name: string) => boolean): string {
   return `# Tool Usage\n\n${bullets.join('\n')}`;
 }
 
-/**
- * Text-output discipline for the working-tags-enabled prompt. Analysis has
- * somewhere to go, so the model is told to put it inside the tags.
- */
+/** Output discipline with working tags: analysis goes inside the tags. */
 const TOOL_OUTPUT_TAGGED_SECTION = `## IMPORTANT: Text output during tool use
 
 When you are using tools, do NOT produce text that narrates what
@@ -145,11 +135,9 @@ Rules:
    look into that."). After that, work silently until you have results.`;
 
 /**
- * Text-output discipline for the working-tags-disabled prompt. There is no
- * second channel, so the model must not write its analysis at all. This
- * variant must never mention <working> tags: instructing the model to emit
- * a delimiter that nothing parses or strips leaks internal reasoning
- * verbatim to the consumer (and, for voice consumers, to TTS).
+ * Output discipline without working tags: no second channel, so no written
+ * analysis. Must never mention <working>: a delimiter nothing strips leaks
+ * reasoning verbatim to the consumer (and to TTS).
  */
 const TOOL_OUTPUT_UNTAGGED_SECTION = `## IMPORTANT: Text output during tool use
 
@@ -185,13 +173,7 @@ Rules:
 4. A brief acknowledgment on the FIRST message is fine ("Sure, let me
    look into that."). After that, work silently until you have results.`;
 
-/**
- * Assemble the Tool Usage section for the current working-tags mode.
- *
- * The tool-selection rules are shared; only the text-output discipline
- * differs, because whether the model has a place to put its analysis
- * depends on whether working tags are parsed.
- */
+/** Shared tool-selection rules plus the output discipline for the working-tags mode. */
 function buildToolUsageSection(
   workingTagsEnabled: boolean,
   has: (name: string) => boolean,
@@ -223,16 +205,12 @@ When encountering unexpected state (unfamiliar files, branches,
 or configurations), investigate before modifying or deleting.
 It may represent in-progress work.`;
 
-/**
- * Build the Environment section of the system prompt.
- * Dynamically generated from the actual runtime environment.
- */
+/** The Environment section, from the actual runtime. */
 function buildEnvironmentSection(workingDirectory: string): string {
   const platform = process.platform;
   const arch = process.arch;
   const shell = detectShell();
 
-  // Build platform description
   let platformDesc: string;
   switch (platform) {
     case 'darwin':
@@ -255,17 +233,12 @@ function buildEnvironmentSection(workingDirectory: string): string {
 - Working Directory: ${workingDirectory}`;
 }
 
-/**
- * Detect the current shell.
- */
 function detectShell(): string {
   if (process.platform === 'win32') {
-    // Check for PowerShell version
     const psVersion = process.env['PSModulePath'] ? 'PowerShell' : 'cmd.exe';
     return psVersion;
   }
 
-  // Unix: use $SHELL env var
   return process.env['SHELL'] ?? '/bin/sh';
 }
 
@@ -303,16 +276,9 @@ export class SystemPromptState {
   }
 
   /**
-   * Build the Cortex operational sections for the current configuration.
-   *
-   * Sections are toolset-aware: Tool Usage and Executing with Care exist to
-   * govern built-in tool work, so a loop with every built-in disabled (the
-   * duplex talker) gets neither, and the per-tool bullets inside them name
-   * only tools the loop actually has. A static section here told the talker
-   * to use Glob and Bash it did not have, and the model obliged.
-   *
-   * Stays accurate at runtime: the loop's refreshTools() recomposes the
-   * prompt through refresh() whenever the toolset changes.
+   * Cortex's operational sections for the current toolset. A loop with no
+   * built-ins (the duplex talker) gets no Tool Usage or Executing with Care;
+   * refreshTools() recomposes through refresh() when the toolset changes.
    */
   sections(): Array<{ name: string; content: string }> {
     const has = this.ports.hasTool;

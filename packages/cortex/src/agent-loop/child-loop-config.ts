@@ -61,9 +61,7 @@ export async function prepareChildLoop(
   parent: ChildLoopParent,
   params: ChildLoopParams,
 ): Promise<{ createParams: ManagedLoopParams; seedContext: string | undefined }> {
-  // Pre-spawn hook: lets the consumer record the spawn and curate the
-  // child's starting context (system prompt, tools, background seed) before
-  // the child is built. Purely additive; errors are swallowed.
+  // onBeforeSubAgentSpawn curates the child's starting context; errors are swallowed.
   let augmentation: SubAgentSpawnAugmentation | void = undefined;
   if (parent.config.onBeforeSubAgentSpawn) {
     try {
@@ -126,8 +124,6 @@ export function buildChildLoopConfig(
     contextWindowLimit: parent.contextWindowLimit,
     // Each sub-agent is its own logical session for prefix-cache routing.
     sessionId: params.taskId,
-    // The child's identity extends this loop's path, so its asks, errors,
-    // and log lines are attributable through the spawn chain.
     loopPath: `${parent.loopPath}/${params.taskId}`,
   };
   if (params.thinkingLevel !== undefined) {
@@ -141,26 +137,18 @@ export function buildChildLoopConfig(
   }
   if (config.logger) childCortexConfig.logger = config.logger;
   if (config.envOverrides) childCortexConfig.envOverrides = config.envOverrides;
-  // Inherit tool tuning so a child's Bash and WebFetch behave like the
-  // parent's (shell override, auto-yield timing, fetch rate limit).
   if (config.bash) childCortexConfig.bash = config.bash;
   if (config.webFetch) childCortexConfig.webFetch = config.webFetch;
-  // Share the parent's sandbox provider so a sub-agent's shell commands are
-  // contained by the same OS boundary. Sharing the instance (not cloning) is
-  // correct: the underlying SandboxManager is a process-global singleton.
+  // Shared, not cloned: the underlying SandboxManager is a process-global singleton.
   if (config.sandbox) childCortexConfig.sandbox = config.sandbox;
   // A read-restricted parent must not spawn read-unrestricted children.
   if (config.readPathAllowlist) {
     childCortexConfig.readPathAllowlist = config.readPathAllowlist;
   }
-  // Share the egress gate so a sub-agent's WebFetch answers to the same
-  // network policy and grant set as the parent's.
   if (config.resolveNetworkAccess) {
     childCortexConfig.resolveNetworkAccess = config.resolveNetworkAccess;
   }
   if (config.getApiKey) childCortexConfig.getApiKey = config.getApiKey;
-  // Inherit tool result persistence so child tool calls (Bash, Grep, WebFetch
-  // inside a sub-agent doing research) get the same protection as the parent.
   // The raw consumer callback, so the child stamps its own loopPath.
   if (parent.rawPersistResult) childCortexConfig.persistResult = parent.rawPersistResult;
   if (parent.resultThresholds) childCortexConfig.toolResultThresholds = parent.resultThresholds;

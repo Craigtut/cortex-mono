@@ -10,13 +10,10 @@ import type { AgentTextOutput, ClassifiedError, LoopOriginContext, RetryExhauste
 
 export interface LoopEventApi {
   /**
-   * Register a handler for when the full agentic loop completes.
-   * Maps to pi-agent-core's agent_end event.
-   * The consumer uses this to trigger conversation history checkpoints.
-   *
-   * The origin context identifies which loop completed. It used to take no
-   * arguments at all, which under a composite agent meant a consumer was told
-   * that "a" loop had finished and could not act on which.
+   * Register a handler for when a logical turn's agentic loop completes
+   * (pi's agent_end, once per turn: not for a failed attempt a retry may
+   * follow). A good point to checkpoint conversation history. The origin
+   * context identifies which loop completed.
    */
   onLoopComplete(handler: (origin: LoopOriginContext) => void): void;
 
@@ -64,8 +61,6 @@ export interface LoopEventApi {
    */
   getEventBridge(): EventBridge;
 
-  /**
-   * Get the BudgetGuard for inspecting turn/cost state.
-   */
+  /** Get the BudgetGuard for inspecting turn/cost state. */
   getBudgetGuard(): BudgetGuard;
 }

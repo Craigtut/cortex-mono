@@ -26,14 +26,10 @@ export interface LoopPromptApi {
    */
   setBasePrompt(basePrompt: string): string;
 
-  /**
-   * Get the current application/base prompt.
-   */
+  /** Get the current application/base prompt. */
   getBasePrompt(): string;
 
-  /**
-   * Get the current assembled system prompt.
-   */
+  /** Get the current assembled system prompt. */
   getCurrentSystemPrompt(): string;
 
   /**
