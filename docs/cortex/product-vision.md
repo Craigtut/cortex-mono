@@ -27,11 +27,14 @@ Cortex structures the context window into four distinct regions:
 
 ```
 ┌─────────────────────────────────────────────────┐
+│  SYSTEM HEAD                                    │  The system prompt and initial tools
+│  Position 0                                     │  (pi keeps them in the transcript)
+├─────────────────────────────────────────────────┤
 │  SLOT REGION                                    │  Named, persistent, stability-ordered
-│  Position 0..N-1                                │  Most stable content at the top
+│  Positions 1..N                                 │  Most stable content at the top
 ├─────────────────────────────────────────────────┤
 │  CONVERSATION HISTORY                           │  Grows organically with the agentic loop
-│  Positions N..M                                 │  Managed by compaction when it grows too large
+│  Positions N+1..M                               │  Managed by compaction when it grows too large
 ├ ─ ─ ─ ─ ─ PREFIX CACHE BOUNDARY ─ ─ ─ ─ ─ ─ ─ ┤
 │  EPHEMERAL CONTEXT                              │  Rebuilt every LLM call
 │  Never persisted                                │  Changes here never invalidate the cache above
@@ -46,7 +49,7 @@ This layout is not incidental. It is the product of a key optimization: **stable
 
 Slots are persistent, named content blocks at the start of the message array. They are defined at agent creation with a fixed order. The consumer populates them with whatever content makes sense for their domain.
 
-The ordering is the key design decision. The first slot (position 0) is the most stable and gets the best cache life. Content that rarely changes (identity, credentials, core configuration) goes first. Content that changes more frequently (recent observations, active tasks) goes later. When a slot in the middle updates, the prefix before it survives in cache; only that slot and everything after it incurs a cache miss.
+The ordering is the key design decision. The first slot (position 1, right after the system head) is the most stable and gets the best cache life. Content that rarely changes (identity, credentials, core configuration) goes first. Content that changes more frequently (recent observations, active tasks) goes later. When a slot in the middle updates, the prefix before it survives in cache; only that slot and everything after it incurs a cache miss.
 
 This enables a pattern that would be impossible with a flat context buffer: **the consumer can update a single aspect of context without invalidating everything else.** If only the "goals" slot changes, the identity slot, the user profile slot, and the project context slot all remain cached.
 

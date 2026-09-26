@@ -40,7 +40,7 @@ The Read tool tracks which files have been read in the current agentic loop. The
 When `AgentLoopConfig.readPathAllowlist` is set, reads are confined to paths under the listed roots, enforced in-tool before any disk I/O. Targets and roots are symlink-resolved through their nearest existing ancestor (a link inside a root pointing outside it is refused), and the refusal is a visible "Access denied" result with `rejected: true`, never a silent empty read. Used by duplex quick-lookup loops, whose answers become spoken conversation. Inherited by spawned sub-agents. Also applies to Glob and Grep search paths.
 
 ### Special File Types
-- **Images** (PNG, JPG, GIF, WebP): Return as base64 in an `ImageContent` block. For vision-capable models, the image is presented visually.
+- **Images** (PNG, JPG, GIF, WebP): Return as base64 in an `ImageContent` block. For vision-capable models, the image is presented visually. Images are not resized. When the current model's catalog entry states an image byte ceiling (`capabilities.imageInput.resize.maxBytes`, from pi-ai's `Model.inputLimits`), an image whose base64 encoding exceeds it is refused with a message asking for a smaller copy, since the provider would reject the whole request and the image would stay in history. The ceiling is read per call, so it follows `setModel()`.
 - **PDFs**: Text extraction via `unpdf` (pure-ESM, zero native deps). Implementation: `packages/cortex/src/tools/shared/pdf-extractor.ts`.
   - Default: extracts the first 20 pages.
   - `pages` parameter accepts `"N"` or `"N-M"`; spec must fit the per-call 20-page cap and the document's page count.
@@ -63,6 +63,7 @@ When `AgentLoopConfig.readPathAllowlist` is set, reads are confined to paths und
 | Permission denied | Return error in `content`: "Permission denied: {path}" |
 | Is a directory | Return error in `content`: "Cannot read a directory. Use `ls` via Bash." |
 | Binary file (not image/PDF) | Return error in `content`: "Binary file detected. Cannot display as text." |
+| Image over the model's byte ceiling | Return error in `content` asking for a resized copy. Sets `rejected: true`. |
 | PDF: `pages` out of range | Return error in `content`: "Pages spec ... exceeds document (has N pages)." Sets `rejected: true`. |
 | PDF: malformed `pages` spec | Return error in `content`: "Invalid pages spec ... Use 'N' or 'N-M'." Sets `rejected: true`. |
 | PDF: scanned / image-only | Return error in `content` suggesting OCR. Sets `rejected: true`. |

@@ -236,6 +236,21 @@ On rebuild:
 4. Cortex reappends its operational rules
 5. Conversation history is preserved
 
+`setBasePrompt()` updates the prompt the loop wants at once (`getCurrentSystemPrompt()` returns it). The transcript picks it up before the next provider request, as described below.
+
+## How the Prompt Reaches the Model
+
+pi-agent-core keeps the system prompt in the transcript: `agent.state.messages[0]` is a `role: 'system'` message (the head), and `agent.state.systemPrompt` is a read-only replay of every system message in the transcript. `SystemPromptState` (`agent-loop/system-prompt.ts`) holds the prompt the loop wants as named sections: `Instructions` (the consumer's base prompt, or a whole adopted prompt) followed by the operational sections above. `src/system-transcript.ts` owns the system-message rules on Cortex's side; the replay semantics themselves are pi-ai's (`@earendil-works/pi-ai/utils/transcript`).
+
+Before every provider request, pi's `prepareRequest` hook runs `SystemPromptState.syncTranscript()` on pi's live in-loop transcript:
+
+- **Until the model has answered** in the transcript, nothing of it is cached, so the head is rebuilt: `content: ''`, `sections` set to the desired sections, and any tool declarations pi added (it declares the initial tool set as a system message before the first prompt) folded in, so the initial tools live in the head.
+- **After that**, messages are never removed, because history indices (the observational watermark) must hold. Sections whose content changed go out as one appended system message carrying only those sections (a removed section is patched to `null`). A head Cortex has not written yet (a restored transcript, or a prompt pi was built with) is rewritten in place first.
+
+Tool changes need nothing from Cortex: pi compares `agent.state.tools` with what the transcript declares before each request and inserts a system message with `toolsAdded`/`toolsRemoved`.
+
 ## Caching Implications
 
 The system prompt is the first content in the prefix. Since the consumer's content comes first and usually changes rarely, the cache is stable. Applications that use different prompts for direct completion phases and agentic loops should treat each distinct prompt as its own cache prefix.
+
+Mid-conversation changes keep the cached prefix on models that accept later system messages (`supportsMidConvoSystemMessages` in pi-ai's model compat): the head is unchanged and the update is read in place. Anthropic models that also support native tool changes receive tool additions and removals as `tool_addition`/`tool_removal` blocks, with later tools declared `defer_loading`, so connecting an MCP server, loading a skill's tools, or discovering a deferred tool no longer invalidates the prompt cache. For every other model pi collapses all system messages into the head before sending, which costs a cache miss exactly as a prompt change always did.

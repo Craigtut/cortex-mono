@@ -39,7 +39,7 @@ When observational memory is active, conversation summarization (L2) is replaced
 
 **L1 behavior** (applies to both classic and observational strategies; see [compaction-strategy.md](./compaction-strategy.md#layer-1-tool-result-trimming-microcompaction) for the full algorithm):
 
-- **Cache check**: Cortex resolves the active provider's cache TTL from `PROVIDER_CACHE_CONFIG` based on the current `CacheRetention` setting (Anthropic short: 5 min / long: 1 hr; OpenAI short: 10 min / long: 24 hr; Google/Mistral/Azure: no caching, L1 runs freely). On each `transformContext`, L1 checks whether the elapsed time since the last LLM call exceeds the TTL.
+- **Cache check**: Cortex resolves the active cache TTL from the model's stated lifetimes (pi-ai's `Model.promptCache`), falling back to the provider's `PROVIDER_CACHE_CONFIG` entry, based on the current `CacheRetention` setting (Anthropic short: 5 min / long: 1 hr; OpenAI short: 10 min / long: 24 hr; Google/Mistral/Azure: no caching, L1 runs freely). On each `transformContext`, L1 checks whether the elapsed time since the last LLM call exceeds the TTL.
 - **Trim floor**: Even when the cache is cold, L1 only runs above 25% context utilization. This prevents pointless work on nearly empty contexts.
 - **Hot zone**: When trimming runs, tool results within `max(hotZoneMinTokens, contextWindow * hotZoneRatio)` tokens of the most recent message stay full. Defaults: 16,000 tokens floor, 5% ratio. Non-reproducible tools get an extended hot zone.
 - **Progressive bookend degradation**: Beyond the hot zone, bookend size shrinks linearly across the degradation span (default 40% of context window) from `bookendMaxChars` (2,000) down to `bookendMinChars` (256).
@@ -271,17 +271,19 @@ When observational memory is active, the message array layout is:
 ```
 Message Array:
 ┌─────────────────────────────────────────┐
-│ SLOT REGION (0..N-1)                    │  Consumer-managed, named slots
-│   [slot 0: system context]              │
-│   [slot 1: thoughts]                    │
-│   [slot 2: experiences]                 │
+│ SYSTEM HEAD (0)                         │  Prompt sections and initial tools
 │                                         │
-│ OBSERVATION SLOT (N)                    │  Cortex-managed, last slot position
+│ SLOT REGION (1..N)                      │  Consumer-managed, named slots
+│   [slot 1: system context]              │
+│   [slot 2: thoughts]                    │
+│   [slot 3: experiences]                 │
+│                                         │
+│ OBSERVATION SLOT (N+1)                  │  Cortex-managed, last slot position
 │   [observations + current-task +        │  Stable prefix, cache-friendly
 │    suggested-response]                  │  Changes only on activation/reflection
 │                                         │
 ├─────────────────────────────────────────┤
-│ RAW MESSAGE REGION (N+1..M)             │  Unobserved messages, append-only
+│ RAW MESSAGE REGION (N+2..M)             │  Unobserved messages, append-only
 │   [user message]                        │  Grows between observation cycles
 │   [assistant response]                  │
 │   [toolCall + toolResult messages]      │
@@ -307,8 +309,8 @@ When `strategy === 'observational'`, Cortex appends `'_observations'` to the con
 
 - Consumer configures: `slots: ['system-context', 'thoughts', 'experiences']`
 - Cortex internally registers: `['system-context', 'thoughts', 'experiences', '_observations']`
-- `slotCount` becomes 4 (consumer's 3 + 1 internal)
-- All compaction operations use `slotCount` to skip the slot region, naturally including the observation slot
+- `slotCount` becomes 4 (consumer's 3 + 1 internal), so `historyStart` is 5 (the system head plus 4 slots)
+- All compaction operations use `historyStart` to skip the head and slot region, naturally including the observation slot
 
 The observation slot content is a user-role message containing:
 1. Context preamble (instructions for the agent on how to use observations)
@@ -635,7 +637,7 @@ The `applyInTransformContext()` method gains a strategy switch:
 ```typescript
 async applyInTransformContext(context, getHistory, setHistory, getSourceHistory, setSourceHistory) {
   // Phase 0: Insertion-time cap (always runs)
-  await this.applyInsertionCap(sourceMessages, slotCount);
+  await this.applyInsertionCap(sourceMessages, historyStart);
 
   // Compute utilization
   const currentTokens = this.estimateCurrentContextTokens(context);

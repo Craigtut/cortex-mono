@@ -179,8 +179,8 @@ See **`context-manager.md`** for the full design: message array layout, slot API
 
 Pi-agent-core is in-memory only. `agent.state` is JSON-serializable. Cortex does NOT own persistence to disk. Instead, it provides lifecycle hooks and serialization helpers that the consumer uses to implement their own storage:
 
-- **`getConversationHistory()`**: Returns the conversation history (everything between slots and ephemeral) as a JSON-serializable array. After compaction, this returns the compacted version. The consumer snapshots this to their storage.
-- **`restoreConversationHistory(messages)`**: Injects saved conversation history after the slot region on startup.
+- **`getConversationHistory()`**: Returns the conversation history (everything between slots and ephemeral) as a JSON-serializable array, including the `role: 'system'` messages pi and Cortex write inline for tool and prompt updates (they carry no conversation; skip them when rendering). After compaction, this returns the compacted version. The consumer snapshots this to their storage.
+- **`restoreConversationHistory(messages)`**: Injects saved conversation history after the slot region on startup. Restored system messages replay as declared, and the loop brings the prompt and tools up to date on its next request.
 - **`onLoopComplete` event**: Fires when the full agentic loop finishes (maps to pi-agent-core's `agent_end` event, not `turn_end`). A single loop may contain many internal turns (tool calls, follow-ups, steering). The consumer listens to this to trigger checkpoints. One snapshot per loop, not per turn.
 
 This design means cortex has zero storage dependencies. The consumer decides where to persist (SQLite, filesystem, Redis, nowhere) and when to checkpoint beyond the basic lifecycle events.

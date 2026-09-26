@@ -6,17 +6,21 @@ The `ContextManager` is the core abstraction in `@animus-labs/cortex` for managi
 
 ## Message Array Layout
 
-In a managed `AgentLoop`, the effective message array has four regions. The ContextManager owns slot content and consumer ephemeral content. AgentLoop composes that with background task state, loaded skills, compaction, and cache breakpoint logic.
+In a managed `AgentLoop`, the effective message array has five regions. The ContextManager owns the layout of the fixed prefix (the system head and the slots), slot content, and consumer ephemeral content. AgentLoop composes that with background task state, loaded skills, compaction, and cache breakpoint logic.
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  SLOT REGION (positions 0..N-1)                 │  Owned by ContextManager
+│  SYSTEM HEAD (position 0)                       │  pi's leading system message: the
+│  Prompt sections and initial tools              │  prompt and tools (system-prompt.md)
+├─────────────────────────────────────────────────┤
+│  SLOT REGION (positions 1..N)                   │  Owned by ContextManager
 │  Persistent, named, stability-ordered           │  Updated immediately via setSlot()
 ├─────────────────────────────────────────────────┤
-│  CONVERSATION HISTORY (old, positions N..M)      │  Owned by pi-agent-core
+│  CONVERSATION HISTORY (old, from historyStart)  │  Owned by pi-agent-core
 │  Grows organically as agent runs                │  ContextManager does NOT touch this
 │  User messages, assistant responses,            │
-│  tool_use/tool_result pairs                     │
+│  tool_use/tool_result pairs, and later          │
+│  system messages (tool and prompt updates)      │
 ├─────────────────────────────────────────────────┤
 │  EPHEMERAL CONTEXT (injected in transformContext)│  Owned by ContextManager + Cortex
 │  Consumer ephemeral, loaded skill instructions  │  Rebuilt every LLM call, stable
@@ -31,6 +35,8 @@ In a managed `AgentLoop`, the effective message array has four regions. The Cont
 ```
 
 Consecutive user-role messages are valid: the Anthropic API auto-merges them into a single turn. No custom `convertToLlm` is needed.
+
+`ContextManager.historyStart` (`N + 1`) is where history begins; every history slice, compaction rewrite, and observational watermark counts from it. The ContextManager puts an empty head at index 0 at construction when pi has not created one. History may carry `role: 'system'` messages inline: pi declares tool changes there, and Cortex patches prompt sections there once the model has answered (see system-prompt.md). They declare, they are not turns: the observer and summarizer skip them, cache breakpoint indexing skips them, and a history rewrite that drops one folds it into the head (`spliceHistory` in `system-transcript.ts`) so the transcript still declares what it carried.
 
 ### Prefix Caching
 
@@ -54,7 +60,7 @@ Anthropic also performs automatic prefix checking around explicit breakpoints. W
 
 For a managed `AgentLoop` using Anthropic, pi-ai first places cache controls on the system prompt, the last tool definition, and the last user message. Cortex's `onPayload` hook then adjusts that payload into the intended four-breakpoint layout:
 
-1. System prompt.
+1. System prompt (the head, which pi-ai lifts into the request's `system` field).
 2. End of the slot region.
 3. End of the stable prefix: old conversation history plus the injected ephemeral and skill messages, before background task state and current-tick content.
 4. Last user message, usually the current prompt.
@@ -69,7 +75,7 @@ Reference: [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-w
 
 ## Slots
 
-Slots are persistent, named content blocks stored as user-role messages at the start of `agent.state.messages`. They are defined at `ContextManager` creation time as an ordered list. The order defines their position in the message array: first slot = position 0 (most stable, best cache life), last slot = position N-1 (least stable among slots). Slot count and names are static for the lifetime of the agent.
+Slots are persistent, named content blocks stored as user-role messages right after the system head in `agent.state.messages`. They are defined at `ContextManager` creation time as an ordered list. The order defines their position in the message array: first slot = position 1 (most stable, best cache life), last slot = position N (least stable among slots). Slot count and names are static for the lifetime of the agent.
 
 ### API
 
@@ -111,7 +117,7 @@ class ContextManager {
 
 ### Constructor Initialization
 
-When the ContextManager is constructed, it automatically reserves space for all declared slots by pushing empty user-role messages (`{ role: 'user', content: '' }`) into `agent.state.messages` at positions 0 through N-1 (where N is the number of slots). This ensures the message array always has the correct length from the start, so `setSlot()` can safely overwrite any position without gaps.
+When the ContextManager is constructed, it puts an empty system head at position 0 if pi has not created one, then reserves space for all declared slots by pushing empty user-role messages (`{ role: 'user', content: '' }`) into `agent.state.messages` at positions 1 through N (where N is the number of slots). This ensures the message array always has the correct length from the start, so `setSlot()` can safely overwrite any position without gaps.
 
 ### Usage: How a Consumer Configures Slots
 
@@ -250,7 +256,7 @@ const agent = new Agent({
 
 - **Manage conversation history**: The organic message accumulation from agent turns is entirely pi-agent-core's responsibility.
 - **Format content**: No XML wrapping, no tags. The consumer formats content however they want.
-- **Handle persistence**: Serializing `agent.state.messages` for crash recovery is the consumer's responsibility. Cortex provides `getConversationHistory()` and `restoreConversationHistory()` on the `AgentLoop`, not on the ContextManager.
+- **Handle persistence**: Serializing `agent.state.messages` for crash recovery is the consumer's responsibility. Cortex provides `getConversationHistory()` and `restoreConversationHistory()` on the `AgentLoop`, not on the ContextManager. The history they carry includes the inline system messages; persist it as returned and skip `role: 'system'` when rendering it.
 - **Compact conversation history**: Compaction is a separate cortex capability that composes with the ContextManager via `transformContext`.
 
 ## Context capacity and budgets

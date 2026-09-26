@@ -39,9 +39,11 @@ Additionally, a consumer may have domain-specific compaction (e.g., compressing 
 ```
 Message Array Layout (from context-manager.md):
 
-SLOT REGION (0..N-1)           -- Persistent, named, managed by ContextManager
+SYSTEM HEAD (0)                -- pi's leading system message: prompt and tools
   |
-CONVERSATION HISTORY (N..M)    -- Grows with each tick, COMPACTION TARGET
+SLOT REGION (1..N)             -- Persistent, named, managed by ContextManager
+  |
+CONVERSATION HISTORY (N+1..M)  -- Grows with each tick, COMPACTION TARGET
   |
 PREFIX CACHE BOUNDARY          -- Providers cache the longest unchanged prefix
   |
@@ -161,7 +163,7 @@ For ephemeral tools (SubAgent, TaskOutput) beyond the degradation span:
 
 #### Cache-aware gating (per-provider TTLs)
 
-Cortex reads the active cache TTL from `PROVIDER_CACHE_CONFIG` based on the current provider and `CacheRetention` setting:
+Cortex resolves the active cache TTL for the current `CacheRetention` setting from the model first: pi-ai's catalog states per-model lifetimes (`Model.promptCache`, surfaced as `capabilities.promptCacheLifetimes`), and a tier the model states wins. Otherwise it falls back to `PROVIDER_CACHE_CONFIG` for the current provider (`resolvePromptCacheTtlMs()` owns the rule; `resolveCacheRetention()` accepts the same lifetimes as an optional third argument). The provider fallbacks:
 
 | Provider | Short TTL | Long TTL |
 |---|---|---|

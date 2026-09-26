@@ -4,6 +4,7 @@ All notable changes to `@animus-labs/cortex-code` are documented here.
 
 ## Unreleased
 
+- Upgrade pi-ai and pi-tui to `0.87.1`.
 - Fix permission prompt ordering: tool and network asks now take the prompt lock in arrival order, so a stream of network asks can no longer starve a waiting tool ask, and a late or repeated lock release can no longer free another prompt's lock.
 
 ## 0.6.0
