@@ -46,7 +46,6 @@ import {
   withPlaceholderContent,
 } from './pi-message.js';
 import { renderPermissionRequest } from './permission-rendering.js';
-import { toolCallSubject } from './tools/tool-call-subject.js';
 import type { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
 import { isContextOverflow } from './compaction/failsafe.js';
@@ -73,9 +72,15 @@ import { SkillBinding } from './agent-loop/skills.js';
 import { createBuiltinTools } from './agent-loop/builtin-tools.js';
 import { ToolRegistry } from './agent-loop/tool-registry.js';
 import { McpAttachment } from './agent-loop/mcp-attachment.js';
+import {
+  buildBackgroundTaskState,
+  formatBashCompletion,
+  formatSubAgentCompletion,
+  summarizeToolActivity,
+} from './agent-loop/background-task-text.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { estimateTokens } from './token-estimator.js';
-import type { BackgroundTask, CortexToolRuntime } from './tools/runtime.js';
+import type { CortexToolRuntime } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { PromptWatchdogDiagnostics } from './prompt-diagnostics.js';
 import type { CortexTool } from './tool-contract.js';
@@ -431,23 +436,6 @@ const MAX_DEAD_LETTERED_RESULTS = 50;
  * behind them (see DeadLetteredBackgroundResult.taskId).
  */
 const WAKE_DELIVERY_DEAD_LETTER_ID = 'wake-delivery';
-
-/**
- * Escape text interpolated into the <background-tasks> block. Task
- * instructions, tool summaries, commands, and stdout tails are untrusted;
- * without escaping they could forge or terminate the block's XML-ish tags.
- */
-function escapeBackgroundStateText(value: string): string {
-  return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;');
-}
-
-/** Attribute values additionally escape double quotes (they sit inside "..."). */
-function escapeBackgroundStateAttribute(value: string): string {
-  return escapeBackgroundStateText(value).replaceAll('"', '&quot;');
-}
 
 // ---------------------------------------------------------------------------
 // AgentLoop
@@ -4571,7 +4559,7 @@ export class AgentLoop {
       const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
       const toolName = payload?.toolName ?? 'unknown';
       const args = payload?.args ?? {};
-      const summary = this.summarizeToolArgs(toolName, args);
+      const summary = summarizeToolActivity(toolName, args);
       // childTaskId is a path when the event was re-forwarded from a deeper
       // descendant; attribute activity to this loop's direct child (the
       // first segment), which is the task ID the manager tracks.
@@ -4581,88 +4569,19 @@ export class AgentLoop {
   }
 
   /**
-   * Build a short summary of tool args for background state display.
-   */
-  private summarizeToolArgs(toolName: string, args: Record<string, unknown>): string {
-    const subject = toolCallSubject(toolName, args);
-    if ('command' in subject) return String(subject.command ?? '').slice(0, 60);
-    if ('path' in subject) return String(subject.path ?? '').split('/').pop() ?? '';
-    if ('pattern' in subject) return String(subject.pattern ?? '');
-    if ('url' in subject) return String(subject.url ?? '').slice(0, 60);
-    return '';
-  }
-
-  /**
    * Build a <background-tasks> block describing running sub-agents and
    * background bash processes. Returns null if nothing is running.
    * Called from transformContext before each LLM call.
    */
   private buildBackgroundTaskState(): string | null {
-    const sections: string[] = [];
-    const now = Date.now();
-
-    // Running sub-agents
-    for (const taskId of this.subAgentManager.getActiveTaskIds()) {
-      const entry = this.subAgentManager.get(taskId);
-      if (!entry) continue;
-
-      const durationSec = Math.round((now - entry.spawnedAt) / 1000);
-      const childAgent = entry.agent;
-      const tokens = (childAgent.currentContextTokenCount / 1000).toFixed(1);
-      const budget = childAgent.getBudgetGuard();
-      const turnsUsed = budget.getTurnCount();
-      const turnsMax = budget.getMaxTurns();
-      const turnsStr = turnsMax < Infinity ? `${turnsUsed}/${turnsMax}` : `${turnsUsed}`;
-      const instructions = escapeBackgroundStateText(entry.instructions.slice(0, 120));
-
-      let status = 'running';
-      let activityLine = '';
-
-      if (entry.pendingPermission) {
-        status = 'waiting-for-permission';
-        activityLine = `  Waiting for permission: ${escapeBackgroundStateText(entry.pendingPermission.toolName)}`;
-      } else if (entry.lastToolName && entry.lastToolStartedAt) {
-        const activityAgeSec = Math.round((now - entry.lastToolStartedAt) / 1000);
-        const summary = entry.lastToolSummary
-          ? ` ${escapeBackgroundStateText(entry.lastToolSummary)}`
-          : '';
-        activityLine = `  Current: ${escapeBackgroundStateText(entry.lastToolName)}${summary} (started ${activityAgeSec}s ago)`;
-      }
-
-      sections.push(
-        `<sub-agent id="${escapeBackgroundStateAttribute(taskId)}" status="${status}" duration="${durationSec}s" tools="${entry.toolCount}" tokens="${tokens}k" turns="${turnsStr}">\n` +
-        `  Instructions: ${instructions}\n` +
-        (activityLine ? `${activityLine}\n` : '') +
-        `</sub-agent>`,
-      );
-    }
-
-    // Running background bash processes
-    const bgTasks = this.tools.runtime.backgroundTasks.getAll();
-    for (const [taskId, task] of bgTasks) {
-      if (task.completed) continue;
-
-      const durationSec = Math.round((now - task.startTime) / 1000);
-      const command = task.command || taskId;
-      const lastLines = task.stdout
-        ? escapeBackgroundStateText(task.stdout.split('\n').filter(Boolean).slice(-3).join('\n  '))
-        : '';
-
-      let content = '';
-      if (lastLines) {
-        content = `  Last output:\n  ${lastLines}\n`;
-      }
-
-      sections.push(
-        `<bash id="${escapeBackgroundStateAttribute(taskId)}" status="running" duration="${durationSec}s" command="${escapeBackgroundStateAttribute(String(command).slice(0, 80))}">\n` +
-        content +
-        `</bash>`,
-      );
-    }
-
-    if (sections.length === 0) return null;
-
-    return `<background-tasks>\n${sections.join('\n\n')}\n</background-tasks>`;
+    const subAgents = this.subAgentManager.getActiveTaskIds()
+      .map((taskId) => this.subAgentManager.get(taskId))
+      .filter((entry): entry is TrackedSubAgent => entry !== undefined);
+    return buildBackgroundTaskState({
+      subAgents,
+      bashTasks: this.tools.runtime.backgroundTasks.getAll(),
+      now: Date.now(),
+    });
   }
 
   /**
@@ -5281,45 +5200,12 @@ export class AgentLoop {
    */
   private formatPendingCompletion(item: PendingBackgroundCompletion): string | null {
     if (item.kind === 'subagent') {
-      return this.formatBackgroundResult(item.taskId, item.result);
+      return formatSubAgentCompletion(item.taskId, item.result);
     }
     const task = this.tools.runtime.backgroundTasks.get(item.taskId);
     if (!task || !task.completed || task.notified) return null;
     task.notified = true;
-    return this.formatBashCompletion(task);
-  }
-
-  private formatBashCompletion(task: BackgroundTask): string {
-    const header = task.exitCode === 0
-      ? `[Background command ${task.id} completed]`
-      : `[Background command ${task.id} failed]`;
-    const exit = task.exitCode === null ? 'unknown' : String(task.exitCode);
-    const durationSec = ((Date.now() - task.startTime) / 1000).toFixed(1);
-    const meta = `\`${task.command}\` (exit code: ${exit}, ${durationSec}s)`;
-
-    const cap = 30000;
-    const stdout = task.stdout.length > cap ? task.stdout.slice(-cap) : task.stdout;
-    const stderr = task.stderr.length > cap ? task.stderr.slice(-cap) : task.stderr;
-    let body = '';
-    if (stdout) body += `\n\nOutput:\n${stdout}`;
-    if (stderr) body += `\n\nStderr:\n${stderr}`;
-    if (!stdout && !stderr) body = '\n\nNo output was produced.';
-    return `${header} ${meta}${body}`;
-  }
-
-  private formatBackgroundResult(taskId: string, result: SubAgentResult): string {
-    const header = result.status === 'completed'
-      ? `[Background sub-agent ${taskId} completed]`
-      : result.status === 'timed_out'
-        ? `[Background sub-agent ${taskId} timed out; partial output below]`
-        : `[Background sub-agent ${taskId} failed]`;
-
-    const usage = `(${result.usage.turns} turns, $${result.usage.cost.toFixed(4)}, ${(result.usage.durationMs / 1000).toFixed(1)}s)`;
-
-    if (result.output) {
-      return `${header} ${usage}\n\n${result.output}`;
-    }
-    return `${header} ${usage}\n\nNo output was produced.`;
+    return formatBashCompletion(task);
   }
 
   private async createChildAgent(params: {
