@@ -288,6 +288,9 @@ export interface LoopOriginContext {
   loopPath: string;
 }
 
+/** Loop identity used when the consumer does not configure one. */
+export const DEFAULT_LOOP_PATH = 'main';
+
 // ---------------------------------------------------------------------------
 // Agent Configuration
 // ---------------------------------------------------------------------------

@@ -51,6 +51,9 @@ const COMPAT: Record<string, Kind> = {
   toolRuntime: 'getter',
   buildChildToolSet: 'method',
   buildBackgroundTaskState: 'method',
+  registerPendingAsk: 'method',
+  settlePendingAsk: 'method',
+  wrapChildPermissionResolver: 'method',
 };
 
 function descriptorOf(name: string): PropertyDescriptor | undefined {

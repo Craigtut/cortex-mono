@@ -20,10 +20,7 @@
 
 import { ContextManager } from './context-manager.js';
 import type { AgentContext, AgentMessage } from './context-manager.js';
-import {
-  computeCacheBreakpointIndices,
-  applyCacheBreakpoints,
-} from './cache-breakpoints.js';
+import { computeCacheBreakpointIndices } from './cache-breakpoints.js';
 import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-breakpoints.js';
 import { EventBridge } from './event-bridge.js';
 import type { CortexEvent } from './event-bridge.js';
@@ -45,7 +42,6 @@ import {
   userMessageText,
   withPlaceholderContent,
 } from './pi-message.js';
-import { renderPermissionRequest } from './permission-rendering.js';
 import type { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
 import { isContextOverflow } from './compaction/failsafe.js';
@@ -54,12 +50,7 @@ import { DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS } from './compaction/observa
 import { createRecallTool } from './compaction/observational/recall-tool.js';
 import { SubAgentManager } from './sub-agent-manager.js';
 import type { SkillRegistry } from './skill-registry.js';
-import { createSubAgentTool, SUB_AGENT_TOOL_NAME } from './tools/sub-agent.js';
-import {
-  BASH_ESCALATION_PERMISSION_NAME,
-  isBashEscalationRequest,
-} from './tools/bash/index.js';
-import { unwrapModel } from './model-wrapper.js';
+import { createSubAgentTool } from './tools/sub-agent.js';
 import type { CortexModel } from './model-wrapper.js';
 import { SystemPromptState } from './agent-loop/system-prompt.js';
 import { HandlerList } from './agent-loop/handler-list.js';
@@ -72,6 +63,14 @@ import { SkillBinding } from './agent-loop/skills.js';
 import { createBuiltinTools } from './agent-loop/builtin-tools.js';
 import { ToolRegistry } from './agent-loop/tool-registry.js';
 import { McpAttachment } from './agent-loop/mcp-attachment.js';
+import { mirrorChildPermissionResolver, PendingAskRegistry } from './agent-loop/permissions.js';
+import {
+  buildPiAgentConfig,
+  loadAgentClass,
+  ToolResultFinalizer,
+  wirePiTransformContext,
+} from './agent-loop/pi-hooks.js';
+import type { PiHookHost, ToolResultInterceptor } from './agent-loop/pi-hooks.js';
 import {
   buildBackgroundTaskState,
   formatBashCompletion,
@@ -113,13 +112,11 @@ import type {
   BudgetScope,
   CortexCompactionConfig,
   PendingAsk,
-  CortexToolPermissionDecision,
-  CortexToolPermissionResult,
-  ToolPermissionRequestContext,
   LoopOriginContext,
   ThinkingLevel,
   ModelThinkingCapabilities,
 } from './types.js';
+import { DEFAULT_LOOP_PATH } from './types.js';
 import {
   clampToSupported,
   fromPiThinkingLevel,
@@ -130,13 +127,18 @@ import type {
   AgentLoopConstructorOptions,
   CacheRetention,
   PiAgent,
-  PiModel,
   QueueDrainMode,
   RegisteredTool,
 } from './agent-loop/pi-agent.js';
 
 export type { PiAgent, PiModel, QueueDrainMode } from './agent-loop/pi-agent.js';
 export type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
+export { TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop/pi-hooks.js';
+export type {
+  ToolResultInterceptor,
+  ToolResultInterceptorInfo,
+  ToolResultInterceptorResult,
+} from './agent-loop/pi-hooks.js';
 
 /** Leading context slot used to seed a sub-agent with background context. */
 const CHILD_SEED_CONTEXT_SLOT = '_seed_context';
@@ -156,12 +158,6 @@ const HEADLINE_TRUNCATION_MARKER = '\n[headline block truncated]';
  * Legacy fallback for unknown capacity. Explicit budgets have no minimum floor.
  */
 export { MINIMUM_CONTEXT_WINDOW } from './context-budget.js';
-
-/**
- * Operational reminder appended to tool results when working tags are enabled.
- * Exported so consumers (e.g., cortex-code TUI) can strip it from display text.
- */
-export const TOOL_RESULT_WORKING_TAGS_REMINDER = '[Do not narrate. If analyzing these results, use <working> tags. Only text outside <working> tags is shown to the user.]';
 
 /** Options for {@link AgentLoop.deliver}. */
 export interface DeliverOptions {
@@ -209,46 +205,6 @@ export interface DeliverOptions {
    */
   atTurnBoundary?: boolean;
 }
-
-/**
- * What the owner-installed tool-result interceptor receives per finalized
- * tool call (see {@link AgentLoop.setToolResultInterceptor}).
- */
-export interface ToolResultInterceptorInfo {
-  toolName: string;
-  /** Validated tool arguments as pi passed them to execute. */
-  args: unknown;
-  /**
-   * The assistant message that carried this tool call (pi's message shape,
-   * opaque). Lets an interceptor inspect the spoken text alongside the call.
-   */
-  assistantMessage: unknown;
-  /** The finalized result (content in pi's block shape). */
-  result: { content: unknown };
-  isError: boolean;
-}
-
-/**
- * Overrides returned by a tool-result interceptor. Absent fields leave the
- * result untouched.
- */
-export interface ToolResultInterceptorResult {
-  /** Replacement result content (pi block shape or plain string). */
-  content?: unknown;
-  /**
-   * Explicit override of the result's terminate flag. `false` suppresses a
-   * tool-set `terminate: true`, forcing a follow-up turn; `true` ends the
-   * batch after this call.
-   */
-  terminate?: boolean;
-  /** Skip the working-tags reminder appendix for this result. */
-  suppressWorkingTagsReminder?: boolean;
-}
-
-/** Owner-installed hook over finalized tool results. */
-export type ToolResultInterceptor = (
-  info: ToolResultInterceptorInfo,
-) => ToolResultInterceptorResult | undefined | null;
 
 /** Which branch of the deliver() state machine handled a delivery. */
 export type DeliverOutcome = 'prompted' | 'parked' | 'queued';
@@ -370,16 +326,6 @@ type PendingBackgroundCompletion = (
    */
   formattedMessage?: string;
 };
-
-/** Returned by the permission race when the run aborted before the consumer answered. */
-const PERMISSION_RACE_ABORTED = Symbol('permission-race-aborted');
-
-/** Block reason for a tool call whose permission ask was cut short by abort. */
-const ABORTED_PERMISSION_REASON =
-  'The run was aborted before this tool call was approved; it was not run.';
-
-/** Loop identity used when the consumer does not configure one. */
-const DEFAULT_LOOP_PATH = 'main';
 
 /**
  * Wrap a logger so every message carries the loop's identity prefix. All
@@ -526,20 +472,15 @@ export class AgentLoop {
   // deliveries are cancelled like the aborted turn) and on destroy().
   private pendingWakeDeliveries: QueuedDelivery[] = [];
 
-  // Permission asks currently blocked on a resolver decision, keyed by their
-  // per-ask nonce. Covers this loop's own asks plus (mirrored) its
-  // children's, so one query surfaces the whole subtree. Entries are removed
-  // the moment an ask settles, however it settles.
-  private readonly pendingAsks = new Map<string, PendingAsk>();
-  /** Resolvers blocked in waitForAskSettlement(), woken on any settlement. */
-  private askSettlementWaiters: Array<() => void> = [];
+  // Permission asks blocked on a resolver decision (this loop's and its children's)
+  private readonly asks = new PendingAskRegistry();
 
   // Consumer-fed headline block: rebuilt from the provider on every LLM
   // call, view-injected after the BP3 cache boundary (never in the cached
   // prefix, never in the transcript), hard token-capped.
   private headlineProvider: (() => string | null) | null = null;
-  /** Owner-installed tool-result hook (see setToolResultInterceptor). */
-  private toolResultInterceptor: ToolResultInterceptor | null = null;
+  /** Tool-result interceptor and working-tags reminder (pi's afterToolCall). */
+  private readonly finalizer: ToolResultFinalizer;
   private headlineMaxTokens = DEFAULT_HEADLINE_MAX_TOKENS;
 
   // Set while digestIdle() runs the transform pipeline, so the compaction
@@ -691,6 +632,10 @@ export class AgentLoop {
       },
       logger: this.logger,
       loopPath: this.loopPath,
+    });
+    this.finalizer = new ToolResultFinalizer({
+      workingTagsEnabled: () => this.workingTagsEnabled,
+      logger: this.logger,
     });
     this.systemPrompt = new SystemPromptState({
       agentState: () => this.agent.state,
@@ -2201,7 +2146,7 @@ export class AgentLoop {
    * however it settles (answered, blocked, or aborted).
    */
   getPendingAsks(): PendingAsk[] {
-    return [...this.pendingAsks.values()].map((ask) => ({ ...ask }));
+    return this.asks.list();
   }
 
   /**
@@ -2211,10 +2156,7 @@ export class AgentLoop {
    * false for an unknown or already-settled askId.
    */
   markAskVoiced(askId: string): boolean {
-    const ask = this.pendingAsks.get(askId);
-    if (!ask) return false;
-    ask.voiced = true;
-    return true;
+    return this.asks.markVoiced(askId);
   }
 
   /**
@@ -2226,16 +2168,7 @@ export class AgentLoop {
    * outlives the work that raised it.
    */
   async waitForAskSettlement(): Promise<void> {
-    if (this.pendingAsks.size === 0) return;
-    return new Promise<void>((resolve) => {
-      this.askSettlementWaiters.push(resolve);
-    });
-  }
-
-  /** Wake everything blocked in {@link waitForAskSettlement}. */
-  private notifyAskSettlement(): void {
-    const waiters = this.askSettlementWaiters.splice(0);
-    for (const waiter of waiters) waiter();
+    return this.asks.waitForSettlement();
   }
 
   // -----------------------------------------------------------------------
@@ -2283,7 +2216,7 @@ export class AgentLoop {
    * path, which for control tools would reopen the very loop D17 closes.
    */
   setToolResultInterceptor(interceptor: ToolResultInterceptor | null): void {
-    this.toolResultInterceptor = interceptor;
+    this.finalizer.setInterceptor(interceptor);
   }
 
   /**
@@ -2309,17 +2242,6 @@ export class AgentLoop {
       this.headlineMaxTokens * 4 - HEADLINE_TRUNCATION_MARKER.length,
     );
     return content.slice(0, budgetChars) + HEADLINE_TRUNCATION_MARKER;
-  }
-
-  /** Track an ask for the lifetime of its resolver call. */
-  private registerPendingAsk(ask: PendingAsk): void {
-    this.pendingAsks.set(ask.askId, ask);
-  }
-
-  /** Remove an ask once its resolver call settles (any outcome). */
-  private settlePendingAsk(askId: string): void {
-    this.pendingAsks.delete(askId);
-    this.notifyAskSettlement();
   }
 
   /**
@@ -2408,288 +2330,36 @@ export class AgentLoop {
   // Static Factory
   // -----------------------------------------------------------------------
 
-  private static async loadAgentClass(errorMessage: string): Promise<new (config: Record<string, unknown>) => PiAgent> {
-    try {
-      const piAgentCore = await import('@earendil-works/pi-agent-core');
-      return piAgentCore.Agent as unknown as new (config: Record<string, unknown>) => PiAgent;
-    } catch {
-      throw new Error(errorMessage);
-    }
-  }
-
   private static buildPiAgentConfig(params: {
     cortexConfig: AgentLoopConfig;
     initialSystemPrompt?: string;
     cacheBreakpointState: { agentLoop: AgentLoop | null };
   }): Record<string, unknown> {
-    const { cortexConfig, initialSystemPrompt = '', cacheBreakpointState } = params;
-    const rawModel = unwrapModel(cortexConfig.model) as PiModel;
-    const agentConfig: Record<string, unknown> = {
-      initialState: {
-        systemPrompt: initialSystemPrompt,
-        model: rawModel,
-        tools: [],
-        messages: [],
-        ...(cortexConfig.thinkingLevel !== undefined && {
-          thinkingLevel: toPiThinkingLevel(cortexConfig.thinkingLevel),
-        }),
-      },
-      getApiKey: cortexConfig.getApiKey,
-      toolExecution: cortexConfig.toolExecution ?? 'sequential',
-    };
-
-    agentConfig['streamFn'] = async (model: unknown, context: unknown, options?: Record<string, unknown>) => {
-      // streamSimple lives on pi-ai 0.80's temporary /compat shim (Phase 2 migrates this).
-      const { streamSimple } = await import('@earendil-works/pi-ai/compat');
-      const retention = cacheBreakpointState.agentLoop?._activePromptCacheRetention
-        ?? cacheBreakpointState.agentLoop?.models.cacheRetention
-        ?? null;
-      const sessionId = cacheBreakpointState.agentLoop?.models.sessionId ?? null;
-      let streamOptions = options;
-      if (retention || sessionId) {
-        streamOptions = { ...options };
-        if (retention) (streamOptions as Record<string, unknown>)['cacheRetention'] = retention;
-        if (sessionId) (streamOptions as Record<string, unknown>)['sessionId'] = sessionId;
-      }
-      return streamSimple(model as any, context as any, streamOptions as any);
-    };
-
-    if (cortexConfig.resolvePermission || cortexConfig.sandbox?.checkToolCall) {
-      const resolver = cortexConfig.resolvePermission;
-      const sandboxConfigured = cortexConfig.sandbox !== undefined;
-      const loopPath = cortexConfig.loopPath ?? DEFAULT_LOOP_PATH;
-      agentConfig['beforeToolCall'] = async (ctx: unknown, signal?: AbortSignal) => {
-        const { toolCall, args } = ctx as { toolCall: { name: string }; args: unknown };
-        const sandboxDenial = cortexConfig.sandbox?.checkToolCall?.(toolCall.name, args, cortexConfig.workingDirectory);
-        if (sandboxDenial) return { block: true, reason: sandboxDenial };
-        if (!resolver) return undefined;
-        // Spawning a sub-agent is an internal orchestration decision, not a
-        // side-effecting operation. Always allow without prompting.
-        if (toolCall.name === SUB_AGENT_TOOL_NAME) return undefined;
-        // Cortex-internal orchestration tools (permissionExempt on the
-        // registered tool) never consult the consumer's resolver: prompting
-        // a user to approve Deliver or recall is asking permission to run
-        // Cortex's own plumbing. The flag is read off the loop's registry,
-        // never off the call, and MCP tools are refused inside the lookup.
-        if (cacheBreakpointState.agentLoop?.isToolPermissionExempt(toolCall.name)) {
-          return undefined;
-        }
-        // An already-aborted run never consults the resolver: pi only checks
-        // the signal AFTER this hook, and a consumer prompt for a dead run
-        // would flash pointlessly.
-        if (signal?.aborted) {
-          return { block: true, reason: ABORTED_PERMISSION_REASON };
-        }
-        // A Bash call requesting to run outside the sandbox reaches the
-        // resolver under a distinct synthetic name, so plain-Bash rules and
-        // auto-approve paths cannot silently authorize an uncontained run and
-        // the consumer can prompt the human distinctly. Only meaningful when a
-        // sandbox is configured; without one the flag changes nothing.
-        const escalation = sandboxConfigured && isBashEscalationRequest(toolCall.name, args);
-        const permissionName = escalation ? BASH_ESCALATION_PERMISSION_NAME : toolCall.name;
-        // Each ask carries a fresh nonce plus the asking loop's identity, so
-        // a consumer fielding several concurrent loops can key prompt state
-        // per ask and attribute it. The nonce is security-relevant (consent
-        // binding keys on it): crypto-random, never reused, never derived.
-        const askId = `ask-${crypto.randomUUID()}`;
-        const renderedRequest = renderPermissionRequest(permissionName, args);
-        const askContext: ToolPermissionRequestContext = {
-          askId,
-          loopPath,
-          renderedRequest,
-          ...(signal ? { signal } : {}),
-        };
-        // Track the ask in the loop's pending-ask registry for the lifetime
-        // of the resolver call, so a facade can enumerate what is currently
-        // blocked and voice it.
-        const owner = cacheBreakpointState.agentLoop;
-        owner?.registerPendingAsk({
-          askId,
-          loopPath,
-          toolName: permissionName,
-          renderedRequest,
-          requestedAt: Date.now(),
-          voiced: false,
-        });
-        // Race the consumer's decision against the run's abort signal. pi
-        // awaits this hook before checking the signal, so without the race a
-        // pending human approval would hang abort/destroy into the force-kill
-        // path. The signal is also passed to the resolver so the consumer UI
-        // can dismiss the moot prompt.
-        let resolution: boolean | CortexToolPermissionResult | typeof PERMISSION_RACE_ABORTED;
-        try {
-          resolution = await AgentLoop.raceResolutionAgainstAbort(
-            resolver(permissionName, args, askContext),
-            signal,
-          );
-        } finally {
-          owner?.settlePendingAsk(askId);
-        }
-        if (resolution === PERMISSION_RACE_ABORTED) {
-          return { block: true, reason: ABORTED_PERMISSION_REASON };
-        }
-        const decision = AgentLoop.normalizePermissionDecision(resolution);
-        if (decision.decision !== 'allow') {
-          return {
-            block: true,
-            reason: decision.reason ?? (escalation
-              ? 'Escalation outside the sandbox was denied for this command; it was not run. Re-run without escalateOutsideSandbox to execute inside the sandbox.'
-              : AgentLoop.buildPermissionReason(permissionName, decision.decision)),
-          };
-        }
-        return undefined;
-      };
-    }
-
-    agentConfig['afterToolCall'] = async (ctx: unknown) => {
-      const agent = cacheBreakpointState.agentLoop;
-      if (!agent) return undefined;
-      agent.tools.syncActiveLoopTools(ctx);
-
-      const { toolCall, assistantMessage, args, result, isError } = ctx as {
-        toolCall: { name: string };
-        assistantMessage?: unknown;
-        args?: unknown;
-        result: { content: unknown };
-        isError: boolean;
-        context: unknown;
-      };
-
-      // Owner-installed interception runs first so it can suppress the
-      // reminder appendix below (control tools carry bare receipts, D17). A
-      // throwing interceptor is swallowed: pi wraps afterToolCall failures
-      // into error results WITHOUT terminate, which would reopen the loop
-      // the interceptor exists to bound.
-      let intercept: ToolResultInterceptorResult | undefined;
-      if (agent.toolResultInterceptor) {
-        try {
-          intercept = agent.toolResultInterceptor({
-            toolName: toolCall.name,
-            args,
-            assistantMessage,
-            result,
-            isError,
-          }) ?? undefined;
-        } catch (err) {
-          // The consumer's logger is itself untrusted here: if it throws,
-          // the error propagates out of afterToolCall and pi wraps it into
-          // an error result WITHOUT terminate, exactly the D17 shape this
-          // catch exists to prevent.
-          try {
-            agent.logger.error('tool result interceptor threw; ignoring', {
-              toolName: toolCall.name,
-              error: errorMessageOf(err),
-            });
-          } catch {
-            // Nothing safe left to report to.
-          }
-        }
-      }
-
-      const override: { content?: unknown; terminate?: boolean } = {};
-      if (intercept?.content !== undefined) override.content = intercept.content;
-      if (intercept?.terminate !== undefined) override.terminate = intercept.terminate;
-
-      if (
-        agent.isWorkingTagsEnabled &&
-        !isError &&
-        intercept?.suppressWorkingTagsReminder !== true
-      ) {
-        const reminder = '\n\n' + TOOL_RESULT_WORKING_TAGS_REMINDER;
-        const content = override.content ?? result.content;
-        if (typeof content === 'string') {
-          override.content = content + reminder;
-        } else if (Array.isArray(content)) {
-          override.content = [...content, { type: 'text', text: reminder }];
-        }
-      }
-
-      return override.content !== undefined || override.terminate !== undefined
-        ? override
-        : undefined;
-    };
-
-    agentConfig['onPayload'] = async (payload: Record<string, unknown>, model: Record<string, unknown>) => {
-      const agent = cacheBreakpointState.agentLoop;
-      if (!agent) return undefined;
-
-      const provider = (model as Record<string, unknown>)['provider'];
-      if (provider !== 'anthropic') return undefined;
-
-      const indices = agent._cacheBreakpointIndices;
-      if (!indices) return undefined;
-
-      return applyCacheBreakpoints(payload, indices);
-    };
-
-    return agentConfig;
-  }
-
-  private static normalizePermissionDecision(
-    resolution: boolean | CortexToolPermissionResult,
-  ): CortexToolPermissionResult {
-    if (typeof resolution === 'boolean') {
-      return { decision: resolution ? 'allow' : 'block' };
-    }
-    return resolution;
-  }
-
-  /**
-   * Race a permission resolution against the run's abort signal. Resolves
-   * with PERMISSION_RACE_ABORTED when the signal fires first, so a pending
-   * consumer ask can never keep the loop from observing an abort. A late
-   * settlement of the resolver promise is ignored (its rejection handled).
-   */
-  private static raceResolutionAgainstAbort<T>(
-    resolution: Promise<T>,
-    signal: AbortSignal | undefined,
-  ): Promise<T | typeof PERMISSION_RACE_ABORTED> {
-    if (!signal) return resolution;
-    if (signal.aborted) {
-      // Consume a possible late rejection so it never surfaces as unhandled.
-      resolution.catch(() => {});
-      return Promise.resolve(PERMISSION_RACE_ABORTED);
-    }
-    return new Promise<T | typeof PERMISSION_RACE_ABORTED>((resolve, reject) => {
-      const onAbort = (): void => resolve(PERMISSION_RACE_ABORTED);
-      signal.addEventListener('abort', onAbort, { once: true });
-      resolution.then(
-        (value) => {
-          signal.removeEventListener('abort', onAbort);
-          resolve(value);
-        },
-        (err) => {
-          signal.removeEventListener('abort', onAbort);
-          reject(err);
-        },
-      );
+    const { cacheBreakpointState } = params;
+    return buildPiAgentConfig({
+      cortexConfig: params.cortexConfig,
+      ...(params.initialSystemPrompt !== undefined ? { initialSystemPrompt: params.initialSystemPrompt } : {}),
+      host: () => cacheBreakpointState.agentLoop?.piHookHost() ?? null,
     });
   }
 
-  private static buildPermissionReason(
-    toolName: string,
-    decision: CortexToolPermissionDecision,
-  ): string {
-    if (decision === 'ask') {
-      return `Tool "${toolName}" requires approval before it can run.`;
-    }
-    return `Tool "${toolName}" is blocked or disabled.`;
+  /** The loop as pi's hooks see it (see pi-hooks.ts). */
+  private piHookHost(): PiHookHost {
+    return {
+      isToolPermissionExempt: (toolName) => this.isToolPermissionExempt(toolName),
+      asks: this.asks,
+      streamOptions: () => ({
+        retention: this._activePromptCacheRetention ?? this.models.cacheRetention ?? null,
+        sessionId: this.models.sessionId ?? null,
+      }),
+      syncActiveLoopTools: (ctx) => this.tools.syncActiveLoopTools(ctx),
+      finalizer: this.finalizer,
+      cacheBreakpointIndices: () => this._cacheBreakpointIndices,
+    };
   }
 
   private static wireManagedPiAgent(agentLoop: AgentLoop, piAgent: PiAgent): void {
-    const hook = agentLoop.getTransformContextHook();
-    piAgent.transformContext = async (messages: unknown[]) => {
-      const result = await hook({
-        systemPrompt: piAgent.state.systemPrompt ?? '',
-        model: piAgent.state.model ?? null,
-        messages: messages as AgentMessage[],
-        tools: (piAgent.state.tools ?? []) as unknown[],
-        thinkingLevel: typeof piAgent.state.thinkingLevel === 'string'
-          ? piAgent.state.thinkingLevel
-          : 'medium',
-      });
-      return result.messages;
-    };
+    wirePiTransformContext(piAgent, agentLoop.getTransformContextHook());
   }
 
   private static async createManagedAgent(params: {
@@ -2709,7 +2379,7 @@ export class AgentLoop {
       missingDependencyMessage,
     } = params;
 
-    const AgentClass = await AgentLoop.loadAgentClass(missingDependencyMessage);
+    const AgentClass = await loadAgentClass(missingDependencyMessage);
     const cacheBreakpointState = { agentLoop: null as AgentLoop | null };
     const agentConfigParams: {
       cortexConfig: AgentLoopConfig;
@@ -4348,10 +4018,7 @@ export class AgentLoop {
     // Parked wake deliveries share that contract: the sweep task no-ops
     // during teardown, so drop the parked content too.
     this.pendingWakeDeliveries = [];
-    // Any ask still pending at teardown settles as a block via the abort
-    // race; the registry entries just have not been reaped yet.
-    this.pendingAsks.clear();
-    this.notifyAskSettlement();
+    this.asks.clear();
     // deadLetteredBackgroundResults is deliberately NOT cleared: it is the
     // consumer's bounded post-mortem record of undelivered completed work,
     // and getDeadLetteredBackgroundResults() must still answer after
@@ -5343,62 +5010,17 @@ export class AgentLoop {
     return childAgent;
   }
 
-  /**
-   * Wrap the consumer's permission resolver for a child agent: mark the
-   * tracked entry as waiting for permission while the ask is pending, and
-   * clear the marker however the ask ends.
-   *
-   * When the child run aborts while the ask is pending, the race in the
-   * child's beforeToolCall proceeds with a block WITHOUT settling this
-   * resolver (the consumer may never answer the dismissed prompt), so the
-   * finally alone is not enough: the marker AND the mirrored registry entry
-   * are also cleared on the abort signal, or the entry lingers as
-   * 'waiting-for-permission' in status surfaces and getPendingAsks() keeps
-   * reporting an ask Cortex already blocked.
-   */
+  /** The consumer's resolver as a child sees it: mirrored into this loop's asks. */
   private wrapChildPermissionResolver(
     parentResolver: NonNullable<AgentLoopConfig['resolvePermission']>,
     childTaskId: string,
   ): NonNullable<AgentLoopConfig['resolvePermission']> {
-    const subAgentMgr = this.subAgentManager;
-    return async (toolName, toolArgs, context) => {
-      const entry = subAgentMgr.get(childTaskId);
-      if (entry) entry.pendingPermission = { toolName, args: toolArgs };
-      const askId = context?.askId;
-      const clearPending = (): void => {
-        const e = subAgentMgr.get(childTaskId);
-        if (e) e.pendingPermission = null;
-        // Settle the mirrored registry entry here too: on the abort path
-        // Cortex proceeds with a block WITHOUT waiting for the consumer's
-        // resolver, so the finally below (which does wait) may not run for
-        // a long time, or ever. Without this, getPendingAsks() keeps
-        // reporting an ask the loop already blocked.
-        if (askId !== undefined) this.settlePendingAsk(askId);
-      };
-      // Mirror the child's ask into this loop's registry so one
-      // getPendingAsks() query surfaces the whole subtree's blocked asks.
-      if (askId !== undefined) {
-        this.registerPendingAsk({
-          askId,
-          loopPath: context?.loopPath ?? `${this.loopPath}/${childTaskId}`,
-          toolName,
-          renderedRequest: context?.renderedRequest
-            ?? renderPermissionRequest(toolName, toolArgs),
-          requestedAt: Date.now(),
-          voiced: false,
-        });
-      }
-      const signal = context?.signal;
-      signal?.addEventListener('abort', clearPending, { once: true });
-      try {
-        // Forward the child run's abort signal so the consumer UI can
-        // dismiss a prompt made moot by the child being cancelled.
-        return await parentResolver(toolName, toolArgs, context);
-      } finally {
-        signal?.removeEventListener('abort', clearPending);
-        clearPending();
-      }
-    };
+    return mirrorChildPermissionResolver(parentResolver, {
+      asks: this.asks,
+      subAgents: this.subAgentManager,
+      childTaskId,
+      childLoopPath: `${this.loopPath}/${childTaskId}`,
+    });
   }
 
   private resolveChildPromptSeed(systemPrompt?: string): {
@@ -5565,6 +5187,14 @@ export class AgentLoop {
   // tests/unit/agent-loop-internals-contract.test.ts; removed once the
   // tests move onto the modules.
   // -----------------------------------------------------------------------
+
+  private registerPendingAsk(ask: PendingAsk): void {
+    this.asks.register(ask);
+  }
+
+  private settlePendingAsk(askId: string): void {
+    this.asks.settle(askId);
+  }
 
   private get trackedPids(): ReadonlySet<number> {
     return this.processes.pids;
