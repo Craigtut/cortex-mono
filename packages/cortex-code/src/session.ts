@@ -35,7 +35,6 @@ import {
   type ToolCallUpdatePayload,
 } from '@animus-labs/cortex';
 import { App, type AppCallbacks } from './tui/app.js';
-import { randomThinkingLabel } from './tui/spinner.js';
 import { resolveAgentMode, type CortexCodeConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { ApiKeyResolver } from './providers/api-key-resolver.js';
@@ -62,6 +61,7 @@ import { WorkTracker } from './session/work-tracker.js';
 import { LoopRouting } from './session/loop-routing.js';
 import { SubAgentActivity } from './session/sub-agent-activity.js';
 import { AssistantStream } from './session/assistant-stream.js';
+import { TurnRunner } from './session/turn-runner.js';
 import { SessionStatusView, readGitBranch } from './session/status-view.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
@@ -104,13 +104,7 @@ export class Session {
   private readonly isResume: boolean;
   private readonly checkpoints: SessionCheckpoints;
   private readonly work: WorkTracker;
-  /**
-   * True once the onError handler has surfaced the current turn's failure. The
-   * agent framework both emits an error (via onError) and re-throws it out of
-   * prompt(); without this guard the prompt() catch would render the same
-   * failure a second time as a generic "Error". Reset at the start of each turn.
-   */
-  private lastTurnErrorHandled = false;
+  private readonly turns: TurnRunner;
   private readonly retry = new RetryStatusLine(() => this.app);
   private readonly subAgents = new SubAgentActivity(() => this.app);
   private readonly stream = new AssistantStream(() => this.app);
@@ -246,6 +240,23 @@ export class Session {
       sandbox: this.sandbox,
       getApp: () => this.app,
       getYoloMode: () => this.yoloMode,
+    });
+    this.turns = new TurnRunner({
+      getAgent: () => this.agent,
+      getApp: () => this.app,
+      getTitleManager: () => this.titleManager,
+      activity: this.activity,
+      transcriptWriter: {
+        addUserMessage: (text) => this.transcriptWriter.addUserMessage(text),
+      },
+      retry: this.retry,
+      status: this.status,
+      work: this.work,
+      applyPreTurnHooks: (text) => applyPreTurnHooks(
+        this.hookHandlers?.pre_turn ?? [],
+        { sessionId: this.sessionId, cwd: this.cwd },
+        text,
+      ),
     });
     this.updatePrompt = new UpdatePrompt({
       getApp: () => this.app,
@@ -398,7 +409,7 @@ export class Session {
     return this.updatePrompt.show(info);
   }
 
-  /** Handle user input (slash command or agent prompt). */
+  /** Handle user input: a slash command, or a turn for the agent. */
   private async handleInput(text: string): Promise<void> {
     // Check for slash commands
     if (text.startsWith('/')) {
@@ -418,85 +429,7 @@ export class Session {
       }
     }
 
-    if (!this.agent) return;
-
-    // If the CONVERSATION is already mid-turn, steer it with the new
-    // message. Deliberately narrower than isRunning: under duplex the
-    // reasoner can be minutes into a task while the talker is free, and the
-    // user's next sentence belongs to the talker as a fresh prompt, not
-    // steered into a loop that is not listening for it.
-    if (this.work.promptInFlight || !this.agent.conversationIdle) {
-      log.info('Steering agent with user message', { text: text.slice(0, 100) });
-      void this.activity.recordWorking();
-      this.app!.transcript.addUserMessage(text);
-      this.transcriptWriter.addUserMessage(text);
-      this.titleManager?.recordUserPrompt(text);
-      this.agent.steer(text);
-      return;
-    }
-
-    log.info('User prompt', { text: text.slice(0, 100) });
-
-    // A fresh turn supersedes any terminal "gave up, send a message" retry line.
-    this.retry.clear();
-
-    // Add user message to transcript
-    this.app!.transcript.addUserMessage(text);
-    this.transcriptWriter.addUserMessage(text);
-    this.titleManager?.recordUserPrompt(text);
-
-    // Update ephemeral context
-    await this.status.refreshEnvironment();
-
-    // Show spinner
-    this.app!.showStatusSpinner(randomThinkingLabel());
-    this.work.beginPrompt();
-    await this.activity.recordWorking();
-
-    // Run pre_turn hooks: outside processes can inject context the agent
-    // should see before this turn (e.g. inter-agent message notifications).
-    // Failures inside individual handlers are logged but do not block the
-    // turn.
-    const promptForAgent = await applyPreTurnHooks(
-      this.hookHandlers?.pre_turn ?? [],
-      { sessionId: this.sessionId, cwd: this.cwd },
-      text,
-    );
-
-    this.lastTurnErrorHandled = false;
-    try {
-      await this.agent.prompt(promptForAgent);
-    } catch (err) {
-      log.error('Prompt error', { error: err instanceof Error ? err.message : String(err) });
-      void this.activity.recordError(err instanceof Error ? err : String(err));
-      // Classified errors are already surfaced by the onError handler, which
-      // both emits and lets the error re-throw here. Only handle throws it did
-      // NOT show: stream interruptions and truly-unexpected errors. Shutdown
-      // (destroying/destroyed) rejects a pending prompt with a lifecycle
-      // error that must not surface as an error toast.
-      const agentState = this.agent?.state;
-      if (
-        agentState !== 'destroyed' &&
-        agentState !== 'destroying' &&
-        !this.lastTurnErrorHandled
-      ) {
-        const message = err instanceof Error ? err.message : String(err);
-        // Check if this is a stream interruption (partial response already displayed)
-        if (message.includes('stream') || message.includes('aborted') || message.includes('interrupted')) {
-          this.app!.transcript.appendAssistantChunk('\n\n[response interrupted]');
-          this.app!.transcript.finalizeAssistantMessage();
-        } else {
-          this.app!.transcript.addNotification('Error', message, { severity: 'error' });
-        }
-      }
-    } finally {
-      this.work.endPrompt();
-      // The turn is NOT necessarily over: under duplex prompt() resolves
-      // when the talker has spoken, with the reasoner still working. Hand
-      // the "we are done" UI to the settlement watcher, which reads the
-      // whole agent rather than the loop that happened to finish first.
-      this.work.watchForSettled();
-    }
+    await this.turns.submit(text);
   }
 
   /**
@@ -677,7 +610,7 @@ export class Session {
       void this.activity.recordError(error, error.severity === 'fatal');
       // The framework emits here and then re-throws out of prompt(); mark the
       // failure handled so the prompt() catch does not render it a second time.
-      this.lastTurnErrorHandled = true;
+      this.turns.markErrorHandled();
       // Record the failure in the durable transcript so a turn that errored
       // before completing is visible, cause chain included. Skip user aborts.
       if (error.category !== 'cancelled') {
