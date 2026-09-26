@@ -18,7 +18,6 @@ const { version: PKG_VERSION } = require('../package.json');
 import {
   CortexAgent,
   ProviderManager,
-  INTERNAL_TAG_NAMES,
   type CortexModel,
   type CortexAgentConfig,
   type CortexEvent,
@@ -62,6 +61,7 @@ import { TitleManager } from './terminal/title-manager.js';
 import { WorkTracker } from './session/work-tracker.js';
 import { LoopRouting } from './session/loop-routing.js';
 import { SubAgentActivity } from './session/sub-agent-activity.js';
+import { AssistantStream } from './session/assistant-stream.js';
 import { SessionStatusView, readGitBranch } from './session/status-view.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
@@ -113,6 +113,7 @@ export class Session {
   private lastTurnErrorHandled = false;
   private readonly retry = new RetryStatusLine(() => this.app);
   private readonly subAgents = new SubAgentActivity(() => this.app);
+  private readonly stream = new AssistantStream(() => this.app);
   private readonly freezeDiagnostics: FreezeDiagnostics;
   private readonly activity: FileSessionActivityReporter;
   private readonly transcriptWriter: TranscriptWriter;
@@ -528,17 +529,10 @@ export class Session {
     this.wireActivityEvents(bridge);
 
     // Streaming response chunks
-    let assistantStarted = false;
-    let rawStreamText = '';
-    let workingTagOpen = false;
-
     bridge.on('response_start', (event: CortexEvent) => {
       if (event.childTaskId) return;
       if (!this.routing.isConversationEvent(event)) return;
-      assistantStarted = false;
-      rawStreamText = '';
-      workingTagOpen = false;
-      this.app!.removeWorkingTagSubtitle();
+      this.stream.begin();
     });
 
     bridge.on('response_chunk', (event: CortexEvent) => {
@@ -553,18 +547,7 @@ export class Session {
       // Text flowing again means a pending retry reconnected.
       this.retry.noteProgress();
 
-      if (!assistantStarted) {
-        this.app!.transcript.startAssistantMessage();
-        assistantStarted = true;
-      }
-      // Extract text delta from the pi-agent-core event data
-      const data = event.data as Record<string, unknown> | undefined;
-      const delta = this.extractTextDelta(data);
-      if (delta) {
-        rawStreamText += delta;
-        this.updateWorkingTagDisplay(rawStreamText, workingTagOpen, (open) => { workingTagOpen = open; });
-        this.app!.transcript.appendAssistantChunk(delta);
-      }
+      this.stream.chunk(event.data as Record<string, unknown> | undefined);
     });
 
     // Tool call lifecycle (uses typed payloads from EventBridge)
@@ -664,11 +647,8 @@ export class Session {
     // assistant_message record. We record here rather than on the raw `turn_end`
     // bridge event to avoid re-accumulating streamed response_chunks.
     this.agent.onTurnComplete((output: AgentTextOutput) => {
-      this.app!.transcript.finalizeAssistantMessage(output.userFacing);
+      this.stream.finish(output.userFacing);
       this.transcriptWriter.addAssistantMessage(output.userFacing);
-      assistantStarted = false;
-      rawStreamText = '';
-      workingTagOpen = false;
     });
 
     // A loop finished. Not "the agent is idle": this callback is registered
@@ -1112,64 +1092,6 @@ export class Session {
     if (freeze.promptWatchdogIntervalMs !== undefined) watchdog.heartbeatIntervalMs = freeze.promptWatchdogIntervalMs;
     if (freeze.abortWaitWarningMs !== undefined) watchdog.abortWaitWarningMs = freeze.abortWaitWarningMs;
     return { promptWatchdog: watchdog };
-  }
-
-  /** Extract text delta from a pi-agent-core message_update event. */
-  private extractTextDelta(data: Record<string, unknown> | undefined): string | null {
-    if (!data) return null;
-
-    // Pi-agent-core message_update events carry the streaming delta inside assistantMessageEvent
-    const assistantEvent = data['assistantMessageEvent'] as Record<string, unknown> | undefined;
-    if (assistantEvent && assistantEvent['type'] === 'text_delta') {
-      const delta = assistantEvent['delta'];
-      if (typeof delta === 'string') return delta;
-    }
-
-    // Fallback patterns for other provider shapes
-    if (typeof data['text'] === 'string') return data['text'];
-    if (typeof data['delta'] === 'string') return data['delta'];
-    if (typeof data['content'] === 'string') return data['content'];
-    const delta = data['delta'] as Record<string, unknown> | undefined;
-    if (delta && typeof delta['text'] === 'string') return delta['text'];
-    return null;
-  }
-
-  /**
-   * Detect working tag close transitions and enqueue completed messages
-   * for display at reading pace on the spinner line.
-   */
-  private updateWorkingTagDisplay(
-    rawText: string,
-    wasOpen: boolean,
-    setOpen: (open: boolean) => void,
-  ): void {
-    // Scan every internal-tag alias (<working>, <thinking>, ...) so a model
-    // that drifted to its trained scratchpad tag still feeds the spinner
-    // subtitle instead of silently vanishing from it.
-    let lastOpenIdx = -1;
-    let openTagLen = 0;
-    let lastCloseIdx = -1;
-    for (const name of INTERNAL_TAG_NAMES) {
-      const openTag = `<${name}>`;
-      const openIdx = rawText.lastIndexOf(openTag);
-      if (openIdx > lastOpenIdx) {
-        lastOpenIdx = openIdx;
-        openTagLen = openTag.length;
-      }
-      lastCloseIdx = Math.max(lastCloseIdx, rawText.lastIndexOf(`</${name}>`));
-    }
-
-    if (lastOpenIdx > lastCloseIdx) {
-      // Inside an unclosed working tag (streaming)
-      setOpen(true);
-    } else if (wasOpen && lastCloseIdx >= lastOpenIdx) {
-      // Working tag just closed: extract content and enqueue for display
-      const content = rawText.slice(lastOpenIdx + openTagLen, lastCloseIdx).trim();
-      if (content) {
-        this.app!.enqueueWorkingTagText(content);
-      }
-      setOpen(false);
-    }
   }
 
   // -------------------------------------------------------------------------
