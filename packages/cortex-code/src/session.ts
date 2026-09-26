@@ -1,14 +1,21 @@
 /**
- * Session Controller: the central orchestrator bridging TUI and Cortex.
+ * Session: the composition root for one interactive cortex-code session.
  *
- * Responsibilities:
- * - Creates and configures the CortexAgent with the active mode's settings
- * - Provides getApiKey callback (env var > credential store > OAuth refresh)
- * - Provides resolvePermission callback (rules check > inline TUI prompt)
- * - Routes Cortex events to the TUI (streaming, tool calls, errors, compaction)
- * - Manages session persistence (auto-save on loop complete and turn end)
- * - Handles user input (slash commands, agent prompts)
- * - Lifecycle: start, abort, resume, shutdown
+ * Builds the CortexAgent and the TUI, and wires the collaborators that each
+ * own one part of a session:
+ * - model, provider and effort selection (session/model-selection)
+ * - the agent's getApiKey credentials (providers/api-key-resolver)
+ * - tool and network permission prompts (permissions/prompt-broker)
+ * - the sandbox rung and status (session/sandbox-state)
+ * - trust gates for project MCP servers, hooks and skills (session/trust-gates)
+ * - busy state keyed on work settlement (session/work-tracker)
+ * - turn submission (session/turn-runner)
+ * - event routing to the TUI, activity stream and transcript (session/agent-events)
+ * - persistence and checkpoints (persistence/session-checkpoints)
+ * - the footer and the model's environment block (session/status-view)
+ *
+ * What stays here is lifecycle (start, input dispatch, resume, abort,
+ * shutdown) and the accessors slash commands use.
  */
 
 import { createRequire } from 'node:module';
@@ -21,42 +28,44 @@ import {
   type CortexModel,
   type CortexAgentConfig,
   type ResolutionNote,
+  type SandboxPolicy,
+  type SandboxRung,
+  type SandboxStatus,
   type ThinkingLevel,
 } from '@animus-labs/cortex';
-import { App, type AppCallbacks } from './tui/app.js';
+import { FileSessionActivityReporter } from './activity/session-activity.js';
+import { getCommand, registerBuiltinCommands } from './commands/index.js';
 import { resolveAgentMode, type CortexCodeConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
-import { ApiKeyResolver } from './providers/api-key-resolver.js';
-import { PermissionBroker } from './permissions/prompt-broker.js';
-import { discoverProjectContext } from './discovery/context.js';
-import { generateSessionId } from './persistence/sessions.js';
-import { SessionCheckpoints } from './persistence/session-checkpoints.js';
-import { TranscriptWriter } from './persistence/transcript-writer.js';
-import { getCommand, registerBuiltinCommands } from './commands/index.js';
-import type { UpdateInfo } from './updates/checker.js';
-import { UpdatePrompt } from './updates/update-prompt.js';
-import type { Mode } from './modes/types.js';
-import type { SandboxStatus, SandboxPolicy, SandboxRung } from '@animus-labs/cortex';
-import { workspaceSettingsPath } from './permissions/rules.js';
-import { log } from './logger.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
-import { FileSessionActivityReporter } from './activity/session-activity.js';
-import { McpReloadScheduler } from './mcp/reload-scheduler.js';
+import { discoverProjectContext } from './discovery/context.js';
 import { applyPreTurnHooks } from './hooks/pre-turn.js';
 import type { HookEvent, HookHandler } from './hooks/types.js';
-import { TitleManager } from './terminal/title-manager.js';
-import { WorkTracker } from './session/work-tracker.js';
-import { LoopRouting } from './session/loop-routing.js';
-import { SubAgentActivity } from './session/sub-agent-activity.js';
-import { AssistantStream } from './session/assistant-stream.js';
-import { TurnRunner } from './session/turn-runner.js';
-import { wireAgentEvents } from './session/agent-events.js';
+import { log } from './logger.js';
+import { McpReloadScheduler } from './mcp/reload-scheduler.js';
+import type { Mode } from './modes/types.js';
+import { PermissionBroker } from './permissions/prompt-broker.js';
+import { workspaceSettingsPath } from './permissions/rules.js';
+import { SessionCheckpoints } from './persistence/session-checkpoints.js';
+import { generateSessionId } from './persistence/sessions.js';
+import { TranscriptWriter } from './persistence/transcript-writer.js';
+import { ApiKeyResolver } from './providers/api-key-resolver.js';
 import { buildAgentConfig } from './session/agent-config.js';
-import { SessionStatusView, readGitBranch } from './session/status-view.js';
-import { RetryStatusLine } from './session/retry-status.js';
+import { wireAgentEvents } from './session/agent-events.js';
+import { AssistantStream } from './session/assistant-stream.js';
+import { LoopRouting } from './session/loop-routing.js';
 import { ModelSelection } from './session/model-selection.js';
+import { RetryStatusLine } from './session/retry-status.js';
 import { SessionSandbox } from './session/sandbox-state.js';
+import { SessionStatusView, readGitBranch } from './session/status-view.js';
+import { SubAgentActivity } from './session/sub-agent-activity.js';
 import { ProjectTrustGates } from './session/trust-gates.js';
+import { TurnRunner } from './session/turn-runner.js';
+import { WorkTracker } from './session/work-tracker.js';
+import { TitleManager } from './terminal/title-manager.js';
+import { App, type AppCallbacks } from './tui/app.js';
+import type { UpdateInfo } from './updates/checker.js';
+import { UpdatePrompt } from './updates/update-prompt.js';
 
 export interface SessionOptions {
   config: CortexCodeConfig;
@@ -82,71 +91,99 @@ export interface SessionOptions {
 }
 
 export class Session {
+  // Created by start(). Collaborators read both through getters, never a
+  // captured value, because they are built here in the constructor.
   private agent: CortexAgent | null = null;
-  private readonly sandbox: SessionSandbox;
-  private readonly status: SessionStatusView;
-  private readonly routing: LoopRouting;
   private app: App | null = null;
-  private readonly permissions: PermissionBroker;
-  private yoloMode: boolean;
-  private sessionId: string;
-  /** True when this session was launched to resume a saved one. */
-  private readonly isResume: boolean;
-  private readonly checkpoints: SessionCheckpoints;
-  private readonly work: WorkTracker;
-  private readonly turns: TurnRunner;
-  private readonly retry = new RetryStatusLine(() => this.app);
-  private readonly subAgents = new SubAgentActivity(() => this.app);
-  private readonly stream = new AssistantStream(() => this.app);
-  private readonly freezeDiagnostics: FreezeDiagnostics;
-  private readonly activity: FileSessionActivityReporter;
-  private readonly transcriptWriter: TranscriptWriter;
-  private readonly mcpReload: McpReloadScheduler;
-  private hookHandlers: Record<HookEvent, HookHandler[]> | null = null;
-  private readonly trust: ProjectTrustGates;
   private titleManager: TitleManager | null = null;
+  private hookHandlers: Record<HookEvent, HookHandler[]> | null = null;
 
   private readonly config: CortexCodeConfig;
   /**
-   * The Cortex facade mode this session runs, resolved once at construction so
-   * the value handed to {@link buildAgentConfig} and every mode-dependent
-   * routing decision in this file cannot drift apart. Resolved once and never
-   * reassigned: the loops are assembled from it, so a mid-session change would
-   * leave the routing describing an agent that does not exist.
-   *
-   * Defaults to passthrough rather than to the facade default, which is
-   * duplex. A coding CLI is a typed, single-surface client that streams the
-   * reasoner's tool calls live, so there is no dead air for a talker to fill,
-   * and duplex puts a second model and a paraphrase layer between a precisely
-   * typed instruction and the loop holding the tools. Passthrough routes
-   * straight to the reasoner and matches the single loop this session drove
-   * before the facade.
-   *
-   * Opting in (`--duplex`, or `"agentMode": "duplex"`) buys the thing that
-   * default costs: a session that can answer a question or take a correction
-   * while the reasoner is still working, rather than queueing it behind the
-   * task. That is a real trade, so it is a choice rather than a default, and
-   * a `--duplex` run is not a mistake. See `resolveAgentMode`.
+   * The Cortex facade mode, resolved once from the flag and config (see
+   * `resolveAgentMode` for why passthrough is the default). Every
+   * mode-dependent decision in this session reads this one value, and it is
+   * never reassigned: the loops are assembled from it, so a change would leave
+   * the routing describing an agent that does not exist.
    */
   private readonly agentMode: NonNullable<CortexAgentConfig['mode']>;
   private readonly mode: Mode;
   private readonly model: CortexModel;
-  private readonly models: ModelSelection;
   private readonly providerManager: ProviderManager;
   private readonly credentialStore: CredentialStore;
-  private readonly apiKeys: ApiKeyResolver;
   private readonly cwd: string;
+  private yoloMode: boolean;
   private readonly initialUtilityModelId: string | undefined;
   private readonly compactionStrategy: 'observational' | 'classic';
-  private updateInfo: UpdateInfo | null;
+  private readonly updateInfo: UpdateInfo | null;
+  private readonly sessionId: string;
+  /** True when this session was launched to resume a saved one. */
+  private readonly isResume: boolean;
+
+  private readonly freezeDiagnostics: FreezeDiagnostics;
+  private readonly activity: FileSessionActivityReporter;
+  /**
+   * Durable append-only conversation log, separate from the lossy state
+   * snapshot. Read by sibling apps to summarize where a session left off.
+   */
+  private readonly transcriptWriter: TranscriptWriter;
+
+  private readonly routing: LoopRouting;
+  private readonly models: ModelSelection;
+  private readonly apiKeys: ApiKeyResolver;
+  private readonly sandbox: SessionSandbox;
+  private readonly permissions: PermissionBroker;
+  private readonly status: SessionStatusView;
+  private readonly checkpoints: SessionCheckpoints;
+  private readonly work: WorkTracker;
+  private readonly trust: ProjectTrustGates;
+  private readonly mcpReload: McpReloadScheduler;
+  private readonly turns: TurnRunner;
   private readonly updatePrompt: UpdatePrompt;
+  private readonly retry = new RetryStatusLine(() => this.app);
+  private readonly subAgents = new SubAgentActivity(() => this.app);
+  private readonly stream = new AssistantStream(() => this.app);
 
   constructor(options: SessionOptions) {
     this.config = options.config;
     this.agentMode = resolveAgentMode(options.duplex, options.config.agentMode);
     this.mode = options.mode;
-    this.routing = new LoopRouting(this.agentMode);
     this.model = options.model;
+    this.providerManager = options.providerManager;
+    this.credentialStore = options.credentialStore;
+    this.cwd = options.cwd;
+    this.yoloMode = options.yoloMode;
+    this.initialUtilityModelId = options.initialUtilityModelId;
+    this.compactionStrategy = options.compactionStrategy ?? 'observational';
+    this.updateInfo = options.updateInfo ?? null;
+    this.sessionId = options.resumeSessionId ?? generateSessionId();
+    this.isResume = options.resumeSessionId !== undefined;
+
+    const getAgent = () => this.agent;
+    const getApp = () => this.app;
+    const settingsPath = workspaceSettingsPath(options.cwd);
+
+    this.freezeDiagnostics = new FreezeDiagnostics(this.config.diagnostics?.freeze);
+    this.activity = new FileSessionActivityReporter(this.sessionId, this.cwd, {
+      onWriteError: (error) => {
+        log.warn('Session activity write failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
+    this.transcriptWriter = new TranscriptWriter(this.sessionId, this.cwd, {
+      cliVersion: PKG_VERSION,
+      provider: options.provider,
+      model: options.modelId,
+      resume: this.isResume,
+      onWriteError: (error) => {
+        log.warn('Session transcript write failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
+
+    this.routing = new LoopRouting(this.agentMode);
     this.models = new ModelSelection({
       provider: options.provider,
       modelId: options.modelId,
@@ -154,27 +191,26 @@ export class Session {
       config: options.config,
       providerManager: options.providerManager,
       credentialStore: options.credentialStore,
-      getAgent: () => this.agent,
-      getApp: () => this.app,
+      getAgent,
+      getApp,
     });
-    this.providerManager = options.providerManager;
-    this.credentialStore = options.credentialStore;
     this.apiKeys = new ApiKeyResolver(options.credentialStore, options.providerManager, () => this.models.provider);
-    this.cwd = options.cwd;
-    this.initialUtilityModelId = options.initialUtilityModelId;
-    this.yoloMode = options.yoloMode;
-    const settingsPath = workspaceSettingsPath(options.cwd);
     this.sandbox = new SessionSandbox({
       config: options.config,
       cwd: options.cwd,
       settingsPath,
-      getAgent: () => this.agent,
-      getApp: () => this.app,
+      getAgent,
+      getApp,
       onRungChanged: () => this.status.refreshEnvironment(),
     });
-    this.sessionId = options.resumeSessionId ?? generateSessionId();
-    this.isResume = options.resumeSessionId !== undefined;
-    this.compactionStrategy = options.compactionStrategy ?? 'observational';
+    this.permissions = new PermissionBroker({
+      cwd: options.cwd,
+      settingsPath,
+      activity: this.activity,
+      sandbox: this.sandbox,
+      getApp,
+      getYoloMode: () => this.yoloMode,
+    });
     this.status = new SessionStatusView({
       cwd: options.cwd,
       modeName: options.mode.name,
@@ -183,14 +219,14 @@ export class Session {
       models: this.models,
       sandbox: this.sandbox,
       getYoloMode: () => this.yoloMode,
-      getAgent: () => this.agent,
-      getApp: () => this.app,
+      getAgent,
+      getApp,
     });
     this.checkpoints = new SessionCheckpoints({
       sessionId: this.sessionId,
       agentMode: this.agentMode,
       compactionStrategy: this.compactionStrategy,
-      getAgent: () => this.agent,
+      getAgent,
       describe: () => ({
         mode: this.mode.name,
         provider: this.models.provider,
@@ -199,46 +235,25 @@ export class Session {
         contextTokenCount: this.status.displayedContextTokens(),
       }),
     });
-    this.updateInfo = options.updateInfo ?? null;
-    this.freezeDiagnostics = new FreezeDiagnostics(this.config.diagnostics?.freeze);
     this.work = new WorkTracker({
-      getAgent: () => this.agent,
+      getAgent,
       freezeDiagnostics: this.freezeDiagnostics,
       onSettled: () => this.applyWorkSettledUi(),
     });
-    this.activity = new FileSessionActivityReporter(this.sessionId, this.cwd, {
-      onWriteError: (error) => {
-        log.warn('Session activity write failed', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      },
-    });
-    // Durable append-only conversation log, separate from the lossy history.json
-    // snapshot. Read by sibling apps to summarize where a session left off.
-    this.trust = new ProjectTrustGates(options.cwd, () => this.agent, () => this.app);
+    this.trust = new ProjectTrustGates(options.cwd, getAgent, getApp);
     this.mcpReload = new McpReloadScheduler({
       cwd: options.cwd,
-      getAgent: () => this.agent,
-      getApp: () => this.app,
+      getAgent,
+      getApp,
       isBusy: () => this.work.isRunning,
       resolveProjectTrust: (cwd, servers) => this.trust.resolveProjectMcpTrust(cwd, servers.map(s => s.name)),
     });
-    this.permissions = new PermissionBroker({
-      cwd: options.cwd,
-      settingsPath,
-      activity: this.activity,
-      sandbox: this.sandbox,
-      getApp: () => this.app,
-      getYoloMode: () => this.yoloMode,
-    });
     this.turns = new TurnRunner({
-      getAgent: () => this.agent,
-      getApp: () => this.app,
+      getAgent,
+      getApp,
       getTitleManager: () => this.titleManager,
       activity: this.activity,
-      transcriptWriter: {
-        addUserMessage: (text) => this.transcriptWriter.addUserMessage(text),
-      },
+      transcriptWriter: this.transcriptWriter,
       retry: this.retry,
       status: this.status,
       work: this.work,
@@ -249,20 +264,9 @@ export class Session {
       ),
     });
     this.updatePrompt = new UpdatePrompt({
-      getApp: () => this.app,
+      getApp,
       activity: this.activity,
       flushTranscript: () => this.transcriptWriter.flush(),
-    });
-    this.transcriptWriter = new TranscriptWriter(this.sessionId, this.cwd, {
-      cliVersion: PKG_VERSION,
-      provider: this.models.provider,
-      model: this.models.modelId,
-      resume: this.isResume,
-      onWriteError: (error) => {
-        log.warn('Session transcript write failed', {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      },
     });
   }
 
@@ -636,7 +640,6 @@ export class Session {
     });
   }
 
-
   // -------------------------------------------------------------------------
   // Public accessors for command handlers
   // -------------------------------------------------------------------------
@@ -658,7 +661,6 @@ export class Session {
   getEffectiveEffort(): ThinkingLevel { return this.models.getEffectiveEffort(); }
   setPreferredEffort(level: ThinkingLevel): Promise<void> { return this.models.setPreferredEffort(level); }
 
-  getSessionId(): string { return this.sessionId; }
   /** Reset the terminal title on a fresh-start signal (e.g. /clear). */
   resetTitle(): void { this.titleManager?.reset(); }
   getSandboxRung(): SandboxRung { return this.sandbox.getRung(); }
