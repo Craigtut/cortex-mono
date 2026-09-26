@@ -2701,25 +2701,6 @@ export class Session {
   getModelId(): string { return this.modelId; }
   getCwd(): string { return this.cwd; }
 
-  /** List available models for the current provider. */
-  async listModels(): Promise<Array<{ id: string; name: string; contextWindow: number }>> {
-    log.info('listModels called', { provider: this.provider });
-    try {
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('listModels timed out after 10s')), 10_000),
-      );
-      const models = await Promise.race([
-        this.providerManager.listModels(this.provider),
-        timeoutPromise,
-      ]);
-      log.info('listModels result', { count: models.length });
-      return models.map(m => ({ id: m.id, name: m.name, contextWindow: m.contextWindow }));
-    } catch (err) {
-      log.error('listModels error', { error: err instanceof Error ? err.message : String(err) });
-      return [];
-    }
-  }
-
   private async resolveProviderModel(provider: string, modelId: string): Promise<CortexModel> {
     const entry = await this.credentialStore.getProvider(provider);
     return resolveConfiguredModel(this.providerManager, provider, modelId, entry, this.config.ollama, this.config.contextWindowLimit);
