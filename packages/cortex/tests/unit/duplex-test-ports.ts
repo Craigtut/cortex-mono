@@ -63,7 +63,7 @@ const UNSTUBBED_PORTS: { [K in RequiredPort]: true } = {
   currentTalkerCauseTags: true,
   currentReasonerCauseTags: true,
   answerAsk: true,
-  pendingAsks: true,
+  reasonerAttemptId: true,
   spawnLookup: true,
 };
 
@@ -120,8 +120,8 @@ export interface TestVoicingPorts {
  * A router and the permission broker it answers asks through, assembled
  * the way DuplexSession assembles them: the broker logs through the same
  * appendLog, reads the same talker cause tags, and stamps the router's
- * spacing clock on every voicing; the router's answer_ask and the
- * watchdog's pending-ask read go to the broker. Ask timeouts and the voicing
+ * spacing clock on every voicing; the router's answer_ask goes to the
+ * broker. Ask timeouts and the voicing
  * cadence come from the router options, as they do from consumer tuning.
  */
 export function makeTestRouter(
@@ -137,7 +137,6 @@ export function makeTestRouter(
   const brokerRef: { broker: PermissionBroker | null } = { broker: null };
   const ports = makeTestRouterPorts({
     answerAsk: (askId, decision, reason) => brokerRef.broker!.answer(askId, decision, reason),
-    pendingAsks: () => brokerRef.broker!.getPendingAsks(),
   });
   Object.defineProperties(ports, routerDescriptors);
   const router = new DuplexRouter(ports, options);

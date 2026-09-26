@@ -1,9 +1,20 @@
 /**
- * ReasonerOutcomeReporter: how the end of a reasoner run reaches the
- * conversation. Its final result (explicit through Deliver, or implicit
- * from its final text), its failure, or its being stopped, each surfaced at
- * most once, so a failed or stopped reasoner is never indistinguishable
- * from a working one and a finished one is never announced twice.
+ * ReasonerOutcomeReporter: every reasoner-to-conversation delivery goes
+ * through here, and here is where a reasoner attempt's outcome is decided,
+ * at most once.
+ *
+ * The policy, per attempt (outcome starts `open` when an attempt starts):
+ *
+ * | producer                          | delivered when       | outcome after |
+ * |-----------------------------------|----------------------|---------------|
+ * | Deliver that concludes the work   | always               | delivered (unless failed) |
+ * | Deliver that is a progress note   | always               | unchanged     |
+ * | implicit final text at run end    | outcome is open      | unchanged     |
+ * | failure (ladder over, fatal, a stop nobody asked for) | outcome is not failed | failed |
+ * | watchdog progress, session notices | always              | unchanged     |
+ *
+ * Every producer stamps the silence clock the watchdog reads, so "the
+ * reasoner has said nothing for a while" means exactly that.
  */
 
 import type { AgentLoop } from '../agent-loop.js';
@@ -43,26 +54,23 @@ export type RequestedAbort = 'user' | 'cancel';
 
 export interface ReasonerOutcomePorts {
   reasoner: AgentLoop;
-  router: DuplexRouter;
-  headlines: DuplexHeadlines;
+  /** The router's delivery intake (wake policy) and delegation retirement. */
+  router: Pick<DuplexRouter, 'deliverFromReasoner' | 'retireRunDelegations'>;
+  headlines: Pick<DuplexHeadlines, 'noteRetry' | 'clearRetry'>;
   /** Whether the session's aggregate spending limit has tripped. */
   aggregateBreached(): boolean;
   destroyed(): boolean;
+  now: () => number;
 }
+
+type DeliveryMeta = { implicit?: boolean; synthetic?: boolean; terminal?: boolean };
 
 export class ReasonerOutcomeReporter implements DeliveryTarget {
   private readonly ports: ReasonerOutcomePorts;
-  /**
-   * Whether the current reasoner run delivered a result through Deliver
-   * (implicit-delivery guard). Progress notes (`silent`) do not count.
-   */
-  private deliveredResultThisRun = false;
-  /**
-   * Whether the reasoner's current terminal failure already produced a
-   * delivery. See deliverFailure for why a per-run reset is the right unit
-   * for this and would not be for anything announced mid-ladder.
-   */
-  private failureAnnounced = false;
+  /** The current attempt's outcome (see the policy table above). */
+  private outcome: 'open' | 'delivered' | 'failed' = 'open';
+  /** When the reasoner last produced anything bound for the conversation. */
+  private lastOutput = 0;
   /**
    * Set while the session itself is aborting the reasoner (a user abort, a
    * cancel), so the run end that abort produces is not mistaken for a stop
@@ -84,10 +92,33 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
   deliverFromReasoner(
     content: string,
     wake: WakeClass | undefined,
-    meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
+    meta?: DeliveryMeta,
   ): DeliveryIntakeResult {
-    if (deliveryConcludes(wake, meta)) this.deliveredResultThisRun = true;
-    return this.ports.router.deliverFromReasoner(content, wake, meta);
+    if (deliveryConcludes(wake, meta) && this.outcome === 'open') this.outcome = 'delivered';
+    return this.intake(content, wake, meta);
+  }
+
+  /**
+   * The watchdog's progress note: the work is still going. Rides the normal
+   * intake (log entry, dedup, spacing), never concludes anything, and never
+   * changes the outcome.
+   */
+  reportProgress(text: string): void {
+    this.intake(text, 'when_idle', { synthetic: true });
+  }
+
+  /**
+   * A notice the session composes about the work (a restore interrupting
+   * it, the session budget stopping it). Delivered as given; it is about
+   * the session, not this attempt's result, so the outcome is untouched.
+   */
+  notify(text: string, wake: WakeClass, meta: DeliveryMeta): void {
+    this.intake(text, wake, meta);
+  }
+
+  /** The silence clock: when the reasoner last said anything. */
+  lastOutputAt(): number {
+    return this.lastOutput;
   }
 
   /** The session is about to abort the reasoner itself, for `cause`. */
@@ -100,20 +131,19 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
     if (this.abortCause === cause) this.abortCause = null;
   }
 
-  /** A reasoner run started: its outcome is open again. */
-  noteRunStart(): void {
-    this.deliveredResultThisRun = false;
-    this.failureAnnounced = false;
+  /** A reasoner attempt started: its outcome is open, its silence fresh. */
+  noteAttemptStart(): void {
+    this.outcome = 'open';
+    this.lastOutput = this.ports.now();
   }
 
   /**
-   * A reasoner run ended: if it never delivered a result through Deliver
-   * (silent progress notes do not count) and its final assistant text is
-   * user-facing, deliver that text as an implicit when_idle delivery so
-   * results always surface (review-findings F1).
+   * A reasoner attempt ended: if it never delivered a result through
+   * Deliver (silent progress notes do not count) and its final assistant
+   * text is user-facing, deliver that text as an implicit when_idle
+   * delivery so results always surface (review-findings F1).
    */
-  noteRunEnd(event: CortexEvent): void {
-    this.ports.router.noteReasonerRunEnd();
+  noteAttemptEnd(event: CortexEvent): void {
     const messages = (event.data as { messages?: unknown[] } | undefined)?.messages;
     if (!Array.isArray(messages)) return;
     let last: { stopReason?: unknown; content?: unknown; errorMessage?: unknown } | null = null;
@@ -129,7 +159,7 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
       this.handleStopped();
       return;
     }
-    if (this.deliveredResultThisRun) return;
+    if (this.outcome !== 'open') return;
     if (last.stopReason === 'error') {
       // Only when nothing else in the system is going to speak.
       //
@@ -159,7 +189,7 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
     }
     const spoken = spokenText(last);
     if (spoken.length === 0) return;
-    this.ports.router.deliverFromReasoner(spoken, 'when_idle', { implicit: true });
+    this.intake(spoken, 'when_idle', { implicit: true });
   }
 
   /**
@@ -271,25 +301,31 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
    * statements later in the same synchronous unwind. The first wins because
    * its message is the better one ("gave up after N attempts").
    *
-   * The guard is reset on `loop_start`, which is the correct unit ONLY
-   * because nothing announces a failure mid-ladder: the run-end branch
-   * defers a recorded stub to the error path, so the two calls above are
-   * the only ones, and no run start falls between them. It is emphatically
-   * not "once per logical turn" (pi emits agent_start per retry attempt, so
-   * a turn spanning a ladder crosses several resets).
+   * The outcome resets per attempt, which is the correct unit ONLY because
+   * nothing announces a failure mid-ladder: the attempt-end branch defers a
+   * recorded stub to the error path, so the two calls above are the only
+   * ones, and no attempt start falls between them. It is emphatically not
+   * "once per logical run" (a run spanning a ladder crosses several
+   * attempts).
    */
   private deliverFailure(text: string): void {
     if (this.ports.destroyed()) return;
-    if (this.failureAnnounced) return;
-    this.failureAnnounced = true;
+    if (this.outcome === 'failed') return;
+    this.outcome = 'failed';
     // interrupt: a user waiting on work that is never coming is exactly the
     // case the class exists for. The router may still demote it under
     // backpressure, which is the intended tradeoff. `terminal` marks it as a
     // conclusion despite being synthetic, so the delegation it answers stops
     // being listed as live work.
-    this.ports.router.deliverFromReasoner(text, 'interrupt', {
+    this.intake(text, 'interrupt', {
       synthetic: true,
       terminal: true,
     });
+  }
+
+  /** Hand one delivery to the router's intake, stamping the silence clock. */
+  private intake(content: string, wake: WakeClass | undefined, meta?: DeliveryMeta): DeliveryIntakeResult {
+    this.lastOutput = this.ports.now();
+    return this.ports.router.deliverFromReasoner(content, wake, meta);
   }
 }

@@ -3,8 +3,8 @@
  * producer-proposes/router-disposes), D19 backpressure (interrupt token
  * bucket with demotion, content-hash dedup, delegation caps, dispatch
  * dedup), the D18 conversation-delta buffer flushed inside dispatch
- * messages, the D17 receipt contract through the control tools, and the
- * liveness watchdog.
+ * messages, and the D17 receipt contract through the control tools. The
+ * liveness watchdog is the session's (duplex-watchdog.test.ts).
  *
  * The router is exercised both directly and through the actual control
  * tools (buildControlTools), so the router + control-tool pairing is tested
@@ -48,6 +48,8 @@ interface Harness {
    * set no dispatch in the test produced.
    */
   setReasonerCauseTags: (tags: readonly CauseTag[]) => void;
+  /** A new reasoner attempt starts (what ReasonerRunTracker reports). */
+  startReasonerAttempt: () => void;
   advance: (ms: number) => void;
   now: () => number;
 }
@@ -77,6 +79,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
   const reasonerDispatches: Harness['reasonerDispatches'] = [];
   const lookupSpawns: Array<{ question: string; causeSeq: number | null }> = [];
   let lookupRefusal: string | null = null;
+  let reasonerAttemptId = 0;
   let nextLookupAlias = 1;
   let nextSeq = 1;
 
@@ -131,6 +134,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     currentTalkerCauseSeq: () => options?.talkerCauseSeq ?? null,
     currentTalkerCauseTags: () => talkerCauseTags,
     currentReasonerCauseTags: () => reasonerCauseTagsOverride ?? derivedReasonerCauseTags(),
+    reasonerAttemptId: () => reasonerAttemptId,
     get idleSignal() {
       return idleSignal;
     },
@@ -157,6 +161,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     setDispatchError: (error) => { dispatchError = error; },
     setTalkerCauseTags: (tags) => { talkerCauseTags = tags; },
     setReasonerCauseTags: (tags) => { reasonerCauseTagsOverride = tags; },
+    startReasonerAttempt: () => { reasonerAttemptId += 1; },
     advance: (ms) => { clock += ms; },
     now: () => clock,
   };
@@ -329,13 +334,12 @@ describe('backpressure', () => {
     expect(absorbed).toHaveLength(3);
     expect(absorbed[2]!.data).toMatchObject({ furtherAbsorbedSuppressed: true });
 
-    // The bound is per reasoner run, not per session.
-    h.router.noteReasonerRunStart();
+    // The bound is per reasoner attempt, not per session.
+    h.startReasonerAttempt();
     expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(false);
     expect(h.log.filter(
       (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'delivery_absorbed',
     )).toHaveLength(4);
-    h.router.noteReasonerRunEnd();
   });
 
   it('identical content under a new causing directive is delivered, not absorbed (S3)', () => {
@@ -732,7 +736,7 @@ describe('control-tool dispatch', () => {
   });
 
   it('a progress note does not retire the work it reports on', async () => {
-    const h = createHarness({ watchdogIntervalMs: 200 });
+    const h = createHarness();
     h.setTalkerIdle(true);
     await callTool(h, 'spawn_task', { instructions: 'build the release' });
     const spawnSeq = h.log.find((entry) => entry.type === 'directive')!.seq;
@@ -743,8 +747,7 @@ describe('control-tool dispatch', () => {
     h.router.deliverFromReasoner('step one done', 'silent');
     expect(h.router.getDelegations()[0]!.completedAt).toBeNull();
 
-    h.router.noteReasonerRunStart();
-    h.advance(250);
+    h.router.deliverFromReasoner('Background work is still running.', 'when_idle', { synthetic: true });
     await waitUntil(() => h.talkerDeliveries.some((d) => d.content.includes('still running')));
     expect(h.router.getDelegations()[0]!.completedAt).toBeNull();
   });
@@ -955,66 +958,6 @@ describe('steer and cancel against a live run', () => {
     await callTool(h, 'spawn_task', { instructions: 'write the report' });
     expect(h.router.deliverFromReasoner('report written', 'when_idle').delivered).toBe(true);
     await waitUntil(() => h.talkerDeliveries.length === 1);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Watchdog
-// ---------------------------------------------------------------------------
-
-describe('liveness watchdog', () => {
-  it('synthesizes a when_idle progress delivery for a long-silent run', async () => {
-    const h = createHarness({ watchdogIntervalMs: 200 });
-    h.setTalkerIdle(true);
-    h.router.noteReasonerRunStart();
-    h.advance(250); // silence exceeds the interval on the injected clock
-    await waitUntil(() => h.talkerDeliveries.length === 1);
-    expect(h.talkerDeliveries[0]!.content).toMatch(/still running/);
-    const entry = h.log.find((item) => item.type === 'delivery')!;
-    expect(entry.data).toMatchObject({ synthetic: true });
-    expect(entry.wake).toBe('when_idle');
-  });
-
-  it('says a run blocked on a permission ask is waiting on the user', async () => {
-    const h = createHarness({ watchdogIntervalMs: 200 });
-    h.setTalkerIdle(true);
-    h.router.noteReasonerRunStart();
-    void h.broker.requestDecision({
-      askId: 'ask-1',
-      loopPath: 'reasoner',
-      toolName: 'Bash',
-      renderedRequest: 'Bash: npm publish',
-      kind: 'tool',
-    });
-    // Precondition: the ask is pending, so the run really is blocked on it.
-    expect(h.broker.getPendingAsks()).toHaveLength(1);
-    h.advance(250);
-    await waitUntil(() => h.log.some(
-      (entry) => entry.type === 'delivery' && (entry.data as { synthetic?: boolean }).synthetic === true,
-    ));
-    const entry = h.log.find(
-      (item) => item.type === 'delivery' && (item.data as { synthetic?: boolean }).synthetic === true,
-    )!;
-    expect(entry.content).toMatch(/waiting for the user's permission answer \(Bash\)/);
-    expect(entry.content).not.toMatch(/no update/);
-    h.router.destroy();
-  });
-
-  it('stays quiet while the reasoner is idle or recently productive', async () => {
-    const h = createHarness({ watchdogIntervalMs: 200 });
-    // Idle: no run in flight.
-    h.advance(1_000);
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    expect(h.talkerDeliveries).toHaveLength(0);
-
-    // Productive: a delivery resets the silence clock.
-    h.router.noteReasonerRunStart();
-    h.advance(150);
-    h.router.deliverFromReasoner('progress', 'silent');
-    h.advance(150); // total 300 since start, but only 150 since output
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    expect(h.talkerDeliveries).toHaveLength(1); // just the silent progress
-    h.router.noteReasonerRunEnd();
   });
 });
 

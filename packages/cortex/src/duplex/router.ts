@@ -37,7 +37,6 @@ import {
 import type { CauseTag } from './cause-tags.js';
 import { DispatchPolicy } from './dispatch-policy.js';
 import { DeliveryScheduler } from './delivery-scheduler.js';
-import { LivenessWatchdog } from './watchdog.js';
 import { DelegationRegistry } from './delegations.js';
 import type { DelegationRegistryState, DelegationSnapshot } from './delegations.js';
 import { ConversationDeltas } from './conversation-deltas.js';
@@ -119,8 +118,11 @@ export interface DuplexRouterPorts {
    * answer, where the D16 consent rules live).
    */
   answerAsk(askId: unknown, decision: unknown, reason: unknown): AskAnswerOutcome;
-  /** Asks blocked on the user right now (the watchdog reports a wait). */
-  pendingAsks(): ReadonlyArray<{ toolName: string; requestedAt: number }>;
+  /**
+   * Id of the reasoner's latest attempt (ReasonerRunTracker). Bounds on
+   * per-attempt log noise reset when it changes.
+   */
+  reasonerAttemptId(): number;
   /**
    * Start a facade-spawned quick lookup (D13): an ephemeral read-only
    * sub-agent, never a reasoner directive. causeSeq is the log seq of the
@@ -234,14 +236,14 @@ export const DUPLEX_ROUTER_DEFAULTS = {
 type ResolvedOptions = typeof DUPLEX_ROUTER_DEFAULTS;
 
 /**
- * Bound on delivery_absorbed lifecycle entries per reasoner run (the N4
+ * Bound on delivery_absorbed lifecycle entries per reasoner attempt (the N4
  * rule applied to the intake side): a reasoner (or its retry ladder)
- * re-emitting the same content arbitrarily many times in one run must not
- * write an entry per repeat. The dedup itself still absorbs every repeat;
+ * re-emitting the same content arbitrarily many times in one attempt must
+ * not write an entry per repeat. The dedup itself still absorbs every repeat;
  * past the bound only the log stays quiet, with the last written entry
  * marking the suppression.
  */
-const MAX_ABSORBED_ENTRIES_PER_RUN = 3;
+const MAX_ABSORBED_ENTRIES_PER_ATTEMPT = 3;
 
 /**
  * Whether a delivery reports the work reaching a conclusion: it retires the
@@ -303,17 +305,11 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   // Dispatch backpressure (D19).
   private readonly policy: DispatchPolicy;
-  /** Absorbed-duplicate lifecycle entries written this reasoner run (bounded). */
-  private absorbedEntriesThisRun = 0;
+  /** Absorbed-duplicate lifecycle entries written this reasoner attempt (bounded). */
+  private absorbed = { attemptId: -1, entries: 0 };
 
   // Delivery backpressure and pacing (D19).
   private readonly scheduler: DeliveryScheduler;
-
-  // Liveness watchdog over reasoner runs (communication.md).
-  private reasonerRunning = false;
-  private reasonerRunStartAt = 0;
-  private lastReasonerOutputAt = 0;
-  private readonly watchdog: LivenessWatchdog;
 
   private destroyed = false;
 
@@ -363,20 +359,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       },
     );
 
-    this.watchdog = new LivenessWatchdog(
-      {
-        runStartedAt: () => (this.reasonerRunning ? this.reasonerRunStartAt : null),
-        lastOutputAt: () => this.lastReasonerOutputAt,
-        activeAliases: () => this.delegations.activeAliases(),
-        pendingAsks: () => this.ports.pendingAsks(),
-        // Rides the normal intake (log entry, dedup, spacing); marks itself
-        // synthetic and resets the silence clock through lastReasonerOutputAt.
-        reportProgress: (text) => {
-          this.deliverFromReasoner(text, 'when_idle', { synthetic: true });
-        },
-      },
-      { intervalMs: this.options.watchdogIntervalMs, now: this.now },
-    );
   }
 
   // -------------------------------------------------------------------------
@@ -440,19 +422,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    */
   noteTalkerTurnEnd(): void {
     this.policy.noteTurnEnd();
-  }
-
-  /** Reasoner run lifecycle, for the liveness watchdog. */
-  noteReasonerRunStart(): void {
-    this.reasonerRunning = true;
-    this.absorbedEntriesThisRun = 0;
-    const now = this.now();
-    this.reasonerRunStartAt = now;
-    this.lastReasonerOutputAt = now;
-  }
-
-  noteReasonerRunEnd(): void {
-    this.reasonerRunning = false;
   }
 
   // -------------------------------------------------------------------------
@@ -694,9 +663,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     if (this.destroyed) {
       return { delivered: false, reason: 'router destroyed' };
     }
-    const now = this.now();
-    this.lastReasonerOutputAt = now;
-
     // cancel_task is the one discard path (communication.md): a result
     // whose causation is entirely cancelled work never reaches the user.
     // It is still recorded, so the audit trail shows what was withheld.
@@ -732,9 +698,11 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       // are bounded per reasoner run (same rule as dispatch_refused, N4)
       // so a run re-emitting the same content in a loop cannot grow the
       // log unboundedly.
-      if (this.absorbedEntriesThisRun < MAX_ABSORBED_ENTRIES_PER_RUN) {
-        this.absorbedEntriesThisRun += 1;
-        const atBound = this.absorbedEntriesThisRun === MAX_ABSORBED_ENTRIES_PER_RUN;
+      const attemptId = this.ports.reasonerAttemptId();
+      if (this.absorbed.attemptId !== attemptId) this.absorbed = { attemptId, entries: 0 };
+      if (this.absorbed.entries < MAX_ABSORBED_ENTRIES_PER_ATTEMPT) {
+        this.absorbed.entries += 1;
+        const atBound = this.absorbed.entries === MAX_ABSORBED_ENTRIES_PER_ATTEMPT;
         this.ports.appendLog({
           type: 'lifecycle',
           loopPath: this.reasonerLoopPath,
@@ -819,6 +787,11 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   /** Snapshot of tracked delegations (copies). */
   getDelegations(): DelegationSnapshot[] {
     return this.delegations.snapshot();
+  }
+
+  /** Aliases of the delegations still described as work in progress. */
+  activeAliases(): string[] {
+    return this.delegations.activeAliases();
   }
 
   /**
@@ -921,14 +894,12 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.dropWorkContext();
     this.delegations.clear();
     this.policy.reset();
-    this.absorbedEntriesThisRun = 0;
-    this.reasonerRunning = false;
+    this.absorbed = { attemptId: -1, entries: 0 };
   }
 
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.watchdog.destroy();
     this.scheduler.destroy();
   }
 

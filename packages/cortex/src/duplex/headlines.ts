@@ -16,7 +16,8 @@
  */
 
 import type { SessionUsage, SubAgentSnapshot } from '../types.js';
-import type { DelegationSnapshot } from './router.js';
+import type { EventBridge } from '../event-bridge.js';
+import type { DelegationSnapshot } from './delegations.js';
 import { clipHeadTail } from '../permission-rendering.js';
 import { toolCallSubject } from '../tools/tool-call-subject.js';
 
@@ -41,10 +42,20 @@ export interface HeadlineAsk {
 // Ports and options
 // ---------------------------------------------------------------------------
 
+/** The reasoner's run as the block reads it (ReasonerRunTracker). */
+export interface HeadlineRunState {
+  /** Whether a logical run is in flight, retry backoffs included. */
+  logicalRunActive(): boolean;
+  /** The live attempt, or null between attempts. */
+  attempt(): { startedAt: number } | null;
+  /** When the last attempt ended, or null before any has. */
+  lastEndedAt(): number | null;
+}
+
 /** Live reads the builder pulls at render time (facade closures). */
 export interface DuplexHeadlinePorts {
-  /** Whether the reasoner has a run in flight. */
-  reasonerRunning(): boolean;
+  /** The reasoner's run: whether one is in flight, and since when. */
+  reasonerRun: HeadlineRunState;
   /** The reasoner's accumulated session usage (turns, cost, tokens). */
   reasonerUsage(): SessionUsage;
   /** Active sub-agents of the reasoner. */
@@ -101,7 +112,7 @@ function ageSeconds(now: number, timestamp: number): number {
  * loop's own log-line summarization: paths, commands, and patterns without
  * content or results. Escaping happens inside the headline builder.
  */
-export function summarizeHeadlineArgs(
+function summarizeHeadlineArgs(
   toolName: string,
   args: Record<string, unknown> | undefined,
 ): string | null {
@@ -123,10 +134,8 @@ export class DuplexHeadlines {
   private readonly ports: DuplexHeadlinePorts;
   private readonly now: () => number;
 
-  // Event-fed state (facade wires the reasoner's bridge into these).
+  // Event-fed state (attach() wires the reasoner's bridge into these).
   private currentTool: { name: string; summary: string | null; startedAt: number } | null = null;
-  private runStartedAt: number | null = null;
-  private lastRunEndedAt: number | null = null;
   private lastOutputLines: string[] = [];
   private lastOutputAt: number | null = null;
   private retry: {
@@ -141,18 +150,44 @@ export class DuplexHeadlines {
     this.now = ports.now ?? Date.now;
   }
 
-  /** The reasoner's main loop started a run. */
-  noteRunStart(): void {
-    this.runStartedAt = this.now();
-    this.currentTool = null;
-    this.retry = null;
+  /**
+   * Feed the block from the reasoner: its own tool calls and last
+   * user-facing output. Child tool activity reaches the block through
+   * activeSubAgents() (the sub-agent manager tracks it), so only main-loop
+   * events feed here. An attempt starting or ending clears the per-attempt
+   * lines (the current tool, a retry in progress).
+   */
+  attach(
+    reasonerBridge: EventBridge,
+    run: {
+      onAttemptStart(listener: () => void): void;
+      onAttemptEnd(listener: () => void): void;
+    },
+  ): void {
+    run.onAttemptStart(() => this.noteAttemptBoundary());
+    run.onAttemptEnd(() => this.noteAttemptBoundary());
+    reasonerBridge.on('tool_call_start', (event) => {
+      if (event.childTaskId) return;
+      const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
+      if (!payload?.toolName) return;
+      this.noteToolStart(payload.toolName, summarizeHeadlineArgs(payload.toolName, payload.args));
+    });
+    reasonerBridge.on('tool_call_end', (event) => {
+      if (event.childTaskId) return;
+      this.noteToolEnd();
+    });
+    reasonerBridge.on('turn_end', (event) => {
+      if (event.childTaskId) return;
+      const userFacing = event.textOutput?.userFacing;
+      if (userFacing && userFacing.trim().length > 0) {
+        this.noteOutput(userFacing);
+      }
+    });
   }
 
-  /** The reasoner's main loop finished its run. */
-  noteRunEnd(): void {
-    this.runStartedAt = null;
+  /** A reasoner attempt started or ended: its current tool and retry are over. */
+  noteAttemptBoundary(): void {
     this.currentTool = null;
-    this.lastRunEndedAt = this.now();
     this.retry = null;
   }
 
@@ -205,7 +240,10 @@ export class DuplexHeadlines {
     const now = this.now();
     const sections: string[] = [];
 
-    const running = this.ports.reasonerRunning();
+    const run = this.ports.reasonerRun;
+    const running = run.logicalRunActive();
+    const attempt = run.attempt();
+    const lastEndedAt = run.lastEndedAt();
     // Cancelled and completed delegations are not work in progress. Without
     // the completed filter the block lists work that finished hours ago
     // beside `<work state="idle">`, and the talker's grounding rules then
@@ -231,11 +269,11 @@ export class DuplexHeadlines {
     if (running || this.retry !== null || this.lastOutputLines.length > 0) {
       const usage = this.ports.reasonerUsage();
       const attrs: string[] = [`state="${running ? 'working' : 'idle'}"`];
-      if (running && this.runStartedAt !== null) {
-        attrs.push(`duration="${ageSeconds(now, this.runStartedAt)}s"`);
+      if (running && attempt !== null) {
+        attrs.push(`duration="${ageSeconds(now, attempt.startedAt)}s"`);
       }
-      if (!running && this.lastRunEndedAt !== null) {
-        attrs.push(`idle_for="${ageSeconds(now, this.lastRunEndedAt)}s"`);
+      if (!running && lastEndedAt !== null) {
+        attrs.push(`idle_for="${ageSeconds(now, lastEndedAt)}s"`);
       }
       attrs.push(`turns="${usage.totalTurns}"`, `cost="$${usage.totalCost.toFixed(4)}"`);
       const lines: string[] = [];

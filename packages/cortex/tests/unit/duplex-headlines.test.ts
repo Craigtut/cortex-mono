@@ -31,6 +31,8 @@ interface HarnessState {
 function createHeadlines(initial?: Partial<HarnessState>): {
   headlines: DuplexHeadlines;
   state: HarnessState;
+  /** A reasoner attempt starting and ending, as the run tracker reports it. */
+  run: { start(): void; end(): void };
 } {
   const state: HarnessState = {
     running: false,
@@ -40,15 +42,36 @@ function createHeadlines(initial?: Partial<HarnessState>): {
     now: 1_000_000,
     ...initial,
   };
+  let attempt: { startedAt: number } | null = null;
+  let lastEndedAt: number | null = null;
   const ports: DuplexHeadlinePorts = {
-    reasonerRunning: () => state.running,
+    reasonerRun: {
+      logicalRunActive: () => state.running,
+      attempt: () => attempt,
+      lastEndedAt: () => lastEndedAt,
+    },
     reasonerUsage: () => usage(),
     activeSubAgents: () => state.subAgents,
     delegations: () => state.delegations,
     pendingAsks: () => state.asks,
     now: () => state.now,
   };
-  return { headlines: new DuplexHeadlines(ports), state };
+  const headlines = new DuplexHeadlines(ports);
+  return {
+    headlines,
+    state,
+    run: {
+      start: () => {
+        attempt = { startedAt: state.now };
+        headlines.noteAttemptBoundary();
+      },
+      end: () => {
+        attempt = null;
+        lastEndedAt = state.now;
+        headlines.noteAttemptBoundary();
+      },
+    },
+  };
 }
 
 describe('DuplexHeadlines', () => {
@@ -58,8 +81,8 @@ describe('DuplexHeadlines', () => {
   });
 
   it('renders the working state with the current tool and as_of ages', () => {
-    const { headlines, state } = createHeadlines({ running: true });
-    headlines.noteRunStart();
+    const { headlines, state, run } = createHeadlines({ running: true });
+    run.start();
     state.now += 30_000;
     headlines.noteToolStart('Bash', 'npm test');
     state.now += 12_000;
@@ -74,15 +97,15 @@ describe('DuplexHeadlines', () => {
   });
 
   it('clears the current tool when it ends and reports idle time after the run', () => {
-    const { headlines, state } = createHeadlines({ running: true });
-    headlines.noteRunStart();
+    const { headlines, state, run } = createHeadlines({ running: true });
+    run.start();
     headlines.noteToolStart('Grep', 'pattern');
     headlines.noteToolEnd();
     expect(headlines.build()).not.toContain('Current:');
 
     headlines.noteOutput('All tests passed.');
     state.running = false;
-    headlines.noteRunEnd();
+    run.end();
     state.now += 60_000;
     const block = headlines.build()!;
     expect(block).toContain('state="idle"');
@@ -95,8 +118,8 @@ describe('DuplexHeadlines', () => {
     // "still working on it" through a failing retry ladder is the answer that
     // makes a user wait instead of intervening, and on the default policy the
     // ladder can run for hours. Retrying is a separate fact.
-    const { headlines, state } = createHeadlines({ running: true });
-    headlines.noteRunStart();
+    const { headlines, state, run } = createHeadlines({ running: true });
+    run.start();
     headlines.noteRetry({ category: 'server_error', attempt: 3, maxAttempts: 5 });
     state.now += 8_000;
 
@@ -110,11 +133,11 @@ describe('DuplexHeadlines', () => {
   });
 
   it('clears the retry line when the run ends', () => {
-    const { headlines, state } = createHeadlines({ running: true });
-    headlines.noteRunStart();
+    const { headlines, state, run } = createHeadlines({ running: true });
+    run.start();
     headlines.noteRetry({ category: 'network', attempt: 1, maxAttempts: 3 });
     state.running = false;
-    headlines.noteRunEnd();
+    run.end();
     expect(headlines.build() ?? '').not.toContain('Retrying after');
   });
 
@@ -317,8 +340,8 @@ describe('DuplexHeadlines', () => {
   });
 
   it('escapes markup in instructions and tool summaries', () => {
-    const { headlines, state } = createHeadlines({ running: true });
-    headlines.noteRunStart();
+    const { headlines, state, run } = createHeadlines({ running: true });
+    run.start();
     headlines.noteToolStart('Bash', 'echo "<work-status>"');
     state.delegations = [{
       alias: 'task-1',

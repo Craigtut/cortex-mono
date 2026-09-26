@@ -30,12 +30,12 @@ import { routerOptionsFrom } from '../facade/config.js';
 import type { ResolvedCortexAgentConfig } from '../facade/config.js';
 import { collectCauseTags, latestCauseSeq } from './cause-tags.js';
 import type { CauseTag } from './cause-tags.js';
-import { DuplexRouter } from './router.js';
+import { DUPLEX_ROUTER_DEFAULTS, DuplexRouter } from './router.js';
 import type { DuplexRouterPorts, DuplexRouterState } from './router.js';
 import { PermissionBroker } from './permission-broker.js';
 import type { PermissionBrokerPorts } from './permission-broker.js';
 import { FanOutContextManager } from './fanout-context-manager.js';
-import { DuplexHeadlines, summarizeHeadlineArgs } from './headlines.js';
+import { DuplexHeadlines } from './headlines.js';
 import { stripAskFence } from './ask-fence.js';
 import { buildControlTools } from './control-tools.js';
 import { buildDeliverTool, buildSteerSubAgentTool } from './reasoner-tools.js';
@@ -55,6 +55,8 @@ import { IdleDigestion } from './idle-digestion.js';
 import { AggregateBudget } from './aggregate-budget.js';
 import { ReasonerDispatcher } from './reasoner-dispatch.js';
 import { ReasonerOutcomeReporter } from './reasoner-outcomes.js';
+import { ReasonerRunTracker } from './reasoner-run.js';
+import { LivenessWatchdog } from './watchdog.js';
 import { errorMessageOf } from '../error-classifier.js';
 import type { CortexAbortScope, CortexDeliverOptions } from '../cortex-agent.js';
 
@@ -92,6 +94,9 @@ export class DuplexSession {
   private readonly digestion: IdleDigestion;
   private readonly dispatcher: ReasonerDispatcher;
   private readonly outcomes: ReasonerOutcomeReporter;
+  /** The single owner of "is the reasoner running, and since when". */
+  private readonly run: ReasonerRunTracker;
+  private readonly watchdog: LivenessWatchdog;
   /**
    * The facade-minted shared MCP manager: loops sharing it never close it,
    * so the session does at destroy. Null when the consumer supplied their
@@ -177,8 +182,9 @@ export class DuplexSession {
         : {}),
     });
     this.router = new DuplexRouter(this.routerPorts(config), routerOptions);
+    this.run = new ReasonerRunTracker(reasoner);
     this.headlines = new DuplexHeadlines({
-      reasonerRunning: () => reasoner.isPrompting,
+      reasonerRun: this.run,
       reasonerUsage: () => reasoner.getSessionUsage(),
       activeSubAgents: () => reasoner.getActiveSubAgents(),
       delegations: () => this.router.getDelegations(),
@@ -196,7 +202,21 @@ export class DuplexSession {
       headlines: this.headlines,
       aggregateBreached: () => this.aggregate.guard.isBreached(),
       destroyed,
+      now: Date.now,
     });
+    this.watchdog = new LivenessWatchdog(
+      {
+        runStartedAt: () => this.run.attempt()?.startedAt ?? null,
+        lastOutputAt: () => this.outcomes.lastOutputAt(),
+        activeAliases: () => this.router.activeAliases(),
+        pendingAsks: () => this.broker.getPendingAsks(),
+        reportProgress: (text) => this.outcomes.reportProgress(text),
+      },
+      {
+        intervalMs: routerOptions.watchdogIntervalMs ?? DUPLEX_ROUTER_DEFAULTS.watchdogIntervalMs,
+        now: Date.now,
+      },
+    );
     this.guards = new TalkerGuards(this.logger);
     this.wire();
     // The merged stream forwards through catch-all listeners, which a bridge
@@ -208,7 +228,7 @@ export class DuplexSession {
       stopAllWork: () => this.stopAllWork(),
       retireAllDelegations: () => this.router.retireAllDelegations(),
       announce: (text) => {
-        this.router.deliverFromReasoner(text, 'interrupt', { synthetic: true, terminal: true });
+        this.outcomes.notify(text, 'interrupt', { synthetic: true, terminal: true });
       },
       destroyed,
       workLoopPath: reasoner.loopPath,
@@ -253,7 +273,7 @@ export class DuplexSession {
       currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
       currentReasonerCauseTags: () => collectCauseTags(reasoner.activeRunCauseTags),
       answerAsk: (askId, decision, reason) => this.broker.answer(askId, decision, reason),
-      pendingAsks: () => this.broker.getPendingAsks(),
+      reasonerAttemptId: () => this.run.latestAttemptId,
       workRefusal: () => this.aggregate.workRefusal(),
       idleSignal: config.idleSignal,
       logger: this.logger,
@@ -340,42 +360,13 @@ export class DuplexSession {
     // the delivery that announces it.
     outcomes.wireFailureSurfacing();
 
-    // Run tracking: implicit deliveries, the liveness watchdog, the
-    // per-turn dispatch cap, the stop-reason audit, and the headline feed.
-    const reasonerBridge = reasoner.getEventBridge();
-    reasonerBridge.on('loop_start', (event) => {
-      if (event.childTaskId) return;
-      outcomes.noteRunStart();
-      router.noteReasonerRunStart();
-      headlines.noteRunStart();
-    });
-    reasonerBridge.on('loop_end', (event) => {
-      if (event.childTaskId) return;
-      outcomes.noteRunEnd(event);
-      headlines.noteRunEnd();
-      this.digestion.schedule();
-    });
-    // Headline activity feed: the reasoner's own tool calls and last
-    // user-facing output. Child tool activity reaches the block through
-    // getActiveSubAgents() (the sub-agent manager tracks it), so only
-    // main-loop events feed here.
-    reasonerBridge.on('tool_call_start', (event) => {
-      if (event.childTaskId) return;
-      const payload = event.payload as { toolName?: string; args?: Record<string, unknown> } | undefined;
-      if (!payload?.toolName) return;
-      headlines.noteToolStart(payload.toolName, summarizeHeadlineArgs(payload.toolName, payload.args));
-    });
-    reasonerBridge.on('tool_call_end', (event) => {
-      if (event.childTaskId) return;
-      headlines.noteToolEnd();
-    });
-    reasonerBridge.on('turn_end', (event) => {
-      if (event.childTaskId) return;
-      const userFacing = event.textOutput?.userFacing;
-      if (userFacing && userFacing.trim().length > 0) {
-        headlines.noteOutput(userFacing);
-      }
-    });
+    // Attempt boundaries, in the order they must run: the outcome (an
+    // implicit result or a failure notice) before the headline clears the
+    // attempt's lines, and both before digestion is scheduled.
+    this.run.onAttemptStart(() => outcomes.noteAttemptStart());
+    this.run.onAttemptEnd((event) => outcomes.noteAttemptEnd(event));
+    headlines.attach(reasoner.getEventBridge(), this.run);
+    this.run.onAttemptEnd(() => this.digestion.schedule());
     const talkerBridge = talker.getEventBridge();
     talkerBridge.on('turn_end', (event) => {
       if (event.childTaskId) return;
@@ -894,7 +885,7 @@ export class DuplexSession {
     const list = interrupted
       .map((delegation) => `${delegation.alias} (${delegation.instructions})`)
       .join(', ');
-    router.deliverFromReasoner(
+    this.outcomes.notify(
       `The session was restored. Background work that was in progress is no longer running: ${list}. ` +
       'If the user asks about it, say it was interrupted and offer to start it again.',
       'silent',
@@ -905,6 +896,7 @@ export class DuplexSession {
   /** Stop the session's timers and settle its asks, synchronously. */
   beginDestroy(): void {
     this.digestion.destroy();
+    this.watchdog.destroy();
     // Settle every pending ask first so no resolver promise outlives the
     // session: a hanging ask would block its loop into the force-kill path.
     this.broker.destroy();
