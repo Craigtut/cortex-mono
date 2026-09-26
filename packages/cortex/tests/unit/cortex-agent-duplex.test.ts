@@ -22,15 +22,15 @@ import type { AgentLoopConfig } from '../../src/types.js';
 import type { AgentMessage } from '../../src/context-manager.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
+import { CortexAgent } from '../../src/cortex-agent.js';
 import {
-  CortexAgent,
   LOOKUP_MAX_TURNS,
   TALKER_MAX_TURNS,
   buildDuplexReasonerConfig,
   buildQuickLookupConfig,
   buildTalkerConfig,
   withBrokeredPermissions,
-} from '../../src/cortex-agent.js';
+} from '../../src/duplex/assembly.js';
 import {
   buildBrokeredNetworkResolver,
   buildBrokeredPermissionResolver,

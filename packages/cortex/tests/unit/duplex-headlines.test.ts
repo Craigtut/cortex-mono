@@ -9,7 +9,7 @@ import type { HeadlineAsk } from '../../src/duplex/headlines.js';
 import type { DuplexHeadlinePorts } from '../../src/duplex/headlines.js';
 import type { SessionUsage, SubAgentSnapshot } from '../../src/types.js';
 import type { DelegationSnapshot } from '../../src/duplex/router.js';
-import { TALKER_HEADLINE_MAX_TOKENS } from '../../src/cortex-agent.js';
+import { TALKER_HEADLINE_MAX_TOKENS } from '../../src/duplex/assembly.js';
 
 function usage(overrides?: Partial<SessionUsage>): SessionUsage {
   return {

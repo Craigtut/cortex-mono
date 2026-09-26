@@ -24,7 +24,7 @@ import { Type } from 'typebox';
 import type { AgentLoop } from '../../src/agent-loop.js';
 import type { CortexTool } from '../../src/tool-contract.js';
 import type { RetryScheduledInfo } from '../../src/types.js';
-import { TALKER_MAX_TURNS } from '../../src/cortex-agent.js';
+import { TALKER_MAX_TURNS } from '../../src/duplex/assembly.js';
 import { REASONER_ROLE_PROMPT, TALKER_ROLE_PROMPT } from '../../src/duplex/prompts.js';
 import { CONTROL_TOOL_NAMES } from '../../src/duplex/control-tools.js';
 import {
