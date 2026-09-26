@@ -685,6 +685,16 @@ export class CortexAgent extends LoopSurface {
   }
 
   /**
+   * Mark a pending ask as presented to the human. In passthrough the
+   * consumer presents asks, so this sets the loop registry's `voiced` flag
+   * as AgentLoop.markAskVoiced does. In duplex the session voices every ask
+   * itself and owns that fact, so this returns false and changes nothing.
+   */
+  markAskVoiced(askId: string): boolean {
+    return this.session.markAskVoiced(askId);
+  }
+
+  /**
    * The network egress decision function this agent actually enforces: in
    * duplex it is the broker-routed wrapper (a consumer `ask` becomes a
    * voiced conversation ask), in passthrough the consumer's own function

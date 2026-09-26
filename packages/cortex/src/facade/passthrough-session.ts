@@ -168,6 +168,11 @@ export class PassthroughSession implements SessionMode {
     return this.reasoner.getPendingAsks();
   }
 
+  /** The consumer presents asks itself here, so it owns the voiced flag. */
+  markAskVoiced(askId: string): boolean {
+    return this.reasoner.markAskVoiced(askId);
+  }
+
   settlementTerms(prompts: SettlementTerm): { conversation: SettlementTerm[]; work: SettlementTerm[] } {
     const { reasoner } = this;
     return {

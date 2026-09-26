@@ -244,8 +244,6 @@ export abstract class LoopSurface {
     return this.topology.work.getDeadLetteredBackgroundResults();
   }
 
-  markAskVoiced(askId: string): boolean { return this.topology.work.markAskVoiced(askId); }
-
   /**
    * Feed a consumer-built headline block into the reasoner's context (view
    * injection outside the cache boundary). In duplex the facade owns the

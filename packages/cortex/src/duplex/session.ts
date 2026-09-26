@@ -194,16 +194,27 @@ export class DuplexSession implements SessionMode {
    * in the reasoner's subtree, so its asks reach the broker alone.
    */
   pendingAsks(): PendingAsk[] {
-    // Whether the user was ever read an ask is the broker's fact (the loop
-    // registry's flag is never set in duplex), so it is overlaid here.
+    // Whether the user was ever read an ask the broker holds is the broker's
+    // fact alone (markAskVoiced below refuses to write the loop registry's
+    // flag in duplex), so it replaces the registry's value, never merges.
     const { voicing } = this.broker;
+    const brokered = new Set(this.broker.getPendingAsks().map((ask) => ask.askId));
     const asks = this.reasoner.getPendingAsks().map((ask) =>
-      (ask.voiced || !voicing.stateOf(ask.askId).voiced ? ask : { ...ask, voiced: true }));
+      (brokered.has(ask.askId) ? { ...ask, voiced: voicing.stateOf(ask.askId).voiced } : ask));
     const mirrored = new Set(asks.map((ask) => ask.askId));
     const brokerOnly = this.broker.getPendingAsks()
       .filter((ask) => !mirrored.has(ask.askId))
       .map(({ kind: _kind, ...ask }) => ask);
     return [...asks, ...brokerOnly];
+  }
+
+  /**
+   * Refused: in duplex the session voices every ask itself (the broker, D16),
+   * and a second writer of "the user heard it" would let the consumer surface
+   * report a request as heard that the broker never read out.
+   */
+  markAskVoiced(_askId: string): boolean {
+    return false;
   }
 
   settlementTerms(prompts: SettlementTerm): { conversation: SettlementTerm[]; work: SettlementTerm[] } {

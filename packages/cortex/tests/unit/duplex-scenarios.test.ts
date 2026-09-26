@@ -755,6 +755,34 @@ describe('scenario: permission brokering through conversation', () => {
     getBroker(h.facade).answer(askId, 'deny', undefined);
   });
 
+  it('keeps the broker the only writer of voiced: markAskVoiced cannot mark an unheard ask', async () => {
+    const h = brokeredScenario();
+    // The talker refuses the voicing, so the broker never reads it out.
+    const original = h.talkerLoop.deliver.bind(h.talkerLoop);
+    const deliver = vi.spyOn(h.talkerLoop, 'deliver').mockImplementation((content, options) => {
+      if (content.includes('permission-request')) throw new Error('talker unavailable');
+      return original(content, options);
+    });
+    h.reasonerPi.script = [
+      { text: 'Deploying.', calls: [{ name: 'Deploy', args: { command: 'ship --prod' } }] },
+      { text: 'Stopped.' },
+    ];
+    h.talkerPi.script = [{ text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'deploy' } }] }];
+    await h.facade.prompt('please deploy');
+    await waitUntil(() => entriesOfType(h.facade, 'ask').length === 1, 2000, 'ask raised');
+    const askId = pendingAskId(h.facade);
+    // Precondition: the loop registry holds the ask, and nobody heard it.
+    expect(h.reasonerLoop.getPendingAsks().map((ask) => ask.askId)).toEqual([askId]);
+    expect(h.facade.getPendingAsks()).toMatchObject([{ askId, voiced: false }]);
+
+    expect(h.facade.markAskVoiced(askId)).toBe(false);
+    expect(h.facade.getPendingAsks()).toMatchObject([{ askId, voiced: false }]);
+
+    deliver.mockRestore();
+    getBroker(h.facade).answer(askId, 'deny', undefined);
+    await waitUntil(() => h.facade.getPendingAsks().length === 0, 2000, 'ask settled');
+  });
+
   it('an unanswered ask times out as a deny the reasoner can see', async () => {
     const h = brokeredScenario({ askTimeoutMs: 40 });
     h.reasonerPi.script = [

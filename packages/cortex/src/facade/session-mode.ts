@@ -99,6 +99,11 @@ export interface SessionMode {
   abort(scope: CortexAbortScope): Promise<void>;
   /** Every ask blocked on a decision, deduplicated by askId. */
   pendingAsks(): PendingAsk[];
+  /**
+   * The consumer says it presented an ask to the human. Only where the
+   * consumer owns that fact; false where the session voices asks itself.
+   */
+  markAskVoiced(askId: string): boolean;
   /** The settlement terms in wait order, the facade's prompt term included. */
   settlementTerms(prompts: SettlementTerm): { conversation: SettlementTerm[]; work: SettlementTerm[] };
 

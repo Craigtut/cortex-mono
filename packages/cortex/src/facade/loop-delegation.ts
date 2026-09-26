@@ -69,6 +69,8 @@ export const AGENT_LOOP_DELEGATION = {
   dropPendingWakeDeliveries: 'withheld',
   // Asks and headlines.
   getPendingAsks: 'forwarded',
+  // Forwarded in passthrough, where the consumer presents asks; a refused
+  // no-op in duplex, where the broker is the only writer of `voiced`.
   markAskVoiced: 'forwarded',
   setHeadlineProvider: 'forwarded',
   // Withheld: the facade owns this hook in duplex (the control-tool
