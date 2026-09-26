@@ -196,6 +196,8 @@ export class PassthroughSession implements SessionMode {
 
   setModel(model: CortexModel): void {
     this.reasoner.setModel(model);
+    // The mode stays; the note explaining it is read off the model.
+    this.services.refreshModelNotes();
   }
 
   setUtilityModel(model: CortexModel): void {

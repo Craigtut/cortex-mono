@@ -312,4 +312,41 @@ describe('setModel after assembly', () => {
     expect(loops.get('talker')!.getModel().modelId).toBe('claude-haiku-4-5');
     expect(note(facade, 'duplex-not-concurrent')).toBeUndefined();
   });
+
+  it('re-reads the passthrough note when setModel moves onto models that would run duplex', async () => {
+    const { facade, loopPaths } = await create({ model: await ollamaModel() });
+    expect(note(facade, 'mode-resolved-passthrough')!.data).toMatchObject({ reasonerProvider: 'ollama' });
+
+    facade.setModel(await new ProviderManager().resolveModel('anthropic', 'claude-sonnet-4-6'));
+
+    // The mode stays; the note now says what fixes it.
+    expect(loopPaths).toEqual(['main']);
+    const resolved = note(facade, 'mode-resolved-passthrough')!;
+    expect(resolved.data).toMatchObject({ reasonerProvider: 'anthropic', wouldResolveTo: 'duplex' });
+    expect(resolved.summary).toContain('resolved at creation');
+    expect(resolved.detail).not.toContain('serves one request at a time');
+  });
+
+  it('re-reads the passthrough note when setModel stays on a shared serial server', async () => {
+    const { facade } = await create({ model: await ollamaModel() });
+    expect(note(facade, 'mode-resolved-passthrough')!.data).toMatchObject({ reasonerModelId: 'test' });
+
+    facade.setModel(await ollamaModel({ modelId: 'small' }));
+
+    expect(note(facade, 'mode-resolved-passthrough')!.data).toMatchObject({
+      reasonerModelId: 'small',
+      wouldResolveTo: 'passthrough',
+    });
+    expect(facade.getResolutionReport().filter((n) => n.code === 'mode-resolved-passthrough')).toHaveLength(1);
+  });
+
+  it('gives an explicit passthrough no mode note after setModel onto a serial server', async () => {
+    const hosted = await new ProviderManager().resolveModel('anthropic', 'claude-sonnet-4-6');
+    const { facade, loops } = await create({ model: hosted, mode: 'passthrough' });
+
+    facade.setModel(await ollamaModel());
+
+    expect(loops.get('main')!.getModel().capabilities?.concurrency).toBe('serial');
+    expect(facade.getResolutionReport()).toEqual([]);
+  });
 });

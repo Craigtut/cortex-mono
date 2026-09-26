@@ -204,7 +204,27 @@ export function collectAssemblyResolutionNotes(
   }
 
   const decided = resolution.modeResolution;
-  if (decided.requested === undefined && resolution.mode === 'passthrough') {
+  if (decided.requested === undefined && resolution.mode === 'passthrough' && decided.mode === 'duplex') {
+    // A setModel() moved a passthrough agent onto models that would resolve
+    // to duplex. The mode stays (loops are built from it), so the note says
+    // what it is now fixed by rather than repeating a reason that is gone.
+    notes.push({
+      code: 'mode-resolved-passthrough',
+      severity: 'info',
+      summary: 'Running passthrough: the mode was resolved at creation, and the current models would run duplex.',
+      detail:
+        'mode was not set, so it was resolved from the backends when the agent was created. ' +
+        'setModel() has since changed the models so that the talker would no longer queue ' +
+        'behind the reasoner, but the mode is fixed once the loops are built, so the agent ' +
+        'still runs a single loop.',
+      remedy: 'Create a new agent to run duplex on these models, or set mode explicitly.',
+      data: {
+        ...modelData('reasoner', decided.reasoner),
+        ...(decided.talker ? modelData('talker', decided.talker) : {}),
+        wouldResolveTo: 'duplex',
+      },
+    });
+  } else if (decided.requested === undefined && resolution.mode === 'passthrough') {
     const shared = decided.talker ? describeSharedBackend(decided.talker, decided.reasoner) : null;
     notes.push({
       code: 'mode-resolved-passthrough',
@@ -218,6 +238,7 @@ export function collectAssemblyResolutionNotes(
       data: {
         ...modelData('reasoner', decided.reasoner),
         ...(decided.talker ? modelData('talker', decided.talker) : {}),
+        wouldResolveTo: 'passthrough',
       },
     });
   }

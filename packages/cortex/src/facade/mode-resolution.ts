@@ -11,6 +11,7 @@
 
 import { resolveUtilityModels } from '../agent-loop/model-settings.js';
 import type { PiModel } from '../agent-loop/pi-agent.js';
+import type { LoopModelApi } from '../agent-loop/api/models.js';
 import { servedConcurrently } from '../model-backend.js';
 import { describeModel, isCortexModel, unwrapModel } from '../model-wrapper.js';
 import type { CortexModel, ModelDescription } from '../model-wrapper.js';
@@ -56,8 +57,36 @@ export function resolveFacadeMode(config: ResolvedCortexAgentConfig): ModeResolu
       talker: null,
     };
   }
-  const reasoner = describeModel(config.model);
-  const talker = describeModel(defaultTalkerModel(config));
+  return resolveModeFor(config.model, defaultTalkerModel(config));
+}
+
+/**
+ * What an omitted mode would resolve to for a passthrough agent's current
+ * reasoner model, after setModel. The agent keeps the mode it was built
+ * with; this is what its resolution note reports against. The talker is
+ * the one duplex would pick now: the pinned model, or the loop's
+ * auto-resolved one (its current utility model when a manual override
+ * makes auto-resolution inapplicable to the new provider).
+ */
+export function redecideForLoop(
+  config: ResolvedCortexAgentConfig,
+  loop: Pick<LoopModelApi, 'getModel' | 'getUtilityModel' | 'getAutoResolvedUtilityModel'>,
+): ModeResolution {
+  if (config.mode !== undefined) return { mode: config.mode, requested: config.mode };
+  let talker = config.talker?.model;
+  if (!talker) {
+    try {
+      talker = loop.getAutoResolvedUtilityModel();
+    } catch {
+      talker = loop.getUtilityModel();
+    }
+  }
+  return resolveModeFor(loop.getModel(), talker);
+}
+
+function resolveModeFor(reasonerModel: CortexModel, talkerModel: CortexModel): ModeResolution {
+  const reasoner = describeModel(reasonerModel);
+  const talker = describeModel(talkerModel);
   const mode = servedConcurrently(reasoner, talker) ? 'duplex' : 'passthrough';
   return { mode, requested: undefined, reasoner, talker };
 }

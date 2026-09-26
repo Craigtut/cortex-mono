@@ -24,6 +24,7 @@ import type {
 import type { LogEntryInput } from './log-recorder.js';
 import type { LoopTopology } from './loop-surface.js';
 import type { ResolvedCortexAgentConfig } from './config.js';
+import { redecideForLoop } from './mode-resolution.js';
 import type { ModeResolution } from './mode-resolution.js';
 import type { BudgetGuard } from '../budget-guard.js';
 
@@ -42,6 +43,7 @@ const MODEL_RESOLUTION_NOTE_CODES: ReadonlySet<ResolutionNoteCode> = new Set<Res
   'talker-model-fallback',
   'talker-utility-model-skipped',
   'duplex-not-concurrent',
+  'mode-resolved-passthrough',
 ]);
 
 export interface ResolutionRecorderOptions {
@@ -85,7 +87,10 @@ export class ResolutionRecorder {
     return new ResolutionRecorder({
       observe: () => ({
         mode: talker ? 'duplex' : 'passthrough',
-        modeResolution: parts.modeResolution,
+        // Passthrough re-reads the decision against the model it holds now,
+        // so the note explaining the mode follows a setModel(). Duplex has
+        // no note that reads the decision.
+        modeResolution: talker ? parts.modeResolution : redecideForLoop(config, topology.work),
         requestedTalkerModel: config.talker?.model,
         talkerModel: talker?.getModel() ?? null,
         reasonerModel: topology.work.getModel(),
