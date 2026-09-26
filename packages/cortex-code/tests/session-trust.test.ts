@@ -2,7 +2,7 @@
  * Drives the REAL trust gates a Session runs at startup (registerSkills /
  * loadHooks) so a wiring bug (wrong filter, forgetting to record trust,
  * loading declined content) is caught. Only the UI prompt
- * (promptProjectContentTrust) and the agent/app collaborators are stubbed; the
+ * (promptTrust) and the agent/app collaborators are stubbed; the
  * trust store and discovery run for real against a temp project + fake home.
  * The agent and app are injected on the Session, which the gates read through.
  */
@@ -84,7 +84,7 @@ function makeSession(): { session: Session; registry: SkillRegistry } {
 }
 
 interface TrustGatesInternals {
-  promptProjectContentTrust: () => Promise<'trust' | 'skip'>;
+  promptTrust: () => Promise<'trust' | 'skip'>;
   registerSkills: () => Promise<void>;
   loadHooks: () => Promise<Record<string, Array<{ source: string }>>>;
 }
@@ -96,7 +96,7 @@ function gatesOf(session: Session): TrustGatesInternals {
 
 /** Force the trust overlay decision without a TUI. */
 function stubPrompt(session: Session, decision: 'trust' | 'skip'): void {
-  vi.spyOn(gatesOf(session), 'promptProjectContentTrust').mockResolvedValue(decision);
+  vi.spyOn(gatesOf(session), 'promptTrust').mockResolvedValue(decision);
 }
 
 beforeEach(() => {
@@ -130,7 +130,7 @@ describe('trust gate: project skills', () => {
     expect(registry.getEntry('helper')).not.toBeNull();
     // Trust was persisted, so a second run needs no prompt.
     const { session: session2, registry: registry2 } = makeSession();
-    const spy = vi.spyOn(gatesOf(session2), 'promptProjectContentTrust');
+    const spy = vi.spyOn(gatesOf(session2), 'promptTrust');
     await gatesOf(session2).registerSkills();
     expect(spy).not.toHaveBeenCalled();
     expect(registry2.getEntry('helper')).not.toBeNull();

@@ -60,55 +60,30 @@ export class ProjectTrustGates {
 
     // Untrusted: prompt the user
     const serverList = projectServers.map(s => `  ${s.name}: ${s.config.command}${s.config.args ? ' ' + s.config.args.join(' ') : ''}`).join('\n');
-
-    await new Promise<void>((resolve) => {
-      const items: SelectItem[] = [
-        { value: 'trust', label: 'Trust and connect', description: 'Approve these servers' },
-        { value: 'skip', label: 'Skip project servers', description: 'Only use global MCP servers' },
-      ];
-
-      const list = new SelectList(items, 2, selectListTheme);
-      const overlayBox = new OverlayBox(list, 'New Project MCP Servers');
-      const handle = this.getApp()!.tui.showOverlay(overlayBox, {
-        anchor: 'center',
-        width: '60%',
-        maxHeight: 12,
-      });
-
-      this.getApp()!.transcript.addNotification(
-        'MCP Trust Check',
-        `This project wants to connect MCP servers:\n${serverList}`,
-      );
-
-      list.onSelect = async (item) => {
-        handle.hide();
-        if (item.value === 'trust') {
-          // Record the EXACT config we trust-checked and showed the user, not a
-          // fresh read, so a file swapped between prompt and click is not trusted.
-          await trustProjectMcpConfig(this.cwd, trust.configContent);
-          for (const server of projectServers) {
-            await this.connectMcpServer(server);
-          }
-          this.getApp()!.transcript.addNotification('MCP', `Connected ${projectServers.length} project server(s).`);
-        } else {
-          this.getApp()!.transcript.addNotification('MCP', 'Skipped project MCP servers.');
-        }
-        resolve();
-      };
-
-      list.onCancel = () => {
-        handle.hide();
-        this.getApp()!.transcript.addNotification('MCP', 'Skipped project MCP servers.');
-        resolve();
-      };
+    const decision = await this.promptTrust({
+      title: 'New Project MCP Servers',
+      notice: { title: 'MCP Trust Check', body: `This project wants to connect MCP servers:\n${serverList}` },
+      trust: { label: 'Trust and connect', description: 'Approve these servers' },
+      skip: { label: 'Skip project servers', description: 'Only use global MCP servers' },
     });
+    if (decision === 'trust') {
+      // Record the EXACT config we trust-checked and showed the user, not a
+      // fresh read, so a file swapped between prompt and click is not trusted.
+      await trustProjectMcpConfig(this.cwd, trust.configContent);
+      for (const server of projectServers) {
+        await this.connectMcpServer(server);
+      }
+      this.getApp()?.transcript.addNotification('MCP', `Connected ${projectServers.length} project server(s).`);
+    } else {
+      this.getApp()?.transcript.addNotification('MCP', 'Skipped project MCP servers.');
+    }
   }
 
   private async connectMcpServer(server: { name: string; config: McpStdioConfig }): Promise<void> {
     try {
       await this.getAgent()!.connectMcpServer(server.name, server.config);
     } catch (err) {
-      this.getApp()!.transcript.addNotification(
+      this.getApp()?.transcript.addNotification(
         'MCP Error',
         `Failed to connect "${server.name}": ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -132,18 +107,18 @@ export class ProjectTrustGates {
     if (await checkProjectTrust(this.cwd, 'hooks', content)) return handlers;
 
     // Untrusted project hooks: prompt before loading them.
-    const decision = await this.promptProjectContentTrust(
+    const decision = await this.promptTrust(projectContentPrompt(
       'New Project Hooks',
       'This project defines lifecycle hooks in .cortex/hooks.json that run\n' +
         'commands on your machine. Trust and load them?',
-    );
+    ));
     if (decision === 'trust' && content !== null) {
       await recordProjectTrust(this.cwd, 'hooks', content);
-      this.getApp()!.transcript.addNotification('Hooks', 'Loaded project hooks.');
+      this.getApp()?.transcript.addNotification('Hooks', 'Loaded project hooks.');
       return handlers;
     }
 
-    this.getApp()!.transcript.addNotification('Hooks', 'Skipped project hooks (untrusted).');
+    this.getApp()?.transcript.addNotification('Hooks', 'Skipped project hooks (untrusted).');
     // Reload global-only so declined project hooks are absent, not just inert.
     return loadHookHandlers(this.cwd, { includeProject: false });
   }
@@ -175,80 +150,60 @@ export class ProjectTrustGates {
       return;
     }
 
-    const decision = await this.promptProjectContentTrust(
+    const decision = await this.promptTrust(projectContentPrompt(
       'New Project Skills',
       `This project defines ${projectSkills.length} skill(s) in .cortex/skills that can\n` +
         'run shell commands when loaded. Trust and register them?',
-    );
+    ));
     if (decision === 'trust' && signature !== null) {
       await recordProjectTrust(this.cwd, 'skills', signature);
       for (const skill of projectSkills) agent.addSkill(skill);
-      this.getApp()!.transcript.addNotification('Skills', `Registered ${projectSkills.length} project skill(s).`);
+      this.getApp()?.transcript.addNotification('Skills', `Registered ${projectSkills.length} project skill(s).`);
       return;
     }
 
-    this.getApp()!.transcript.addNotification('Skills', 'Skipped project skills (untrusted).');
-  }
-
-  /**
-   * Show a two-option trust overlay for project-local executable content
-   * (hooks or skills), mirroring the MCP trust prompt. Returns 'skip' if the
-   * user declines, cancels, or the TUI is unavailable.
-   */
-  private async promptProjectContentTrust(
-    title: string,
-    message: string,
-  ): Promise<'trust' | 'skip'> {
-    if (!this.getApp()) return 'skip';
-    return new Promise<'trust' | 'skip'>((resolve) => {
-      const items: SelectItem[] = [
-        { value: 'trust', label: 'Trust and load', description: 'Approve this project content' },
-        { value: 'skip', label: 'Skip', description: 'Leave it inert for this project' },
-      ];
-      const list = new SelectList(items, 2, selectListTheme);
-      const overlayBox = new OverlayBox(list, title);
-      const handle = this.getApp()!.tui.showOverlay(overlayBox, {
-        anchor: 'center',
-        width: '60%',
-        maxHeight: 12,
-      });
-      this.getApp()!.transcript.addNotification(title, message);
-      list.onSelect = (item) => {
-        handle.hide();
-        resolve(item.value === 'trust' ? 'trust' : 'skip');
-      };
-      list.onCancel = () => {
-        handle.hide();
-        resolve('skip');
-      };
-    });
+    this.getApp()?.transcript.addNotification('Skills', 'Skipped project skills (untrusted).');
   }
 
   /**
    * Prompt the user to trust a new/changed project MCP config during a
-   * watcher-driven reload. Mirrors the startup overlay in
-   * `connectMcpServers`. Returns 'skip' if the user declines or
-   * dismisses the overlay.
+   * watcher-driven reload. Returns 'skip' if the user declines or dismisses
+   * the overlay.
    */
   async resolveProjectMcpTrust(cwd: string, serverNames: string[]): Promise<'trust' | 'skip'> {
-    if (!this.getApp()) return 'skip';
     void cwd;
-    return await new Promise<'trust' | 'skip'>((resolve) => {
+    return this.promptTrust({
+      title: 'Project MCP Servers Changed',
+      notice: {
+        title: 'MCP Trust Check',
+        body: `Approve new/changed project MCP servers?\n${serverNames.map(n => `  ${n}`).join('\n')}`,
+      },
+      trust: { label: 'Trust and connect', description: 'Approve project MCP servers' },
+      skip: { label: 'Skip', description: 'Keep using global servers only' },
+    });
+  }
+
+  /**
+   * The two-option trust overlay every gate shows, with a transcript note
+   * explaining what is asking. Returns 'skip' if the user declines, cancels,
+   * or the TUI is unavailable.
+   */
+  private async promptTrust(prompt: TrustPrompt): Promise<'trust' | 'skip'> {
+    const app = this.getApp();
+    if (!app) return 'skip';
+    return new Promise<'trust' | 'skip'>((resolve) => {
       const items: SelectItem[] = [
-        { value: 'trust', label: 'Trust and connect', description: 'Approve project MCP servers' },
-        { value: 'skip', label: 'Skip', description: 'Keep using global servers only' },
+        { value: 'trust', ...prompt.trust },
+        { value: 'skip', ...prompt.skip },
       ];
       const list = new SelectList(items, 2, selectListTheme);
-      const overlayBox = new OverlayBox(list, 'Project MCP Servers Changed');
-      const handle = this.getApp()!.tui.showOverlay(overlayBox, {
+      const overlayBox = new OverlayBox(list, prompt.title);
+      const handle = app.tui.showOverlay(overlayBox, {
         anchor: 'center',
         width: '60%',
         maxHeight: 12,
       });
-      this.getApp()!.transcript.addNotification(
-        'MCP Trust Check',
-        `Approve new/changed project MCP servers?\n${serverNames.map(n => `  ${n}`).join('\n')}`,
-      );
+      app.transcript.addNotification(prompt.notice.title, prompt.notice.body);
       list.onSelect = (item) => {
         handle.hide();
         resolve(item.value === 'trust' ? 'trust' : 'skip');
@@ -259,4 +214,22 @@ export class ProjectTrustGates {
       };
     });
   }
+}
+
+interface TrustPrompt {
+  title: string;
+  /** The transcript note shown alongside the overlay. */
+  notice: { title: string; body: string };
+  trust: { label: string; description: string };
+  skip: { label: string; description: string };
+}
+
+/** The prompt for project hooks and skills, which share their wording. */
+function projectContentPrompt(title: string, message: string): TrustPrompt {
+  return {
+    title,
+    notice: { title, body: message },
+    trust: { label: 'Trust and load', description: 'Approve this project content' },
+    skip: { label: 'Skip', description: 'Leave it inert for this project' },
+  };
 }
