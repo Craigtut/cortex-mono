@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { SandboxPolicy, SandboxStatus } from '@animus-labs/cortex';
 import { sandboxCommand, formatSandboxStatus, type SandboxStatusView } from '../../src/commands/sandbox.js';
+import type { CommandSession } from '../../src/commands/index.js';
 
 function policyFixture(overrides: Partial<SandboxPolicy> = {}): SandboxPolicy {
   return {
@@ -115,7 +116,7 @@ describe('formatSandboxStatus', () => {
 // ---------------------------------------------------------------------------
 
 interface FakeSetup {
-  session: Record<string, unknown>;
+  session: CommandSession;
   notifications: Array<{ title: string; message: string }>;
   overlays: unknown[];
   setSandboxRung: ReturnType<typeof vi.fn>;
@@ -147,7 +148,8 @@ function makeFakeSession(overrides: Record<string, unknown> = {}): FakeSetup {
     setSandboxRung,
     ...overrides,
   };
-  return { session, notifications, overlays, setSandboxRung };
+  // Only the members /sandbox reads; the rest of the session is never reached.
+  return { session: session as unknown as CommandSession, notifications, overlays, setSandboxRung };
 }
 
 /** Reach the SelectList inside a captured OverlayBox. */

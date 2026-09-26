@@ -1,6 +1,6 @@
 import { basename } from 'node:path';
 import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
-import type { Command } from './index.js';
+import type { Command, CommandSession } from './index.js';
 import { listSessions, type SessionMeta } from '../persistence/sessions.js';
 import { selectListTheme } from '../tui/theme.js';
 import { OverlayBox } from '../tui/overlay-box.js';
@@ -20,7 +20,7 @@ function buildItems(sessions: SessionMeta[]): SelectItem[] {
 }
 
 async function openResumeDialog(
-  session: { getApp: () => { transcript: { addNotification: (t: string, m: string) => void }; tui: { showOverlay: (box: unknown, opts: unknown) => { hide: () => void } } } | null; resume: (id: string) => Promise<void> },
+  session: Pick<CommandSession, 'getApp' | 'resume'>,
   sessions: SessionMeta[],
   title: string,
 ): Promise<void> {

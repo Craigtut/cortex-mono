@@ -1,4 +1,5 @@
 import { fuzzyFilter } from '@earendil-works/pi-tui';
+import type { Session } from '../session.js';
 import { helpCommand } from './help.js';
 import { clearCommand } from './clear.js';
 import { compactCommand } from './compact.js';
@@ -17,12 +18,48 @@ import { mcpReloadCommand } from './mcp-reload.js';
 import { sandboxCommand } from './sandbox.js';
 import { statusCommand } from './status.js';
 
-// Handler type uses `any` for the session parameter to avoid circular
-// dependency with session.ts. Type safety is enforced at the call site.
-// `args` carries whitespace-split tokens after the command name (e.g.
-// "/sandbox off" -> ['off']); handlers that take no arguments ignore it.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type CommandHandler = (session: any, args: string[]) => Promise<void> | void;
+/**
+ * The part of the session slash commands reach. Picked from Session itself
+ * (a type-only import, so no runtime cycle with session.ts), so a reshaped
+ * Session surface fails typecheck in the command that relies on it.
+ */
+export type CommandSession = Pick<Session,
+  | 'getAgent'
+  | 'getAgentMode'
+  | 'getApp'
+  | 'getCompactionStrategy'
+  | 'getCredentialStore'
+  | 'getCwd'
+  | 'getEffectiveEffort'
+  | 'getModelId'
+  | 'getNetworkGrantInfo'
+  | 'getProvider'
+  | 'getProviderManager'
+  | 'getResolutionReport'
+  | 'getSandboxPolicy'
+  | 'getSandboxRung'
+  | 'getSandboxStatus'
+  | 'getYoloMode'
+  | 'isSandboxConfigEnabled'
+  | 'promptForUpdate'
+  | 'resetTitle'
+  | 'resetUtilityModel'
+  | 'resume'
+  | 'setPreferredEffort'
+  | 'setSandboxRung'
+  | 'setUtilityModel'
+  | 'setYoloMode'
+  | 'shutdown'
+  | 'switchModel'
+  | 'switchProvider'
+  | 'triggerMcpReload'
+>;
+
+/**
+ * `args` carries whitespace-split tokens after the command name (e.g.
+ * "/sandbox off" -> ['off']); handlers that take no arguments ignore it.
+ */
+export type CommandHandler = (session: CommandSession, args: string[]) => Promise<void> | void;
 
 export interface Command {
   name: string;
