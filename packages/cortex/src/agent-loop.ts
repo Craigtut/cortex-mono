@@ -35,10 +35,7 @@ import {
 import {
   assistantText,
   findLastAssistant,
-  messageHasText,
-  messageHasToolCalls,
   toolCallNames,
-  userMessageText,
   withPlaceholderContent,
 } from './pi-message.js';
 import type { McpClientManager } from './mcp-client.js';
@@ -123,6 +120,12 @@ import type {
   ModelThinkingCapabilities,
 } from './types.js';
 import { DEFAULT_LOOP_PATH } from './types.js';
+import {
+  isResumableAfterTrim,
+  trimTrailingFailures,
+  unwindFailedDelivery,
+  unwindSplicedBatch,
+} from './agent-loop/transcript-repair.js';
 import {
   clampToSupported,
   fromPiThinkingLevel,
@@ -1148,9 +1151,6 @@ export class AgentLoop {
     // This enables cache breakpoint optimization: old history is stable
     // across ticks and can be cached, while new content changes each tick.
     this._prePromptMessageCount = this.agent.state.messages.length;
-    // Pre-delivery boundary for the wake-batch failure unwind, captured as
-    // a local because compaction may move _prePromptMessageCount mid-run.
-    const preDeliveryCount = this._prePromptMessageCount;
 
     this.logger.debug('loop start', {
       messageCount: this._prePromptMessageCount,
@@ -1186,9 +1186,7 @@ export class AgentLoop {
       // own. An aborted turn instead cancels its spliced deliveries, the
       // same way abort() cancels parked ones.
       if (promptStatus !== 'cancelled') {
-        this.reparkUndeliveredWakeBatch(
-          wakeBatch, preDeliveryCount, silentBatch.length, error.message,
-        );
+        this.reparkUndeliveredWakeBatch(wakeBatch, silentBatch.length, error.message);
       }
       // Classification, overflow handling, retry orchestration, and the onError
       // emission all happen inside runTurnWithRetry. Here we only record status
@@ -1411,73 +1409,14 @@ export class AgentLoop {
     }
   }
 
-  /**
-   * Count trailing synthetic failure messages on the transcript. When a run
-   * fails, pi-agent-core appends an assistant message with `stopReason` of
-   * 'error'/'aborted' (and `errorMessage` set) and empty content. These must be
-   * removed before `agent.continue()`, which rejects a trailing assistant turn.
-   */
-  private trailingFailureTrimCount(): number {
-    const messages = this.agent.state.messages;
-    let count = 0;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i] as unknown as Record<string, unknown>;
-      if (AgentLoop.isTrimmableFailureMessage(msg)) {
-        count += 1;
-      } else {
-        break;
-      }
-    }
-    return count;
-  }
-
-  /**
-   * Whether a transcript message is a synthetic failure stub that trimming
-   * may remove. Error stubs (stopReason 'error' or errorMessage set) are
-   * always trimmable: pi appends them with empty content, and continue()
-   * rejects a trailing assistant turn.
-   *
-   * An aborted message (stopReason 'aborted') is different: pi returns the
-   * accumulated PARTIAL content with that stopReason, and a consumer UI has
-   * already shown any streamed text to the user. Trimming it would make the
-   * model forget an answer the user read. So an aborted message is only
-   * trimmable when it has no text to keep, or when it carries tool calls
-   * (trailing ones are unpaired by construction, and an unpaired tool call
-   * in history is a hard provider error on the next request).
-   */
-  private static isTrimmableFailureMessage(msg: Record<string, unknown>): boolean {
-    if (msg['role'] !== 'assistant') return false;
-    const isAborted = msg['stopReason'] === 'aborted';
-    if (msg['stopReason'] === 'error' || (msg['errorMessage'] != null && !isAborted)) {
-      return true;
-    }
-    if (!isAborted) return false;
-    return !messageHasText(msg) || messageHasToolCalls(msg);
-  }
-
-  /**
-   * Whether trimming trailing failure messages would leave a transcript that
-   * `agent.continue()` can resume (last message is a user or tool-result, not a
-   * dangling assistant turn). Guards the rare case of a failure that lands right
-   * after an assistant tool-call turn but before its tool results.
-   */
+  /** Whether trimming the failure stubs leaves a transcript continue() can resume. */
   private peekResumableAfterTrim(): boolean {
-    const messages = this.agent.state.messages;
-    const lastIndex = messages.length - this.trailingFailureTrimCount() - 1;
-    // Require a real conversation message PAST the slot region: a failure with
-    // only slots present (no committed user/tool turn) has nothing to resume,
-    // so it must surface rather than retry.
-    if (lastIndex < this.contextManager.slotCount) return false;
-    const last = messages[lastIndex] as unknown as Record<string, unknown>;
-    return last['role'] !== 'assistant';
+    return isResumableAfterTrim(this.agent.state.messages, this.contextManager.slotCount);
   }
 
   /** Remove trailing synthetic failure messages so continue() can resume. */
   private trimTrailingFailureMessages(): void {
-    const messages = this.agent.state.messages;
-    const trimCount = this.trailingFailureTrimCount();
-    if (trimCount > 0) {
-      messages.splice(messages.length - trimCount, trimCount);
+    if (trimTrailingFailures(this.agent.state.messages)) {
       this.notifySourceHistoryTailTrimmed();
     }
   }
@@ -1896,63 +1835,24 @@ export class AgentLoop {
    */
   private reparkUndeliveredWakeBatch(
     wakeBatch: QueuedDelivery[],
-    preDeliveryCount: number,
     trailingBatchCount: number,
     lastError: string,
   ): void {
     if (wakeBatch.length === 0) return;
     const messages = this.agent.state.messages;
 
-    // A mid-run front trim (observational activation through
+    // Walk from the LIVE boundary, not the one captured at run start: a
+    // mid-run front trim (observational activation through
     // setSourceHistory, the only in-run writer of _prePromptMessageCount)
-    // shifts every message down: the pushed batch is still in the
-    // transcript verbatim, just no longer at the captured boundary.
-    // Walking from the stale offset would misread "rewritten down" as
-    // "never pushed" and re-park content the transcript already carries,
-    // so the sweep would deliver it twice. The recalculated
-    // _prePromptMessageCount tracks exactly that shift (new length minus
-    // current-tick messages), so walk from the live value when it moved;
-    // unwindFailedDelivery reasons about mid-run rewrites the same way.
-    const boundary = this._prePromptMessageCount !== preDeliveryCount
-      ? this._prePromptMessageCount
-      : preDeliveryCount;
+    // shifts every message down, and the recalculated boundary tracks
+    // exactly that shift (new length minus current-tick messages). From
+    // the stale offset, "rewritten down" reads as "never pushed" and the
+    // sweep would deliver content the transcript already carries twice.
+    const boundary = this._prePromptMessageCount;
 
-    // How many spliced wake messages sit at the batch position, identity-
-    // checked by role and content so a mid-run history rewrite can never
-    // cause an unrelated message to be removed.
-    let landed = 0;
-    while (landed < wakeBatch.length) {
-      const idx = boundary + landed;
-      if (idx >= messages.length) break;
-      const msg = messages[idx] as unknown as Record<string, unknown>;
-      if (msg['role'] !== 'user' || msg['content'] !== wakeBatch[landed]!.content) break;
-      landed += 1;
-    }
-
-    if (landed === wakeBatch.length) {
-      // Progression test, ignoring trailing failure stubs: any survivor
-      // beyond the pushed batch (wake, silent, and the prompt input) means
-      // the run progressed past the content.
-      let end = messages.length;
-      while (end > boundary) {
-        const msg = messages[end - 1] as unknown as Record<string, unknown>;
-        if (!AgentLoop.isTrimmableFailureMessage(msg)) break;
-        end -= 1;
-      }
-      if (end > boundary + wakeBatch.length + trailingBatchCount + 1) {
-        return; // Durable history; re-parking would duplicate it.
-      }
-      messages.splice(boundary, landed);
-      this.notifySourceHistoryTailTrimmed();
-    } else if (landed > 0) {
-      // pi pushes the whole batch at run start, so a partial match means
-      // the transcript was rewritten under us. Leave it untouched and do
-      // not re-park: duplicating content is worse than leaving it as the
-      // context the surviving transcript already carries.
-      return;
-    }
-    // landed === 0: the failure hit before pi pushed the batch. Nothing to
-    // unwind, but the content is not in history and must be re-parked.
+    const unwind = unwindSplicedBatch(messages, wakeBatch, boundary, trailingBatchCount);
+    if (unwind.trimmed) this.notifySourceHistoryTailTrimmed();
+    if (unwind.outcome !== 'repark') return;
 
     const { retry: requeue, exhausted: droppedItems } =
       partitionExhausted(wakeBatch, WAKE_DELIVERY_LIMITS, Date.now());
@@ -4596,77 +4496,25 @@ export class AgentLoop {
    * re-queueing would duplicate it.
    */
   private unwindFailedDelivery(preDeliveryCount: number, runAbortEpoch: number): boolean {
-    const messages = this.agent.state.messages;
-    // Trim failure stubs appended during this run only; a stub predating
-    // the delivery belongs to an earlier turn and stays.
-    let end = messages.length;
-    while (end > preDeliveryCount) {
-      const msg = messages[end - 1] as unknown as Record<string, unknown>;
-      if (!AgentLoop.isTrimmableFailureMessage(msg)) break;
-      end -= 1;
-    }
-    if (end < messages.length) {
-      messages.splice(end, messages.length - end);
-      this.notifySourceHistoryTailTrimmed();
-    }
-    if (messages.length <= preDeliveryCount) {
-      // Nothing beyond the pre-delivery transcript survived (the failure
-      // hit before pi pushed the message, or only stubs landed): nothing
-      // to unwind, but the batch is not in history and must be re-queued.
-      // (`<` covers a mid-run compaction shrinking history; the recent
-      // tail survives compaction, so the delivery message is still there
-      // and this branch is not taken in that case.)
-      return messages.length === preDeliveryCount;
-    }
-    if (messages.length === preDeliveryCount + 1) {
-      const last = messages[messages.length - 1] as unknown as Record<string, unknown>;
-      if (last['role'] === 'user') {
-        messages.pop();
-        this.notifySourceHistoryTailTrimmed();
-        return true;
+    const unwind = unwindFailedDelivery(this.agent.state.messages, preDeliveryCount);
+    if (unwind.trimmed) this.notifySourceHistoryTailTrimmed();
+    if (unwind.injectedUserTexts.length > 0) {
+      // Content pi injected inside the failed run opens the next run
+      // through wake parking.
+      for (const content of unwind.injectedUserTexts) {
+        this.pendingWakeDeliveries.push({
+          content,
+          timestamp: Date.now(),
+          // Stamped with the epoch the failed run STARTED under. Read at
+          // push time it would race the abort's epoch advance: a catch
+          // running after the abort's finally would stamp the new epoch
+          // and resurrect content the abort should cancel with its run.
+          abortEpoch: runAbortEpoch,
+        });
       }
+      this.scheduleWakeSweep();
     }
-    const survivingTail = messages[messages.length - 1] as unknown as Record<string, unknown>;
-    if (survivingTail['role'] === 'assistant') {
-      // The run failed after an assistant tool-call turn but before its tool
-      // results, so the surviving tail carries an unpaired tool call: a hard
-      // provider error on the very next request. Unwind the whole delivery
-      // and re-queue rather than leave the transcript unusable.
-      //
-      // A user message pi injected inside this run (a public steer() drained
-      // at a turn boundary, or a follow-up drained at a would-stop point) is
-      // in the spliced range. Its content must survive the splice exactly
-      // once: recover it through the loop-owned wake parking, so it opens
-      // the next run. The transcript cannot tell a drained steer from a
-      // drained follow-up, and re-injecting through either pi queue would
-      // guess the wrong semantics for the other; parking delivers both at a
-      // clean run start instead.
-      const injected: string[] = [];
-      for (const raw of messages.slice(preDeliveryCount + 1)) {
-        const msg = raw as unknown as Record<string, unknown>;
-        if (msg['role'] !== 'user') continue;
-        const text = userMessageText(msg);
-        if (text.trim().length > 0) injected.push(text);
-      }
-      messages.splice(preDeliveryCount, messages.length - preDeliveryCount);
-      this.notifySourceHistoryTailTrimmed();
-      if (injected.length > 0) {
-        for (const content of injected) {
-          this.pendingWakeDeliveries.push({
-            content,
-            timestamp: Date.now(),
-            // Stamped with the epoch the failed run STARTED under. Read at
-            // push time it would race the abort's epoch advance: a catch
-            // running after the abort's finally would stamp the new epoch
-            // and resurrect content the abort should cancel with its run.
-            abortEpoch: runAbortEpoch,
-          });
-        }
-        this.scheduleWakeSweep();
-      }
-      return true;
-    }
-    return false;
+    return unwind.outcome === 'requeue';
   }
 
   /**
