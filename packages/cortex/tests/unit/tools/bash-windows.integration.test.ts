@@ -20,7 +20,9 @@ describe.skipIf(process.platform !== 'win32').each(shells)('$name execution', ({
   let tool: ReturnType<typeof createBashTool>;
 
   beforeEach(() => {
-    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex windows '));
+    // os.tmpdir() can be an 8.3 short path (C:\Users\RUNNER~1\...) while
+    // PowerShell reports the long one; the native realpath expands it.
+    directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'cortex windows ')));
     tool = createBashTool({ cwdTracker: new CwdTracker(directory), ...(shellPath ? { shellPath } : {}) });
   });
 
