@@ -23,6 +23,7 @@ import {
 } from '../activity/session-activity.js';
 import type { App } from '../tui/app.js';
 import { PermissionRuleManager } from './rules.js';
+import { PromptLock } from './prompt-lock.js';
 import { preflightPermission, type PreflightDeps } from './preflight.js';
 import { isPathWithinRealCwd } from './path-containment.js';
 import {
@@ -43,48 +44,6 @@ export interface PermissionBrokerDeps {
   sandbox: { getStatus(): SandboxStatus | undefined; getPolicy(): SandboxPolicy | undefined };
   getApp: () => Pick<App, 'showPermissionPrompt' | 'showNetworkPrompt'> | null;
   getYoloMode: () => boolean;
-}
-
-/** A single-holder lock over the on-screen prompt. */
-class PromptLock {
-  private held: Promise<void> | null = null;
-  private release: (() => void) | null = null;
-
-  get isHeld(): boolean {
-    return this.held !== null;
-  }
-
-  /** Resolve once no prompt holds the lock. Does not take it. */
-  async waitUntilFree(): Promise<void> {
-    while (this.held) {
-      await this.held;
-    }
-  }
-
-  /**
-   * Wait for the lock and take it. The free check and the take run in one
-   * synchronous step: a release wakes every waiter, and a waiter that took
-   * the lock one microtask after seeing it free could collide with another.
-   */
-  async acquire(): Promise<() => void> {
-    for (;;) {
-      await this.waitUntilFree();
-      if (!this.held) return this.take();
-    }
-  }
-
-  /** Take the lock; the returned function releases it and wakes the waiters. */
-  take(): () => void {
-    this.held = new Promise<void>((resolve) => {
-      this.release = resolve;
-    });
-    return () => {
-      const release = this.release;
-      this.held = null;
-      this.release = null;
-      release?.();
-    };
-  }
 }
 
 export class PermissionBroker {
@@ -196,13 +155,9 @@ export class PermissionBroker {
     const app = this.getApp();
     if (!app) return { decision: 'block', reason: 'TUI not initialized' };
 
-    // Serialize: wait for any active prompt to finish. A release wakes every
-    // waiter and the re-check below awaits, so another ask can take the lock
-    // in between; go round again until it is still free after the re-check.
-    let releaseLock: () => void;
-    for (;;) {
-      await this.promptLock.waitUntilFree();
-
+    // Serialize: take the lock in arrival order, tool and network asks alike.
+    const releaseLock = await this.promptLock.acquire();
+    try {
       // The asking run may have been aborted while this ask waited behind
       // another prompt (or before it arrived). Cortex has already stopped
       // waiting for this resolver, so never show a prompt for dead work.
@@ -218,14 +173,20 @@ export class PermissionBroker {
           ? { decision: 'block', reason: preAfterWait.reason }
           : { decision: 'block' };
       }
-
-      // Acquire the lock in the same synchronous step as the free check.
-      if (!this.promptLock.isHeld) {
-        releaseLock = this.promptLock.take();
-        break;
-      }
+      return await this.promptTool(app, toolName, toolArgs, context);
+    } finally {
+      releaseLock();
     }
+  }
 
+  /** Show the tool prompt; the caller holds the prompt lock. */
+  private async promptTool(
+    app: Pick<App, 'showPermissionPrompt'>,
+    toolName: string,
+    toolArgs: unknown,
+    context: ToolPermissionRequestContext | undefined,
+  ): Promise<boolean | CortexToolPermissionResult> {
+    const abortSignal = context?.signal;
     const permission = this.activity.recordPermissionRequested(
       toolName,
       toolArgs,
@@ -308,7 +269,6 @@ export class PermissionBroker {
       }
       externalController.abort();
       await this.activity.recordPermissionResolved(permission.id, toolName, permissionResolution);
-      releaseLock();
     }
   }
 
@@ -334,9 +294,20 @@ export class PermissionBroker {
     const app = this.getApp();
     if (!app) return 'deny';
 
-    // Serialize: wait for any active permission or network prompt to finish.
+    // Serialize: take the lock in arrival order, tool and network asks alike.
     const releaseLock = await this.promptLock.acquire();
+    try {
+      return await this.showNetworkPrompt(app, req);
+    } finally {
+      releaseLock();
+    }
+  }
 
+  /** Show the network prompt; the caller holds the prompt lock. */
+  private async showNetworkPrompt(
+    app: Pick<App, 'showNetworkPrompt'>,
+    req: NetworkAccessRequest,
+  ): Promise<NetworkPromptChoice> {
     const permission = this.activity.recordPermissionRequested('NetworkAccess', {
       host: req.host,
       via: req.via,
@@ -362,7 +333,6 @@ export class PermissionBroker {
     } finally {
       externalController.abort();
       await this.activity.recordPermissionResolved(permission.id, 'NetworkAccess', permissionResolution);
-      releaseLock();
     }
   }
 

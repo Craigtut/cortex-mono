@@ -143,4 +143,32 @@ describe('PermissionBroker prompt serialization', () => {
     await Promise.all([tool, network]);
     expect(maxOpen()).toBe(1);
   });
+
+  it('shows a queued tool ask before network asks that arrived after it', async () => {
+    const { broker, open } = makeBroker();
+
+    const first = broker.resolveNetworkAccess({ host: 'a.example.com', via: 'webfetch' } as never);
+    await waitUntil(() => open.length === 1);
+    const tool = broker.resolvePermission('Bash', { command: 'git push origin main' });
+    await settle();
+    const later = [
+      broker.resolveNetworkAccess({ host: 'b.example.com', via: 'webfetch' } as never),
+      broker.resolveNetworkAccess({ host: 'c.example.com', via: 'webfetch' } as never),
+    ];
+    await settle();
+    expect(open.map((prompt) => prompt.kind)).toEqual(['network']);
+
+    // The tool ask re-checks its rules after waking; a network ask woken by
+    // the same release used to take the lock during that await.
+    open[0]!.answer();
+    await first;
+    await waitUntil(() => open.length === 1);
+    expect(open[0]!.kind).toBe('tool');
+
+    while (open.length > 0) {
+      open[0]!.answer();
+      await settle();
+    }
+    await Promise.all([tool, ...later]);
+  });
 });
