@@ -95,28 +95,43 @@ export function unwindFailedDelivery(
   let trimmed = stubs > 0;
   if (trimmed) messages.splice(messages.length - stubs, stubs);
 
-  if (messages.length <= preDeliveryCount) {
-    // Nothing beyond the pre-delivery transcript survived. `<` is a mid-run
-    // compaction, which keeps the recent tail, so the delivery is durable.
-    const outcome = messages.length === preDeliveryCount ? 'requeue' : 'durable';
-    return { outcome, injectedUserTexts, trimmed };
-  }
-  if (messages.length === preDeliveryCount + 1 && raw(messages[messages.length - 1])['role'] === 'user') {
-    messages.pop();
+  // A mid-run compaction keeps the recent tail, so the delivery is durable.
+  if (messages.length < preDeliveryCount) return { outcome: 'durable', injectedUserTexts, trimmed };
+  // Turns only: pi declares tool changes ahead of the delivery and Cortex
+  // patches the prompt mid-run. Those system messages stay where they are
+  // (they declare what is still true); only turns are unwound.
+  const turns = turnIndicesFrom(messages, preDeliveryCount);
+  if (turns.length === 0) return { outcome: 'requeue', injectedUserTexts, trimmed };
+  if (turns.length === 1 && raw(messages[turns[0]!])['role'] === 'user') {
+    messages.splice(turns[0]!, 1);
     return { outcome: 'requeue', injectedUserTexts, trimmed: true };
   }
-  if (raw(messages[messages.length - 1])['role'] === 'assistant') {
-    for (const message of messages.slice(preDeliveryCount + 1)) {
-      const msg = raw(message);
+  if (raw(messages[turns[turns.length - 1]!])['role'] === 'assistant') {
+    for (const index of turns.slice(1)) {
+      const msg = raw(messages[index]);
       if (msg['role'] !== 'user') continue;
       const text = userMessageText(msg);
       if (text.trim().length > 0) injectedUserTexts.push(text);
     }
-    messages.splice(preDeliveryCount, messages.length - preDeliveryCount);
+    removeIndices(messages, turns);
     trimmed = true;
     return { outcome: 'requeue', injectedUserTexts, trimmed };
   }
   return { outcome: 'durable', injectedUserTexts, trimmed };
+}
+
+/** Indices of the non-system messages at or after `from`. */
+function turnIndicesFrom(messages: readonly AgentMessage[], from: number): number[] {
+  const indices: number[] = [];
+  for (let i = from; i < messages.length; i++) {
+    if (!isSystemMessage(messages[i])) indices.push(i);
+  }
+  return indices;
+}
+
+/** Remove the messages at ascending `indices`. */
+function removeIndices(messages: AgentMessage[], indices: readonly number[]): void {
+  for (let i = indices.length - 1; i >= 0; i--) messages.splice(indices[i]!, 1);
 }
 
 /**
@@ -143,11 +158,13 @@ export function unwindSplicedBatch(
   boundary: number,
   trailingBatchCount: number,
 ): { outcome: 'repark' | 'durable' | 'rewritten'; trimmed: boolean } {
+  // pi puts a tool-change declaration ahead of the batch, and Cortex may
+  // patch the prompt mid-run: match and count turns, not system messages.
+  const end = messages.length - trailingFailureCount(messages, boundary);
+  const turns = turnIndicesFrom(messages, boundary).filter((index) => index < end);
   let landed = 0;
-  while (landed < wakeBatch.length) {
-    const idx = boundary + landed;
-    if (idx >= messages.length) break;
-    const msg = raw(messages[idx]);
+  while (landed < wakeBatch.length && landed < turns.length) {
+    const msg = raw(messages[turns[landed]!]);
     if (msg['role'] !== 'user' || msg['content'] !== wakeBatch[landed]!.content) break;
     landed += 1;
   }
@@ -155,11 +172,10 @@ export function unwindSplicedBatch(
   if (landed === 0) return { outcome: 'repark', trimmed: false };
   if (landed < wakeBatch.length) return { outcome: 'rewritten', trimmed: false };
 
-  // Any survivor beyond the pushed batch, stubs aside, means progress.
-  const end = messages.length - trailingFailureCount(messages, boundary);
-  if (end > boundary + wakeBatch.length + trailingBatchCount + 1) {
+  // Any surviving turn beyond the pushed batch, stubs aside, means progress.
+  if (turns.length > wakeBatch.length + trailingBatchCount + 1) {
     return { outcome: 'durable', trimmed: false };
   }
-  messages.splice(boundary, landed);
+  removeIndices(messages, turns.slice(0, landed));
   return { outcome: 'repark', trimmed: true };
 }

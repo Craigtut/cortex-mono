@@ -47,6 +47,42 @@ describe('failure stubs', () => {
   });
 });
 
+describe('unwinding around system messages', () => {
+  const declaration = () => ({ role: 'system', content: '', toolsAdded: [{ name: 't' }], timestamp: 1 }) as unknown as AgentMessage;
+  const patch = () => ({ role: 'system', content: '', sections: { A: 'b' }, timestamp: 1 }) as unknown as AgentMessage;
+
+  it('requeues a delivery pi declared a tool change ahead of, keeping the declaration', () => {
+    const messages = [user('old'), declaration(), user('delivery'), stub()];
+    expect(unwindFailedDelivery(messages, 1).outcome).toBe('requeue');
+    expect(messages.map((m) => m.role)).toEqual(['user', 'system']);
+  });
+
+  it('requeues a delivery a prompt patch followed', () => {
+    const messages = [user('old'), user('delivery'), patch(), stub()];
+    expect(unwindFailedDelivery(messages, 1).outcome).toBe('requeue');
+    expect(messages.map((m) => m.role)).toEqual(['user', 'system']);
+  });
+
+  it('never hands the delivery itself back as injected text', () => {
+    const messages = [user('old'), declaration(), user('delivery'), user('steered'), toolCallTurn(), stub()];
+    const result = unwindFailedDelivery(messages, 1);
+    expect(result).toMatchObject({ outcome: 'requeue', injectedUserTexts: ['steered'] });
+    expect(messages.map((m) => m.role)).toEqual(['user', 'system']);
+  });
+
+  it('reparks a spliced batch pi declared a tool change ahead of', () => {
+    const messages = [user('old'), declaration(), user('wake'), user('prompt'), stub()];
+    expect(unwindSplicedBatch(messages, [{ content: 'wake' }], 1, 0))
+      .toEqual({ outcome: 'repark', trimmed: true });
+    expect(messages.map((m) => (m.role === 'user' ? m.content : m.role))).toEqual(['old', 'system', 'prompt', 'assistant']);
+  });
+
+  it('does not count a prompt patch as progress past a spliced batch', () => {
+    const messages = [user('old'), user('wake'), user('prompt'), patch(), stub()];
+    expect(unwindSplicedBatch(messages, [{ content: 'wake' }], 1, 0).outcome).toBe('repark');
+  });
+});
+
 describe('unwindFailedDelivery', () => {
   it('removes the delivery message and its stub when the run made no progress', () => {
     const messages = [user('old'), user('delivery'), stub()];

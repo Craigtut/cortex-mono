@@ -333,7 +333,12 @@ export class SystemPromptState {
     return this.basePrompt;
   }
 
-  /** The prompt as the model reads it: every non-empty section, in order. */
+  /**
+   * The prompt the loop wants: every non-empty section, in order. The
+   * transcript declares the same sections, but one added after the model
+   * has answered (a patch cannot insert) replays last, so its rendered order
+   * can differ from this.
+   */
   current(): string {
     return this.desired
       .map((section) => section.content)
@@ -380,11 +385,14 @@ export class SystemPromptState {
 
     // A head the loop has not written (a restored transcript, a prompt pi
     // was built with) is written now, in place. Free-form head content
-    // cannot be patched: later content appends to it.
+    // cannot be patched: later content appends to it. It keeps only its own
+    // tool declarations: the later messages still declare theirs, and
+    // declaring a tool twice is outside what native tool-change transports
+    // accept.
     let changed = false;
     const head = transcript[0] as SystemTranscriptMessage;
     if (contentText(head) !== '' || (this.desired.length > 0 && head.sections === undefined)) {
-      transcript[0] = this.headMessage(foldSystemMessages(transcript));
+      transcript[0] = this.headMessage(head);
       changed = true;
     }
 
@@ -418,16 +426,16 @@ export class SystemPromptState {
     return true;
   }
 
-  /** A head declaring the desired sections and `folded`'s tools. */
-  private headMessage(folded: SystemTranscriptMessage): AgentMessage {
+  /** A head declaring the desired sections and the tools `source` declares. */
+  private headMessage(source: SystemTranscriptMessage): AgentMessage {
     return {
       role: 'system',
       content: '',
       ...(this.desired.length > 0
         ? { sections: Object.fromEntries(this.desired.map(({ name, content }) => [name, content])) }
         : {}),
-      ...(folded.toolsAdded && folded.toolsAdded.length > 0 ? { toolsAdded: folded.toolsAdded } : {}),
-      timestamp: folded.timestamp,
+      ...(source.toolsAdded && source.toolsAdded.length > 0 ? { toolsAdded: source.toolsAdded } : {}),
+      timestamp: source.timestamp,
     };
   }
 }

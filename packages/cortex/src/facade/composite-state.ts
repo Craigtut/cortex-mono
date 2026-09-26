@@ -13,6 +13,7 @@ import type { SessionMode } from './session-mode.js';
 import { normalizePersistedState, persistedMode } from './persisted-state.js';
 import type { CortexAgentPersistedState, CortexAgentStateV2 } from './persisted-state.js';
 import { handOverPendingConversation } from './cross-mode-restore.js';
+import { withoutSystemMessages } from '../system-transcript.js';
 import type { ModeCrossingRestore } from './cross-mode-restore.js';
 import type { CortexAgentMode } from './config.js';
 import { CompositeUsage } from './composite-usage.js';
@@ -121,7 +122,8 @@ export class CompositeState {
       artifactMode,
       agentMode,
       conversationLinesHandedOver: handOver.handedOver,
-      talkerHistoryLength: talkerHistory.length,
+      // Turns, not the system messages declaring prompt and tool updates.
+      talkerHistoryLength: withoutSystemMessages(talkerHistory).length,
       resultsNotRelayed: Array.isArray(routerState?.pendingDeliveries) ? routerState.pendingDeliveries.length : 0,
     };
   }

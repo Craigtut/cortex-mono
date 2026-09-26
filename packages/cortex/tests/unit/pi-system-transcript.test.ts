@@ -12,7 +12,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Type } from 'typebox';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import * as piCompat from '@earendil-works/pi-ai/compat';
-import { getCurrentSystemPrompt, getCurrentTools } from '@earendil-works/pi-ai/utils/transcript';
+import {
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  hasNonAdditiveToolChanges,
+} from '@earendil-works/pi-ai/utils/transcript';
 import { AgentLoop } from '../../src/agent-loop.js';
 import { ProviderManager } from '../../src/provider-manager.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
@@ -33,13 +37,17 @@ function probe(name: string) {
   };
 }
 
-async function createLoop(requests: Sent[]) {
-  const stream = vi.spyOn(piCompat, 'streamSimple');
-  stream.mockImplementation((rawModel, context) => {
+/**
+ * Every streamSimple call is captured into `requests`; `failNext()` makes a
+ * call fail the way a provider error does. Installed once per test.
+ */
+function mockProvider(requests: Sent[], failNext: () => boolean = () => false) {
+  vi.spyOn(piCompat, 'streamSimple').mockImplementation((rawModel, context) => {
     requests.push(structuredClone(context.messages) as unknown as Sent);
+    const fail = failNext();
     const message: AssistantMessage = {
       role: 'assistant',
-      content: [{ type: 'text', text: 'Done' }],
+      content: fail ? [] : [{ type: 'text', text: 'Done' }],
       api: rawModel.api,
       provider: rawModel.provider,
       model: rawModel.id,
@@ -47,14 +55,22 @@ async function createLoop(requests: Sent[]) {
         input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
-      stopReason: 'stop',
+      stopReason: fail ? 'error' : 'stop',
+      ...(fail ? { errorMessage: 'upstream exploded' } : {}),
       timestamp: Date.now(),
     };
     const events = createAssistantMessageEventStream();
-    events.push({ type: 'start', partial: message });
-    events.push({ type: 'done', reason: 'stop', message });
+    if (fail) {
+      events.push({ type: 'error', reason: 'error', error: message });
+    } else {
+      events.push({ type: 'start', partial: message });
+      events.push({ type: 'done', reason: 'stop', message });
+    }
     return events;
   });
+}
+
+async function buildLoop(tools: string[] = ['first_probe']) {
   const manager = new ProviderManager();
   const catalog = await manager.listModels('anthropic');
   const model = await manager.resolveModel('anthropic', catalog[0]!.id);
@@ -67,8 +83,29 @@ async function createLoop(requests: Sent[]) {
     disableTools: Object.values(TOOL_NAMES),
     enableSubAgentTool: false,
     enableLoadSkillTool: false,
-    tools: [probe('first_probe')],
+    retryPolicy: { enabled: false },
+    tools: tools.map(probe),
   });
+}
+
+async function createLoop(requests: Sent[]) {
+  mockProvider(requests);
+  return buildLoop();
+}
+
+const textOf = (message: { content?: unknown }): string =>
+  typeof message.content === 'string'
+    ? message.content
+    : Array.isArray(message.content)
+      ? message.content.map((block: { text?: string }) => block.text ?? '').join('')
+      : '';
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 const systemMessages = (sent: Sent) => sent.filter((message) => message.role === 'system');
@@ -165,6 +202,63 @@ describe('system transcript at the provider boundary', () => {
       // Nothing to re-declare: the restored delta already matches the live tools.
       expect(systemMessages(last)).toHaveLength(2);
       expect(toolNames(last)).toEqual(['first_probe', 'second_probe']);
+    } finally {
+      await loop.destroy();
+    }
+  });
+
+  it('declares each tool once after restoring into a fresh loop', async () => {
+    const requests: Sent[] = [];
+    mockProvider(requests);
+    const first = await buildLoop(['first_probe']);
+    let saved: unknown;
+    try {
+      await first.prompt('Hello.');
+      first.addConsumerTool(probe('second_probe'));
+      await first.prompt('Again.');
+      saved = JSON.parse(JSON.stringify(first.getConversationHistory()));
+    } finally {
+      await first.destroy();
+    }
+
+    const resumed = await buildLoop(['first_probe', 'second_probe']);
+    try {
+      resumed.restoreConversationHistory(saved as never);
+      await resumed.prompt('Resumed.');
+      const sent = requests.at(-1)!;
+      expect(toolNames(sent)).toEqual(['first_probe', 'second_probe']);
+      // A duplicate declaration is outside what native tool-change transports accept.
+      expect(hasNonAdditiveToolChanges(sent as never)).toBe(false);
+      expect(getCurrentSystemPrompt(sent as never)).toBe(resumed.getCurrentSystemPrompt());
+    } finally {
+      await resumed.destroy();
+    }
+  });
+
+  it('re-delivers a spliced wake delivery once when a tool change preceded the failed run', async () => {
+    const requests: Sent[] = [];
+    let failNext = false;
+    mockProvider(requests, () => {
+      const fail = failNext;
+      failNext = false;
+      return fail;
+    });
+    const loop = await buildLoop();
+    try {
+      await loop.prompt('Hello.');
+      // pi declares the new tool ahead of the next run's batch, at the boundary.
+      loop.addConsumerTool(probe('second_probe'));
+      failNext = true;
+      const turn = loop.prompt('real question');
+      expect(loop.deliver('spliced wake content').outcome).toBe('parked');
+      await expect(turn).rejects.toThrow();
+      await waitUntil(() => !loop.isLoopActive && loop.pendingWakeDeliveryCount === 0);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitUntil(() => !loop.isLoopActive);
+
+      const copies = loop.getConversationHistory()
+        .filter((message) => message.role === 'user' && textOf(message).includes('spliced wake content'));
+      expect(copies).toHaveLength(1);
     } finally {
       await loop.destroy();
     }
