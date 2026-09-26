@@ -168,6 +168,15 @@ export interface LoopDeliveryApi {
   readonly pendingWakeDeliveryCount: number;
 
   /**
+   * Resolve once no wake delivery is parked: a run took them, or they were
+   * retracted, cancelled by an abort, or dead-lettered. Resolves at once
+   * when none is parked. The awaitable form of
+   * {@link pendingWakeDeliveryCount}; content parked after it resolves needs
+   * a fresh wait.
+   */
+  waitForWakeDeliveriesDrained(): Promise<void>;
+
+  /**
    * Drop all queued silent deliveries, returning their content in queue
    * order so the caller can re-route or persist them.
    */

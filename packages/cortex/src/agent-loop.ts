@@ -348,6 +348,7 @@ export class AgentLoop implements
   clearAllQueues(): string[] { return this.parts.queues.clearAll(); }
   get queuedDeliveryCount(): number { return this.parts.queues.silentCount; }
   get pendingWakeDeliveryCount(): number { return this.parts.queues.wakeCount; }
+  async waitForWakeDeliveriesDrained(): Promise<void> { return this.parts.queues.waitForWakeDrained(); }
   clearQueuedDeliveries(): string[] { return this.parts.queues.clearSilent(); }
   getQueuedDeliveries(): string[] { return this.parts.queues.silentContents(); }
   dropPendingWakeDeliveries(predicate: (content: string, delivery: PendingWakeDelivery) => boolean): string[] {

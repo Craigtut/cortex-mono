@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { PromptTracker, Settlement, yieldMacrotask } from '../../src/facade/settlement.js';
+import { parkedWakesTerm, PromptTracker, Settlement, yieldMacrotask } from '../../src/facade/settlement.js';
+import type { AgentLoop } from '../../src/agent-loop.js';
 import type { SettlementTerm } from '../../src/facade/settlement.js';
 
 /** A term whose state the test flips, recording each wait it is asked for. */
@@ -114,5 +115,25 @@ describe('PromptTracker', () => {
     await wait;
     expect(released).toBe(true);
     expect(prompts.pending).toBe(false);
+  });
+});
+
+describe('parkedWakesTerm', () => {
+  it('waits on the loop drain signal instead of yielding a macrotask', async () => {
+    let parked = 1;
+    let release!: () => void;
+    const loop = {
+      loopPath: 'talker',
+      get pendingWakeDeliveryCount() { return parked; },
+      waitForWakeDeliveriesDrained: () => new Promise<void>((resolve) => { release = resolve; }),
+    } as unknown as AgentLoop;
+    const term = parkedWakesTerm(loop);
+    expect(term.pending()).toBe(true);
+    const signal = term.settled();
+    expect(signal).toBeInstanceOf(Promise);
+    parked = 0;
+    release();
+    await signal;
+    expect(term.pending()).toBe(false);
   });
 });

@@ -80,6 +80,8 @@ export class DeliveryQueues {
   private readonly silent: QueuedDelivery[] = [];
   /** Parked wake deliveries (mutated in place; tests hold the array). */
   readonly wake: QueuedDelivery[] = [];
+  /** waitForWakeDrained() callers, released whenever the parked queue empties. */
+  private drainWaiters: Array<() => void> = [];
 
   constructor(private readonly ports: DeliveryQueuePorts) {}
 
@@ -157,6 +159,7 @@ export class DeliveryQueues {
   takeDeliverableWake(): QueuedDelivery[] {
     const taken = this.wake.splice(0);
     if (taken.length === 0) return taken;
+    this.releaseIfDrained();
     const epoch = this.ports.abort.epoch;
     const deliverable = this.ports.abort.inFlight
       ? []
@@ -203,6 +206,7 @@ export class DeliveryQueues {
     }
     if (count === 0) return;
     const taken = this.wake.splice(0, count);
+    this.releaseIfDrained();
     this.ports.piQueues.steer({ role: 'user', content: taken.map((item) => item.content).join('\n\n') });
     // The run now answers this content, so it carries its causation too.
     const tags = taken.map((item) => item.causeTag).filter((tag) => tag !== undefined);
@@ -385,6 +389,7 @@ export class DeliveryQueues {
   /** abort() entry: cancel (and dead-letter) everything parked. */
   dropAllWakeForAbort(): void {
     const droppedWake = this.wake.splice(0);
+    this.releaseIfDrained();
     if (droppedWake.length > 0) {
       this.ports.logger.info('abort dropped parked wake deliveries', {
         count: droppedWake.length,
@@ -422,7 +427,23 @@ export class DeliveryQueues {
     this.clearSteeringQueue();
     this.clearFollowUpQueue();
     const wake = this.wake.splice(0).map((item) => item.content);
+    this.releaseIfDrained();
     return [...this.clearSilent(), ...wake];
+  }
+
+  /**
+   * Resolve once no wake delivery is parked (at once when none is). Every
+   * path that empties the queue releases it: a run taking the batch, a
+   * turn-boundary hand-over, a retraction, an abort or teardown drop.
+   */
+  waitForWakeDrained(): Promise<void> {
+    if (this.wake.length === 0) return Promise.resolve();
+    return new Promise((resolve) => this.drainWaiters.push(resolve));
+  }
+
+  private releaseIfDrained(): void {
+    if (this.wake.length > 0 || this.drainWaiters.length === 0) return;
+    for (const release of this.drainWaiters.splice(0)) release();
   }
 
   get silentCount(): number {
@@ -459,6 +480,7 @@ export class DeliveryQueues {
       };
       if (predicate(item.content, delivery)) dropped.unshift(this.wake.splice(i, 1)[0]!.content);
     }
+    this.releaseIfDrained();
     return dropped;
   }
 
@@ -470,6 +492,7 @@ export class DeliveryQueues {
   deadLetterForTeardown(reason: string): void {
     const wake = this.wake.splice(0);
     const silent = this.silent.splice(0);
+    this.releaseIfDrained();
     if (wake.length > 0) this.ports.deadLetters.recordWake(wake, reason);
     if (silent.length > 0) this.ports.deadLetters.recordSilent(silent, reason);
   }

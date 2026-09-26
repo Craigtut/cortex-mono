@@ -41,6 +41,7 @@ export const AGENT_LOOP_DELEGATION = {
   isLoopActive: 'subsumed',
   waitForLoopIdle: 'subsumed',
   waitForAskSettlement: 'subsumed',
+  waitForWakeDeliveriesDrained: 'subsumed',
   // Queues.
   setSteeringQueueMode: 'forwarded',
   setFollowUpQueueMode: 'forwarded',
@@ -58,8 +59,8 @@ export const AGENT_LOOP_DELEGATION = {
   clearAllQueues: 'subsumed',
   // Withheld: a retraction primitive the facade uses to drop permission
   // voicings whose ask an abort already settled. It asks the caller to
-  // recognize its own content by text, which is a composition concern; a
-  // consumer wanting to drop queued content has clearQueuedDeliveries().
+  // recognize its own deliveries by handle, which is a composition concern;
+  // a consumer wanting to drop queued content has clearQueuedDeliveries().
   dropPendingWakeDeliveries: 'withheld',
   // Asks and headlines.
   getPendingAsks: 'forwarded',

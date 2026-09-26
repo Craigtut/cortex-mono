@@ -1238,6 +1238,45 @@ describe('AgentLoop.deliver cause tags', () => {
   });
 });
 
+describe('AgentLoop.waitForWakeDeliveriesDrained', () => {
+  it('resolves at once with nothing parked, and when the sweep takes what parked', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    await loop.waitForWakeDeliveriesDrained();
+
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    loop.deliver('parked');
+    let drained = false;
+    const wait = loop.waitForWakeDeliveriesDrained().then(() => { drained = true; });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Precondition: it is still parked, so the wait is really waiting.
+    expect(loop.pendingWakeDeliveryCount).toBe(1);
+    expect(drained).toBe(false);
+
+    piAgent.releaseRun();
+    await turn;
+    await wait;
+    expect(loop.pendingWakeDeliveryCount).toBe(0);
+    expect(piAgent.promptCalls).toEqual(['long task', 'parked']);
+  });
+
+  it('is released by a retraction too', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    piAgent.finalHold = true;
+    const turn = loop.prompt('long task');
+    await waitUntil(() => piAgent.promptCalls.length === 1);
+    const { deliveryId } = loop.deliver('retract me');
+    const wait = loop.waitForWakeDeliveriesDrained();
+    loop.dropPendingWakeDeliveries((_content, delivery) => delivery.id === deliveryId);
+    await wait;
+    piAgent.releaseRun();
+    await turn;
+  });
+});
+
 describe('AgentLoop.deliver handles', () => {
   it('returns a stable id on every branch, and honors a supplied one', async () => {
     const piAgent = createMockPiAgent();

@@ -40,14 +40,14 @@ export function gateTerm(loop: AgentLoop): SettlementTerm {
 }
 
 /**
- * Parked wake deliveries have no settle signal of their own; they start a
- * run when they land, which the gate terms then wait out.
+ * Parked wake deliveries, waited out on the loop's own drain signal. They
+ * start a run when they land, which the gate terms then wait out.
  */
 export function parkedWakesTerm(loop: AgentLoop): SettlementTerm {
   return {
     name: `${loop.loopPath}-parked-wakes`,
     pending: () => loop.pendingWakeDeliveryCount > 0,
-    settled: () => null,
+    settled: () => loop.waitForWakeDeliveriesDrained(),
   };
 }
 
