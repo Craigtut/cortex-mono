@@ -17,7 +17,7 @@ const { version: PKG_VERSION } = require('../package.json');
  *   cortex --duplex                 Run the talker/reasoner duplex agent
  */
 
-import { PRIMARY_MODEL_DEFAULTS, ProviderManager, type ThinkingLevel } from '@animus-labs/cortex';
+import { ProviderManager, type ThinkingLevel } from '@animus-labs/cortex';
 import { parseArgs } from './cli-args.js';
 import { loadConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
@@ -47,7 +47,7 @@ async function main(): Promise<void> {
     { BUILD_MODE },
     { listSessions },
     { runFirstRunSetup },
-    { resolveConfiguredModel },
+    { defaultModelFor, resolveConfiguredModel },
     { resolveUpdateInfo },
   ] = await Promise.all([
     import('./session.js'),
@@ -89,7 +89,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     provider = resolvedProvider;
-    modelId = args.model ?? config.defaultModel ?? defaults.model ?? getDefaultModel(provider);
+    modelId = args.model ?? config.defaultModel ?? defaults.model ?? defaultModelFor(provider);
 
     // Resolve local connections through the shared provider configuration.
     const entry = await credentialStore.getProvider(provider);
@@ -104,7 +104,7 @@ async function main(): Promise<void> {
         // the providers Cortex supports), and resolveModel throws by design on
         // a catalog miss. Left uncaught that is a hard startup failure with no
         // way back in, so fall back to the provider default and say so.
-        const fallbackId = getDefaultModel(provider);
+        const fallbackId = defaultModelFor(provider);
         if (fallbackId === modelId) throw error;
         console.warn(
           `Model "${modelId}" is no longer available for provider "${provider}". ` +
@@ -184,11 +184,6 @@ async function main(): Promise<void> {
     await session?.disposeSandbox().catch(() => {});
     throw err;
   }
-}
-
-/** Get a sensible default model for a provider. */
-function getDefaultModel(provider: string): string {
-  return PRIMARY_MODEL_DEFAULTS[provider] ?? PRIMARY_MODEL_DEFAULTS['anthropic']!;
 }
 
 function installActivitySignalHandlers(session: CortexCodeSession): () => void {

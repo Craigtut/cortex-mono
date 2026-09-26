@@ -30,7 +30,7 @@ describe('provider-cache', () => {
     });
 
     it('bedrock is supported', () => {
-      expect(PROVIDER_CACHE_CONFIG['bedrock'].supported).toBe(true);
+      expect(PROVIDER_CACHE_CONFIG['amazon-bedrock'].supported).toBe(true);
     });
 
     it('google is not supported', () => {
@@ -106,15 +106,15 @@ describe('provider-cache', () => {
       // Bedrock has same config as Anthropic: shortTtlMs = 300,000
       // shortThreshold = 300,000 * 0.9 = 270,000
       // 270,000 <= 270,000 => "short"
-      expect(resolveCacheRetention('bedrock', 270_000)).toBe('short');
+      expect(resolveCacheRetention('amazon-bedrock', 270_000)).toBe('short');
     });
 
     it('returns "long" at 30 min', () => {
-      expect(resolveCacheRetention('bedrock', 1_800_000)).toBe('long');
+      expect(resolveCacheRetention('amazon-bedrock', 1_800_000)).toBe('long');
     });
 
     it('returns "long" just over the boundary', () => {
-      expect(resolveCacheRetention('bedrock', 271_000)).toBe('long');
+      expect(resolveCacheRetention('amazon-bedrock', 271_000)).toBe('long');
     });
   });
 

@@ -159,6 +159,68 @@ export const PROVIDER_REGISTRY: ProviderInfo[] = [
     envVar: 'META_API_KEY',
   },
   {
+    id: 'amazon-bedrock',
+    name: 'Amazon Bedrock',
+    // A Bedrock API key (bearer token). pi-ai takes the region from the
+    // model's inference profile, else us-east-1.
+    authMethods: ['api_key'],
+    envVar: 'AWS_BEARER_TOKEN_BEDROCK',
+  },
+  {
+    id: 'radius',
+    name: 'Radius',
+    authMethods: ['oauth', 'api_key'],
+    envVar: 'RADIUS_API_KEY',
+  },
+  {
+    id: 'together',
+    name: 'Together',
+    authMethods: ['api_key'],
+    envVar: 'TOGETHER_API_KEY',
+  },
+  {
+    id: 'baseten',
+    name: 'Baseten',
+    authMethods: ['api_key'],
+    envVar: 'BASETEN_API_KEY',
+  },
+  {
+    id: 'nvidia',
+    name: 'NVIDIA',
+    authMethods: ['api_key'],
+    envVar: 'NVIDIA_API_KEY',
+  },
+  {
+    id: 'ant-ling',
+    name: 'Ant Ling',
+    authMethods: ['api_key'],
+    envVar: 'ANT_LING_API_KEY',
+  },
+  {
+    id: 'zai-coding-cn',
+    name: 'Z.AI Coding CN',
+    authMethods: ['api_key'],
+    envVar: 'ZAI_CODING_CN_API_KEY',
+  },
+  {
+    id: 'qwen-token-plan',
+    name: 'Qwen Token Plan',
+    authMethods: ['api_key'],
+    envVar: 'QWEN_TOKEN_PLAN_API_KEY',
+  },
+  {
+    id: 'qwen-token-plan-cn',
+    name: 'Qwen Token Plan CN',
+    authMethods: ['api_key'],
+    envVar: 'QWEN_TOKEN_PLAN_CN_API_KEY',
+  },
+  {
+    id: 'qwen-token-plan-individual',
+    name: 'Qwen Token Plan Individual',
+    authMethods: ['api_key'],
+    envVar: 'QWEN_TOKEN_PLAN_API_KEY',
+  },
+  {
     id: 'openrouter',
     name: 'OpenRouter',
     authMethods: ['api_key'],
@@ -288,6 +350,7 @@ export const OAUTH_PROVIDER_IDS: string[] = [
   'meta',
   'openai-codex',
   'openrouter',
+  'radius',
   'xai',
 ];
 
@@ -295,22 +358,6 @@ export const OAUTH_PROVIDER_IDS: string[] = [
 // Model Defaults
 // ---------------------------------------------------------------------------
 
-/**
- * Default primary model IDs per provider.
- * Used when a user first connects a provider and no model is explicitly selected.
- * These are the best general-purpose models for each provider.
- */
-export const PRIMARY_MODEL_DEFAULTS: Record<string, string> = {
-  anthropic: 'claude-sonnet-5',
-  openai: 'gpt-6-sol',
-  'openai-codex': 'gpt-6-sol',
-  google: 'gemini-3.1-pro-preview',
-  xai: 'grok-4.7',
-  meta: 'muse-spark-1.3',
-  groq: 'openai/gpt-oss-120b',
-  cerebras: 'gpt-oss-120b',
-  mistral: 'mistral-large-2512',
-};
 
 /**
  * Per-provider utility model overrides for inference exceptions.
@@ -355,7 +402,7 @@ export interface ProviderCacheConfig {
  */
 export const PROVIDER_CACHE_CONFIG: Record<string, ProviderCacheConfig> = {
   anthropic:  { supported: true,  shortTtlMs: 300_000,  longTtlMs: 3_600_000,   shortWritePremium: 1.25, longWritePremium: 2.0, readDiscount: 0.1, ttlResetsOnHit: true,  preferLong: false },
-  bedrock:    { supported: true,  shortTtlMs: 300_000,  longTtlMs: 3_600_000,   shortWritePremium: 1.25, longWritePremium: 2.0, readDiscount: 0.1, ttlResetsOnHit: true,  preferLong: false },
+  'amazon-bedrock': { supported: true,  shortTtlMs: 300_000,  longTtlMs: 3_600_000,   shortWritePremium: 1.25, longWritePremium: 2.0, readDiscount: 0.1, ttlResetsOnHit: true,  preferLong: false },
   openai:     { supported: true,  shortTtlMs: 600_000,  longTtlMs: 86_400_000,  shortWritePremium: 1.0,  longWritePremium: 1.0, readDiscount: 0.5, ttlResetsOnHit: true,  preferLong: true  },
   google:     { supported: false, shortTtlMs: 0,        longTtlMs: 0,           shortWritePremium: 1.0,  longWritePremium: 1.0, readDiscount: 1.0, ttlResetsOnHit: false, preferLong: false },
   mistral:    { supported: false, shortTtlMs: 0,        longTtlMs: 0,           shortWritePremium: 1.0,  longWritePremium: 1.0, readDiscount: 1.0, ttlResetsOnHit: false, preferLong: false },

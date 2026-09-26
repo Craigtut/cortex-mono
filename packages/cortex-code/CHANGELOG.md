@@ -5,6 +5,7 @@ All notable changes to `@animus-labs/cortex-code` are documented here.
 ## Unreleased
 
 - Upgrade pi-ai and pi-tui to `0.87.1`.
+- Start a provider with no chosen model on that provider's own default from Cortex. A provider missing from the old defaults table used to fall back to the Anthropic model id, which it does not serve; a provider with no catalog (Ollama without a stored model) now asks for a model instead.
 - Fix permission prompt ordering: tool and network asks now take the prompt lock in arrival order, so a stream of network asks can no longer starve a waiting tool ask, and a late or repeated lock release can no longer free another prompt's lock.
 
 ## 0.6.0

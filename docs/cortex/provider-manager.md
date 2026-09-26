@@ -766,6 +766,7 @@ These providers authenticate via browser-based OAuth flows. The user signs in wi
 | OpenAI Codex | `openai-codex` | ChatGPT Plus or Pro |
 | GitHub Copilot | `github-copilot` | Copilot subscription |
 | Meta | `meta` | Muse subscription |
+| Radius | `radius` | Radius account |
 
 Google Gemini CLI and Google Antigravity OAuth providers were removed upstream in pi-ai 0.71. Cortex supports Google through the `google` API key provider. Google Vertex can be used by consumers that supply the required Google application credentials to pi-ai.
 
@@ -789,8 +790,24 @@ These providers authenticate with a static API key obtained from the provider's 
 | OpenCode Go | `opencode-go` | `OPENCODE_API_KEY` |
 | Kimi Coding | `kimi-coding` | `KIMI_API_KEY` |
 | Meta (Model API) | `meta` | `META_API_KEY` |
+| Radius | `radius` | `RADIUS_API_KEY` |
+| Amazon Bedrock | `amazon-bedrock` | `AWS_BEARER_TOKEN_BEDROCK` |
+| Together | `together` | `TOGETHER_API_KEY` |
+| Baseten | `baseten` | `BASETEN_API_KEY` |
+| NVIDIA | `nvidia` | `NVIDIA_API_KEY` |
+| Ant Ling | `ant-ling` | `ANT_LING_API_KEY` |
+| Z.AI Coding CN | `zai-coding-cn` | `ZAI_CODING_CN_API_KEY` |
+| Qwen Token Plan | `qwen-token-plan` | `QWEN_TOKEN_PLAN_API_KEY` |
+| Qwen Token Plan CN | `qwen-token-plan-cn` | `QWEN_TOKEN_PLAN_CN_API_KEY` |
+| Qwen Token Plan Individual | `qwen-token-plan-individual` | `QWEN_TOKEN_PLAN_API_KEY` |
 
-Note: Anthropic and Meta support both OAuth and API key. They appear in both tables.
+Note: Anthropic, Meta, and Radius support both OAuth and API key. They appear in both tables. Amazon Bedrock takes a Bedrock API key (bearer token); pi-ai reads the region from the model's inference profile and otherwise uses `us-east-1`. AWS profiles and the SDK credential chain are not offered, since Cortex never reads credentials from the environment.
+
+The registry lists every provider pi-ai ships; a test fails when a pi-ai upgrade adds one that is missing.
+
+### Default Models
+
+`PRIMARY_MODEL_DEFAULTS` (and `resolveDefaultModelId(provider)`) give the model a provider starts on when none was picked. They are resolved from the installed pi-ai catalog when `model-defaults.ts` loads, not hardcoded: each provider names a model family in `PRIMARY_MODEL_FAMILIES` (Claude Opus for Anthropic, the GPT Sol tier for OpenAI, Grok for xAI, and so on), and the default is the newest version of that family the catalog carries, so a pi-ai release that adds a newer Opus moves the default with no change in Cortex. Providers without a family of their own, the aggregators, take the first family in `FALLBACK_FAMILY_ORDER` they serve (Claude Opus first). A provider serving none of them defaults to its first catalog model. Every resolved default is a model its provider has; a provider with no catalog (Ollama, custom endpoints) has none, and the consumer must supply a model.
 
 ### Custom Endpoints
 
@@ -800,7 +817,6 @@ OpenAI-compatible endpoints such as vLLM and LM Studio can be configured via `cr
 
 These providers require complex credential configurations beyond a single API key:
 
-- **Amazon Bedrock**: Requires AWS access key, secret key, region, and optional session token. Deferred due to complexity and enterprise-focused audience.
 - **Azure OpenAI**: Requires resource name, deployment name, API version, and API key. May be supported under API key entry with additional fields in a future iteration.
 - **Google Vertex AI**: Requires project ID, location, and either an API key or Application Default Credentials. May be supported in a future iteration.
 

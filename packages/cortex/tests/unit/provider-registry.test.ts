@@ -3,10 +3,10 @@ import { builtinProviders, getBuiltinModel } from '@earendil-works/pi-ai/provide
 import {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
-  PRIMARY_MODEL_DEFAULTS,
   UTILITY_MODEL_DEFAULTS,
   UTILITY_MODEL_OVERRIDES,
 } from '../../src/provider-registry.js';
+import { PRIMARY_MODEL_DEFAULTS } from '../../src/model-defaults.js';
 
 describe('provider-registry', () => {
   // -----------------------------------------------------------------------
@@ -143,13 +143,20 @@ describe('provider-registry', () => {
     it('lists as OAuth only providers whose pi-ai definition has an OAuth flow', () => {
       const oauthCapable = piProviders.filter((provider) => provider.auth?.oauth).map((provider) => provider.id);
       expect(OAUTH_PROVIDER_IDS.filter((id) => !oauthCapable.includes(id))).toEqual([]);
-      expect(OAUTH_PROVIDER_IDS).toContain('meta');
+      expect(OAUTH_PROVIDER_IDS).toEqual(expect.arrayContaining(['meta', 'radius']));
     });
 
-    it('defaults every provider to a model the catalog still has', () => {
-      const missing = Object.entries(PRIMARY_MODEL_DEFAULTS)
-        .filter(([provider, modelId]) => getBuiltinModel(provider as never, modelId as never) === undefined)
-        .map(([provider, modelId]) => `${provider}/${modelId}`);
+    it('lists every provider pi-ai ships', () => {
+      const registered = new Set(PROVIDER_REGISTRY.map((provider) => provider.id));
+      expect(piProviders.map((provider) => provider.id).filter((id) => !registered.has(id))).toEqual([]);
+    });
+
+    it('defaults every registered provider to a model its catalog has', () => {
+      const missing = PROVIDER_REGISTRY
+        .map((provider) => [provider.id, PRIMARY_MODEL_DEFAULTS[provider.id]] as const)
+        .filter(([provider, modelId]) =>
+          modelId === undefined || getBuiltinModel(provider as never, modelId as never) === undefined)
+        .map(([provider, modelId]) => `${provider}/${String(modelId)}`);
       expect(missing).toEqual([]);
     });
   });

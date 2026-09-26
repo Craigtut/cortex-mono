@@ -424,7 +424,6 @@ export {
   OAUTH_PROVIDER_IDS,
   UTILITY_MODEL_OVERRIDES,
   UTILITY_MODEL_DEFAULTS,
-  PRIMARY_MODEL_DEFAULTS,
   PROVIDER_CACHE_CONFIG,
   resolveCacheRetention,
   resolvePromptCacheTtlMs,
@@ -436,6 +435,9 @@ export type {
   ProviderCacheConfig,
   CacheRetention,
 } from './provider-registry.js';
+
+// Default primary models, resolved from the installed pi-ai catalog
+export { PRIMARY_MODEL_DEFAULTS, resolveDefaultModelId } from './model-defaults.js';
 
 // Provider Manager (Phase 1D)
 export { ProviderManager, OAuthError } from './provider-manager.js';

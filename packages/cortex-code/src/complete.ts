@@ -1,7 +1,6 @@
 import { readFile } from 'node:fs/promises';
 
 import {
-  PRIMARY_MODEL_DEFAULTS,
   ProviderManager,
   structuredCompletionRequest,
   parseSchemaCompletion,
@@ -12,7 +11,7 @@ import {
 import { loadConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { resolveStoredOAuthApiKey } from './utils/oauth-credentials.js';
-import { resolveConfiguredModel } from './providers/model-resolution.js';
+import { defaultModelFor, resolveConfiguredModel } from './providers/model-resolution.js';
 
 interface CompleteArgs {
   promptParts: string[];
@@ -191,13 +190,15 @@ async function resolveCompletionModel(input: {
   }
 
   const entry = await input.credentialStore.getProvider(provider);
-  const providerDefaultModel = entry?.method === 'custom' && entry.modelId
+  // Only reached for when nothing else names a model: a provider without a
+  // default (Ollama) must not fail a call that did name one.
+  const providerDefaultModel = (): string => entry?.method === 'custom' && entry.modelId
     ? entry.modelId
-    : getDefaultModel(provider);
+    : defaultModelFor(provider);
   const primaryModelId = input.modelOverride
     ?? config.defaultModel
     ?? defaults.model
-    ?? providerDefaultModel;
+    ?? providerDefaultModel();
   const utilityModelId = input.usePrimary
     ? primaryModelId
     : input.modelOverride
@@ -351,10 +352,6 @@ function extractText(result: unknown): string {
     }
   }
   return parts.join('');
-}
-
-function getDefaultModel(provider: string): string {
-  return PRIMARY_MODEL_DEFAULTS[provider] ?? PRIMARY_MODEL_DEFAULTS['anthropic']!;
 }
 
 function printCompleteUsage(version: string): void {

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ProviderManager, wrapModel } from '@animus-labs/cortex';
-import { resolveConfiguredModel } from '../../src/providers/model-resolution.js';
+import { defaultModelFor, resolveConfiguredModel } from '../../src/providers/model-resolution.js';
 import { ModelSelection } from '../../src/session/model-selection.js';
 
 afterEach(() => vi.restoreAllMocks());
@@ -53,5 +53,15 @@ describe('connection model resolution', () => {
     if (method === 'switchProvider') await selection.switchProvider('ollama', 'new');
     else await selection[method]('new');
     expect(resolve).toHaveBeenCalledWith(expect.objectContaining({ modelId: 'new', contextWindow: 32768, contextWindowLimit: 8192 }));
+  });
+
+  it('starts a provider on its own catalog default, never another provider\'s', async () => {
+    const manager = new ProviderManager();
+    for (const provider of ['anthropic', 'deepseek', 'openrouter']) {
+      const model = await manager.resolveModel(provider, defaultModelFor(provider));
+      expect(model.provider).toBe(provider);
+    }
+    expect(defaultModelFor('anthropic')).toMatch(/^claude-opus-/);
+    expect(() => defaultModelFor('ollama')).toThrow(/No default model for provider "ollama"/);
   });
 });
