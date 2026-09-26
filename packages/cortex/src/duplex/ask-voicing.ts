@@ -87,7 +87,7 @@ interface VoicingRecord extends AskVoicingState {
 }
 
 /** What a refusal's re-read did (see {@link AskVoicing.revoiceCurrent}). */
-export type RevoiceOutcome = 'revoiced' | 'damped' | 'exhausted' | 'none';
+export type RevoiceOutcome = 'revoiced' | 'damped' | 'held' | 'exhausted' | 'none';
 
 export interface AskVoicingPorts {
   appendLog(input: BrokerLogInput): number;
@@ -198,12 +198,16 @@ export class AskVoicing {
    * tells the talker the request needs the user's fresh answer. Use
    * {@link noteLost} instead when the previous voicing never reached the
    * user: that case is neither damped nor capped, takes a fresh anchor, and
-   * restarts the count.
+   * restarts the count. Nothing is re-read while a conversation abort holds
+   * the request.
    */
   revoiceCurrent(): RevoiceOutcome {
     if (this.destroyed || this.voicedAskId === null) return 'none';
     const record = this.records.get(this.voicedAskId);
     if (!record) return 'none';
+    // The user said stop: the request waits for the conversation to reopen
+    // (see hold), and no refusal may read it out before then.
+    if (this.held) return 'held';
     if (record.revoices >= MAX_REVOICES_PER_ASK) {
       if (record.revoices === MAX_REVOICES_PER_ASK) {
         // Counted past the cap so the entry is written once per ask.

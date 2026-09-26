@@ -558,6 +558,23 @@ describe('D16 consent binding', () => {
     await waitUntil(() => decisions.length === 1);
   });
 
+  it('does not re-voice on a refused answer while a conversation abort holds the request', async () => {
+    const h = createHarness();
+    requestAsk(h);
+    h.broker.voicing.hold();
+    h.advance(3_001);
+    h.setTalkerCauseTags([]);
+    const refused = await callAnswerAsk(h, { decision: 'allow' });
+    // Refused, as any unconsented allow is, but nothing is read out: the
+    // user just said stop.
+    expect(refused.content[0]!.text).toContain('Not accepted');
+    expect(h.askVoicings).toHaveLength(1);
+
+    // The conversation reopening reads it out again.
+    h.broker.voicing.reopen();
+    expect(h.askVoicings).toHaveLength(2);
+  });
+
   it('a refusal re-read does not make consent the user already gave stale', async () => {
     // The anchor answers "could the user have heard this yet", and a
     // re-read does not un-hear it. Moving it on every refusal costs the
