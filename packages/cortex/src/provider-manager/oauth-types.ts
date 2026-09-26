@@ -183,6 +183,7 @@ export interface OAuthRefreshResult {
  */
 export type OAuthErrorCode =
   | 'unsupported_provider'
+  | 'flow_in_progress'
   | 'callback_port_in_use'
   | 'cancelled'
   | 'timed_out'

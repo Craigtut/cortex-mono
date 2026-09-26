@@ -46,7 +46,7 @@ interface IProviderManager {
   listModels(provider: string): Promise<ModelInfo[]>;
 
   // ── OAuth ──
-  initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult>;
+  initiateOAuth(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult>; // one flow at a time
   cancelOAuth(): void;
   resolveOAuthApiKey(provider: string, credentials: string): Promise<OAuthRefreshResult>;
 
@@ -638,6 +638,8 @@ The shim is intentionally narrow:
 - It passes only safe page metadata to the renderer. Query parameters such as OAuth `code` and `state` are never exposed.
 - It is installed only for the duration of the OAuth login and restored in `finally`.
 - It rejects concurrent customized callback-page flows in the same process.
+
+One flow runs per `ProviderManager` at a time. A second `initiateOAuth()` while one is in progress rejects with `OAuthError` code `flow_in_progress` and leaves the first untouched, so `cancelOAuth()` still cancels it; the fixed callback ports mean two flows could not both complete anyway. A `cancelOAuth()` that lands while the flow is still checking its callback port rejects it with `cancelled` before any browser opens.
 
 GitHub Copilot uses device-code OAuth and does not show a localhost callback page, so this renderer is not used for that provider.
 

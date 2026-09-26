@@ -166,6 +166,10 @@ function buildOAuthMeta(
   return meta;
 }
 
+function cancelledError(provider: string): OAuthError {
+  return new OAuthError('cancelled', provider, `OAuth flow for "${provider}" was cancelled.`);
+}
+
 export interface OAuthFlowsOptions {
   /** Fixed loopback callback routes (provider to path/port). */
   routes: Record<string, OAuthCallbackRoute>;
@@ -186,8 +190,36 @@ export class OAuthFlows {
     this.probeOAuthCallbackPort = options.probe;
   }
 
-  /** Run one login flow to completion, cancellation, timeout, or callback failure. */
+  /**
+   * Run one login flow to completion, cancellation, timeout, or callback
+   * failure. One flow at a time: a second call while one is in progress is
+   * rejected with `flow_in_progress` and leaves the first untouched, so
+   * cancel() still reaches it. The slot is taken synchronously, before any
+   * await, so two calls in one tick cannot both pass the check, and it is
+   * released only by the flow that holds it, however that flow ends.
+   */
   async initiate(provider: string, callbacks: OAuthCallbacks): Promise<OAuthResult> {
+    if (this.activeOAuthAbort) {
+      throw new OAuthError(
+        'flow_in_progress',
+        provider,
+        'Another OAuth flow is already in progress. Cancel it or let it finish before starting another.',
+      );
+    }
+    const abort = new AbortController();
+    this.activeOAuthAbort = abort;
+    try {
+      return await this.run(provider, callbacks, abort);
+    } finally {
+      if (this.activeOAuthAbort === abort) this.activeOAuthAbort = null;
+    }
+  }
+
+  private async run(
+    provider: string,
+    callbacks: OAuthCallbacks,
+    abort: AbortController,
+  ): Promise<OAuthResult> {
     const oauthProvider = await loadPiOAuth(provider);
     if (!oauthProvider) {
       throw new OAuthError(
@@ -205,9 +237,8 @@ export class OAuthFlows {
       this.oauthCallbackRoutes,
       this.probeOAuthCallbackPort,
     );
-
-    const abort = new AbortController();
-    this.activeOAuthAbort = abort;
+    // cancel() can land during the awaits above; never open a browser after it.
+    if (abort.signal.aborted) throw cancelledError(provider);
 
     // pi-ai only settles its callback wait on success; on a failed
     // callback (e.g. state mismatch) it hangs. The render shim already sees
@@ -252,11 +283,7 @@ export class OAuthFlows {
       }
     });
     const cancelled = new Promise<never>((_, reject) => {
-      abort.signal.addEventListener('abort', () => reject(new OAuthError(
-        'cancelled',
-        provider,
-        `OAuth flow for "${provider}" was cancelled.`,
-      )), { once: true });
+      abort.signal.addEventListener('abort', () => reject(cancelledError(provider)), { once: true });
     });
 
     // pi's login takes one interaction object: every out-bound message is
@@ -300,7 +327,7 @@ export class OAuthFlows {
           // cancel". Cortex signals cancel as undefined, so translate rather
           // than handing pi the string "undefined".
           if (chosen === undefined) {
-            throw new OAuthError('cancelled', provider, `OAuth flow for "${provider}" was cancelled.`);
+            throw cancelledError(provider);
           }
           return chosen;
         }
@@ -334,7 +361,6 @@ export class OAuthFlows {
     } finally {
       if (timer) clearTimeout(timer);
       releaseShim();
-      if (this.activeOAuthAbort === abort) this.activeOAuthAbort = null;
     }
   }
 

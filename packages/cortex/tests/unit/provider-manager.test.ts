@@ -639,34 +639,72 @@ describe('ProviderManager', () => {
       expect(JSON.parse(result.credentials)).toEqual(rawCredentials);
     });
 
-    it('clears activeOAuthAbort after successful login', async () => {
-      mockLoginAnthropic.mockResolvedValue({});
-
+    it('rejects a second flow while one runs, and cancel still reaches the first', async () => {
+      // Never settles, like pi-ai's callback-server wait.
+      mockLoginCodex.mockImplementation(() => new Promise(() => {}));
+      // A renderer installs the process-wide callback shim: the second flow
+      // used to overwrite the active abort and then throw from the shim,
+      // leaving cancel pointed at a dead flow.
       const callbacks = {
         onAuth: vi.fn(),
         onPrompt: vi.fn(),
-        onProgress: vi.fn(),
+        renderCallbackPage: vi.fn(() => '<!doctype html><html><body>Done</body></html>'),
       };
+      const first = pm.initiateOAuth('openai-codex', callbacks);
+      await vi.waitFor(() => expect(mockLoginCodex).toHaveBeenCalledTimes(1));
 
-      await pm.initiateOAuth('anthropic', callbacks);
+      await expect(pm.initiateOAuth('openai-codex', callbacks)).rejects.toMatchObject({
+        name: 'OAuthError',
+        code: 'flow_in_progress',
+      });
+      pm.cancelOAuth();
 
-      // cancelOAuth should be a no-op now (no active abort)
-      pm.cancelOAuth(); // Should not throw
+      const outcome = await Promise.race([
+        first.then(() => 'resolved', (error: unknown) => error),
+        new Promise((resolve) => setTimeout(() => resolve('still hanging'), 500)),
+      ]);
+      expect(outcome).toMatchObject({ name: 'OAuthError', code: 'cancelled', provider: 'openai-codex' });
+      expect(mockLoginCodex).toHaveBeenCalledTimes(1);
     });
 
-    it('clears activeOAuthAbort after failed login', async () => {
-      mockLoginAnthropic.mockRejectedValue(new Error('Login failed'));
+    it('never starts the login when cancelled during the port probe', async () => {
+      let releaseProbe!: () => void;
+      const probeGate = new Promise<void>((resolve) => {
+        releaseProbe = resolve;
+      });
+      let probed!: () => void;
+      const probeStarted = new Promise<void>((resolve) => {
+        probed = resolve;
+      });
+      const slowPm = new ProviderManager({
+        probeCallbackPortInUse: async () => {
+          probed();
+          await probeGate;
+          return false;
+        },
+      });
+      mockLoginCodex.mockResolvedValue({ accessToken: 'token' });
 
-      const callbacks = {
-        onAuth: vi.fn(),
-        onPrompt: vi.fn(),
-        onProgress: vi.fn(),
-      };
+      const flow = slowPm.initiateOAuth('openai-codex', { onAuth: vi.fn(), onPrompt: vi.fn() });
+      await probeStarted;
+      slowPm.cancelOAuth();
+      releaseProbe();
 
-      await expect(pm.initiateOAuth('anthropic', callbacks))
+      await expect(flow).rejects.toMatchObject({ name: 'OAuthError', code: 'cancelled' });
+      expect(mockLoginCodex).not.toHaveBeenCalled();
+    });
+
+    it('releases the flow slot after a failed login, so the next flow runs and is cancellable', async () => {
+      mockLoginCodex.mockRejectedValueOnce(new Error('Login failed'));
+      await expect(pm.initiateOAuth('openai-codex', { onAuth: vi.fn(), onPrompt: vi.fn() }))
         .rejects.toThrow('Login failed');
 
-      pm.cancelOAuth(); // Should not throw
+      mockLoginCodex.mockImplementationOnce(() => new Promise(() => {}));
+      const next = pm.initiateOAuth('openai-codex', { onAuth: vi.fn(), onPrompt: vi.fn() });
+      await vi.waitFor(() => expect(mockLoginCodex).toHaveBeenCalledTimes(2));
+      pm.cancelOAuth();
+
+      await expect(next).rejects.toMatchObject({ name: 'OAuthError', code: 'cancelled' });
     });
   });
 
