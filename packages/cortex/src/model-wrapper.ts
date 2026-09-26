@@ -27,8 +27,32 @@ import type { ModelBackend } from './model-backend.js';
  *
  * Internally, this wraps pi-ai's Model<T> type.
  */
+/**
+ * Prompt cache lifetimes per retention tier, in seconds (pi-ai's
+ * `Model.promptCache`). A missing tier means the model does not say.
+ */
+export type ModelPromptCacheLifetimes = Partial<Record<'short' | 'long', number>>;
+
+/**
+ * Image input limits (pi-ai's `Model.inputLimits.images`): the cache-safe
+ * resize profile a new image should fit before it enters history, and how
+ * many images one message or request accepts.
+ */
+export interface ModelImageInputLimits {
+  resize?: { maxWidth?: number; maxHeight?: number; maxBytes?: number; jpegQuality?: number };
+  maxPerMessage?: number;
+  maxPerRequest?: number;
+}
+
 export interface ModelCapabilities {
   promptCaching?: 'automatic-prefix' | undefined;
+  /** Image input limits, when the catalog states them. The Read tool enforces the byte ceiling. */
+  imageInput?: ModelImageInputLimits | undefined;
+  /**
+   * How long the provider keeps this model's prompt cache at each retention
+   * tier, when the catalog states it. Pass to resolveCacheRetention().
+   */
+  promptCacheLifetimes?: ModelPromptCacheLifetimes | undefined;
   structuredOutput?: 'json-schema' | undefined;
   trainedContextWindow?: number | undefined;
   /** Whether the backend serves this model while another request is in flight. */
@@ -105,10 +129,32 @@ export function wrapModel(
     // (Ollama) states it, and everything else is judged by its backend.
     capabilities: {
       concurrency: backendConcurrency(modelBackend(provider, baseUrlOf(model))),
+      ...promptCacheLifetimesOf(model),
+      ...imageInputOf(model),
       ...(model as { cortexCapabilities?: ModelCapabilities }).cortexCapabilities,
     },
   };
   return wrapped;
+}
+
+/** The pi-ai model's stated cache lifetimes, as a capability entry (empty when it states none). */
+function promptCacheLifetimesOf(model: unknown): Pick<ModelCapabilities, 'promptCacheLifetimes'> {
+  const lifetimes = (model as { promptCache?: unknown }).promptCache;
+  if (typeof lifetimes !== 'object' || lifetimes === null) return {};
+  const { short, long } = lifetimes as { short?: unknown; long?: unknown };
+  const stated: ModelPromptCacheLifetimes = {
+    ...(typeof short === 'number' ? { short } : {}),
+    ...(typeof long === 'number' ? { long } : {}),
+  };
+  return Object.keys(stated).length > 0 ? { promptCacheLifetimes: stated } : {};
+}
+
+/** The pi-ai model's image input limits, as a capability entry (empty when it states none). */
+function imageInputOf(model: unknown): Pick<ModelCapabilities, 'imageInput'> {
+  const images = (model as { inputLimits?: { images?: unknown } }).inputLimits?.images;
+  return typeof images === 'object' && images !== null
+    ? { imageInput: structuredClone(images) as ModelImageInputLimits }
+    : {};
 }
 
 /** The model's concurrency capability; `unknown` when nothing declared one. */

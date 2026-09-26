@@ -99,6 +99,29 @@ describe('AgentLoop tool config threading', () => {
     return tmpDir;
   }
 
+  it('gives Read the current model\'s image limits, following setModel', async () => {
+    const dir = makeTmpDir();
+    const image = path.join(dir, 'shot.png');
+    fs.writeFileSync(image, Buffer.alloc(300, 1));
+    const limited = makeModel({
+      provider: 'anthropic',
+      name: 'claude-sonnet-4-20250514',
+      contextWindow: 200_000,
+      inputLimits: { images: { resize: { maxBytes: 100 } } },
+    } as PiModel);
+    agent = createTestAgentLoop(dir, { model: limited });
+    const read = getRegisteredTool(agent, 'Read');
+
+    expect(textOf(await read.execute({ file_path: image }))).toMatch(/too large for the current model/);
+
+    agent.setModel(makeModel({
+      provider: 'anthropic',
+      name: 'claude-sonnet-4-20250514',
+      contextWindow: 200_000,
+    } as PiModel));
+    expect((await read.execute({ file_path: image })).content[0]?.type).toBe('image');
+  });
+
   it('threads webFetch.maxPerLoop to the WebFetch tool', async () => {
     agent = createTestAgentLoop(makeTmpDir(), { webFetch: { maxPerLoop: 0 } });
     const webFetch = getRegisteredTool(agent, 'WebFetch');

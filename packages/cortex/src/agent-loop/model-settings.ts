@@ -201,6 +201,7 @@ export class ModelSettings {
       this.primaryModel.provider,
       this.retention ?? 'none',
       this.primaryModel.capabilities?.promptCaching,
+      this.primaryModel.capabilities?.promptCacheLifetimes,
     );
   }
 

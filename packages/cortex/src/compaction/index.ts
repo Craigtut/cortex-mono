@@ -43,7 +43,9 @@ import {
 } from './failsafe.js';
 import { ObservationalMemoryEngine } from './observational/index.js';
 import type { ObservationalMemoryConfig, ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './observational/types.js';
-import { PROVIDER_CACHE_CONFIG, type CacheRetention } from '../provider-registry.js';
+import { resolvePromptCacheTtlMs } from '../provider-registry.js';
+import type { CacheRetention } from '../provider-registry.js';
+import type { ModelPromptCacheLifetimes } from '../model-wrapper.js';
 
 // ---------------------------------------------------------------------------
 // Re-exports for consumer convenience
@@ -344,21 +346,24 @@ export class CompactionManager {
 
   /**
    * Set the active provider and cache retention. Resolves the effective
-   * cache TTL from PROVIDER_CACHE_CONFIG and stores it for L1's cache-aware
-   * gating. Called by AgentLoop at construction, on provider changes, and
-   * on cache retention changes.
+   * cache TTL (the model's own promptCache lifetimes first, then
+   * PROVIDER_CACHE_CONFIG) and stores it for L1's cache-aware gating.
+   * Called by AgentLoop at construction, on model changes, and on cache
+   * retention changes.
    *
    * @param provider - The active provider name (e.g., "anthropic", "openai")
    * @param cacheRetention - The configured cache retention ('none' | 'short' | 'long')
+   * @param promptCaching - The model's caching mode, when it is automatic-prefix
+   * @param modelPromptCache - The model's lifetimes per tier (pi-ai's Model.promptCache)
    */
-  setCacheInfo(provider: string, cacheRetention: CacheRetention, promptCaching?: 'automatic-prefix'): void {
+  setCacheInfo(
+    provider: string,
+    cacheRetention: CacheRetention,
+    promptCaching?: 'automatic-prefix',
+    modelPromptCache?: ModelPromptCacheLifetimes,
+  ): void {
     this._automaticPrefixCache = promptCaching === 'automatic-prefix';
-    const cfg = PROVIDER_CACHE_CONFIG[provider];
-    if (!cfg || !cfg.supported || cacheRetention === 'none') {
-      this._providerCacheTtlMs = 0;
-      return;
-    }
-    this._providerCacheTtlMs = cacheRetention === 'long' ? cfg.longTtlMs : cfg.shortTtlMs;
+    this._providerCacheTtlMs = resolvePromptCacheTtlMs(provider, cacheRetention, modelPromptCache);
   }
 
   /**

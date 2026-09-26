@@ -7,6 +7,7 @@
 import type { ProcessTracker } from './process-tracker.js';
 import type { RegisteredTool } from './pi-agent.js';
 import type { AgentLoopConfig } from '../types.js';
+import type { ModelImageInputLimits } from '../model-wrapper.js';
 import type { CortexToolRuntime } from '../tools/runtime.js';
 import type { DeferredToolRegistry } from '../tools/tool-search/registry.js';
 import { TOOL_NAMES } from '../tools/tool-names.js';
@@ -38,6 +39,8 @@ export interface BuiltinToolDeps {
   >;
   /** Resolved at call time, so it follows setModel changes to the utility model. */
   utilityComplete(context: UtilityContext, usageCategory: string): Promise<string>;
+  /** The primary model's image input limits, resolved at call time (follows setModel). */
+  imageInputLimits(): ModelImageInputLimits | undefined;
   processes: Pick<ProcessTracker, 'track' | 'untrack'>;
   /** A Bash task went to the background (inside the tool call). */
   onBackgroundTaskStarted(taskId: string): void;
@@ -56,7 +59,11 @@ export function createBuiltinTools(deps: BuiltinToolDeps, disabled: ReadonlySet<
   const allowedRoots = config.readPathAllowlist;
 
   if (!disabled.has(TOOL_NAMES.Read)) {
-    tools.push(createReadTool({ runtime, allowedRoots }) as RegisteredTool);
+    tools.push(createReadTool({
+      runtime,
+      allowedRoots,
+      imageInputLimits: () => deps.imageInputLimits(),
+    }) as RegisteredTool);
   }
   if (!disabled.has(TOOL_NAMES.Write)) {
     tools.push(createWriteTool({ runtime }) as RegisteredTool);

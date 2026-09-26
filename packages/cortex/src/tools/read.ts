@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Type, type Static } from 'typebox';
 import type { ReadRegistry } from './shared/read-registry.js';
+import type { ModelImageInputLimits } from '../model-wrapper.js';
 import type { ToolContentDetails } from '../types.js';
 import type { CortexToolRuntime } from './runtime.js';
 import { attachRuntimeAwareTool } from './runtime.js';
@@ -133,6 +134,13 @@ export interface ReadToolConfig {
    * working directory is an exfiltration path.
    */
   allowedRoots?: readonly string[] | undefined;
+  /**
+   * The current model's image input limits, read per call so a model switch
+   * applies to the next read. An image whose encoding exceeds the byte
+   * ceiling is refused here: sent anyway, the provider rejects the whole
+   * request, and the image stays in history to fail every later one.
+   */
+  imageInputLimits?: (() => ModelImageInputLimits | undefined) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +389,14 @@ export function createReadTool(config: ReadToolConfig): {
         const buffer = await fs.promises.readFile(filePath);
         const mimeType = IMAGE_MIME_TYPES[ext] ?? 'application/octet-stream';
         const base64 = buffer.toString('base64');
+        const maxEncodedBytes = config.imageInputLimits?.()?.resize?.maxBytes;
+        if (maxEncodedBytes !== undefined && base64.length > maxEncodedBytes) {
+          return makeRejection(
+            filePath,
+            stat.size,
+            `Image is too large for the current model (${formatBytes(base64.length)} encoded, limit ${formatBytes(maxEncodedBytes)}). Resize or compress it first, then read the smaller copy.`,
+          );
+        }
 
         readRegistry.markRead(filePath, { timestamp: stat.mtimeMs });
 

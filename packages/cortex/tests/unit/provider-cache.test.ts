@@ -1,8 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveCacheRetention,
+  resolvePromptCacheTtlMs,
   PROVIDER_CACHE_CONFIG,
 } from '../../src/provider-registry.js';
+import { CompactionManager, buildCompactionConfig } from '../../src/compaction/index.js';
+import { ProviderManager } from '../../src/provider-manager.js';
 
 describe('provider-cache', () => {
   // -----------------------------------------------------------------------
@@ -134,6 +137,52 @@ describe('provider-cache', () => {
 
     it('returns "none" for Azure (unsupported)', () => {
       expect(resolveCacheRetention('azure', 300_000)).toBe('none');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Model-stated lifetimes (pi-ai's Model.promptCache)
+  // -----------------------------------------------------------------------
+
+  describe('model-stated cache lifetimes', () => {
+    it('prefer the model over the provider table, tier by tier', () => {
+      const lifetimes = { short: 120 };
+      expect(resolvePromptCacheTtlMs('anthropic', 'short', lifetimes)).toBe(120_000);
+      // The model does not state the long tier: the table answers.
+      expect(resolvePromptCacheTtlMs('anthropic', 'long', lifetimes)).toBe(3_600_000);
+      expect(resolvePromptCacheTtlMs('anthropic', 'none', lifetimes)).toBe(0);
+    });
+
+    it('cover a provider the table does not list', () => {
+      expect(resolvePromptCacheTtlMs('fireworks', 'short')).toBe(0);
+      expect(resolvePromptCacheTtlMs('fireworks', 'short', { short: 600 })).toBe(600_000);
+      expect(resolveCacheRetention('fireworks', 60_000)).toBe('none');
+      expect(resolveCacheRetention('fireworks', 60_000, { short: 600 })).toBe('short');
+      expect(resolveCacheRetention('fireworks', 3_600_000, { short: 600, long: 86_400 })).toBe('long');
+      expect(resolveCacheRetention('fireworks', 3_600_000, { short: 600 })).toBe('none');
+    });
+
+    it('move the short/long threshold with the model\'s short lifetime', () => {
+      // Anthropic's table short TTL is 5 min; a model stating 10 min keeps 8 min on short.
+      expect(resolveCacheRetention('anthropic', 480_000)).toBe('long');
+      expect(resolveCacheRetention('anthropic', 480_000, { short: 600, long: 3600 })).toBe('short');
+    });
+
+    it('drive when L1 treats the cache as cold', () => {
+      const manager = new CompactionManager(buildCompactionConfig({ strategy: 'classic' }), 1);
+      manager.setCacheInfo('anthropic', 'short', undefined, { short: 30 });
+      manager.updateCurrentContextTokenCount(1_000);
+      const lastCall = manager.lastLlmCallTimestamp!;
+      expect(manager.providerCacheTtlMs).toBe(30_000);
+      expect(manager.isCacheCold(lastCall + 29_000)).toBe(false);
+      expect(manager.isCacheCold(lastCall + 30_000)).toBe(true);
+    });
+
+    it('reach a catalog model\'s capabilities', async () => {
+      const manager = new ProviderManager();
+      const [first] = await manager.listModels('anthropic');
+      const model = await manager.resolveModel('anthropic', first!.id);
+      expect(model.capabilities?.promptCacheLifetimes).toEqual({ short: 300, long: 3600 });
     });
   });
 });

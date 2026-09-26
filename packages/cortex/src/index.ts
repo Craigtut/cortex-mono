@@ -427,6 +427,7 @@ export {
   PRIMARY_MODEL_DEFAULTS,
   PROVIDER_CACHE_CONFIG,
   resolveCacheRetention,
+  resolvePromptCacheTtlMs,
 } from './provider-registry.js';
 export type {
   AuthMethod,
@@ -465,5 +466,10 @@ export type { SandboxConfig, SandboxOptions, SandboxState, CreateSandboxProvider
 export { getOllamaHost, detectOllama, getOllamaContextWindow } from './providers/ollama/discovery.js';
 export { getOllamaRuntimeInfo } from './providers/ollama/model.js';
 export type { OllamaModelConfig, OllamaMetrics } from './providers/ollama/runtime.js';
-export type { ModelCapabilities, ModelConcurrency } from './model-wrapper.js';
+export type {
+  ModelCapabilities,
+  ModelConcurrency,
+  ModelImageInputLimits,
+  ModelPromptCacheLifetimes,
+} from './model-wrapper.js';
 export { structuredCompletionRequest, parseSchemaCompletion } from './structured-completion.js';

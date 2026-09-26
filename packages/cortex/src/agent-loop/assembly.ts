@@ -272,6 +272,7 @@ export function assembleLoop(params: {
     runtime: tools.runtime,
     config,
     utilityComplete: (context, usageCategory) => host.utilityComplete(context, { usageCategory }),
+    imageInputLimits: () => models.primary.capabilities?.imageInput,
     processes,
     // Inside the tool call, so the live run is the one backgrounding it.
     onBackgroundTaskStarted: (taskId) => background.noteBashStarted(taskId, runner.activeCauseTags),

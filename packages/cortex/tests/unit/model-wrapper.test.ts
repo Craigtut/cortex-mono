@@ -3,6 +3,20 @@ import { wrapModel, unwrapModel, isCortexModel, modelConcurrency } from '../../s
 import type { CortexModel } from '../../src/model-wrapper.js';
 
 describe('model-wrapper', () => {
+  it('carries the pi model\'s stated cache lifetimes as a capability', () => {
+    const stated = wrapModel({ promptCache: { short: 300, long: 3600 } }, 'anthropic', 'm');
+    expect(stated.capabilities?.promptCacheLifetimes).toEqual({ short: 300, long: 3600 });
+    const unstated = wrapModel({}, 'anthropic', 'm');
+    expect(unstated.capabilities).not.toHaveProperty('promptCacheLifetimes');
+  });
+
+  it('carries the pi model\'s image input limits as a capability', () => {
+    const images = { maxPerRequest: 600, resize: { maxWidth: 2000, maxBytes: 4_718_592 } };
+    const stated = wrapModel({ inputLimits: { maxRequestBytes: 1, images } }, 'anthropic', 'm');
+    expect(stated.capabilities?.imageInput).toEqual(images);
+    expect(wrapModel({}, 'anthropic', 'm').capabilities).not.toHaveProperty('imageInput');
+  });
+
   // -----------------------------------------------------------------------
   // wrapModel
   // -----------------------------------------------------------------------

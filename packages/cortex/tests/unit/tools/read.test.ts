@@ -91,6 +91,25 @@ describe('Read tool', () => {
     expect(imageContent.data).toBe(pngHeader.toString('base64'));
   });
 
+  it('refuses an image whose encoding exceeds the model\'s byte ceiling, per read', async () => {
+    const filePath = path.join(tmpDir, 'big.png');
+    fs.writeFileSync(filePath, Buffer.alloc(3000, 1));
+    let limits: { resize?: { maxBytes?: number } } | undefined = { resize: { maxBytes: 3000 } };
+    const limitedTool = createReadTool({ readRegistry: registry, imageInputLimits: () => limits });
+
+    const refused = await limitedTool.execute({ file_path: filePath });
+    expect(refused.content[0]?.type).toBe('text');
+    expect((refused.content[0] as { text: string }).text).toMatch(/too large for the current model/);
+    expect(refused.details.rejected).toBe(true);
+    expect(registry.hasBeenRead(filePath)).toBe(false);
+
+    // 3000 bytes encode to 4000; a model allowing that takes the image.
+    limits = { resize: { maxBytes: 4000 } };
+    expect((await limitedTool.execute({ file_path: filePath })).content[0]?.type).toBe('image');
+    limits = undefined;
+    expect((await limitedTool.execute({ file_path: filePath })).content[0]?.type).toBe('image');
+  });
+
   it('detects binary files', async () => {
     const filePath = path.join(tmpDir, 'binary.dat');
     const buffer = Buffer.alloc(1024);

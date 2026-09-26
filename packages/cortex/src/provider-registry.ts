@@ -11,6 +11,7 @@
  * Reference: provider-manager.md
  */
 
+import type { ModelPromptCacheLifetimes } from './model-wrapper.js';
 import type { ThinkingLevel } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -353,40 +354,54 @@ export const PROVIDER_CACHE_CONFIG: Record<string, ProviderCacheConfig> = {
 };
 
 /**
+ * The prompt cache lifetime (ms) a request at `retention` gets: the model's
+ * own metadata when it states that tier, else the provider's entry in
+ * {@link PROVIDER_CACHE_CONFIG}. Zero when caching is off or unknown.
+ */
+export function resolvePromptCacheTtlMs(
+  provider: string,
+  retention: CacheRetention,
+  modelPromptCache?: ModelPromptCacheLifetimes,
+): number {
+  if (retention === 'none') return 0;
+  const seconds = modelPromptCache?.[retention];
+  if (seconds !== undefined) return Math.max(0, seconds) * 1000;
+  const config = PROVIDER_CACHE_CONFIG[provider];
+  if (!config?.supported) return 0;
+  return retention === 'long' ? config.longTtlMs : config.shortTtlMs;
+}
+
+/**
  * Resolve the optimal cache retention setting for a provider and tick interval.
+ *
+ * Lifetimes come from the model's metadata when given (pi-ai's
+ * `Model.promptCache`), else from the provider table, so a model that
+ * states its cache is covered even when its provider has no entry.
  *
  * Decision logic:
  * - Providers with preferLong (e.g. OpenAI, free writes): always "long"
- * - Anthropic/Bedrock with interval ≤ 4.5 min: "short" (cheaper writes, TTL resets on hit)
- * - Anthropic/Bedrock with interval > 4.5 min: "long" (need 1-hour window for sleep ticks)
- * - Unsupported providers: "none"
+ * - Otherwise "short" while the interval fits 90% of the short lifetime
+ *   (cheaper writes, the lifetime resets on hit), else "long" when the
+ *   model or provider has one (e.g. Anthropic's 1-hour window for sleep ticks)
+ * - No known lifetime: "none"
  */
-export function resolveCacheRetention(provider: string, tickIntervalMs: number): CacheRetention {
-  const config = PROVIDER_CACHE_CONFIG[provider];
-
-  // Unknown or unsupported provider
-  if (!config || !config.supported) {
-    return 'none';
-  }
+export function resolveCacheRetention(
+  provider: string,
+  tickIntervalMs: number,
+  modelPromptCache?: ModelPromptCacheLifetimes,
+): CacheRetention {
+  const shortTtlMs = resolvePromptCacheTtlMs(provider, 'short', modelPromptCache);
+  const longTtlMs = resolvePromptCacheTtlMs(provider, 'long', modelPromptCache);
+  if (shortTtlMs <= 0 && longTtlMs <= 0) return 'none';
 
   // Providers where long cache is free (e.g. OpenAI): always use long
-  if (config.preferLong) {
-    return 'long';
-  }
+  if (PROVIDER_CACHE_CONFIG[provider]?.preferLong && longTtlMs > 0) return 'long';
 
   // Providers with a write cost premium (e.g. Anthropic):
   // use short when the interval fits within the short TTL (with safety margin)
   const SHORT_TTL_SAFETY_MARGIN = 0.9; // 90% of TTL as threshold
-  const shortThreshold = config.shortTtlMs * SHORT_TTL_SAFETY_MARGIN;
-
-  if (tickIntervalMs <= shortThreshold) {
-    return 'short';
-  }
+  if (shortTtlMs > 0 && tickIntervalMs <= shortTtlMs * SHORT_TTL_SAFETY_MARGIN) return 'short';
 
   // Interval exceeds short TTL: use long if available
-  if (config.longTtlMs > 0) {
-    return 'long';
-  }
-
-  return 'none';
+  return longTtlMs > 0 ? 'long' : 'none';
 }
