@@ -24,7 +24,6 @@ import type { AgentContext, AgentMessage } from './context-manager.js';
 import {
   computeCacheBreakpointIndices,
   applyCacheBreakpoints,
-  resolveDirectCompletionContext,
 } from './cache-breakpoints.js';
 import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-breakpoints.js';
 import { EventBridge } from './event-bridge.js';
@@ -40,11 +39,9 @@ import {
 } from './retry-policy.js';
 import {
   assistantText,
-  assistantUsage,
   findLastAssistant,
   messageHasText,
   messageHasToolCalls,
-  toolCallArguments,
   toolCallNames,
   userMessageText,
   withPlaceholderContent,
@@ -90,6 +87,8 @@ import { HandlerList } from './agent-loop/handler-list.js';
 import { ProcessTracker } from './agent-loop/process-tracker.js';
 import { UsageLedger } from './agent-loop/usage-ledger.js';
 import { wireLoopEvents } from './agent-loop/event-wiring.js';
+import { DirectCompletions } from './agent-loop/direct-completion.js';
+import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { estimateTokens } from './token-estimator.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
@@ -135,7 +134,6 @@ import type {
   PersistResultFn,
   ToolCategory,
 } from './types.js';
-import { structuredCompletionRequest, parseSchemaCompletion } from './structured-completion.js';
 import { processToolResult } from './tool-result-persistence.js';
 import {
   clampToSupported,
@@ -153,6 +151,7 @@ import type {
 } from './agent-loop/pi-agent.js';
 
 export type { PiAgent, PiModel, QueueDrainMode } from './agent-loop/pi-agent.js';
+export type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 
 /** Leading context slot used to seed a sub-agent with background context. */
 const CHILD_SEED_CONTEXT_SLOT = '_seed_context';
@@ -178,34 +177,6 @@ export { MINIMUM_CONTEXT_WINDOW } from './context-budget.js';
  * Exported so consumers (e.g., cortex-code TUI) can strip it from display text.
  */
 export const TOOL_RESULT_WORKING_TAGS_REMINDER = '[Do not narrate. If analyzing these results, use <working> tags. Only text outside <working> tags is shown to the user.]';
-
-export interface DirectCompletionOptions {
-  cacheRetention?: CacheRetention;
-  /**
-   * Per-call cache affinity key, sent as the `x-session-affinity` header on
-   * Anthropic requests so repeated calls route to the same cache. Defaults to
-   * the agent's sessionId. Set a distinct value per pipeline when running
-   * several independent direct-completion pipelines with different stable
-   * prefixes.
-   */
-  sessionId?: string;
-  /**
-   * Optional abort signal to cancel an in-flight completion. When the signal
-   * fires, the call rejects with an `AbortError` (an Error whose `name` is
-   * `'AbortError'`) so callers can distinguish caller-initiated cancellation
-   * from a genuine failure. Applies to `directComplete`, `structuredComplete`,
-   * and `utilityComplete`.
-   */
-  signal?: AbortSignal;
-  /**
-   * Category tag this completion's spend is recorded under in the loop's
-   * session usage (see SessionUsage.utility) and on the emitted
-   * utility_usage event. Cortex tags its internal calls ('observer',
-   * 'reflector', 'summarization', 'webfetch', 'bash_utility'); consumer
-   * calls default to 'direct', 'structured', or 'utility' by entry point.
-   */
-  usageCategory?: string;
-}
 
 /** Options for {@link AgentLoop.deliver}. */
 export interface DeliverOptions {
@@ -746,6 +717,7 @@ export class AgentLoop {
 
   // Session-lifetime usage plus the last direct completion's usage.
   private readonly usage = new UsageLedger();
+  private readonly completions: DirectCompletions;
 
   /**
    * Create an AgentLoop. Prefer AgentLoop.create().
@@ -807,6 +779,22 @@ export class AgentLoop {
     this.primaryPiModel = primaryPiModel;
     this.resolvedUtilityModel = utilityModel;
     this.resolvedUtilityPiModel = utilityPiModel;
+    this.completions = new DirectCompletions({
+      models: () => ({
+        primary: this.primaryModel,
+        primaryPi: this.primaryPiModel,
+        utility: this.resolvedUtilityModel,
+        utilityPi: this.resolvedUtilityPiModel,
+      }),
+      getApiKey: config.getApiKey,
+      cacheRetention: () => this._cacheRetention,
+      sessionId: () => this._sessionId,
+      isAborted: () => this.isAborted(),
+      emitError: (error, wasAborted) => this.emitError(error, wasAborted),
+      emitUtilityUsage: (category, usage) => this.eventBridge.emitUtilityUsage(category, usage),
+      ledger: this.usage,
+      logger: this.logger,
+    });
 
     // Resolve deferred tools config and create the registry up-front. Built-in
     // tool creation needs the registry so it can wire ToolSearch's
@@ -2485,58 +2473,6 @@ export class AgentLoop {
     return classified;
   }
 
-  /**
-   * Handle an error thrown by a direct (non-agentic) completion path
-   * (directComplete / structuredComplete / utilityComplete).
-   *
-   * Prefers the original credential-resolution error as the cause when present,
-   * since "OAuth refresh failed" / "Vault is sealed" is more actionable than the
-   * downstream provider error that results from calling without a key. Classifies
-   * and emits the error through onError (so auth failures in THOUGHT/REFLECT/
-   * utility phases surface like loop failures), then returns the error to throw.
-   */
-  private surfaceDirectError(
-    err: unknown,
-    keyError: Error | undefined,
-    signal?: AbortSignal,
-  ): Error {
-    const downstream = toError(err);
-    const aborted =
-      this.isAborted() || (signal?.aborted ?? false) || downstream.name === 'AbortError';
-    const cause = aborted ? downstream : (keyError ?? downstream);
-    this.emitError(cause, aborted);
-    return cause;
-  }
-
-  private buildDirectCompletionOptions(
-    apiKey: string | undefined,
-    options?: DirectCompletionOptions,
-    breakpointIndices?: CacheBreakpointIndices | null,
-  ): Record<string, unknown> | undefined {
-    const completeOptions: Record<string, unknown> = {};
-    const cacheRetention = options?.cacheRetention ?? this._cacheRetention;
-    const sessionId = options?.sessionId ?? this._sessionId;
-
-    if (apiKey) completeOptions['apiKey'] = apiKey;
-    if (cacheRetention) completeOptions['cacheRetention'] = cacheRetention;
-    if (sessionId) completeOptions['sessionId'] = sessionId;
-    if (options?.signal) completeOptions['signal'] = options.signal;
-
-    // Structured contexts carry BP2/BP3 indices; stamp them onto the payload
-    // via pi-ai's onPayload hook, same as the agentic loop does.
-    if (breakpointIndices) {
-      completeOptions['onPayload'] = (
-        payload: Record<string, unknown>,
-        model: Record<string, unknown>,
-      ) => {
-        if (!model || model['provider'] !== 'anthropic') return undefined;
-        return applyCacheBreakpoints(payload, breakpointIndices);
-      };
-    }
-
-    return Object.keys(completeOptions).length > 0 ? completeOptions : undefined;
-  }
-
   // -----------------------------------------------------------------------
   // Direct Completion (non-agentic)
   // -----------------------------------------------------------------------
@@ -2561,78 +2497,9 @@ export class AgentLoop {
    * @throws Error if pi-ai is not installed or the call fails
    */
   async directComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string> {
-    // Dynamically import pi-ai's complete() function
-    // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
-    // here pending the planned createModels() migration (Phase 2).
-    let completeFn: typeof import('@earendil-works/pi-ai/compat').complete;
-    try {
-      const piAi = await import('@earendil-works/pi-ai/compat');
-      completeFn = piAi.complete;
-    } catch {
-      throw new Error(
-        'directComplete() requires @earendil-works/pi-ai to be installed. ' +
-        'Install it as a dependency or peer dependency.',
-      );
-    }
-
-    // Validate and assemble the context. Structured contexts get the
-    // [slots][history][ephemeral][prompt] layout plus BP2/BP3 indices.
-    const resolved = resolveDirectCompletionContext(context);
-
-    // Resolve API key for the provider. A resolution failure is remembered
-    // rather than swallowed: pi-ai may still succeed via env vars, but if the
-    // call below fails we surface this (more actionable) cause instead.
-    const provider = this.primaryModel.provider;
-    let apiKey: string | undefined;
-    let keyError: Error | undefined;
-    if (this.config.getApiKey) {
-      try {
-        apiKey = await this.config.getApiKey(provider);
-      } catch (err) {
-        keyError = toError(err);
-      }
-    }
-
-    this.usage.lastDirect = null;
-
-    const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
-
-    const directStartMs = Date.now();
-    try {
-      // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
-      // provider-specific convertMessages() handle all format normalization:
-      // UserMessage (string or content blocks), AssistantMessage (content block
-      // arrays with text/thinking/toolCall), and ToolResultMessage.
-      const result = await completeFn(
-        this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
-        {
-          systemPrompt: resolved.systemPrompt,
-          messages: resolved.messages,
-        } as Parameters<typeof completeFn>[1],
-        completeOptions as Parameters<typeof completeFn>[2] | undefined,
-      );
-
-      // Caller-initiated cancellation takes precedence over error/usage handling.
-      this.throwIfAborted(result, options?.signal);
-
-      // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
-      this.checkForSilentError(result);
-
-      // Capture usage from the AssistantMessage response
-      this.usage.lastDirect = assistantUsage(result);
-      this.recordUtilityUsage(options?.usageCategory ?? 'direct', this.usage.lastDirect);
-
-      this.logger.debug('directComplete', {
-        durationMs: Date.now() - directStartMs,
-        usage: this.usage.lastDirect,
-      });
-
-      // Extract text from the AssistantMessage response
-      return assistantText(result);
-    } catch (err) {
-      throw this.surfaceDirectError(err, keyError, options?.signal);
-    }
+    return this.completions.direct(context, options);
   }
+
 
   /**
    * Make a structured output LLM call using the tool-call-as-structured-output pattern.
@@ -2655,136 +2522,9 @@ export class AgentLoop {
    * @returns The parsed tool call arguments, or null if the model didn't call the tool
    */
   async structuredComplete(context: DirectCompletionContext, schema: unknown, toolName: string = 'structured_output', toolDescription: string = 'Produce structured output', options?: DirectCompletionOptions): Promise<Record<string, unknown> | null> {
-    // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
-    // here pending the planned createModels() migration (Phase 2).
-    let completeFn: typeof import('@earendil-works/pi-ai/compat').complete;
-    try {
-      const piAi = await import('@earendil-works/pi-ai/compat');
-      completeFn = piAi.complete;
-    } catch {
-      throw new Error(
-        'structuredComplete() requires @earendil-works/pi-ai to be installed.',
-      );
-    }
-
-    const tool = {
-      name: toolName,
-      description: toolDescription,
-      parameters: schema,
-    };
-
-    // Validate and assemble the context (see directComplete).
-    const resolved = resolveDirectCompletionContext(context);
-
-    // Resolve API key for the provider. A resolution failure is remembered
-    // rather than swallowed (see directComplete) so a downstream failure can be
-    // reported with the more actionable credential cause.
-    const provider = this.primaryModel.provider;
-    let apiKey: string | undefined;
-    let keyError: Error | undefined;
-    if (this.config.getApiKey) {
-      try {
-        apiKey = await this.config.getApiKey(provider);
-      } catch (err) {
-        keyError = toError(err);
-      }
-    }
-
-    this.usage.lastDirect = null;
-    const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
-
-    const structuredRequest = structuredCompletionRequest(this.primaryModel, schema, tool);
-    const structStartMs = Date.now();
-    try {
-      // Pass messages through to pi-ai as-is. Pi-ai's transformMessages() and
-      // provider-specific convertMessages() handle all format normalization:
-      // UserMessage (string or content blocks), AssistantMessage (content block
-      // arrays with text/thinking/toolCall), and ToolResultMessage.
-      const result = await completeFn(
-        this.primaryPiModel as unknown as Parameters<typeof completeFn>[0],
-        {
-          systemPrompt: resolved.systemPrompt,
-          messages: resolved.messages,
-          ...structuredRequest.context,
-        } as Parameters<typeof completeFn>[1],
-        {
-          ...(completeOptions ?? {}),
-          // The provider capability selects native schema output or a forced tool.
-          ...structuredRequest.options,
-        } as Parameters<typeof completeFn>[2],
-      );
-
-      // Caller-initiated cancellation takes precedence over error/usage handling.
-      this.throwIfAborted(result, options?.signal);
-
-      // Check for silent errors: pi-ai resolves with stopReason 'error' instead of throwing
-      this.checkForSilentError(result);
-
-      // Capture usage from the AssistantMessage response
-      this.usage.lastDirect = assistantUsage(result);
-      this.recordUtilityUsage(options?.usageCategory ?? 'structured', this.usage.lastDirect);
-
-      this.logger.debug('structuredComplete', {
-        toolName,
-        durationMs: Date.now() - structStartMs,
-        usage: this.usage.lastDirect,
-      });
-
-      // Extract tool call arguments from the response
-      return this.primaryModel.capabilities?.structuredOutput === 'json-schema'
-        ? parseSchemaCompletion(result, schema)
-        : toolCallArguments(result, toolName);
-    } catch (err) {
-      throw this.surfaceDirectError(err, keyError, options?.signal);
-    }
+    return this.completions.structured(context, schema, toolName, toolDescription, options);
   }
 
-  /**
-   * Extract tool call arguments from a pi-ai AssistantMessage response.
-   */
-  /**
-   * Check if a pi-ai result represents a silent error.
-   *
-   * Pi-ai's stream wrapper catches errors and resolves the promise with an
-   * output object that has stopReason 'error' and errorMessage set, instead
-   * of throwing. This means callers never see the error unless they check.
-   * This method surfaces those silent errors as thrown exceptions so they
-   * propagate properly (e.g., to retry logic).
-   */
-  private checkForSilentError(result: unknown): void {
-    if (!result || typeof result !== 'object') return;
-    const msg = result as Record<string, unknown>;
-    if (msg['stopReason'] === 'error') {
-      const errorMessage = typeof msg['errorMessage'] === 'string'
-        ? msg['errorMessage']
-        : 'Unknown pi-ai error (stopReason=error)';
-      throw new Error(`LLM call failed: ${errorMessage}`);
-    }
-  }
-
-  /**
-   * Surface a caller-aborted completion as a throwable `AbortError`.
-   *
-   * Pi-ai resolves (it does not throw) with stopReason 'aborted' when the
-   * supplied AbortSignal fires mid-flight. We also check the signal directly
-   * to cover the race where abortion lands just after a result resolved: the
-   * caller signalled they no longer want this completion, so we discard it.
-   * Throwing an Error named 'AbortError' lets callers distinguish caller
-   * cancellation from genuine failure via the standard `err.name` idiom, and
-   * must be checked before `checkForSilentError` so an abort is never
-   * misreported as an LLM error.
-   */
-  private throwIfAborted(result: unknown, signal?: AbortSignal): void {
-    const resultAborted =
-      !!result &&
-      typeof result === 'object' &&
-      (result as Record<string, unknown>)['stopReason'] === 'aborted';
-    if (signal?.aborted || resultAborted) {
-      const err = new Error('Completion aborted');
-      err.name = 'AbortError';
-      throw err;
-    }
-  }
 
   // -----------------------------------------------------------------------
   // Static Factory
@@ -3729,71 +3469,9 @@ export class AgentLoop {
    * @throws Error if pi-ai is not installed or the call fails
    */
   async utilityComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string> {
-    // pi-ai 0.80 relocated complete() to the temporary /compat shim; pinned
-    // here pending the planned createModels() migration (Phase 2).
-    let completeFn: typeof import('@earendil-works/pi-ai/compat').complete;
-    try {
-      const piAi = await import('@earendil-works/pi-ai/compat');
-      completeFn = piAi.complete;
-    } catch {
-      throw new Error(
-        'utilityComplete() requires @earendil-works/pi-ai to be installed. ' +
-        'Install it as a dependency or peer dependency.',
-      );
-    }
-
-    // Validate and assemble the context (see directComplete).
-    const resolved = resolveDirectCompletionContext(context);
-
-    // Resolve API key for the utility model's provider. A resolution failure is
-    // remembered rather than swallowed (see directComplete) so a downstream
-    // failure can be reported with the more actionable credential cause.
-    const provider = this.resolvedUtilityModel.provider;
-    let apiKey: string | undefined;
-    let keyError: Error | undefined;
-    if (this.config.getApiKey) {
-      try {
-        apiKey = await this.config.getApiKey(provider);
-      } catch (err) {
-        keyError = toError(err);
-      }
-    }
-
-    this.usage.lastDirect = null;
-
-    const completeOptions = this.buildDirectCompletionOptions(apiKey, options, resolved.indices);
-
-    const utilStartMs = Date.now();
-    try {
-      const result = await completeFn(
-        this.resolvedUtilityPiModel as unknown as Parameters<typeof completeFn>[0],
-        {
-          systemPrompt: resolved.systemPrompt,
-          messages: resolved.messages,
-        } as Parameters<typeof completeFn>[1],
-        completeOptions as Parameters<typeof completeFn>[2] | undefined,
-      );
-
-      // Caller-initiated cancellation takes precedence over error/usage handling.
-      this.throwIfAborted(result, options?.signal);
-
-      // Check for silent errors (same as directComplete/structuredComplete)
-      this.checkForSilentError(result);
-
-      // Capture usage from utility model calls
-      this.usage.lastDirect = assistantUsage(result);
-      this.recordUtilityUsage(options?.usageCategory ?? 'utility', this.usage.lastDirect);
-
-      this.logger.debug('utilityComplete', {
-        durationMs: Date.now() - utilStartMs,
-        usage: this.usage.lastDirect,
-      });
-
-      return assistantText(result);
-    } catch (err) {
-      throw this.surfaceDirectError(err, keyError, options?.signal);
-    }
+    return this.completions.utility(context, options);
   }
+
 
   // -----------------------------------------------------------------------
   // Lifecycle
@@ -4193,17 +3871,6 @@ export class AgentLoop {
    */
   restoreSessionUsage(usage: SessionUsage): void {
     this.usage.restore(usage);
-  }
-
-  /**
-   * Emit a utility_usage event for a completed direct/utility call. The
-   * session-usage accumulation happens in the event listener (see
-   * event-wiring.ts), one code path for this loop's own completions and
-   * forwarded child ones alike.
-   */
-  private recordUtilityUsage(category: string, usage: CortexUsage | null): void {
-    if (!usage) return;
-    this.eventBridge.emitUtilityUsage(category, usage);
   }
 
   // -----------------------------------------------------------------------
