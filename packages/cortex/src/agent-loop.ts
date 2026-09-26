@@ -54,6 +54,8 @@ import { createBuiltinTools } from './agent-loop/builtin-tools.js';
 import { ToolRegistry } from './agent-loop/tool-registry.js';
 import { McpAttachment } from './agent-loop/mcp-attachment.js';
 import { DeliveryQueues } from './agent-loop/delivery-queues.js';
+import { BackgroundDelivery } from './agent-loop/background-delivery.js';
+import type { PendingBackgroundCompletion } from './agent-loop/background-delivery.js';
 import type {
   DeliverOptions,
   DeliverResult,
@@ -80,17 +82,8 @@ import {
   wirePiTransformContext,
 } from './agent-loop/pi-hooks.js';
 import type { PiHookHost, ToolResultInterceptor } from './agent-loop/pi-hooks.js';
-import {
-  BACKGROUND_DELIVERY_LIMITS,
-  boundedPolicyFor,
-  DeadLetterStore,
-  partitionExhausted,
-} from './agent-loop/delivery-failure.js';
-import {
-  buildBackgroundTaskState,
-  formatBashCompletion,
-  formatSubAgentCompletion,
-} from './agent-loop/background-task-text.js';
+import { DeadLetterStore } from './agent-loop/delivery-failure.js';
+import { buildBackgroundTaskState } from './agent-loop/background-task-text.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import { estimateTokens } from './token-estimator.js';
 import type { CortexToolRuntime } from './tools/runtime.js';
@@ -118,7 +111,6 @@ import type {
   McpToolCallProgress,
   LoadedSkill,
   SubAgentSpawnConfig,
-  SubAgentResult,
   DeadLetteredBackgroundResult,
   SubAgentSnapshot,
   TrackedSubAgent,
@@ -214,38 +206,6 @@ export interface IdleDigestionResult {
 }
 
 /**
- * A background task that finished while the agent was busy and must be
- * delivered to the loop once it goes idle. Either a sub-agent (carries its
- * result) or a backgrounded Bash command (read live from the task store at
- * delivery time, so dedup against polling/kill stays correct).
- */
-type PendingBackgroundCompletion = (
-  | { kind: 'subagent'; taskId: string; result: SubAgentResult }
-  | { kind: 'bash'; taskId: string }
-) & {
-  /** Failed delivery attempts so far. Set by the drain's re-queue path. */
-  deliveryAttempts?: number;
-  /**
-   * Set when the item was given up on. Read by the drain to tell a recovered
-   * batch from a terminal one; an exact marker rather than a lookup in the
-   * capped dead-letter list, which can evict the entry being looked for.
-   */
-  deadLettered?: boolean;
-  /**
-   * When the first delivery attempt for this completion started. Bounds the
-   * TOTAL time spent delivering it (in-run retry backoff included), so
-   * re-queued attempts cannot re-enter the full retry ladder back-to-back.
-   */
-  firstDeliveryAttemptAt?: number;
-  /**
-   * Message formatted on the first delivery attempt. Re-queued items reuse
-   * it because formatting marks Bash tasks notified, so re-formatting would
-   * return null and silently drop the completion.
-   */
-  formattedMessage?: string;
-};
-
-/**
  * Wrap a logger so every message carries the loop's identity prefix. All
  * components logging through the loop's logger (the loop itself, the prompt
  * watchdog, the event bridge, budget guard, compaction, MCP) inherit it, so
@@ -321,8 +281,8 @@ export class AgentLoop {
   private readonly retrySucceededHandlers: HandlerList<[RetrySucceededInfo, LoopOriginContext]>;
   private readonly retryExhaustedHandlers: HandlerList<[RetryExhaustedInfo, LoopOriginContext]>;
   private readonly turnCompleteHandlers: HandlerList<[AgentTextOutput, LoopOriginContext]>;
-  private readonly backgroundResultDeliveryHandlers: HandlerList<[taskIds: string[]]>;
-  private pendingBackgroundResults: PendingBackgroundCompletion[] = [];
+  // Finished background work waiting to be delivered to the loop
+  private readonly background: BackgroundDelivery;
   // Content the loop gave up delivering (bounded; survives destroy)
   private readonly deadLetters: DeadLetterStore;
 
@@ -443,7 +403,6 @@ export class AgentLoop {
     this.retrySucceededHandlers = new HandlerList('onRetrySucceeded', this.logger);
     this.retryExhaustedHandlers = new HandlerList('onRetryExhausted', this.logger);
     this.turnCompleteHandlers = new HandlerList('onTurnComplete', this.logger);
-    this.backgroundResultDeliveryHandlers = new HandlerList('onBackgroundResultDelivery', this.logger);
     this.deadLetters = new DeadLetterStore(this.logger);
     this.queues = new DeliveryQueues({
       gate: this.gate,
@@ -469,6 +428,25 @@ export class AgentLoop {
         notifyTailTrimmed: () => this.notifySourceHistoryTailTrimmed(),
       },
       piQueues: this.agent,
+      deadLetters: this.deadLetters,
+      retryPolicy: this.retryPolicy,
+      emitError: (error) => this.emitError(error),
+      logger: this.logger,
+    });
+    this.background = new BackgroundDelivery({
+      gate: this.gate,
+      abort: this.abortState,
+      isAborted: () => this.isAborted(),
+      isShuttingDown: () => this.isShuttingDown(),
+      isCancelled: (taskId) => this.subAgentManager.isCancelled(taskId),
+      runDeliveryTurn: (message, retryPolicy) =>
+        this.runPromptOnce(message, undefined, true, retryPolicy),
+      unwindFailedDelivery: (preDeliveryCount, runAbortEpoch) =>
+        this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch),
+      messages: () => this.agent.state.messages,
+      backgroundTasks: {
+        get: (taskId) => this.tools.runtime.backgroundTasks.get(taskId),
+      },
       deadLetters: this.deadLetters,
       retryPolicy: this.retryPolicy,
       emitError: (error) => this.emitError(error),
@@ -679,11 +657,7 @@ export class AgentLoop {
       createChild: (params) => this.createChildAgent(params),
       eventBridge: this.eventBridge,
       onBackgroundComplete: (item) => this.deliverOrQueueBackgroundCompletion(item),
-      purgePendingResult: (taskId) => {
-        this.pendingBackgroundResults = this.pendingBackgroundResults.filter(
-          item => !(item.kind === 'subagent' && item.taskId === taskId),
-        );
-      },
+      purgePendingResult: (taskId) => this.background.purgeSubAgent(taskId),
       logger: this.logger,
     });
 
@@ -928,7 +902,7 @@ export class AgentLoop {
       // onError (once, at this chain root), never by rejecting a consumer
       // turn that already succeeded or replacing that turn's own error.
       try {
-        await this.drainPendingBackgroundResults();
+        await this.background.drain();
       } catch (err) {
         this.emitError(toError(err));
       }
@@ -1109,7 +1083,7 @@ export class AgentLoop {
         turns: this.budgetGuard.getTurnCount(),
         totalCost: this.budgetGuard.getTotalCost(),
         currentContextTokens: this.compactionManager.currentContextTokenCount,
-        pendingBackgroundResults: this.pendingBackgroundResults.length,
+        pendingBackgroundResults: this.background.pending.length,
       });
 
       // Signal that this turn has fully unwound (status classified, flags
@@ -2238,7 +2212,7 @@ export class AgentLoop {
       // on every take of the parked queue) and never starts a run. When
       // deliveries ARE pending they start a fresh (non-aborted) loop, so
       // return immediately rather than blocking on it.
-      if (this.pendingBackgroundResults.length === 0) {
+      if (this.background.pending.length === 0) {
         await this.gate.settled;
       }
 
@@ -2488,7 +2462,7 @@ export class AgentLoop {
    * Consumers can use this to update UI state (show spinners, etc.).
    */
   onBackgroundResultDelivery(handler: (taskIds: string[]) => void): void {
-    this.backgroundResultDeliveryHandlers.add(handler);
+    this.background.deliveryHandlers.add(handler);
   }
 
   /**
@@ -3247,9 +3221,7 @@ export class AgentLoop {
     // will never be delivered; record it (and notify handlers, which are
     // still registered at this point) rather than letting completed work
     // vanish with the shutdown.
-    for (const item of this.pendingBackgroundResults.splice(0)) {
-      this.deadLetterBackgroundResult(item, 'agent shut down before delivery');
-    }
+    this.background.deadLetterAllPending('agent shut down before delivery');
 
     // 2. Cancel all sub-agents. Full child destroy(), not just a pi-level
     // abort: an abort alone left the child's MCP connections, event
@@ -3298,9 +3270,8 @@ export class AgentLoop {
     this.subAgents.spawnedHandlers.clear();
     this.subAgents.completedHandlers.clear();
     this.subAgents.failedHandlers.clear();
-    this.backgroundResultDeliveryHandlers.clear();
+    this.background.deliveryHandlers.clear();
     this.deadLetters.handlers.clear();
-    this.pendingBackgroundResults = [];
     this.queues.clearForTeardown();
     this.asks.clear();
     // The dead-letter store itself is deliberately kept: it must still
@@ -3442,167 +3413,6 @@ export class AgentLoop {
   }
 
   /**
-   * Handle a background task (sub-agent or Bash command) completing. The
-   * completion is queued and a gated drain cycle is scheduled: if a loop is
-   * currently running, its own end-of-cycle drain delivers the item first
-   * and the scheduled drain becomes a no-op; if the agent is idle, the
-   * scheduled drain delivers it by starting a new loop.
-   *
-   * Scheduling unconditionally (instead of branching on _isPrompting)
-   * closes the race where a completion lands between the running cycle's
-   * final drain check and the gate release, which would strand it.
-   *
-   * Shared by background sub-agents (resolved promise) and backgrounded Bash
-   * commands (process `close` callback), so both wake the loop the same way.
-   */
-  private async deliverOrQueueBackgroundCompletion(
-    item: PendingBackgroundCompletion,
-  ): Promise<void> {
-    // A cancelled sub-agent can settle after its cancel (its completion path
-    // survives the abort); its result must never wake the loop. Checked
-    // before the shutdown gate: work discarded on purpose is not
-    // dead-letter material, even when the discard happens mid-teardown.
-    if (item.kind === 'subagent' && this.subAgentManager.isCancelled(item.taskId)) {
-      this.logger.info('dropping result of cancelled subagent', {
-        taskId: item.taskId,
-      });
-      return;
-    }
-    // Completed work arriving during teardown will never be delivered:
-    // record it as dead-lettered instead of dropping it silently.
-    if (this.isShuttingDown()) {
-      this.deadLetterBackgroundResult(item, 'agent shut down before delivery');
-      return;
-    }
-
-    this.pendingBackgroundResults.push(item);
-    await this.schedulePendingResultDelivery();
-  }
-
-  /**
-   * Enqueue a gated drain cycle. Delivery failures have no consumer-level
-   * caller to catch them, so a terminal failure is routed to onError (once,
-   * at this chain root) and never rejected out of the returned promise.
-   */
-  private schedulePendingResultDelivery(): Promise<void> {
-    return this.enqueueLoopTask(async () => {
-      if (this.isShuttingDown()) return;
-      try {
-        await this.drainPendingBackgroundResults();
-      } catch (err) {
-        this.emitError(toError(err));
-      }
-    });
-  }
-
-  /**
-   * Drain all pending background completions by restarting the agentic loop
-   * with a combined message. Must be called while holding the loop gate
-   * (from a cycle's finally or a scheduled drain task). Completions that
-   * were already observed in the meantime (Bash poll/kill) are skipped, and
-   * if nothing remains to deliver the loop is not restarted.
-   */
-  private async drainPendingBackgroundResults(): Promise<void> {
-    if (this.isShuttingDown()) return;
-    if (this.pendingBackgroundResults.length === 0) return;
-
-    const pending = this.pendingBackgroundResults.splice(0);
-    const batch: PendingBackgroundCompletion[] = [];
-    const parts: string[] = [];
-    const firstAttemptTaskIds: string[] = [];
-    for (const item of pending) {
-      // Cancelled sub-agent work is discarded, including re-queued items
-      // whose cancel landed between delivery attempts.
-      if (item.kind === 'subagent' && this.subAgentManager.isCancelled(item.taskId)) {
-        continue;
-      }
-      // Re-queued items reuse the message formatted on their first attempt
-      // (formatting marks Bash tasks notified, so it must not re-run).
-      const message = item.formattedMessage ?? this.formatPendingCompletion(item);
-      if (message === null) continue;
-      item.formattedMessage = message;
-      item.firstDeliveryAttemptAt ??= Date.now();
-      batch.push(item);
-      parts.push(message);
-      if (!item.deliveryAttempts) firstAttemptTaskIds.push(item.taskId);
-    }
-    if (batch.length === 0) return;
-
-    // Each attempt's in-run retry ladder is capped to the batch's remaining
-    // delivery budget (see delivery-failure.ts).
-    const boundedRetryPolicy = boundedPolicyFor(
-      this.retryPolicy, batch, BACKGROUND_DELIVERY_LIMITS, Date.now(),
-    );
-
-    const message = parts.join('\n\n---\n\n');
-    // Notify consumers once per completion (not again on re-attempts).
-    if (firstAttemptTaskIds.length > 0) {
-      this.backgroundResultDeliveryHandlers.emit(firstAttemptTaskIds);
-    }
-    // pi pushes the delivery's user message into state.messages at run
-    // start, before any model call, so a failed delivery leaves that
-    // message (plus a synthetic failure stub) in the transcript. Captured
-    // here so the catch can unwind exactly what this attempt appended. The
-    // abort epoch rides along for deterministic re-park stamping.
-    const preDeliveryCount = this.agent.state.messages.length;
-    const runAbortEpoch = this.abortState.epoch;
-    let attemptError: Error | null = null;
-    let requeuedForRetry = false;
-    try {
-      // fromDrain: deliver via a fresh loop even if a prior turn was
-      // aborted; background completions are not cancelled by user abort.
-      await this.runPromptOnce(message, undefined, true, boundedRetryPolicy);
-    } catch (err) {
-      // The delivery loop failed. Re-queue only when the delivery message
-      // could be unwound from the transcript (or never landed); if the run
-      // progressed past it, the body already lives in history where the
-      // next successful run will see it, and re-queueing would append the
-      // same completion a second time.
-      attemptError = toError(err);
-      if (this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch)) {
-        this.requeueOrDeadLetter(batch, err);
-        requeuedForRetry = true;
-      }
-    }
-
-    // Deliver anything that arrived during this delivery (including items
-    // the catch above re-queued), even when the attempt failed, matching
-    // the pre-gate recursive prompt() behavior. Bounded: each re-queued
-    // item carries an attempt count and dead-letters at the cap. A failure
-    // here propagates in place of this attempt's own error (as the old
-    // finally-based flow did).
-    await this.drainPendingBackgroundResults();
-
-    if (attemptError !== null) {
-      // A later attempt in this same drain chain delivered the whole
-      // re-queued batch: the failure was recovered from, so it must not
-      // reach onError or reject a consumer turn (mirroring how an in-run
-      // retry that recovers reports onRetrySucceeded rather than onError).
-      if (requeuedForRetry && this.batchRecoveredAfterRequeue(batch)) {
-        this.logger.info('background delivery recovered after re-queue', {
-          taskIds: batch.map((item) => item.taskId),
-          error: attemptError.message,
-        });
-        return;
-      }
-      throw attemptError;
-    }
-  }
-
-  /**
-   * Whether every item of a failed-then-re-queued delivery batch has since
-   * left the system without being dead-lettered: no longer waiting in the
-   * pending queue and not marked given-up. True means the recursive drain
-   * that ran after the re-queue delivered the batch (or a cancel discarded
-   * it), so the failure that re-queued it was transient.
-   */
-  private batchRecoveredAfterRequeue(batch: PendingBackgroundCompletion[]): boolean {
-    return batch.every(
-      (item) => !this.pendingBackgroundResults.includes(item) && !item.deadLettered,
-    );
-  }
-
-  /**
    * After a failed delivery attempt, restore the transcript to its
    * pre-delivery state when possible. pi pushes the delivery's user message
    * at run start (before any model call) and appends a synthetic assistant
@@ -3621,66 +3431,6 @@ export class AgentLoop {
   }
 
   /**
-   * After a failed delivery, put the batch back at the front of the queue
-   * (preserving order relative to completions that arrived meanwhile), or
-   * dead-letter items that cannot productively re-attempt: attempts
-   * exhausted, total delivery time over budget, or a fatal error category
-   * (an immediate identical re-attempt of an authentication failure is
-   * futile; the consumer must act first). Bounds both deterministic
-   * redelivery loops and gate-holding during a sustained outage.
-   */
-  private requeueOrDeadLetter(batch: PendingBackgroundCompletion[], err: unknown): void {
-    const error = toError(err);
-    const lastError = error.message;
-    const classified = classifyError(error, { wasAborted: this.isAborted() });
-    const fatal = classified.severity === 'fatal';
-    // An abort is the user stopping the agent, not this delivery failing on
-    // its own terms, so it must not consume an attempt: a few quick aborts
-    // would otherwise dead-letter completed work that never truly failed.
-    const { retry: requeue, exhausted } = partitionExhausted(
-      batch,
-      BACKGROUND_DELIVERY_LIMITS,
-      Date.now(),
-      { countAttempt: classified.category !== 'cancelled', fatal },
-    );
-    for (const item of exhausted) this.deadLetterBackgroundResult(item, lastError);
-    this.pendingBackgroundResults.unshift(...requeue);
-  }
-
-  /**
-   * Record a completion the agent gives up on delivering: log it, append it
-   * to the bounded dead-letter list, and notify
-   * onBackgroundResultDeadLettered handlers. Cap evictions are logged,
-   * since an evicted entry is completed work vanishing for good.
-   */
-  private deadLetterBackgroundResult(
-    item: PendingBackgroundCompletion,
-    lastError: string,
-  ): void {
-    const attempts = item.deliveryAttempts ?? 0;
-    item.deadLettered = true;
-    this.logger.error('background result dead-lettered', {
-      kind: item.kind,
-      taskId: item.taskId,
-      attempts,
-      lastError,
-    });
-    // Items dead-lettered without ever entering a drain (teardown, a
-    // completion arriving mid-shutdown) have no formattedMessage yet, so
-    // format here to preserve the payload. Empty only when the source is
-    // already gone (a Bash completion landing after runtime teardown).
-    const message = item.formattedMessage ?? this.formatPendingCompletion(item) ?? '';
-    this.deadLetters.record({
-      kind: item.kind,
-      taskId: item.taskId,
-      attempts,
-      lastError,
-      deadLetteredAt: Date.now(),
-      message,
-    });
-  }
-
-  /**
    * Dead-lettered content (newest last, bounded): background completions
    * whose delivery failed repeatedly, and wake deliveries dropped after
    * their carrying runs failed repeatedly. The consumer can surface these
@@ -3688,21 +3438,6 @@ export class AgentLoop {
    */
   getDeadLetteredBackgroundResults(): DeadLetteredBackgroundResult[] {
     return this.deadLetters.list();
-  }
-
-  /**
-   * Format a pending completion into the message delivered to the loop, or
-   * null if there is nothing to deliver. Marks Bash tasks as notified so the
-   * same completion is never delivered twice.
-   */
-  private formatPendingCompletion(item: PendingBackgroundCompletion): string | null {
-    if (item.kind === 'subagent') {
-      return formatSubAgentCompletion(item.taskId, item.result);
-    }
-    const task = this.tools.runtime.backgroundTasks.get(item.taskId);
-    if (!task || !task.completed || task.notified) return null;
-    task.notified = true;
-    return formatBashCompletion(task);
   }
 
   /** Build a sub-agent's loop (the spawner's factory; tests stand in for it). */
@@ -3768,6 +3503,30 @@ export class AgentLoop {
 
   private settlePendingAsk(askId: string): void {
     this.asks.settle(askId);
+  }
+
+  private get pendingBackgroundResults(): PendingBackgroundCompletion[] {
+    return this.background.pending;
+  }
+
+  private deliverOrQueueBackgroundCompletion(item: PendingBackgroundCompletion): Promise<void> {
+    return this.background.enqueue(item);
+  }
+
+  private schedulePendingResultDelivery(): Promise<void> {
+    return this.background.schedule();
+  }
+
+  private drainPendingBackgroundResults(): Promise<void> {
+    return this.background.drain();
+  }
+
+  private requeueOrDeadLetter(batch: PendingBackgroundCompletion[], err: unknown): void {
+    this.background.requeueOrDeadLetter(batch, err);
+  }
+
+  private batchRecoveredAfterRequeue(batch: PendingBackgroundCompletion[]): boolean {
+    return this.background.batchRecoveredAfterRequeue(batch);
   }
 
   private get pendingWakeDeliveries(): QueuedDelivery[] {
