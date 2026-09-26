@@ -92,7 +92,6 @@ import { workspaceSettingsPath } from './permissions/rules.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { log } from './logger.js';
-import { resolveConfiguredModel } from './providers/model-resolution.js';
 import { FreezeDiagnostics } from './diagnostics/freeze.js';
 import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display-args.js';
 import { FileSessionActivityReporter, watchDecisionFile, type PermissionResolution } from './activity/session-activity.js';
@@ -103,6 +102,7 @@ import { runHookHandlers } from './hooks/runner.js';
 import type { HookEvent, HookHandler, PreTurnEnvelope } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 import { RetryStatusLine } from './session/retry-status.js';
+import { ModelSelection } from './session/model-selection.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -112,12 +112,6 @@ const execFileAsync = promisify(execFile);
  * window, which a session that is still working may not reach.
  */
 const SHUTDOWN_SNAPSHOT_TIMEOUT_MS = 2000;
-
-function formatEffortLabel(level: ThinkingLevel): string {
-  return level === 'max'
-    ? 'Max'
-    : level.charAt(0).toUpperCase() + level.slice(1);
-}
 
 export interface SessionOptions {
   config: CortexCodeConfig;
@@ -165,10 +159,6 @@ export class Session {
   private app: App | null = null;
   private rules: PermissionRuleManager;
   private yoloMode: boolean;
-  /** The user's desired effort level. Persists across model switches within a session. */
-  private preferredEffort: ThinkingLevel;
-  /** The actual effort level applied to the agent (may differ from preferred due to model limits). */
-  private effectiveEffort: ThinkingLevel;
   private sessionId: string;
   /** True when this session was launched to resume a saved one. */
   private readonly isResume: boolean;
@@ -253,8 +243,7 @@ export class Session {
   private readonly agentMode: NonNullable<CortexAgentConfig['mode']>;
   private readonly mode: Mode;
   private readonly model: CortexModel;
-  private provider: string;
-  private modelId: string;
+  private readonly models: ModelSelection;
   private readonly providerManager: ProviderManager;
   private readonly credentialStore: CredentialStore;
   private readonly apiKeys: ApiKeyResolver;
@@ -270,16 +259,22 @@ export class Session {
     this.agentMode = resolveAgentMode(options.duplex, options.config.agentMode);
     this.mode = options.mode;
     this.model = options.model;
-    this.provider = options.provider;
-    this.modelId = options.modelId;
+    this.models = new ModelSelection({
+      provider: options.provider,
+      modelId: options.modelId,
+      initialEffort: options.initialEffort,
+      config: options.config,
+      providerManager: options.providerManager,
+      credentialStore: options.credentialStore,
+      getAgent: () => this.agent,
+      getApp: () => this.app,
+    });
     this.providerManager = options.providerManager;
     this.credentialStore = options.credentialStore;
-    this.apiKeys = new ApiKeyResolver(options.credentialStore, options.providerManager, () => this.provider);
+    this.apiKeys = new ApiKeyResolver(options.credentialStore, options.providerManager, () => this.models.provider);
     this.cwd = options.cwd;
     this.initialUtilityModelId = options.initialUtilityModelId;
     this.yoloMode = options.yoloMode;
-    this.preferredEffort = options.initialEffort;
-    this.effectiveEffort = this.preferredEffort;
     this.rules = new PermissionRuleManager(options.cwd);
     const settingsPath = workspaceSettingsPath(options.cwd);
     this.networkGrants = new NetworkGrantStore(settingsPath);
@@ -312,8 +307,8 @@ export class Session {
     // snapshot. Read by sibling apps to summarize where a session left off.
     this.transcriptWriter = new TranscriptWriter(this.sessionId, this.cwd, {
       cliVersion: PKG_VERSION,
-      provider: this.provider,
-      model: this.modelId,
+      provider: this.models.provider,
+      model: this.models.modelId,
       resume: this.isResume,
       onWriteError: (error) => {
         log.warn('Session transcript write failed', {
@@ -325,7 +320,7 @@ export class Session {
 
   /** Start the session: create agent, set up context, wire events, start TUI. */
   async start(): Promise<void> {
-    log.info('Session starting', { provider: this.provider, model: this.modelId, cwd: this.cwd });
+    log.info('Session starting', { provider: this.models.provider, model: this.models.modelId, cwd: this.cwd });
     await this.activity.initialize();
 
     // Register commands
@@ -353,15 +348,7 @@ export class Session {
     this.applySandboxState(this.agent.getSandboxState());
 
     if (this.initialUtilityModelId) {
-      try {
-        await this.applyUtilityModel(this.initialUtilityModelId, false);
-      } catch (err) {
-        log.warn('Failed to apply initial utility model', {
-          provider: this.provider,
-          model: this.initialUtilityModelId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      await this.models.applyInitialUtilityModel(this.initialUtilityModelId);
     }
 
     // Set up context slots
@@ -428,7 +415,7 @@ export class Session {
     this.app.refreshCommands(this.cwd);
 
     // Apply initial thinking level
-    const { effective: initialEffort } = await this.reconcileEffort();
+    const { effective: initialEffort } = await this.models.reconcileEffort();
 
     // Show banner. The split-flap settle plays only for a fresh session; a
     // resumed session opens straight to the settled logo.
@@ -2167,7 +2154,7 @@ export class Session {
       `Current date: ${new Date().toISOString().split('T')[0]}`,
       `Current working directory: ${this.cwd}`,
       branch ? `Git branch: ${branch}` : '',
-      `Model: ${this.provider}/${this.modelId}`,
+      `Model: ${this.models.provider}/${this.models.modelId}`,
       this.yoloMode ? 'YOLO mode is active: all tools auto-approved' : '',
       this.sandboxRung !== 'off'
         ? `Sandbox: ${this.sandboxRung} rung, ${enforcementLabel}`
@@ -2249,8 +2236,8 @@ export class Session {
       mode: this.mode.name,
       modeCount: AVAILABLE_MODES.length,
       agentMode: this.agentMode,
-      provider: this.provider,
-      model: this.modelId,
+      provider: this.models.provider,
+      model: this.models.modelId,
       contextTokenCount: this.getDisplayedCurrentContextTokens(),
       contextTokenLimit: this.agent.effectiveContextWindow,
       gitBranch: branch,
@@ -2431,8 +2418,8 @@ export class Session {
     const meta: SessionMeta = {
       id: this.sessionId,
       mode: this.mode.name,
-      provider: this.provider,
-      model: this.modelId,
+      provider: this.models.provider,
+      model: this.models.modelId,
       cwd: this.cwd,
       createdAt: this.createdAt,
       updatedAt: Date.now(),
@@ -2595,46 +2582,6 @@ export class Session {
   }
 
   // -------------------------------------------------------------------------
-  // Effort reconciliation
-  // -------------------------------------------------------------------------
-
-  /**
-   * Reconcile the preferred effort with the current model's capabilities.
-   * Sets the effective effort on the agent and returns whether it was clamped.
-   */
-  private async reconcileEffort(): Promise<{
-    effective: ThinkingLevel;
-    clamped: boolean;
-    reason?: string;
-  }> {
-    if (!this.agent) {
-      return { effective: this.preferredEffort, clamped: false };
-    }
-
-    const caps = await this.agent.getModelThinkingCapabilities();
-
-    let effective = this.preferredEffort;
-    let clamped = false;
-    let reason: string | undefined;
-
-    if (!caps.supportedLevels.includes(this.preferredEffort)) {
-      effective = await this.agent.clampThinkingLevel(this.preferredEffort);
-      clamped = effective !== this.preferredEffort;
-      const preferredLabel = formatEffortLabel(this.preferredEffort);
-      const effectiveLabel = formatEffortLabel(effective);
-      reason = caps.supportsThinking
-        ? `${this.modelId} does not support ${preferredLabel} effort. Using ${effectiveLabel}.`
-        : `${this.modelId} does not support thinking. Using ${effectiveLabel}.`;
-    }
-
-    this.effectiveEffort = effective;
-    this.agent.setThinkingLevel(effective);
-    const result: { effective: ThinkingLevel; clamped: boolean; reason?: string } = { effective, clamped };
-    if (reason) result.reason = reason;
-    return result;
-  }
-
-  // -------------------------------------------------------------------------
   // Public accessors for command handlers
   // -------------------------------------------------------------------------
 
@@ -2661,23 +2608,9 @@ export class Session {
     this.yoloMode = enabled;
     this.app?.updateStatus({ yoloMode: enabled });
   }
-  getPreferredEffort(): ThinkingLevel { return this.preferredEffort; }
-  getEffectiveEffort(): ThinkingLevel { return this.effectiveEffort; }
-
-  /**
-   * Set the user's preferred effort level.
-   * Reconciles with current model capabilities and applies the effective level.
-   */
-  async setPreferredEffort(level: ThinkingLevel): Promise<void> {
-    this.preferredEffort = level;
-    const { effective, clamped, reason } = await this.reconcileEffort();
-    this.app?.updateStatus({ effortLevel: effective });
-    if (clamped && reason) {
-      this.app?.transcript.addNotification('Effort', reason);
-    }
-    // Persist across sessions
-    await this.credentialStore.setDefaultEffort(level);
-  }
+  getPreferredEffort(): ThinkingLevel { return this.models.getPreferredEffort(); }
+  getEffectiveEffort(): ThinkingLevel { return this.models.getEffectiveEffort(); }
+  setPreferredEffort(level: ThinkingLevel): Promise<void> { return this.models.setPreferredEffort(level); }
 
   getSessionId(): string { return this.sessionId; }
   /** Reset the terminal title on a fresh-start signal (e.g. /clear). */
@@ -2697,82 +2630,12 @@ export class Session {
   getRules(): PermissionRuleManager { return this.rules; }
   getProviderManager(): ProviderManager { return this.providerManager; }
   getCredentialStore(): CredentialStore { return this.credentialStore; }
-  getProvider(): string { return this.provider; }
-  getModelId(): string { return this.modelId; }
+  getProvider(): string { return this.models.provider; }
+  getModelId(): string { return this.models.modelId; }
   getCwd(): string { return this.cwd; }
 
-  private async resolveProviderModel(provider: string, modelId: string): Promise<CortexModel> {
-    const entry = await this.credentialStore.getProvider(provider);
-    return resolveConfiguredModel(this.providerManager, provider, modelId, entry, this.config.ollama, this.config.contextWindowLimit);
-  }
-
-  private async applyUtilityModel(modelId: string, persist: boolean): Promise<void> {
-    const utilityModel = await this.resolveProviderModel(this.provider, modelId);
-    this.agent!.setUtilityModel(utilityModel);
-    if (persist) {
-      await this.credentialStore.setDefaultUtilityModel(this.provider, modelId);
-    }
-  }
-
-  async setUtilityModel(modelId: string): Promise<void> {
-    await this.applyUtilityModel(modelId, true);
-  }
-
-  async resetUtilityModel(): Promise<void> {
-    this.agent!.resetUtilityModel();
-    await this.credentialStore.setDefaultUtilityModel(this.provider, null);
-  }
-
-  private async applyStoredUtilityModelForProvider(provider: string): Promise<void> {
-    const utilityModelId = this.config.defaultUtilityModel
-      ?? await this.credentialStore.getDefaultUtilityModel(provider);
-    if (!utilityModelId) {
-      this.agent!.resetUtilityModel();
-      return;
-    }
-
-    try {
-      await this.applyUtilityModel(utilityModelId, false);
-    } catch (err) {
-      this.agent!.resetUtilityModel();
-      log.warn('Failed to apply stored utility model', {
-        provider,
-        model: utilityModelId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  /** Switch the primary model. Returns the new CortexModel or throws. */
-  async switchModel(modelId: string): Promise<void> {
-    const newModel = await this.resolveProviderModel(this.provider, modelId);
-    this.agent!.setModel(newModel);
-    this.modelId = modelId;
-    // Reconcile effort with new model's capabilities
-    const { clamped, reason, effective } = await this.reconcileEffort();
-    this.app?.updateStatus({ model: modelId, effortLevel: effective, contextTokenLimit: this.agent!.effectiveContextWindow });
-    if (clamped && reason) {
-      this.app?.transcript.addNotification('Effort', reason);
-    }
-    await this.credentialStore.setDefaults(this.provider, modelId);
-  }
-
-  /** Switch to a different provider and model. Used by /login after adding a new provider. */
-  async switchProvider(newProvider: string, newModelId: string): Promise<void> {
-    log.info('Switching provider', { from: this.provider, to: newProvider, model: newModelId });
-
-    const newModel = await this.resolveProviderModel(newProvider, newModelId);
-
-    this.agent!.setModel(newModel);
-    this.provider = newProvider;
-    this.modelId = newModelId;
-    await this.applyStoredUtilityModelForProvider(newProvider);
-    // Reconcile effort with new model's capabilities
-    const { clamped, reason, effective } = await this.reconcileEffort();
-    this.app?.updateStatus({ provider: newProvider, model: newModelId, effortLevel: effective, contextTokenLimit: this.agent!.effectiveContextWindow });
-    if (clamped && reason) {
-      this.app?.transcript.addNotification('Effort', reason);
-    }
-    await this.credentialStore.setDefaults(newProvider, newModelId);
-  }
+  setUtilityModel(modelId: string): Promise<void> { return this.models.setUtilityModel(modelId); }
+  resetUtilityModel(): Promise<void> { return this.models.resetUtilityModel(); }
+  switchModel(modelId: string): Promise<void> { return this.models.switchModel(modelId); }
+  switchProvider(provider: string, modelId: string): Promise<void> { return this.models.switchProvider(provider, modelId); }
 }

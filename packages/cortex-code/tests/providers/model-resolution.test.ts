@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ProviderManager, wrapModel } from '@animus-labs/cortex';
 import { resolveConfiguredModel } from '../../src/providers/model-resolution.js';
-import { Session } from '../../src/session.js';
+import { ModelSelection } from '../../src/session/model-selection.js';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -35,18 +35,23 @@ describe('connection model resolution', () => {
     const manager = new ProviderManager();
     const model = wrapModel({ provider: 'ollama' }, 'ollama', 'new', 32768);
     const resolve = vi.spyOn(manager, 'createOllamaModel').mockResolvedValue(model);
-    const session = Object.create(Session.prototype) as Session;
-    Object.assign(session, {
-      provider: 'ollama', providerManager: manager, config: { contextWindowLimit: 8192, ollama: { contextWindow: 32768 } },
+    const agent = { setModel: vi.fn(), setUtilityModel: vi.fn(), resetUtilityModel: vi.fn(), effectiveContextWindow: 32768 };
+    const selection = new ModelSelection({
+      provider: 'ollama',
+      modelId: 'old',
+      initialEffort: 'low',
+      providerManager: manager,
+      config: { contextWindowLimit: 8192, ollama: { contextWindow: 32768 } } as never,
       credentialStore: {
         getProvider: vi.fn(async () => ({ method: 'custom', baseUrl: 'http://server:11434/v1' })),
         setDefaults: vi.fn(), setDefaultUtilityModel: vi.fn(), getDefaultUtilityModel: vi.fn(async () => null),
-      },
-      agent: { setModel: vi.fn(), setUtilityModel: vi.fn(), resetUtilityModel: vi.fn(), effectiveContextWindow: 32768 },
-      reconcileEffort: vi.fn(async () => ({ clamped: false, effective: 'low' })),
+      } as never,
+      getAgent: () => agent as never,
+      getApp: () => null,
     });
-    if (method === 'switchProvider') await session.switchProvider('ollama', 'new');
-    else await session[method]('new');
+    vi.spyOn(selection, 'reconcileEffort').mockResolvedValue({ clamped: false, effective: 'low' });
+    if (method === 'switchProvider') await selection.switchProvider('ollama', 'new');
+    else await selection[method]('new');
     expect(resolve).toHaveBeenCalledWith(expect.objectContaining({ modelId: 'new', contextWindow: 32768, contextWindowLimit: 8192 }));
   });
 });

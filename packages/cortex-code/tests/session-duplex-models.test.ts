@@ -47,8 +47,8 @@ describe('duplex: switching provider moves the talker too', () => {
     expect(harness.talkerLoop.getModel().provider).toBe('anthropic');
 
     const gpt = wrapModel({ provider: 'openai', name: 'gpt-4o' } as never, 'openai', 'gpt-4o');
-    vi.spyOn(session as unknown as { resolveProviderModel: () => Promise<unknown> }, 'resolveProviderModel')
-      .mockResolvedValue(gpt);
+    const models = (session as unknown as { models: { resolveProviderModel: () => Promise<unknown> } }).models;
+    vi.spyOn(models, 'resolveProviderModel').mockResolvedValue(gpt);
 
     await session.switchProvider('openai', 'gpt-4o');
 
