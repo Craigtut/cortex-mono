@@ -97,10 +97,12 @@ describe('ReasonerOutcomeReporter silence clock and outcome', () => {
     intake: Array<{ content: string; wake: WakeClass | undefined; meta: unknown }>;
     clock: { t: number };
     run: { id: number | null };
+    retired: { count: number };
   } {
     const intake: Array<{ content: string; wake: WakeClass | undefined; meta: unknown }> = [];
     const clock = { t: 5_000 };
     const run: { id: number | null } = { id: 1 };
+    const retired = { count: 0 };
     const reporter = new ReasonerOutcomeReporter({
       reasoner: {} as AgentLoop,
       runId: () => run.id,
@@ -109,14 +111,14 @@ describe('ReasonerOutcomeReporter silence clock and outcome', () => {
           intake.push({ content, wake, meta });
           return { delivered: true, ...(wake !== undefined ? { wake } : {}) };
         },
-        retireRunDelegations: () => {},
+        retireRunDelegations: () => { retired.count += 1; },
       },
       headlines: { noteRetry: () => {}, clearRetry: () => {} },
       aggregateBreached: () => false,
       destroyed: () => false,
       now: () => clock.t,
     });
-    return { reporter, intake, clock, run };
+    return { reporter, intake, clock, run, retired };
   }
 
   function endedWith(text: string) {
@@ -161,6 +163,20 @@ describe('ReasonerOutcomeReporter silence clock and outcome', () => {
     concluded.reporter.noteAttemptStart();
     concluded.reporter.noteAttemptEnd(endedWith('Second result.'));
     expect(concluded.intake.at(-1)!.content).toBe('Second result.');
+  });
+
+  it('retires the stopped run delegations whoever stopped it, announcing only an unrequested stop', () => {
+    // A user abort: acknowledged when asked for, so nothing is delivered,
+    // but the work the run served is no longer in progress.
+    const { reporter, intake, retired } = createReporter();
+    reporter.expectAbort('user');
+    reporter.noteAttemptStart();
+    reporter.noteAttemptEnd({
+      type: 'loop_end',
+      payload: { messages: [{ role: 'assistant', stopReason: 'aborted', content: [] }] },
+    } as never);
+    expect(retired.count).toBe(1);
+    expect(intake).toHaveLength(0);
   });
 
   it('keys the outcome by run: a retry attempt of a delivered run adds no implicit result', () => {

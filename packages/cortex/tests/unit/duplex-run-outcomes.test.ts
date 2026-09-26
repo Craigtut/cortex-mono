@@ -10,6 +10,7 @@ import {
   lifecycleEvents,
   talkerHeadline,
   waitUntil,
+  duplexRouterOf,
 } from './duplex-scenario-harness.js';
 
 afterEach(async () => {
@@ -123,6 +124,45 @@ describe('a reasoner run that is stopped', () => {
     expect(talkerHeadline(h.talkerLoop) ?? '').not.toContain('alias="task-1"');
     // The user asked for it; nothing is announced back.
     expect(entriesOfType(h.facade, 'delivery')).toHaveLength(0);
+  });
+
+  it("retires tasks whose dispatch was still parked when the user stopped the work", async () => {
+    const h = createDuplexScenario();
+    h.reasonerPi.hold = true;
+    h.talkerPi.script = [{ text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'migrate the schema' } }] }];
+    await h.facade.prompt('migrate the schema');
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'work started');
+    h.talkerPi.script = [{ text: 'Queued.', calls: [{ name: 'spawn_task', args: { instructions: 'rebuild the index' } }] }];
+    await h.facade.prompt('then rebuild the index');
+    // Precondition: task-2 never reached a run, so no run end can retire it.
+    expect(h.reasonerLoop.pendingWakeDeliveryCount).toBe(1);
+    expect(duplexRouterOf(h.facade).activeAliases()).toEqual(['task-1', 'task-2']);
+
+    await h.facade.abort('work');
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner idle');
+    expect(duplexRouterOf(h.facade).activeAliases()).toEqual([]);
+  });
+
+  it('retires tasks whose dispatch was still parked when the session limit stopped the work', async () => {
+    // Two talker turns (0.006) fit; the reasoner's first turn crosses it.
+    const h = createDuplexScenario({ duplex: { maxTotalCost: 0.008 } });
+    h.reasonerPi.hold = true;
+    h.talkerPi.script = [{ text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'migrate the schema' } }] }];
+    h.reasonerPi.script = [{ text: '', calls: [{ name: 'NoSuchTool' }] }, { text: 'Schema migrated.' }];
+    await h.facade.prompt('migrate the schema');
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'work started');
+    h.talkerPi.script = [{ text: 'Queued.', calls: [{ name: 'spawn_task', args: { instructions: 'rebuild the index' } }] }];
+    await h.facade.prompt('then rebuild the index');
+    expect(h.reasonerLoop.pendingWakeDeliveryCount).toBe(1);
+    expect(duplexRouterOf(h.facade).activeAliases()).toEqual(['task-1', 'task-2']);
+
+    h.reasonerPi.releaseRun();
+    await waitUntil(
+      () => lifecycleEvents(h.facade, 'budget_breached').length === 1,
+      2000, 'the session limit was breached',
+    );
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner idle');
+    expect(duplexRouterOf(h.facade).activeAliases()).toEqual([]);
   });
 
   it('after the session limit is breached, says so once and refuses new work', async () => {
