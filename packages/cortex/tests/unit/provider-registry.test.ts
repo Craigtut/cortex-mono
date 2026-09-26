@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
+import { builtinProviders, getBuiltinModel } from '@earendil-works/pi-ai/providers/all';
 import {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
+  PRIMARY_MODEL_DEFAULTS,
   UTILITY_MODEL_DEFAULTS,
   UTILITY_MODEL_OVERRIDES,
 } from '../../src/provider-registry.js';
@@ -123,6 +125,32 @@ describe('provider-registry', () => {
 
     it('keeps UTILITY_MODEL_DEFAULTS as a backwards-compatible alias', () => {
       expect(UTILITY_MODEL_DEFAULTS).toBe(UTILITY_MODEL_OVERRIDES);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Agreement with the installed pi-ai catalog
+  // -----------------------------------------------------------------------
+
+  describe('against the installed pi-ai catalog', () => {
+    const piProviders = builtinProviders();
+
+    it('names only providers pi-ai ships', () => {
+      const piIds = new Set(piProviders.map((provider) => provider.id));
+      expect(PROVIDER_REGISTRY.map((provider) => provider.id).filter((id) => !piIds.has(id))).toEqual([]);
+    });
+
+    it('lists as OAuth only providers whose pi-ai definition has an OAuth flow', () => {
+      const oauthCapable = piProviders.filter((provider) => provider.auth?.oauth).map((provider) => provider.id);
+      expect(OAUTH_PROVIDER_IDS.filter((id) => !oauthCapable.includes(id))).toEqual([]);
+      expect(OAUTH_PROVIDER_IDS).toContain('meta');
+    });
+
+    it('defaults every provider to a model the catalog still has', () => {
+      const missing = Object.entries(PRIMARY_MODEL_DEFAULTS)
+        .filter(([provider, modelId]) => getBuiltinModel(provider as never, modelId as never) === undefined)
+        .map(([provider, modelId]) => `${provider}/${modelId}`);
+      expect(missing).toEqual([]);
     });
   });
 });

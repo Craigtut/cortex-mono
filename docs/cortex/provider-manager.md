@@ -765,6 +765,7 @@ These providers authenticate via browser-based OAuth flows. The user signs in wi
 | Anthropic (Claude) | `anthropic` | Claude Pro or Max |
 | OpenAI Codex | `openai-codex` | ChatGPT Plus or Pro |
 | GitHub Copilot | `github-copilot` | Copilot subscription |
+| Meta | `meta` | Muse subscription |
 
 Google Gemini CLI and Google Antigravity OAuth providers were removed upstream in pi-ai 0.71. Cortex supports Google through the `google` API key provider. Google Vertex can be used by consumers that supply the required Google application credentials to pi-ai.
 
@@ -787,8 +788,9 @@ These providers authenticate with a static API key obtained from the provider's 
 | OpenCode | `opencode` | `OPENCODE_API_KEY` |
 | OpenCode Go | `opencode-go` | `OPENCODE_API_KEY` |
 | Kimi Coding | `kimi-coding` | `KIMI_API_KEY` |
+| Meta (Model API) | `meta` | `META_API_KEY` |
 
-Note: Anthropic supports both OAuth and API key. It appears in both tables.
+Note: Anthropic and Meta support both OAuth and API key. They appear in both tables.
 
 ### Custom Endpoints
 

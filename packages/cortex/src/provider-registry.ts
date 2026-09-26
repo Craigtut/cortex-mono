@@ -152,6 +152,13 @@ export const PROVIDER_REGISTRY: ProviderInfo[] = [
     keyUrl: 'console.x.ai',
   },
   {
+    id: 'meta',
+    name: 'Meta',
+    // OAuth is the Muse subscription sign-in; the key is a Meta Model API key.
+    authMethods: ['oauth', 'api_key'],
+    envVar: 'META_API_KEY',
+  },
+  {
     id: 'openrouter',
     name: 'OpenRouter',
     authMethods: ['api_key'],
@@ -278,6 +285,7 @@ export const OAUTH_PROVIDER_IDS: string[] = [
   'anthropic',
   'github-copilot',
   'kimi-coding',
+  'meta',
   'openai-codex',
   'openrouter',
   'xai',
@@ -293,11 +301,12 @@ export const OAUTH_PROVIDER_IDS: string[] = [
  * These are the best general-purpose models for each provider.
  */
 export const PRIMARY_MODEL_DEFAULTS: Record<string, string> = {
-  anthropic: 'claude-sonnet-4-6',
-  openai: 'gpt-5.4',
-  'openai-codex': 'gpt-5.5',
+  anthropic: 'claude-sonnet-5',
+  openai: 'gpt-6-sol',
+  'openai-codex': 'gpt-6-sol',
   google: 'gemini-3.1-pro-preview',
-  xai: 'grok-4',
+  xai: 'grok-4.7',
+  meta: 'muse-spark-1.3',
   groq: 'openai/gpt-oss-120b',
   cerebras: 'gpt-oss-120b',
   mistral: 'mistral-large-2512',
