@@ -22,6 +22,9 @@ import type {
   ResolutionNoteCode,
 } from '../resolution-report.js';
 import type { LogEntryInput } from './log-recorder.js';
+import type { LoopTopology } from './loop-surface.js';
+import type { ResolvedCortexAgentConfig } from './config.js';
+import type { BudgetGuard } from '../budget-guard.js';
 
 /**
  * Producer identity on a resolution note's lifecycle entry. Not a loop: the
@@ -60,6 +63,39 @@ export class ResolutionRecorder {
 
   constructor(options: ResolutionRecorderOptions) {
     this.options = options;
+  }
+
+  /**
+   * The recorder for one facade assembly: the consumer's requests read from
+   * its config, the resolution read off the loops (and the session guard)
+   * as they are at the moment of reading.
+   */
+  static forAssembly(parts: {
+    config: ResolvedCortexAgentConfig;
+    topology: LoopTopology;
+    aggregateGuard: () => BudgetGuard | null;
+    append: (input: LogEntryInput) => void;
+    logger: CortexLogger;
+  }): ResolutionRecorder {
+    const { config, topology } = parts;
+    const talker = topology.conversation !== topology.work ? topology.conversation : null;
+    return new ResolutionRecorder({
+      observe: () => ({
+        mode: talker ? 'duplex' : 'passthrough',
+        requestedTalkerModel: config.talker?.model,
+        talkerModel: talker?.getModel() ?? null,
+        reasonerModel: topology.work.getModel(),
+        configuredUtilityModel: config.utilityModel,
+        talkerUtilityModel: talker?.getUtilityModel() ?? null,
+        aggregateCostCap: parts.aggregateGuard()?.getMaxCost() ?? null,
+        perPromptMaxCost: config.budgetGuard?.maxCost,
+      }),
+      brokeredEgressResolver: talker !== null
+        && config.sandbox !== undefined
+        && config.resolveNetworkAccess !== undefined,
+      append: parts.append,
+      logger: parts.logger,
+    });
   }
 
   /** A snapshot copy of the notes (see CortexAgent.getResolutionReport). */

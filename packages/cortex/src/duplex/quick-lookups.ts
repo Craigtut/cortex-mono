@@ -60,9 +60,9 @@ export interface QuickLookupPorts {
 
 export interface QuickLookupOptions {
   /** Concurrent lookup cap (the separate small pool). Default: 2. */
-  maxConcurrent?: number;
+  maxConcurrent?: number | undefined;
   /** Wall-clock timeout per lookup in ms. Default: 30000. */
-  timeoutMs?: number;
+  timeoutMs?: number | undefined;
 }
 
 export const QUICK_LOOKUP_DEFAULTS = {

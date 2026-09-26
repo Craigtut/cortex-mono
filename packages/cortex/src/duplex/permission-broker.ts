@@ -165,17 +165,17 @@ export interface PermissionBrokerOptions {
    * Timeout for tool and network asks, after which the ask settles as deny
    * with a reason. Null disables the timeout.
    */
-  askTimeoutMs?: number | null;
+  askTimeoutMs?: number | null | undefined;
   /**
    * Timeout for sandbox escalation asks. Long rather than absent (see
    * {@link PERMISSION_BROKER_DEFAULTS}). Null disables it.
    */
-  escalationAskTimeoutMs?: number | null;
+  escalationAskTimeoutMs?: number | null | undefined;
   /**
    * Coalescing window before a settlement voices the next queued ask (see
    * {@link PERMISSION_BROKER_DEFAULTS}).
    */
-  settleVoiceDelayMs?: number;
+  settleVoiceDelayMs?: number | undefined;
   /** Clock override for tests (stamps and revoice damping, not timers). */
   now?: () => number;
 }

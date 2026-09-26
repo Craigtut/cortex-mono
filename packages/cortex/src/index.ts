@@ -184,7 +184,7 @@ export type {
   DuplexTuningConfig,
   ConfigDestination,
 } from './facade/config.js';
-export type { CortexAbortScope, CortexDeliverOptions } from './cortex-agent.js';
+export type { CortexAbortScope, CortexDeliverOptions } from './facade/session-mode.js';
 export type {
   CortexAgentStateV1,
   CortexAgentStateV2,

@@ -31,7 +31,7 @@ import { CortexAgent } from '../../src/cortex-agent.js';
 import type { CortexAgentConfig } from '../../src/cortex-agent.js';
 import type { PermissionBroker } from '../../src/duplex/permission-broker.js';
 import type { DuplexRouter } from '../../src/duplex/router.js';
-import type { DuplexSession } from '../../src/duplex/session.js';
+import { DuplexSession } from '../../src/duplex/session.js';
 import type { SessionLogEntry } from '../../src/session-log.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 import { partsOf } from './agent-loop/parts.js';
@@ -824,8 +824,10 @@ export function roles(messages: AgentMessage[]): string[] {
  * of in each suite (or silently, for a write through a stale path).
  */
 export function duplexSessionOf(facade: CortexAgent): DuplexSession {
-  const session = (facade as unknown as { duplex?: DuplexSession | null }).duplex;
-  if (!session?.router) throw new Error('duplexSessionOf: not a duplex facade, or its internals moved');
+  const session = (facade as unknown as { session?: unknown }).session;
+  if (!(session instanceof DuplexSession)) {
+    throw new Error('duplexSessionOf: not a duplex facade, or its internals moved');
+  }
   return session;
 }
 

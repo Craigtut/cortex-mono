@@ -15,10 +15,23 @@ import type { ObservationalMemoryState } from '../../src/compaction/index.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 import { CortexAgent } from '../../src/cortex-agent.js';
+import { PassthroughSession } from '../../src/facade/passthrough-session.js';
 import type {
   CortexAgentConfig,
   CortexAgentStateV2,
 } from '../../src/cortex-agent.js';
+
+/**
+ * The passthrough facade's session, for planting state no public surface
+ * can produce. Checked by class, so a moved field fails here loudly.
+ */
+function passthroughSessionOf(facade: CortexAgent): PassthroughSession {
+  const session = (facade as unknown as { session?: unknown }).session;
+  if (!(session instanceof PassthroughSession)) {
+    throw new Error('passthroughSessionOf: not a passthrough facade, or its internals moved');
+  }
+  return session;
+}
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent (same shape as the facade tests: holdable runs, usage on
@@ -642,9 +655,10 @@ describe('CortexAgent.onStateChanged', () => {
     // Simulates 2b, where the talker side holds a live loop's history: one
     // non-cloneable value makes getState() reject inside the debounce
     // timer, where nothing awaits it.
-    (facade as unknown as { retainedTalkerHistory: unknown[] }).retainedTalkerHistory = [
-      { role: 'user', content: 'x', callback: () => {} },
-    ];
+    passthroughSessionOf(facade).hydrate({
+      talkerHistory: [{ role: 'user', content: 'x', callback: () => {} } as unknown as AgentMessage],
+      talkerMemory: null,
+    });
 
     const rejections: unknown[] = [];
     const onRejection = (reason: unknown): void => {

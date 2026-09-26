@@ -1,0 +1,107 @@
+/**
+ * CompositeState: capturing and applying the persisted artifact
+ * (persisted-state.ts) across every owner of session state, each in one
+ * synchronous frame and in the order restore depends on, plus the composite
+ * usage those owners' counters add up to.
+ */
+
+import type { SessionUsage } from '../types.js';
+import type { LoopTopology } from './loop-surface.js';
+import type { LogRecorder } from './log-recorder.js';
+import type { SessionMode } from './session-mode.js';
+import { normalizePersistedState } from './persisted-state.js';
+import type { CortexAgentPersistedState, CortexAgentStateV2 } from './persisted-state.js';
+import { UsageLedger } from './usage-ledger.js';
+import type { UsageReadings } from './usage-ledger.js';
+
+export class CompositeState {
+  private readonly topology: LoopTopology;
+  private readonly recorder: LogRecorder;
+  private readonly session: () => SessionMode;
+  private readonly usage = new UsageLedger();
+
+  constructor(parts: { topology: LoopTopology; recorder: LogRecorder; session: () => SessionMode }) {
+    this.topology = parts.topology;
+    this.recorder = parts.recorder;
+    this.session = parts.session;
+  }
+
+  /**
+   * The composite session usage: every loop and settled quick lookups
+   * (children counted once via each loop's own accounting), under the
+   * baseline-plus-delta restore model.
+   */
+  totalUsage(): SessionUsage {
+    return this.usage.total(this.usageReadings());
+  }
+
+  /** The artifact, read in one frame; the caller guarantees gate quiescence. */
+  capture(): CortexAgentStateV2 {
+    const { work } = this.topology;
+    // Duplex reads the live talker; passthrough carries a restored duplex
+    // artifact's talker side and router state through unchanged, so
+    // nothing is lost on round trip.
+    const session = this.session().captureState();
+    return {
+      version: 2,
+      log: this.recorder.log.getLog(),
+      talkerHistory: session.talkerHistory,
+      reasonerHistory: work.getConversationHistory(),
+      talkerMemory: session.talkerMemory,
+      reasonerMemory: work.getObservationalMemoryState(),
+      usage: this.usage.breakdown(this.usageReadings()),
+      ...(session.router ? { router: session.router } : {}),
+    };
+  }
+
+  /**
+   * Apply an artifact, all or nothing: the caller has checked nothing is
+   * running, and there is no await in here, so it lands in one frame.
+   */
+  apply(state: CortexAgentPersistedState): void {
+    const session = this.session();
+    const { work } = this.topology;
+    const v2 = normalizePersistedState(state);
+
+    // Deep copies: the caller's artifact stays the caller's (a later
+    // in-place mutation of it must never reach live state). Taken before
+    // the first mutation below: structuredClone throws on proxies and
+    // functions (a reactive-store artifact hands it exactly that), and a
+    // clone failure must reject the restore with nothing touched, never
+    // half-applied.
+    const talkerHistory = structuredClone(v2.talkerHistory);
+    const talkerMemory = structuredClone(v2.talkerMemory);
+    const routerState = v2.router ? structuredClone(v2.router) : undefined;
+
+    // History before observational state (restore ordering), per loop.
+    work.restoreConversationHistory(v2.reasonerHistory);
+    if (v2.reasonerMemory) {
+      work.restoreObservationalMemoryState(v2.reasonerMemory);
+    }
+    session.hydrate({ talkerHistory, talkerMemory });
+    this.recorder.log.restore(v2.log);
+
+    this.usage.rebase(v2.usage, this.usageReadings());
+    this.recorder.resetForRestore();
+    // Pre-restore queued content belongs to the replaced session: left in
+    // place, queued silent deliveries would flush into the first
+    // post-restore prompt (and stale steer/follow-up content into its run).
+    // What gets destroyed is recorded in the restored log, which is the
+    // durable record of undelivered content from here on.
+    this.recorder.recordDroppedQueue(work, 'restore', work.clearAllQueues());
+    // Everything the mode holds describes the replaced session too; what
+    // the artifact carries of the router's state comes back (passthrough
+    // carries it through untouched).
+    session.resetForRestore(routerState);
+  }
+
+  /** Each usage producer's live reading, for the ledger. */
+  private usageReadings(): UsageReadings {
+    const { work, conversation } = this.topology;
+    return {
+      reasoner: work.getSessionUsage(),
+      talker: conversation !== work ? conversation.getSessionUsage() : null,
+      lookups: this.session().lookupUsage(),
+    };
+  }
+}

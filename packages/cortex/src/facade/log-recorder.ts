@@ -23,6 +23,7 @@ import type { SessionLogEntry, WakeClass } from '../session-log.js';
 import { errorMessageOf } from '../error-classifier.js';
 import { latestCauseSeq } from '../duplex/cause-tags.js';
 import type { CausationSource } from '../duplex/cause-tags.js';
+import type { CortexSessionLogConfig } from './config.js';
 
 /** One entry as a producer hands it over; causation is optional. */
 export interface LogEntryInput {
@@ -41,8 +42,8 @@ export interface LogEntryInput {
 }
 
 export interface LogRecorderOptions {
-  maxEntries?: number;
-  maxSubscriberBuffer?: number;
+  /** Retention and subscriber buffering (the consumer's sessionLog config). */
+  sessionLog?: CortexSessionLogConfig | undefined;
   /** The session's causation, for stamping entries that bring none. */
   causation: CausationSource;
   /**
@@ -67,11 +68,10 @@ export class LogRecorder {
 
   constructor(options: LogRecorderOptions) {
     this.options = options;
+    const { maxEntries, maxSubscriberBuffer } = options.sessionLog ?? {};
     this.log = new SessionLog({
-      ...(options.maxEntries !== undefined ? { maxEntries: options.maxEntries } : {}),
-      ...(options.maxSubscriberBuffer !== undefined
-        ? { maxSubscriberBuffer: options.maxSubscriberBuffer }
-        : {}),
+      ...(maxEntries !== undefined ? { maxEntries } : {}),
+      ...(maxSubscriberBuffer !== undefined ? { maxSubscriberBuffer } : {}),
       logger: options.logger,
       onEvict: (evicted) => this.spillEvictedEntries(evicted),
     });
@@ -98,6 +98,15 @@ export class LogRecorder {
     });
     for (const listener of this.appendListeners) listener(entry);
     return entry;
+  }
+
+  /**
+   * Append an entry whose producer states its own causation (the router,
+   * the broker): an absent cause means none, never the live run's guess.
+   * Returns the entry's seq.
+   */
+  appendAttributed(input: Omit<LogEntryInput, 'causedBy'> & { causedBy?: number | undefined }): number {
+    return this.append({ ...input, causedBy: input.causedBy ?? null }).seq;
   }
 
   /** Run after every append, in registration order. */

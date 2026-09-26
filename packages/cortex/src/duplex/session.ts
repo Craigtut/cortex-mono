@@ -1,83 +1,46 @@
 /**
  * DuplexSession: a fast talker loop fronting the persistent reasoner
- * (docs/cortex/duplex/architecture.md). Builds the duplex subsystem (router,
- * quick lookups, headlines, guards, run outcomes, budget, digestion) over the
- * assembled loop pair and wires it in one explicit, ordered pass, and owns
- * the duplex semantics of the facade's interaction surface.
- *
- * Handler registration order is semantics here, not style: on a shared
- * event the handler registered first runs first, so wire() states the order
- * outright (the reply entry before its conversation delta, a dead-letter
- * entry before the broker's recovery, an error entry before the delivery
- * announcing it, run outcomes before the headline run end before
- * digestion). duplex-session-wiring.test.ts pins the observable ones.
+ * (docs/cortex/duplex/architecture.md), as the facade's SessionMode. The
+ * parts it is made of, and the ordered wiring between them and the loops,
+ * are session-parts.ts; this is what the facade's surface means in duplex.
  */
 
-import { AgentLoop } from '../agent-loop.js';
-import type { DeliverResult, DirectCompletionOptions } from '../agent-loop.js';
+import type { AgentLoop, DeliverResult, DirectCompletionOptions } from '../agent-loop.js';
 import type { McpClientManager } from '../mcp-client.js';
 import type { CortexLogger, PendingAsk, SessionUsage } from '../types.js';
 import type { CortexModel } from '../model-wrapper.js';
-import type { AgentMessage, ContextManager } from '../context-manager.js';
-import type { ObservationalMemoryState } from '../compaction/index.js';
+import type { ContextManager } from '../context-manager.js';
 import type { BudgetGuard } from '../budget-guard.js';
 import type { EventBridge } from '../event-bridge.js';
-import type { SessionLogEntryType } from '../session-log.js';
 import type { LogRecorder } from '../facade/log-recorder.js';
-import { yieldMacrotask } from '../facade/settlement.js';
-import type { PromptTracker, SettlementTerm } from '../facade/settlement.js';
-import { routerOptionsFrom } from '../facade/config.js';
-import type { ResolvedCortexAgentConfig } from '../facade/config.js';
-import { collectCauseTags } from './cause-tags.js';
-import type { CausationSource, CauseTag } from './cause-tags.js';
-import { DUPLEX_ROUTER_DEFAULTS, DuplexRouter } from './router.js';
-import type { DuplexRouterPorts, DuplexRouterState } from './router.js';
-import { PermissionBroker } from './permission-broker.js';
-import type { PermissionBrokerPorts } from './permission-broker.js';
-import { FanOutContextManager } from './fanout-context-manager.js';
-import { DuplexHeadlines } from './headlines.js';
-import { stripAskFence } from './ask-fence.js';
-import { buildControlTools } from './control-tools.js';
-import { buildDeliverTool, buildSteerSubAgentTool } from './reasoner-tools.js';
-import { QuickLookupManager } from './quick-lookups.js';
-import type { QuickLookupOutcome } from './quick-lookups.js';
-import { highestTaskAlias } from './delegations.js';
 import {
-  appendRolePrompt,
-  buildQuickLookupConfig,
-  TALKER_HEADLINE_MAX_TOKENS,
-  TALKER_SESSION_ID_SUFFIX,
-} from './assembly.js';
-import { REASONER_ROLE_PROMPT, TALKER_ROLE_PROMPT, wrapExternalContent } from './prompts.js';
-import { TalkerGuards } from './talker-guards.js';
-import { MergedEvents } from './merged-events.js';
-import { IdleDigestion } from './idle-digestion.js';
-import { AggregateBudget } from './aggregate-budget.js';
-import { ReasonerDispatcher } from './reasoner-dispatch.js';
-import { ReasonerOutcomeReporter } from './reasoner-outcomes.js';
-import { ReasonerRunTracker } from './reasoner-run.js';
-import { LivenessWatchdog } from './watchdog.js';
-import { errorMessageOf } from '../error-classifier.js';
-import type { CortexAbortScope, CortexDeliverOptions } from '../cortex-agent.js';
+  gateTerm,
+  loopAsksTerm,
+  parkedWakesTerm,
+  subAgentsTerm,
+  yieldMacrotask,
+} from '../facade/settlement.js';
+import type { SettlementTerm } from '../facade/settlement.js';
+import type { ResolvedCortexAgentConfig } from '../facade/config.js';
+import type {
+  CortexAbortScope,
+  CortexDeliverOptions,
+  FacadeServices,
+  SessionMode,
+  SessionStateParts,
+} from '../facade/session-mode.js';
+import { collectCauseTags } from './cause-tags.js';
+import type { CausationSource } from './cause-tags.js';
+import type { DuplexRouter, DuplexRouterState } from './router.js';
+import type { PermissionBroker } from './permission-broker.js';
+import { FanOutContextManager } from './fanout-context-manager.js';
+import { highestTaskAlias } from './delegations.js';
+import { appendRolePrompt, TALKER_SESSION_ID_SUFFIX } from './assembly.js';
+import { REASONER_ROLE_PROMPT, TALKER_ROLE_PROMPT } from './prompts.js';
+import { assembleSessionParts } from './session-parts.js';
+import type { DuplexParts } from './session-parts.js';
 
-/** What the session needs of the facade that hosts it. */
-export interface DuplexSessionServices {
-  readonly recorder: LogRecorder;
-  readonly prompts: PromptTracker;
-  readonly logger: CortexLogger;
-  markStateDirty(): void;
-  destroyed(): boolean;
-  /** Whether the conversation surface is quiet (facade settlement). */
-  conversationIdle(): boolean;
-  /** The facade's own prompt(), validation included. */
-  prompt(input: string): Promise<unknown>;
-  /** The first input is the moment an unwired egress resolver is noted. */
-  noteInputArriving(): void;
-  /** setModel re-resolved the talker's model: its resolution notes change. */
-  refreshModelNotes(): void;
-}
-
-export class DuplexSession {
+export class DuplexSession implements SessionMode {
   readonly reasoner: AgentLoop;
   readonly talker: AgentLoop;
   readonly router: DuplexRouter;
@@ -89,20 +52,10 @@ export class DuplexSession {
    * keeps its utterance seq through the sweep run (B1).
    */
   readonly causation: CausationSource;
-  private readonly services: DuplexSessionServices;
+  private readonly parts: DuplexParts;
+  private readonly services: FacadeServices;
   private readonly recorder: LogRecorder;
   private readonly logger: CortexLogger;
-  private readonly lookups: QuickLookupManager;
-  private readonly headlines: DuplexHeadlines;
-  private readonly merged: MergedEvents;
-  private readonly aggregate: AggregateBudget;
-  private readonly guards: TalkerGuards;
-  private readonly digestion: IdleDigestion;
-  private readonly dispatcher: ReasonerDispatcher;
-  private readonly outcomes: ReasonerOutcomeReporter;
-  /** The single owner of "is the reasoner running, and since when". */
-  private readonly run: ReasonerRunTracker;
-  private readonly watchdog: LivenessWatchdog;
   /**
    * The facade-minted shared MCP manager: loops sharing it never close it,
    * so the session does at destroy. Null when the consumer supplied their
@@ -119,11 +72,12 @@ export class DuplexSession {
   private consumerBasePrompt: string | null;
   /** Lazily-built D6 fan-out view over both loops' context managers. */
   private fanOutContextManager: FanOutContextManager | null = null;
+
   constructor(
     reasoner: AgentLoop,
     talker: AgentLoop,
     config: ResolvedCortexAgentConfig,
-    services: DuplexSessionServices,
+    services: FacadeServices,
   ) {
     this.reasoner = reasoner;
     this.talker = talker;
@@ -136,114 +90,9 @@ export class DuplexSession {
       tags: (surface) =>
         collectCauseTags((surface === 'conversation' ? talker : reasoner).activeRunCauseTags),
     };
-    const destroyed = (): boolean => services.destroyed();
-
-    // The facade-owned quick-lookup fleet (D13): ephemeral read-only loops
-    // on the talker's fast model, spawned on the talker's behalf, with their
-    // own small pool. Created before the router so its ports can dispatch
-    // into it synchronously.
-    this.lookups = new QuickLookupManager(
-      {
-        createLoop: async (alias) => {
-          const loop = await AgentLoop.create(
-            buildQuickLookupConfig(config, talker.getModel(), alias),
-          );
-          return { loop, cleanup: this.merged.forwardLookup(loop) };
-        },
-        onOutcome: (outcome) => this.handleLookupOutcome(outcome),
-        logger: this.logger,
-      },
-      {
-        ...(config.duplex?.maxConcurrentLookups !== undefined
-          ? { maxConcurrent: config.duplex.maxConcurrentLookups }
-          : {}),
-        ...(config.duplex?.lookupTimeoutMs !== undefined
-          ? { timeoutMs: config.duplex.lookupTimeoutMs }
-          : {}),
-      },
-    );
-    this.digestion = new IdleDigestion(
-      {
-        talker,
-        reasoner,
-        quiet: () => services.conversationIdle() && this.router.pendingDeliveryCount === 0,
-        destroyed,
-        logger: this.logger,
-      },
-      config.duplex?.idleDigestionDelayMs ?? 10_000,
-    );
-    this.dispatcher = new ReasonerDispatcher({
-      reasoner,
-      append: (input) => this.recorder.append(input),
-      beforeInput: () => this.digestion.preempt(),
-      cancelAbortStarting: () => this.outcomes.expectAbort('cancel'),
-      cancelAbortFinished: () => this.outcomes.abortUnwound('cancel'),
-      destroyed,
-      logger: this.logger,
-    });
-    const routerOptions = routerOptionsFrom(config.duplex);
-    this.broker = new PermissionBroker(this.brokerPorts(), {
-      ...(routerOptions.askTimeoutMs !== undefined ? { askTimeoutMs: routerOptions.askTimeoutMs } : {}),
-      ...(routerOptions.escalationAskTimeoutMs !== undefined
-        ? { escalationAskTimeoutMs: routerOptions.escalationAskTimeoutMs }
-        : {}),
-      ...(routerOptions.settleVoiceDelayMs !== undefined
-        ? { settleVoiceDelayMs: routerOptions.settleVoiceDelayMs }
-        : {}),
-    });
-    this.router = new DuplexRouter(this.routerPorts(config), routerOptions);
-    this.run = new ReasonerRunTracker(reasoner);
-    this.headlines = new DuplexHeadlines({
-      reasonerRun: this.run,
-      reasonerUsage: () => reasoner.getSessionUsage(),
-      activeSubAgents: () => reasoner.getActiveSubAgents(),
-      delegations: () => this.router.getDelegations(),
-      // The BROKER, not the facade's merged consumer view. The broker holds
-      // every ask (tool, escalation, network, so a blocked egress wait is
-      // visible here too) and its consent anchor is the authority on whether
-      // one could have been heard: the sticky `voiced` flag keeps reading
-      // true after a voicing is lost, and the block would offer a request as
-      // answerable that the broker would refuse an answer for.
-      pendingAsks: () => this.broker.getPendingAsks(),
-    });
-    this.outcomes = new ReasonerOutcomeReporter({
-      reasoner,
-      router: this.router,
-      headlines: this.headlines,
-      aggregateBreached: () => this.aggregate.guard.isBreached(),
-      destroyed,
-      now: Date.now,
-    });
-    this.watchdog = new LivenessWatchdog(
-      {
-        runStartedAt: () => this.run.attempt()?.startedAt ?? null,
-        lastOutputAt: () => this.outcomes.lastOutputAt(),
-        activeAliases: () => this.router.activeAliases(),
-        pendingAsks: () => this.broker.getPendingAsks(),
-        reportProgress: (text) => this.outcomes.reportProgress(text),
-      },
-      {
-        intervalMs: routerOptions.watchdogIntervalMs ?? DUPLEX_ROUTER_DEFAULTS.watchdogIntervalMs,
-        now: Date.now,
-      },
-    );
-    this.guards = new TalkerGuards(this.logger);
-    this.wire();
-    // The merged stream forwards through catch-all listeners, which a bridge
-    // runs after every typed handler: consumers see an event only once the
-    // session has handled it, whatever the registration order.
-    this.merged = new MergedEvents(talker, reasoner, this.logger);
-    this.aggregate = new AggregateBudget(config.duplex?.maxTotalCost, this.merged.bridge, {
-      append: (input) => this.recorder.append(input),
-      stopAllWork: () => this.stopAllWork(),
-      retireAllDelegations: () => this.router.retireAllDelegations(),
-      announce: (text) => {
-        this.outcomes.notify(text, 'interrupt', { synthetic: true, terminal: true });
-      },
-      destroyed,
-      workLoopPath: reasoner.loopPath,
-      logger: this.logger,
-    });
+    this.parts = assembleSessionParts({ reasoner, talker }, config, services, this.causation);
+    this.router = this.parts.router;
+    this.broker = this.parts.broker;
   }
 
   /** Adopt the facade-minted MCP manager this session must close. */
@@ -252,297 +101,19 @@ export class DuplexSession {
   }
 
   // -------------------------------------------------------------------------
-  // Assembly
-  // -------------------------------------------------------------------------
-
-  private routerPorts(config: ResolvedCortexAgentConfig): DuplexRouterPorts {
-    const { talker, reasoner } = this;
-    return {
-      deliverToTalker: (content, wake) => {
-        if (wake) this.digestion.preempt();
-        talker.deliver(content, { wake });
-      },
-      talkerIdle: () => !talker.isLoopActive,
-      spawnLookup: (question, causeSeq) => this.lookups.request(question, causeSeq),
-      dispatchToReasoner: (message, causeSeq, options) =>
-        this.dispatcher.dispatch(message, causeSeq, options),
-      appendLog: (input) => this.recorder.append({
-        type: input.type,
-        loopPath: input.loopPath,
-        content: input.content,
-        // The router supplies causation explicitly; entries it cannot
-        // attribute carry no stamp rather than a guessed one.
-        causedBy: input.causedBy ?? null,
-        ...(input.wake !== undefined ? { wake: input.wake } : {}),
-        ...(input.data !== undefined ? { data: input.data } : {}),
-      }).seq,
-      currentTalkerCauseTags: () => this.causation.tags('conversation'),
-      currentReasonerCauseTags: () => this.causation.tags('work'),
-      answerAsk: (askId, decision, reason) => this.broker.answer(askId, decision, reason),
-      reasonerAttemptId: () => this.run.latestAttemptId,
-      workRefusal: () => this.aggregate.workRefusal(),
-      idleSignal: config.idleSignal,
-      logger: this.logger,
-      talkerLoopPath: talker.loopPath,
-      reasonerLoopPath: reasoner.loopPath,
-    };
-  }
-
-  private brokerPorts(): PermissionBrokerPorts {
-    const { talker } = this;
-    return {
-      appendLog: (input) => this.recorder.append({
-        type: input.type,
-        loopPath: input.loopPath,
-        content: input.content,
-        causedBy: input.causedBy ?? null,
-        ...(input.wake !== undefined ? { wake: input.wake } : {}),
-        ...(input.data !== undefined ? { data: input.data } : {}),
-      }).seq,
-      // The reserved ask lane: a real wake delivery carrying the ask-kind
-      // cause tag, so the run that voices the request is identifiable to
-      // the consent check (an answer from that same run cannot bind). No
-      // token bucket, no dedup, no queues; it stamps the delivery spacing
-      // clock so queued ordinary deliveries hold off behind a fresh ask
-      // instead of talking over it.
-      voiceToTalker: (content, causeTag) => {
-        this.router.stampReservedLane();
-        this.digestion.preempt();
-        talker.deliver(content, { wake: true, causeTag });
-      },
-      currentTalkerCauseTags: () => this.causation.tags('conversation'),
-      talkerLoopPath: talker.loopPath,
-      dropParkedDeliveries: (matches) => talker.dropPendingWakeDeliveries(matches),
-      logger: this.logger,
-    };
-  }
-
-  /** Every handler the session installs, in the order they must run. */
-  private wire(): void {
-    const { talker, reasoner, router, headlines, outcomes } = this;
-
-    // The talker carries exactly the control toolset (D5/D8); the reasoner
-    // gains Deliver (F1), which reports through the outcome reporter, and
-    // SteerSubAgent (D12).
-    for (const tool of buildControlTools(router)) {
-      talker.addConsumerTool(tool);
-    }
-    reasoner.addConsumerTool(buildDeliverTool(outcomes));
-    reasoner.addConsumerTool(buildSteerSubAgentTool(reasoner));
-
-    // Conversation-side log producers and delta capture.
-    this.recorder.wireConversation(talker, (text) => {
-      // The reply entry keeps the raw text on purpose: it is the audit
-      // trail and has to record what the talker actually said. Only the
-      // reasoner-bound copy is sanitized, so a talker that quotes a
-      // permission marker cannot carry the fence nonce to the loop that
-      // authors the fenced content.
-      router.noteTalkerReply(stripAskFence(text));
-    });
-    this.recorder.wireErrors(talker);
-    this.recorder.wireErrors(reasoner);
-    this.recorder.wireWork(reasoner);
-    // The talker has no background completions, but its parked wake
-    // deliveries (user utterances among them) can dead-letter after
-    // repeated failed carrying runs; those drops must reach the log.
-    this.recorder.wireDeadLetters(talker, (result) => {
-      // A destroyed wake delivery on the conversation surface may be a
-      // permission voicing, in which case the user never heard the request
-      // the broker still counts as read out. The broker withdraws its
-      // consent anchor and reads it again (D16 anchor rules).
-      if (result.kind === 'wake_delivery') {
-        this.broker.voicing.noteDestroyed(result.message);
-      }
-    });
-
-    // The facade-fed headline block (communication.md): live status per
-    // loop and running sub-agent, view-injected into the talker every turn
-    // outside BP3, hard token cap with truncation, all interpolated values
-    // escaped. Session state, never log entries.
-    talker.setHeadlineProvider(() => headlines.build(), {
-      maxTokens: TALKER_HEADLINE_MAX_TOKENS,
-    });
-    // After the error log producers: a failure's error entry lands before
-    // the delivery that announces it.
-    outcomes.wireFailureSurfacing();
-
-    // Attempt boundaries, in the order they must run: the outcome (an
-    // implicit result or a failure notice) before the headline clears the
-    // attempt's lines, and both before digestion is scheduled.
-    this.run.onAttemptStart(() => outcomes.noteAttemptStart());
-    this.run.onAttemptEnd((event) => outcomes.noteAttemptEnd(event));
-    headlines.attach(reasoner.getEventBridge(), this.run);
-    this.run.onAttemptEnd(() => this.digestion.schedule());
-    const talkerBridge = talker.getEventBridge();
-    talkerBridge.on('turn_end', (event) => {
-      if (event.childTaskId) return;
-      router.noteTalkerTurnEnd();
-    });
-    // D17 terminate guards and the stop-reason audit, after the turn-end
-    // dispatch bookkeeping above.
-    this.guards.attach(talker);
-    talkerBridge.on('loop_end', (event) => {
-      if (event.childTaskId) return;
-      this.digestion.schedule();
-    });
-  }
-
-  // -------------------------------------------------------------------------
   // Interaction
   // -------------------------------------------------------------------------
 
-  /** Duplex prompt path: talker deliver(), never talker prompt() (F15). */
-  async prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
-    const talker = this.talker;
-    this.services.noteInputArriving();
-    this.digestion.preempt();
-    this.services.prompts.begin();
-    try {
-      const entry = this.recorder.append({
-        type: 'utterance',
-        loopPath: talker.loopPath,
-        content: input,
-        causedBy: null,
-      });
-      // The user's own words reach the reasoner with the next dispatch
-      // (D18). The exchange rollover for the delegation caps and dispatch
-      // dedup happens when a talker run consumes this utterance (the
-      // router reads its cause tag off the run), not here at arrival: a
-      // barge-in arriving mid-batch must not reset state under the batch
-      // still running.
-      this.router.noteUserUtterance(input);
-      // The utterance travels with the content as a discriminated cause tag
-      // (kind + seq): the run that consumes the input (the turn started
-      // here, or the sweep run after a barge-in parks) exposes it through
-      // activeRunCauseTags, which is where the router reads directive
-      // causation and where D16's consent check will look for a qualifying
-      // user utterance among mixed-kind causes (B1/D16).
-      const result = talker.deliver(input, {
-        wake: true,
-        causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag,
-        ...(options ? { promptOptions: options } : {}),
-      });
-      // The user is back, so a request an abort silenced is read out again,
-      // behind this input rather than ahead of it.
-      this.broker.voicing.reopen();
-      if (result.outcome === 'prompted' && result.turn) {
-        return await result.turn;
-      }
-      // Parked (barge-in): the input rides the talker's next run. Resolve
-      // at the next gate quiescence, which is after that run.
-      for (;;) {
-        await talker.waitForLoopIdle();
-        if (!talker.isLoopActive) return undefined;
-      }
-    } finally {
-      this.services.prompts.end();
-    }
+  prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
+    return this.parts.input.prompt(input, options);
   }
 
-  /**
-   * Duplex deliver: 'conversation' (default) reaches the talker,
-   * 'work' reaches the reasoner as a dispatch. A no-wake work delivery is
-   * context only: it joins the conversation-delta buffer and rides the
-   * next dispatch rather than starting a reasoner turn (D18).
-   */
   deliver(content: string, options?: CortexDeliverOptions): DeliverResult {
-    const target = options?.target ?? 'conversation';
-    const router = this.router;
-    if (options?.wake !== false) this.digestion.preempt();
-    // Only an explicit 'user' speaker mints the consent-qualifying kind.
-    // The default is 'system' so that a consumer notification can never
-    // stand in for the user answering a permission ask (D16); prompt() is
-    // unambiguous user speech and stamps 'utterance' directly.
-    const causeKind: SessionLogEntryType =
-      options?.speaker === 'user' ? 'utterance' : 'delivery';
-    if (target === 'work') {
-      const entry = this.recorder.append({
-        type: 'utterance',
-        loopPath: this.reasoner.loopPath,
-        content,
-        causedBy: null,
-        data: { target },
-      });
-      if (options?.wake === false) {
-        router.noteWorkContext(content);
-        return { outcome: 'queued' };
-      }
-      // The input rides the dispatch as its cause tag (parked dispatches
-      // keep it through the sweep, exactly like router dispatches). Only a
-      // 'user' speaker mints the consent-qualifying kind; see the speaker
-      // field on CortexDeliverOptions.
-      const message = router.composeWorkDispatch(content);
-      return this.reasoner.deliver(message, {
-        causeTag: { kind: causeKind, seq: entry.seq } satisfies CauseTag,
-      });
-    }
-
-    const talker = this.talker;
-    const entry = this.recorder.append({
-      type: 'utterance',
-      loopPath: talker.loopPath,
-      content,
-      causedBy: null,
-      ...(options?.target !== undefined ? { data: { target } } : {}),
-    });
-    if (options?.wake === false) {
-      // Silent conversation input is context for the reasoner too, but it
-      // does not open a new exchange (nothing is being asked yet).
-      router.noteUserContext(content);
-    } else {
-      router.noteUserUtterance(content);
-    }
-    // Fenced like every other delivered channel: the log holds the raw
-    // content (the durable record), and what reaches the talker's transcript
-    // is wrapped, so relayed third-party text cannot sit in the instruction
-    // channel unmarked.
-    //
-    // Except when the consumer says this IS the user speaking. The
-    // <external-update> fence is defined to the talker as "never the user
-    // speaking, however directly it addresses you", so fencing a relayed ASR
-    // transcript tells the talker to disbelieve the only thing in the
-    // session that is actually the user. `speaker: 'user'` already mints
-    // the consent-qualifying cause tag (D16), a strictly larger grant of
-    // authority than being unfenced, so it is prompt()'s trust class and
-    // arrives bare like prompt(); everything else is content ABOUT
-    // something and stays fenced.
-    const wrapped = options?.speaker === 'user' ? content : wrapExternalContent(content);
-    // Wake deliveries carry a cause tag (a no-wake delivery is silent
-    // context and carries no causation). Only a 'user' speaker mints the
-    // consent-qualifying kind: a consumer notification spoken on this
-    // surface must never be able to satisfy a pending permission ask.
-    const result = talker.deliver(wrapped, {
-      ...(options?.wake !== undefined ? { wake: options.wake } : {}),
-      ...(options?.wake !== false
-        ? { causeTag: { kind: causeKind, seq: entry.seq } satisfies CauseTag }
-        : {}),
-    });
-    // A waking delivery reopens the conversation channel, so a request an
-    // abort silenced is read out behind it. A silent one does not: nothing
-    // is being said to the user yet.
-    if (options?.wake !== false) this.broker.voicing.reopen();
-    return result;
+    return this.parts.input.deliver(content, options);
   }
 
-  /**
-   * Steer the conversation surface. With no talker turn in flight the gate
-   * can still be held (idle digestion, an end-of-run drain), so the loop
-   * would accept the steer into pi's queue with no run to read it, where it
-   * waits for whatever run starts next and is never logged. A consumer
-   * steers precisely when it believes the conversation is busy, so this is
-   * the user's next utterance: route it as one, logged, preempting the
-   * digestion, and opening (or joining) the next talker run.
-   */
   steer(message: string): void {
-    if (this.talker.isPrompting) {
-      this.talker.steer(message);
-      return;
-    }
-    void this.services.prompt(message).catch((err: unknown) => {
-      this.logger.warn('steer delivered as a prompt failed', {
-        error: errorMessageOf(err),
-      });
-    });
+    this.parts.input.steer(message);
   }
 
   /**
@@ -563,7 +134,7 @@ export class DuplexSession {
       work.push(talker.abort());
       // Quick lookups belong to the conversation surface (abort table):
       // cancelled here, untouched by a 'work' abort.
-      work.push(this.lookups.cancelAll());
+      work.push(this.parts.lookups.cancelAll());
     }
     if (scope === 'work' || scope === 'all') {
       router.dropWorkContext();
@@ -573,7 +144,7 @@ export class DuplexSession {
       // result from the stopped work would degrade and still be voiced.
       router.dropPendingDeliveries();
       this.recorder.recordDroppedQueue(reasoner, 'abort', reasoner.clearAllQueues());
-      this.outcomes.expectAbort('user');
+      this.parts.outcomes.expectAbort('user');
       work.push(reasoner.abort());
       for (const taskId of reasoner.getSubAgentManager().getActiveTaskIds()) {
         work.push(reasoner.cancelSubAgent(taskId));
@@ -597,7 +168,7 @@ export class DuplexSession {
     try {
       await Promise.all(work);
     } finally {
-      this.outcomes.abortUnwound('user');
+      this.parts.outcomes.abortUnwound('user');
     }
     // The user said stop, so a request whose voicing went with the
     // talker's queues is held silent rather than read straight back out.
@@ -606,75 +177,18 @@ export class DuplexSession {
     }
   }
 
-  /** Stop every piece of running work (the aggregate budget tripped). */
-  private stopAllWork(): Promise<unknown> {
-    const swallow = (err: unknown): void => {
-      this.logger.warn('budget-breach abort failed', {
-        error: errorMessageOf(err),
-      });
-    };
-    const { talker, reasoner } = this;
-    const stops: Array<Promise<unknown>> = [];
-    stops.push(talker.abort().catch(swallow));
-    stops.push(reasoner.abort().catch(swallow));
-    for (const taskId of reasoner.getSubAgentManager().getActiveTaskIds()) {
-      stops.push(reasoner.cancelSubAgent(taskId).catch(swallow));
-    }
-    stops.push(this.lookups.cancelAll().catch(swallow));
-    return Promise.all(stops);
-  }
-
-  /**
-   * A quick lookup settled. Non-cancelled outcomes (including timeouts and
-   * failures, which must be visible) route through the router: durable
-   * lookup_result entry, talker wake, reasoner delta. Cancelled lookups
-   * were stopped on purpose (abort, restore, teardown): logged, never
-   * delivered.
-   */
-  private handleLookupOutcome(outcome: QuickLookupOutcome): void {
-    if (outcome.status === 'cancelled') {
-      if (this.services.destroyed()) return;
-      this.recorder.append({
-        type: 'lifecycle',
-        loopPath: `lookup/${outcome.alias}`,
-        content: `Quick lookup ${outcome.alias} cancelled`,
-        data: {
-          event: 'lookup_cancelled',
-          alias: outcome.alias,
-          question: outcome.question,
-        },
-        causedBy: outcome.causeSeq,
-      });
-      return;
-    }
-    this.router.deliverLookupResult(outcome);
-    this.services.markStateDirty();
-  }
-
   // -------------------------------------------------------------------------
   // Reads
   // -------------------------------------------------------------------------
 
   /**
    * Every permission ask currently blocked on a decision, from both
-   * registries, deduplicated by askId.
-   *
-   * Two registries exist because two different things track asks. The
-   * reasoner's holds its own and its sub-agents' (children mirror in through
-   * the child resolver wrapper). The broker's holds everything routed
-   * through the conversation, whichever loop raised it. They overlap for
-   * reasoner tool asks, which carry the same askId in both, and each holds
-   * asks the other never sees: a quick-lookup loop is built through
-   * `AgentLoop.create`, not `createChildAgent`, so its asks reach the broker
-   * and never the reasoner's registry.
-   *
-   * Lookup asks are deliberately NOT mirrored into the reasoner's registry
-   * the way sub-agent asks are. A lookup is not in the reasoner's subtree:
-   * it is a facade-owned peer on the conversation side (D13) with its own
-   * pool, its own wall-clock timeout, and cancellation by a *conversation*
-   * abort. Mirroring would make `reasoner.waitForAskSettlement()` block on
-   * something the reasoner cannot influence and its registry claim work it
-   * does not own.
+   * registries, deduplicated by askId. The reasoner's holds its own and its
+   * sub-agents' (children mirror in through the child resolver wrapper); the
+   * broker's holds everything routed through the conversation. They overlap
+   * for reasoner tool asks, and each holds asks the other never sees: a
+   * quick lookup is a facade-owned peer on the conversation side (D13), not
+   * in the reasoner's subtree, so its asks reach the broker alone.
    */
   pendingAsks(): PendingAsk[] {
     // Whether the user was ever read an ask is the broker's fact (the loop
@@ -689,47 +203,59 @@ export class DuplexSession {
     return [...asks, ...brokerOnly];
   }
 
-  /** The duplex-only settlement terms, in wait order. */
-  settlementTerms(): {
-    afterTalkerGate: SettlementTerm[];
-    afterSubAgents: SettlementTerm[];
-    afterReasonerAsks: SettlementTerm[];
-  } {
-    const { router, lookups } = this;
+  settlementTerms(prompts: SettlementTerm): { conversation: SettlementTerm[]; work: SettlementTerm[] } {
+    const { talker, reasoner, router, broker } = this;
+    const { lookups } = this.parts;
     return {
-      // Held wake deliveries start talker runs when they land; wait
-      // event-driven on the router rather than spinning.
-      afterTalkerGate: [{
-        name: 'router-deliveries',
-        pending: () => router.pendingDeliveryCount > 0,
-        settled: () => router.waitForDeliveriesSettled(),
-      }],
-      // Active quick lookups: their settlement enqueues router deliveries
-      // and talker wakes, so the wait re-checks everything afterwards.
-      afterSubAgents: [{
-        name: 'quick-lookups',
-        pending: () => lookups.activeCount > 0,
-        settled: async () => {
-          await lookups.waitForIdle();
-          await yieldMacrotask();
+      conversation: [prompts, gateTerm(talker)],
+      work: [
+        prompts,
+        gateTerm(reasoner),
+        gateTerm(talker),
+        // Held wake deliveries start talker runs when they land; wait
+        // event-driven on the router rather than spinning.
+        {
+          name: 'router-deliveries',
+          pending: () => router.pendingDeliveryCount > 0,
+          settled: () => router.waitForDeliveriesSettled(),
         },
-      }],
-      afterReasonerAsks: [{
-        name: 'broker-asks',
-        pending: () => this.broker.pendingAskCount > 0,
-        settled: () => this.broker.waitForSettlement(),
-      }],
+        subAgentsTerm(reasoner),
+        // Active quick lookups: their settlement enqueues router deliveries
+        // and talker wakes, so the wait re-checks everything afterwards.
+        {
+          name: 'quick-lookups',
+          pending: () => lookups.activeCount > 0,
+          settled: async () => {
+            await lookups.waitForIdle();
+            await yieldMacrotask();
+          },
+        },
+        // Pending asks block on a settlement signal, never on a polling
+        // yield: an ask can outlive the child that raised it, and a
+        // setImmediate spin would otherwise run hot for as long as it stays
+        // unanswered. Two registries, each with its own signal: the
+        // reasoner's (its own and its sub-agents' asks) and the broker's,
+        // which alone holds network and quick-lookup asks.
+        loopAsksTerm(reasoner),
+        {
+          name: 'broker-asks',
+          pending: () => broker.pendingAskCount > 0,
+          settled: () => broker.waitForSettlement(),
+        },
+        parkedWakesTerm(reasoner),
+        parkedWakesTerm(talker),
+      ],
     };
   }
 
-  /** Quick lookups in flight (restore refuses to run under them). */
-  get activeLookups(): number {
-    return this.lookups.activeCount;
+  /** Quick lookups in flight: a restore refuses to run under them. */
+  restoreBlocked(): boolean {
+    return this.parts.lookups.activeCount > 0;
   }
 
   /** Settled quick-lookup spend, for the usage ledger. */
   lookupUsage(): SessionUsage {
-    return this.lookups.getSettledUsage();
+    return this.parts.lookups.getSettledUsage();
   }
 
   /**
@@ -738,7 +264,7 @@ export class DuplexSession {
    * childTaskId keeps meaning "this came from a sub-agent".
    */
   get eventBridge(): EventBridge {
-    return this.merged.bridge;
+    return this.parts.merged.bridge;
   }
 
   /**
@@ -755,7 +281,7 @@ export class DuplexSession {
   }
 
   get aggregateBudgetGuard(): BudgetGuard {
-    return this.aggregate.guard;
+    return this.parts.aggregate.guard;
   }
 
   // -------------------------------------------------------------------------
@@ -827,11 +353,7 @@ export class DuplexSession {
   // -------------------------------------------------------------------------
 
   /** The talker side and router state of the persisted artifact. */
-  captureState(): {
-    talkerHistory: AgentMessage[];
-    talkerMemory: ObservationalMemoryState | null;
-    router: DuplexRouterState;
-  } {
+  captureState(): SessionStateParts {
     return {
       talkerHistory: this.talker.getConversationHistory(),
       talkerMemory: this.talker.getObservationalMemoryState(),
@@ -840,10 +362,10 @@ export class DuplexSession {
   }
 
   /** Hydrate the talker from a restored artifact (history before memory). */
-  hydrate(talkerHistory: AgentMessage[], talkerMemory: ObservationalMemoryState | null): void {
-    this.talker.restoreConversationHistory(talkerHistory);
-    if (talkerMemory) {
-      this.talker.restoreObservationalMemoryState(talkerMemory);
+  hydrate(parts: SessionStateParts): void {
+    this.talker.restoreConversationHistory(parts.talkerHistory);
+    if (parts.talkerMemory) {
+      this.talker.restoreObservationalMemoryState(parts.talkerMemory);
     }
   }
 
@@ -861,8 +383,8 @@ export class DuplexSession {
     this.broker.reset();
     this.router.resetForRestore();
     this.restoreRouterState(routerState);
-    this.aggregate.resetForRestore();
-    this.guards.resetForRestore();
+    this.parts.aggregate.resetForRestore();
+    this.parts.guards.resetForRestore();
   }
 
   /**
@@ -891,7 +413,7 @@ export class DuplexSession {
     const list = interrupted
       .map((delegation) => `${delegation.alias} (${delegation.instructions})`)
       .join(', ');
-    this.outcomes.notify(
+    this.parts.outcomes.notify(
       `The session was restored. Background work that was in progress is no longer running: ${list}. ` +
       'If the user asks about it, say it was interrupted and offer to start it again.',
       'silent',
@@ -901,18 +423,18 @@ export class DuplexSession {
 
   /** Stop the session's timers and settle its asks, synchronously. */
   beginDestroy(): void {
-    this.digestion.destroy();
-    this.watchdog.destroy();
+    this.parts.digestion.destroy();
+    this.parts.watchdog.destroy();
     // Settle every pending ask first so no resolver promise outlives the
     // session: a hanging ask would block its loop into the force-kill path.
     this.broker.destroy();
     this.router.destroy();
-    this.aggregate.destroy();
+    this.parts.aggregate.destroy();
   }
 
   /** The teardowns that run alongside the loops' own. */
   teardowns(): Array<Promise<void>> {
-    return [this.lookups.destroy()];
+    return [this.parts.lookups.destroy()];
   }
 
   /**
@@ -927,6 +449,6 @@ export class DuplexSession {
 
   /** Last: nothing forwards events after teardown. */
   finishDestroy(): void {
-    this.merged.destroy();
+    this.parts.merged.destroy();
   }
 }

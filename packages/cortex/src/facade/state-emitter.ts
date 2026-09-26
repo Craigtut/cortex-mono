@@ -5,6 +5,7 @@
  * observation) settles for the debounce window.
  */
 
+import type { AgentLoop } from '../agent-loop.js';
 import type { CortexLogger } from '../types.js';
 import { errorMessageOf } from '../error-classifier.js';
 import type { CortexAgentStateV2 } from './persisted-state.js';
@@ -50,6 +51,21 @@ export class StateEmitter {
   markDirty(): void {
     this.dirty = true;
     this.schedule();
+  }
+
+  /**
+   * History can change without a log entry (compaction rewrites,
+   * observation activation trims, a run completing); these mark the
+   * composite state dirty so onStateChanged fires for them too. Log appends
+   * mark it through the recorder's append listener.
+   */
+  watch(loops: readonly AgentLoop[]): void {
+    for (const loop of loops) {
+      loop.onLoopComplete(() => this.markDirty());
+      loop.onPostCompaction(() => this.markDirty());
+      loop.onObservation(() => this.markDirty());
+      loop.onReflection(() => this.markDirty());
+    }
   }
 
   destroy(): void {
