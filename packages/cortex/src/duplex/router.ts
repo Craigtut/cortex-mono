@@ -221,6 +221,28 @@ const MAX_REFUSAL_ENTRIES_PER_TURN = 3;
  */
 const MAX_ABSORBED_ENTRIES_PER_RUN = 3;
 
+/**
+ * Whether a delivery reports the work reaching a conclusion: it retires the
+ * delegation it answers, and an explicit one stands in for the run's
+ * implicit final-text delivery.
+ *
+ * `silent` is a milestone or progress note by contract (the reasoner's
+ * role prompt says so), and the watchdog's synthetic delivery says
+ * explicitly that the work is STILL running, so neither concludes
+ * anything. A facade-synthesized terminal delivery (a failed run) does:
+ * nothing further is coming for that task. The router may demote
+ * `interrupt` to `when_idle` but never to or from `silent`, so the
+ * proposed and the applied wake class give the same answer here.
+ */
+export function deliveryConcludes(
+  wake: WakeClass | undefined,
+  meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
+): boolean {
+  if (meta?.terminal) return true;
+  if (meta?.synthetic) return false;
+  return wake !== 'silent';
+}
+
 /** One tracked delegation (a spawn_task dispatch), keyed by alias. */
 export interface DelegationSnapshot {
   alias: string;
@@ -831,7 +853,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // A result retires the work it answers, so the block and the watchdog
     // stop calling finished work live. Read AFTER the log append and before
     // any queueing, while the producing run is still the live one.
-    if (this.deliveryConcludes(wake, meta)) {
+    if (deliveryConcludes(wake, meta)) {
       this.retireDelegationsFor(this.ports.currentReasonerCauseTags());
     }
 
@@ -1076,25 +1098,6 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     for (const [alias, delegation] of this.delegations) {
       if (delegation.lastActivityAt < cutoff) this.delegations.delete(alias);
     }
-  }
-
-  /**
-   * Whether a delivery reports the work reaching a conclusion, and so
-   * retires the delegation it answers.
-   *
-   * `silent` is a milestone or progress note by contract (the reasoner's
-   * role prompt says so), and the watchdog's synthetic delivery says
-   * explicitly that the work is STILL running, so neither concludes
-   * anything. A facade-synthesized terminal delivery (a failed run) does:
-   * nothing further is coming for that task.
-   */
-  private deliveryConcludes(
-    wake: WakeClass,
-    meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
-  ): boolean {
-    if (meta?.terminal) return true;
-    if (meta?.synthetic) return false;
-    return wake !== 'silent';
   }
 
   private resolveDelegation(aliasName: string): TrackedDelegation | undefined {

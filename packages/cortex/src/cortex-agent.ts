@@ -96,7 +96,7 @@ import {
 import type { ResolutionNote } from './resolution-report.js';
 import { stripWorkingTags, WorkingTagStreamFilter } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
-import { DuplexRouter } from './duplex/router.js';
+import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
 import type { DuplexRouterOptions, DuplexRouterPorts } from './duplex/router.js';
 import { collectCauseTags, latestCauseSeq } from './duplex/cause-tags.js';
 import { FanOutContextManager } from './duplex/fanout-context-manager.js';
@@ -1371,8 +1371,11 @@ export class CortexAgent {
    */
   private ownedMcpManager: McpClientManager | null = null;
   private aggregateBreachLogged = false;
-  /** Whether the current reasoner run called Deliver (implicit-delivery guard). */
-  private reasonerDeliverCalledThisRun = false;
+  /**
+   * Whether the current reasoner run delivered a result through Deliver
+   * (implicit-delivery guard). Progress notes (`silent`) do not count.
+   */
+  private reasonerDeliveredResultThisRun = false;
   /**
    * Whether the reasoner's current terminal failure already produced a
    * delivery. See deliverReasonerFailure for why a per-run reset is the
@@ -1728,9 +1731,12 @@ export class CortexAgent {
     }
     this.reasoner.addConsumerTool(buildDeliverTool({
       deliverFromReasoner: (content, wake, meta) => {
-        // An explicit Deliver this run suppresses the implicit final-text
-        // delivery for the same run.
-        this.reasonerDeliverCalledThisRun = true;
+        // An explicit Deliver that concludes the work suppresses the
+        // implicit final-text delivery for the same run. A silent progress
+        // note does not: the role prompt encourages those mid-work, and
+        // letting one swallow the final answer would leave the user with
+        // "halfway there" as the last thing they heard.
+        if (deliveryConcludes(wake, meta)) this.reasonerDeliveredResultThisRun = true;
         return router.deliverFromReasoner(content, wake, meta);
       },
     }));
@@ -1792,7 +1798,7 @@ export class CortexAgent {
     const reasonerBridge = this.reasoner.getEventBridge();
     reasonerBridge.on('loop_start', (event) => {
       if (event.childTaskId) return;
-      this.reasonerDeliverCalledThisRun = false;
+      this.reasonerDeliveredResultThisRun = false;
       this.reasonerFailureAnnounced = false;
       router.noteReasonerRunStart();
       headlines.noteRunStart();
@@ -2002,13 +2008,14 @@ export class CortexAgent {
   }
 
   /**
-   * A reasoner run ended: if it never called Deliver and its final
-   * assistant text is user-facing, deliver that text as an implicit
-   * when_idle delivery so results always surface (review-findings F1).
+   * A reasoner run ended: if it never delivered a result through Deliver
+   * (silent progress notes do not count) and its final assistant text is
+   * user-facing, deliver that text as an implicit when_idle delivery so
+   * results always surface (review-findings F1).
    */
   private handleReasonerRunEnd(event: CortexEvent): void {
     this.router?.noteReasonerRunEnd();
-    if (this.reasonerDeliverCalledThisRun) return;
+    if (this.reasonerDeliveredResultThisRun) return;
     const messages = (event.data as { messages?: unknown[] } | undefined)?.messages;
     if (!Array.isArray(messages)) return;
     let last: { stopReason?: unknown; content?: unknown; errorMessage?: unknown } | null = null;
