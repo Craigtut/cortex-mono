@@ -33,26 +33,18 @@ import {
   type LoopOriginContext,
   type ResolutionNote,
   type ThinkingLevel,
-  type McpStdioConfig,
   type ObservationalMemoryState,
   type ToolCallEndPayload,
   type ToolCallStartPayload,
   type ToolCallUpdatePayload,
 } from '@animus-labs/cortex';
-import { SelectList, type SelectItem } from '@earendil-works/pi-tui';
 import { App, type AppCallbacks } from './tui/app.js';
 import { randomThinkingLabel } from './tui/spinner.js';
-import { selectListTheme } from './tui/theme.js';
-import { OverlayBox } from './tui/overlay-box.js';
 import { resolveAgentMode, type CortexCodeConfig } from './config/config.js';
 import { CredentialStore } from './config/credentials.js';
 import { ApiKeyResolver } from './providers/api-key-resolver.js';
 import { PermissionBroker } from './permissions/prompt-broker.js';
 import { discoverProjectContext } from './discovery/context.js';
-import { discoverSkills, isProjectSkill, computeProjectSkillsSignature } from './discovery/skills.js';
-import { discoverMcpServers } from './discovery/mcp.js';
-import { checkProjectMcpTrust, trustProjectMcpConfig } from './discovery/mcp-trust.js';
-import { checkProjectTrust, recordProjectTrust } from './discovery/project-trust.js';
 import {
   generateSessionId,
   createDebouncedStateSaver,
@@ -75,13 +67,13 @@ import { buildToolDisplayArgs, summarizeToolStartArgs } from './tui/tool-display
 import { FileSessionActivityReporter } from './activity/session-activity.js';
 import { McpConfigWatcher, type McpConfigChangeReason } from './mcp/mcp-watcher.js';
 import { reconcileMcpServers, type McpReconcileResult } from './mcp/reconcile.js';
-import { loadHookHandlers, readProjectHooksContent, hasProjectHooks } from './hooks/loader.js';
 import { applyPreTurnHooks } from './hooks/pre-turn.js';
 import type { HookEvent, HookHandler } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
 import { SessionSandbox } from './session/sandbox-state.js';
+import { ProjectTrustGates } from './session/trust-gates.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -176,6 +168,7 @@ export class Session {
   private mcpReloadPending: McpConfigChangeReason | null = null;
   private mcpReloadInFlight = false;
   private hookHandlers: Record<HookEvent, HookHandler[]> | null = null;
+  private readonly trust: ProjectTrustGates;
   private titleManager: TitleManager | null = null;
 
   private readonly config: CortexCodeConfig;
@@ -264,6 +257,7 @@ export class Session {
     });
     // Durable append-only conversation log, separate from the lossy history.json
     // snapshot. Read by sibling apps to summarize where a session left off.
+    this.trust = new ProjectTrustGates(options.cwd, () => this.agent, () => this.app);
     this.permissions = new PermissionBroker({
       cwd: options.cwd,
       settingsPath,
@@ -351,7 +345,7 @@ export class Session {
     this.wireEvents();
 
     // Connect MCP servers (with trust-on-first-use for project-local configs)
-    await this.connectMcpServersWithTrust();
+    await this.trust.connectMcpServers();
 
     // Watch ~/.cortex/mcp.json and {cwd}/.cortex/mcp.json for changes so we
     // can pick them up between turns without a restart.
@@ -369,7 +363,7 @@ export class Session {
     // project's hooks are NOT loaded, so a cloned repo cannot run its
     // hooks.json on the first turn.
     try {
-      this.hookHandlers = await this.loadHooksWithTrust();
+      this.hookHandlers = await this.trust.loadHooks();
     } catch (err) {
       log.warn('Hook loader failed; running without hooks', {
         error: err instanceof Error ? err.message : String(err),
@@ -381,7 +375,7 @@ export class Session {
     // always registered. Project skills (.cortex/skills) run shell on load, so
     // they pass through the trust gate first: an untrusted project's skills are
     // NOT registered and are therefore not model-invocable.
-    await this.registerSkillsWithTrust();
+    await this.trust.registerSkills();
     // Refresh autocomplete after skills are registered
     this.app.refreshCommands(this.cwd);
 
@@ -607,200 +601,6 @@ export class Session {
   }
 
   /**
-   * Discover and connect MCP servers, applying trust-on-first-use for
-   * project-local configs. Global servers (~/.cortex/mcp.json) connect
-   * immediately. Project servers require user approval if the config
-   * is new or has changed since last approval.
-   */
-  private async connectMcpServersWithTrust(): Promise<void> {
-    const allServers = await discoverMcpServers(this.cwd);
-    const globalServers = allServers.filter(s => s.source === 'global');
-    const projectServers = allServers.filter(s => s.source === 'project');
-
-    // Global servers are always trusted
-    for (const server of globalServers) {
-      await this.connectMcpServer(server);
-    }
-
-    // No project servers: nothing to trust-check
-    if (projectServers.length === 0) return;
-
-    // Check if the project MCP config is trusted
-    const trust = await checkProjectMcpTrust(this.cwd);
-    if (trust.trusted) {
-      for (const server of projectServers) {
-        await this.connectMcpServer(server);
-      }
-      return;
-    }
-
-    // Untrusted: prompt the user
-    const serverList = projectServers.map(s => `  ${s.name}: ${s.config.command}${s.config.args ? ' ' + s.config.args.join(' ') : ''}`).join('\n');
-
-    await new Promise<void>((resolve) => {
-      const items: SelectItem[] = [
-        { value: 'trust', label: 'Trust and connect', description: 'Approve these servers' },
-        { value: 'skip', label: 'Skip project servers', description: 'Only use global MCP servers' },
-      ];
-
-      const list = new SelectList(items, 2, selectListTheme);
-      const overlayBox = new OverlayBox(list, 'New Project MCP Servers');
-      const handle = this.app!.tui.showOverlay(overlayBox, {
-        anchor: 'center',
-        width: '60%',
-        maxHeight: 12,
-      });
-
-      this.app!.transcript.addNotification(
-        'MCP Trust Check',
-        `This project wants to connect MCP servers:\n${serverList}`,
-      );
-
-      list.onSelect = async (item) => {
-        handle.hide();
-        if (item.value === 'trust') {
-          // Record the EXACT config we trust-checked and showed the user, not a
-          // fresh read, so a file swapped between prompt and click is not trusted.
-          await trustProjectMcpConfig(this.cwd, trust.configContent);
-          for (const server of projectServers) {
-            await this.connectMcpServer(server);
-          }
-          this.app!.transcript.addNotification('MCP', `Connected ${projectServers.length} project server(s).`);
-        } else {
-          this.app!.transcript.addNotification('MCP', 'Skipped project MCP servers.');
-        }
-        resolve();
-      };
-
-      list.onCancel = () => {
-        handle.hide();
-        this.app!.transcript.addNotification('MCP', 'Skipped project MCP servers.');
-        resolve();
-      };
-    });
-  }
-
-  private async connectMcpServer(server: { name: string; config: McpStdioConfig }): Promise<void> {
-    try {
-      await this.agent!.connectMcpServer(server.name, server.config);
-    } catch (err) {
-      this.app!.transcript.addNotification(
-        'MCP Error',
-        `Failed to connect "${server.name}": ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
-
-  /**
-   * Load lifecycle hooks with the project-trust gate applied. Global hooks
-   * (~/.cortex/hooks.json) are user-authored and always load. Project hooks
-   * (.cortex/hooks.json) run subprocesses, so if the project's hooks are new or
-   * changed and the user has not trusted them, we prompt before loading. On
-   * decline, only global hooks load and the project's hooks never run.
-   */
-  private async loadHooksWithTrust(): Promise<Record<HookEvent, HookHandler[]>> {
-    const handlers = await loadHookHandlers(this.cwd);
-
-    // Nothing project-local to gate: return as-is (global-only or empty).
-    if (!hasProjectHooks(handlers)) return handlers;
-
-    const content = await readProjectHooksContent(this.cwd);
-    if (await checkProjectTrust(this.cwd, 'hooks', content)) return handlers;
-
-    // Untrusted project hooks: prompt before loading them.
-    const decision = await this.promptProjectContentTrust(
-      'New Project Hooks',
-      'This project defines lifecycle hooks in .cortex/hooks.json that run\n' +
-        'commands on your machine. Trust and load them?',
-    );
-    if (decision === 'trust' && content !== null) {
-      await recordProjectTrust(this.cwd, 'hooks', content);
-      this.app!.transcript.addNotification('Hooks', 'Loaded project hooks.');
-      return handlers;
-    }
-
-    this.app!.transcript.addNotification('Hooks', 'Skipped project hooks (untrusted).');
-    // Reload global-only so declined project hooks are absent, not just inert.
-    return loadHookHandlers(this.cwd, { includeProject: false });
-  }
-
-  /**
-   * Register discovered skills with the project-trust gate applied. Global
-   * skills always register. Project skills (.cortex/skills) can run shell on
-   * load, so if they are new or changed and untrusted, we prompt before
-   * registering them. On decline, project skills are not registered and so are
-   * never model-invocable.
-   */
-  private async registerSkillsWithTrust(): Promise<void> {
-    if (!this.agent) return;
-    // Through the facade's addSkill(), not getSkillRegistry().addSkill():
-    // the facade owns which loops a skill lands on, and reaching past it
-    // registers on whatever loop the getter happens to return today.
-    const agent = this.agent;
-    const skills = await discoverSkills(this.cwd);
-
-    const globalSkills = skills.filter((s) => !isProjectSkill(s));
-    const projectSkills = skills.filter(isProjectSkill);
-    for (const skill of globalSkills) agent.addSkill(skill);
-
-    if (projectSkills.length === 0) return;
-
-    const signature = await computeProjectSkillsSignature(skills);
-    if (await checkProjectTrust(this.cwd, 'skills', signature)) {
-      for (const skill of projectSkills) agent.addSkill(skill);
-      return;
-    }
-
-    const decision = await this.promptProjectContentTrust(
-      'New Project Skills',
-      `This project defines ${projectSkills.length} skill(s) in .cortex/skills that can\n` +
-        'run shell commands when loaded. Trust and register them?',
-    );
-    if (decision === 'trust' && signature !== null) {
-      await recordProjectTrust(this.cwd, 'skills', signature);
-      for (const skill of projectSkills) agent.addSkill(skill);
-      this.app!.transcript.addNotification('Skills', `Registered ${projectSkills.length} project skill(s).`);
-      return;
-    }
-
-    this.app!.transcript.addNotification('Skills', 'Skipped project skills (untrusted).');
-  }
-
-  /**
-   * Show a two-option trust overlay for project-local executable content
-   * (hooks or skills), mirroring the MCP trust prompt. Returns 'skip' if the
-   * user declines, cancels, or the TUI is unavailable.
-   */
-  private async promptProjectContentTrust(
-    title: string,
-    message: string,
-  ): Promise<'trust' | 'skip'> {
-    if (!this.app) return 'skip';
-    return new Promise<'trust' | 'skip'>((resolve) => {
-      const items: SelectItem[] = [
-        { value: 'trust', label: 'Trust and load', description: 'Approve this project content' },
-        { value: 'skip', label: 'Skip', description: 'Leave it inert for this project' },
-      ];
-      const list = new SelectList(items, 2, selectListTheme);
-      const overlayBox = new OverlayBox(list, title);
-      const handle = this.app!.tui.showOverlay(overlayBox, {
-        anchor: 'center',
-        width: '60%',
-        maxHeight: 12,
-      });
-      this.app!.transcript.addNotification(title, message);
-      list.onSelect = (item) => {
-        handle.hide();
-        resolve(item.value === 'trust' ? 'trust' : 'skip');
-      };
-      list.onCancel = () => {
-        handle.hide();
-        resolve('skip');
-      };
-    });
-  }
-
-  /**
    * Queue an MCP config reload. If the agentic loop is currently running, the
    * reload is deferred until `onLoopComplete`; otherwise it runs immediately.
    * Multiple queued reloads collapse into one pass.
@@ -835,7 +635,7 @@ export class Session {
     this.mcpReloadPending = null;
     try {
       const result = await reconcileMcpServers(this.agent, this.cwd, {
-        resolveProjectTrust: (cwd, servers) => this.resolveProjectMcpTrust(cwd, servers.map(s => s.name)),
+        resolveProjectTrust: (cwd, servers) => this.trust.resolveProjectMcpTrust(cwd, servers.map(s => s.name)),
         log: (msg, data) => log.info(msg, data),
       });
       this.notifyMcpReloadOutcome(reason, result);
@@ -855,42 +655,6 @@ export class Session {
         void this.runQueuedMcpReload();
       }
     }
-  }
-
-  /**
-   * Prompt the user to trust a new/changed project MCP config during a
-   * watcher-driven reload. Mirrors the startup overlay in
-   * `connectMcpServersWithTrust`. Returns 'skip' if the user declines or
-   * dismisses the overlay.
-   */
-  private async resolveProjectMcpTrust(cwd: string, serverNames: string[]): Promise<'trust' | 'skip'> {
-    if (!this.app) return 'skip';
-    void cwd;
-    return await new Promise<'trust' | 'skip'>((resolve) => {
-      const items: SelectItem[] = [
-        { value: 'trust', label: 'Trust and connect', description: 'Approve project MCP servers' },
-        { value: 'skip', label: 'Skip', description: 'Keep using global servers only' },
-      ];
-      const list = new SelectList(items, 2, selectListTheme);
-      const overlayBox = new OverlayBox(list, 'Project MCP Servers Changed');
-      const handle = this.app!.tui.showOverlay(overlayBox, {
-        anchor: 'center',
-        width: '60%',
-        maxHeight: 12,
-      });
-      this.app!.transcript.addNotification(
-        'MCP Trust Check',
-        `Approve new/changed project MCP servers?\n${serverNames.map(n => `  ${n}`).join('\n')}`,
-      );
-      list.onSelect = (item) => {
-        handle.hide();
-        resolve(item.value === 'trust' ? 'trust' : 'skip');
-      };
-      list.onCancel = () => {
-        handle.hide();
-        resolve('skip');
-      };
-    });
   }
 
   private notifyMcpReloadOutcome(reason: McpConfigChangeReason, result: McpReconcileResult): void {

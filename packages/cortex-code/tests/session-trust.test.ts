@@ -1,9 +1,10 @@
 /**
- * Drives the REAL Session.registerSkillsWithTrust / loadHooksWithTrust so a
- * wiring bug in Session itself (wrong filter, forgetting to record trust,
+ * Drives the REAL trust gates a Session runs at startup (registerSkills /
+ * loadHooks) so a wiring bug (wrong filter, forgetting to record trust,
  * loading declined content) is caught. Only the UI prompt
  * (promptProjectContentTrust) and the agent/app collaborators are stubbed; the
  * trust store and discovery run for real against a temp project + fake home.
+ * The agent and app are injected on the Session, which the gates read through.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
@@ -82,10 +83,20 @@ function makeSession(): { session: Session; registry: SkillRegistry } {
   return { session, registry };
 }
 
+interface TrustGatesInternals {
+  promptProjectContentTrust: () => Promise<'trust' | 'skip'>;
+  registerSkills: () => Promise<void>;
+  loadHooks: () => Promise<Record<string, Array<{ source: string }>>>;
+}
+
+/** The session's trust gates, where the prompt and the gated loaders live. */
+function gatesOf(session: Session): TrustGatesInternals {
+  return (session as unknown as { trust: TrustGatesInternals }).trust;
+}
+
 /** Force the trust overlay decision without a TUI. */
 function stubPrompt(session: Session, decision: 'trust' | 'skip'): void {
-  vi.spyOn(session as unknown as { promptProjectContentTrust: () => Promise<'trust' | 'skip'> },
-    'promptProjectContentTrust').mockResolvedValue(decision);
+  vi.spyOn(gatesOf(session), 'promptProjectContentTrust').mockResolvedValue(decision);
 }
 
 beforeEach(() => {
@@ -97,13 +108,13 @@ afterEach(() => {
   fs.rmSync(cwd, { recursive: true, force: true });
 });
 
-describe('Session.registerSkillsWithTrust', () => {
+describe('trust gate: project skills', () => {
   it('does not register an untrusted project skill when the user declines', async () => {
     writeSkill('evil', '!`echo pwned`');
     const { session, registry } = makeSession();
     stubPrompt(session, 'skip');
 
-    await (session as unknown as { registerSkillsWithTrust: () => Promise<void> }).registerSkillsWithTrust();
+    await gatesOf(session).registerSkills();
 
     expect(registry.getEntry('evil')).toBeNull();
     expect(registry.getAvailableSkillsSummary()).not.toContain('evil');
@@ -114,30 +125,25 @@ describe('Session.registerSkillsWithTrust', () => {
     const { session, registry } = makeSession();
     stubPrompt(session, 'trust');
 
-    await (session as unknown as { registerSkillsWithTrust: () => Promise<void> }).registerSkillsWithTrust();
+    await gatesOf(session).registerSkills();
 
     expect(registry.getEntry('helper')).not.toBeNull();
     // Trust was persisted, so a second run needs no prompt.
     const { session: session2, registry: registry2 } = makeSession();
-    const spy = vi.spyOn(
-      session2 as unknown as { promptProjectContentTrust: () => Promise<'trust' | 'skip'> },
-      'promptProjectContentTrust',
-    );
-    await (session2 as unknown as { registerSkillsWithTrust: () => Promise<void> }).registerSkillsWithTrust();
+    const spy = vi.spyOn(gatesOf(session2), 'promptProjectContentTrust');
+    await gatesOf(session2).registerSkills();
     expect(spy).not.toHaveBeenCalled();
     expect(registry2.getEntry('helper')).not.toBeNull();
   });
 });
 
-describe('Session.loadHooksWithTrust', () => {
+describe('trust gate: project hooks', () => {
   it('loads NO project hooks when the user declines', async () => {
     writeHooks();
     const { session } = makeSession();
     stubPrompt(session, 'skip');
 
-    const handlers = await (session as unknown as {
-      loadHooksWithTrust: () => Promise<Record<string, unknown[]>>;
-    }).loadHooksWithTrust();
+    const handlers = await gatesOf(session).loadHooks();
 
     expect(handlers['pre_turn']).toHaveLength(0);
   });
@@ -147,9 +153,7 @@ describe('Session.loadHooksWithTrust', () => {
     const { session } = makeSession();
     stubPrompt(session, 'trust');
 
-    const handlers = await (session as unknown as {
-      loadHooksWithTrust: () => Promise<Record<string, Array<{ source: string }>>>;
-    }).loadHooksWithTrust();
+    const handlers = await gatesOf(session).loadHooks();
 
     expect(handlers['pre_turn']).toHaveLength(1);
     expect(handlers['pre_turn']?.[0]?.source).toBe('project');
