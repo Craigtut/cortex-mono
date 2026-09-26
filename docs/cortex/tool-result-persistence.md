@@ -226,8 +226,9 @@ const agent = await AgentLoop.create({
 ## File Locations
 
 - `packages/cortex/src/tool-result-persistence.ts` — the interceptor module
-- `packages/cortex/src/agent-loop.ts` — wired into `refreshTools()` and
-  `applyToolResultPersistence()` private method
+- `packages/cortex/src/agent-loop/tool-registry.ts`: wired into
+  `ToolRegistry.refresh()` (reached through `AgentLoop.refreshTools()`) and
+  its private `applyPersistence()` method
 - `packages/cortex/src/types.ts` — `PersistResultFn` type, `persistResult`
   on `AgentLoopConfig`
 - `packages/cortex/src/compaction/microcompaction.ts` — `applyBookend()`

@@ -401,7 +401,7 @@ In `applyInTransformContext()` (fires before each LLM call):
       - Run the observer synchronously on remaining unbuffered messages
       - Merge sync observations into the observation slot
       - Remove the observed messages
-   c. Update `_prePromptMessageCount`
+   c. Update the turn's history boundary (`TurnRunner.boundary`, public as `prePromptMessageCount`)
    d. Reset microcompaction cache
    e. Fire `onObservation` with the compacted messages and new observations
    f. Check observation slot tokens against reflection threshold

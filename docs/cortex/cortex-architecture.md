@@ -14,7 +14,19 @@ Two agent surfaces are exported. `AgentLoop` is the loop primitive this document
 packages/cortex/
   src/
     index.ts                    # Public API
-    agent-loop.ts             # Wraps pi-agent-core Agent with production concerns
+    agent-loop.ts               # AgentLoop: public surface, forwards to the parts below
+    agent-loop/                 # AgentLoop internals (see "AgentLoop module layout")
+      assembly.ts               # Composition root: builds and wires one loop's parts
+      api/                      # Slice interfaces AgentLoop implements; carry the public JSDoc
+      run-control.ts            # Loop gate, abort state, abortable waits
+      turn-runner.ts            # One logical turn plus background retries
+      delivery-queues.ts        # deliver(): silent and parked wake queues, steering
+      background-delivery.ts    # Delivering background completions back to the loop
+      delivery-failure.ts       # Redelivery budgets and the dead-letter store
+      transcript-repair.ts      # Unwinding a failed run from the transcript
+      lifecycle.ts              # abort() and destroy() protocols
+      context-pipeline.ts       # transformContext hook and idle digestion
+      ...                       # tools, permissions, sub-agents, models, system prompt, etc.
     cortex-agent.ts             # Composite facade over AgentLoop (see cortex-agent.md)
     session-log.ts              # Append-only session log owned by the facade
     context-manager.ts          # Slot-based context management
@@ -45,6 +57,14 @@ packages/cortex/
       tool-search/              # Deferred tool schema loading
   package.json
 ```
+
+### AgentLoop module layout
+
+`AgentLoop` is a thin class. `assembleLoop()` in `src/agent-loop/assembly.ts` builds the loop's parts once, in a fixed order whose invariants are listed at the top of that file (for example, the budget guard's `turn_end` listener registers before the turn-boundary steer listener, so a turn that breaches the budget is never handed steered content). `AgentLoop` keeps the result and implements each method as a one-line forwarder.
+
+Each part is a small module that takes a narrow `...Ports` interface of the callbacks and state it needs, rather than the loop itself, so modules can be tested with plain fakes. Ports that reach the loop's own public or overridable methods resolve through the loop at call time, so a spy or replacement installed on the loop's method still takes effect.
+
+The public documentation lives on the slice interfaces in `src/agent-loop/api/` (`LoopRunApi`, `LoopDeliveryApi`, and so on). `AgentLoop` implements them, so the JSDoc shows up on the class's methods in editors and in the emitted `.d.ts`.
 
 ## Why a Separate Package
 
@@ -83,6 +103,60 @@ By default, per-loop tool runtime state (working directory, read-before-edit reg
 - **`wake: false` (silent), any state**: the content is queued on the `AgentLoop` itself and flushed as leading user messages into the next real prompt's message batch. It never touches pi's steering queue (which drains into whatever run starts next, surfacing "silent" content as an unprompted response) and never flushes into a background-completion delivery run. Inspect and clear the queue via `queuedDeliveryCount` / `clearQueuedDeliveries()`; queued content is dropped at `destroy()`.
 
 Alongside `deliver()`, the loop surfaces pi's queue controls directly: `followUp(message)` (queued until a would-stop point: after the model produces what would otherwise be the run's final answer), `setSteeringQueueMode` / `setFollowUpQueueMode` (`'all' | 'one-at-a-time'`), and `clearSteeringQueue` / `clearFollowUpQueue` / `clearAllQueues` (the last also drops the silent delivery queue and parked wake deliveries, returning their content).
+
+### Loop gate, turn unwind, abort epoch
+
+These three mechanisms keep runs from overlapping and make `abort()` exact. They live in `src/agent-loop/run-control.ts` (`LoopGate`, `AbortState`, the abortable waits), `src/agent-loop/turn-runner.ts` (the turn unwind), `src/agent-loop/transcript-repair.ts` (transcript unwind after a failed run), and `src/agent-loop/lifecycle.ts` (the abort and destroy protocols).
+
+**Loop gate.** Every task that owns the loop runs through one promise chain: consumer prompts, background delivery drains, wake sweeps, and [idle digestion](#context-compaction). At most one runs at a time, so a second run can never corrupt the tool runtime or the history boundary of the first. The gate's depth counts the running task plus queued ones, which is what the public state reads: `prompt()` throws while the gate is non-empty, `deliver()` parks while it is non-empty, `steer()` reaches pi when the gate is non-empty even before the turn has started, and `waitForLoopIdle()` waits until it is empty, including tasks enqueued by tasks. A consumer prompt's gate task runs the turn and then, under the same acquisition, delivers any background completions that arrived meanwhile. Lifecycle is re-checked at dequeue, so a `destroy()` that lands between enqueue and dequeue never starts a loop.
+
+**Turn unwind.** Each turn creates an unwind promise before it starts and resolves it in its `finally`, after the turn's status is classified and its flags are cleared. `abort()` captures that promise before aborting and waits for it after pi goes idle. Pi's `waitForIdle()` covers only pi's own run; renewing the abort controller before Cortex classified the failure would let the cancelled turn read as a retryable failure.
+
+A failed run can also leave content in the transcript that no run answered. Pi pushes a run's leading messages at run start and appends a synthetic failure stub when the run fails, so after a failed delivery run Cortex trims the stubs appended during that run and then:
+
+- removes the delivery message when nothing else followed it, and re-queues the content (also when the message never landed);
+- removes the whole delivery when the transcript still ends on an assistant message (such as a tool-call turn whose results never arrived, which would be an unpaired tool call on the next request), and re-parks any user messages pi drained into the run (a `steer()` or follow-up) as wake deliveries;
+- otherwise treats the run as having progressed past the content. It stays as history and is not re-queued, which would duplicate it.
+
+A consumer prompt that fails terminally, other than by an abort, applies the same test to the wake deliveries spliced into its leading batch, matching them by role and content at the live history boundary. Only the wake messages are removed and re-parked; the prompt's own input and any flushed silent deliveries stay, as for any failed prompt. A batch that was only partly found (history rewritten under the run) is left alone rather than risk duplication.
+
+**Abort epoch.** `AbortState` holds the current run's `AbortController` plus an epoch counter. `abort()` runs in this order:
+
+1. Capture the current turn's unwind promise.
+2. Drop every parked wake delivery (dead-lettered as cancelled).
+3. `begin()`: abort the current controller and mark an abort in progress.
+4. Abort pi, wait for pi to go idle, then wait for the turn unwind.
+5. If no background completions are pending, wait for the gate to settle, so a follow-up `prompt()` does not fail on a stale gate. Pending completions start a fresh run, so `abort()` returns without waiting on it.
+6. `renew()`: install a fresh controller, unless teardown began or a newer run already replaced the aborted one.
+7. `end()`: clear the in-progress mark and advance the epoch.
+
+The epoch exists because the controller cannot say which content an abort cancelled. Content can park during the awaits in steps 4 and 5, a background drain that starts mid-abort replaces the aborted controller, and step 5 is skipped when deliveries are pending. So each parked delivery is stamped with the epoch at park time, and every take of the parked queue drops everything while an abort is in flight (in progress, or the current controller still aborted) plus any item stamped with an older epoch. Content re-parked after a failed run is stamped with the epoch the run started under, captured before the run, so a failure handler that runs after the abort finished cannot stamp the new epoch and bring the content back. Dropped content is dead-lettered.
+
+Two more rules close the same-frame cases. `prompt()` installs a fresh controller synchronously when the current one is already aborted, so an `abort()` in the same frame lands on the new turn, which then cancels at dequeue without reaching pi. Delivery runs (background drains and wake sweeps) replace an aborted controller instead of cancelling: background completions are not cancelled by a user abort.
+
+**Abortable waits.** `raceAbort(promise, signal)` resolves to the value, or to the `ABORTED` marker when the signal fires first; a late rejection is swallowed. `raceTimeout(promise, ms, signal?)` resolves to `'settled'`, `'timeout'`, or `'aborted'`, and propagates a rejection that lands before the deadline. `sleepUnlessAborted(ms, signal)` resolves `true` after the delay or `false` as soon as the signal aborts. They bound permission asks (an abort answers a pending ask with a block), idle digestion's observer catch-up and threshold pass, the retry backoff wait, and `destroy()`'s force-kill deadline. `raceAbort` and `raceTimeout` abandon the wait, not the work; an abandoned idle-digestion pass is invalidated so a late settlement cannot write over live state.
+
+### Background delivery budgets and dead letters
+
+Two kinds of content reach the loop without a consumer caller waiting on them: background completions (finished background sub-agents and backgrounded Bash commands, `src/agent-loop/background-delivery.ts`) and parked wake deliveries (see [Delivery and Steering](#delivery-and-steering), `src/agent-loop/delivery-queues.ts`). Both are delivered by runs of their own, both re-attempt a failed run a bounded number of times, and both dead-letter what they give up on. The budgets and the store live in `src/agent-loop/delivery-failure.ts`.
+
+**Background completions.** A completion is queued and a gated drain is scheduled. If a turn is running, the end of that turn's gate task delivers it first and the scheduled drain finds nothing; scheduling unconditionally covers a completion that lands after the running turn's last drain check. The drain batches every pending completion into one message and starts a run with it. `onBackgroundResultDelivery(taskIds)` fires with each completion's task id on its first attempt only. Each completion's message is formatted once and reused on re-attempts, because formatting marks a Bash task notified. After the run, the drain repeats for anything that arrived meanwhile, including re-queued items.
+
+**Budgets.** Each item records its failed attempts and when its first delivery run started. The limits are the same for both paths: 3 failed runs or 4 hours in total, whichever comes first (`BACKGROUND_DELIVERY_LIMITS`, `WAKE_DELIVERY_LIMITS`). Each run's own [retry ladder](error-recovery.md#transient-error-handling) is capped too: `boundedPolicyFor()` lowers the retry policy's `maxElapsedMs` to what remains of the oldest item's budget. Without that cap, three attempts could each run a full default ladder (about 3 hours) while holding the loop gate through an outage.
+
+**Requeue or dead letter.** After a failed run the transcript is unwound first (see [Loop gate, turn unwind, abort epoch](#loop-gate-turn-unwind-abort-epoch)). Content the run progressed past is history and is never re-queued; its failure surfaces through `onError`. Otherwise `partitionExhausted()` charges each item an attempt and splits the batch:
+
+- Items with budget left go back to the front of their queue, ahead of anything that arrived meanwhile, and get another run (a re-queued background batch rides the drain's repeat; re-parked wake content gets a new sweep).
+- Items out of attempts or out of time are dead-lettered. For background completions a `fatal` failure, such as an authentication error, exhausts the whole batch at once, since an identical re-attempt cannot succeed.
+- Background completions are not charged an attempt when the run was aborted: the user stopped the agent, the delivery did not fail. Parked wake content whose carrying run was aborted is cancelled with it and dead-lettered.
+
+A failure that a later attempt recovers from never reaches `onError`. A background batch counts as recovered when every item has left the queue without being dead-lettered. A wake sweep stays silent while every item still has budget.
+
+**Dead-letter store.** `DeadLetterStore` keeps the last 50 entries; evictions are logged, since an evicted entry is completed work gone for good. Each entry records `kind` (`'subagent'`, `'bash'`, or `'wake_delivery'`), `taskId` (`'wake-delivery'` for wake content), `attempts`, `lastError`, `deadLetteredAt`, and the undelivered `message`. Read them with `getDeadLetteredBackgroundResults()` and subscribe with `onBackgroundResultDeadLettered(handler)`; the `CortexAgent` facade turns entries into session-log lifecycle entries. The store is not cleared by `destroy()`, so it still answers after teardown.
+
+**Teardown.** Once `destroy()` starts, queued drains and sweeps no-op. After the gate settles, every background completion still pending is dead-lettered with `'agent shut down before delivery'`, and so is any completion that arrives during teardown. Parked wake deliveries and queued silent deliveries are dropped at teardown without dead-letter entries; a consumer that needs them durable drains them first with `clearAllQueues()` or `clearQueuedDeliveries()`.
+
+**Cancel purge.** `cancelSubAgent(taskId)` destroys the child and removes its queued result. The drain also skips any sub-agent whose task was cancelled, including a re-queued item whose cancel landed between attempts, and a result that settles after its cancel is dropped at enqueue. Discarded results are logged, not dead-lettered: the work was thrown away on purpose.
 
 ### The ContextManager
 
@@ -315,7 +389,7 @@ Pi-agent-core emits 10 events across 4 scopes. Cortex normalizes these into a co
 
 Pi-ai surfaces errors as plain `Error` objects with string messages. Cortex implements a regex-based error classifier that maps error strings to actionable categories (`authentication`, `rate_limit`, `context_overflow`, `server_error`, `network`, `cancelled`, `unknown`). Classified errors are emitted via the `onError` event for the consumer to route (logging, UI notifications, backoff, or retry).
 
-Cortex does not automatically retry `prompt()` internally. Provider SDKs have inconsistent retry coverage, so Cortex normalizes the error category and lets each consumer choose the right recovery behavior for its runtime.
+Provider SDKs have inconsistent retry coverage, so Cortex retries transient failures (`network`, `server_error`, `rate_limit` by default) itself, per a configurable `retryPolicy`: it waits out a backoff, trims pi's failure stub, and resumes the turn with `agent.continue()`. Only failures it gives up on reach `onError`, and `onRetryScheduled` / `onRetrySucceeded` / `onRetryExhausted` report the retries along the way.
 
 See **`error-recovery.md`** for the full design: classification patterns per category, error event flow, auth failure detection, transient error handling, consumer-specific rate limit handling, and pipeline integration.
 
@@ -340,59 +414,24 @@ Cortex wraps this with explicit lifecycle management.
 
 ### `AgentLoop.destroy()`
 
-Ordered cleanup of all resources. Called by the consumer when the agent is no longer needed (e.g., during application shutdown or pipeline teardown).
+Ordered cleanup of all resources, implemented in `src/agent-loop/lifecycle.ts`. Called by the consumer when the agent is no longer needed (e.g., during application shutdown or pipeline teardown). `destroy(timeoutMs = 8000)` is idempotent, and concurrent calls share one teardown.
 
-```typescript
-async destroy(): Promise<void> {
-  // 1. Abort any in-progress agentic loop
-  this.agent.abort();
-  await this.agent.waitForIdle();
+Before any await, the loop moves to `destroying`: `prompt()` and `deliver()` throw, queued gate tasks no-op, and the current abort controller is aborted, which cancels a pending retry backoff. The ordered cleanup then runs, raced against `timeoutMs`; if the deadline wins, every subprocess the loop tracked is killed.
 
-  // 2. Cancel all background sub-agents
-  for (const subAgent of this.activeSubAgents) {
-    subAgent.abort();
-    await subAgent.waitForIdle();
-    this.emit('onSubAgentFailed', subAgent.taskId, 'Parent agent destroyed');
-  }
+1. Abort pi and wait for it to go idle, then wait for the loop gate to settle.
+2. Dead-letter background completions still awaiting delivery (see [Background delivery budgets and dead letters](#background-delivery-budgets-and-dead-letters)).
+3. Cancel all sub-agents with a full child `destroy()`.
+4. Emit `onLoopComplete` for a final checkpoint. A throwing handler is logged and teardown continues.
+5. Detach from the MCP client manager. Connections close only when this loop owns the manager; a shared manager's connections belong to its owner.
+6. Release skills, the sub-agent manager, the budget guard, the event bridge, and the loop's event subscriptions.
+7. Reset pi's agent state, then destroy the compaction manager and the tool runtime.
+8. Clear every handler list, the loop-owned delivery queues, and pending permission asks. The dead-letter store is kept so it still answers after teardown.
 
-  // 3. Checkpoint conversation history (best-effort)
-  try {
-    this.emit('onLoopComplete');  // gives consumer a chance to save
-  } catch { /* ignore checkpoint failures during shutdown */ }
-
-  // 4. Close all MCP client connections
-  await this.mcpClientManager.closeAll();
-  //    - Stdio subprocesses are killed
-  //    - HTTP connections are closed
-  //    - Bridge context registry entry is unregistered
-
-  // 5. Clear skill buffer
-  this.skillRegistry.clear();
-
-  // 6. Unsubscribe from pi-agent-core events
-  for (const unsub of this.eventUnsubscribers) {
-    unsub();
-  }
-
-  // 7. Clear agent state
-  this.agent.reset();
-
-  // 8. Mark as destroyed
-  this.destroyed = true;
-  // All subsequent prompt() calls throw: "Agent has been destroyed"
-}
-```
+The state becomes `destroyed` when cleanup finishes or times out. Any later `prompt()` throws "Agent has been destroyed".
 
 ### `AgentLoop.abort()`
 
-Cancel the current agentic loop without destroying the agent. The agent remains usable for subsequent prompts.
-
-```typescript
-async abort(): Promise<void> {
-  this.agent.abort();
-  await this.agent.waitForIdle();
-}
-```
+Cancel the current agentic loop without destroying the agent. The agent remains usable for subsequent prompts. Parked wake deliveries are cancelled with the run; background completions are not, and a pending one starts a fresh run. The ordered protocol, and why an abort epoch backs it, is in [Loop gate, turn unwind, abort epoch](#loop-gate-turn-unwind-abort-epoch).
 
 **Tool abort is cooperative.** Pi-agent-core passes the `AbortSignal` to each `tool.execute()` call, but if a tool doesn't check the signal, it runs to completion. For Bash commands, the process tree is killed independently via the process cleanup mechanism (see `bash.md`). For MCP tool calls, the MCP client can close the pending request.
 
@@ -423,16 +462,17 @@ Mitigations:
 ### Lifecycle States
 
 ```
-CREATED → ACTIVE → DESTROYED
-                ↑
-                └── abort() returns to ACTIVE (agent still usable)
+CREATED → ACTIVE → DESTROYING → DESTROYED
+             ↑
+             └── abort() stays in ACTIVE (agent still usable)
 ```
 
 - **CREATED**: After `await AgentLoop.create(config)`. Slots can be set, but no loops have run.
 - **ACTIVE**: After the first `prompt()` call. The agent is running or idle between prompts.
+- **DESTROYING**: From the start of `destroy()` until cleanup finishes or times out. Nothing new can start.
 - **DESTROYED**: After `destroy()`. All resources released. Any `prompt()` call throws.
 
-There is no IDLE vs RUNNING sub-state. The consumer can check `agent.isRunning` (delegates to pi-agent-core's internal streaming state) if needed.
+There is no IDLE vs RUNNING sub-state. `isRunning` is true while the loop is `active` and a turn is in flight; `isLoopActive` is true while any gate task (a turn, a delivery drain, a wake sweep, idle digestion) is running or queued.
 
 ## References
 

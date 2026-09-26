@@ -152,7 +152,7 @@ cortexAgent.onError((error: ClassifiedError) => {
 });
 ```
 
-This fires for any LLM call failure, whether it happens in the agentic loop (`prompt()`) or in a direct completion (`directComplete` / `structuredComplete` / `utilityComplete`, used for phases like THOUGHT and REFLECT). All four paths route failures through the same `emitError()` helper. Tool execution errors are not surfaced here; those are handled by pi-agent-core internally and don't crash the loop.
+This fires for any LLM call failure, whether it happens in the agentic loop (`prompt()`) or in a direct completion (`directComplete` / `structuredComplete` / `utilityComplete`, used for phases like THOUGHT and REFLECT). All four paths route failures through the same `emitError()` helper. Tool execution errors are not surfaced here; those are handled by pi-agent-core internally and don't crash the loop. A transient failure that a background retry recovers from never reaches `onError` (see [Transient error handling](#transient-error-handling)).
 
 ### Consumer Error Routing
 
@@ -218,11 +218,11 @@ The LLM call fails with an auth error string (e.g., "Invalid API key"). The erro
 
 Both detection points result in the same consumer event. The backend emits `system:error` with `category: 'authentication'`, which the frontend renders as a SystemErrorCard with the suggested action to check API keys.
 
-## Transient Error Handling
+## Transient error handling
 
-Cortex classifies transient errors (`rate_limit`, `server_error`, `network`) but does not retry `AgentLoop.prompt()` internally. The `onError` event gives consumers the category and suggested action so each consumer can choose the right retry, backoff, or user notification behavior for its runtime.
+Cortex retries transient failures of a turn itself, in the background, before anything reaches `onError`. A turn that recovers never surfaces an error; the caller's `prompt()` promise just stays pending across the backoff window and resolves with the recovered result. Only a failure Cortex gives up on is classified, emitted through `onError`, and thrown.
 
-### Why Cortex Owns This
+### Why Cortex owns this
 
 Provider-level retries exist but are inconsistent:
 - **Anthropic SDK**: 2 retries (built-in)
@@ -230,51 +230,82 @@ Provider-level retries exist but are inconsistent:
 - **OpenAI, Mistral, Google SDK**: SDK built-in (varies)
 - **Groq, xAI, Cerebras, OpenRouter, etc.**: No retry at all
 
-Pi-agent-core has no retry at the agent loop level. When an LLM call fails after provider-level retries are exhausted, the agent catches the error, appends an error message (`stopReason: "error"`), and stops. The consumer must handle retry.
+Pi-agent-core has no retry at the agent loop level. When an LLM call fails after provider-level retries are exhausted, the agent appends a synthetic assistant failure message (`stopReason: "error"`) and stops. Cortex sits above that inconsistent behavior, so it can apply one policy to every provider and resume the failed turn without re-running completed tool calls.
 
-Cortex sits at the right layer for classification: above inconsistent provider behavior, below the consumer. It normalizes error categories without assuming how a background service, CLI, TUI, or web app should recover.
+### Retry policy
+
+`AgentLoopConfig.retryPolicy` takes a partial `RetryPolicy`, merged over the defaults by `resolveRetryPolicy()` (`src/retry-policy.ts`). `retryableCategories` and `backoffMs` replace the defaults wholesale when given; invalid values fall back to the default.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `enabled` | `true` | Master switch. `{ enabled: false }` turns background retry off. |
+| `retryableCategories` | `['network', 'server_error', 'rate_limit']` | Categories eligible for retry. |
+| `backoffMs` | `[120_000, 240_000, 480_000]` | Wait before each retry (2m, 4m, 8m). Entries past the end use `maxBackoffMs`. |
+| `maxBackoffMs` | `600_000` | Cap on any single wait (10m). |
+| `maxAttempts` | `20` | Retries before giving up (about a 3h window with the defaults). |
+| `maxElapsedMs` | unset | Optional ceiling on time since the turn's first failure. |
 
 ### Mechanism
 
-AgentLoop surfaces pi-agent-core failures through `prompt()` and its `onError` handlers:
+`TurnRunner` (`src/agent-loop/turn-runner.ts`) runs one logical turn under the loop gate:
 
-```typescript
-// Inside AgentLoop.prompt()
-try {
-  const result = await this.agent.prompt(input);
-  const stateError = this.agent.state.errorMessage ?? this.agent.state.error;
-  if (stateError) {
-    throw new Error(String(stateError));
-  }
-  return result;
-} catch (err) {
-  const classified = classifyError(err, { wasAborted: this.isAborted() });
-  this.emitError(classified);
-  throw err;
-}
-```
+1. The first attempt calls `agent.prompt()`. For a consumer turn the input is preceded by any parked wake deliveries and queued silent deliveries taken for this run. Pi catches provider errors and stores them in `state.errorMessage` without throwing, so the runner turns a set error state into a thrown error.
+2. A failure is classified with `classifyError()`. A context overflow triggers emergency truncation first; it is not in the default retryable set, so it then surfaces.
+3. The turn is retried only when `shouldRetry()` agrees (policy enabled, not aborted, severity not `fatal`, category retryable, attempts and elapsed time within the policy) and the transcript can be resumed: after trimming trailing failure stubs, the last message must be a user message or tool result past the slot region. A failure that lands after an assistant tool-call turn but before its results cannot be resumed and surfaces instead.
+4. Before each wait the runner emits `onRetryScheduled`, then sleeps for `backoffForAttempt()`. The sleep wakes at once if the run is aborted.
+5. After the wait it trims pi's failure stub and calls `agent.continue()`. The user message is already in the transcript, so nothing is re-sent and completed tool calls do not re-run.
+6. A retry that succeeds emits `onRetrySucceeded`. A failure that will not be retried emits `onError` and rethrows. When the policy stopped a retryable category after at least one retry, `onRetryExhausted` fires first.
+
+### Aborts
+
+`isAborted()` is true when the run's abort controller fired or pi's run state holds an abort-shaped error. The match is on a word start ("abort", "cancelled"), so a network error such as `ECONNABORTED` stays a network error and keeps its retry.
+
+- An abort during a backoff wait trims the failure stub, emits `onError` classified as `cancelled`, and throws an `AbortError` ("Prompt aborted during retry backoff") rather than the stale transient error.
+- An aborted run that ends cleanly or with an error has its trailing aborted stub trimmed. A stub that carries partial text the user already saw is kept unless it also carries tool calls, which would be unpaired.
+- A consumer turn whose controller was aborted before the turn left the gate queue never reaches pi: it emits a `cancelled` error and throws "Prompt aborted before it started".
+
+### Failed delivery runs
+
+Runs that deliver content without a consumer caller (background completions, parked wake deliveries swept into a run of their own) use the same retry loop with two differences:
+
+- Their retry ladder is capped by a delivery budget: `maxElapsedMs` is lowered to what remains of the oldest item's budget, so re-attempts cannot re-enter the full ladder back to back.
+- Per-attempt `onError` and `onRetryExhausted` are suppressed. A failed run is unwound from the transcript and re-attempted. `onError` fires once, at the root of the delivery chain, when content is dead-lettered after a failure or the failed run had progressed past it. A later attempt that delivers the content surfaces no error.
+
+Content the loop gives up on is dead-lettered, never dropped silently. See [Background delivery budgets and dead letters](cortex-architecture.md#background-delivery-budgets-and-dead-letters) for the budgets, the unwind rules, and the dead-letter store.
+
+Two related consumer-visible guarantees:
+
+- A background delivery that fails after a consumer turn succeeded surfaces through `onError`. It never rejects that turn or replaces its error.
+- Wake deliveries spliced into a consumer prompt that fails terminally are unwound and re-parked for a run of their own, unless the run progressed past them or was aborted.
 
 ### Events
 
-AgentLoop exposes `onError(handler)`. The handler receives a `ClassifiedError` with `category`, `severity`, `originalMessage`, and an optional `suggestedAction`.
+| Hook | Payload | Fires |
+|------|---------|-------|
+| `onRetryScheduled(handler)` | `RetryScheduledInfo`: `category`, `attempt` (1-based), `maxAttempts`, `delayMs`, `nextAttemptAt`, `originalMessage`, optional `causeDetail` | Before each backoff wait |
+| `onRetrySucceeded(handler)` | `RetrySucceededInfo`: `attempts` | When a retry resolves the turn |
+| `onRetryExhausted(handler)` | `RetryExhaustedInfo`: `attempts`, `category` | When the policy stops retrying a retryable failure (consumer turns only) |
+| `onError(handler)` | `ClassifiedError` | For any failure Cortex gives up on |
 
-### Error Categories and Retry Behavior
+Every handler also receives the loop's `LoopOriginContext` as its second argument.
 
-| Category | Severity | Consumer Retry? | Notes |
-|----------|----------|----------|-------|
-| `rate_limit` | retry | Usually | 429 or rate limit patterns |
-| `server_error` | retry | Usually | 500, 502, 503, 504 |
-| `network` | retry | Usually | Connection failure, DNS, timeout |
-| `authentication` | fatal | No | Invalid key, expired token |
-| `context_overflow` | recoverable | No | Handled by compaction, not retry |
+### Error categories and retry behavior
+
+| Category | Severity | Retried by Cortex? | Notes |
+|----------|----------|--------------------|-------|
+| `rate_limit` | retry | Yes, by default | 429 or rate limit patterns |
+| `server_error` | retry | Yes, by default | 500, 502, 503, 504 |
+| `network` | retry | Yes, by default | Connection failure, DNS, timeout |
+| `authentication` | fatal | No | Invalid key, expired token. Fatal errors are never retried, even if listed. |
+| `context_overflow` | recoverable | No | Emergency truncation runs, then the error surfaces |
 | `cancelled` | recoverable | No | User abort |
-| `unknown` | recoverable | No | Unclassified errors |
+| `unknown` | recoverable | No | Unclassified errors, including a 404 |
 
-### Interaction with Provider-Level Retries
+### Interaction with provider-level retries
 
-Provider SDKs retry internally before the error reaches Cortex. Consumers should account for those provider attempts when choosing their own retry cadence. For example, a consumer may avoid immediate retries for `rate_limit` because the provider may already have exhausted a short retry budget.
+Provider SDKs retry inside each attempt, before the error reaches Cortex. Cortex's backoff starts only after those are spent.
 
-The `maxRetryDelayMs` option in pi-ai caps provider-requested retry delays. If a server requests a longer delay, pi-ai throws immediately rather than waiting. Cortex classifies the thrown error so consumers can apply their own backoff schedule.
+The `maxRetryDelayMs` option in pi-ai caps provider-requested retry delays. If a server asks for a longer delay, pi-ai throws immediately rather than waiting, and Cortex's own backoff takes over.
 
 ## Consumer-Specific Rate Limit Handling
 
@@ -321,7 +352,7 @@ Each phase of the pipeline (THOUGHT, AGENTIC LOOP, REFLECT) can fail independent
 | Phase | On Error | Classification Used For |
 |-------|----------|------------------------|
 | THOUGHT | Skip thought, continue to agentic loop with no thought in context | Log + surface to UI. Auth errors halt the tick. |
-| AGENTIC LOOP | Cortex classifies the error and throws. Consumers decide whether to retry, use partial results, or fall back. | Log + surface to UI. Auth errors halt the tick. |
+| AGENTIC LOOP | Cortex retries transient failures per its retry policy, then classifies the error and throws. Consumers decide whether to retry further, use partial results, or fall back. | Log + surface to UI. Auth errors halt the tick. |
 | REFLECT | Retry up to 3 times. If all fail, skip reflection (emotions/decisions for this tick are lost). | Log + surface to UI. Auth errors halt the tick. |
 | Any phase | If `authentication`: halt the tick entirely, surface to UI, do not retry. | Auth is always fatal. |
 

@@ -133,11 +133,11 @@ The key is that cortex doesn't need explicit dock icon awareness. As long as it 
 
 **Verify:** Ensure `DYLD_INSERT_LIBRARIES` is NOT in the Bash tool's env var blocklist (it shouldn't be; it IS in the list as a security-blocked var). This creates a conflict: dock suppression on macOS uses `DYLD_INSERT_LIBRARIES`, but the Bash safety layer strips it for library injection prevention.
 
-**Resolution (IMPLEMENTED):** The consumer explicitly adds any required environment variables (e.g., `DYLD_INSERT_LIBRARIES` for dock suppression) to the `envOverrides` config field, which gets merged into ALL subprocess environments, bypassing the security blocklist for these specific vars. `AgentLoopConfig` includes `envOverrides?: Record<string, string>`, stored as a private readonly field on `AgentLoop` and propagated to the MCP client manager, sub-agents, and built-in tools.
+**Resolution (IMPLEMENTED):** The consumer explicitly adds any required environment variables (e.g., `DYLD_INSERT_LIBRARIES` for dock suppression) to the `envOverrides` config field, which gets merged into ALL subprocess environments, bypassing the security blocklist for these specific vars. `AgentLoopConfig` includes `envOverrides?: Record<string, string>`, kept on the loop's config (`AgentLoop.getEnvOverrides()`) and propagated to the MCP client manager, sub-agents, and built-in tools.
 
 ### Implementation Phase
 
-The `envOverrides` config field is implemented in `AgentLoopConfig` (types.ts), stored and propagated by `AgentLoop` (agent-loop.ts), and passed through to the MCP client manager and child agent configs.
+The `envOverrides` config field is implemented in `AgentLoopConfig` (types.ts), applied to the MCP client manager by `agent-loop/mcp-attachment.ts`, and copied into child loop configs by `agent-loop/child-loop-config.ts`.
 
 ## Docker Shutdown Grace Period (MEDIUM, IMPLEMENTED)
 
@@ -153,13 +153,13 @@ Docker's default `stop_grace_period` is 10 seconds. Cortex's `destroy()` sequenc
 async destroy(timeoutMs = 8000): Promise<void>
 ```
 
-When the timeout elapses, `forceKillAll()` terminates all remaining tracked processes. The implementation lives in `agent-loop.ts`.
+When the timeout elapses, every remaining tracked process is killed (`ProcessTracker.killAll()`). The implementation lives in `agent-loop/lifecycle.ts` and `agent-loop/process-tracker.ts`.
 
 Docker users should set `stop_grace_period: 15s` in `docker-compose.yml` if they experience orphaned processes.
 
 ### Implementation Phase
 
-Implemented in `AgentLoop` (agent-loop.ts). The `destroy()` method accepts `timeoutMs` (default 8000ms) and force-kills all tracked processes via `forceKillAll()` if cleanup exceeds the deadline.
+Implemented in `AgentLoop` (`agent-loop/lifecycle.ts`). The `destroy()` method accepts `timeoutMs` (default 8000ms) and force-kills all tracked processes via `ProcessTracker.killAll()` if cleanup exceeds the deadline.
 
 ## Custom Endpoint Docker Networking (MEDIUM)
 
