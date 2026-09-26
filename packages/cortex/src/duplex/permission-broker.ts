@@ -18,30 +18,9 @@
  * sub-agents, each blocked on its own. That is why the queue exists at all,
  * and why every ask carries loopPath.
  *
- * D16 is enforced HERE, router-side, never prompt-side: the talker's
- * judgment is precisely what an injected-content attacker targets, so no
- * consent rule may depend on the talker behaving. The rules:
- *
- * - exactly one ask is voiced at a time;
- * - `allow` binds only to the most recently voiced ask, takes effect at most
- *   once, and is accepted only from a talker turn whose cause set contains a
- *   user utterance newer than the voicing (details on {@link answer});
- * - `deny` is unrestricted;
- * - anything else returns a voiceable refusal and re-voices the pending ask.
- *
- * The consent check reads the FULL discriminated cause set
- * (currentTalkerCauseTags) and filters by kind before aggregating. It must
- * never use the collapsing latest-seq helper: collapse-then-filter denies a
- * real "yes" whenever a later non-utterance rode the same run, and
- * collapse-without-filter grants consent off a delivery the user never
- * spoke (decisions.md D16 worked examples).
- *
- * The tag set is NOT a complete record of what the user said: steer()
- * bypasses causation entirely, so a user steering "yes, go ahead" reaches
- * neither the log nor this check. That failure direction is safe by design:
- * an unheard yes leaves the ask pending and it gets re-voiced. There is
- * deliberately NO recovery path that tries to infer such consent; any
- * recovery heuristic would itself be an attack surface.
+ * D16 is enforced here, never prompt-side: exactly one ask is voiced at a
+ * time (AskVoicing), and an answer settles an ask only as the consent rules
+ * allow (ask-consent.ts).
  */
 
 import type {
@@ -52,8 +31,7 @@ import type {
 import type { WakeClass } from '../session-log.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
 import type { CauseTag } from './cause-tags.js';
-import { stripAskFence } from './ask-fence.js';
-import { asTrimmedString } from './control-tools.js';
+import { ALLOW_RECEIPT, DENY_RECEIPT, judgeAnswer } from './ask-consent.js';
 import { AskVoicing } from './ask-voicing.js';
 
 // ---------------------------------------------------------------------------
@@ -210,29 +188,7 @@ export const PERMISSION_BROKER_DEFAULTS = {
 /** Cap on {@link PermissionBroker.settledAskIds}. */
 const MAX_SETTLED_ASK_IDS = 64;
 
-// ---------------------------------------------------------------------------
-// Receipts and reasons (bare and uniform, D16/D17: as little imitable
-// decision text in the talker's transcript as possible)
-// ---------------------------------------------------------------------------
-
-const NO_PENDING_RECEIPT = 'There are no pending permission requests to answer.';
-const NOT_PENDING_RECEIPT = 'That permission request is no longer pending; nothing was changed.';
-const UNKNOWN_ASK_RECEIPT =
-  'No permission request has that id. The pending one will be read to the user again; ' +
-  'answer that one.';
-const ALLOW_RECEIPT = 'Approval passed along.';
-const DENY_RECEIPT = 'Denial passed along.';
-const CONSENT_REFUSED_RECEIPT =
-  'Not accepted: approval needs the user\'s own answer, given after hearing the request. ' +
-  'It will be read to the user again.';
-const NOT_VOICED_RECEIPT =
-  'Not accepted: only the request most recently read to the user can be approved. ' +
-  'It will be read again.';
-const INVALID_DECISION_RECEIPT =
-  'Could not read that decision. Ask the user to allow or deny, then call answer_ask again.';
-const UNBOUND_RECEIPT =
-  'Could not tell which pending request that answers; it will be read to the user again.';
-
+// Deny reasons, bare and uniform like the receipts (D16/D17).
 const TIMEOUT_DENY_REASON =
   'No answer from the user before the permission request timed out; denied by default. ' +
   'Ask again if the work still needs it.';
@@ -252,14 +208,6 @@ const DROP_REASONS: Record<'abort' | 'restore' | 'destroy', string> = {
   restore: 'The session was restored before the user answered the permission request.',
   destroy: 'The agent was shut down before the user answered the permission request.',
 };
-
-/** Cap on the relayed reason so a runaway argument cannot bloat the log. */
-const MAX_REASON_CHARS = 400;
-
-/** Fence-strip an unvalidated tool argument, leaving non-strings alone. */
-function stripAskFenceFromReason(value: unknown): unknown {
-  return typeof value === 'string' ? stripAskFence(value) : value;
-}
 
 // ---------------------------------------------------------------------------
 // Broker
@@ -416,71 +364,32 @@ export class PermissionBroker {
   // -------------------------------------------------------------------------
 
   /**
-   * Settle an ask from the talker's answer_ask dispatch. Enforced here, not
-   * in any prompt:
-   *
-   * - `deny` is unrestricted: any pending ask (named by id, or the voiced
-   *   one when no id is given) settles as deny with no causation check.
-   * - `allow` binds only to the most recently voiced ask, at most once, and
-   *   only when the talker's live cause set contains an utterance-kind tag
-   *   with seq strictly greater than the ask's voicing anchor. The set is
-   *   scanned whole and filtered by kind first (never collapsed, D16).
-   *   Additionally, a run whose cause set carries THIS ask's voicing tag
-   *   cannot grant it: content consumed alongside the voicing was authored
-   *   before the user could have heard the request, so a stale "yes" that
-   *   parked with the voicing must not bind to it.
-   * - anything else returns a voiceable refusal and re-voices the pending
-   *   ask (damped, so a spraying turn cannot flood the voice channel).
+   * Settle an ask from the talker's answer_ask dispatch, as the D16 consent
+   * rules allow (ask-consent.ts). A refused answer re-reads the pending ask
+   * (damped, so a spraying turn cannot flood the voice channel).
    */
   answer(askIdRaw: unknown, decisionRaw: unknown, reasonRaw: unknown): AskAnswerOutcome {
-    if (this.asks.size === 0) {
-      return { receipt: NO_PENDING_RECEIPT };
-    }
-    const askId = asTrimmedString(askIdRaw);
-    const decisionText = asTrimmedString(decisionRaw)?.toLowerCase() ?? null;
-    // The reason is talker-authored and reaches the reasoner verbatim as the
-    // resolver's block reason, so it is a fence leak path. Sanitized once
-    // here at intake rather than at each use: the same string goes to the
-    // log and to the resolver, and a second copy of this rule is a second
-    // place for it to be forgotten. Strip before the cap, so the cap
-    // measures what is actually relayed.
-    const rawReason = asTrimmedString(stripAskFenceFromReason(reasonRaw));
-    const reason = rawReason !== null && rawReason.length > MAX_REASON_CHARS
-      ? rawReason.slice(0, MAX_REASON_CHARS)
-      : rawReason;
-
-    if (decisionText !== 'allow' && decisionText !== 'deny') {
+    const verdict = judgeAnswer(
+      {
+        pendingCount: this.asks.size,
+        isPending: (askId) => this.asks.has(askId),
+        wasSettled: (askId) => this.settledAskIds.has(askId),
+        voiced: () => this.voicing.voiced(),
+        entrySeqOf: (askId) => this.asks.get(askId)!.entrySeq,
+        talkerCauseTags: () => this.ports.currentTalkerCauseTags(),
+      },
+      askIdRaw,
+      decisionRaw,
+      reasonRaw,
+    );
+    if (verdict.kind === 'receipt') return { receipt: verdict.receipt };
+    if (verdict.kind === 'refused') {
       this.voicing.revoiceCurrent();
-      return { receipt: INVALID_DECISION_RECEIPT, refusal: 'unreadable decision' };
+      return { receipt: verdict.receipt, refusal: verdict.refusal };
     }
-
-    let ask: BrokeredAsk | undefined;
-    if (askId !== null) {
-      ask = this.asks.get(askId);
-      if (!ask) {
-        // An already-settled ask is the replay path: a second allow for the
-        // same ask finds nothing here, which is what makes allow take
-        // effect exactly once, and the receipt says so.
-        if (this.settledAskIds.has(askId)) return { receipt: NOT_PENDING_RECEIPT };
-        // An id that never existed is something else: a typo or a
-        // fabrication, with the real request still pending. Reported as
-        // "no longer pending" it tells the user the request went away while
-        // it sits there waiting, so it refuses and re-reads instead.
-        this.voicing.revoiceCurrent();
-        return { receipt: UNKNOWN_ASK_RECEIPT, refusal: 'unknown ask id' };
-      }
-    } else {
-      // A bare answer binds to the one voiced ask; with exactly one voiced
-      // at a time there is nothing else it could honestly mean.
-      const voicedAskId = this.voicing.voiced()?.askId;
-      if (voicedAskId !== undefined) ask = this.asks.get(voicedAskId);
-    }
-    if (!ask) {
-      this.voicing.revoiceCurrent();
-      return { receipt: UNBOUND_RECEIPT, refusal: 'no ask bindable without an id' };
-    }
-
-    if (decisionText === 'deny') {
+    const ask = this.asks.get(verdict.askId)!;
+    const { reason } = verdict;
+    if (verdict.kind === 'deny') {
       this.ports.appendLog({
         type: 'ask_answer',
         loopPath: ask.request.loopPath,
@@ -495,47 +404,17 @@ export class PermissionBroker {
       this.settle(ask, { decision: 'deny', ...(reason !== null ? { reason } : {}) });
       return { receipt: DENY_RECEIPT };
     }
-
-    // allow
-    const voiced = this.voicing.voiced();
-    if (voiced?.askId !== ask.request.askId || voiced.voicedAtSeq === null) {
-      this.voicing.revoiceCurrent();
-      return {
-        receipt: NOT_VOICED_RECEIPT,
-        refusal: 'allow for an ask that is not the most recently voiced',
-      };
-    }
-    let qualifyingSeq: number | null = null;
-    let voicingInThisRun = false;
-    for (const tag of this.ports.currentTalkerCauseTags()) {
-      if (tag.kind === 'utterance' && tag.seq > voiced.voicedAtSeq) {
-        if (qualifyingSeq === null || tag.seq > qualifyingSeq) qualifyingSeq = tag.seq;
-      }
-      if (tag.kind === 'ask' && tag.seq === ask.entrySeq) {
-        voicingInThisRun = true;
-      }
-    }
-    if (qualifyingSeq === null || voicingInThisRun) {
-      this.voicing.revoiceCurrent();
-      return {
-        receipt: CONSENT_REFUSED_RECEIPT,
-        refusal: voicingInThisRun
-          ? 'allow from the run that carried the voicing'
-          : 'no user utterance after the ask was voiced',
-      };
-    }
-
     this.ports.appendLog({
       type: 'ask_answer',
       loopPath: ask.request.loopPath,
       content: `allow: ${ask.request.renderedRequest}`,
       // The consent-carrying cause: the qualifying utterance, so an audit
       // can trace every allow to the user words that granted it.
-      causedBy: qualifyingSeq,
+      causedBy: verdict.qualifyingSeq,
       data: {
         askId: ask.request.askId,
         decision: 'allow',
-        qualifyingUtteranceSeq: qualifyingSeq,
+        qualifyingUtteranceSeq: verdict.qualifyingSeq,
         ...(reason !== null ? { reason } : {}),
       },
     });
