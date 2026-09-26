@@ -38,6 +38,7 @@ import type {
 } from './types.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { parseWorkingTags } from './working-tags.js';
+import { assistantUsage, readUsage, turnText } from './pi-message.js';
 
 // ---------------------------------------------------------------------------
 // Normalized event types emitted to consumers
@@ -386,7 +387,7 @@ export class EventBridge {
       }
 
       if (this.workingTagsEnabled) {
-        const text = this.extractTurnText(piEvent);
+        const text = turnText(piEvent);
         if (text) {
           cortexEvent.textOutput = parseWorkingTags(text);
         }
@@ -467,118 +468,16 @@ export class EventBridge {
   }
 
   /**
-   * Extract the text content from a turn_end event.
-   * Pi-agent-core's turn_end event carries the assistant message for that turn.
-   */
-  private extractTurnText(piEvent: PiEvent): string | null {
-    // The turn_end event from pi-agent-core carries the assistant message.
-    // The structure varies, so we try multiple access patterns.
-
-    // Pattern 1: Direct text property
-    if (typeof piEvent['text'] === 'string') {
-      return piEvent['text'];
-    }
-
-    // Pattern 2: message.content as string
-    const message = piEvent['message'] as Record<string, unknown> | undefined;
-    if (message && typeof message['content'] === 'string') {
-      return message['content'];
-    }
-
-    // Pattern 3: message.content as array with text parts
-    if (message && Array.isArray(message['content'])) {
-      const textParts = (message['content'] as Array<{ type: string; text?: string }>)
-        .filter((part) => part.type === 'text' && typeof part.text === 'string')
-        .map((part) => part.text!);
-      if (textParts.length > 0) {
-        return textParts.join('');
-      }
-    }
-
-    // Pattern 4: result.content
-    const result = piEvent['result'] as Record<string, unknown> | undefined;
-    if (result && typeof result['content'] === 'string') {
-      return result['content'];
-    }
-
-    // Pattern 5: content on the content parts of the result
-    if (result && Array.isArray(result['content'])) {
-      const textParts = (result['content'] as Array<{ type: string; text?: string }>)
-        .filter((part) => part.type === 'text' && typeof part.text === 'string')
-        .map((part) => part.text!);
-      if (textParts.length > 0) {
-        return textParts.join('');
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Extract typed CortexUsage from a turn_end event.
-   *
-   * Pi-ai's AssistantMessage carries usage at message.usage with a nested
-   * cost object. This method navigates the opaque event data once so all
-   * subscribers receive clean, typed usage without duplicating extraction.
+   * Extract typed CortexUsage from a turn_end event, so all subscribers
+   * receive clean usage without navigating the opaque event data.
    */
   private extractUsage(piEvent: PiEvent): CortexUsage | null {
-    // Pattern 1: message.usage (pi-ai AssistantMessage, the primary path)
-    const message = piEvent['message'] as Record<string, unknown> | undefined;
-    if (message) {
-      const usage = this.buildUsageFromObject(message['usage']);
-      if (usage) {
-        if (typeof message['model'] === 'string') {
-          usage.model = message['model'];
-        }
-        return usage;
-      }
-    }
-
-    // Pattern 2: Direct usage property on the event
-    const directUsage = this.buildUsageFromObject(piEvent['usage']);
-    if (directUsage) return directUsage;
-
-    // Pattern 3: result.usage
-    const result = piEvent['result'] as Record<string, unknown> | undefined;
-    if (result) {
-      const resultUsage = this.buildUsageFromObject(result['usage']);
-      if (resultUsage) return resultUsage;
-    }
-
-    return null;
-  }
-
-  /**
-   * Build a CortexUsage from a raw usage-shaped object.
-   * Returns null if the object is not a valid usage structure.
-   */
-  private buildUsageFromObject(raw: unknown): CortexUsage | null {
-    if (!raw || typeof raw !== 'object') return null;
-
-    const u = raw as Record<string, unknown>;
-    const input = typeof u['input'] === 'number' ? u['input'] : 0;
-    const output = typeof u['output'] === 'number' ? u['output'] : 0;
-    const cacheRead = typeof u['cacheRead'] === 'number' ? u['cacheRead'] : 0;
-    const cacheWrite = typeof u['cacheWrite'] === 'number' ? u['cacheWrite'] : 0;
-    const totalTokens = typeof u['totalTokens'] === 'number' ? u['totalTokens'] : input + output;
-
-    // At least one non-zero field to consider this a valid usage object
-    if (input === 0 && output === 0 && cacheRead === 0 && totalTokens === 0) return null;
-
-    let cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-    const costObj = u['cost'];
-    if (costObj && typeof costObj === 'object') {
-      const c = costObj as Record<string, unknown>;
-      cost = {
-        input: typeof c['input'] === 'number' ? c['input'] : 0,
-        output: typeof c['output'] === 'number' ? c['output'] : 0,
-        cacheRead: typeof c['cacheRead'] === 'number' ? c['cacheRead'] : 0,
-        cacheWrite: typeof c['cacheWrite'] === 'number' ? c['cacheWrite'] : 0,
-        total: typeof c['total'] === 'number' ? c['total'] : 0,
-      };
-    }
-
-    return { input, output, cacheRead, cacheWrite, totalTokens, cost };
+    const nonZero = { requireNonZero: true };
+    return (
+      assistantUsage(piEvent['message'], nonZero) ??
+      readUsage(piEvent['usage'], nonZero) ??
+      readUsage((piEvent['result'] as Record<string, unknown> | undefined)?.['usage'], nonZero)
+    );
   }
 
   /**

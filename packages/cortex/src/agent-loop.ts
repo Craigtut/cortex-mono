@@ -39,6 +39,19 @@ import {
   isRetryableCategory,
 } from './retry-policy.js';
 import { parseWorkingTags } from './working-tags.js';
+import {
+  assistantText,
+  assistantUsage,
+  findLastAssistant,
+  messageHasText,
+  messageHasToolCalls,
+  toolCallArguments,
+  toolCallNames,
+  turnInputTokens,
+  turnText,
+  userMessageText,
+  withPlaceholderContent,
+} from './pi-message.js';
 // pi-ai 0.80 moved the static catalog reads off the root to the durable
 // `providers/all` entrypoint (`getModel`/`getModels` on root are deprecated
 // compat aliases). These are the non-deprecated replacements.
@@ -2021,30 +2034,11 @@ export class AgentLoop {
       return true;
     }
     if (!isAborted) return false;
-    return !AgentLoop.messageHasText(msg) || AgentLoop.messageHasToolCalls(msg);
+    return !messageHasText(msg) || messageHasToolCalls(msg);
   }
 
   /** Whether an assistant message carries non-empty text content. */
-  private static messageHasText(msg: Record<string, unknown>): boolean {
-    const content = msg['content'];
-    if (typeof content === 'string') return content.length > 0;
-    if (!Array.isArray(content)) return false;
-    return content.some((part) => {
-      const p = part as Record<string, unknown>;
-      return p['type'] === 'text' && typeof p['text'] === 'string' && p['text'].length > 0;
-    });
-  }
-
   /** Whether an assistant message contains tool-call content parts. */
-  private static messageHasToolCalls(msg: Record<string, unknown>): boolean {
-    const content = msg['content'];
-    if (!Array.isArray(content)) return false;
-    return content.some((part) => {
-      const type = (part as Record<string, unknown>)['type'];
-      return type === 'toolCall' || type === 'tool_use';
-    });
-  }
-
   /**
    * Whether trimming trailing failure messages would leave a transcript that
    * `agent.continue()` can resume (last message is a user or tool-result, not a
@@ -3023,7 +3017,7 @@ export class AgentLoop {
       this.checkForSilentError(result);
 
       // Capture usage from the AssistantMessage response
-      this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      this._lastDirectUsage = assistantUsage(result);
       this.recordUtilityUsage(options?.usageCategory ?? 'direct', this._lastDirectUsage);
 
       this.logger.debug('directComplete', {
@@ -3032,7 +3026,7 @@ export class AgentLoop {
       });
 
       // Extract text from the AssistantMessage response
-      return this.extractTextFromAssistantMessage(result);
+      return assistantText(result);
     } catch (err) {
       throw this.surfaceDirectError(err, keyError, options?.signal);
     }
@@ -3125,7 +3119,7 @@ export class AgentLoop {
       this.checkForSilentError(result);
 
       // Capture usage from the AssistantMessage response
-      this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      this._lastDirectUsage = assistantUsage(result);
       this.recordUtilityUsage(options?.usageCategory ?? 'structured', this._lastDirectUsage);
 
       this.logger.debug('structuredComplete', {
@@ -3137,7 +3131,7 @@ export class AgentLoop {
       // Extract tool call arguments from the response
       return this.primaryModel.capabilities?.structuredOutput === 'json-schema'
         ? parseSchemaCompletion(result, schema)
-        : this.extractToolCallArgs(result, toolName);
+        : toolCallArguments(result, toolName);
     } catch (err) {
       throw this.surfaceDirectError(err, keyError, options?.signal);
     }
@@ -3188,32 +3182,6 @@ export class AgentLoop {
       err.name = 'AbortError';
       throw err;
     }
-  }
-
-  private extractToolCallArgs(result: unknown, toolName: string): Record<string, unknown> | null {
-    if (!result || typeof result !== 'object') return null;
-    const msg = result as Record<string, unknown>;
-
-    // pi-ai AssistantMessage has content: Array<ContentPart>
-    // Tool calls appear as { type: 'toolCall', name, arguments }
-    const content = msg['content'];
-    if (!Array.isArray(content)) return null;
-
-    for (const part of content) {
-      if (
-        part &&
-        typeof part === 'object' &&
-        (part as Record<string, unknown>)['type'] === 'toolCall' &&
-        (part as Record<string, unknown>)['name'] === toolName
-      ) {
-        const args = (part as Record<string, unknown>)['arguments'];
-        if (args && typeof args === 'object') {
-          return args as Record<string, unknown>;
-        }
-      }
-    }
-
-    return null;
   }
 
   // -----------------------------------------------------------------------
@@ -3862,12 +3830,7 @@ export class AgentLoop {
     // have been checkpointed from previous sessions with tool execution bugs.
     const now = Date.now();
     const sanitized = messages.map(msg => {
-      const content = (msg as unknown as Record<string, unknown>)['content'];
-      let patched = msg;
-      if (content === undefined || content === null ||
-          (Array.isArray(content) && content.length === 0)) {
-        patched = { ...patched, content: [{ type: 'text' as const, text: '(no output)' }] };
-      }
+      let patched = withPlaceholderContent(msg);
       // Migrate messages from old sessions that predate the timestamp field
       if (patched.timestamp == null) {
         patched = { ...patched, timestamp: now };
@@ -4371,7 +4334,7 @@ export class AgentLoop {
       this.checkForSilentError(result);
 
       // Capture usage from utility model calls
-      this._lastDirectUsage = this.extractUsageFromAssistantMessage(result);
+      this._lastDirectUsage = assistantUsage(result);
       this.recordUtilityUsage(options?.usageCategory ?? 'utility', this._lastDirectUsage);
 
       this.logger.debug('utilityComplete', {
@@ -4379,7 +4342,7 @@ export class AgentLoop {
         usage: this._lastDirectUsage,
       });
 
-      return this.extractTextFromAssistantMessage(result);
+      return assistantText(result);
     } catch (err) {
       throw this.surfaceDirectError(err, keyError, options?.signal);
     }
@@ -5563,14 +5526,7 @@ export class AgentLoop {
     // Sanitize messages before token estimation or compaction.
     return {
       ...result,
-      messages: result.messages.map(msg => {
-        const content = (msg as unknown as Record<string, unknown>)['content'];
-        if (content === undefined || content === null ||
-            (Array.isArray(content) && content.length === 0)) {
-          return { ...msg, content: [{ type: 'text' as const, text: '(no output)' }] };
-        }
-        return msg;
-      }),
+      messages: result.messages.map(withPlaceholderContent),
     };
   }
 
@@ -5991,7 +5947,7 @@ export class AgentLoop {
           // Fallback: extract input tokens from raw event data if EventBridge
           // could not build typed usage (e.g., provider returned partial data).
           // Only for parent events (child context is irrelevant here).
-          const inputTokens = this.extractInputTokens(event.data);
+          const inputTokens = turnInputTokens(event.data);
           if (inputTokens > 0) {
             this.compactionManager.updateCurrentContextTokenCount(inputTokens);
 
@@ -6026,7 +5982,7 @@ export class AgentLoop {
           } else {
             // If the bridge did not parse (working tags disabled), still emit
             // with raw text for non-tag scenarios
-            const text = this.extractTurnTextFromEvent(event.data);
+            const text = turnText(event.data);
             if (text) {
               const output = parseWorkingTags(text);
               for (const handler of this.turnCompleteHandlers) {
@@ -6043,115 +5999,6 @@ export class AgentLoop {
         }
       }),
     );
-  }
-
-  /**
-   * Extract text from a turn_end event's raw data.
-   */
-  private extractTurnTextFromEvent(data: unknown): string | null {
-    if (!data || typeof data !== 'object') {
-      return null;
-    }
-
-    const event = data as Record<string, unknown>;
-
-    if (typeof event['text'] === 'string') {
-      return event['text'];
-    }
-
-    const message = event['message'] as Record<string, unknown> | undefined;
-    if (message && typeof message['content'] === 'string') {
-      return message['content'];
-    }
-
-    // pi's own shape: content as typed parts.
-    if (message && Array.isArray(message['content'])) {
-      const textParts = (message['content'] as Array<{ type?: unknown; text?: unknown }>)
-        .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-        .map((part) => part.text as string);
-      if (textParts.length > 0) return textParts.join('');
-    }
-
-    return null;
-  }
-
-  /**
-   * Extract input token count from a turn_end event's raw data.
-   *
-   * Pi-agent-core's turn_end event carries the AssistantMessage which
-   * includes usage.input from pi-ai. This is the total input token count
-   * for that LLM call (an assignment, not a delta).
-   *
-   * Follows the same multi-pattern extraction approach as BudgetGuard's
-   * extractCost to handle variations in pi-agent-core event structure.
-   */
-  private extractInputTokens(data: unknown): number {
-    if (!data || typeof data !== 'object') {
-      return 0;
-    }
-
-    const event = data as Record<string, unknown>;
-
-    // Pi-ai's Usage type has: input, output, cacheRead, cacheWrite, totalTokens.
-    // With prefix caching, tokens shift between input/cacheRead/cacheWrite.
-    // For compaction, we need the TOTAL context size the model saw:
-    // input + cacheRead + cacheWrite = total input tokens.
-    // Fallback to totalTokens - output if individual fields are unavailable.
-
-    // Pattern 1: message.usage (pi-ai AssistantMessage structure, most common)
-    const message = event['message'] as Record<string, unknown> | undefined;
-    if (message) {
-      const msgUsage = message['usage'] as Record<string, unknown> | undefined;
-      if (msgUsage) {
-        const totalInput = this.computeTotalInput(msgUsage);
-        if (totalInput > 0) return totalInput;
-      }
-    }
-
-    // Pattern 2: Direct usage property on the event
-    const eventUsage = event['usage'] as Record<string, unknown> | undefined;
-    if (eventUsage) {
-      const totalInput = this.computeTotalInput(eventUsage);
-      if (totalInput > 0) return totalInput;
-    }
-
-    // Pattern 3: result.usage
-    const result = event['result'] as Record<string, unknown> | undefined;
-    if (result) {
-      const resultUsage = result['usage'] as Record<string, unknown> | undefined;
-      if (resultUsage) {
-        const totalInput = this.computeTotalInput(resultUsage);
-        if (totalInput > 0) return totalInput;
-      }
-    }
-
-    return 0;
-  }
-
-  /**
-   * Compute total input tokens from a pi-ai Usage object.
-   * With prefix caching, tokens shift between input/cacheRead/cacheWrite.
-   * The real context size is `input + cacheRead + cacheWrite`.
-   * Falls back to `totalTokens - output` if individual fields are missing.
-   */
-  private computeTotalInput(usage: Record<string, unknown>): number {
-    const input = typeof usage['input'] === 'number' ? usage['input'] : 0;
-    const cacheRead = typeof usage['cacheRead'] === 'number' ? usage['cacheRead'] : 0;
-    const cacheWrite = typeof usage['cacheWrite'] === 'number' ? usage['cacheWrite'] : 0;
-
-    // Primary: input + cacheRead + cacheWrite = total tokens the model saw as input
-    if (input + cacheRead + cacheWrite > 0) {
-      return input + cacheRead + cacheWrite;
-    }
-
-    // Fallback: totalTokens - output
-    const totalTokens = typeof usage['totalTokens'] === 'number' ? usage['totalTokens'] : 0;
-    const output = typeof usage['output'] === 'number' ? usage['output'] : 0;
-    if (totalTokens > output) {
-      return totalTokens - output;
-    }
-
-    return 0;
   }
 
   // -----------------------------------------------------------------------
@@ -6197,119 +6044,11 @@ export class AgentLoop {
     return !this._isPrompting;
   }
 
-  /**
-   * Extract text content from a pi-ai AssistantMessage response.
-   *
-   * Pi-ai's complete() returns an AssistantMessage with either:
-   * - A string `content` field
-   * - A `content` array with typed parts (text, thinking, toolCall)
-   */
-  private extractTextFromAssistantMessage(result: unknown): string {
-    if (!result || typeof result !== 'object') {
-      return '';
-    }
-
-    const msg = result as Record<string, unknown>;
-
-    // Direct string content
-    if (typeof msg['content'] === 'string') {
-      return msg['content'];
-    }
-
-    // Content array: extract text parts
-    if (Array.isArray(msg['content'])) {
-      return (msg['content'] as Array<Record<string, unknown>>)
-        .filter(part => part['type'] === 'text' && typeof part['text'] === 'string')
-        .map(part => part['text'] as string)
-        .join('');
-    }
-
-    // Fallback: try .text field directly
-    if (typeof msg['text'] === 'string') {
-      return msg['text'];
-    }
-
-    return '';
-  }
-
-  /**
-   * Extract a summary of tool calls from a child agent's conversation history.
-   * Scans for toolResult messages and builds a name + duration list.
-   */
+  /** Tool calls (name only) made across a child agent's conversation history. */
   private extractToolCallSummary(
     history: unknown[],
   ): Array<{ name: string; durationMs: number; error?: string }> {
-    const calls: Array<{ name: string; durationMs: number; error?: string }> = [];
-
-    for (const msg of history) {
-      if (!msg || typeof msg !== 'object') continue;
-      const m = msg as Record<string, unknown>;
-
-      // Look for assistant messages with tool calls in content array
-      if (m['role'] !== 'assistant' || !Array.isArray(m['content'])) continue;
-
-      for (const part of m['content'] as Array<Record<string, unknown>>) {
-        if (part['type'] === 'tool_use' || part['type'] === 'toolCall') {
-          const name = String(part['name'] ?? part['toolName'] ?? 'unknown');
-          calls.push({ name, durationMs: 0 });
-        }
-      }
-    }
-
-    return calls;
-  }
-
-  /**
-   * Extract usage data from a pi-ai AssistantMessage response.
-   *
-   * The AssistantMessage.usage field has the structure:
-   *   { input, output, cacheRead, cacheWrite, totalTokens,
-   *     cost: { input, output, cacheRead, cacheWrite, total } }
-   *
-   * Returns null if usage data is not present or not in the expected format.
-   */
-  private extractUsageFromAssistantMessage(result: unknown): CortexUsage | null {
-    if (!result || typeof result !== 'object') return null;
-
-    const msg = result as Record<string, unknown>;
-    const usage = msg['usage'];
-    if (!usage || typeof usage !== 'object') return null;
-
-    const u = usage as Record<string, unknown>;
-
-    // Validate required numeric fields
-    const input = typeof u['input'] === 'number' ? u['input'] : 0;
-    const output = typeof u['output'] === 'number' ? u['output'] : 0;
-    const cacheRead = typeof u['cacheRead'] === 'number' ? u['cacheRead'] : 0;
-    const cacheWrite = typeof u['cacheWrite'] === 'number' ? u['cacheWrite'] : 0;
-    const totalTokens = typeof u['totalTokens'] === 'number' ? u['totalTokens'] : input + output;
-
-    // Extract cost breakdown
-    const costObj = u['cost'];
-    let cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-    if (costObj && typeof costObj === 'object') {
-      const c = costObj as Record<string, unknown>;
-      cost = {
-        input: typeof c['input'] === 'number' ? c['input'] : 0,
-        output: typeof c['output'] === 'number' ? c['output'] : 0,
-        cacheRead: typeof c['cacheRead'] === 'number' ? c['cacheRead'] : 0,
-        cacheWrite: typeof c['cacheWrite'] === 'number' ? c['cacheWrite'] : 0,
-        total: typeof c['total'] === 'number' ? c['total'] : 0,
-      };
-    }
-
-    // Extract model if available
-    const model = typeof msg['model'] === 'string' ? msg['model'] : undefined;
-
-    return {
-      input,
-      output,
-      cacheRead,
-      cacheWrite,
-      totalTokens,
-      cost,
-      ...(model !== undefined && { model }),
-    };
+    return history.flatMap((msg) => toolCallNames(msg).map((name) => ({ name, durationMs: 0 })));
   }
 
   /**
@@ -7335,17 +7074,7 @@ export class AgentLoop {
       for (const raw of messages.slice(preDeliveryCount + 1)) {
         const msg = raw as unknown as Record<string, unknown>;
         if (msg['role'] !== 'user') continue;
-        const content = msg['content'];
-        const text = typeof content === 'string'
-          ? content
-          : Array.isArray(content)
-            ? content
-                .map((part) => {
-                  const p = part as Record<string, unknown>;
-                  return typeof p['text'] === 'string' ? p['text'] : '';
-                })
-                .join('')
-            : '';
+        const text = userMessageText(msg);
         if (text.trim().length > 0) injected.push(text);
       }
       messages.splice(preDeliveryCount, messages.length - preDeliveryCount);
@@ -7792,10 +7521,7 @@ export class AgentLoop {
       // prompt() returns void; extract the last assistant message from
       // the child's conversation history.
       const history = childAgent.getConversationHistory();
-      const lastAssistant = [...history].reverse().find(
-        m => (m as unknown as Record<string, unknown>)['role'] === 'assistant',
-      );
-      const output = this.extractTextFromAssistantMessage(lastAssistant);
+      const output = assistantText(findLastAssistant(history));
 
       const result: SubAgentResult = {
         output,
@@ -7833,11 +7559,7 @@ export class AgentLoop {
       // A timed-out run rejects with an abort-shaped failure; salvage the
       // partial output so the spawner sees what the child got done.
       const partialOutput = timedOut && !cancelled
-        ? this.extractTextFromAssistantMessage(
-            [...childAgent.getConversationHistory()].reverse().find(
-              m => (m as unknown as Record<string, unknown>)['role'] === 'assistant',
-            ),
-          )
+        ? assistantText(findLastAssistant(childAgent.getConversationHistory()))
         : '';
 
       const result: SubAgentResult = {

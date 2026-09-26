@@ -1,13 +1,12 @@
 /**
- * Tests for CortexUsage type and AgentLoop usage extraction.
- *
- * Since AgentLoop.extractUsageFromAssistantMessage() is private,
- * we test it indirectly through the public getLastDirectUsage() API
- * using mock pi-ai responses.
+ * Tests for the CortexUsage type and usage extraction from pi-ai
+ * AssistantMessages (pi-message.ts assistantUsage, used by AgentLoop's
+ * direct completions and the event bridge).
  */
 
 import { describe, it, expect } from 'vitest';
 import type { CortexUsage } from '../../src/types.js';
+import { assistantUsage } from '../../src/pi-message.js';
 
 // ---------------------------------------------------------------------------
 // CortexUsage type shape
@@ -58,42 +57,7 @@ describe('CortexUsage', () => {
 // ---------------------------------------------------------------------------
 
 describe('Usage extraction patterns', () => {
-  /**
-   * Simulate the extraction logic that AgentLoop.extractUsageFromAssistantMessage
-   * uses. This mirrors the private method for direct testing.
-   */
-  function extractUsage(result: unknown): CortexUsage | null {
-    if (!result || typeof result !== 'object') return null;
-
-    const msg = result as Record<string, unknown>;
-    const usage = msg['usage'];
-    if (!usage || typeof usage !== 'object') return null;
-
-    const u = usage as Record<string, unknown>;
-
-    const input = typeof u['input'] === 'number' ? u['input'] : 0;
-    const output = typeof u['output'] === 'number' ? u['output'] : 0;
-    const cacheRead = typeof u['cacheRead'] === 'number' ? u['cacheRead'] : 0;
-    const cacheWrite = typeof u['cacheWrite'] === 'number' ? u['cacheWrite'] : 0;
-    const totalTokens = typeof u['totalTokens'] === 'number' ? u['totalTokens'] : input + output;
-
-    const costObj = u['cost'];
-    let cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-    if (costObj && typeof costObj === 'object') {
-      const c = costObj as Record<string, unknown>;
-      cost = {
-        input: typeof c['input'] === 'number' ? c['input'] : 0,
-        output: typeof c['output'] === 'number' ? c['output'] : 0,
-        cacheRead: typeof c['cacheRead'] === 'number' ? c['cacheRead'] : 0,
-        cacheWrite: typeof c['cacheWrite'] === 'number' ? c['cacheWrite'] : 0,
-        total: typeof c['total'] === 'number' ? c['total'] : 0,
-      };
-    }
-
-    const model = typeof msg['model'] === 'string' ? msg['model'] : undefined;
-
-    return { input, output, cacheRead, cacheWrite, totalTokens, cost, model };
-  }
+  const extractUsage = (result: unknown): CortexUsage | null => assistantUsage(result);
 
   it('should extract usage from a full pi-ai AssistantMessage', () => {
     const assistantMessage = {

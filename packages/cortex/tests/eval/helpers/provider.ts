@@ -9,6 +9,7 @@
  */
 
 import type { CortexUsage } from '../../../src/types.js';
+import { assistantText, assistantUsage } from '../../../src/pi-message.js';
 import type { CompleteFn } from '../../../src/compaction/compaction.js';
 import { costTracker } from './cost-tracker.js';
 import {
@@ -76,57 +77,6 @@ export async function getEvalModel(providerName: string = DEFAULT_EVAL_PROVIDER)
 }
 
 // ---------------------------------------------------------------------------
-// Usage extraction (mirrors AgentLoop.extractUsageFromAssistantMessage)
-// ---------------------------------------------------------------------------
-
-function extractUsage(result: unknown): CortexUsage | null {
-  if (!result || typeof result !== 'object') return null;
-  const msg = result as Record<string, unknown>;
-  const usage = msg['usage'];
-  if (!usage || typeof usage !== 'object') return null;
-
-  const u = usage as Record<string, unknown>;
-  const input = typeof u['input'] === 'number' ? u['input'] : 0;
-  const output = typeof u['output'] === 'number' ? u['output'] : 0;
-  const cacheRead = typeof u['cacheRead'] === 'number' ? u['cacheRead'] : 0;
-  const cacheWrite = typeof u['cacheWrite'] === 'number' ? u['cacheWrite'] : 0;
-  const totalTokens = typeof u['totalTokens'] === 'number' ? u['totalTokens'] : input + output;
-
-  const costObj = u['cost'];
-  let cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-  if (costObj && typeof costObj === 'object') {
-    const c = costObj as Record<string, unknown>;
-    cost = {
-      input: typeof c['input'] === 'number' ? c['input'] : 0,
-      output: typeof c['output'] === 'number' ? c['output'] : 0,
-      cacheRead: typeof c['cacheRead'] === 'number' ? c['cacheRead'] : 0,
-      cacheWrite: typeof c['cacheWrite'] === 'number' ? c['cacheWrite'] : 0,
-      total: typeof c['total'] === 'number' ? c['total'] : 0,
-    };
-  }
-
-  const model = typeof msg['model'] === 'string' ? msg['model'] : undefined;
-  return { input, output, cacheRead, cacheWrite, totalTokens, cost, model };
-}
-
-function extractText(result: unknown): string {
-  if (!result || typeof result !== 'object') return '';
-  const msg = result as Record<string, unknown>;
-
-  if (typeof msg.content === 'string') return msg.content;
-
-  if (Array.isArray(msg.content)) {
-    return (msg.content as Array<Record<string, unknown>>)
-      .filter(part => part.type === 'text' && typeof part.text === 'string')
-      .map(part => part.text as string)
-      .join('');
-  }
-
-  if (typeof msg.text === 'string') return msg.text;
-  return '';
-}
-
-// ---------------------------------------------------------------------------
 // Complete function (tracked)
 // ---------------------------------------------------------------------------
 
@@ -169,8 +119,8 @@ export async function evalComplete(
     }
   }
 
-  const text = extractText(result);
-  const usage = extractUsage(result);
+  const text = assistantText(result);
+  const usage = assistantUsage(result);
 
   if (usage) {
     costTracker.record(usage);
