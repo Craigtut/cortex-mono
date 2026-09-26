@@ -29,6 +29,8 @@ import { UsageLedger } from './facade/usage-ledger.js';
 import { StateEmitter } from './facade/state-emitter.js';
 import { LogRecorder } from './facade/log-recorder.js';
 import { ResolutionRecorder } from './facade/resolution-recorder.js';
+import { PromptTracker, Settlement, yieldMacrotask } from './facade/settlement.js';
+import type { SettlementTerm } from './facade/settlement.js';
 import type { UsageReadings } from './facade/usage-ledger.js';
 import type {
   CortexAgentConfig,
@@ -458,11 +460,6 @@ export interface CortexDeliverOptions {
 
 const DEFAULT_STATE_DEBOUNCE_MS = 500;
 
-/** One macrotask yield: lets pending microtask cascades finish. */
-function yieldMacrotask(): Promise<void> {
-  return new Promise((resolve) => setImmediate(resolve));
-}
-
 /** Chars of a provider error message carried into a failure delivery. */
 const MAX_FAILURE_DETAIL_CHARS = 300;
 
@@ -597,9 +594,8 @@ export class CortexAgent {
   /** Serializes facade prompt() calls (concurrent prompts queue, never throw). */
   private promptChain: Promise<void> = Promise.resolve();
   /** Facade prompts accepted but not yet settled (chain-queued or running). */
-  private pendingFacadePrompts = 0;
-  /** Waiters released whenever pendingFacadePrompts returns to zero. */
-  private promptSettlers: Array<() => void> = [];
+  private readonly prompts = new PromptTracker();
+  private readonly settlement: Settlement;
 
   /**
    * Passthrough only: seq of the utterance whose facade-initiated reasoner
@@ -700,6 +696,7 @@ export class CortexAgent {
       this.wireLogProducers();
     }
     this.wireStateTriggers();
+    this.settlement = this.buildSettlement();
     // Last, because it reads the assembly back: the loops are built, the
     // aggregate guard exists, and every note below is a statement about what
     // this constructor just produced.
@@ -1641,7 +1638,7 @@ export class CortexAgent {
     }
     this.resolution.noteUnwiredIfNeeded();
 
-    this.pendingFacadePrompts += 1;
+    this.prompts.begin();
     const run = this.promptChain.then(async () => {
       // Wait for gate quiescence, then act in the SAME frame: between the
       // idle wait resolving and this continuation running, an unrelated
@@ -1674,8 +1671,7 @@ export class CortexAgent {
       }
     });
     const settle = (): void => {
-      this.pendingFacadePrompts -= 1;
-      this.notifyPromptSettled();
+      this.prompts.end();
     };
     this.promptChain = run.then(settle, settle);
     return run;
@@ -1686,7 +1682,7 @@ export class CortexAgent {
     const talker = this.talker!;
     this.resolution.noteUnwiredIfNeeded();
     this.preemptIdleDigestion();
-    this.pendingFacadePrompts += 1;
+    this.prompts.begin();
     try {
       const entry = this.recorder.append({
         type: 'utterance',
@@ -1725,21 +1721,8 @@ export class CortexAgent {
         if (!talker.isLoopActive) return undefined;
       }
     } finally {
-      this.pendingFacadePrompts -= 1;
-      this.notifyPromptSettled();
+      this.prompts.end();
     }
-  }
-
-  private notifyPromptSettled(): void {
-    if (this.pendingFacadePrompts > 0 || this.promptSettlers.length === 0) return;
-    const waiters = this.promptSettlers.splice(0);
-    for (const resolve of waiters) resolve();
-  }
-
-  /** Resolves once no facade prompt is queued or running. */
-  private waitForPromptSettled(): Promise<void> {
-    if (this.pendingFacadePrompts === 0) return Promise.resolve();
-    return new Promise((resolve) => this.promptSettlers.push(resolve));
   }
 
   /**
@@ -2316,7 +2299,7 @@ export class CortexAgent {
     if (
       this.reasoner.isLoopActive ||
       (this.talker?.isLoopActive ?? false) ||
-      this.pendingFacadePrompts > 0 ||
+      this.prompts.pending ||
       this.reasoner.getSubAgentManager().activeCount > 0 ||
       (this.lookups?.activeCount ?? 0) > 0
     ) {
@@ -2442,7 +2425,7 @@ export class CortexAgent {
    * this keys on the talker.
    */
   get conversationIdle(): boolean {
-    return this.pendingFacadePrompts === 0 && !this.conversationLoop.isLoopActive;
+    return this.settlement.conversationIdle;
   }
 
   /**
@@ -2459,28 +2442,12 @@ export class CortexAgent {
    * one thing this predicate exists to rule out.
    */
   get workSettled(): boolean {
-    return (
-      this.conversationIdle &&
-      !this.reasoner.isLoopActive &&
-      this.reasoner.getSubAgentManager().activeCount === 0 &&
-      (this.lookups?.activeCount ?? 0) === 0 &&
-      this.reasoner.pendingWakeDeliveryCount === 0 &&
-      (this.talker?.pendingWakeDeliveryCount ?? 0) === 0 &&
-      (this.router?.pendingDeliveryCount ?? 0) === 0 &&
-      this.getPendingAsks().length === 0
-    );
+    return this.settlement.workSettled;
   }
 
   /** Resolve once {@link conversationIdle} holds. */
   async waitForConversationIdle(): Promise<void> {
-    for (;;) {
-      if (this.pendingFacadePrompts > 0) {
-        await this.waitForPromptSettled();
-        continue;
-      }
-      await this.conversationLoop.waitForLoopIdle();
-      if (this.conversationIdle) return;
-    }
+    return this.settlement.waitForConversationIdle();
   }
 
   /**
@@ -2491,64 +2458,86 @@ export class CortexAgent {
    * verdict.
    */
   async waitForWorkSettled(): Promise<void> {
-    for (;;) {
-      if (this.pendingFacadePrompts > 0) {
-        await this.waitForPromptSettled();
-        continue;
-      }
-      await this.reasoner.waitForLoopIdle();
-      if (this.talker) {
-        await this.talker.waitForLoopIdle();
-        if (this.router && this.router.pendingDeliveryCount > 0) {
-          // Held wake deliveries start talker runs when they land; wait
-          // event-driven on the router rather than spinning.
-          await this.router.waitForDeliveriesSettled();
-          continue;
-        }
-      }
+    return this.settlement.waitForWorkSettled();
+  }
 
-      const manager = this.reasoner.getSubAgentManager();
-      const activeIds = manager.getActiveTaskIds();
-      if (activeIds.length > 0) {
-        const completions = activeIds
+  /** The settlement terms, in wait order, for this session's topology. */
+  private buildSettlement(): Settlement {
+    const gate = (loop: AgentLoop): SettlementTerm => ({
+      name: `${loop.loopPath}-gate`,
+      pending: () => loop.isLoopActive,
+      settled: () => loop.waitForLoopIdle(),
+    });
+    // Parked wake deliveries have no settle signal of their own; they start
+    // a run when they land, which the gate terms then wait out.
+    const parkedWakes = (loop: AgentLoop): SettlementTerm => ({
+      name: `${loop.loopPath}-parked-wakes`,
+      pending: () => loop.pendingWakeDeliveryCount > 0,
+      settled: () => null,
+    });
+    const manager = this.reasoner.getSubAgentManager();
+    const subAgents: SettlementTerm = {
+      name: 'sub-agents',
+      pending: () => manager.activeCount > 0,
+      settled: async () => {
+        const completions = manager.getActiveTaskIds()
           .map((taskId) => manager.get(taskId)?.completion)
           .filter((completion) => completion !== undefined);
         await Promise.all(completions);
         await yieldMacrotask();
-        continue;
-      }
-
-      // Active quick lookups: their settlement enqueues router deliveries
-      // and talker wakes, so loop back for a full re-check afterwards.
-      if (this.lookups && this.lookups.activeCount > 0) {
-        await this.lookups.waitForIdle();
-        await yieldMacrotask();
-        continue;
-      }
-
-      // Pending asks block on a settlement signal, never on a polling
-      // yield: an ask can outlive the child that raised it, and a
-      // setImmediate spin would otherwise run hot for as long as it stays
-      // unanswered. Two registries, two signals. Loop asks have the loop's
-      // own; broker-minted network asks have none, so they wait on the next
-      // log append, which every broker settlement path (answer, timeout,
-      // abort, drain) performs before resolving the blocked resolver.
-      if (this.getPendingAsks().length > 0) {
-        await (this.reasoner.getPendingAsks().length > 0
-          ? this.reasoner.waitForAskSettlement()
-          : this.recorder.waitForNextAppend());
-        continue;
-      }
-
-      if (!this.workSettled) {
-        await yieldMacrotask();
-        continue;
-      }
-      // Confirm across one macrotask: a cascade between microtasks may
-      // still be about to enqueue gate work for a just-settled child.
-      await yieldMacrotask();
-      if (this.workSettled) return;
-    }
+      },
+    };
+    // Pending asks block on a settlement signal, never on a polling
+    // yield: an ask can outlive the child that raised it, and a
+    // setImmediate spin would otherwise run hot for as long as it stays
+    // unanswered. Two registries, two signals. Loop asks have the loop's
+    // own; broker-minted network asks have none, so they wait on the next
+    // log append, which every broker settlement path (answer, timeout,
+    // abort, drain) performs before resolving the blocked resolver.
+    const asks: SettlementTerm = {
+      name: 'permission-asks',
+      pending: () => this.getPendingAsks().length > 0,
+      settled: () => (this.reasoner.getPendingAsks().length > 0
+        ? this.reasoner.waitForAskSettlement()
+        : this.recorder.waitForNextAppend()),
+    };
+    const conversation = [this.prompts.term(), gate(this.conversationLoop)];
+    const talker = this.talker;
+    const router = this.router;
+    const lookups = this.lookups;
+    return new Settlement({
+      conversation,
+      work: [
+        this.prompts.term(),
+        gate(this.reasoner),
+        ...(talker ? [gate(talker)] : []),
+        // Held wake deliveries start talker runs when they land; wait
+        // event-driven on the router rather than spinning.
+        ...(router
+          ? [{
+              name: 'router-deliveries',
+              pending: () => router.pendingDeliveryCount > 0,
+              settled: () => router.waitForDeliveriesSettled(),
+            }]
+          : []),
+        subAgents,
+        // Active quick lookups: their settlement enqueues router deliveries
+        // and talker wakes, so the wait re-checks everything afterwards.
+        ...(lookups
+          ? [{
+              name: 'quick-lookups',
+              pending: () => lookups.activeCount > 0,
+              settled: async () => {
+                await lookups.waitForIdle();
+                await yieldMacrotask();
+              },
+            }]
+          : []),
+        asks,
+        parkedWakes(this.reasoner),
+        ...(talker ? [parkedWakes(talker)] : []),
+      ],
+    });
   }
 
   // -------------------------------------------------------------------------
