@@ -411,6 +411,37 @@ describe('unheard voicings', () => {
     expect(allowed.content[0]!.text).toBe('Approval passed along.');
   });
 
+  it('an older voicing destroyed after a newer one was handed over leaves consent alone', async () => {
+    const h = createHarness();
+    const { decisions } = requestAsk(h);
+    const anchor = h.lastVoicedSeq();
+    // A refusal re-reads the request: a second voicing, same anchor.
+    h.advance(3_001);
+    h.setTalkerCauseTags([]);
+    await callAnswerAsk(h, { decision: 'allow' });
+    expect(h.askVoicings).toHaveLength(2);
+
+    // The first, superseded voicing is destroyed; the second one stands.
+    expect(h.broker.voicing.noteDestroyed(h.askVoicings[0]!.deliveryId)).toBe(false);
+    expect(h.askVoicings).toHaveLength(2);
+
+    // The user's answer to the request they heard still binds.
+    h.setTalkerCauseTags([{ kind: 'utterance', seq: anchor + 50 }]);
+    const allowed = await callAnswerAsk(h, { decision: 'allow' });
+    expect(allowed.content[0]!.text).toBe('Approval passed along.');
+    await waitUntil(() => decisions.length === 1);
+  });
+
+  it('the newest voicing destroyed still withdraws consent and reads it again', async () => {
+    const h = createHarness();
+    requestAsk(h);
+    h.advance(3_001);
+    h.setTalkerCauseTags([]);
+    await callAnswerAsk(h, { decision: 'allow' });
+    expect(h.broker.voicing.noteDestroyed(h.askVoicings[1]!.deliveryId)).toBe(true);
+    expect(h.askVoicings).toHaveLength(3);
+  });
+
   it('unrelated destroyed content never touches the pending voicing', async () => {
     const h = createHarness();
     requestAsk(h);

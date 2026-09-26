@@ -84,6 +84,8 @@ interface VoicingRecord extends AskVoicingState {
   lastVoicedAtMs: number;
   /** Refusal re-reads delivered since the user could last have heard it fresh. */
   revoices: number;
+  /** The talker delivery carrying the newest voicing of this ask. */
+  latestDeliveryId: string | null;
 }
 
 /** What a refusal's re-read did (see {@link AskVoicing.revoiceCurrent}). */
@@ -153,6 +155,7 @@ export class AskVoicing {
       voicedAtSeq: null,
       lastVoicedAtMs: 0,
       revoices: 0,
+      latestDeliveryId: null,
     });
     this.queue.push(ask.askId);
     this.voiceNext();
@@ -258,14 +261,18 @@ export class AskVoicing {
 
   /**
    * A talker delivery was destroyed (the loop's dead-letter surface reports
-   * its id). If it is the current voicing, the user never heard it; any
-   * other delivery is another producer's content and is ignored. Returns
-   * whether it matched the current voicing.
+   * its id). Only the newest voicing of the current ask decides whether the
+   * user could have heard it: an older one superseded by a re-read that was
+   * handed over after it says nothing about that re-read, and withdrawing
+   * consent over it would discard an answer the user gave to the request
+   * they did hear. Any other delivery is another producer's content and is
+   * ignored. Returns whether it withdrew the current voicing.
    */
   noteDestroyed(deliveryId: string | undefined): boolean {
     if (deliveryId === undefined) return false;
     if (this.voicedAskId === null || this.ledger.get(deliveryId) !== this.voicedAskId) return false;
     this.ledger.delete(deliveryId);
+    if (this.records.get(this.voicedAskId)?.latestDeliveryId !== deliveryId) return false;
     return this.noteLost();
   }
 
@@ -453,6 +460,7 @@ export class AskVoicing {
       return false;
     }
     if (anchoring) record.voicedAtSeq = anchorSeq;
+    record.latestDeliveryId = deliveryId;
     this.remember(deliveryId, ask.askId);
     // A voicing reached the talker, so nothing is being held any more.
     this.held = false;
