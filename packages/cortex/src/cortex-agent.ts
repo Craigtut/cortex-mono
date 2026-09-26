@@ -27,6 +27,7 @@ import type {
 } from './facade/persisted-state.js';
 import { UsageLedger } from './facade/usage-ledger.js';
 import { StateEmitter } from './facade/state-emitter.js';
+import { LogRecorder } from './facade/log-recorder.js';
 import type { UsageReadings } from './facade/usage-ledger.js';
 import type {
   CortexAgentConfig,
@@ -87,13 +88,11 @@ import type {
   ObservationalMemoryState,
   ReflectionEvent,
 } from './compaction/index.js';
-import { SessionLog } from './session-log.js';
 import type {
   SessionLogEntry,
   SessionLogEntryType,
   SessionLogEvent,
   SessionLogSubscriber,
-  WakeClass,
 } from './session-log.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { errorMessageOf } from './error-classifier.js';
@@ -533,7 +532,7 @@ export class CortexAgent {
   /** The talker loop; null in passthrough. */
   private readonly talker: AgentLoop | null;
   private readonly mode: CortexAgentMode;
-  private readonly log: SessionLog;
+  private readonly recorder: LogRecorder;
   private readonly logger: CortexLogger;
 
   // Duplex machinery (null in passthrough).
@@ -627,8 +626,6 @@ export class CortexAgent {
   private pendingFacadePrompts = 0;
   /** Waiters released whenever pendingFacadePrompts returns to zero. */
   private promptSettlers: Array<() => void> = [];
-  /** Waiters released on the next log append (see waitForLogAppend). */
-  private logAppendWaiters: Array<() => void> = [];
 
   /**
    * Passthrough only: seq of the utterance whose facade-initiated reasoner
@@ -644,8 +641,6 @@ export class CortexAgent {
    * against the loop gate.
    */
   private activeCauseSeq: number | null = null;
-  /** Spawn lifecycle seq per live task, for completion causation. */
-  private readonly spawnSeqByTaskId = new Map<string, number>();
 
   private readonly usage = new UsageLedger();
   /**
@@ -697,15 +692,17 @@ export class CortexAgent {
       error: (message, data) => baseLogger.error(`[CortexAgent] ${message}`, data),
     };
 
-    this.log = new SessionLog({
+    this.recorder = new LogRecorder({
       ...(config.sessionLog?.maxEntries !== undefined
         ? { maxEntries: config.sessionLog.maxEntries }
         : {}),
       ...(config.sessionLog?.maxSubscriberBuffer !== undefined
         ? { maxSubscriberBuffer: config.sessionLog.maxSubscriberBuffer }
         : {}),
+      defaultCause: (loopPath) => this.defaultCauseSeqFor(loopPath),
+      persistResult: config.persistResult,
+      spillLoopPath: reasoner.loopPath,
       logger: this.logger,
-      onEvict: (evicted) => this.spillEvictedEntries(evicted, config),
     });
 
     this.stateEmitter = new StateEmitter({
@@ -716,6 +713,7 @@ export class CortexAgent {
       debounceMs: config.stateChangeDebounceMs ?? DEFAULT_STATE_DEBOUNCE_MS,
       logger: this.logger,
     });
+    this.recorder.onAppend(() => this.stateEmitter.markDirty());
     this.consumerBasePrompt = config.initialBasePrompt ?? null;
     this.idleDigestionDelayMs = config.duplex?.idleDigestionDelayMs ?? 10_000;
     // In duplex, create() has already wrapped this in the broker pipeline.
@@ -833,7 +831,7 @@ export class CortexAgent {
       spawnLookup: (question, causeSeq) => lookups.request(question, causeSeq),
       dispatchToReasoner: (message, causeSeq, options) =>
         this.dispatchToReasoner(message, causeSeq, options),
-      appendLog: (input) => this.appendEntry({
+      appendLog: (input) => this.recorder.append({
         type: input.type,
         loopPath: input.loopPath,
         content: input.content,
@@ -909,27 +907,29 @@ export class CortexAgent {
     talker.setToolResultInterceptor((info) => this.talkerToolResultGuard(info));
 
     // Conversation-side log producers and delta capture.
-    talker.onTurnComplete((output: AgentTextOutput, origin: LoopOriginContext) => {
-      if (output.userFacing.trim().length === 0) return;
-      this.appendEntry({
-        type: 'reply',
-        loopPath: origin.loopPath,
-        content: output.userFacing,
-      });
-      // The log entry above keeps the raw text on purpose: it is the audit
+    this.recorder.wireConversation(talker, (text) => {
+      // The reply entry keeps the raw text on purpose: it is the audit
       // trail and has to record what the talker actually said. Only the
       // reasoner-bound copy is sanitized, so a talker that quotes a
       // permission marker cannot carry the fence nonce to the loop that
       // authors the fenced content.
-      router.noteTalkerReply(stripAskFence(output.userFacing));
+      router.noteTalkerReply(stripAskFence(text));
     });
-    this.wireErrorProducers(talker);
-    this.wireErrorProducers(this.reasoner);
-    this.wireWorkLoopProducers();
+    this.recorder.wireErrors(talker);
+    this.recorder.wireErrors(this.reasoner);
+    this.recorder.wireWork(this.reasoner);
     // The talker has no background completions, but its parked wake
     // deliveries (user utterances among them) can dead-letter after
     // repeated failed carrying runs; those drops must reach the log.
-    this.wireDeadLetterProducer(talker);
+    this.recorder.wireDeadLetters(talker, (result) => {
+      // A destroyed wake delivery on the conversation surface may be a
+      // permission voicing, in which case the user never heard the request
+      // the broker still counts as read out. The broker withdraws its
+      // consent anchor and reads it again (D16 anchor rules).
+      if (result.kind === 'wake_delivery') {
+        router.permissionBroker.noteDeliveryDestroyed(result.message);
+      }
+    });
 
     // The facade-fed headline block (communication.md): live status per
     // loop and running sub-agent, view-injected into the talker every turn
@@ -1113,7 +1113,7 @@ export class CortexAgent {
       // dispatches among it); stopping one task must not cost another.
       this.reasoner.pendingWakeDeliveryCount === 0
     ) {
-      this.appendEntry({
+      this.recorder.append({
         type: 'lifecycle',
         loopPath: this.reasoner.loopPath,
         content: 'Stopping the reasoner run: it served only cancelled work',
@@ -1157,7 +1157,7 @@ export class CortexAgent {
       this.logger.error('dispatch to reasoner failed after a cancel abort', {
         error: errorMessageOf(err),
       });
-      this.appendEntry({
+      this.recorder.append({
         type: 'lifecycle',
         loopPath: this.reasoner.loopPath,
         content: 'Dispatch to the reasoner failed',
@@ -1451,7 +1451,7 @@ export class CortexAgent {
   private handleLookupOutcome(outcome: QuickLookupOutcome): void {
     if (outcome.status === 'cancelled') {
       if (this.destroyed) return;
-      this.appendEntry({
+      this.recorder.append({
         type: 'lifecycle',
         loopPath: `lookup/${outcome.alias}`,
         content: `Quick lookup ${outcome.alias} cancelled`,
@@ -1478,7 +1478,7 @@ export class CortexAgent {
     const firstBreach = !this.aggregateBreachLogged;
     if (!this.aggregateBreachLogged) {
       this.aggregateBreachLogged = true;
-      this.appendEntry({
+      this.recorder.append({
         type: 'lifecycle',
         loopPath: this.reasoner.loopPath,
         content: 'Aggregate budget limit breached; stopping work',
@@ -1587,192 +1587,18 @@ export class CortexAgent {
   // Log producers
   // -------------------------------------------------------------------------
 
-  /**
-   * Register the facade's own handlers on the reasoner (passthrough). All
-   * registrations are additive (the loop keeps handler arrays), so
-   * consumer handlers and their signatures are untouched; passthrough
-   * parity holds.
-   */
+  /** The facade's own log producers on the single loop (passthrough). */
   private wireLogProducers(): void {
-    this.reasoner.onTurnComplete((output: AgentTextOutput, origin: LoopOriginContext) => {
-      if (output.userFacing.trim().length === 0) return;
-      this.appendEntry({
-        type: 'reply',
-        loopPath: origin.loopPath,
-        content: output.userFacing,
-      });
-    });
-    this.wireErrorProducers(this.reasoner);
-    this.wireWorkLoopProducers();
-  }
-
-  /** Error and retry log producers for one loop (both loops in duplex). */
-  private wireErrorProducers(loop: AgentLoop): void {
-    loop.onError((error: ClassifiedError, origin: LoopOriginContext) => {
-      this.appendEntry({
-        type: 'error',
-        loopPath: origin.loopPath,
-        content: error.originalMessage,
-        data: {
-          category: error.category,
-          severity: error.severity,
-          ...(error.causeDetail !== undefined ? { causeDetail: error.causeDetail } : {}),
-        },
-      });
-    });
-
-    loop.onRetryScheduled((info: RetryScheduledInfo) => {
-      this.appendEntry({
-        type: 'retrying',
-        loopPath: loop.loopPath,
-        content: info.originalMessage,
-        data: {
-          category: info.category,
-          attempt: info.attempt,
-          maxAttempts: info.maxAttempts,
-          delayMs: info.delayMs,
-          nextAttemptAt: info.nextAttemptAt,
-        },
-      });
-    });
-  }
-
-  /** Sub-agent lifecycle and dead-letter producers (the work surface). */
-  private wireWorkLoopProducers(): void {
-    this.reasoner.onSubAgentSpawned((taskId, instructions, background) => {
-      const entry = this.appendEntry({
-        type: 'lifecycle',
-        loopPath: this.reasoner.loopPath,
-        content: `Sub-agent ${taskId} spawned`,
-        data: {
-          event: 'sub_agent_spawned',
-          taskId,
-          background,
-          instructions,
-        },
-      });
-      this.spawnSeqByTaskId.set(taskId, entry.seq);
-    });
-
-    this.reasoner.onSubAgentCompleted((taskId, _result, status) => {
-      const spawnSeq = this.spawnSeqByTaskId.get(taskId);
-      this.spawnSeqByTaskId.delete(taskId);
-      this.appendEntry({
-        type: 'lifecycle',
-        loopPath: this.reasoner.loopPath,
-        content: `Sub-agent ${taskId} ${status}`,
-        data: { event: 'sub_agent_completed', taskId, status },
-        ...(spawnSeq !== undefined ? { causedBy: spawnSeq } : {}),
-      });
-    });
-
-    this.reasoner.onSubAgentFailed((taskId, error) => {
-      const spawnSeq = this.spawnSeqByTaskId.get(taskId);
-      this.spawnSeqByTaskId.delete(taskId);
-      // SubAgentManager.cancel fires the loop's onSubAgentFailed hook with
-      // 'Cancelled' (the consumer callback contract keeps that shape), but
-      // the log is the durable record the duplex router reads, and
-      // log-and-context.md lists cancellations as their own milestone, not
-      // failures. The manager marks the ID cancelled before any hook fires,
-      // so this discriminator is reliable, unlike matching the error text.
-      const manager = this.reasoner.getSubAgentManager();
-      if (manager.isCancelled(taskId)) {
-        this.appendEntry({
-          type: 'lifecycle',
-          loopPath: this.reasoner.loopPath,
-          content: `Sub-agent ${taskId} cancelled`,
-          // reason distinguishes an explicit cancel from a shutdown
-          // teardown; 2b's delivery router keys on it.
-          data: {
-            event: 'sub_agent_cancelled',
-            taskId,
-            reason: manager.cancellationReason(taskId),
-          },
-          ...(spawnSeq !== undefined ? { causedBy: spawnSeq } : {}),
-        });
-        return;
-      }
-      this.appendEntry({
-        type: 'lifecycle',
-        loopPath: this.reasoner.loopPath,
-        content: `Sub-agent ${taskId} failed: ${error}`,
-        data: { event: 'sub_agent_failed', taskId, error },
-        ...(spawnSeq !== undefined ? { causedBy: spawnSeq } : {}),
-      });
-    });
-
-    this.wireDeadLetterProducer(this.reasoner);
-  }
-
-  /**
-   * Dead-letter log producer for one loop. Background-completion drops
-   * come from the reasoner; wake-delivery drops can come from either
-   * resident loop (duplex wires the talker too), and without a lifecycle
-   * entry for those the session log would show a user utterance with no
-   * reply and nothing saying why.
-   */
-  private wireDeadLetterProducer(loop: AgentLoop): void {
-    loop.onBackgroundResultDeadLettered((result: DeadLetteredBackgroundResult) => {
-      this.appendEntry({
-        type: 'lifecycle',
-        loopPath: loop.loopPath,
-        content: result.kind === 'wake_delivery'
-          ? (result.attempts > 0
-              ? `Wake delivery dropped after ${result.attempts} failed carrying runs`
-              : `Wake delivery dropped: ${result.lastError}`)
-          : `Background ${result.kind} ${result.taskId} delivery dead-lettered after ${result.attempts} attempts`,
-        data: {
-          event: 'delivery_dead_lettered',
-          kind: result.kind,
-          taskId: result.taskId,
-          attempts: result.attempts,
-          lastError: result.lastError,
-          // The FULL destroyed content, not a preview: in duplex the router
-          // owns delivery and the session log is the durable record of
-          // undelivered content, so a truncated copy here would make the
-          // in-memory dead-letter store (which does not survive the
-          // process) the only complete record.
-          ...(result.kind === 'wake_delivery' ? { message: result.message } : {}),
-        },
-      });
-      // A destroyed wake delivery on the conversation surface may be a
-      // permission voicing, in which case the user never heard the request
-      // the broker still counts as read out. The broker withdraws its
-      // consent anchor and reads it again (D16 anchor rules).
-      if (result.kind === 'wake_delivery' && loop === this.talker) {
-        this.router?.permissionBroker.noteDeliveryDestroyed(result.message);
-      }
-    });
-  }
-
-  /**
-   * Record loop-queued content (silent deliveries, parked wake content, in
-   * queue order as clearAllQueues returns it) destroyed by a facade abort
-   * or restore. Without this the dropped content is unrecoverable AND
-   * unrecorded: clearAllQueues returns it for re-routing and the facade is
-   * the only caller in a position to preserve it (the loop-level abort
-   * dead-letter path never sees content the facade already cleared).
-   */
-  private recordDroppedQueueContent(
-    loop: AgentLoop,
-    reason: 'abort' | 'restore',
-    dropped: string[],
-  ): void {
-    if (dropped.length === 0) return;
-    this.appendEntry({
-      type: 'lifecycle',
-      loopPath: loop.loopPath,
-      content: `${dropped.length} queued item(s) dropped by ${reason}`,
-      data: { event: 'queued_content_dropped', reason, items: dropped },
-      causedBy: null,
-    });
+    this.recorder.wireConversation(this.reasoner);
+    this.recorder.wireErrors(this.reasoner);
+    this.recorder.wireWork(this.reasoner);
   }
 
   /**
    * History can change without a log entry (compaction rewrites,
    * observation activation trims, a run completing); these mark the
    * composite state dirty so onStateChanged fires for them too. Log
-   * appends mark it in appendEntry.
+   * appends mark it through the recorder's append listener.
    */
   private wireStateTriggers(): void {
     for (const loop of this.talker ? [this.reasoner, this.talker] : [this.reasoner]) {
@@ -1781,52 +1607,6 @@ export class CortexAgent {
       loop.onObservation(() => this.stateEmitter.markDirty());
       loop.onReflection(() => this.stateEmitter.markDirty());
     }
-  }
-
-  /**
-   * Append a log entry, stamping causation from the live facade-initiated
-   * run unless the caller supplies (or suppresses, with null) its own. In
-   * duplex the fallback follows the producing surface: work-loop entries
-   * default to the live dispatch's directive seq, everything else to the
-   * live conversation run's utterance seq.
-   */
-  private appendEntry(input: {
-    type: SessionLogEntry['type'];
-    loopPath: string;
-    content: string;
-    causedBy?: number | null;
-    wake?: WakeClass;
-    data?: Record<string, unknown>;
-  }): SessionLogEntry {
-    const fallback = this.defaultCauseSeqFor(input.loopPath);
-    const causedBy = input.causedBy === null
-      ? undefined
-      : input.causedBy ?? fallback ?? undefined;
-    const entry = this.log.append({
-      type: input.type,
-      loopPath: input.loopPath,
-      content: input.content,
-      ...(causedBy !== undefined ? { causedBy } : {}),
-      ...(input.wake !== undefined ? { wake: input.wake } : {}),
-      ...(input.data !== undefined ? { data: input.data } : {}),
-    });
-    this.stateEmitter.markDirty();
-    if (this.logAppendWaiters.length > 0) {
-      for (const resolve of this.logAppendWaiters.splice(0)) resolve();
-    }
-    return entry;
-  }
-
-  /**
-   * Resolve on the next log append. The settlement wait uses this as the
-   * event signal for broker-minted asks, which have no registry of their
-   * own to wake it: every path that settles one appends its entry first, so
-   * an append is guaranteed before the blocked resolver resumes. Deliberately
-   * not a general "something happened" surface; it exists so
-   * {@link waitForWorkSettled} never has to spin.
-   */
-  private waitForLogAppend(): Promise<void> {
-    return new Promise((resolve) => this.logAppendWaiters.push(resolve));
   }
 
   /**
@@ -1843,23 +1623,6 @@ export class CortexAgent {
       return latestCauseSeq(this.talker.activeRunCauseTags);
     }
     return this.activeCauseSeq;
-  }
-
-  /** Spill retention-evicted entries through persistResult when configured. */
-  private spillEvictedEntries(evicted: SessionLogEntry[], config: ResolvedCortexAgentConfig): void {
-    const persist = config.persistResult;
-    if (!persist) return;
-    const payload = evicted.map((entry) => JSON.stringify(entry)).join('\n');
-    void persist(payload, {
-      toolName: '_session_log',
-      category: 'non-reproducible',
-      loopPath: this.reasoner.loopPath,
-    }).catch((err: unknown) => {
-      this.logger.warn('session log spill failed', {
-        error: errorMessageOf(err),
-        entries: evicted.length,
-      });
-    });
   }
 
   // -------------------------------------------------------------------------
@@ -1926,7 +1689,7 @@ export class CortexAgent {
         // Logged here rather than at call time: the log is the ordering
         // authority, and content that reached the loop first (a same-tick
         // deliver()) must hold the lower seq.
-        const entry = this.appendEntry({
+        const entry = this.recorder.append({
           type: 'utterance',
           loopPath: this.reasoner.loopPath,
           content: input,
@@ -1957,7 +1720,7 @@ export class CortexAgent {
     this.preemptIdleDigestion();
     this.pendingFacadePrompts += 1;
     try {
-      const entry = this.appendEntry({
+      const entry = this.recorder.append({
         type: 'utterance',
         loopPath: talker.loopPath,
         content: input,
@@ -2041,7 +1804,7 @@ export class CortexAgent {
     if (this.mode === 'duplex') {
       return this.deliverDuplex(content, options);
     }
-    const entry = this.appendEntry({
+    const entry = this.recorder.append({
       type: 'utterance',
       loopPath: this.reasoner.loopPath,
       content,
@@ -2085,7 +1848,7 @@ export class CortexAgent {
     const causeKind: SessionLogEntryType =
       options?.speaker === 'user' ? 'utterance' : 'delivery';
     if (target === 'work') {
-      const entry = this.appendEntry({
+      const entry = this.recorder.append({
         type: 'utterance',
         loopPath: this.reasoner.loopPath,
         content,
@@ -2107,7 +1870,7 @@ export class CortexAgent {
     }
 
     const talker = this.talker!;
-    const entry = this.appendEntry({
+    const entry = this.recorder.append({
       type: 'utterance',
       loopPath: talker.loopPath,
       content,
@@ -2210,7 +1973,7 @@ export class CortexAgent {
    */
   async abort(scope: CortexAbortScope = 'all'): Promise<void> {
     if (this.destroyed) return;
-    this.appendEntry({
+    this.recorder.append({
       type: 'lifecycle',
       loopPath: scope === 'conversation' ? this.conversationLoop.loopPath : this.reasoner.loopPath,
       content: `Abort requested (scope: ${scope})`,
@@ -2227,7 +1990,7 @@ export class CortexAgent {
       const work: Array<Promise<unknown>> = [];
       if (scope === 'conversation' || scope === 'all') {
         this.router!.dropPendingDeliveries();
-        this.recordDroppedQueueContent(this.talker!, 'abort', this.talker!.clearAllQueues());
+        this.recorder.recordDroppedQueue(this.talker!, 'abort', this.talker!.clearAllQueues());
         // Everything parked is gone, voicings included.
         this.trackedAskVoicings.clear();
         work.push(this.talker!.abort());
@@ -2242,7 +2005,7 @@ export class CortexAgent {
         // every scope. Without this a completed-but-undelivered when_idle
         // result from the stopped work would degrade and still be voiced.
         this.router!.dropPendingDeliveries();
-        this.recordDroppedQueueContent(this.reasoner, 'abort', this.reasoner.clearAllQueues());
+        this.recorder.recordDroppedQueue(this.reasoner, 'abort', this.reasoner.clearAllQueues());
         this.reasonerAbortCause = 'user';
         work.push(this.reasoner.abort());
         for (const taskId of this.reasoner.getSubAgentManager().getActiveTaskIds()) {
@@ -2277,7 +2040,7 @@ export class CortexAgent {
 
     // Dropped queued content: silent deliveries, parked wake deliveries
     // (abort() drops those itself too), and pi's steering/follow-up queues.
-    this.recordDroppedQueueContent(this.reasoner, 'abort', this.reasoner.clearAllQueues());
+    this.recorder.recordDroppedQueue(this.reasoner, 'abort', this.reasoner.clearAllQueues());
 
     const work: Array<Promise<unknown>> = [this.reasoner.abort()];
     if (scope !== 'conversation') {
@@ -2317,7 +2080,7 @@ export class CortexAgent {
     // it was still parked.
     this.trackedAskVoicings.clear();
     if (dropped.length === 0) return;
-    this.appendEntry({
+    this.recorder.append({
       type: 'lifecycle',
       loopPath: talker.loopPath,
       content: `${dropped.length} permission voicing(s) dropped by ${reason}: their requests are settled`,
@@ -2357,7 +2120,7 @@ export class CortexAgent {
     }
     if (!held) return;
     this.deferredAskVoicing = true;
-    this.appendEntry({
+    this.recorder.append({
       type: 'lifecycle',
       loopPath: this.talker!.loopPath,
       content: 'Permission request held silent after a conversation abort; ' +
@@ -2413,10 +2176,7 @@ export class CortexAgent {
           await this.ownedSandbox?.dispose();
         } finally {
           this.mergedBridge?.destroy();
-          this.log.clearSubscribers();
-          // Nothing appends after teardown, so a settlement wait blocked on
-          // the next append would never resume on its own.
-          for (const resolve of this.logAppendWaiters.splice(0)) resolve();
+          this.recorder.destroy();
         }
       }
     })();
@@ -2513,7 +2273,7 @@ export class CortexAgent {
       if (current) {
         this.resolutionNotes.splice(index, 1);
         if (!next) {
-          this.appendEntry({
+          this.recorder.append({
             type: 'lifecycle',
             loopPath: RESOLUTION_LOOP_PATH,
             content: `Resolution note cleared: ${code}`,
@@ -2540,7 +2300,7 @@ export class CortexAgent {
   private recordResolutionNote(note: ResolutionNote): void {
     this.resolutionNotes.push(cloneResolutionNote(note));
     this.logger.warn(resolutionWarnText(note));
-    this.appendEntry({
+    this.recorder.append({
       type: 'lifecycle',
       loopPath: RESOLUTION_LOOP_PATH,
       content: note.summary,
@@ -2562,7 +2322,7 @@ export class CortexAgent {
    */
   getLog(fromSeq?: number): SessionLogEntry[] {
     this.assertNotDestroyed();
-    return this.log.getLog(fromSeq);
+    return this.recorder.log.getLog(fromSeq);
   }
 
   /**
@@ -2578,7 +2338,7 @@ export class CortexAgent {
    */
   getLogEvents(fromSeq?: number): SessionLogEvent[] {
     this.assertNotDestroyed();
-    return this.log.getLogEvents(fromSeq);
+    return this.recorder.log.getLogEvents(fromSeq);
   }
 
   /**
@@ -2589,7 +2349,7 @@ export class CortexAgent {
    */
   subscribeLog(cb: SessionLogSubscriber, fromSeq?: number): () => void {
     this.assertNotDestroyed();
-    return this.log.subscribeLog(cb, fromSeq);
+    return this.recorder.log.subscribeLog(cb, fromSeq);
   }
 
   // -------------------------------------------------------------------------
@@ -2618,7 +2378,7 @@ export class CortexAgent {
   private captureStateInFrame(): CortexAgentStateV2 {
     return {
       version: 2,
-      log: this.log.getLog(),
+      log: this.recorder.log.getLog(),
       // Duplex reads the live talker; passthrough carries a restored duplex
       // artifact's talker side through unchanged so nothing is lost on
       // round trip. Copied like getLog(): a persistence layer that
@@ -2710,19 +2470,19 @@ export class CortexAgent {
       this.retainedTalkerHistory = talkerHistory;
       this.retainedTalkerMemory = talkerMemory;
     }
-    this.log.restore(v2.log);
+    this.recorder.log.restore(v2.log);
 
     this.usage.rebase(v2.usage, this.usageReadings());
-    this.spawnSeqByTaskId.clear();
+    this.recorder.resetForRestore();
     this.activeCauseSeq = null;
     // Pre-restore queued content belongs to the replaced session: left in
     // place, queued silent deliveries would flush into the first
     // post-restore prompt (and stale steer/follow-up content into its run).
     // What gets destroyed is recorded in the restored log, which is the
     // durable record of undelivered content from here on.
-    this.recordDroppedQueueContent(this.reasoner, 'restore', this.reasoner.clearAllQueues());
+    this.recorder.recordDroppedQueue(this.reasoner, 'restore', this.reasoner.clearAllQueues());
     if (this.talker) {
-      this.recordDroppedQueueContent(this.talker, 'restore', this.talker.clearAllQueues());
+      this.recorder.recordDroppedQueue(this.talker, 'restore', this.talker.clearAllQueues());
     }
     // Router state (delegations, deltas, held deliveries, dedup) describes
     // the replaced session too; what the artifact carries of it comes back.
@@ -2754,10 +2514,10 @@ export class CortexAgent {
    */
   private restoreRouterState(state: DuplexRouterState | undefined): void {
     const router = this.router!;
-    const interrupted = router.restoreState(state, highestTaskAliasInLog(this.log.getLog()));
+    const interrupted = router.restoreState(state, highestTaskAliasInLog(this.recorder.log.getLog()));
     if (interrupted.length === 0) return;
     for (const delegation of interrupted) {
-      this.appendEntry({
+      this.recorder.append({
         type: 'lifecycle',
         loopPath: this.reasoner.loopPath,
         content: `Task ${delegation.alias} interrupted by the session restore`,
@@ -2893,7 +2653,7 @@ export class CortexAgent {
       if (this.getPendingAsks().length > 0) {
         await (this.reasoner.getPendingAsks().length > 0
           ? this.reasoner.waitForAskSettlement()
-          : this.waitForLogAppend());
+          : this.recorder.waitForNextAppend());
         continue;
       }
 
