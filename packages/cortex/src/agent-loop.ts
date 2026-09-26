@@ -24,33 +24,16 @@ import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-br
 import { EventBridge } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
 import { classifyError } from './error-classifier.js';
-import { resolveRetryPolicy } from './retry-policy.js';
 import { withPlaceholderContent } from './pi-message.js';
 import type { McpClientManager } from './mcp-client.js';
-import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
+import { CompactionManager } from './compaction/index.js';
 import type { ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './compaction/observational/types.js';
-import { createRecallTool } from './compaction/observational/recall-tool.js';
 import { SubAgentManager } from './sub-agent-manager.js';
 import type { SkillRegistry } from './skill-registry.js';
-import { createSubAgentTool } from './tools/sub-agent.js';
 import type { CortexModel } from './model-wrapper.js';
-import { SystemPromptState } from './agent-loop/system-prompt.js';
-import { HandlerList } from './agent-loop/handler-list.js';
-import { ProcessTracker } from './agent-loop/process-tracker.js';
-import { UsageLedger } from './agent-loop/usage-ledger.js';
-import { wireLoopEvents } from './agent-loop/event-wiring.js';
-import { DirectCompletions } from './agent-loop/direct-completion.js';
-import { ModelSettings } from './agent-loop/model-settings.js';
-import { SkillBinding } from './agent-loop/skills.js';
-import { createBuiltinTools } from './agent-loop/builtin-tools.js';
-import { ToolRegistry } from './agent-loop/tool-registry.js';
-import { McpAttachment } from './agent-loop/mcp-attachment.js';
-import { DeliveryQueues } from './agent-loop/delivery-queues.js';
-import { TurnRunner } from './agent-loop/turn-runner.js';
-import { LoopLifecycle } from './agent-loop/lifecycle.js';
-import { ContextPipeline } from './agent-loop/context-pipeline.js';
+import { assembleLoop, backgroundTaskState } from './agent-loop/assembly.js';
+import type { LoopParts } from './agent-loop/assembly.js';
 import type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
-import { BackgroundDelivery } from './agent-loop/background-delivery.js';
 import type { PendingBackgroundCompletion } from './agent-loop/background-delivery.js';
 import type {
   DeliverOptions,
@@ -58,28 +41,21 @@ import type {
   QueuedDelivery,
 } from './agent-loop/delivery-queues.js';
 import {
-  AbortState,
   isAbortShapedError,
-  LoopGate,
 } from './agent-loop/run-control.js';
 import { CHILD_SEED_CONTEXT_SLOT, prepareChildLoop } from './agent-loop/child-loop-config.js';
 import type { ChildLoopParams } from './agent-loop/child-loop-config.js';
-import { SubAgentSpawner } from './agent-loop/sub-agent-spawner.js';
 import type { ForegroundSpawnResult, SubAgentSpawnParams } from './agent-loop/sub-agent-spawner.js';
-import { mirrorChildPermissionResolver, PendingAskRegistry } from './agent-loop/permissions.js';
+import { mirrorChildPermissionResolver } from './agent-loop/permissions.js';
 import {
   buildPiAgentConfig,
   loadAgentClass,
-  ToolResultFinalizer,
   wirePiTransformContext,
 } from './agent-loop/pi-hooks.js';
 import type { PiHookHost, ToolResultInterceptor } from './agent-loop/pi-hooks.js';
-import { DeadLetterStore } from './agent-loop/delivery-failure.js';
-import { buildBackgroundTaskState } from './agent-loop/background-task-text.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 import type { CortexToolRuntime } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
-import { PromptWatchdogDiagnostics } from './prompt-diagnostics.js';
 import type { CortexTool } from './tool-contract.js';
 import type {
   CortexLogger,
@@ -88,7 +64,6 @@ import type {
   CortexUsage,
   SessionUsage,
   ClassifiedError,
-  RetryPolicy,
   RetryScheduledInfo,
   RetrySucceededInfo,
   RetryExhaustedInfo,
@@ -104,8 +79,6 @@ import type {
   SubAgentSpawnConfig,
   DeadLetteredBackgroundResult,
   SubAgentSnapshot,
-  TrackedSubAgent,
-  BudgetScope,
   PendingAsk,
   LoopOriginContext,
   ThinkingLevel,
@@ -163,11 +136,7 @@ function prefixLoggerWithLoopPath(logger: CortexLogger, loopPath: string): Corte
 
 export class AgentLoop {
   private readonly agent: PiAgent;
-  private readonly contextManager: ContextManager;
-  private readonly eventBridge: EventBridge;
-  private readonly budgetGuard: BudgetGuard;
   private readonly config: AgentLoopConfig;
-  private readonly retryPolicy: RetryPolicy;
   private readonly logger: CortexLogger;
   /**
    * Path identity of this loop (config `loopPath`, default 'main'). Threaded
@@ -175,92 +144,18 @@ export class AgentLoop {
    * and log prefixes; sub-agents extend it with '/<taskId>'.
    */
   readonly loopPath: string;
+  private workingTagsEnabled: boolean;
+  /** The loop's modules, wired by assembly.ts. */
+  private readonly parts: LoopParts;
 
   /**
    * This loop's identity as the trailing argument of every fan-out callback.
-   *
-   * A composite agent registers one consumer handler on several loops, so
-   * without this a duplex consumer receives two of everything with no way to
-   * tell them apart: two retry countdowns for one provider hiccup, two
-   * compaction notifications, two observation events. The fan-out itself is
-   * correct (both loops really did do the thing); what was missing was the
-   * label saying which.
+   * A composite agent registers one consumer handler on several loops; the
+   * origin says which loop did the thing.
    */
   private get originContext(): LoopOriginContext {
-    return { loopPath: this.loopPath };
+    return this.parts.origin;
   }
-
-  private readonly promptDiagnostics: PromptWatchdogDiagnostics;
-  private workingTagsEnabled: boolean;
-  private readonly workingDirectory: string;
-  private readonly envOverrides: Record<string, string> | undefined;
-
-  // CREATED -> ACTIVE -> DESTROYING -> DESTROYED, and the abort/destroy protocols
-  private readonly lifecycle: LoopLifecycle;
-  private readonly systemPrompt: SystemPromptState;
-
-  // Primary and utility models, context window limit, cache retention, session key.
-  private readonly models: ModelSettings;
-
-  // Registered and MCP tools, their pi adaptation, runtime, and result persistence
-  private readonly tools: ToolRegistry;
-
-  // Compaction Manager
-  private readonly compactionManager: CompactionManager;
-
-
-  // Event handlers (consumer-registered callbacks)
-  private readonly loopCompleteHandlers: HandlerList<[LoopOriginContext]>;
-  private readonly errorHandlers: HandlerList<[ClassifiedError, LoopOriginContext]>;
-  private readonly turnCompleteHandlers: HandlerList<[AgentTextOutput, LoopOriginContext]>;
-  // Finished background work waiting to be delivered to the loop
-  private readonly background: BackgroundDelivery;
-  // Content the loop gave up delivering (bounded; survives destroy)
-  private readonly deadLetters: DeadLetterStore;
-
-  // Loop-owned silent and parked-wake delivery queues
-  private readonly queues: DeliveryQueues;
-
-  // Permission asks blocked on a resolver decision (this loop's and its children's)
-  private readonly asks = new PendingAskRegistry();
-
-  /** Tool-result interceptor and working-tags reminder (pi's afterToolCall). */
-  private readonly finalizer: ToolResultFinalizer;
-
-  // What the model sees on each call: transformContext, headline, idle digestion
-  private readonly pipeline: ContextPipeline;
-
-  // Event bridge unsubscribers (for cleanup)
-  private readonly eventUnsubscribers: Array<() => void> = [];
-
-  // The current run's abort controller and the abort epoch (run-control.ts)
-  private readonly abortState = new AbortState();
-
-  // Runs a logical turn (with retries) and owns the turn-scoped state
-  private readonly runner: TurnRunner;
-
-  // Serializes every loop-owning task (run-control.ts)
-  private readonly gate = new LoopGate();
-
-
-  // Tracked subprocess PIDs for synchronous exit cleanup (Level 3 safety net)
-  private readonly processes = new ProcessTracker();
-
-  // The MCP client manager this loop is attached to (owned or shared).
-  private readonly mcp: McpAttachment;
-
-  // Sub-Agent Manager for tracking active sub-agents
-  private readonly subAgentManager: SubAgentManager;
-  private readonly subAgents: SubAgentSpawner;
-
-  // Skill registry, the load_skill tool, and the loaded-skill buffer
-  private readonly skills: SkillBinding;
-
-
-
-  // Session-lifetime usage plus the last direct completion's usage.
-  private readonly usage = new UsageLedger();
-  private readonly completions: DirectCompletions;
 
   /**
    * Create an AgentLoop. Prefer AgentLoop.create().
@@ -277,432 +172,31 @@ export class AgentLoop {
   ) {
     this.agent = agent;
     this.config = config;
-    this.retryPolicy = resolveRetryPolicy(config.retryPolicy);
     this.loopPath = config.loopPath ?? DEFAULT_LOOP_PATH;
     this.logger = prefixLoggerWithLoopPath(config.logger ?? NOOP_LOGGER, this.loopPath);
-    this.lifecycle = new LoopLifecycle(() => ({
-      agent: this.agent,
-      diagnostics: this.promptDiagnostics,
-      runner: this.runner,
-      queues: this.queues,
-      abortState: this.abortState,
-      gate: this.gate,
-      background: this.background,
-      subAgentManager: this.subAgentManager,
-      subAgents: this.subAgents,
-      mcp: this.mcp,
-      processes: this.processes,
-      skills: this.skills,
-      budgetGuard: this.budgetGuard,
-      eventBridge: this.eventBridge,
-      unsubscribeEvents: () => {
-        for (const unsub of this.eventUnsubscribers.splice(0)) unsub();
-      },
-      compactionManager: this.compactionManager,
-      tools: this.tools,
-      loopComplete: this.loopCompleteHandlers,
-      errorHandlers: this.errorHandlers,
-      turnComplete: this.turnCompleteHandlers,
-      deadLetters: this.deadLetters,
-      asks: this.asks,
-      origin: this.originContext,
-      logger: this.logger,
-    }));
-    this.loopCompleteHandlers = new HandlerList('onLoopComplete', this.logger);
-    this.errorHandlers = new HandlerList('onError', this.logger);
-    this.turnCompleteHandlers = new HandlerList('onTurnComplete', this.logger);
-    this.deadLetters = new DeadLetterStore(this.logger);
-    this.queues = new DeliveryQueues({
-      gate: this.gate,
-      abort: this.abortState,
-      isAborted: () => this.isAborted(),
-      isShuttingDown: () => this.isShuttingDown(),
-      assertNotShuttingDown: () => this.assertNotShuttingDown(),
-      hasSystemPrompt: () => this.systemPrompt.isConfigured(),
-      isPrompting: () => this.runner.isPrompting,
-      budgetBreached: () => this.budgetGuard.isBreached(),
-      startPrompt: (content, options, causeTag) => {
-        this.runner.stagePromptCauseTag(causeTag);
-        return this.prompt(content, options);
-      },
-      runDeliveryTurn: (message, retryPolicy, causeTags) =>
-        this.runner.run(message, undefined, true, retryPolicy, causeTags),
-      appendActiveCauseTags: (tags) => this.runner.appendActiveCauseTags(tags),
-      transcript: {
-        messages: () => this.agent.state.messages,
-        boundary: () => this.runner.boundary,
-        notifyTailTrimmed: () => this.notifySourceHistoryTailTrimmed(),
-      },
-      piQueues: this.agent,
-      deadLetters: this.deadLetters,
-      retryPolicy: this.retryPolicy,
-      emitError: (error) => this.emitError(error),
-      logger: this.logger,
-    });
-    this.background = new BackgroundDelivery({
-      gate: this.gate,
-      abort: this.abortState,
-      isAborted: () => this.isAborted(),
-      isShuttingDown: () => this.isShuttingDown(),
-      isCancelled: (taskId) => this.subAgentManager.isCancelled(taskId),
-      runDeliveryTurn: (message, retryPolicy) =>
-        this.runner.run(message, undefined, true, retryPolicy),
-      unwindFailedDelivery: (preDeliveryCount, runAbortEpoch) =>
-        this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch),
-      messages: () => this.agent.state.messages,
-      backgroundTasks: {
-        get: (taskId) => this.tools.runtime.backgroundTasks.get(taskId),
-      },
-      deadLetters: this.deadLetters,
-      retryPolicy: this.retryPolicy,
-      emitError: (error) => this.emitError(error),
-      logger: this.logger,
-    });
-    this.promptDiagnostics = new PromptWatchdogDiagnostics(
-      config.diagnostics?.promptWatchdog,
-      this.logger,
-      {
-        isPrompting: () => this.runner.isPrompting,
-        isAbortRequested: () => this.isAborted(),
-      },
-      this.loopPath,
-    );
     this.workingTagsEnabled = config.workingTags?.enabled ?? true;
-    this.workingDirectory = config.workingDirectory;
-    this.envOverrides = config.envOverrides;
-    this.tools = new ToolRegistry(config, {
-      mcpTools: () => this.mcp.manager.getTools(),
-      writeAgentTools: (tools) => {
-        (this.agent.state as Record<string, unknown>)['tools'] = tools;
-      },
-      onToolsChanged: () => this.systemPrompt.refresh(),
-      refreshTools: () => this.refreshTools(),
-      slots: {
-        getSlot: (name) => this.contextManager.getSlot(name),
-        setSlot: (name, content) => this.contextManager.setSlot(name, content),
-      },
-      logger: this.logger,
+    this.parts = assembleLoop({
+      agent,
+      config,
+      tools,
+      options,
       loopPath: this.loopPath,
-    });
-    this.finalizer = new ToolResultFinalizer({
-      workingTagsEnabled: () => this.workingTagsEnabled,
       logger: this.logger,
-    });
-    this.systemPrompt = new SystemPromptState({
-      agentState: () => this.agent.state,
-      hasTool: (name) => this.tools.has(name),
-      workingTagsEnabled: () => this.workingTagsEnabled,
-      workingDirectory: this.workingDirectory,
-    });
-
-    // Resolve models
-    if (!config.model) {
-      throw new Error('AgentLoopConfig.model is required but was undefined. Pass a CortexModel.');
-    }
-    this.models = new ModelSettings(config, {
-      writeAgentModel: (model) => {
-        (this.agent.state as Record<string, unknown>)['model'] = model;
+      host: {
+        workingTagsEnabled: () => this.workingTagsEnabled,
+        prompt: (input, promptOptions) => this.prompt(input, promptOptions),
+        refreshTools: () => this.refreshTools(),
+        directComplete: (context, completeOptions) => this.directComplete(context, completeOptions),
+        utilityComplete: (context, completeOptions) => this.utilityComplete(context, completeOptions),
+        isAborted: () => this.isAborted(),
+        emitError: (error, wasAborted) => this.emitError(error, wasAborted),
+        getConversationHistory: () => this.getConversationHistory(),
+        restoreConversationHistory: (messages) => this.restoreConversationHistory(messages),
+        createChildAgent: (params) => this.createChildAgent(params),
       },
-      // Undefined until built below; the settings sync it once it exists.
-      compaction: () => this.compactionManager ?? null,
-      onModelChanged: () => this.skills.rebuildDescription(),
-      logger: this.logger,
     });
-    this.completions = new DirectCompletions({
-      models: () => ({
-        primary: this.models.primary,
-        primaryPi: this.models.primaryPi,
-        utility: this.models.utility,
-        utilityPi: this.models.utilityPi,
-      }),
-      getApiKey: config.getApiKey,
-      cacheRetention: () => this.models.cacheRetention,
-      sessionId: () => this.models.sessionId,
-      isAborted: () => this.isAborted(),
-      emitError: (error, wasAborted) => this.emitError(error, wasAborted),
-      emitUtilityUsage: (category, usage) => this.eventBridge.emitUtilityUsage(category, usage),
-      ledger: this.usage,
-      logger: this.logger,
-    });
-
-    // Auto-register built-in tools, filtered by disableTools config
-    const disabledSet = new Set(config.disableTools ?? []);
-    const builtinTools = createBuiltinTools({
-      workingDirectory: this.workingDirectory,
-      runtime: this.tools.runtime,
-      config,
-      utilityComplete: (context, usageCategory) => this.utilityComplete(context, { usageCategory }),
-      processes: this.processes,
-      onBackgroundTaskComplete: (taskId) => {
-        void this.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId });
-      },
-      ...(this.tools.deferredEnabled
-        ? {
-            deferred: {
-              registry: this.tools.deferredRegistry,
-              onAfterDiscovery: () => this.refreshTools(),
-            },
-          }
-        : {}),
-    }, disabledSet);
-    this.tools.register([...builtinTools, ...(tools ?? [])]);
-    this.models.applyToAgent();
-
-    // Build the slot list. When using observational memory, append the
-    // internal observation slot so it occupies the last slot position.
-    const compactionConfig = buildCompactionConfig(config.compaction);
-    this.tools.bindPersistence(config, compactionConfig.microcompaction);
-
-    const compactionStrategy = compactionConfig.strategy ?? 'observational';
-    // Slot ordering by stability (most stable first):
-    //   1. `_available_tools` (changes only on MCP server connect/disconnect)
-    //   2. consumer slots (consumer decides their own ordering)
-    //   3. `_observations`   (changes potentially every turn)
-    const slots: string[] = [];
-    if (this.tools.deferredEnabled) {
-      slots.push('_available_tools');
-    }
-    slots.push(...(config.slots ?? []));
-    if (compactionStrategy === 'observational') {
-      slots.push('_observations');
-    }
-
-    // Set up ContextManager
-    this.contextManager = new ContextManager(agent, {
-      slots,
-    });
-
-    // Set up EventBridge
-    this.eventBridge = new EventBridge(this.workingTagsEnabled, this.logger);
-    this.eventBridge.wire(agent);
-
-    // Wire internal event handlers
-    this.eventUnsubscribers.push(wireLoopEvents(this.eventBridge, {
-      logger: this.logger,
-      diagnostics: this.promptDiagnostics,
-      ledger: this.usage,
-      agentState: () => this.agent.state as unknown as { messages: AgentMessage[]; errorMessage?: unknown },
-      slotCount: () => this.contextManager.slotCount,
-      compaction: () => this.compactionManager,
-      effectiveContextWindow: () => this.effectiveContextWindow,
-      budgetSummary: () => ({
-        turns: this.budgetGuard.getTurnCount(),
-        totalCost: this.budgetGuard.getTotalCost(),
-      }),
-      onLoopEnd: () => this.skills.clear(),
-      loopComplete: this.loopCompleteHandlers,
-      turnComplete: this.turnCompleteHandlers,
-      origin: this.originContext,
-    }));
-
-    // Set up BudgetGuard
-    const budgetGuardConfig: {
-      maxTurns?: number;
-      maxCost?: number;
-      scope?: BudgetScope;
-      includeChildUsage?: boolean;
-      includeUtilityUsage?: boolean;
-    } = {};
-    if (config.budgetGuard?.maxTurns !== undefined) {
-      budgetGuardConfig.maxTurns = config.budgetGuard.maxTurns;
-    }
-    if (config.budgetGuard?.maxCost !== undefined) {
-      budgetGuardConfig.maxCost = config.budgetGuard.maxCost;
-    }
-    if (config.budgetGuard?.scope !== undefined) {
-      budgetGuardConfig.scope = config.budgetGuard.scope;
-    }
-    if (config.budgetGuard?.includeChildUsage !== undefined) {
-      budgetGuardConfig.includeChildUsage = config.budgetGuard.includeChildUsage;
-    }
-    if (config.budgetGuard?.includeUtilityUsage !== undefined) {
-      budgetGuardConfig.includeUtilityUsage = config.budgetGuard.includeUtilityUsage;
-    }
-    this.budgetGuard = new BudgetGuard(
-      budgetGuardConfig,
-      () => this.agent.abort(),
-      this.logger,
-    );
-    this.budgetGuard.wire(this.eventBridge);
-    // After the budget guard, so a turn that breaches the budget is seen as
-    // breached here and does not have content steered into a run that is
-    // about to be aborted.
-    this.eventUnsubscribers.push(
-      this.eventBridge.on('turn_end', (event) => {
-        if (event.childTaskId) return;
-        this.queues.steerTurnBoundary(event);
-      }),
-    );
-
-    this.runner = new TurnRunner({
-      agent: this.agent,
-      config,
-      retryPolicy: this.retryPolicy,
-      abort: this.abortState,
-      isAborted: () => this.isAborted(),
-      activate: () => this.lifecycle.activate(),
-      assertNotShuttingDown: () => this.assertNotShuttingDown(),
-      emitError: (error, wasAborted) => this.emitError(error, wasAborted),
-      cacheRetention: () => this.models.cacheRetention,
-      model: () => this.models.primary,
-      queues: this.queues,
-      toolRuntime: this.tools.runtime,
-      budget: this.budgetGuard,
-      diagnostics: this.promptDiagnostics,
-      compaction: () => this.compactionManager,
-      handleOverflow: () => this.compactionManager.handleOverflowError(
-        () => this.getConversationHistory(),
-        (history) => this.restoreConversationHistory(history),
-      ),
-      slotCount: () => this.contextManager.slotCount,
-      notifyTailTrimmed: () => this.notifySourceHistoryTailTrimmed(),
-      pendingBackgroundCount: () => this.background.pending.length,
-      drainBackground: () => this.background.drain(),
-      origin: this.originContext,
-      logger: this.logger,
-    });
-
-    // Attach to the MCP client manager (private, or a shared external one).
-    this.mcp = new McpAttachment(config, this.logger, {
-      onSubprocessSpawned: (pid) => this.processes.track(pid),
-      onSubprocessExited: (pid) => this.processes.untrack(pid),
-      onToolsChanged: () => this.refreshTools(),
-    });
-
-    // Set up Sub-Agent Manager (must be before the spawner)
-    this.subAgentManager = new SubAgentManager({
-      maxConcurrent: config.maxConcurrentSubAgents ?? 4,
-      ...(config.subAgentPools ? { pools: config.subAgentPools } : {}),
-    });
-
-    // Set up Skill Registry with auto-rebuild callback
-    this.skills = new SkillBinding({
-      contextWindow: () => this.compactionManager?.contextWindow ?? Math.min(
-        this.models.primary.contextWindow,
-        this.models.contextWindowLimit ?? this.models.primary.contextWindow,
-      ),
-      refreshTools: () => this.refreshTools(),
-      logger: this.logger,
-    });
-    this.pipeline = new ContextPipeline({
-      agentState: () => this.agent.state,
-      setAgentMessages: (messages) => {
-        this.agent.state.messages = messages;
-      },
-      slots: this.contextManager,
-      compaction: () => this.compactionManager,
-      injections: () => {
-        const stable: string[] = [];
-        const ephemeral = this.contextManager.getEphemeral();
-        if (ephemeral) stable.push(ephemeral);
-        const skills = this.skills.renderInjection();
-        if (skills) stable.push(skills);
-        // Background task state gives the agent visibility into running
-        // sub-agents and background bash processes.
-        const background = this.buildBackgroundTaskState();
-        return { stable, volatile: background ? [background] : [] };
-      },
-      boundary: () => this.runner.boundary,
-      setBoundary: (boundary) => {
-        this.runner.boundary = boundary;
-      },
-      isPrompting: () => this.runner.isPrompting,
-      gate: this.gate,
-      assertNotShuttingDown: () => this.assertNotShuttingDown(),
-      isShuttingDown: () => this.isShuttingDown(),
-      logger: this.logger,
-    });
-
-    // Sub-agent spawning; wires the manager's hooks to the consumer fan-out.
-    this.subAgents = new SubAgentSpawner({
-      manager: this.subAgentManager,
-      createChild: (params) => this.createChildAgent(params),
-      eventBridge: this.eventBridge,
-      onBackgroundComplete: (item) => this.deliverOrQueueBackgroundCompletion(item),
-      purgePendingResult: (taskId) => this.background.purgeSubAgent(taskId),
-      logger: this.logger,
-    });
-
-    // Create and register the SubAgent tool.
-    // Must be after the spawner exists.
-    if (options?.enableSubAgentTool !== false) {
-      const subAgentTool = createSubAgentTool({
-        spawnSubAgent: (params) => this.spawnForegroundSubAgentInternal(params),
-        spawnBackgroundSubAgent: (params) => this.spawnBackgroundSubAgentInternal(params),
-        // Tool spawns count against the default pool.
-        canSpawn: () => this.subAgentManager.canSpawn(),
-        checkConsumerSpawn: () => {
-          const verdict = this.config.canSpawnSubAgent?.();
-          if (verdict === undefined) return { allowed: true };
-          if (typeof verdict === 'boolean') return { allowed: verdict };
-          return verdict;
-        },
-        getConcurrencyInfo: () => ({
-          active: this.subAgentManager.activeCount,
-          limit: this.subAgentManager.limit,
-        }),
-        getModelId: () => this.models.primary.modelId,
-      });
-      this.tools.registerInternal(subAgentTool as RegisteredTool);
-    }
-
-    // Create and register the load_skill tool.
-    // Must be after the skill binding exists.
-    if (options?.enableLoadSkillTool !== false) {
-      this.tools.registerInternal(this.skills.createLoadSkillTool());
-    }
-
-    // Adapt the normalized Cortex tool set to pi-agent-core's raw execute
-    // signature and sync the result to the underlying agent.
-    this.refreshTools();
-
-    // Set up CompactionManager (reuse compactionConfig from slot registration above)
-    this.compactionManager = new CompactionManager(
-      compactionConfig,
-      slots.length,
-    );
-    this.compactionManager.setLogger(this.logger);
-    // Context windows and cache TTL follow the model settings from here on.
-    this.models.syncCompaction();
-
     if (typeof config.initialBasePrompt === 'string') {
       this.setBasePrompt(config.initialBasePrompt);
-    }
-
-    // Wire compaction completion function (uses directComplete). Tagged so
-    // L2 summarization spend lands in session usage under its own bucket.
-    this.compactionManager.setCompleteFn(async (context) => {
-      return this.directComplete(context, { usageCategory: 'summarization' });
-    });
-
-    // Wire utility model completion for observer/reflector. The purpose the
-    // engine passes per call becomes the usage category, so observer and
-    // reflector spend are separable in accounting.
-    this.compactionManager.setObservationalCompleteFn(async (context, options) => {
-      return this.utilityComplete(
-        {
-          systemPrompt: context.systemPrompt,
-          messages: context.messages as Array<{ role: string; content: string }>,
-        },
-        { usageCategory: options?.purpose ?? 'observation' },
-      );
-    });
-
-    // Wire compaction result -> onPostCompaction handlers on the manager.
-    // The CompactionManager also calls postCompactionHandlers registered
-    // directly via onPostCompaction(); the onCompactionResult handler here
-    // is the bridge for results that come through the manager's internal
-    // checkAndRunCompaction() path (which already calls its own handlers).
-    // No additional bridging needed; consumers register via onPostCompaction().
-
-    // Register recall tool if observational memory has one configured
-    if (this.compactionManager.hasRecallTool()) {
-      const recallConfig = this.compactionManager.getRecallConfig();
-      if (recallConfig) {
-        const recallTool = createRecallTool(recallConfig);
-        this.tools.registerInternal(recallTool as RegisteredTool);
-        this.refreshTools();
-      }
     }
   }
 
@@ -727,14 +221,14 @@ export class AgentLoop {
    * @throws Error if the agent has been destroyed or is already prompting
    */
   async prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
-    this.assertNotShuttingDown();
-    if (!this.systemPrompt.isConfigured()) {
+    this.parts.lifecycle.assertNotShuttingDown();
+    if (!this.parts.systemPrompt.isConfigured()) {
       throw new Error(
         'AgentLoop prompt is not configured. Call setBasePrompt() before prompt(), ' +
         'or provide initialBasePrompt during creation.',
       );
     }
-    if (this.gate.isActive) {
+    if (this.parts.gate.isActive) {
       // Spurious-fail-fast note: re-prompting synchronously inside the .then
       // of a just-resolved prompt() can land here while a no-op
       // background-drain task is still queued (depth briefly > 0). It clears
@@ -754,32 +248,9 @@ export class AgentLoop {
     // on THIS turn's controller, so the cycle sees the abort at dequeue and
     // cancels promptly instead of replacing a stale-aborted controller and
     // running to completion un-aborted.
-    this.abortState.renewIfAborted();
+    this.parts.abortState.renewIfAborted();
 
-    return this.enqueueLoopTask(() => this.runner.runCycle(input, options));
-  }
-
-  /** Whether teardown has started (no new loops may start). */
-  private isShuttingDown(): boolean {
-    return this.lifecycle.isShuttingDown;
-  }
-
-  /** Throw the consumer-facing lifecycle error when teardown has started. */
-  private assertNotShuttingDown(): void {
-    this.lifecycle.assertNotShuttingDown();
-  }
-
-  /**
-   * Serialize a loop-owning task behind every previously enqueued one.
-   *
-   * This is the single gate through which every agentic loop starts:
-   * consumer prompt() calls and background-completion drains. Retry
-   * continuations run inside runTurnWithRetry under the same gate
-   * acquisition. At most one gate task executes at a time; the depth
-   * counter covers running plus queued tasks.
-   */
-  private enqueueLoopTask<T>(task: () => Promise<T>): Promise<T> {
-    return this.gate.enqueue(task);
+    return this.parts.gate.enqueue(() => this.parts.runner.runCycle(input, options));
   }
 
   /**
@@ -789,7 +260,7 @@ export class AgentLoop {
    * instead of starting a turn.
    */
   get isLoopActive(): boolean {
-    return this.gate.isActive;
+    return this.parts.gate.isActive;
   }
 
   /**
@@ -803,7 +274,7 @@ export class AgentLoop {
    * turn is in flight waits for whatever run starts next.
    */
   get isPrompting(): boolean {
-    return this.runner.isPrompting;
+    return this.parts.runner.isPrompting;
   }
 
   /**
@@ -818,7 +289,7 @@ export class AgentLoop {
    * consent to those stamps, docs/cortex/duplex/log-and-context.md).
    */
   get activeRunCauseTags(): readonly unknown[] {
-    return this.runner.activeCauseTags;
+    return this.parts.runner.activeCauseTags;
   }
 
   /**
@@ -838,41 +309,25 @@ export class AgentLoop {
    * again if the gate refilled.
    */
   async waitForLoopIdle(): Promise<void> {
-    return this.gate.waitForIdle();
+    return this.parts.gate.waitForIdle();
   }
 
   // -----------------------------------------------------------------------
   // Background retry
   // -----------------------------------------------------------------------
 
-  /**
-   * Tell the compaction manager the tail of the post-slot source history was
-   * trimmed, so the observational buffer watermark (and any in-flight
-   * observer end index) can be clamped to the surviving length. pi emits
-   * turn_end for trimmed messages before Cortex removes them, so without
-   * this the watermark can end up counting messages that no longer exist and
-   * the next activation would slice away unobserved ones.
-   */
-  private notifySourceHistoryTailTrimmed(): void {
-    const postSlotLength = Math.max(
-      0,
-      this.agent.state.messages.length - this.contextManager.slotCount,
-    );
-    this.compactionManager.onSourceHistoryTailTrimmed(postSlotLength);
-  }
-
 
 
   private fireRetryScheduled(info: RetryScheduledInfo): void {
-    this.runner.retryScheduled.emit(info, this.originContext);
+    this.parts.runner.retryScheduled.emit(info, this.originContext);
   }
 
   private fireRetrySucceeded(info: RetrySucceededInfo): void {
-    this.runner.retrySucceeded.emit(info, this.originContext);
+    this.parts.runner.retrySucceeded.emit(info, this.originContext);
   }
 
   private fireRetryExhausted(info: RetryExhaustedInfo): void {
-    this.runner.retryExhausted.emit(info, this.originContext);
+    this.parts.runner.retryExhausted.emit(info, this.originContext);
   }
 
   // -----------------------------------------------------------------------
@@ -890,7 +345,7 @@ export class AgentLoop {
    * @param message - The message content to inject
    */
   steer(message: string): void {
-    this.queues.steer(message);
+    this.parts.queues.steer(message);
   }
 
   /**
@@ -942,7 +397,7 @@ export class AgentLoop {
    * @param options - Wake behavior; default wakes an idle loop
    */
   deliver(content: string, options?: DeliverOptions): DeliverResult {
-    return this.queues.deliver(content, options);
+    return this.parts.queues.deliver(content, options);
   }
 
   /**
@@ -954,17 +409,17 @@ export class AgentLoop {
    * end of the next run.
    */
   followUp(message: string): void {
-    this.queues.followUp(message);
+    this.parts.queues.followUp(message);
   }
 
   /** Set how pi drains queued steering messages. */
   setSteeringQueueMode(mode: QueueDrainMode): void {
-    this.queues.setSteeringQueueMode(mode);
+    this.parts.queues.setSteeringQueueMode(mode);
   }
 
   /** Set how pi drains queued follow-up messages. */
   setFollowUpQueueMode(mode: QueueDrainMode): void {
-    this.queues.setFollowUpQueueMode(mode);
+    this.parts.queues.setFollowUpQueueMode(mode);
   }
 
   /**
@@ -973,12 +428,12 @@ export class AgentLoop {
    * affected; drop those via {@link clearAllQueues}.
    */
   clearSteeringQueue(): void {
-    this.queues.clearSteeringQueue();
+    this.parts.queues.clearSteeringQueue();
   }
 
   /** Remove all queued follow-up messages from pi's follow-up queue. */
   clearFollowUpQueue(): void {
-    this.queues.clearFollowUpQueue();
+    this.parts.queues.clearFollowUpQueue();
   }
 
   /**
@@ -989,17 +444,17 @@ export class AgentLoop {
    * sweep task finds nothing and no-ops.
    */
   clearAllQueues(): string[] {
-    return this.queues.clearAll();
+    return this.parts.queues.clearAll();
   }
 
   /** Number of silent deliveries waiting for the next real prompt. */
   get queuedDeliveryCount(): number {
-    return this.queues.silentCount;
+    return this.parts.queues.silentCount;
   }
 
   /** Number of parked wake deliveries waiting for the next run. */
   get pendingWakeDeliveryCount(): number {
-    return this.queues.wakeCount;
+    return this.parts.queues.wakeCount;
   }
 
   /**
@@ -1007,7 +462,7 @@ export class AgentLoop {
    * order so the caller can re-route or persist them.
    */
   clearQueuedDeliveries(): string[] {
-    return this.queues.clearSilent();
+    return this.parts.queues.clearSilent();
   }
 
   /**
@@ -1029,7 +484,7 @@ export class AgentLoop {
    * caller is the one holding the context to record it.
    */
   dropPendingWakeDeliveries(predicate: (content: string) => boolean): string[] {
-    return this.queues.dropWake(predicate);
+    return this.parts.queues.dropWake(predicate);
   }
 
   // -----------------------------------------------------------------------
@@ -1045,7 +500,7 @@ export class AgentLoop {
    * however it settles (answered, blocked, or aborted).
    */
   getPendingAsks(): PendingAsk[] {
-    return this.asks.list();
+    return this.parts.asks.list();
   }
 
   /**
@@ -1055,7 +510,7 @@ export class AgentLoop {
    * false for an unknown or already-settled askId.
    */
   markAskVoiced(askId: string): boolean {
-    return this.asks.markVoiced(askId);
+    return this.parts.asks.markVoiced(askId);
   }
 
   /**
@@ -1067,7 +522,7 @@ export class AgentLoop {
    * outlives the work that raised it.
    */
   async waitForAskSettlement(): Promise<void> {
-    return this.asks.waitForSettlement();
+    return this.parts.asks.waitForSettlement();
   }
 
   // -----------------------------------------------------------------------
@@ -1094,7 +549,7 @@ export class AgentLoop {
     provider: (() => string | null) | null,
     options?: { maxTokens?: number },
   ): void {
-    this.pipeline.headline.set(provider, options);
+    this.parts.pipeline.headline.set(provider, options);
   }
 
   /**
@@ -1109,7 +564,7 @@ export class AgentLoop {
    * path, which for control tools would reopen the very loop D17 closes.
    */
   setToolResultInterceptor(interceptor: ToolResultInterceptor | null): void {
-    this.finalizer.setInterceptor(interceptor);
+    this.parts.finalizer.setInterceptor(interceptor);
   }
 
   /**
@@ -1136,7 +591,7 @@ export class AgentLoop {
       ...(classified.causeDetail ? { cause: classified.causeDetail } : {}),
     });
 
-    this.errorHandlers.emit(classified, { loopPath: this.loopPath });
+    this.parts.errorHandlers.emit(classified, { loopPath: this.loopPath });
 
     return classified;
   }
@@ -1165,7 +620,7 @@ export class AgentLoop {
    * @throws Error if pi-ai is not installed or the call fails
    */
   async directComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string> {
-    return this.completions.direct(context, options);
+    return this.parts.completions.direct(context, options);
   }
 
 
@@ -1190,7 +645,7 @@ export class AgentLoop {
    * @returns The parsed tool call arguments, or null if the model didn't call the tool
    */
   async structuredComplete(context: DirectCompletionContext, schema: unknown, toolName: string = 'structured_output', toolDescription: string = 'Produce structured output', options?: DirectCompletionOptions): Promise<Record<string, unknown> | null> {
-    return this.completions.structured(context, schema, toolName, toolDescription, options);
+    return this.parts.completions.structured(context, schema, toolName, toolDescription, options);
   }
 
 
@@ -1215,14 +670,14 @@ export class AgentLoop {
   private piHookHost(): PiHookHost {
     return {
       isToolPermissionExempt: (toolName) => this.isToolPermissionExempt(toolName),
-      asks: this.asks,
+      asks: this.parts.asks,
       streamOptions: () => ({
-        retention: this.runner.activeCacheRetention ?? this.models.cacheRetention ?? null,
-        sessionId: this.models.sessionId ?? null,
+        retention: this.parts.runner.activeCacheRetention ?? this.parts.models.cacheRetention ?? null,
+        sessionId: this.parts.models.sessionId ?? null,
       }),
-      syncActiveLoopTools: (ctx) => this.tools.syncActiveLoopTools(ctx),
-      finalizer: this.finalizer,
-      cacheBreakpointIndices: () => this.pipeline.cacheBreakpointIndices,
+      syncActiveLoopTools: (ctx) => this.parts.tools.syncActiveLoopTools(ctx),
+      finalizer: this.parts.finalizer,
+      cacheBreakpointIndices: () => this.parts.pipeline.cacheBreakpointIndices,
     };
   }
 
@@ -1276,7 +731,7 @@ export class AgentLoop {
     if (typeof initialBasePrompt === 'string') {
       agentLoop.setBasePrompt(initialBasePrompt);
     } else if (typeof initialSystemPrompt === 'string' && initialSystemPrompt.trim()) {
-      agentLoop.systemPrompt.apply(initialSystemPrompt);
+      agentLoop.parts.systemPrompt.apply(initialSystemPrompt);
     }
 
     return agentLoop;
@@ -1352,7 +807,7 @@ export class AgentLoop {
    * Get the ContextManager for slot and ephemeral context management.
    */
   getContextManager(): ContextManager {
-    return this.contextManager;
+    return this.parts.contextManager;
   }
 
   // -----------------------------------------------------------------------
@@ -1371,7 +826,7 @@ export class AgentLoop {
    * @returns The assembled system prompt
    */
   composeSystemPrompt(basePrompt: string): string {
-    return this.systemPrompt.compose(basePrompt);
+    return this.parts.systemPrompt.compose(basePrompt);
   }
 
   /**
@@ -1380,21 +835,21 @@ export class AgentLoop {
    * Preserves conversation history. Non-destructive.
    */
   setBasePrompt(basePrompt: string): string {
-    return this.systemPrompt.setBase(basePrompt);
+    return this.parts.systemPrompt.setBase(basePrompt);
   }
 
   /**
    * Get the current application/base prompt.
    */
   getBasePrompt(): string {
-    return this.systemPrompt.base() ?? '';
+    return this.parts.systemPrompt.base() ?? '';
   }
 
   /**
    * Get the current assembled system prompt.
    */
   getCurrentSystemPrompt(): string {
-    return this.systemPrompt.current();
+    return this.parts.systemPrompt.current();
   }
 
   /**
@@ -1402,7 +857,7 @@ export class AgentLoop {
    * Useful for context snapshot / inspector tooling.
    */
   getSystemPromptSections(): Array<{ name: string; content: string }> {
-    return this.systemPrompt.sections();
+    return this.parts.systemPrompt.sections();
   }
 
   // -----------------------------------------------------------------------
@@ -1418,7 +873,7 @@ export class AgentLoop {
    * @returns Conversation history messages (everything after slots)
    */
   getConversationHistory(): AgentMessage[] {
-    const slotCount = this.contextManager.slotCount;
+    const slotCount = this.parts.contextManager.slotCount;
     return this.agent.state.messages.slice(slotCount);
   }
 
@@ -1431,7 +886,7 @@ export class AgentLoop {
    * @param messages - Previously saved conversation history
    */
   restoreConversationHistory(messages: AgentMessage[]): void {
-    const slotCount = this.contextManager.slotCount;
+    const slotCount = this.parts.contextManager.slotCount;
     // Remove existing conversation history (everything after slots)
     this.agent.state.messages.splice(slotCount);
     // Sanitize restored messages: fix undefined/null/empty content that may
@@ -1457,14 +912,14 @@ export class AgentLoop {
    * Get the primary model.
    */
   getModel(): CortexModel {
-    return this.models.primary;
+    return this.parts.models.primary;
   }
 
   /**
    * Get the resolved utility model.
    */
   getUtilityModel(): CortexModel {
-    return this.models.utility;
+    return this.parts.models.utility;
   }
 
   /**
@@ -1478,7 +933,7 @@ export class AgentLoop {
    * run, instead of re-deriving it from a model list that the agent never sees.
    */
   getAutoResolvedUtilityModel(): CortexModel {
-    return this.models.autoResolvedUtility();
+    return this.parts.models.autoResolvedUtility();
   }
 
   /**
@@ -1488,7 +943,7 @@ export class AgentLoop {
    * @param model - The new CortexModel to use
    */
   setModel(model: CortexModel): void {
-    this.models.setModel(model);
+    this.parts.models.setModel(model);
   }
 
   /**
@@ -1500,7 +955,7 @@ export class AgentLoop {
    * @param model - The CortexModel to use as the utility model
    */
   setUtilityModel(model: CortexModel): void {
-    this.models.setUtilityModel(model);
+    this.parts.models.setUtilityModel(model);
   }
 
   /**
@@ -1508,14 +963,14 @@ export class AgentLoop {
    * Clears any manual override set by setUtilityModel().
    */
   resetUtilityModel(): void {
-    this.models.resetUtilityModel();
+    this.parts.models.resetUtilityModel();
   }
 
   /**
    * Whether the utility model has been manually overridden.
    */
   isUtilityModelOverridden(): boolean {
-    return this.models.isUtilityOverridden;
+    return this.parts.models.isUtilityOverridden;
   }
 
   /**
@@ -1549,8 +1004,8 @@ export class AgentLoop {
   setWorkingTagsEnabled(enabled: boolean): void {
     if (this.workingTagsEnabled === enabled) return;
     this.workingTagsEnabled = enabled;
-    this.eventBridge.setWorkingTagsEnabled(enabled);
-    const base = this.systemPrompt.base();
+    this.parts.eventBridge.setWorkingTagsEnabled(enabled);
+    const base = this.parts.systemPrompt.base();
     if (base !== null) {
       this.setBasePrompt(base);
     }
@@ -1563,7 +1018,7 @@ export class AgentLoop {
    * @returns Capabilities object describing thinking support
    */
   async getModelThinkingCapabilities(): Promise<ModelThinkingCapabilities> {
-    return modelThinkingCapabilities(this.models.primaryPi);
+    return modelThinkingCapabilities(this.parts.models.primaryPi);
   }
 
   /**
@@ -1593,7 +1048,7 @@ export class AgentLoop {
    * stream options for each provider request.
    */
   setCacheRetention(value: 'none' | 'short' | 'long'): void {
-    this.models.setCacheRetention(value);
+    this.parts.models.setCacheRetention(value);
   }
 
   /**
@@ -1601,7 +1056,7 @@ export class AgentLoop {
    * Returns null if not yet resolved (pi-ai will use its own default).
    */
   getCacheRetention(): 'none' | 'short' | 'long' | null {
-    return this.models.cacheRetention;
+    return this.parts.models.cacheRetention;
   }
 
   /**
@@ -1610,14 +1065,14 @@ export class AgentLoop {
    * Pass null to clear (the provider then generates its own per-request key).
    */
   setSessionId(value: string | null): void {
-    this.models.setSessionId(value);
+    this.parts.models.setSessionId(value);
   }
 
   /**
    * Get the current cache/session key, or null if unset.
    */
   getSessionId(): string | null {
-    return this.models.sessionId;
+    return this.parts.models.sessionId;
   }
 
   /**
@@ -1629,7 +1084,7 @@ export class AgentLoop {
    * "deferred" set (announced by name in the `_available_tools` slot).
    */
   refreshTools(): void {
-    this.tools.refresh();
+    this.parts.tools.refresh();
   }
 
   /**
@@ -1642,7 +1097,7 @@ export class AgentLoop {
    * name, or the same name arriving via MCP, still goes to the resolver.
    */
   isToolPermissionExempt(toolName: string): boolean {
-    return this.tools.isPermissionExempt(toolName);
+    return this.parts.tools.isPermissionExempt(toolName);
   }
 
   /**
@@ -1651,7 +1106,7 @@ export class AgentLoop {
    * creation based on user permission changes).
    */
   addConsumerTool(tool: CortexTool): void {
-    this.tools.add(tool);
+    this.parts.tools.add(tool);
   }
 
   /**
@@ -1659,7 +1114,7 @@ export class AgentLoop {
    * Built-in tools cannot be removed.
    */
   removeConsumerTool(toolName: string): void {
-    this.tools.remove(toolName);
+    this.parts.tools.remove(toolName);
   }
 
   /**
@@ -1676,7 +1131,7 @@ export class AgentLoop {
    * @throws Error if pi-ai is not installed or the call fails
    */
   async utilityComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string> {
-    return this.completions.utility(context, options);
+    return this.parts.completions.utility(context, options);
   }
 
 
@@ -1689,7 +1144,7 @@ export class AgentLoop {
    * The agent remains usable for subsequent prompts.
    */
   async abort(): Promise<void> {
-    return this.lifecycle.abort();
+    return this.parts.lifecycle.abort();
   }
 
   /**
@@ -1710,21 +1165,21 @@ export class AgentLoop {
    * @param timeoutMs - Maximum time to wait for cleanup (default: 8000ms)
    */
   async destroy(timeoutMs = 8000): Promise<void> {
-    return this.lifecycle.destroy(timeoutMs);
+    return this.parts.lifecycle.destroy(timeoutMs);
   }
 
   /**
    * Whether the agent is currently running an agentic loop.
    */
   get isRunning(): boolean {
-    return this.lifecycle.state === 'active' && this.runner.isPrompting;
+    return this.parts.lifecycle.state === 'active' && this.parts.runner.isPrompting;
   }
 
   /**
    * Get the current lifecycle state.
    */
   get state(): CortexLifecycleState {
-    return this.lifecycle.state;
+    return this.parts.lifecycle.state;
   }
 
   /**
@@ -1733,7 +1188,7 @@ export class AgentLoop {
    * "old history" (cacheable) from "new tick content" (ephemeral).
    */
   get prePromptMessageCount(): number {
-    return this.runner.boundary;
+    return this.parts.runner.boundary;
   }
 
   // -----------------------------------------------------------------------
@@ -1750,7 +1205,7 @@ export class AgentLoop {
    * that "a" loop had finished and could not act on which.
    */
   onLoopComplete(handler: (origin: LoopOriginContext) => void): void {
-    this.loopCompleteHandlers.add(handler);
+    this.parts.loopComplete.add(handler);
   }
 
   /**
@@ -1758,7 +1213,7 @@ export class AgentLoop {
    * The origin context identifies which loop produced the error.
    */
   onError(handler: (error: ClassifiedError, origin: LoopOriginContext) => void): void {
-    this.errorHandlers.add(handler);
+    this.parts.errorHandlers.add(handler);
   }
 
   /**
@@ -1769,7 +1224,7 @@ export class AgentLoop {
   onRetryScheduled(
     handler: (info: RetryScheduledInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.runner.retryScheduled.add(handler);
+    this.parts.runner.retryScheduled.add(handler);
   }
 
   /**
@@ -1779,7 +1234,7 @@ export class AgentLoop {
   onRetrySucceeded(
     handler: (info: RetrySucceededInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.runner.retrySucceeded.add(handler);
+    this.parts.runner.retrySucceeded.add(handler);
   }
 
   /**
@@ -1790,7 +1245,7 @@ export class AgentLoop {
   onRetryExhausted(
     handler: (info: RetryExhaustedInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.runner.retryExhausted.add(handler);
+    this.parts.runner.retryExhausted.add(handler);
   }
 
   /**
@@ -1803,7 +1258,7 @@ export class AgentLoop {
   onBeforeCompaction(
     handler: (target: CompactionTarget, origin: LoopOriginContext) => Promise<void>,
   ): void {
-    this.compactionManager.onBeforeCompaction(
+    this.parts.compactionManager.onBeforeCompaction(
       (target) => handler(target, this.originContext),
     );
   }
@@ -1816,7 +1271,7 @@ export class AgentLoop {
   onPostCompaction(
     handler: (result: CompactionResult, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionManager.onPostCompaction(
+    this.parts.compactionManager.onPostCompaction(
       (result) => handler(result, this.originContext),
     );
   }
@@ -1827,7 +1282,7 @@ export class AgentLoop {
   onCompactionError(
     handler: (error: Error, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionManager.onCompactionError(
+    this.parts.compactionManager.onCompactionError(
       (error) => handler(error, this.originContext),
     );
   }
@@ -1840,7 +1295,7 @@ export class AgentLoop {
   onCompactionDegraded(
     handler: (info: CompactionDegradedInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionManager.onCompactionDegraded(
+    this.parts.compactionManager.onCompactionDegraded(
       (info) => handler(info, this.originContext),
     );
   }
@@ -1853,7 +1308,7 @@ export class AgentLoop {
   onCompactionExhausted(
     handler: (info: CompactionExhaustedInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionManager.onCompactionExhausted(
+    this.parts.compactionManager.onCompactionExhausted(
       (info) => handler(info, this.originContext),
     );
   }
@@ -1863,28 +1318,28 @@ export class AgentLoop {
    * The origin context identifies which loop completed the turn.
    */
   onTurnComplete(handler: (output: AgentTextOutput, origin: LoopOriginContext) => void): void {
-    this.turnCompleteHandlers.add(handler);
+    this.parts.turnComplete.add(handler);
   }
 
   /**
    * Register a handler for sub-agent spawn events.
    */
   onSubAgentSpawned(handler: (taskId: string, instructions: string, background: boolean) => void): void {
-    this.subAgents.spawnedHandlers.add(handler);
+    this.parts.subAgents.spawnedHandlers.add(handler);
   }
 
   /**
    * Register a handler for sub-agent completion events.
    */
   onSubAgentCompleted(handler: (taskId: string, result: string, status: string, usage: unknown) => void): void {
-    this.subAgents.completedHandlers.add(handler);
+    this.parts.subAgents.completedHandlers.add(handler);
   }
 
   /**
    * Register a handler for sub-agent failure events.
    */
   onSubAgentFailed(handler: (taskId: string, error: string) => void): void {
-    this.subAgents.failedHandlers.add(handler);
+    this.parts.subAgents.failedHandlers.add(handler);
   }
 
   /**
@@ -1893,7 +1348,7 @@ export class AgentLoop {
    * Consumers can use this to update UI state (show spinners, etc.).
    */
   onBackgroundResultDelivery(handler: (taskIds: string[]) => void): void {
-    this.background.deliveryHandlers.add(handler);
+    this.parts.background.deliveryHandlers.add(handler);
   }
 
   /**
@@ -1908,7 +1363,7 @@ export class AgentLoop {
   onBackgroundResultDeadLettered(
     handler: (result: DeadLetteredBackgroundResult) => void,
   ): void {
-    this.deadLetters.handlers.add(handler);
+    this.parts.deadLetters.handlers.add(handler);
   }
 
   /**
@@ -1916,14 +1371,14 @@ export class AgentLoop {
    * Consumers that need raw event data (for logging) can subscribe directly.
    */
   getEventBridge(): EventBridge {
-    return this.eventBridge;
+    return this.parts.eventBridge;
   }
 
   /**
    * Get the BudgetGuard for inspecting turn/cost state.
    */
   getBudgetGuard(): BudgetGuard {
-    return this.budgetGuard;
+    return this.parts.budgetGuard;
   }
 
   /**
@@ -1936,7 +1391,7 @@ export class AgentLoop {
    * at the start of each directComplete/structuredComplete call.
    */
   getLastDirectUsage(): CortexUsage | null {
-    return this.usage.lastDirect;
+    return this.parts.usage.lastDirect;
   }
 
   /**
@@ -1947,7 +1402,7 @@ export class AgentLoop {
    * and restore it via restoreSessionUsage() after loading a saved session.
    */
   getSessionUsage(): SessionUsage {
-    return this.usage.snapshot();
+    return this.parts.usage.snapshot();
   }
 
   /**
@@ -1958,7 +1413,7 @@ export class AgentLoop {
    * before the restore call).
    */
   restoreSessionUsage(usage: SessionUsage): void {
-    this.usage.restore(usage);
+    this.parts.usage.restore(usage);
   }
 
   // -----------------------------------------------------------------------
@@ -1971,14 +1426,14 @@ export class AgentLoop {
    * from AssistantMessage.usage.
    */
   updateCurrentContextTokenCount(inputTokens: number): void {
-    this.compactionManager.updateCurrentContextTokenCount(inputTokens);
+    this.parts.compactionManager.updateCurrentContextTokenCount(inputTokens);
   }
 
   /**
    * Get the post-hoc current-context token count from the most recent parent turn.
    */
   get currentContextTokenCount(): number {
-    return this.compactionManager.currentContextTokenCount;
+    return this.parts.compactionManager.currentContextTokenCount;
   }
 
   /**
@@ -1996,7 +1451,7 @@ export class AgentLoop {
    * internal decision logic.
    */
   estimateCurrentContextTokens(): number {
-    return this.pipeline.estimateTokens();
+    return this.parts.pipeline.estimateTokens();
   }
 
   /**
@@ -2005,7 +1460,7 @@ export class AgentLoop {
    * min(limit, contextWindow).
    */
   setContextWindow(contextWindow: number): void {
-    this.models.setContextWindow(contextWindow);
+    this.parts.models.setContextWindow(contextWindow);
   }
 
   /**
@@ -2015,28 +1470,28 @@ export class AgentLoop {
    * Pass null to remove the limit and use the model's full context window.
    */
   setContextWindowLimit(limit: number | null): void {
-    this.models.setContextWindowLimit(limit);
+    this.parts.models.setContextWindowLimit(limit);
   }
 
   /**
    * Get the raw user-configured context window limit (null = no limit).
    */
   get contextWindowLimit(): number | null {
-    return this.models.contextWindowLimit;
+    return this.parts.models.contextWindowLimit;
   }
 
   /**
    * Get the effective context window after clamping the limit to backend capacity.
    */
   get effectiveContextWindow(): number {
-    return this.compactionManager.contextWindow;
+    return this.parts.compactionManager.contextWindow;
   }
 
   /**
    * Get the model's actual context window (unaffected by consumer limits).
    */
   get modelContextWindow(): number {
-    return this.compactionManager.modelContextWindow;
+    return this.parts.compactionManager.modelContextWindow;
   }
 
   /**
@@ -2050,7 +1505,7 @@ export class AgentLoop {
    * timestamp ages naturally.
    */
   setLastInteractionTime(timestamp: number): void {
-    this.compactionManager.setLastInteractionTime(timestamp);
+    this.parts.compactionManager.setLastInteractionTime(timestamp);
   }
 
   /**
@@ -2059,7 +1514,7 @@ export class AgentLoop {
    * Call this when tool results enter conversation history.
    */
   capToolResult(content: string): string {
-    return this.compactionManager.capToolResult(content);
+    return this.parts.compactionManager.capToolResult(content);
   }
 
   // -----------------------------------------------------------------------
@@ -2071,7 +1526,7 @@ export class AgentLoop {
    * Returns null if not using the observational strategy.
    */
   getObservationalMemoryState(): ObservationalMemoryState | null {
-    return this.compactionManager.getObservationalMemoryState();
+    return this.parts.compactionManager.getObservationalMemoryState();
   }
 
   /**
@@ -2081,16 +1536,16 @@ export class AgentLoop {
   restoreObservationalMemoryState(state: ObservationalMemoryState): void {
     // Conversation history is restored before this call, so the post-slot
     // message count is the length the buffer watermark must align with.
-    const slotCount = this.contextManager.slotCount;
+    const slotCount = this.parts.contextManager.slotCount;
     const historyLength = Math.max(0, this.agent.state.messages.length - slotCount);
-    this.compactionManager.restoreObservationalMemoryState(state, historyLength);
+    this.parts.compactionManager.restoreObservationalMemoryState(state, historyLength);
     // Populate the observation slot only when there are real observations to
     // show. getObservationSlotContent() always returns at least the preamble,
     // so guarding on hasObservations() keeps a resumed-but-never-observed
     // session looking like a fresh one (empty slot) instead of injecting the
     // preamble around an empty <observations> block.
-    if (this.compactionManager.hasObservations()) {
-      this.contextManager.setSlot('_observations', this.compactionManager.getObservationSlotContent());
+    if (this.parts.compactionManager.hasObservations()) {
+      this.parts.contextManager.setSlot('_observations', this.parts.compactionManager.getObservationSlotContent());
     }
     // No observer is launched on resume. The restored buffer + watermark are
     // valid as-is, and the unobserved tail is restored as raw messages. The
@@ -2104,12 +1559,12 @@ export class AgentLoop {
    * Useful after critical user corrections.
    */
   async triggerObservation(): Promise<void> {
-    const slotCount = this.contextManager.slotCount;
-    await this.compactionManager.triggerObservation(this.agent.state.messages, slotCount);
+    const slotCount = this.parts.contextManager.slotCount;
+    await this.parts.compactionManager.triggerObservation(this.agent.state.messages, slotCount);
     // Update the slot after the observer completes
-    const slotContent = this.compactionManager.getObservationSlotContent();
+    const slotContent = this.parts.compactionManager.getObservationSlotContent();
     if (slotContent) {
-      this.contextManager.setSlot('_observations', slotContent);
+      this.parts.contextManager.setSlot('_observations', slotContent);
     }
   }
 
@@ -2120,7 +1575,7 @@ export class AgentLoop {
   onObservation(
     handler: (event: ObservationEvent, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionManager.onObservation(
+    this.parts.compactionManager.onObservation(
       (event) => handler(event, this.originContext),
     );
   }
@@ -2132,7 +1587,7 @@ export class AgentLoop {
   onReflection(
     handler: (event: ReflectionEvent, origin: LoopOriginContext) => void,
   ): void {
-    this.compactionManager.onReflection(
+    this.parts.compactionManager.onReflection(
       (event) => handler(event, this.originContext),
     );
   }
@@ -2160,7 +1615,7 @@ export class AgentLoop {
    * appended in the meantime.
    */
   async digestIdle(options?: IdleDigestionOptions): Promise<IdleDigestionResult> {
-    return this.pipeline.digest(options);
+    return this.parts.pipeline.digest(options);
   }
 
   /**
@@ -2169,7 +1624,7 @@ export class AgentLoop {
    * Layer 2 compaction ran, null otherwise.
    */
   async checkAndRunCompaction(): Promise<CompactionResult | null> {
-    return this.compactionManager.checkAndRunCompaction(
+    return this.parts.compactionManager.checkAndRunCompaction(
       () => this.getConversationHistory(),
       (history) => this.restoreConversationHistory(history),
     );
@@ -2179,7 +1634,7 @@ export class AgentLoop {
    * Get the CompactionManager for advanced use.
    */
   getCompactionManager(): CompactionManager {
-    return this.compactionManager;
+    return this.parts.compactionManager;
   }
 
   /**
@@ -2188,7 +1643,7 @@ export class AgentLoop {
    * to ensure all subprocess environments include these overrides.
    */
   getEnvOverrides(): Record<string, string> | undefined {
-    return this.envOverrides;
+    return this.config.envOverrides;
   }
 
   /**
@@ -2197,7 +1652,7 @@ export class AgentLoop {
    * and to retrieve discovered tools.
    */
   getMcpClientManager(): McpClientManager {
-    return this.mcp.manager;
+    return this.parts.mcp.manager;
   }
 
   /**
@@ -2208,7 +1663,7 @@ export class AgentLoop {
    * @param config - Transport configuration (stdio or http)
    */
   async connectMcpServer(serverName: string, config: McpTransportConfig): Promise<void> {
-    await this.mcp.manager.connect(serverName, config);
+    await this.parts.mcp.manager.connect(serverName, config);
   }
 
   /**
@@ -2218,7 +1673,7 @@ export class AgentLoop {
    * @param serverName - The server name to disconnect
    */
   async disconnectMcpServer(serverName: string): Promise<void> {
-    await this.mcp.manager.disconnect(serverName);
+    await this.parts.mcp.manager.disconnect(serverName);
   }
 
   /**
@@ -2229,7 +1684,7 @@ export class AgentLoop {
    * diff between desired (config files) and current state between turns.
    */
   getMcpServerStates(): McpConnectionState[] {
-    return this.mcp.manager.getConnectionStates();
+    return this.parts.mcp.manager.getConnectionStates();
   }
 
   /**
@@ -2242,7 +1697,7 @@ export class AgentLoop {
    * false when no server is connected under `serverName`.
    */
   mcpConfigMatches(serverName: string, config: McpTransportConfig): boolean {
-    return this.mcp.manager.configMatches(serverName, config);
+    return this.parts.mcp.manager.configMatches(serverName, config);
   }
 
   /**
@@ -2256,7 +1711,7 @@ export class AgentLoop {
   setMcpToolCallProgressHandler(
     handler: ((progress: McpToolCallProgress) => void) | undefined,
   ): void {
-    this.mcp.setProgressHandler(handler);
+    this.parts.mcp.setProgressHandler(handler);
   }
 
   /**
@@ -2267,7 +1722,7 @@ export class AgentLoop {
    * directly on the Agent and are not included here.
    */
   getMcpTools(): CortexTool[] {
-    return this.mcp.manager.getTools();
+    return this.parts.mcp.manager.getTools();
   }
 
   // -----------------------------------------------------------------------
@@ -2301,7 +1756,7 @@ export class AgentLoop {
    * @returns An async transformContext function for the Agent constructor
    */
   getTransformContextHook(): (context: AgentContext) => Promise<AgentContext> {
-    return this.pipeline.hook();
+    return this.parts.pipeline.hook();
   }
 
   // Cache breakpoint index computation lives in cache-breakpoints.ts,
@@ -2320,7 +1775,7 @@ export class AgentLoop {
    * Only returns true for actual abort/cancel signals, not arbitrary errors.
    */
   private isAborted(): boolean {
-    return this.abortState.signal.aborted ||
+    return this.parts.abortState.signal.aborted ||
       isAbortShapedError(this.agent.state as Record<string, unknown>);
   }
 
@@ -2332,7 +1787,7 @@ export class AgentLoop {
    * Get the SkillRegistry for add/remove/query operations.
    */
   getSkillRegistry(): SkillRegistry {
-    return this.skills.registry;
+    return this.parts.skills.registry;
   }
 
   /**
@@ -2341,7 +1796,7 @@ export class AgentLoop {
    * No LLM turn is consumed.
    */
   async loadSkill(name: string, args?: string): Promise<void> {
-    await this.skills.load(name, args);
+    await this.parts.skills.load(name, args);
   }
 
   /**
@@ -2351,14 +1806,14 @@ export class AgentLoop {
    * and clearing at prompt() start would wipe consumer pre-loaded skills.
    */
   clearSkillBuffer(): void {
-    this.skills.clear();
+    this.parts.skills.clear();
   }
 
   /**
    * Get the current skill buffer contents.
    */
   getSkillBuffer(): LoadedSkill[] {
-    return this.skills.snapshot();
+    return this.parts.skills.snapshot();
   }
 
   /**
@@ -2368,7 +1823,7 @@ export class AgentLoop {
    * Call this each tick during GATHER to update runtime values.
    */
   setPreprocessorVariables(variables: Record<string, string>): void {
-    this.skills.registry.setPreprocessorVariables(variables);
+    this.parts.skills.registry.setPreprocessorVariables(variables);
   }
 
   /**
@@ -2378,7 +1833,7 @@ export class AgentLoop {
    * Call this each tick during GATHER to update runtime values.
    */
   setScriptContext(context: Record<string, unknown>): void {
-    this.skills.registry.setScriptContext(context);
+    this.parts.skills.registry.setScriptContext(context);
   }
 
   // -----------------------------------------------------------------------
@@ -2389,7 +1844,7 @@ export class AgentLoop {
    * Get the SubAgentManager for direct sub-agent tracking.
    */
   getSubAgentManager(): SubAgentManager {
-    return this.subAgentManager;
+    return this.parts.subAgentManager;
   }
 
   /**
@@ -2398,7 +1853,7 @@ export class AgentLoop {
    * Throws when the concurrency limit is reached.
    */
   async spawnBackgroundSubAgent(params: Omit<SubAgentSpawnConfig, 'background'>): Promise<{ taskId: string }> {
-    return this.subAgents.spawnBackgroundChecked(params);
+    return this.parts.subAgents.spawnBackgroundChecked(params);
   }
 
   /**
@@ -2408,7 +1863,7 @@ export class AgentLoop {
    * Returns false when the task ID is not an active sub-agent.
    */
   async cancelSubAgent(taskId: string): Promise<boolean> {
-    return this.subAgents.cancel(taskId);
+    return this.parts.subAgents.cancel(taskId);
   }
 
   /**
@@ -2430,7 +1885,7 @@ export class AgentLoop {
    * child acted on it rather than treat true as delivery.
    */
   steerSubAgent(taskId: string, message: string): boolean {
-    return this.subAgents.steer(taskId, message);
+    return this.parts.subAgents.steer(taskId, message);
   }
 
   /**
@@ -2439,7 +1894,7 @@ export class AgentLoop {
    * or status surfaces). Returns an empty array when none are running.
    */
   getActiveSubAgents(): SubAgentSnapshot[] {
-    return this.subAgents.snapshots();
+    return this.parts.subAgents.snapshots();
   }
 
   /**
@@ -2448,14 +1903,7 @@ export class AgentLoop {
    * Called from transformContext before each LLM call.
    */
   private buildBackgroundTaskState(): string | null {
-    const subAgents = this.subAgentManager.getActiveTaskIds()
-      .map((taskId) => this.subAgentManager.get(taskId))
-      .filter((entry): entry is TrackedSubAgent => entry !== undefined);
-    return buildBackgroundTaskState({
-      subAgents,
-      bashTasks: this.tools.runtime.backgroundTasks.getAll(),
-      now: Date.now(),
-    });
+    return backgroundTaskState(this.parts.subAgentManager, this.parts.tools);
   }
 
   /**
@@ -2473,7 +1921,7 @@ export class AgentLoop {
    * re-queueing would duplicate it.
    */
   private unwindFailedDelivery(preDeliveryCount: number, runAbortEpoch: number): boolean {
-    return this.queues.unwindFailedDelivery(preDeliveryCount, runAbortEpoch);
+    return this.parts.queues.unwindFailedDelivery(preDeliveryCount, runAbortEpoch);
   }
 
   /**
@@ -2483,21 +1931,21 @@ export class AgentLoop {
    * to the user or re-drive the work; Cortex will not retry them.
    */
   getDeadLetteredBackgroundResults(): DeadLetteredBackgroundResult[] {
-    return this.deadLetters.list();
+    return this.parts.deadLetters.list();
   }
 
   /** Build a sub-agent's loop (the spawner's factory; tests stand in for it). */
   private async createChildAgent(params: ChildLoopParams): Promise<AgentLoop> {
     const { createParams, seedContext } = await prepareChildLoop({
       config: this.config,
-      model: this.models.primary,
+      model: this.parts.models.primary,
       workingTagsEnabled: this.workingTagsEnabled,
-      contextWindowLimit: this.models.contextWindowLimit,
+      contextWindowLimit: this.parts.models.contextWindowLimit,
       loopPath: this.loopPath,
-      prompt: { base: this.systemPrompt.base(), current: this.systemPrompt.current() },
-      rawPersistResult: this.tools.rawPersistResult,
-      resultThresholds: this.tools.resultThresholds,
-      inheritableTools: (requested) => this.tools.childInheritable(requested),
+      prompt: { base: this.parts.systemPrompt.base(), current: this.parts.systemPrompt.current() },
+      rawPersistResult: this.parts.tools.rawPersistResult,
+      resultThresholds: this.parts.tools.resultThresholds,
+      inheritableTools: (requested) => this.parts.tools.childInheritable(requested),
       childResolver: (taskId) => this.config.resolvePermission
         ? this.wrapChildPermissionResolver(this.config.resolvePermission, taskId)
         : undefined,
@@ -2521,8 +1969,8 @@ export class AgentLoop {
     childTaskId: string,
   ): NonNullable<AgentLoopConfig['resolvePermission']> {
     return mirrorChildPermissionResolver(parentResolver, {
-      asks: this.asks,
-      subAgents: this.subAgentManager,
+      asks: this.parts.asks,
+      subAgents: this.parts.subAgentManager,
       childTaskId,
       childLoopPath: `${this.loopPath}/${childTaskId}`,
     });
@@ -2535,96 +1983,104 @@ export class AgentLoop {
   // tests move onto the modules.
   // -----------------------------------------------------------------------
 
+  private get compactionManager(): CompactionManager {
+    return this.parts.compactionManager;
+  }
+
+  private get subAgentManager(): SubAgentManager {
+    return this.parts.subAgentManager;
+  }
+
   private spawnForegroundSubAgentInternal(params: SubAgentSpawnParams): Promise<ForegroundSpawnResult> {
-    return this.subAgents.spawnForeground(params);
+    return this.parts.subAgents.spawnForeground(params);
   }
 
   private spawnBackgroundSubAgentInternal(params: SubAgentSpawnParams): Promise<{ taskId: string }> {
-    return this.subAgents.spawnBackground(params);
+    return this.parts.subAgents.spawnBackground(params);
   }
 
   private registerPendingAsk(ask: PendingAsk): void {
-    this.asks.register(ask);
+    this.parts.asks.register(ask);
   }
 
   private settlePendingAsk(askId: string): void {
-    this.asks.settle(askId);
+    this.parts.asks.settle(askId);
   }
 
   private get _prePromptMessageCount(): number {
-    return this.runner.boundary;
+    return this.parts.runner.boundary;
   }
 
   private set _prePromptMessageCount(value: number) {
-    this.runner.boundary = value;
+    this.parts.runner.boundary = value;
   }
 
   private get _isPrompting(): boolean {
-    return this.runner.isPrompting;
+    return this.parts.runner.isPrompting;
   }
 
   private get headlineProvider(): (() => string | null) | null {
-    return this.pipeline.headline.current;
+    return this.parts.pipeline.headline.current;
   }
 
   private get _cacheBreakpointIndices(): CacheBreakpointIndices | null {
-    return this.pipeline.cacheBreakpointIndices;
+    return this.parts.pipeline.cacheBreakpointIndices;
   }
 
   private set _cacheBreakpointIndices(indices: CacheBreakpointIndices | null) {
-    this.pipeline.cacheBreakpointIndices = indices;
+    this.parts.pipeline.cacheBreakpointIndices = indices;
   }
 
   private get pendingBackgroundResults(): PendingBackgroundCompletion[] {
-    return this.background.pending;
+    return this.parts.background.pending;
   }
 
   private deliverOrQueueBackgroundCompletion(item: PendingBackgroundCompletion): Promise<void> {
-    return this.background.enqueue(item);
+    return this.parts.background.enqueue(item);
   }
 
   private schedulePendingResultDelivery(): Promise<void> {
-    return this.background.schedule();
+    return this.parts.background.schedule();
   }
 
   private drainPendingBackgroundResults(): Promise<void> {
-    return this.background.drain();
+    return this.parts.background.drain();
   }
 
   private requeueOrDeadLetter(batch: PendingBackgroundCompletion[], err: unknown): void {
-    this.background.requeueOrDeadLetter(batch, err);
+    this.parts.background.requeueOrDeadLetter(batch, err);
   }
 
   private batchRecoveredAfterRequeue(batch: PendingBackgroundCompletion[]): boolean {
-    return this.background.batchRecoveredAfterRequeue(batch);
+    return this.parts.background.batchRecoveredAfterRequeue(batch);
   }
 
   private get pendingWakeDeliveries(): QueuedDelivery[] {
-    return this.queues.wake;
+    return this.parts.queues.wake;
   }
 
   private get _abortEpoch(): number {
-    return this.abortState.epoch;
+    return this.parts.abortState.epoch;
   }
 
   private set _abortEpoch(value: number) {
-    this.abortState.epoch = value;
+    this.parts.abortState.epoch = value;
   }
 
   private get trackedPids(): ReadonlySet<number> {
-    return this.processes.pids;
+    return this.parts.processes.pids;
   }
 
   private get registeredTools(): RegisteredTool[] {
-    return this.tools.registered;
+    return this.parts.tools.registered;
   }
 
   private get toolRuntime(): CortexToolRuntime {
-    return this.tools.runtime;
+    return this.parts.tools.runtime;
   }
 
   private buildChildToolSet(requestedTools?: string[]): RegisteredTool[] {
-    return this.tools.childInheritable(requestedTools);
+    return this.parts.tools.childInheritable(requestedTools);
   }
 }
 

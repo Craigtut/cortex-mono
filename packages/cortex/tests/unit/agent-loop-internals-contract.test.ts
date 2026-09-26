@@ -47,6 +47,8 @@ type Kind = 'getter' | 'accessor' | 'method';
 
 const COMPAT: Record<string, Kind> = {
   trackedPids: 'getter',
+  compactionManager: 'getter',
+  subAgentManager: 'getter',
   _abortEpoch: 'accessor',
   _prePromptMessageCount: 'accessor',
   _isPrompting: 'getter',
@@ -120,8 +122,8 @@ describe('AgentLoop test-compat contract', () => {
     expect(internals._abortEpoch).toBe(7);
     // Hold the gate so the delivery parks rather than prompting.
     let release!: () => void;
-    void (loop as unknown as { enqueueLoopTask(task: () => Promise<void>): Promise<void> })
-      .enqueueLoopTask(() => new Promise<void>((resolve) => { release = resolve; }));
+    void (loop as unknown as { parts: { gate: { enqueue(task: () => Promise<void>): Promise<void> } } })
+      .parts.gate.enqueue(() => new Promise<void>((resolve) => { release = resolve; }));
     loop.deliver('parked');
     expect(internals.pendingWakeDeliveries[0]!.abortEpoch).toBe(7);
     internals.pendingWakeDeliveries.splice(0);
