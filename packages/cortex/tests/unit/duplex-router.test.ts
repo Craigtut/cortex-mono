@@ -55,7 +55,6 @@ interface Harness {
 }
 
 function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] & {
-  talkerCauseSeq?: number | null;
   talkerCauseTags?: readonly CauseTag[];
   reasonerCauseTags?: readonly CauseTag[];
 }): Harness {
@@ -131,7 +130,6 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
       log.push({ ...input, seq });
       return seq;
     },
-    currentTalkerCauseSeq: () => options?.talkerCauseSeq ?? null,
     currentTalkerCauseTags: () => talkerCauseTags,
     currentReasonerCauseTags: () => reasonerCauseTagsOverride ?? derivedReasonerCauseTags(),
     reasonerAttemptId: () => reasonerAttemptId,
@@ -393,7 +391,7 @@ describe('control-tool dispatch', () => {
   }
 
   it('spawn_task dispatches to the reasoner and returns a terminating alias receipt', async () => {
-    const h = createHarness({ talkerCauseSeq: 41 });
+    const h = createHarness({ talkerCauseTags: [{ kind: 'utterance', seq: 41 }] });
     h.router.noteUserUtterance('please scan the repo');
     const result = await callTool(h, 'spawn_task', { instructions: 'scan the repo' });
 

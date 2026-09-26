@@ -81,7 +81,6 @@ function createHarness(options?: DuplexRouterOptions): Harness {
       log.push({ ...input, seq });
       return seq;
     },
-    currentTalkerCauseSeq: () => null,
     // The facade's own wiring: the loop's tag slot is `unknown`, so
     // collectCauseTags is the only validator ahead of the consent decision.
     currentTalkerCauseTags: () => collectCauseTags(rawTalkerCauseTags),

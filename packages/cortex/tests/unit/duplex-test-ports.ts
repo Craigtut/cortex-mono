@@ -59,7 +59,6 @@ const UNSTUBBED_PORTS: { [K in RequiredPort]: true } = {
   talkerIdle: true,
   dispatchToReasoner: true,
   appendLog: true,
-  currentTalkerCauseSeq: true,
   currentTalkerCauseTags: true,
   currentReasonerCauseTags: true,
   answerAsk: true,

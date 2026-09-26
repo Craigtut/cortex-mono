@@ -29,6 +29,7 @@ import { UsageLedger } from './facade/usage-ledger.js';
 import { StateEmitter } from './facade/state-emitter.js';
 import { LogRecorder } from './facade/log-recorder.js';
 import { DuplexSession } from './duplex/session.js';
+import type { CausationSource } from './duplex/cause-tags.js';
 import { LoopSurface, loopTopology } from './facade/loop-surface.js';
 import type { ForwardedLoopMember } from './facade/loop-delegation.js';
 import { ResolutionRecorder } from './facade/resolution-recorder.js';
@@ -74,7 +75,6 @@ import type { ResolutionNote } from './resolution-report.js';
 import type {
   DuplexRouterState,
 } from './duplex/router.js';
-import { latestCauseSeq } from './duplex/cause-tags.js';
 import type { ResolveNetworkAccess, SandboxRung } from './sandbox/types.js';
 import type { SandboxState } from './sandbox/options.js';
 import { isSandboxProvider } from './sandbox/options.js';
@@ -252,7 +252,8 @@ export class CortexAgent extends LoopSurface {
       ...(config.sessionLog?.maxSubscriberBuffer !== undefined
         ? { maxSubscriberBuffer: config.sessionLog.maxSubscriberBuffer }
         : {}),
-      defaultCause: (loopPath) => this.defaultCauseSeqFor(loopPath),
+      causation: { tags: (surface) => this.causation.tags(surface) },
+      conversationLoopPath: this.topology.conversation.loopPath,
       persistResult: config.persistResult,
       spillLoopPath: reasoner.loopPath,
       logger: this.logger,
@@ -378,19 +379,16 @@ export class CortexAgent extends LoopSurface {
   }
 
   /**
-   * Which live-run causation track a producer's entries default to. Duplex
-   * reads the producing loop's live-run cause tags (bound to the run inside
-   * the loop, so parked content keeps its stamp through the sweep);
-   * passthrough keeps the facade-field stamp around its serialized prompt.
+   * The session's causation. Duplex reads the loops' live-run cause tags
+   * (DuplexSession.causation). Passthrough stamps the utterance whose
+   * facade-initiated run is live, around its serialized prompt.
    */
-  private defaultCauseSeqFor(loopPath: string): number | null {
-    if (this.talker) {
-      if (loopPath !== this.talker.loopPath) {
-        return latestCauseSeq(this.reasoner.activeRunCauseTags);
-      }
-      return latestCauseSeq(this.talker.activeRunCauseTags);
-    }
-    return this.activeCauseSeq;
+  private get causation(): CausationSource {
+    return this.duplex?.causation ?? {
+      tags: () => (this.activeCauseSeq !== null
+        ? [{ kind: 'utterance', seq: this.activeCauseSeq }]
+        : []),
+    };
   }
 
   // -------------------------------------------------------------------------

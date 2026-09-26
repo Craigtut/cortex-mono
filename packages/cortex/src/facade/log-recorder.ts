@@ -21,6 +21,8 @@ import type {
 import { SessionLog } from '../session-log.js';
 import type { SessionLogEntry, WakeClass } from '../session-log.js';
 import { errorMessageOf } from '../error-classifier.js';
+import { latestCauseSeq } from '../duplex/cause-tags.js';
+import type { CausationSource } from '../duplex/cause-tags.js';
 
 /** One entry as a producer hands it over; causation is optional. */
 export interface LogEntryInput {
@@ -41,11 +43,14 @@ export interface LogEntryInput {
 export interface LogRecorderOptions {
   maxEntries?: number;
   maxSubscriberBuffer?: number;
+  /** The session's causation, for stamping entries that bring none. */
+  causation: CausationSource;
   /**
-   * The live run's causation stamp for an entry from the surface at
-   * loopPath, or null when no run is live there.
+   * Entries from this loop path belong to the conversation surface; every
+   * other producer's (the work loop, its sub-agents, lookups) to the work
+   * surface.
    */
-  defaultCause: (loopPath: string) => number | null;
+  conversationLoopPath: string;
   /** Spill sink for retention-evicted entries (the consumer's persistResult). */
   persistResult?: PersistResultFn | undefined;
   /** Loop path the spill is attributed to. */
@@ -78,7 +83,8 @@ export class LogRecorder {
    * its own.
    */
   append(input: LogEntryInput): SessionLogEntry {
-    const fallback = this.options.defaultCause(input.loopPath);
+    const surface = input.loopPath === this.options.conversationLoopPath ? 'conversation' : 'work';
+    const fallback = latestCauseSeq(this.options.causation.tags(surface));
     const causedBy = input.causedBy === null
       ? undefined
       : input.causedBy ?? fallback ?? undefined;

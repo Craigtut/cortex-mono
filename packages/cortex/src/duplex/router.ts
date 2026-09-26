@@ -34,6 +34,7 @@ import {
   composeDispatchMessage,
   wrapDeliveryForTalker,
 } from './prompts.js';
+import { latestCauseSeq } from './cause-tags.js';
 import type { CauseTag } from './cause-tags.js';
 import { DispatchPolicy } from './dispatch-policy.js';
 import { DeliveryScheduler } from './delivery-scheduler.js';
@@ -81,20 +82,14 @@ export interface DuplexRouterPorts {
   /** Append a session log entry; returns its seq. */
   appendLog(input: RouterLogInput): number;
   /**
-   * Latest cause seq on the talker's live run, or null. This is the
-   * LOG-STAMPING collapse; anything deciding behavior from causation (the
-   * exchange rollover here, the D16 consent check in the broker) must read
-   * the full set via {@link currentTalkerCauseTags} instead.
-   */
-  currentTalkerCauseSeq(): number | null;
-  /**
    * The FULL discriminated cause set of the talker's live run (empty when
    * no run is live or its content carried no tags). The set carries NO
    * ordering guarantee: readers must scan it, never assume ascending seq
    * order or read only the last element. This is the surface the D16
    * consent check reads (does the chain include a user utterance newer than
    * the voiced ask), where the collapsing helper above would misread a
-   * mixed-kind set in both directions.
+   * mixed-kind set in both directions. Log stamps collapse it with
+   * latestCauseSeq; nothing deciding behavior may.
    */
   currentTalkerCauseTags(): readonly CauseTag[];
   /**
@@ -104,13 +99,9 @@ export interface DuplexRouterPorts {
    * with a steer parked behind it), and a collapse to the newest would leave
    * the delegation the result actually answers listed as live forever.
    *
-   * There is deliberately NO `currentReasonerCauseSeq` beside this. The
-   * reasoner's log-stamping collapse is computed from this same set inside
-   * the router ({@link DuplexRouter.reasonerCause}), so the pair cannot
-   * disagree and a port implementation cannot supply a stamping seq while
-   * reporting no tags. The talker keeps both ports because two different
-   * consumers read them for two different purposes, with the D16 warning
-   * attached; here there is one array and one reader of each derivation.
+   * There is deliberately no separate stamping port beside either set: the
+   * log stamp is latestCauseSeq over the same set, so the two cannot
+   * disagree.
    */
   currentReasonerCauseTags(): readonly CauseTag[];
   /**
@@ -951,22 +942,13 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   }
 
   private talkerCause(): { causedBy?: number } {
-    const seq = this.ports.currentTalkerCauseSeq();
+    const seq = latestCauseSeq(this.ports.currentTalkerCauseTags());
     return seq !== null ? { causedBy: seq } : {};
   }
 
-  /**
-   * The reasoner's log-stamping collapse, derived from the same tag set
-   * retirement reads. Identical to the loop-side `latestCauseSeq` helper
-   * (max seq over the validated tags), computed here so the stamp and the
-   * retirement can never be told different stories by a port.
-   */
   private reasonerCause(): { causedBy?: number } {
-    let latest: number | null = null;
-    for (const tag of this.ports.currentReasonerCauseTags()) {
-      if (latest === null || tag.seq > latest) latest = tag.seq;
-    }
-    return latest !== null ? { causedBy: latest } : {};
+    const seq = latestCauseSeq(this.ports.currentReasonerCauseTags());
+    return seq !== null ? { causedBy: seq } : {};
   }
 }
 

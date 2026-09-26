@@ -28,8 +28,8 @@ import { yieldMacrotask } from '../facade/settlement.js';
 import type { PromptTracker, SettlementTerm } from '../facade/settlement.js';
 import { routerOptionsFrom } from '../facade/config.js';
 import type { ResolvedCortexAgentConfig } from '../facade/config.js';
-import { collectCauseTags, latestCauseSeq } from './cause-tags.js';
-import type { CauseTag } from './cause-tags.js';
+import { collectCauseTags } from './cause-tags.js';
+import type { CausationSource, CauseTag } from './cause-tags.js';
 import { DUPLEX_ROUTER_DEFAULTS, DuplexRouter } from './router.js';
 import type { DuplexRouterPorts, DuplexRouterState } from './router.js';
 import { PermissionBroker } from './permission-broker.js';
@@ -83,6 +83,12 @@ export class DuplexSession {
   readonly router: DuplexRouter;
   /** The consent boundary for every permission ask in the session (D16). */
   readonly broker: PermissionBroker;
+  /**
+   * Causation read off the loops' live runs, never off session fields: the
+   * tags travel with the content, so a barge-in parked behind a live run
+   * keeps its utterance seq through the sweep run (B1).
+   */
+  readonly causation: CausationSource;
   private readonly services: DuplexSessionServices;
   private readonly recorder: LogRecorder;
   private readonly logger: CortexLogger;
@@ -126,6 +132,10 @@ export class DuplexSession {
     this.logger = services.logger;
     this.talkerModelPinned = config.talker?.model !== undefined;
     this.consumerBasePrompt = config.initialBasePrompt ?? null;
+    this.causation = {
+      tags: (surface) =>
+        collectCauseTags((surface === 'conversation' ? talker : reasoner).activeRunCauseTags),
+    };
     const destroyed = (): boolean => services.destroyed();
 
     // The facade-owned quick-lookup fleet (D13): ephemeral read-only loops
@@ -266,12 +276,8 @@ export class DuplexSession {
         ...(input.wake !== undefined ? { wake: input.wake } : {}),
         ...(input.data !== undefined ? { data: input.data } : {}),
       }).seq,
-      // Read from the loops' live-run cause tags, never from session
-      // fields: the tags travel with the content, so a barge-in parked
-      // behind a live run keeps its utterance seq through the sweep run (B1).
-      currentTalkerCauseSeq: () => latestCauseSeq(talker.activeRunCauseTags),
-      currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
-      currentReasonerCauseTags: () => collectCauseTags(reasoner.activeRunCauseTags),
+      currentTalkerCauseTags: () => this.causation.tags('conversation'),
+      currentReasonerCauseTags: () => this.causation.tags('work'),
       answerAsk: (askId, decision, reason) => this.broker.answer(askId, decision, reason),
       reasonerAttemptId: () => this.run.latestAttemptId,
       workRefusal: () => this.aggregate.workRefusal(),
@@ -304,7 +310,7 @@ export class DuplexSession {
         this.digestion.preempt();
         talker.deliver(content, { wake: true, causeTag });
       },
-      currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
+      currentTalkerCauseTags: () => this.causation.tags('conversation'),
       talkerLoopPath: talker.loopPath,
       dropParkedDeliveries: (matches) => talker.dropPendingWakeDeliveries(matches),
       logger: this.logger,

@@ -103,3 +103,17 @@ export function latestCauseSeq(tags: readonly unknown[]): number | null {
   }
   return latest;
 }
+
+/** The two surfaces a session's live runs belong to. */
+export type CauseSurface = 'conversation' | 'work';
+
+/**
+ * Where a session's causation comes from: the discriminated cause set of
+ * the live run on each surface (empty when none is live). One per session
+ * mode, read by the log recorder (entry stamps), the router (directive and
+ * delivery stamps, delegation retirement, the exchange rollover) and the
+ * broker (the D16 consent check). The set carries no ordering guarantee.
+ */
+export interface CausationSource {
+  tags(surface: CauseSurface): readonly CauseTag[];
+}
