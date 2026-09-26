@@ -93,7 +93,7 @@ import {
   networkResolverUnwiredNote,
   resolutionWarnText,
 } from './resolution-report.js';
-import type { ResolutionNote } from './resolution-report.js';
+import type { ResolutionNote, ResolutionNoteCode } from './resolution-report.js';
 import { stripWorkingTags, WorkingTagStreamFilter } from './working-tags.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
@@ -850,7 +850,11 @@ export const AGENT_LOOP_DELEGATION = {
   // terminate guards install through it, D17); exposing it would let a
   // consumer displace those guards. Direct AgentLoop users keep it.
   setToolResultInterceptor: 'withheld',
-  // Prompt and model surface.
+  // Prompt and model surface. In duplex the setters for model, utility
+  // model, cache retention, context-window limit and session id reach both
+  // resident loops (setModel re-mirrors an unpinned talker); thinking level
+  // and setContextWindow stay reasoner-only (the talker's model is different
+  // and its thinking is fixed off). Getters report the reasoner.
   setBasePrompt: 'forwarded',
   getBasePrompt: 'forwarded',
   getCurrentSystemPrompt: 'forwarded',
@@ -1280,6 +1284,15 @@ const DEFAULT_STATE_DEBOUNCE_MS = 500;
  */
 const RESOLUTION_LOOP_PATH = 'facade';
 
+/**
+ * Notes read off the talker's model, re-evaluated when the facade itself
+ * re-resolves that model (setModel on an unpinned talker).
+ */
+const MODEL_RESOLUTION_NOTE_CODES: ReadonlySet<ResolutionNoteCode> = new Set<ResolutionNoteCode>([
+  'talker-model-fallback',
+  'talker-utility-model-skipped',
+]);
+
 /** One macrotask yield: lets pending microtask cascades finish. */
 function yieldMacrotask(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
@@ -1410,6 +1423,12 @@ export class CortexAgent {
   private readonly networkResolver: ResolveNetworkAccess | null;
   /** Whether a sandbox was configured (for the egress-wiring warning). */
   private readonly sandboxConfigured: boolean;
+  /**
+   * Whether the consumer pinned `talker.model`. An unpinned talker mirrors
+   * the reasoner's auto-resolved fast tier, at assembly and again on every
+   * facade setModel(); a pinned one keeps the consumer's choice.
+   */
+  private readonly talkerModelPinned: boolean;
   private ownedSandbox: SandboxSession | undefined;
   /** Whether anyone took the resolver to wire into a sandbox. */
   private networkResolverHandedOut = false;
@@ -1485,6 +1504,16 @@ export class CortexAgent {
    * written alongside them.
    */
   private readonly resolutionNotes: ResolutionNote[] = [];
+  /**
+   * The consumer-supplied inputs the model-derived notes are read against,
+   * kept so a talker re-mirror (setModel) can re-evaluate them against the
+   * loops as they now are.
+   */
+  private readonly resolutionInputs: {
+    requestedTalkerModel: CortexModel | undefined;
+    configuredUtilityModel: CortexModel | 'default' | undefined;
+    perPromptMaxCost: number | undefined;
+  };
 
   private constructor(reasoner: AgentLoop, config: ResolvedCortexAgentConfig, talker?: AgentLoop) {
     this.mode = config.mode ?? DEFAULT_MODE;
@@ -1518,6 +1547,12 @@ export class CortexAgent {
     // In duplex, create() has already wrapped this in the broker pipeline.
     this.networkResolver = config.resolveNetworkAccess ?? null;
     this.sandboxConfigured = config.sandbox !== undefined;
+    this.talkerModelPinned = config.talker?.model !== undefined;
+    this.resolutionInputs = {
+      requestedTalkerModel: config.talker?.model,
+      configuredUtilityModel: config.utilityModel,
+      perPromptMaxCost: config.budgetGuard?.maxCost,
+    };
 
     if (this.mode === 'duplex') {
       this.wireDuplex(config);
@@ -1528,7 +1563,7 @@ export class CortexAgent {
     // Last, because it reads the assembly back: the loops are built, the
     // aggregate guard exists, and every note below is a statement about what
     // this constructor just produced.
-    this.collectAssemblyResolution(config);
+    this.collectAssemblyResolution();
   }
 
   /**
@@ -3131,18 +3166,56 @@ export class CortexAgent {
    * assembly fact, and would also mean the log entries appeared whenever the
    * consumer happened to look.
    */
-  private collectAssemblyResolution(config: ResolvedCortexAgentConfig): void {
-    const notes = collectAssemblyResolutionNotes({
+  private collectAssemblyResolution(): void {
+    for (const note of this.currentResolutionNotes()) this.recordResolutionNote(note);
+  }
+
+  private currentResolutionNotes(): ResolutionNote[] {
+    return collectAssemblyResolutionNotes({
       mode: this.mode,
-      requestedTalkerModel: config.talker?.model,
+      requestedTalkerModel: this.resolutionInputs.requestedTalkerModel,
       talkerModel: this.talker?.getModel() ?? null,
       reasonerModel: this.reasoner.getModel(),
-      configuredUtilityModel: config.utilityModel,
+      configuredUtilityModel: this.resolutionInputs.configuredUtilityModel,
       talkerUtilityModel: this.talker?.getUtilityModel() ?? null,
       aggregateCostCap: this.aggregateGuard?.getMaxCost() ?? null,
-      perPromptMaxCost: config.budgetGuard?.maxCost,
+      perPromptMaxCost: this.resolutionInputs.perPromptMaxCost,
     });
-    for (const note of notes) this.recordResolutionNote(note);
+  }
+
+  /**
+   * Re-evaluate the notes that describe the talker's model after the facade
+   * re-resolved it (setModel re-mirrors an unpinned talker). This is not the
+   * lazy report the eager design rules out: the facade itself just redid
+   * part of the assembly, so the model notes are assembly facts again, and
+   * leaving them would report a fallback that no longer exists or miss one
+   * that now does (switching onto a provider Cortex cannot enumerate).
+   * Mutation the facade did not make (a direct loop setModel) still changes
+   * nothing here. A note that stops applying is removed from the report and
+   * its clearing is logged, so the log still explains the report.
+   */
+  private refreshModelResolutionNotes(): void {
+    const fresh = this.currentResolutionNotes()
+      .filter((note) => MODEL_RESOLUTION_NOTE_CODES.has(note.code));
+    for (const code of MODEL_RESOLUTION_NOTE_CODES) {
+      const index = this.resolutionNotes.findIndex((note) => note.code === code);
+      const current = index >= 0 ? this.resolutionNotes[index]! : null;
+      const next = fresh.find((note) => note.code === code) ?? null;
+      if (current && next && JSON.stringify(current) === JSON.stringify(next)) continue;
+      if (current) {
+        this.resolutionNotes.splice(index, 1);
+        if (!next) {
+          this.appendEntry({
+            type: 'lifecycle',
+            loopPath: RESOLUTION_LOOP_PATH,
+            content: `Resolution note cleared: ${code}`,
+            causedBy: null,
+            data: { event: 'resolution_note_cleared', code },
+          });
+        }
+      }
+      if (next) this.recordResolutionNote(next);
+    }
   }
 
   /**
@@ -3740,20 +3813,49 @@ export class CortexAgent {
     return this.reasoner.getModel();
   }
 
+  /**
+   * Swap the primary (reasoner) model. In duplex an unpinned talker is
+   * re-mirrored to the fast tier of the new model, exactly as create()
+   * picked it; without that a provider switch would leave the presence loop
+   * (and every quick lookup, which builds from the talker's model) on the
+   * old provider. A pinned `talker.model` is the consumer's choice and
+   * stays.
+   */
   setModel(model: CortexModel): void {
     this.reasoner.setModel(model);
+    if (!this.talker || this.talkerModelPinned) return;
+    this.talker.setModel(this.reasoner.getAutoResolvedUtilityModel());
+    this.refreshModelResolutionNotes();
   }
 
   getUtilityModel(): CortexModel {
     return this.reasoner.getUtilityModel();
   }
 
+  /**
+   * Set the utility model on every resident loop that can take it
+   * (CONFIG_ROUTING utilityModel: per-loop), under the same rule assembly
+   * applies: the talker takes it when it shares the talker's provider and
+   * skips it otherwise, because a loop rejects a utility model from another
+   * provider. The talker's primary model is not affected: it mirrors the
+   * reasoner's auto-resolved fast tier, which an override does not change.
+   */
   setUtilityModel(model: CortexModel): void {
     this.reasoner.setUtilityModel(model);
+    if (!this.talker) return;
+    if (model.provider === this.talker.getModel().provider) {
+      this.talker.setUtilityModel(model);
+    } else {
+      this.logger.warn('talker keeps its own utility model: the new one is from another provider', {
+        utilityProvider: model.provider,
+        talkerProvider: this.talker.getModel().provider,
+      });
+    }
   }
 
   resetUtilityModel(): void {
     this.reasoner.resetUtilityModel();
+    this.talker?.resetUtilityModel();
   }
 
   // Utility-model reads are per loop in duplex (CONFIG_ROUTING utilityModel:
@@ -3783,8 +3885,14 @@ export class CortexAgent {
     return this.reasoner.clampThinkingLevel(level);
   }
 
+  /**
+   * Cache retention is a provider-request policy, not a per-model dial, so
+   * it reaches every resident loop. The talker's small cached prefix is
+   * where retention buys the most latency.
+   */
   setCacheRetention(value: 'none' | 'short' | 'long'): void {
     this.reasoner.setCacheRetention(value);
+    this.talker?.setCacheRetention(value);
   }
 
   getCacheRetention(): 'none' | 'short' | 'long' | null {
@@ -3798,7 +3906,7 @@ export class CortexAgent {
    */
   setSessionId(value: string | null): void {
     this.reasoner.setSessionId(value);
-    this.talker?.setSessionId(value === null ? null : `${value}:talker`);
+    this.talker?.setSessionId(value === null ? null : `${value}${TALKER_SESSION_ID_SUFFIX}`);
   }
 
   getSessionId(): string | null {
@@ -3833,6 +3941,11 @@ export class CortexAgent {
     return this.reasoner.modelContextWindow;
   }
 
+  /**
+   * Model metadata for the primary model, so reasoner only: the talker runs
+   * a different model with its own window, set from its own metadata when
+   * setModel() re-mirrors it.
+   */
   setContextWindow(contextWindow: number): void {
     this.reasoner.setContextWindow(contextWindow);
   }
