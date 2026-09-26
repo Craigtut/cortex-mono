@@ -1290,6 +1290,25 @@ You have 12 emotions.`;
       expect(handler).toHaveBeenCalled();
     });
 
+    it('logs a checkpoint handler that throws during destroy and keeps tearing down', async () => {
+      const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const agent = createTestAgentLoop(piAgent, { ...config, logger });
+      const later = vi.fn();
+      agent.onLoopComplete(() => {
+        throw new Error('checkpoint write failed');
+      });
+      agent.onLoopComplete(later);
+
+      await agent.destroy();
+
+      expect(later).toHaveBeenCalled();
+      expect(agent.state).toBe('destroyed');
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('onLoopComplete handler threw'),
+        expect.objectContaining({ error: 'checkpoint write failed' }),
+      );
+    });
+
     it('clears handlers after destroy', async () => {
       const agent = createTestAgentLoop(piAgent, config);
       const errorHandler = vi.fn();

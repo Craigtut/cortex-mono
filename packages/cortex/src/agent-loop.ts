@@ -5450,12 +5450,15 @@ export class AgentLoop {
       // Best-effort sub-agent cleanup
     }
 
-    // 3. Emit onLoopComplete for final checkpoint (best-effort)
+    // 3. Emit onLoopComplete for final checkpoint (best-effort: a throwing
+    // handler is logged and teardown continues)
     for (const handler of this.loopCompleteHandlers) {
       try {
         handler(this.originContext);
-      } catch {
-        // Ignore checkpoint failures during shutdown
+      } catch (err) {
+        this.logger.error('onLoopComplete handler threw', {
+          error: errorMessageOf(err),
+        });
       }
     }
 
