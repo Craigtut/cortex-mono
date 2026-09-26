@@ -4,6 +4,8 @@ All notable changes to `@animus-labs/cortex-code` are documented here.
 
 ## Unreleased
 
+- Fix permission prompt ordering: tool and network asks now take the prompt lock in arrival order, so a stream of network asks can no longer starve a waiting tool ask, and a late or repeated lock release can no longer free another prompt's lock.
+
 ## 0.6.0
 
 - Use Cortex's native Ollama integration for interactive sessions and `complete`, with context allocation settings and runtime diagnostics. Existing Ollama credentials remain supported; the server must run Ollama `0.15.0` or newer.
