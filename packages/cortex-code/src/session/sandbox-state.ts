@@ -132,7 +132,7 @@ export class SessionSandbox {
 
     // On Windows the Tier-1 helper is not yet code-signed, so it is opt-in:
     // default to 'off' (no helper is ever spawned, so nothing can be flagged by
-    // antivirus). Do NOT persist that 'off' — leaving the remembered rung empty
+    // antivirus). Do NOT persist that 'off': leaving the remembered rung empty
     // means a later consumer default (sandbox.rung, e.g. once a signed helper
     // ships) or a future on-by-default flip still takes effect, while
     // `/sandbox workspace` remains the explicit, remembered opt-in. Persisting
