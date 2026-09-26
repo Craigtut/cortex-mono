@@ -60,6 +60,7 @@ import { applyPreTurnHooks } from './hooks/pre-turn.js';
 import type { HookEvent, HookHandler } from './hooks/types.js';
 import { TitleManager } from './terminal/title-manager.js';
 import { WorkTracker } from './session/work-tracker.js';
+import { LoopRouting } from './session/loop-routing.js';
 import { SessionStatusView, readGitBranch } from './session/status-view.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
@@ -93,6 +94,7 @@ export class Session {
   private agent: CortexAgent | null = null;
   private readonly sandbox: SessionSandbox;
   private readonly status: SessionStatusView;
+  private readonly routing: LoopRouting;
   private app: App | null = null;
   private readonly permissions: PermissionBroker;
   private yoloMode: boolean;
@@ -157,6 +159,7 @@ export class Session {
     this.config = options.config;
     this.agentMode = resolveAgentMode(options.duplex, options.config.agentMode);
     this.mode = options.mode;
+    this.routing = new LoopRouting(this.agentMode);
     this.model = options.model;
     this.models = new ModelSelection({
       provider: options.provider,
@@ -517,59 +520,6 @@ export class Session {
     this.mcpReload.schedule('manual');
   }
 
-  /** The duplex talker's loop path, or null in passthrough, which has none. */
-  private get talkerLoopPath(): string | null {
-    return this.agentMode === 'duplex' ? 'talker' : null;
-  }
-
-  /**
-   * The loop whose streamed text is the user-visible reply: the reasoner in
-   * passthrough, the talker in duplex. Passthrough hands back the reasoner's
-   * own bridge verbatim, so its events carry no `loopPath` at all; the duplex
-   * merged bridge stamps every event with one.
-   */
-  private get conversationLoopPath(): string {
-    return this.talkerLoopPath ?? 'reasoner';
-  }
-
-  /** True when an event came from the loop the user is actually talking to. */
-  private isConversationEvent(event: CortexEvent): boolean {
-    return event.loopPath === undefined || event.loopPath === this.conversationLoopPath;
-  }
-
-  /**
-   * True when an event came from the talker.
-   *
-   * Used to keep the talker's tool calls out of the transcript. The talker's
-   * toolset is fixed and is entirely control plumbing (`spawn_task`,
-   * `steer_task`, `cancel_task`, `quick_lookup`, `answer_ask`): it has no
-   * file, shell, MCP or sub-agent tools, by construction. A coding CLI's
-   * transcript is a record of what was done to the workspace, and routing
-   * chatter rendered beside Read/Edit/Bash is noise that reads like work.
-   *
-   * Filtered on the loop rather than on a list of tool names deliberately, so
-   * a control tool added to the talker later is hidden by inheritance instead
-   * of appearing in the transcript the day it ships. Sub-agent tool calls are
-   * unaffected: they carry `childTaskId` and their own `reasoner/<taskId>`
-   * path, and are handled by the child branches above.
-   */
-  private isTalkerEvent(event: CortexEvent): boolean {
-    return this.talkerLoopPath !== null && event.loopPath === this.talkerLoopPath;
-  }
-
-  /**
-   * Whether a fan-out callback came from the loop doing the user's work.
-   *
-   * Defined by excluding the talker rather than by naming the reasoner, so it
-   * cannot be wrong about what the reasoner's loop path is called: passthrough
-   * has no talker and every origin is work, and a sub-agent
-   * (`reasoner/<taskId>`) is work too, which is what its compaction and
-   * observation events should count as.
-   */
-  private isWorkLoop(origin: LoopOriginContext): boolean {
-    return origin.loopPath !== this.talkerLoopPath;
-  }
-
   /** Wire all agent events to the TUI. */
   private wireEvents(): void {
     if (!this.agent || !this.app) return;
@@ -583,7 +533,7 @@ export class Session {
 
     bridge.on('response_start', (event: CortexEvent) => {
       if (event.childTaskId) return;
-      if (!this.isConversationEvent(event)) return;
+      if (!this.routing.isConversationEvent(event)) return;
       assistantStarted = false;
       rawStreamText = '';
       workingTagOpen = false;
@@ -597,7 +547,7 @@ export class Session {
       // both resident loops and neither sets childTaskId, so without this
       // the reasoner's private working prose streams into the assistant
       // bubble and is then replaced by the talker's actual reply.
-      if (!this.isConversationEvent(event)) return;
+      if (!this.routing.isConversationEvent(event)) return;
 
       // Text flowing again means a pending retry reconnected.
       this.retry.noteProgress();
@@ -626,7 +576,7 @@ export class Session {
       }
       // The talker's control tools are routing plumbing, not work. See
       // isTalkerEvent().
-      if (this.isTalkerEvent(event)) return;
+      if (this.routing.isTalkerEvent(event)) return;
 
       // A tool starting means the agent is making progress again.
       this.retry.noteProgress();
@@ -669,7 +619,7 @@ export class Session {
     // Streaming tool updates (bash output, etc.)
     bridge.on('tool_call_update', (event: CortexEvent) => {
       if (event.childTaskId) return;
-      if (this.isTalkerEvent(event)) return;
+      if (this.routing.isTalkerEvent(event)) return;
 
       const p = event.payload as ToolCallUpdatePayload | undefined;
       const toolCallId = p?.toolCallId ?? String((event.data as Record<string, unknown> | undefined)?.['toolCallId'] ?? '');
@@ -687,7 +637,7 @@ export class Session {
         this.recordSubAgentToolEnd(event);
         return;
       }
-      if (this.isTalkerEvent(event)) return;
+      if (this.routing.isTalkerEvent(event)) return;
 
       const p = event.payload as ToolCallEndPayload | undefined;
       const toolName = p?.toolName ?? String((event.data as Record<string, unknown> | undefined)?.['toolName'] ?? 'unknown');
@@ -815,7 +765,7 @@ export class Session {
     // announce numbers that do not correspond to anything the user can see,
     // about a context they do not own.
     this.agent.onPostCompaction((result: CompactionResult, origin: LoopOriginContext) => {
-      if (!this.isWorkLoop(origin)) return;
+      if (!this.routing.isWorkLoop(origin)) return;
       const beforeK = (result.tokensBefore / 1000).toFixed(1);
       const afterK = (result.tokensAfter / 1000).toFixed(1);
       // Mark in the durable transcript where context was summarized away. The
@@ -858,11 +808,11 @@ export class Session {
     // so a talker generation would only trigger a redundant re-read of a
     // number that did not change.
     this.agent.onObservation((_event, origin: LoopOriginContext) => {
-      if (!this.isWorkLoop(origin)) return;
+      if (!this.routing.isWorkLoop(origin)) return;
       this.status.refreshObservationalMemory();
     });
     this.agent.onReflection((_event, origin: LoopOriginContext) => {
-      if (!this.isWorkLoop(origin)) return;
+      if (!this.routing.isWorkLoop(origin)) return;
       this.status.refreshObservationalMemory();
     });
 
