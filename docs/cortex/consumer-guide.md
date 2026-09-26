@@ -49,7 +49,7 @@ If `getApiKey` is omitted, pi-ai falls back to provider environment variables su
 
 ## Duplex Is the Default
 
-A `CortexAgent` runs **two loops** unless you tell it otherwise:
+On a backend that serves concurrent requests (every hosted provider), a `CortexAgent` runs **two loops** unless you tell it otherwise:
 
 - a **talker**: a fast, small model holding the conversation. It has no file tools, no bash, no MCP, and no sub-agent spawning of its own. It speaks, and it dispatches work through a fixed control toolset.
 - a **reasoner**: your configured `model`, doing all the actual work. It is session-lifetime and keeps running across conversational exchanges, reporting back through the router.
@@ -66,6 +66,18 @@ What changes for you, in practice:
 
 Set `talker: { model }` to pick the talker's model. The default is the fast tier auto-resolved from your primary provider (the same resolution the utility model uses). For a provider Cortex cannot enumerate (Ollama, custom OpenAI-compatible endpoints) that resolution falls back to your primary model: duplex still works, but the talker is as slow as the reasoner, so you should name a fast model yourself. `getResolutionReport()` tells you whether that happened (see [What you actually got](#what-you-actually-got)).
 
+### Local and custom backends
+
+The talker only helps if it can answer while the reasoner's request is in flight. Ollama serves one request per model by default, and Cortex cannot see what a custom endpoint does. So when you omit `mode`, the agent resolves it from each model's `capabilities.concurrency`: duplex when both the talker's and the reasoner's models are `'parallel'`, passthrough otherwise, with a `mode-resolved-passthrough` note in the report saying why. Hosted providers are `'parallel'`, native Ollama models are `'serial'`, and custom endpoints are `'unknown'`.
+
+If your Ollama server does run requests in parallel (`OLLAMA_NUM_PARALLEL` above 1, and your talker and reasoner models fit in memory together), declare it:
+
+```typescript
+const model = await providers.createOllamaModel({ modelId: 'qwen3:32b', parallelRequests: true });
+```
+
+Or pass `mode: 'duplex'` yourself: an explicit mode always wins, and on a backend that is not `'parallel'` the report carries a `duplex-not-concurrent` warning. The mode is fixed when the agent is created; `setModel()` does not switch it (see [cortex-agent.md](./cortex-agent.md#mode-resolution)).
+
 The design lives in [`duplex/`](./duplex/README.md): [architecture](./duplex/architecture.md), [the facade API contract](./duplex/facade-api.md), [communication and the permission broker](./duplex/communication.md), and [the decision record](./duplex/decisions.md).
 
 ### Opting out
@@ -79,7 +91,7 @@ const agent = await CortexAgent.create({
 });
 ```
 
-`passthrough` is a single reasoner loop and exactly the old single-loop behavior, verified by a side-by-side parity suite against a bare `AgentLoop`. Use it when you do not want a second model in the path: a batch or non-interactive job, a CLI where there is nobody waiting on first feedback, or a provider with no usable fast tier.
+`passthrough` is a single reasoner loop and exactly the old single-loop behavior, verified by a side-by-side parity suite against a bare `AgentLoop`. Use it when you do not want a second model in the path: a batch or non-interactive job, a CLI where there is nobody waiting on first feedback, or a provider with no usable fast tier. It is also what an omitted `mode` resolves to on a backend that is not known to serve concurrent requests.
 
 Two facade behaviors still apply in passthrough, and both are deliberate: `prompt()` never throws on a busy loop (a direct `AgentLoop.prompt()` does), and `abort()` clears queued content that a direct `AgentLoop.abort()` retains.
 
@@ -99,7 +111,7 @@ for (const note of agent.getResolutionReport()) {
 }
 ```
 
-`degraded` means you asked for something and are not getting it, or duplex is not delivering its premise (a talker on the primary model, a `utilityModel` the talker could not take, shell egress asks that cannot be voiced because nothing took `getNetworkAccessResolver()`). `info` means a default is in force you may want to change (no `duplex.maxTotalCost`, so no session cost ceiling).
+`degraded` means you asked for something and are not getting it, or duplex is not delivering its premise (a talker on the primary model, a `utilityModel` the talker could not take, shell egress asks that cannot be voiced because nothing took `getNetworkAccessResolver()`, duplex on a backend not known to be concurrent). `info` means a default is in force you may want to change (no `duplex.maxTotalCost`, so no session cost ceiling; an omitted `mode` resolved to passthrough).
 
 Read it once after `create()` and render it wherever your configuration lives. Cortex also logs each note through your `logger` and writes it into the session log as a `lifecycle` entry, so it survives into your persistence artifact; both are generated from the report, so they cannot disagree with it. If you never wire a `logger`, the report is the only place these appear. One code, `network-resolver-unwired`, cannot be known at assembly and lands after the first `prompt()`. It is duplex-only, and it means your shell egress asks are settled somewhere other than the broker and so are never spoken; if you wired your sandbox's `onNetworkRequest` to your own permission UI on purpose, that is what it is telling you and you can ignore it.
 
@@ -170,7 +182,7 @@ const agent = await CortexAgent.create({
 
 | Field | Purpose |
 |-------|---------|
-| `mode` | `'duplex'` (default) or `'passthrough'` |
+| `mode` | `'duplex'` or `'passthrough'`. Omitted: duplex when both loops' models are `'parallel'`, otherwise passthrough |
 | `talker.model` | Talker model. Default: the fast tier auto-resolved from the primary provider |
 | `idleSignal` | `() => boolean`: is the user or channel idle right now? Advisory input to the wake policy |
 | `duplex` | Router and scheduling tuning (delivery spacing, backpressure caps, ask timeouts, lookup pool and timeout, `maxTotalCost`). Every field has a production default except `maxTotalCost`, which is unlimited until you set it |

@@ -4,6 +4,10 @@ All notable changes to `@animus-labs/cortex` are documented here.
 
 ## Unreleased
 
+- Breaking: an omitted `CortexAgent` `mode` now resolves from backend concurrency. It is duplex when both the talker's and the reasoner's models are served concurrently (every hosted provider) and passthrough otherwise, with a `mode-resolved-passthrough` resolution note saying why. Native Ollama and custom endpoints now default to passthrough. An explicit `mode` always wins; `mode: 'duplex'` on a backend not known to be concurrent adds a `duplex-not-concurrent` note, which `setModel()` also re-evaluates.
+- Add `capabilities.concurrency` (`'parallel' | 'serial' | 'unknown'`, type `ModelConcurrency`) to every `CortexModel`: `parallel` for hosted providers in Cortex's registry, `serial` for `createOllamaModel()`, `unknown` for custom endpoints and unrecognized providers.
+- Add `parallelRequests` to the Ollama model config, for servers that run requests in parallel (`OLLAMA_NUM_PARALLEL` above 1, with the talker and reasoner models fitting in memory together).
+
 ## 0.6.0
 
 - Add native local Ollama support through `ProviderManager.createOllamaModel()`, including runtime context allocation, thinking, structured output, and inference metrics. Requires Ollama `0.15.0` or newer.

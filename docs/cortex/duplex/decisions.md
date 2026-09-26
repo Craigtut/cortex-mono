@@ -1,6 +1,6 @@
 # Decision Record
 
-> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode (D14); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
+> **STATUS: IMPLEMENTED AND DEFAULT.** Built across phases 0 through 2b-ii on the `duplex-restructure` branch and validated in Phase 3. Duplex is the default mode on concurrent backends (D14, D21); `mode: 'passthrough'` is the opt-out. See migration-plan.md for the honest boundary of what the test suite can see, and consumer-guide.md for what changes on upgrade.
 
 Decisions made during the 2026-08 design phase, with rationale and rejected alternatives. Newer decisions supersede older ones where they conflict.
 
@@ -89,7 +89,7 @@ While the reasoner is mid-turn and deaf, small factual questions ("what does res
 
 ## D14: Duplex Is the Default; Passthrough Is the Opt-Out
 
-Both modes are built. Passthrough routes the facade straight to the reasoner and reproduces today's single-loop behavior exactly; it exists for consumers who want it and for parity testing. Duplex ships as the default. Rationale: faster first feedback is close to a pure gain in every modality, and the reasoner is unchanged, so no reasoning power is lost. The accepted tradeoff is a slightly longer time-to-final-answer (acknowledgment plus handoff) in exchange for dramatically better time-to-first-feedback, plus one small-model call per exchange.
+Both modes are built. Passthrough routes the facade straight to the reasoner and reproduces today's single-loop behavior exactly; it exists for consumers who want it and for parity testing. Duplex ships as the default (on a concurrent backend; D21 narrows the default to where it can deliver). Rationale: faster first feedback is close to a pure gain in every modality, and the reasoner is unchanged, so no reasoning power is lost. The accepted tradeoff is a slightly longer time-to-final-answer (acknowledgment plus handoff) in exchange for dramatically better time-to-first-feedback, plus one small-model call per exchange.
 
 ## D15: Tier Depth Is Hard-Capped
 
@@ -160,3 +160,15 @@ Wake classes describe intent; they do not bound rate. The router enforces an int
 ## D20: The Steer Fast-Path Is Removed
 
 Steers always route through the reasoner. Delivering a steer straight to a named child saved one hop and removed the only loop exercising judgment between injected content and a tool-carrying agent (F11).
+
+## D21: An Omitted Mode Resolves from Backend Concurrency
+
+D14's rationale assumes the talker answers while the reasoner works. That holds only when the backend serves both requests at once. Hosted providers do, even for two requests to one model. Ollama serves one request per model by default (`OLLAMA_NUM_PARALLEL=1`), runs two models concurrently only if both fit in memory, and exposes neither through its API. On a serial backend duplex adds a second loop, a second model call per exchange and the handoff latency, and the talker queues behind the reasoner, so the premise is gone and the cost stays.
+
+So every `CortexModel` carries `capabilities.concurrency: 'parallel' | 'serial' | 'unknown'`, stamped at creation: `parallel` for providers in Cortex's registry (not pi-ai's catalog, which also lists providers Cortex has not vetted), `serial` for native Ollama unless the consumer sets `parallelRequests: true`, `unknown` for custom endpoints and unrecognized providers. `wrapModel` is the one place a `CortexModel` is built, so it owns the registry lookup; a creator that knows its backend better (Ollama) declares its own value, which wins. An omitted `mode` resolves to duplex only when both the talker's and the reasoner's models are `parallel`, and to passthrough otherwise, with a `mode-resolved-passthrough` resolution note naming the model that blocked it. The talker judged is the one assembly builds (`talker.model`, or the reasoner's auto-resolved fast tier), computed by the same function before either loop exists.
+
+An explicit `mode` always wins. `mode: 'duplex'` on a backend that is not `parallel` runs duplex and records a `duplex-not-concurrent` note, because a consumer may know what Cortex cannot (a raised `OLLAMA_NUM_PARALLEL` it did not declare, a custom endpoint that is really a hosted gateway).
+
+The mode is not re-decided on `setModel()`. The loops are assembled from it: a passthrough agent has no talker to start, and a duplex agent's talker holds conversation state that a live teardown would have to migrate. So `setModel()` onto a non-`parallel` backend keeps duplex and re-evaluates `duplex-not-concurrent` alongside the other model notes, and a passthrough agent stays passthrough. A consumer that wants the mode re-decided creates a new agent. The note makes the mismatch visible, and switching to a different mode is not something a model swap should do behind the consumer's back.
+
+Not done: an Ollama `/api/ps` probe that warns when the talker and reasoner models were never resident at the same time. It would need polling during runs from the facade, would put provider-specific code in a general-purpose layer, and could not see the common case anyway (talker = reasoner on one model, where the limit is `OLLAMA_NUM_PARALLEL` and `/api/ps` shows one resident model either way).

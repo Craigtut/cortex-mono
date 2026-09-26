@@ -1,13 +1,34 @@
 # CortexAgent: The Composite Facade
 
-> **STATUS: IMPLEMENTED. DUPLEX IS THE DEFAULT.**
+> **STATUS: IMPLEMENTED. DUPLEX IS THE DEFAULT ON CONCURRENT BACKENDS.**
 
 `CortexAgent` is the composite facade over the `AgentLoop` primitive. Consumers interact with one agent; internally the facade owns the resident loops, the session log, settlement predicates, and composite persistence. The design lives in `docs/cortex/duplex/`; this document describes what is implemented and, in particular, where the facade's surface does *not* mean what the same-named `AgentLoop` member means.
 
 Two modes:
 
-- **`duplex`** (the default, decisions.md D14): a fast talker loop fronting a persistent reasoner. The talker always has the floor and delegates through fire-and-forget control tools; the reasoner does all real work.
+- **`duplex`** (the default on concurrent backends, decisions.md D14 and D21): a fast talker loop fronting a persistent reasoner. The talker always has the floor and delegates through fire-and-forget control tools; the reasoner does all real work.
 - **`passthrough`**: a single reasoner loop. Behavior is identical to using `AgentLoop` directly, verified by a side-by-side parity suite. This is the consumer opt-out and the parity baseline.
+
+### Mode resolution
+
+Duplex only helps when the talker's request runs while the reasoner's is in flight. Hosted providers serve concurrent requests, even two for the same model. Ollama serves one request per model by default (`OLLAMA_NUM_PARALLEL=1`) and runs two different models at once only if both fit in memory, and custom OpenAI-compatible endpoints are unknown. So the mode follows the backend:
+
+| `mode` | Result |
+|---|---|
+| omitted | `duplex` when both the talker's and the reasoner's models have `capabilities.concurrency: 'parallel'`; otherwise `passthrough`, with a `mode-resolved-passthrough` note saying which model blocked it. |
+| `'duplex'` | Always duplex. If either model is not `parallel`, a `duplex-not-concurrent` note warns that the responsiveness gain needs a concurrent backend. |
+| `'passthrough'` | Always passthrough. |
+
+The talker model judged is the one assembly would build: `talker.model` when set, otherwise the reasoner's auto-resolved fast tier (which falls back to the primary model itself on a provider Cortex cannot enumerate).
+
+`concurrency` is stamped when the model is created:
+
+- **Hosted providers** (every provider in Cortex's `PROVIDER_REGISTRY`, plus the hosted providers pi-ai resolves that the registry does not list, such as `amazon-bedrock`): `parallel`.
+- **Native Ollama** (`ProviderManager.createOllamaModel()`): `serial`, unless the config sets `parallelRequests: true` (for a server with `OLLAMA_NUM_PARALLEL` raised whose talker and reasoner models fit in memory together). Ollama's API does not expose either setting, so Cortex cannot detect it.
+- **Custom endpoints** (`createCustomModel()`) and any unrecognized provider: `unknown`.
+- **`wrapModel()` called directly** judges by the provider id you pass, so wrapping a local server under a hosted provider's id (`'openai'` pointed at vLLM, say) reads as `parallel`. Pass `mode` explicitly in that case.
+
+The mode is fixed at construction, because the loops are assembled from it. A later `setModel()` onto a backend that is not `parallel` keeps a duplex agent duplex and records a `duplex-not-concurrent` note (and clears it if you switch back); a passthrough agent stays passthrough. To change mode, create a new agent.
 
 `AgentLoop` remains exported and remains the loop primitive. Nothing about direct `AgentLoop` use changes.
 
@@ -26,7 +47,7 @@ import { CortexAgent } from '@animus-labs/cortex';
 
 const agent = await CortexAgent.create({
   // everything AgentLoopConfig accepts, plus:
-  mode: 'duplex',               // the default; 'passthrough' to opt out
+  mode: 'duplex',               // optional; omitted resolves from backend concurrency (see Mode resolution)
   talker: { model },            // optional; defaults to the fast tier of the primary provider
   idleSignal: () => boolean,    // optional wake-policy idle signal (advisory)
   duplex: {
@@ -42,7 +63,7 @@ const agent = await CortexAgent.create({
 
 Config is routed per the table in `src/facade/config.ts` (`CONFIG_ROUTING`). The table is compile-time exhaustive: adding a config key without a routing destination is a type error. In passthrough every non-facade key flows to the reasoner unchanged, so behavior matches direct `AgentLoop` construction exactly.
 
-One routing caveat in duplex. There is no unresolvable-talker-model case: model resolution falls back to the primary model rather than failing, so on a provider whose model list cannot be enumerated (Ollama, custom OpenAI-compatible endpoints) duplex assembles with **talker = reasoner**. That configuration is healthy-looking and passes every test while delivering none of the latency benefit, so it is reported as a `talker-model-fallback` note in [the resolution report](#the-resolution-report).
+One routing caveat in duplex. There is no unresolvable-talker-model case: model resolution falls back to the primary model rather than failing, so on a provider whose model list cannot be enumerated (Ollama, custom OpenAI-compatible endpoints) an explicit or opted-in duplex assembles with **talker = reasoner**. That configuration is healthy-looking and passes every test while delivering none of the latency benefit, so it is reported as a `talker-model-fallback` note in [the resolution report](#the-resolution-report).
 
 The talker keeps mirroring after assembly. When `talker.model` is unset, a facade `setModel()` re-resolves the talker onto the fast tier of the new primary model, exactly as `create()` picked it, so a model or provider switch moves the presence loop and every later quick lookup (which builds from the talker's model) along with the reasoner. A pinned `talker.model` is never touched. The talker's primary does not follow `setUtilityModel()`: a utility override changes observational spend, not which fast tier the provider has.
 
@@ -79,12 +100,14 @@ Assembly resolves a configuration that can quietly differ from what the consumer
 | `talker-utility-model-skipped` | degraded | A configured `utilityModel` is from a different provider than the talker's model, so the talker runs its observational memory on its own auto-resolved model. |
 | `network-resolver-unwired` | degraded | **Duplex only.** A sandbox and `resolveNetworkAccess` are configured but nobody took `getNetworkAccessResolver()`, so shell egress asks cannot reach the broker and are never voiced, while WebFetch's still are. |
 | `duplex-cost-cap-unset` | info | Duplex assembled with no `duplex.maxTotalCost`, so there is no session-level cost ceiling. |
+| `mode-resolved-passthrough` | info | `mode` was omitted and the talker's or the reasoner's model is not `parallel`, so the agent runs passthrough. `data` carries each model's provider, id and concurrency. |
+| `duplex-not-concurrent` | degraded | The agent runs duplex but the talker's or the reasoner's model is not `parallel`, so the talker can queue behind the reasoner. Earned at assembly only by an explicit `mode: 'duplex'`; re-evaluated on `setModel()`. |
 
 **A note claims only what Cortex can observe.** `network-resolver-unwired` first said that egress "fails closed", which was an inference about consumer wiring Cortex has no way to see: a consumer that hands its sandbox its own decision function answers those asks perfectly well, and the first consumer to read the note did exactly that. It is duplex-only for the same reason. In passthrough there is no broker, `getNetworkAccessResolver()` returns the consumer's own function unchanged, and whether anyone called it is evidence of nothing. A marker that lights on a healthy session costs more than the condition it was meant to catch, so the rule for any new note is: state the observation and the consequence that follows from it necessarily, and stop there.
 
 **The notes are the source; the other surfaces derive from them.** Each note also produces one `logger.warn` (the text is `detail` plus `remedy`) and one `lifecycle` session-log entry carrying the whole note under `data.note`, both generated from the note rather than written beside it. This is deliberate: the same fact described in two hand-written places is the bug class that produced several of the divergences in the delegation table above. The log entry puts the report in the persistence artifact, so an audit of "why was this session slow or expensive" can find it after the fact.
 
-The report is computed **eagerly at assembly**, not lazily on first read, so it cannot observe a later mutation and present it as an assembly fact. Two exceptions. A facade `setModel()` that re-mirrors an unpinned talker redoes that part of the assembly, so the two notes read off the talker's model (`talker-model-fallback`, `talker-utility-model-skipped`) are re-evaluated then: a note that newly applies is recorded through the usual pathway, and one that stops applying leaves the report with a `resolution_note_cleared` lifecycle entry naming its code. A direct loop `setModel()` changes nothing. The other exception is `network-resolver-unwired`, which is not an assembly fact and cannot be: a consumer wires the resolver on the line after `create()` returns, so the check runs at the first `prompt()` and the note joins the report then, through the same pathway.
+The report is computed **eagerly at assembly**, not lazily on first read, so it cannot observe a later mutation and present it as an assembly fact. Two exceptions. A facade `setModel()` redoes that part of the assembly (it swaps the reasoner's model and re-mirrors an unpinned talker), so the notes read off the loops' models (`talker-model-fallback`, `talker-utility-model-skipped`, `duplex-not-concurrent`) are re-evaluated then: a note that newly applies is recorded through the usual pathway, and one that stops applying leaves the report with a `resolution_note_cleared` lifecycle entry naming its code. A direct loop `setModel()` changes nothing. The other exception is `network-resolver-unwired`, which is not an assembly fact and cannot be: a consumer wires the resolver on the line after `create()` returns, so the check runs at the first `prompt()` and the note joins the report then, through the same pathway.
 
 `getResolutionReport()` is facade-owned, like `getLog()`, so it has no `AGENT_LOOP_DELEGATION` entry. That table is exhaustive over `keyof AgentLoop` in both directions, which means it constrains nothing about facade-only members: no compile-time check exists that a new facade surface is documented anywhere.
 

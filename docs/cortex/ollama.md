@@ -113,6 +113,26 @@ the model expired, Cortex prepares only that model with its pinned
 allocation. This check cannot reserve the shared server against simultaneous
 changes by another client.
 
+### Concurrency and facade mode
+
+Ollama serves one request per model by default (`OLLAMA_NUM_PARALLEL=1`) and
+runs two different models at once only if both fit in memory. Its API exposes
+neither, so an Ollama model's `capabilities.concurrency` is `'serial'`, and a
+`CortexAgent` created with `mode` omitted runs passthrough with a
+`mode-resolved-passthrough` resolution note. If your server does run requests
+in parallel, declare it and the omitted mode resolves to duplex:
+
+```typescript
+const model = await providers.createOllamaModel({
+  modelId: 'qwen3:32b',
+  parallelRequests: true, // OLLAMA_NUM_PARALLEL > 1, talker and reasoner fit together
+});
+```
+
+An explicit `mode: 'duplex'` runs duplex either way and records a
+`duplex-not-concurrent` note when the model is `'serial'`. See
+[cortex-agent.md](cortex-agent.md#mode-resolution).
+
 ## Thinking and structured output
 
 Capabilities come from `/api/show`. Known Qwen3 and DeepSeek thinking families
