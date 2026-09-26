@@ -36,6 +36,7 @@ import {
 } from './prompts.js';
 import type { CauseTag } from './cause-tags.js';
 import { DispatchPolicy } from './dispatch-policy.js';
+import { DeliveryScheduler } from './delivery-scheduler.js';
 import { DelegationRegistry } from './delegations.js';
 import type { DelegationRegistryState, DelegationSnapshot } from './delegations.js';
 import { ConversationDeltas } from './conversation-deltas.js';
@@ -278,22 +279,6 @@ export interface DuplexRouterState extends DelegationRegistryState, Conversation
   pendingDeliveries: string[];
 }
 
-interface PendingDelivery {
-  /** Raw delivered content (wrapped for the talker at delivery time). */
-  content: string;
-  enqueuedAt: number;
-}
-
-/** FNV-1a 32-bit; cheap content identity for dedup, not security. */
-function fnv1a(input: string): number {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
 // ---------------------------------------------------------------------------
 // DuplexRouter
 // ---------------------------------------------------------------------------
@@ -320,18 +305,8 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   /** Absorbed-duplicate lifecycle entries written this reasoner run (bounded). */
   private absorbedEntriesThisRun = 0;
 
-  // Delivery backpressure (D19).
-  private interruptTokens: number;
-  private lastTokenRefillAt: number;
-  private recentDeliveryHashes: Array<{ hash: number; at: number }> = [];
-  private lastDeliveryAt = 0;
-
-  // Delivery queues: interrupts ahead of held when_idle content.
-  private interruptQueue: PendingDelivery[] = [];
-  private whenIdleQueue: PendingDelivery[] = [];
-  private pumpTimer: ReturnType<typeof setTimeout> | null = null;
-  private pumpTimerAt = 0;
-  private settleWaiters: Array<() => void> = [];
+  // Delivery backpressure and pacing (D19).
+  private readonly scheduler: DeliveryScheduler;
 
   // Liveness watchdog over reasoner runs (communication.md).
   private reasonerRunning = false;
@@ -368,8 +343,27 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       now: this.now,
       maxAgeMs: this.options.delegationMaxAgeMs,
     });
-    this.interruptTokens = this.options.interruptBucketCapacity;
-    this.lastTokenRefillAt = this.now();
+    this.scheduler = new DeliveryScheduler(
+      {
+        deliver: (content) => ports.deliverToTalker(wrapDeliveryForTalker(content), true),
+        talkerIdle: () => ports.talkerIdle(),
+        // A getter: the consumer's signal is read at every check.
+        get idleSignal() {
+          return ports.idleSignal;
+        },
+      },
+      {
+        minDeliverySpacingMs: this.options.minDeliverySpacingMs,
+        whenIdleDegradeMs: this.options.whenIdleDegradeMs,
+        idlePollMs: this.options.idlePollMs,
+        interruptBucketCapacity: this.options.interruptBucketCapacity,
+        interruptRefillMs: this.options.interruptRefillMs,
+        deliveryDedupWindowMs: this.options.deliveryDedupWindowMs,
+        deliveryDedupMaxEntries: this.options.deliveryDedupMaxEntries,
+        now: this.now,
+        logger: this.logger,
+      },
+    );
 
     this.broker = new PermissionBroker(
       {
@@ -379,7 +373,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
           // Voicing stamps the spacing clock so queued normal deliveries
           // hold off for one spacing window behind a fresh ask instead of
           // talking over it.
-          this.lastDeliveryAt = this.now();
+          this.scheduler.stampReservedLane();
           this.ports.voiceAskToTalker(content, causeTag);
         },
         currentTalkerCauseTags: () => this.ports.currentTalkerCauseTags(),
@@ -668,17 +662,9 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // Proposed interrupt (D13: results wake the talker), bounded by the
     // same token bucket as reasoner interrupts (D19): a demoted result
     // arrives at the next lull instead.
-    const now = this.now();
-    let wake: WakeClass = 'interrupt';
-    let demoted = false;
-    this.refillInterruptTokens(now);
-    if (this.interruptTokens > 0) {
-      this.interruptTokens -= 1;
-    } else {
-      wake = 'when_idle';
-      demoted = true;
-      this.logger.info('lookup result demoted to when_idle (token bucket empty)');
-    }
+    const demoted = !this.scheduler.drawInterrupt();
+    const wake: 'interrupt' | 'when_idle' = demoted ? 'when_idle' : 'interrupt';
+    if (demoted) this.logger.info('lookup result demoted to when_idle (token bucket empty)');
 
     this.ports.appendLog({
       type: 'lookup_result',
@@ -697,14 +683,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     });
 
     this.deltas.push({ speaker: 'lookup', text });
-
-    const pending: PendingDelivery = { content: text, enqueuedAt: now };
-    if (wake === 'interrupt') {
-      this.interruptQueue.push(pending);
-    } else {
-      this.whenIdleQueue.push(pending);
-    }
-    this.pump();
+    this.scheduler.enqueue(text, wake);
   }
 
   dispatchAnswerAsk(askIdRaw: unknown, decisionRaw: unknown, reasonRaw: unknown): string {
@@ -762,11 +741,10 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // explicitly asked for ("run it again", new directive) whose result is
     // byte-identical to the previous run's must still be delivered, or the
     // second request looks unanswered.
-    this.pruneRecentHashes(now);
     const cause = this.reasonerCause();
-    const hash = fnv1a(`${cause.causedBy ?? 'uncaused'}:${content.trim()}`);
-    if (this.recentDeliveryHashes.some((entry) => entry.hash === hash)) {
-      this.logger.info('duplicate delivery absorbed', { hash });
+    const proposed: WakeClass = wakeProposed ?? 'when_idle';
+    const admission = this.scheduler.admit(`${cause.causedBy ?? 'uncaused'}:${content.trim()}`, proposed);
+    if (admission.duplicate) {
       // An absorbed duplicate still leaves a trace: communication.md says
       // results are never silently dropped from the audit trail. Entries
       // are bounded per reasoner run (same rule as dispatch_refused, N4)
@@ -790,26 +768,10 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       }
       return { delivered: false, reason: 'duplicate of a recent delivery' };
     }
-    this.recentDeliveryHashes.push({ hash, at: now });
-    if (this.recentDeliveryHashes.length > this.options.deliveryDedupMaxEntries) {
-      this.recentDeliveryHashes.shift();
-    }
-
     // Producer proposes, router disposes: interrupts draw from the token
     // bucket and demote to when_idle when it is empty.
-    const proposed: WakeClass = wakeProposed ?? 'when_idle';
-    let wake: WakeClass = proposed;
-    let demoted = false;
-    if (proposed === 'interrupt') {
-      this.refillInterruptTokens(now);
-      if (this.interruptTokens > 0) {
-        this.interruptTokens -= 1;
-      } else {
-        wake = 'when_idle';
-        demoted = true;
-        this.logger.info('interrupt delivery demoted to when_idle (token bucket empty)');
-      }
-    }
+    const { wake, demoted } = admission;
+    if (demoted) this.logger.info('interrupt delivery demoted to when_idle (token bucket empty)');
 
     // The log is the durable record of the delivery; a delivery dropped
     // later (abort, restore) stays retained here (facade-api.md abort
@@ -850,13 +812,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
       return { delivered: true, wake };
     }
 
-    const pending: PendingDelivery = { content, enqueuedAt: now };
-    if (wake === 'interrupt') {
-      this.interruptQueue.push(pending);
-    } else {
-      this.whenIdleQueue.push(pending);
-    }
-    this.pump();
+    this.scheduler.enqueue(content, wake);
     return { delivered: true, wake };
   }
 
@@ -866,124 +822,12 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
 
   /** Talker-waking deliveries not yet handed to the talker. */
   get pendingDeliveryCount(): number {
-    return this.interruptQueue.length + this.whenIdleQueue.length;
+    return this.scheduler.pendingCount;
   }
 
   /** Resolves once no talker-waking delivery is held by the router. */
   waitForDeliveriesSettled(): Promise<void> {
-    if (this.pendingDeliveryCount === 0) return Promise.resolve();
-    return new Promise((resolve) => this.settleWaiters.push(resolve));
-  }
-
-  private pump(): void {
-    if (this.destroyed) return;
-    for (;;) {
-      if (this.interruptQueue.length === 0 && this.whenIdleQueue.length === 0) {
-        this.notifySettled();
-        return;
-      }
-      const now = this.now();
-      // Minimum inter-delivery spacing holds regardless of wake class or
-      // idle signal (the anti-collapse rule in communication.md).
-      const spacingReadyAt = this.lastDeliveryAt + this.options.minDeliverySpacingMs;
-      if (this.lastDeliveryAt > 0 && now < spacingReadyAt) {
-        // Re-checked at the poll cadence rather than in one long sleep, so
-        // the wait stays responsive to queue drops and clock control.
-        this.scheduleAt(Math.min(spacingReadyAt, now + this.options.idlePollMs));
-        return;
-      }
-      if (this.interruptQueue.length > 0) {
-        this.deliverNow(this.interruptQueue.shift()!);
-        continue;
-      }
-      const head = this.whenIdleQueue[0]!;
-      const degradeAt = head.enqueuedAt + this.options.whenIdleDegradeMs;
-      if (this.channelIdle()) {
-        this.whenIdleQueue.shift();
-        this.deliverNow(head);
-        continue;
-      }
-      if (now >= degradeAt) {
-        // The lull never came (no signal, or a signal that never reports
-        // idle): the delivery interrupts rather than starving.
-        this.logger.info('when_idle delivery degraded to interrupt after delay', {
-          heldMs: now - head.enqueuedAt,
-        });
-        this.whenIdleQueue.shift();
-        this.deliverNow(head);
-        continue;
-      }
-      this.scheduleAt(Math.min(now + this.options.idlePollMs, degradeAt));
-      return;
-    }
-  }
-
-  private deliverNow(item: PendingDelivery): void {
-    this.lastDeliveryAt = this.now();
-    try {
-      this.ports.deliverToTalker(wrapDeliveryForTalker(item.content), true);
-    } catch (err) {
-      // The content stays in the log (the durable record); the talker-side
-      // failure is loop-owned territory (its deliver() never throws while
-      // healthy, so this is teardown or a bug).
-      this.logger.error('delivery to talker failed', {
-        error: errorMessageOf(err),
-      });
-    }
-  }
-
-  private channelIdle(): boolean {
-    const signal = this.ports.idleSignal;
-    if (signal) {
-      try {
-        return signal() === true;
-      } catch (err) {
-        this.logger.warn('idle signal threw; treating as not idle', {
-          error: errorMessageOf(err),
-        });
-        return false;
-      }
-    }
-    return this.ports.talkerIdle();
-  }
-
-  private scheduleAt(at: number): void {
-    if (this.destroyed) return;
-    if (this.pumpTimer !== null) {
-      if (at >= this.pumpTimerAt) return;
-      clearTimeout(this.pumpTimer);
-    }
-    this.pumpTimerAt = at;
-    const timer = setTimeout(() => {
-      this.pumpTimer = null;
-      this.pump();
-    }, Math.max(0, at - this.now()));
-    timer.unref?.();
-    this.pumpTimer = timer;
-  }
-
-  private notifySettled(): void {
-    if (this.settleWaiters.length === 0) return;
-    const waiters = this.settleWaiters.splice(0);
-    for (const resolve of waiters) resolve();
-  }
-
-  private refillInterruptTokens(now: number): void {
-    const capacity = this.options.interruptBucketCapacity;
-    if (this.interruptTokens >= capacity) {
-      this.lastTokenRefillAt = now;
-      return;
-    }
-    const earned = Math.floor((now - this.lastTokenRefillAt) / this.options.interruptRefillMs);
-    if (earned > 0) {
-      this.interruptTokens = Math.min(capacity, this.interruptTokens + earned);
-      this.lastTokenRefillAt += earned * this.options.interruptRefillMs;
-    }
-  }
-
-  private pruneRecentHashes(now: number): void {
-    const cutoff = now - this.options.deliveryDedupWindowMs;
-    this.recentDeliveryHashes = this.recentDeliveryHashes.filter((entry) => entry.at >= cutoff);
+    return this.scheduler.waitSettled();
   }
 
   // -------------------------------------------------------------------------
@@ -1066,11 +910,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
    * The delivery entries stay in the log: retained, not delivered.
    */
   dropPendingDeliveries(): number {
-    const dropped = this.pendingDeliveryCount;
-    this.interruptQueue = [];
-    this.whenIdleQueue = [];
-    this.notifySettled();
-    return dropped;
+    return this.scheduler.dropPending();
   }
 
   /** Drop buffered conversation deltas (abort scope 'work'/'all'). */
@@ -1085,7 +925,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
   exportState(): DuplexRouterState {
     return {
       ...this.delegations.exportState(),
-      pendingDeliveries: [...this.interruptQueue, ...this.whenIdleQueue].map((item) => item.content),
+      pendingDeliveries: this.scheduler.pendingContents(),
       ...this.deltas.exportState(),
     };
   }
@@ -1130,16 +970,12 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // Pending asks belong to the replaced session; every resolver settles
     // as deny so no loop stays blocked on an ask nobody can answer anymore.
     this.broker.reset();
-    this.dropPendingDeliveries();
+    this.scheduler.reset();
     this.dropWorkContext();
     this.delegations.clear();
     this.policy.reset();
-    this.recentDeliveryHashes = [];
     this.absorbedEntriesThisRun = 0;
     this.reasonerRunning = false;
-    this.lastDeliveryAt = 0;
-    this.interruptTokens = this.options.interruptBucketCapacity;
-    this.lastTokenRefillAt = this.now();
   }
 
   destroy(): void {
@@ -1149,13 +985,7 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     // router: a hanging ask would block its loop into the force-kill path.
     this.broker.destroy();
     clearInterval(this.watchdogTimer);
-    if (this.pumpTimer !== null) {
-      clearTimeout(this.pumpTimer);
-      this.pumpTimer = null;
-    }
-    this.interruptQueue = [];
-    this.whenIdleQueue = [];
-    this.notifySettled();
+    this.scheduler.destroy();
   }
 
   // -------------------------------------------------------------------------
