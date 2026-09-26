@@ -152,7 +152,7 @@ Two kinds of content reach the loop without a consumer caller waiting on them: b
 
 - Items with budget left go back to the front of their queue, ahead of anything that arrived meanwhile, and get another run (a re-queued background batch rides the drain's repeat; re-parked wake content gets a new sweep).
 - Items out of attempts or out of time are dead-lettered. A `fatal` failure, such as an authentication error, exhausts the whole batch at once on every path (background drains, wake sweeps, and a failed prompt carrying spliced wake content), since an identical re-attempt cannot succeed.
-- Background completions are not charged an attempt when the run was aborted: the user stopped the agent, the delivery did not fail. Parked wake content whose carrying run was aborted is cancelled with it and dead-lettered.
+- Background completions are not charged an attempt when the run was aborted: the user stopped the agent, the delivery did not fail. Parked wake content whose carrying run was aborted is cancelled with it and dead-lettered, whether a sweep run or a consumer prompt that spliced it into its batch carried it; content the aborted run had already answered stays, and content it never answered is also removed from the transcript, so the next run does not read it as delivered.
 
 A failure that a later attempt recovers from never reaches `onError`. A background batch counts as recovered when every item has left the queue without being dead-lettered. A wake sweep stays silent while every item still has budget.
 

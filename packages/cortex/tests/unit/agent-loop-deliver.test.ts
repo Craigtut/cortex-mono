@@ -980,6 +980,74 @@ describe('AgentLoop fatal failures exhaust parked wake content at once', () => {
   });
 });
 
+describe('AgentLoop abort of a prompt carrying spliced wake content', () => {
+  // An abort cancels parked content with the run that carried it, on the
+  // sweep path and on a consumer prompt's batch alike: content no response
+  // answered leaves the transcript and is dead-lettered, never left behind
+  // as unanswered context the next run reads as already delivered.
+
+  /** A run that pushes its batch and holds until abort() ends it. */
+  function abortableRun(piAgent: DeliverMockPiAgent, ending: 'rejects' | 'resolves-with-stub'): void {
+    let endRun: (() => void) | null = null;
+    piAgent.abort = () => { endRun?.(); };
+    piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
+      piAgent.promptCalls.push(input);
+      const messages: AgentMessage[] = Array.isArray(input)
+        ? input
+        : [{ role: 'user', content: input, timestamp: Date.now() }];
+      piAgent.state.messages.push(...messages);
+      await new Promise<void>((resolve) => { endRun = resolve; });
+      if (ending === 'rejects') {
+        const err = new Error('Request was aborted.');
+        err.name = 'AbortError';
+        throw err;
+      }
+      piAgent.state.messages.push({ role: 'assistant', content: [], stopReason: 'aborted' } as never);
+      return {};
+    };
+  }
+
+  it.each(['rejects', 'resolves-with-stub'] as const)(
+    'unwinds and dead-letters the batch when the aborted run %s',
+    async (ending) => {
+      const piAgent = createMockPiAgent();
+      const loop = createLoop(piAgent);
+      loop.onError(() => {});
+      const deadLettered = vi.fn();
+      loop.onBackgroundResultDeadLettered(deadLettered);
+      await loop.prompt('warm up');
+      piAgent.promptCalls = [];
+
+      // Parked in the frame the prompt enqueued, so its run splices it.
+      abortableRun(piAgent, ending);
+      const turn = loop.prompt('real question');
+      expect(loop.deliver('spoken during the turn').outcome).toBe('parked');
+      await waitUntil(() => piAgent.promptCalls.length === 1);
+      // Precondition: the content rode the prompt's batch into the transcript.
+      expect(Array.isArray(piAgent.promptCalls[0])).toBe(true);
+      expect(occurrences(piAgent, 'spoken during the turn')).toBe(1);
+
+      await loop.abort();
+      await turn.catch(() => {});
+      await waitUntil(() => !loop.isLoopActive);
+
+      expect(occurrences(piAgent, 'spoken during the turn')).toBe(0);
+      expect(deadLettered.mock.calls.map((call) => call[0])).toEqual([
+        expect.objectContaining({
+          kind: 'wake_delivery',
+          message: 'spoken during the turn',
+          lastError: 'cancelled by abort (carrying run aborted)',
+        }),
+      ]);
+      // Not re-parked either: nothing starts a run after the user stopped.
+      expect(loop.pendingWakeDeliveryCount).toBe(0);
+      expect(piAgent.promptCalls).toHaveLength(1);
+      // The prompt's own input stays, as it does for any aborted prompt.
+      expect(occurrences(piAgent, 'real question')).toBe(1);
+    },
+  );
+});
+
 describe('AgentLoop.deliver and abort', () => {
   it('abort() drops parked wake deliveries instead of waiting on a swept run', async () => {
     const piAgent = createMockPiAgent();

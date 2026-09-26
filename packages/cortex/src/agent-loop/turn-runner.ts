@@ -47,7 +47,7 @@ export interface TurnRunnerPorts {
   emitError(error: Error, wasAborted?: boolean): void;
   cacheRetention(): CacheRetention | null;
   model(): CortexModel;
-  queues: Pick<DeliveryQueues, 'takeSilent' | 'takeDeliverableWake' | 'reparkAfterFailedPrompt'>;
+  queues: Pick<DeliveryQueues, 'takeSilent' | 'takeDeliverableWake' | 'settleSplicedBatch'>;
   toolRuntime: Pick<CortexToolRuntime, 'resetForLoop'>;
   budget: Pick<BudgetGuard, 'reset' | 'getTurnCount' | 'getTotalCost'>;
   diagnostics: Pick<PromptWatchdogDiagnostics, 'startPrompt' | 'finishPrompt'>;
@@ -240,17 +240,23 @@ export class TurnRunner {
     let promptStatus: 'resolved' | 'rejected' | 'cancelled' = 'resolved';
     try {
       this.activeTags = runCauseTags;
-      return await this.runWithRetry(
+      const result = await this.runWithRetry(
         input, fromDrain, retryPolicyOverride, silentBatch, wakeBatch,
       );
+      // An abort can end the run without a throw; its spliced content was
+      // no more answered than on the throwing path.
+      if (this.ports.isAborted()) {
+        this.ports.queues.settleSplicedBatch(wakeBatch, silentBatch.length, null, true);
+      }
+      return result;
     } catch (err) {
       const error = toError(err);
       promptStatus = this.ports.isAborted() ? 'cancelled' : 'rejected';
-      // Parked content must end in a run that answers it, so a failed
-      // prompt re-parks its wake batch. An aborted turn cancels it instead.
-      if (promptStatus !== 'cancelled') {
-        this.ports.queues.reparkAfterFailedPrompt(wakeBatch, silentBatch.length, error);
-      }
+      // Parked content must end in a run that answers it: a failed prompt
+      // re-parks its wake batch, and an aborted one cancels it.
+      this.ports.queues.settleSplicedBatch(
+        wakeBatch, silentBatch.length, error, promptStatus === 'cancelled',
+      );
       throw error;
     } finally {
       this.activeRetention = null;

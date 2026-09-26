@@ -344,15 +344,26 @@ export class DeliveryQueues {
   }
 
   /**
-   * After a terminal prompt failure, re-park wake deliveries spliced into
-   * its batch if the run never progressed past them, so 'parked' content
-   * never demotes to inert context. The prompt's own input stays. A fatal
-   * failure dead-letters them instead of re-parking.
+   * After a prompt whose batch carried spliced wake deliveries ended without
+   * answering them (a terminal failure, or an abort), settle them so
+   * 'parked' content never demotes to inert context. Only content the run
+   * never progressed past is touched; it leaves the transcript and then:
+   *
+   * - an abort cancels it with the run that carried it, dead-lettered like
+   *   a sweep run's aborted content (nothing starts a run after a stop);
+   * - a fatal failure dead-letters it at once;
+   * - any other failure re-parks it within the delivery budget.
+   *
+   * The prompt's own input stays in every case.
+   *
+   * @param error - The failure, or null for an abort that ended the run
+   *   without throwing.
    */
-  reparkAfterFailedPrompt(
+  settleSplicedBatch(
     wakeBatch: QueuedDelivery[],
     trailingBatchCount: number,
-    error: Error,
+    error: Error | null,
+    aborted: boolean,
   ): void {
     if (wakeBatch.length === 0) return;
     const messages = this.ports.transcript.messages();
@@ -366,6 +377,13 @@ export class DeliveryQueues {
     if (unwind.trimmed) this.ports.transcript.notifyTailTrimmed();
     if (unwind.outcome !== 'repark') return;
 
+    if (aborted || error === null) {
+      this.ports.logger.info('prompt aborted; spliced wake deliveries cancelled', {
+        count: wakeBatch.length,
+      });
+      this.ports.deadLetters.recordWake(wakeBatch, 'cancelled by abort (carrying run aborted)');
+      return;
+    }
     const fatal = classifyError(error, { wasAborted: this.ports.isAborted() }).severity === 'fatal';
     const { retry: requeue, exhausted: droppedItems } =
       partitionExhausted(wakeBatch, WAKE_DELIVERY_LIMITS, Date.now(), { fatal });
