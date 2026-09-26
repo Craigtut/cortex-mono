@@ -13,7 +13,7 @@
  * Reference: provider-manager.md
  */
 
-import { providerConcurrency } from './provider-registry.js';
+import { backendConcurrency, modelBackend } from './model-backend.js';
 
 // ---------------------------------------------------------------------------
 // Branded type
@@ -101,9 +101,9 @@ export function wrapModel(
     contextWindow: contextWindow ?? extractContextWindow(model) ?? 200_000,
     [INNER_MODEL]: model,
     // Concurrency always resolves: a model creator that knows its backend
-    // (Ollama) states it, and everything else is judged by provider id.
+    // (Ollama) states it, and everything else is judged by its backend.
     capabilities: {
-      concurrency: providerConcurrency(provider),
+      concurrency: backendConcurrency(modelBackend(provider, baseUrlOf(model))),
       ...(model as { cortexCapabilities?: ModelCapabilities }).cortexCapabilities,
     },
   };
@@ -162,6 +162,11 @@ export function isCortexModel(value: unknown): value is CortexModel {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/** The pi model's base URL, when it declares one. */
+function baseUrlOf(model: unknown): unknown {
+  return model && typeof model === 'object' ? (model as Record<string, unknown>)['baseUrl'] : undefined;
+}
 
 /**
  * Attempt to extract the context window size from a pi-ai Model object.

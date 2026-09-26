@@ -135,7 +135,7 @@ type ModelConcurrency = 'parallel' | 'serial' | 'unknown';
 
 The consumer can read `provider`, `modelId`, and `contextWindow` for display and configuration purposes.
 
-`capabilities.concurrency` says whether the backend serves a request while another is in flight, which decides the default `CortexAgent` mode (cortex-agent.md, "Mode resolution"). It is stamped at creation: `resolveModel()` and a direct `wrapModel()` judge by provider id against the registry (`parallel` for every hosted provider it knows, `unknown` otherwise), `createCustomModel()` is `unknown` (provider `custom`), and `createOllamaModel()` is `serial` unless its config sets `parallelRequests: true`. A direct `wrapModel()` of a local server under a hosted provider's id reads as `parallel`; pass `mode` explicitly in that case. The underlying pi-ai `Model` object is accessed internally by AgentLoop when constructing the pi-agent-core Agent.
+`capabilities.concurrency` says whether the backend serves a request while another is in flight, which decides the default `CortexAgent` mode (cortex-agent.md, "Mode resolution"). It is stamped at creation: `resolveModel()` and a direct `wrapModel()` judge by the backend (`parallel` for every provider in pi-ai's catalog, `unknown` for any other id and for any base URL on loopback, a private network or a private-use name, whatever the provider id), `createCustomModel()` is `unknown` (provider `custom`), and `createOllamaModel()` is `serial` unless its config sets `parallelRequests: true`. The underlying pi-ai `Model` object is accessed internally by AgentLoop when constructing the pi-agent-core Agent.
 
 ### OAuth
 

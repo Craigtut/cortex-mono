@@ -23,10 +23,10 @@ The talker model judged is the one assembly would build: `talker.model` when set
 
 `concurrency` is stamped when the model is created:
 
-- **Hosted providers** (every provider in Cortex's `PROVIDER_REGISTRY`, plus the hosted providers pi-ai resolves that the registry does not list, such as `amazon-bedrock`): `parallel`.
+- **Hosted providers** (every provider in pi-ai's catalog, read at runtime, so a provider a pi-ai release adds is covered without a Cortex change): `parallel`.
 - **Native Ollama** (`ProviderManager.createOllamaModel()`): `serial`, unless the config sets `parallelRequests: true` (for a server with `OLLAMA_NUM_PARALLEL` raised whose talker and reasoner models fit in memory together). Ollama's API does not expose either setting, so Cortex cannot detect it.
-- **Custom endpoints** (`createCustomModel()`) and any unrecognized provider: `unknown`.
-- **`wrapModel()` called directly** judges by the provider id you pass, so wrapping a local server under a hosted provider's id (`'openai'` pointed at vLLM, say) reads as `parallel`. Pass `mode` explicitly in that case.
+- **Custom endpoints** (`createCustomModel()`) and any provider id pi-ai does not know: `unknown`.
+- **Any model whose base URL is local**: `unknown`, whatever its provider id. Loopback, private-network addresses (RFC 1918, link-local, IPv6 unique-local, the `100.64/10` space tailnets use) and private-use names (`.local`, `.internal`, `.lan`, a single-label host) all count, so a catalog provider id aimed at a local proxy or vLLM is not mistaken for the hosted API.
 
 The mode is fixed at construction, because the loops are assembled from it. A later `setModel()` onto a backend that is not `parallel` keeps a duplex agent duplex and records a `duplex-not-concurrent` note (and clears it if you switch back); a passthrough agent stays passthrough. To change mode, create a new agent.
 

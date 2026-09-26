@@ -57,9 +57,14 @@ describe('model-wrapper', () => {
       expect(wrapped.__brand).toBe('CortexModel');
     });
 
-    it('derives concurrency from the provider registry', () => {
+    it('derives concurrency from the backend', () => {
       expect(wrapModel({}, 'anthropic', 'claude-sonnet-4').capabilities?.concurrency).toBe('parallel');
       expect(wrapModel({}, 'amazon-bedrock', 'model').capabilities?.concurrency).toBe('parallel');
+      // In pi-ai's catalog but in no hand-kept list.
+      expect(wrapModel({}, 'qwen-token-plan', 'qwen3-max').capabilities?.concurrency).toBe('parallel');
+      // A catalog id aimed at a local proxy is a local server.
+      expect(wrapModel({ baseUrl: 'http://localhost:4000' }, 'anthropic', 'claude-sonnet-4')
+        .capabilities?.concurrency).toBe('unknown');
       expect(wrapModel({}, 'custom', 'my-model').capabilities?.concurrency).toBe('unknown');
       expect(wrapModel({}, 'ollama', 'qwen3:32b').capabilities?.concurrency).toBe('unknown');
       expect(modelConcurrency(wrapModel({}, 'self-hosted-vllm', 'm'))).toBe('unknown');
