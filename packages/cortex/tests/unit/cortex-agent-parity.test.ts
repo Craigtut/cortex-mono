@@ -204,6 +204,8 @@ interface Harness {
   events: unknown[];
   /** What AgentLoop.prompt() received on this side (input plus options). */
   loopPromptCalls: Array<{ input: string; options: unknown }>;
+  /** Causation tags this side's wiring put on AgentLoop.prompt() calls. */
+  loopCauseTags: unknown[];
   turnOutputs: Array<{ userFacing: string; loopPath: string }>;
   loopCompletes: number;
   errors: Array<{ category: string; severity: string; loopPath: string }>;
@@ -303,14 +305,22 @@ function createEventNormalizer(): (value: unknown) => unknown {
   return normalize;
 }
 
-/** Record every AgentLoop.prompt() invocation (input plus options). */
+/**
+ * Record every AgentLoop.prompt() invocation (input plus options). The
+ * facade's own causation tag rides the options (PromptOptions.causeTag); it
+ * is facade-internal wiring, not a consumer option, so it is recorded apart
+ * and the options compare as the consumer passed them.
+ */
 function recordLoopPrompts(
   loop: AgentLoop,
   calls: Array<{ input: string; options: unknown }>,
+  causeTags: unknown[] = [],
 ): void {
   const original = loop.prompt.bind(loop);
   (loop as { prompt: AgentLoop['prompt'] }).prompt = (input, options) => {
-    calls.push({ input, options });
+    const { causeTag, ...consumerOptions } = options ?? {};
+    if (causeTag !== undefined) causeTags.push(causeTag);
+    calls.push({ input, options: Object.keys(consumerOptions).length > 0 ? consumerOptions : undefined });
     return original(input, options);
   };
 }
@@ -359,6 +369,7 @@ function createDirectHarness(overrides?: Partial<AgentLoopConfig>): Harness {
     piAgent,
     events: [],
     loopPromptCalls: [],
+    loopCauseTags: [],
     turnOutputs: [],
     loopCompletes: 0,
     errors: [],
@@ -372,7 +383,7 @@ function createDirectHarness(overrides?: Partial<AgentLoopConfig>): Harness {
     queuedDeliveryCount: () => loop.queuedDeliveryCount,
     waitForIdle: () => loop.waitForLoopIdle(),
   };
-  recordLoopPrompts(loop, harness.loopPromptCalls);
+  recordLoopPrompts(loop, harness.loopPromptCalls, harness.loopCauseTags);
   collect(harness, loop);
   return harness;
 }
@@ -389,6 +400,7 @@ function createFacadeHarness(overrides?: Partial<AgentLoopConfig>): Harness {
     piAgent,
     events: [],
     loopPromptCalls: [],
+    loopCauseTags: [],
     turnOutputs: [],
     loopCompletes: 0,
     errors: [],
@@ -402,7 +414,7 @@ function createFacadeHarness(overrides?: Partial<AgentLoopConfig>): Harness {
     queuedDeliveryCount: () => facade.queuedDeliveryCount,
     waitForIdle: () => facade.waitForConversationIdle(),
   };
-  recordLoopPrompts(loop, harness.loopPromptCalls);
+  recordLoopPrompts(loop, harness.loopPromptCalls, harness.loopCauseTags);
   collect(harness, facade);
   return harness;
 }
@@ -651,6 +663,9 @@ describe('CortexAgent passthrough parity', () => {
       { input: 'hello', options: { sessionId: 'affinity-1' } },
     ]);
     expect(facade.loopPromptCalls).toEqual(direct.loopPromptCalls);
+    // Beside them, the facade's own causation: the logged utterance.
+    expect(direct.loopCauseTags).toEqual([]);
+    expect(facade.loopCauseTags).toEqual([{ kind: 'utterance', seq: expect.any(Number) }]);
   });
 
   it('usage parity includes cache token and cost breakdowns', async () => {

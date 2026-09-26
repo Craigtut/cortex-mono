@@ -28,7 +28,7 @@ import type {
   RetrySucceededInfo,
 } from '../types.js';
 import type { DeliveryQueues, QueuedDelivery } from './delivery-queues.js';
-import type { DirectCompletionOptions } from './direct-completion.js';
+import type { PromptOptions } from './api/run.js';
 import { HandlerList } from './handler-list.js';
 import type { CacheRetention, PiAgent } from './pi-agent.js';
 import type { AbortState } from './run-control.js';
@@ -71,9 +71,6 @@ export class TurnRunner {
   private prompting = false;
   // Cause tags of the run in flight (see DeliverOptions.causeTag).
   private activeTags: readonly unknown[] = [];
-  // Staged by deliver()'s prompted branch with the gate empty, so the very
-  // next run (that prompt's own) consumes it.
-  private pendingCauseTag: unknown = undefined;
   private activeRetention: CacheRetention | null = null;
   // Messages before the current prompt: stable, cacheable history versus
   // new tick content. Compaction moves it mid-run.
@@ -114,11 +111,6 @@ export class TurnRunner {
     return this.unwoundPromise;
   }
 
-  /** Stage the cause tag the next consumer run consumes. */
-  stagePromptCauseTag(tag: unknown): void {
-    this.pendingCauseTag = tag;
-  }
-
   /** Content steered into the run in flight carries its causation too. */
   appendActiveCauseTags(tags: unknown[]): void {
     this.activeTags = [...this.activeTags, ...tags];
@@ -129,7 +121,7 @@ export class TurnRunner {
    * background completions that arrived while it ran. Lifecycle is
    * re-checked at dequeue so a destroy() after enqueue never starts a loop.
    */
-  async runCycle(input: string, options?: DirectCompletionOptions): Promise<unknown> {
+  async runCycle(input: string, options?: PromptOptions): Promise<unknown> {
     this.ports.assertNotShuttingDown();
     try {
       return await this.run(input, options);
@@ -154,23 +146,16 @@ export class TurnRunner {
    * @param retryPolicyOverride - The drain's policy, capped at its remaining
    *   delivery budget.
    * @param causeTags - Tags for content a drain-started run carries itself.
+   *   A consumer run's input carries its own in `options.causeTag`.
    */
   async run(
     input: string,
-    options?: DirectCompletionOptions,
+    options?: PromptOptions,
     fromDrain = false,
     retryPolicyOverride?: RetryPolicy,
     causeTags?: unknown[],
   ): Promise<unknown> {
     this.ports.activate();
-
-    // Consumed even on paths that cancel before the run starts: left
-    // pending, it would mislabel a later, unrelated run.
-    let directCauseTag: unknown;
-    if (!fromDrain) {
-      directCauseTag = this.pendingCauseTag;
-      this.pendingCauseTag = undefined;
-    }
 
     // prompt() installs a fresh controller synchronously, so an aborted one
     // here means abort() landed between enqueue and dequeue.
@@ -202,7 +187,7 @@ export class TurnRunner {
     const runCauseTags: readonly unknown[] = [
       ...(causeTags ?? []),
       ...wakeBatch.map((item) => item.causeTag).filter((tag) => tag !== undefined),
-      ...(directCauseTag !== undefined ? [directCauseTag] : []),
+      ...(options?.causeTag !== undefined ? [options.causeTag] : []),
     ];
 
     // Long-lived mode keeps workspace state (cwd, read registry, undo).

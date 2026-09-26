@@ -8,6 +8,17 @@ import type { CortexLifecycleState } from '../../types.js';
 import type { IdleDigestionOptions, IdleDigestionResult } from '../context-pipeline.js';
 import type { DirectCompletionOptions } from '../direct-completion.js';
 
+/** Options for {@link LoopRunApi.prompt}. */
+export interface PromptOptions extends DirectCompletionOptions {
+  /**
+   * Opaque causation tag for this prompt's input, exposed through
+   * {@link LoopRunApi.activeRunCauseTags} for exactly the run it starts,
+   * the same way a delivery's DeliverOptions.causeTag is. Bound to the
+   * call, so no later run can inherit it.
+   */
+  causeTag?: unknown;
+}
+
 export interface LoopRunApi {
   /**
    * Send a prompt to the agent and run the agentic loop.
@@ -24,7 +35,7 @@ export interface LoopRunApi {
    * @returns The agent's response (opaque, from pi-agent-core)
    * @throws Error if the agent has been destroyed or is already prompting
    */
-  prompt(input: string, options?: DirectCompletionOptions): Promise<unknown>;
+  prompt(input: string, options?: PromptOptions): Promise<unknown>;
 
   /**
    * True while any gate task is running or queued: a prompt cycle, a

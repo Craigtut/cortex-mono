@@ -51,6 +51,7 @@ import { DeadLetterStore } from './delivery-failure.js';
 import { DeliveryQueues } from './delivery-queues.js';
 import { DirectCompletions } from './direct-completion.js';
 import type { DirectCompletionOptions } from './direct-completion.js';
+import type { PromptOptions } from './api/run.js';
 import { wireLoopEvents } from './event-wiring.js';
 import { HandlerList } from './handler-list.js';
 import { LoopLifecycle } from './lifecycle.js';
@@ -72,7 +73,7 @@ import { UsageLedger } from './usage-ledger.js';
 /** The loop's own methods the parts call back into (resolved per call). */
 export interface LoopHost {
   workingTagsEnabled(): boolean;
-  prompt(input: string, options?: DirectCompletionOptions): Promise<unknown>;
+  prompt(input: string, options?: PromptOptions): Promise<unknown>;
   refreshTools(): void;
   directComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string>;
   utilityComplete(context: DirectCompletionContext, options?: DirectCompletionOptions): Promise<string>;
@@ -167,10 +168,8 @@ export function assembleLoop(params: {
     hasSystemPrompt: () => systemPrompt.isConfigured(),
     isPrompting: () => runner.isPrompting,
     budgetBreached: () => budgetGuard.isBreached(),
-    startPrompt: (content, promptOptions, causeTag) => {
-      runner.stagePromptCauseTag(causeTag);
-      return host.prompt(content, promptOptions);
-    },
+    startPrompt: (content, promptOptions, causeTag) =>
+      host.prompt(content, causeTag !== undefined ? { ...promptOptions, causeTag } : promptOptions),
     runDeliveryTurn: (message, policy, causeTags) =>
       runner.run(message, undefined, true, policy, causeTags),
     appendActiveCauseTags: (tags) => runner.appendActiveCauseTags(tags),

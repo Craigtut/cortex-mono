@@ -432,7 +432,11 @@ describe('CortexAgent.prompt', () => {
     const promptSpy = vi.spyOn(loop, 'prompt');
     const options = { sessionId: 'per-call-affinity' };
     await facade.prompt('hello', options);
-    expect(promptSpy).toHaveBeenCalledWith('hello', options);
+    // Plus the facade's own causation tag for the logged utterance.
+    expect(promptSpy).toHaveBeenCalledWith('hello', {
+      ...options,
+      causeTag: { kind: 'utterance', seq: expect.any(Number) },
+    });
     expect(piAgent.promptCalls).toEqual(['hello']);
   });
 

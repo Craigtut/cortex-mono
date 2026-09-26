@@ -1194,6 +1194,20 @@ describe('AgentLoop.deliver and abort', () => {
 });
 
 describe('AgentLoop.deliver cause tags', () => {
+  it('prompt() carries its own cause tag into exactly the run it starts', async () => {
+    const piAgent = createMockPiAgent();
+    const loop = createLoop(piAgent);
+    const seen: Array<readonly unknown[]> = [];
+    const original = piAgent.prompt.bind(piAgent);
+    piAgent.prompt = async (input) => {
+      seen.push(loop.activeRunCauseTags);
+      return original(input);
+    };
+    await loop.prompt('tagged', { causeTag: 'utterance-3' });
+    await loop.prompt('untagged');
+    expect(seen).toEqual([['utterance-3'], []]);
+  });
+
   it('a run killed by a throwing consumer logger does not leak its cause tags', async () => {
     // The tag set and its clearing finally must be paired by construction:
     // logger.debug('loop start') runs between the batch take and the run's

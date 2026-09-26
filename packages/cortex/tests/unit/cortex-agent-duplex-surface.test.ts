@@ -644,6 +644,24 @@ describe('duplex getConversationHistory', () => {
     expect(transcriptText(state.talkerHistory)).toContain('please audit the deploy config');
   });
 
+  it('passthrough stamps a parked delivery run with that delivery, not with nothing', async () => {
+    const { facade, reasonerPi } = createPassthroughScenario();
+    reasonerPi.hold = true;
+    const first = facade.prompt('start the long thing');
+    await waitUntil(() => reasonerPi.promptCalls.length === 1, 2000, 'run live');
+    // Parks behind the live run; the sweep run answers it.
+    reasonerPi.script = [{ text: 'First done.' }, { text: 'Picked up the note.' }];
+    expect(facade.deliver('also note this').outcome).toBe('parked');
+    reasonerPi.releaseRun();
+    await first;
+    await waitUntil(() => reasonerPi.promptCalls.length === 2 && facade.conversationIdle, 2000, 'sweep ran');
+
+    const note = facade.getLog().find((entry) => entry.content === 'also note this')!;
+    const reply = facade.getLog().find((entry) => entry.type === 'reply' && entry.content === 'Picked up the note.');
+    expect(reply).toBeDefined();
+    expect(reply!.causedBy).toBe(note.seq);
+  });
+
   it('passthrough is unchanged: the single loop is the conversation loop', async () => {
     const { facade, reasonerLoop } = createPassthroughScenario();
     await facade.prompt('hello there');

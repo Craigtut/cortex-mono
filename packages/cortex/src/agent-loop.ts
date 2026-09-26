@@ -60,7 +60,7 @@ import type { LoopDeliveryApi } from './agent-loop/api/delivery.js';
 import type { LoopEventApi } from './agent-loop/api/events.js';
 import type { LoopModelApi } from './agent-loop/api/models.js';
 import type { LoopPromptApi } from './agent-loop/api/prompt.js';
-import type { LoopRunApi } from './agent-loop/api/run.js';
+import type { LoopRunApi, PromptOptions } from './agent-loop/api/run.js';
 import type { LoopSubAgentApi } from './agent-loop/api/sub-agents.js';
 import type { LoopToolApi } from './agent-loop/api/tools.js';
 import { assembleLoop } from './agent-loop/assembly.js';
@@ -96,6 +96,7 @@ export type {
   DeliverResult,
   PendingWakeDelivery,
 } from './agent-loop/api/delivery.js';
+export type { PromptOptions } from './agent-loop/api/run.js';
 export type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
 export { TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop/pi-hooks.js';
 export type {
@@ -295,7 +296,7 @@ export class AgentLoop implements
   // Running turns (LoopRunApi)
   // -----------------------------------------------------------------------
 
-  async prompt(input: string, options?: DirectCompletionOptions): Promise<unknown> {
+  async prompt(input: string, options?: PromptOptions): Promise<unknown> {
     const { lifecycle, gate, abortState, runner } = this.parts;
     lifecycle.assertNotShuttingDown();
     if (!this.parts.systemPrompt.isConfigured()) {

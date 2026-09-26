@@ -54,7 +54,7 @@ export interface DeliveryQueuePorts {
   /** Whether a logical turn is in flight. */
   isPrompting(): boolean;
   budgetBreached(): boolean;
-  /** The loop's prompt(), with the delivery's cause tag staged for its run. */
+  /** The loop's prompt(), carrying the delivery's cause tag into its run. */
   startPrompt(content: string, options: DirectCompletionOptions | undefined, causeTag: unknown): Promise<unknown>;
   /** A drain-style run (no silent flush) carrying `causeTags`. */
   runDeliveryTurn(message: string, retryPolicy: RetryPolicy, causeTags: unknown[]): Promise<unknown>;
@@ -137,8 +137,8 @@ export class DeliveryQueues {
     }
 
     // The gate is empty in this frame, so the run prompt() enqueues is the
-    // next run task and the staged cause tag cannot reach another run. The
-    // catch keeps a fire-and-forget caller from an unhandled rejection.
+    // next run task. The catch keeps a fire-and-forget caller from an
+    // unhandled rejection.
     const turn = this.ports.startPrompt(content, options?.promptOptions, options?.causeTag);
     turn.catch((err) => {
       this.ports.logger.warn('deliver-started turn failed', {

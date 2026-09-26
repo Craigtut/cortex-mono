@@ -164,6 +164,8 @@ export type {
   DeliverOptions,
   DeliverOutcome,
   DeliverResult,
+  PendingWakeDelivery,
+  PromptOptions,
   IdleDigestionResult,
   QueueDrainMode,
   ToolResultInterceptor,

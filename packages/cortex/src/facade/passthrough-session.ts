@@ -10,7 +10,8 @@ import type { CortexModel } from '../model-wrapper.js';
 import type { AgentMessage, ContextManager } from '../context-manager.js';
 import type { ObservationalMemoryState } from '../compaction/index.js';
 import type { EventBridge } from '../event-bridge.js';
-import type { CausationSource } from '../duplex/cause-tags.js';
+import { collectCauseTags } from '../duplex/cause-tags.js';
+import type { CausationSource, CauseTag } from '../duplex/cause-tags.js';
 import type { DuplexRouterState } from '../duplex/router-contract.js';
 import type { LogRecorder } from './log-recorder.js';
 import {
@@ -38,14 +39,6 @@ export class PassthroughSession implements SessionMode {
   /** Serializes facade prompt() calls (concurrent prompts queue, never throw). */
   private promptChain: Promise<void> = Promise.resolve();
   /**
-   * Seq of the utterance whose facade-initiated reasoner run is currently
-   * live. Entries produced by that run (replies, errors, spawn lifecycle)
-   * carry it as their causation stamp; entries produced while no
-   * facade-initiated run is live (e.g. by a background delivery run) carry
-   * no stamp rather than a guessed one.
-   */
-  private activeCauseSeq: number | null = null;
-  /**
    * The talker side and router state of a restored duplex artifact, carried
    * through opaquely: passthrough has no talker loop to hydrate, but the
    * artifact must round-trip getState() without losing that side.
@@ -56,10 +49,12 @@ export class PassthroughSession implements SessionMode {
     this.reasoner = reasoner;
     this.services = services;
     this.recorder = services.recorder;
+    // Read off the loop's live run, as in duplex: the input's log seq rides
+    // the call or delivery that carries it, so a run's entries are stamped
+    // with the input it actually consumed (a parked delivery's included)
+    // and a run with no tagged input carries no stamp rather than a guess.
     this.causation = {
-      tags: () => (this.activeCauseSeq !== null
-        ? [{ kind: 'utterance', seq: this.activeCauseSeq }]
-        : []),
+      tags: () => collectCauseTags(reasoner.activeRunCauseTags),
     };
     // Additive handlers (the loop keeps handler arrays), so consumer
     // handlers and their signatures are untouched and parity holds.
@@ -106,14 +101,10 @@ export class PassthroughSession implements SessionMode {
           content: input,
           causedBy: null,
         });
-        this.activeCauseSeq = entry.seq;
-        try {
-          return await this.reasoner.prompt(input, options);
-        } finally {
-          if (this.activeCauseSeq === entry.seq) {
-            this.activeCauseSeq = null;
-          }
-        }
+        return await this.reasoner.prompt(input, {
+          ...options,
+          causeTag: { kind: 'utterance', seq: entry.seq } satisfies CauseTag,
+        });
       }
     });
     const settle = (): void => {
@@ -132,23 +123,20 @@ export class PassthroughSession implements SessionMode {
       ...(options?.target !== undefined ? { data: { target: options.target } } : {}),
     });
 
-    const result = this.reasoner.deliver(
-      content,
-      options?.wake !== undefined ? { wake: options.wake } : undefined,
-    );
-    if (result.outcome === 'prompted' && result.turn) {
-      // Bind causation for the run this delivery started. Parked and
-      // queued deliveries have no bindable run in passthrough (the sweep
-      // batches them); their runs' entries carry no stamp.
-      this.activeCauseSeq = entry.seq;
-      const clear = (): void => {
-        if (this.activeCauseSeq === entry.seq) {
-          this.activeCauseSeq = null;
-        }
-      };
-      void result.turn.then(clear, clear);
-    }
-    return result;
+    // A wake delivery carries its seq into whichever run consumes it (the
+    // turn it starts, a prompt batch, or a sweep); a silent one is context
+    // and carries none. The kind follows the same speaker rule as duplex.
+    return this.reasoner.deliver(content, {
+      ...(options?.wake !== undefined ? { wake: options.wake } : {}),
+      ...(options?.wake !== false
+        ? {
+            causeTag: {
+              kind: options?.speaker === 'user' ? 'utterance' : 'delivery',
+              seq: entry.seq,
+            } satisfies CauseTag,
+          }
+        : {}),
+    });
   }
 
   /** Matches AgentLoop.steer(), including the no-op while idle. */
@@ -242,7 +230,6 @@ export class PassthroughSession implements SessionMode {
   }
 
   resetForRestore(restored: RestoredSessionParts): void {
-    this.activeCauseSeq = null;
     const { router: _router, talkerQueuedDeliveries: _queued, ...rest } = this.retained;
     this.retained = { ...rest, ...restored };
   }

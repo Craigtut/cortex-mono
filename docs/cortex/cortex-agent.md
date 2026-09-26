@@ -132,7 +132,7 @@ Entries carry:
 
 - **`seq`**: monotonic sequence number, the ordering authority (timestamps collide under burst).
 - **`loopPath`**: producer identity.
-- **`causedBy`**: causation stamp. An entry produced by a facade-initiated run (a reply to an utterance, an error in that run, a spawn made during it) carries the seq of the utterance that caused it; a completion lifecycle entry carries its spawn entry's seq. Entries from runs the facade did not initiate (a background delivery drain, a sweep run for parked content) carry no stamp rather than a guessed one.
+- **`causedBy`**: causation stamp. An entry produced by a run (a reply, an error in that run, a spawn made during it) carries the seq of the input that run consumed: the utterance a prompt logged, or the delivery a parked item's sweep run carried. The seq rides with the input into whichever run takes it, in both modes, so nothing is guessed. A background delivery drain carries the causation of the run that started the work it delivers; a completion lifecycle entry carries its spawn entry's seq. A run whose input carried no tag (a consumer's own direct loop call, say) stamps nothing.
 - **`wake`** and **`data`**: wake class (duplex) and structured per-type payload.
 
 Reads and subscriptions:
