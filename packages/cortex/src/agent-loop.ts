@@ -96,6 +96,7 @@ import { createToolSearchTool } from './tools/tool-search/index.js';
 import { wrapModel, unwrapModel } from './model-wrapper.js';
 import type { CortexModel } from './model-wrapper.js';
 import { SystemPromptState } from './agent-loop/system-prompt.js';
+import { HandlerList } from './agent-loop/handler-list.js';
 import { estimateTokens } from './token-estimator.js';
 import { cloneRuntimeAwareTool, CortexToolRuntime, type BackgroundTask } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
@@ -601,17 +602,17 @@ export class AgentLoop {
   private _warnedContextWindowOverride: string | null = null;
 
   // Event handlers (consumer-registered callbacks)
-  private loopCompleteHandlers: Array<(origin: LoopOriginContext) => void> = [];
-  private errorHandlers: Array<(error: ClassifiedError, origin: LoopOriginContext) => void> = [];
-  private retryScheduledHandlers: Array<(info: RetryScheduledInfo, origin: LoopOriginContext) => void> = [];
-  private retrySucceededHandlers: Array<(info: RetrySucceededInfo, origin: LoopOriginContext) => void> = [];
-  private retryExhaustedHandlers: Array<(info: RetryExhaustedInfo, origin: LoopOriginContext) => void> = [];
-  private turnCompleteHandlers: Array<(output: AgentTextOutput, origin: LoopOriginContext) => void> = [];
-  private subAgentSpawnedHandlers: Array<(taskId: string, instructions: string, background: boolean) => void> = [];
-  private subAgentCompletedHandlers: Array<(taskId: string, result: string, status: string, usage: unknown) => void> = [];
-  private subAgentFailedHandlers: Array<(taskId: string, error: string) => void> = [];
-  private backgroundResultDeliveryHandlers: Array<(taskIds: string[]) => void> = [];
-  private backgroundResultDeadLetterHandlers: Array<(result: DeadLetteredBackgroundResult) => void> = [];
+  private readonly loopCompleteHandlers: HandlerList<[LoopOriginContext]>;
+  private readonly errorHandlers: HandlerList<[ClassifiedError, LoopOriginContext]>;
+  private readonly retryScheduledHandlers: HandlerList<[RetryScheduledInfo, LoopOriginContext]>;
+  private readonly retrySucceededHandlers: HandlerList<[RetrySucceededInfo, LoopOriginContext]>;
+  private readonly retryExhaustedHandlers: HandlerList<[RetryExhaustedInfo, LoopOriginContext]>;
+  private readonly turnCompleteHandlers: HandlerList<[AgentTextOutput, LoopOriginContext]>;
+  private readonly subAgentSpawnedHandlers: HandlerList<[taskId: string, instructions: string, background: boolean]>;
+  private readonly subAgentCompletedHandlers: HandlerList<[taskId: string, result: string, status: string, usage: unknown]>;
+  private readonly subAgentFailedHandlers: HandlerList<[taskId: string, error: string]>;
+  private readonly backgroundResultDeliveryHandlers: HandlerList<[taskIds: string[]]>;
+  private readonly backgroundResultDeadLetterHandlers: HandlerList<[result: DeadLetteredBackgroundResult]>;
   private pendingBackgroundResults: PendingBackgroundCompletion[] = [];
   private deadLetteredBackgroundResults: DeadLetteredBackgroundResult[] = [];
 
@@ -783,6 +784,19 @@ export class AgentLoop {
     this.retryPolicy = resolveRetryPolicy(config.retryPolicy);
     this.loopPath = config.loopPath ?? DEFAULT_LOOP_PATH;
     this.logger = prefixLoggerWithLoopPath(config.logger ?? NOOP_LOGGER, this.loopPath);
+    const byTask = (taskId: string): Record<string, unknown> => ({ taskId });
+    this.loopCompleteHandlers = new HandlerList('onLoopComplete', this.logger);
+    this.errorHandlers = new HandlerList('onError', this.logger);
+    this.retryScheduledHandlers = new HandlerList('onRetryScheduled', this.logger);
+    this.retrySucceededHandlers = new HandlerList('onRetrySucceeded', this.logger);
+    this.retryExhaustedHandlers = new HandlerList('onRetryExhausted', this.logger);
+    this.turnCompleteHandlers = new HandlerList('onTurnComplete', this.logger);
+    this.subAgentSpawnedHandlers = new HandlerList('onSubAgentSpawned', this.logger, byTask);
+    this.subAgentCompletedHandlers = new HandlerList('onSubAgentCompleted', this.logger, byTask);
+    this.subAgentFailedHandlers = new HandlerList('onSubAgentFailed', this.logger, byTask);
+    this.backgroundResultDeliveryHandlers = new HandlerList('onBackgroundResultDelivery', this.logger);
+    this.backgroundResultDeadLetterHandlers =
+      new HandlerList('onBackgroundResultDeadLettered', this.logger);
     this.promptDiagnostics = new PromptWatchdogDiagnostics(
       config.diagnostics?.promptWatchdog,
       this.logger,
@@ -1735,39 +1749,15 @@ export class AgentLoop {
   }
 
   private fireRetryScheduled(info: RetryScheduledInfo): void {
-    for (const handler of this.retryScheduledHandlers) {
-      try {
-        handler(info, this.originContext);
-      } catch (err) {
-        this.logger.error('onRetryScheduled handler threw', {
-          error: errorMessageOf(err),
-        });
-      }
-    }
+    this.retryScheduledHandlers.emit(info, this.originContext);
   }
 
   private fireRetrySucceeded(info: RetrySucceededInfo): void {
-    for (const handler of this.retrySucceededHandlers) {
-      try {
-        handler(info, this.originContext);
-      } catch (err) {
-        this.logger.error('onRetrySucceeded handler threw', {
-          error: errorMessageOf(err),
-        });
-      }
-    }
+    this.retrySucceededHandlers.emit(info, this.originContext);
   }
 
   private fireRetryExhausted(info: RetryExhaustedInfo): void {
-    for (const handler of this.retryExhaustedHandlers) {
-      try {
-        handler(info, this.originContext);
-      } catch (err) {
-        this.logger.error('onRetryExhausted handler threw', {
-          error: errorMessageOf(err),
-        });
-      }
-    }
+    this.retryExhaustedHandlers.emit(info, this.originContext);
   }
 
   // -----------------------------------------------------------------------
@@ -2494,15 +2484,7 @@ export class AgentLoop {
       ...(classified.causeDetail ? { cause: classified.causeDetail } : {}),
     });
 
-    for (const handler of this.errorHandlers) {
-      try {
-        handler(classified, { loopPath: this.loopPath });
-      } catch (handlerErr) {
-        this.logger.error('onError handler threw', {
-          error: errorMessageOf(handlerErr),
-        });
-      }
-    }
+    this.errorHandlers.emit(classified, { loopPath: this.loopPath });
 
     return classified;
   }
@@ -4006,7 +3988,7 @@ export class AgentLoop {
    * that "a" loop had finished and could not act on which.
    */
   onLoopComplete(handler: (origin: LoopOriginContext) => void): void {
-    this.loopCompleteHandlers.push(handler);
+    this.loopCompleteHandlers.add(handler);
   }
 
   /**
@@ -4014,7 +3996,7 @@ export class AgentLoop {
    * The origin context identifies which loop produced the error.
    */
   onError(handler: (error: ClassifiedError, origin: LoopOriginContext) => void): void {
-    this.errorHandlers.push(handler);
+    this.errorHandlers.add(handler);
   }
 
   /**
@@ -4025,7 +4007,7 @@ export class AgentLoop {
   onRetryScheduled(
     handler: (info: RetryScheduledInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.retryScheduledHandlers.push(handler);
+    this.retryScheduledHandlers.add(handler);
   }
 
   /**
@@ -4035,7 +4017,7 @@ export class AgentLoop {
   onRetrySucceeded(
     handler: (info: RetrySucceededInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.retrySucceededHandlers.push(handler);
+    this.retrySucceededHandlers.add(handler);
   }
 
   /**
@@ -4046,7 +4028,7 @@ export class AgentLoop {
   onRetryExhausted(
     handler: (info: RetryExhaustedInfo, origin: LoopOriginContext) => void,
   ): void {
-    this.retryExhaustedHandlers.push(handler);
+    this.retryExhaustedHandlers.add(handler);
   }
 
   /**
@@ -4119,28 +4101,28 @@ export class AgentLoop {
    * The origin context identifies which loop completed the turn.
    */
   onTurnComplete(handler: (output: AgentTextOutput, origin: LoopOriginContext) => void): void {
-    this.turnCompleteHandlers.push(handler);
+    this.turnCompleteHandlers.add(handler);
   }
 
   /**
    * Register a handler for sub-agent spawn events.
    */
   onSubAgentSpawned(handler: (taskId: string, instructions: string, background: boolean) => void): void {
-    this.subAgentSpawnedHandlers.push(handler);
+    this.subAgentSpawnedHandlers.add(handler);
   }
 
   /**
    * Register a handler for sub-agent completion events.
    */
   onSubAgentCompleted(handler: (taskId: string, result: string, status: string, usage: unknown) => void): void {
-    this.subAgentCompletedHandlers.push(handler);
+    this.subAgentCompletedHandlers.add(handler);
   }
 
   /**
    * Register a handler for sub-agent failure events.
    */
   onSubAgentFailed(handler: (taskId: string, error: string) => void): void {
-    this.subAgentFailedHandlers.push(handler);
+    this.subAgentFailedHandlers.add(handler);
   }
 
   /**
@@ -4149,7 +4131,7 @@ export class AgentLoop {
    * Consumers can use this to update UI state (show spinners, etc.).
    */
   onBackgroundResultDelivery(handler: (taskIds: string[]) => void): void {
-    this.backgroundResultDeliveryHandlers.push(handler);
+    this.backgroundResultDeliveryHandlers.add(handler);
   }
 
   /**
@@ -4164,7 +4146,7 @@ export class AgentLoop {
   onBackgroundResultDeadLettered(
     handler: (result: DeadLetteredBackgroundResult) => void,
   ): void {
-    this.backgroundResultDeadLetterHandlers.push(handler);
+    this.backgroundResultDeadLetterHandlers.add(handler);
   }
 
   /**
@@ -5235,15 +5217,7 @@ export class AgentLoop {
           currentContextTokens: this.compactionManager.currentContextTokenCount,
         });
         this.skillBuffer = [];
-        for (const handler of this.loopCompleteHandlers) {
-          try {
-            handler(this.originContext);
-          } catch (err) {
-            this.logger.error('onLoopComplete handler threw', {
-              error: errorMessageOf(err),
-            });
-          }
-        }
+        this.loopCompleteHandlers.emit(this.originContext);
       }),
     );
 
@@ -5329,30 +5303,14 @@ export class AgentLoop {
         // (including XML tags and metadata) into the main chat thread.
         if (!isChildEvent) {
           if (event.textOutput) {
-            for (const handler of this.turnCompleteHandlers) {
-              try {
-                handler(event.textOutput, { loopPath: this.loopPath });
-              } catch (err) {
-                this.logger.error('onTurnComplete handler threw', {
-                  error: errorMessageOf(err),
-                });
-              }
-            }
+            this.turnCompleteHandlers.emit(event.textOutput, { loopPath: this.loopPath });
           } else {
             // If the bridge did not parse (working tags disabled), still emit
             // with raw text for non-tag scenarios
             const text = turnText(event.data);
             if (text) {
               const output = parseWorkingTags(text);
-              for (const handler of this.turnCompleteHandlers) {
-                try {
-                  handler(output, { loopPath: this.loopPath });
-                } catch (err) {
-                  this.logger.error('onTurnComplete handler threw', {
-                    error: errorMessageOf(err),
-                  });
-                }
-              }
+              this.turnCompleteHandlers.emit(output, { loopPath: this.loopPath });
             }
           }
         }
@@ -5452,15 +5410,7 @@ export class AgentLoop {
 
     // 3. Emit onLoopComplete for final checkpoint (best-effort: a throwing
     // handler is logged and teardown continues)
-    for (const handler of this.loopCompleteHandlers) {
-      try {
-        handler(this.originContext);
-      } catch (err) {
-        this.logger.error('onLoopComplete handler threw', {
-          error: errorMessageOf(err),
-        });
-      }
-    }
+    this.loopCompleteHandlers.emit(this.originContext);
 
     // 4. Detach from the MCP manager; close connections only when owned (a
     // shared manager's connections belong to its owner and outlive this loop)
@@ -5498,14 +5448,14 @@ export class AgentLoop {
     this.toolRuntime.destroy();
 
     // 9. Clear all handler arrays
-    this.loopCompleteHandlers = [];
-    this.errorHandlers = [];
-    this.turnCompleteHandlers = [];
-    this.subAgentSpawnedHandlers = [];
-    this.subAgentCompletedHandlers = [];
-    this.subAgentFailedHandlers = [];
-    this.backgroundResultDeliveryHandlers = [];
-    this.backgroundResultDeadLetterHandlers = [];
+    this.loopCompleteHandlers.clear();
+    this.errorHandlers.clear();
+    this.turnCompleteHandlers.clear();
+    this.subAgentSpawnedHandlers.clear();
+    this.subAgentCompletedHandlers.clear();
+    this.subAgentFailedHandlers.clear();
+    this.backgroundResultDeliveryHandlers.clear();
+    this.backgroundResultDeadLetterHandlers.clear();
     this.pendingBackgroundResults = [];
     // Queued silent deliveries are dropped on destroy by contract; a facade
     // that needs them durable drains them first via clearQueuedDeliveries().
@@ -5819,40 +5769,13 @@ export class AgentLoop {
   private wireSubAgentHooks(): void {
     this.subAgentManager.setHooks({
       onSpawned: (taskId, instructions, background) => {
-        for (const handler of this.subAgentSpawnedHandlers) {
-          try {
-            handler(taskId, instructions, background);
-          } catch (err) {
-            this.logger.error('onSubAgentSpawned handler threw', {
-              taskId,
-              error: errorMessageOf(err),
-            });
-          }
-        }
+        this.subAgentSpawnedHandlers.emit(taskId, instructions, background);
       },
       onCompleted: (taskId, result, status, usage) => {
-        for (const handler of this.subAgentCompletedHandlers) {
-          try {
-            handler(taskId, result, status, usage);
-          } catch (err) {
-            this.logger.error('onSubAgentCompleted handler threw', {
-              taskId,
-              error: errorMessageOf(err),
-            });
-          }
-        }
+        this.subAgentCompletedHandlers.emit(taskId, result, status, usage);
       },
       onFailed: (taskId, error) => {
-        for (const handler of this.subAgentFailedHandlers) {
-          try {
-            handler(taskId, error);
-          } catch (err) {
-            this.logger.error('onSubAgentFailed handler threw', {
-              taskId,
-              error: errorMessageOf(err),
-            });
-          }
-        }
+        this.subAgentFailedHandlers.emit(taskId, error);
       },
     });
 
@@ -6296,7 +6219,7 @@ export class AgentLoop {
     const message = parts.join('\n\n---\n\n');
     // Notify consumers once per completion (not again on re-attempts).
     if (firstAttemptTaskIds.length > 0) {
-      this.fireBackgroundResultDeliveryHandlers(firstAttemptTaskIds);
+      this.backgroundResultDeliveryHandlers.emit(firstAttemptTaskIds);
     }
     // pi pushes the delivery's user message into state.messages at run
     // start, before any model call, so a failed delivery leaves that
@@ -6553,15 +6476,7 @@ export class AgentLoop {
         evicted: evicted.map((e) => ({ kind: e.kind, taskId: e.taskId })),
       });
     }
-    for (const handler of this.backgroundResultDeadLetterHandlers) {
-      try {
-        handler(entry);
-      } catch (err) {
-        this.logger.error('onBackgroundResultDeadLettered handler threw', {
-          error: errorMessageOf(err),
-        });
-      }
-    }
+    this.backgroundResultDeadLetterHandlers.emit(entry);
   }
 
   /**
@@ -6620,18 +6535,6 @@ export class AgentLoop {
       return `${header} ${usage}\n\n${result.output}`;
     }
     return `${header} ${usage}\n\nNo output was produced.`;
-  }
-
-  private fireBackgroundResultDeliveryHandlers(taskIds: string[]): void {
-    for (const handler of this.backgroundResultDeliveryHandlers) {
-      try {
-        handler(taskIds);
-      } catch (err) {
-        this.logger.error('onBackgroundResultDelivery handler threw', {
-          error: errorMessageOf(err),
-        });
-      }
-    }
   }
 
   private async createChildAgent(params: {
