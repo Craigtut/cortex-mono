@@ -13,6 +13,7 @@ import type { AgentContext, AgentMessage } from '../../src/context-manager.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import { estimateTokens } from '../../src/token-estimator.js';
 import type { CacheBreakpointIndices } from '../../src/cache-breakpoints.js';
+import { partsOf } from './agent-loop/parts.js';
 
 type TestAgentLoopConstructor = new (
   agent: PiAgent,
@@ -109,10 +110,7 @@ describe('setHeadlineProvider', () => {
     // empty fixture both arms compute {bp2: -1, bp3: -1} and the equality
     // assertion holds vacuously.
     const loop = createLoop({ slots: ['notes'] });
-    const internals = loop as unknown as {
-      _cacheBreakpointIndices: CacheBreakpointIndices | null;
-      _prePromptMessageCount: number;
-    };
+    const internals = partsOf(loop);
     const piAgent = (loop as unknown as { agent: PiAgent }).agent;
     loop.getContextManager().setSlot('notes', 'stable slot content');
     piAgent.state.messages.push(
@@ -122,10 +120,10 @@ describe('setHeadlineProvider', () => {
       { role: 'assistant', content: 'more detail', timestamp: 4 },
     );
     // Everything above is pre-prompt history, so BP3 sits after it.
-    internals._prePromptMessageCount = piAgent.state.messages.length;
+    internals.runner.boundary = piAgent.state.messages.length;
 
     await runHook(loop);
-    const withoutHeadline = internals._cacheBreakpointIndices;
+    const withoutHeadline = internals.pipeline.cacheBreakpointIndices;
 
     // Guard against the fixture going vacuous again: BP2 covers the slot,
     // BP3 the old-history boundary beyond it.
@@ -134,7 +132,7 @@ describe('setHeadlineProvider', () => {
 
     loop.setHeadlineProvider(() => '<status>churn every tick</status>');
     await runHook(loop);
-    const withHeadline = internals._cacheBreakpointIndices;
+    const withHeadline = internals.pipeline.cacheBreakpointIndices;
 
     expect(withHeadline).toEqual(withoutHeadline);
   });

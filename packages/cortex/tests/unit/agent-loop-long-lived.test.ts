@@ -14,6 +14,7 @@ import type { AgentMessage } from '../../src/context-manager.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
 import type { CortexToolRuntime } from '../../src/tools/runtime.js';
+import { partsOf } from './agent-loop/parts.js';
 
 interface LongLivedMockPiAgent extends PiAgent {
   emitEvent: (event: PiEvent) => void;
@@ -101,7 +102,7 @@ function createLoop(agent: PiAgent, overrides?: Partial<AgentLoopConfig>): Agent
 }
 
 function runtimeOf(loop: AgentLoop): CortexToolRuntime {
-  return (loop as unknown as { toolRuntime: CortexToolRuntime }).toolRuntime;
+  return partsOf(loop).tools.runtime;
 }
 
 describe('persistentRuntime', () => {

@@ -19,6 +19,7 @@ import type { AgentLoopConfig } from '../../src/types.js';
 import type { AgentMessage } from '../../src/context-manager.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import type { CortexModel } from '../../src/model-wrapper.js';
+import { partsOf } from './agent-loop/parts.js';
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent with steering/follow-up queues and a run that can hold at
@@ -388,9 +389,7 @@ describe('AgentLoop.deliver', () => {
     piAgent.promptCalls = [];
 
     loop.deliver('silent fact', { wake: false });
-    await (loop as unknown as {
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-    }).deliverOrQueueBackgroundCompletion({
+    await partsOf(loop).background.enqueue({
       kind: 'subagent',
       taskId: 'task-1',
       result: {
@@ -462,9 +461,7 @@ describe('AgentLoop.deliver run guarantee (sweep)', () => {
     // Schedule a drain with nothing to deliver: it dequeues, finds the
     // pending queue empty, and returns while still holding the gate. No
     // run will start on its own for content parked in that window.
-    const drain = (loop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(loop).background.schedule();
     const result = loop.deliver('urgent redirect');
     expect(result.outcome).toBe('parked');
 
@@ -484,9 +481,7 @@ describe('AgentLoop.deliver run guarantee (sweep)', () => {
     await loop.prompt('warm up');
     piAgent.promptCalls = [];
 
-    const drain = (loop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(loop).background.schedule();
     loop.deliver('will be cleared');
     const dropped = loop.clearAllQueues();
     expect(dropped).toEqual(['will be cleared']);
@@ -618,9 +613,7 @@ describe('AgentLoop.deliver sweep failure recovery', () => {
       return { content: 'ok' };
     };
 
-    const drain = (loop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(loop).background.schedule();
     loop.deliver('parked content');
     await drain;
 
@@ -669,15 +662,11 @@ describe('AgentLoop.deliver sweep failure recovery', () => {
     // Park through the real API (an empty drain holds the gate), then age
     // the item: its first delivery run started five hours ago, so earlier
     // attempts already consumed the whole elapsed budget.
-    const drain = (loop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(loop).background.schedule();
     loop.deliver('over-budget parked content');
-    const internal = loop as unknown as {
-      pendingWakeDeliveries: Array<{ deliveryAttempts?: number; firstDeliveryAttemptAt?: number }>;
-    };
-    internal.pendingWakeDeliveries[0]!.deliveryAttempts = 1;
-    internal.pendingWakeDeliveries[0]!.firstDeliveryAttemptAt =
+    const internal = partsOf(loop);
+    internal.queues.wake[0]!.deliveryAttempts = 1;
+    internal.queues.wake[0]!.firstDeliveryAttemptAt =
       Date.now() - 5 * 60 * 60 * 1000;
     await drain;
 
@@ -710,9 +699,7 @@ describe('AgentLoop.deliver sweep failure recovery', () => {
       throw new Error('provider dropped mid-batch');
     };
 
-    const drain = (loop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(loop).background.schedule();
     loop.deliver('doomed content');
     await drain;
 
@@ -747,9 +734,7 @@ describe('AgentLoop.deliver sweep failure recovery', () => {
       throw new Error('provider dropped mid-batch');
     };
 
-    const drain = (loop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(loop).background.schedule();
     loop.deliver('doomed content');
     await drain;
 
@@ -855,11 +840,11 @@ describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {
     // The run pushes its batch, then a mid-run front trim rewrites the
     // transcript exactly the way observational activation does through
     // setSourceHistory (splice the observed prefix, reassign
-    // state.messages, recalculate _prePromptMessageCount, the only in-run
+    // state.messages, recalculate the runner's history boundary, the only in-run
     // writer), then the provider fails before any output. The spliced wake
     // message is still in the transcript verbatim, just shifted down: the
     // repark must not misread that as "never pushed" and deliver it twice.
-    const internals = loop as unknown as { _prePromptMessageCount: number };
+    const internals = partsOf(loop);
     let failuresLeft = 1;
     piAgent.prompt = async (input: string | AgentMessage[]): Promise<unknown> => {
       piAgent.promptCalls.push(input);
@@ -870,10 +855,10 @@ describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {
       if (failuresLeft > 0) {
         failuresLeft -= 1;
         const source = piAgent.state.messages;
-        const currentTickCount = source.length - internals._prePromptMessageCount;
+        const currentTickCount = source.length - internals.runner.boundary;
         source.splice(0, 2);
         piAgent.state.messages = [...source];
-        internals._prePromptMessageCount = Math.max(
+        internals.runner.boundary = Math.max(
           0,
           piAgent.state.messages.length - currentTickCount,
         );
@@ -903,11 +888,7 @@ describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {
   it('unwind recovery stamps re-parked injected content with the run-start abort epoch', () => {
     const piAgent = createMockPiAgent();
     const loop = createLoop(piAgent);
-    const internals = loop as unknown as {
-      _abortEpoch: number;
-      unwindFailedDelivery(preDeliveryCount: number, runAbortEpoch: number): boolean;
-      pendingWakeDeliveries: Array<{ content: string; abortEpoch?: number }>;
-    };
+    const internals = partsOf(loop);
 
     // A failed delivery run whose transcript ends on an unpaired assistant
     // tool call, with a steer pi injected mid-run in the spliced range.
@@ -923,16 +904,16 @@ describe('AgentLoop.deliver consumer-prompt splice failure recovery', () => {
 
     // The run started at epoch 3; an abort completed during the run and
     // advanced the live epoch before the failure's catch ran.
-    internals._abortEpoch = 3;
+    internals.abortState.epoch = 3;
     const runStartEpoch = 3;
-    internals._abortEpoch = 4;
+    internals.abortState.epoch = 4;
 
-    expect(internals.unwindFailedDelivery(0, runStartEpoch)).toBe(true);
-    expect(internals.pendingWakeDeliveries.map((d) => d.content)).toEqual(['injected steer']);
+    expect(internals.queues.unwindFailedDelivery(0, runStartEpoch)).toBe(true);
+    expect(internals.queues.wake.map((d) => d.content)).toEqual(['injected steer']);
     // Stamped with the epoch the run started under, so the abort's epoch
     // gate cancels the recovered content with the run it rode in, instead
     // of a late-running catch resurrecting it under the new epoch.
-    expect(internals.pendingWakeDeliveries[0]!.abortEpoch).toBe(runStartEpoch);
+    expect(internals.queues.wake[0]!.abortEpoch).toBe(runStartEpoch);
   });
 });
 
@@ -1001,9 +982,7 @@ describe('AgentLoop.deliver and abort', () => {
     await waitUntil(() => piAgent.promptCalls.length === 1);
 
     // A background completion is pending, so abort() skips the gate wait.
-    void (loop as unknown as {
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-    }).deliverOrQueueBackgroundCompletion({
+    void partsOf(loop).background.enqueue({
       kind: 'subagent',
       taskId: 'task-mid-abort',
       result: {
@@ -1067,9 +1046,7 @@ describe('AgentLoop.deliver and abort', () => {
       rejectRun = null;
     };
 
-    const drain = (loop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(loop).background.schedule();
     loop.deliver('swept then aborted');
     await drain;
     await waitUntil(() => piAgent.promptCalls.length === 1);
@@ -1248,9 +1225,7 @@ describe('AgentLoop abort-cancelled wake deliveries are dead-lettered', () => {
 
     const turn = loop.prompt('long task');
     await waitUntil(() => piAgent.promptCalls.length === 1);
-    void (loop as unknown as {
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-    }).deliverOrQueueBackgroundCompletion({
+    void partsOf(loop).background.enqueue({
       kind: 'subagent',
       taskId: 'task-mid-abort',
       result: {
@@ -1308,9 +1283,7 @@ describe('AgentLoop abort-cancelled wake deliveries are dead-lettered', () => {
       rejectRun = null;
     };
 
-    const drain = (loop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(loop).background.schedule();
     loop.deliver('swept then aborted');
     await drain;
     await waitUntil(() => piAgent.promptCalls.length === 1);

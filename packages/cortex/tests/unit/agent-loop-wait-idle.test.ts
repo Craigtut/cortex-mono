@@ -2,7 +2,7 @@
  * waitForLoopIdle(): the awaitable form of isLoopActive, keyed on loop-gate
  * depth. This is the primitive the facade's settlement predicates
  * (conversationIdle, workSettled) are built on, per
- * docs/cortex/duplex/facade-api.md: gate depth, not _isPrompting, because
+ * docs/cortex/duplex/facade-api.md: gate depth, not isPrompting, because
  * the prompting flag reads idle while gate tasks (queued drains, delivery
  * sweeps) are still pending.
  */

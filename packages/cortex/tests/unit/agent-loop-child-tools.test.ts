@@ -11,6 +11,7 @@ import { createReadTool } from '../../src/tools/read.js';
 import { createWriteTool } from '../../src/tools/write.js';
 import { CwdTracker } from '../../src/tools/shared/cwd-tracker.js';
 import { ReadRegistry } from '../../src/tools/shared/read-registry.js';
+import { partsOf } from './agent-loop/parts.js';
 
 type RegisteredTool = {
   name: string;
@@ -103,7 +104,7 @@ describe('AgentLoop child tool hardening', () => {
         { enableSubAgentTool: false, enableLoadSkillTool: false },
       );
 
-      const childTools = (parent as any).buildChildToolSet() as RegisteredTool[];
+      const childTools = partsOf(parent).tools.childInheritable() as RegisteredTool[];
       const child = createTestAgentLoop(
         createMockPiAgent(),
         createConfig(tmpDir),
@@ -111,10 +112,10 @@ describe('AgentLoop child tool hardening', () => {
         { enableSubAgentTool: false, enableLoadSkillTool: false },
       );
 
-      const parentBash = (parent as any).registeredTools.find((tool: RegisteredTool) => tool.name === 'Bash') as RegisteredTool;
-      const childBash = (child as any).registeredTools.find((tool: RegisteredTool) => tool.name === 'Bash') as RegisteredTool;
-      const parentRead = (parent as any).registeredTools.find((tool: RegisteredTool) => tool.name === 'Read') as RegisteredTool;
-      const childWrite = (child as any).registeredTools.find((tool: RegisteredTool) => tool.name === 'Write') as RegisteredTool;
+      const parentBash = partsOf(parent).tools.registered.find((tool: RegisteredTool) => tool.name === 'Bash') as RegisteredTool;
+      const childBash = partsOf(child).tools.registered.find((tool: RegisteredTool) => tool.name === 'Bash') as RegisteredTool;
+      const parentRead = partsOf(parent).tools.registered.find((tool: RegisteredTool) => tool.name === 'Read') as RegisteredTool;
+      const childWrite = partsOf(child).tools.registered.find((tool: RegisteredTool) => tool.name === 'Write') as RegisteredTool;
 
       await parentBash.execute({ command: `cd ${JSON.stringify(subdir)} && pwd` });
       const childPwd = await childBash.execute({ command: 'pwd' }) as { details: { finalCwd: string } };
@@ -152,7 +153,7 @@ describe('AgentLoop child tool hardening', () => {
 
       vi.spyOn(parent.getMcpClientManager(), 'getTools').mockReturnValue([mcpTool]);
 
-      const childTools = (parent as any).buildChildToolSet() as RegisteredTool[];
+      const childTools = partsOf(parent).tools.childInheritable() as RegisteredTool[];
 
       expect(childTools.map(tool => tool.name)).toContain('domain__search');
       expect(childTools.map(tool => tool.name)).not.toContain('SubAgent');

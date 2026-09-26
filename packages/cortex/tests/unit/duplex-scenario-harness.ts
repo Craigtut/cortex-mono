@@ -32,6 +32,7 @@ import type { CortexAgentConfig } from '../../src/cortex-agent.js';
 import type { PermissionBroker } from '../../src/duplex/permission-broker.js';
 import type { SessionLogEntry } from '../../src/session-log.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
+import { partsOf } from './agent-loop/parts.js';
 
 // ---------------------------------------------------------------------------
 // Scripted mock pi agent
@@ -536,9 +537,7 @@ export function stubLookupLoops(setup?: (pi: ScriptedPiAgent) => void): {
 
 /** The headline block the talker is actually fed on its next call. */
 export function talkerHeadline(talkerLoop: AgentLoop): string | null {
-  const provider = (talkerLoop as unknown as {
-    headlineProvider: (() => string | null) | null;
-  }).headlineProvider;
+  const provider = partsOf(talkerLoop).pipeline.headline.current;
   if (typeof provider !== 'function') throw new Error('no headline provider wired');
   return provider();
 }

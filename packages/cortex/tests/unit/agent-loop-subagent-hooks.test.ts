@@ -6,6 +6,7 @@ import { AgentLoop } from '../../src/agent-loop.js';
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { AgentLoopConfig, TrackedSubAgent, SubAgentResult } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
+import { partsOf } from './agent-loop/parts.js';
 
 type RegisteredTool = {
   name: string;
@@ -101,7 +102,7 @@ describe('AgentLoop.getActiveSubAgents', () => {
   it('maps tracked sub-agents to snapshots including live cost and activity', () => {
     withTmpDir((dir) => {
       const agent = createTestAgentLoop(createConfig(dir));
-      const manager = (agent as unknown as { subAgentManager: { track(e: TrackedSubAgent): boolean } }).subAgentManager;
+      const manager = partsOf(agent).subAgentManager;
 
       const fakeChild = {
         getBudgetGuard: () => ({ getTotalCost: () => 0.42, getTurnCount: () => 3 }),
@@ -142,7 +143,7 @@ describe('AgentLoop.getActiveSubAgents', () => {
   it('reports waiting-for-permission status when a sub-agent is blocked on approval', () => {
     withTmpDir((dir) => {
       const agent = createTestAgentLoop(createConfig(dir));
-      const manager = (agent as unknown as { subAgentManager: { track(e: TrackedSubAgent): boolean } }).subAgentManager;
+      const manager = partsOf(agent).subAgentManager;
 
       const entry: TrackedSubAgent = {
         taskId: 't2',

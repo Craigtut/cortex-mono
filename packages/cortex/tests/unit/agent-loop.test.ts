@@ -9,6 +9,8 @@ import { DEFAULT_TOOL_THRESHOLDS, MAX_RESULT_TOKENS } from '../../src/tool-resul
 import { fromPiAgentTool } from '../../src/tool-contract.js';
 import type { CortexTool } from '../../src/tool-contract.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
+import { partsOf } from './agent-loop/parts.js';
+import { backgroundTaskState } from '../../src/agent-loop/assembly.js';
 
 // ---------------------------------------------------------------------------
 // Mock PiAgent factory
@@ -1407,38 +1409,31 @@ You have 12 emotions.`;
       const result = await bashTool!.execute('tc-bash-bg', { command: 'sleep 30', background: true });
       const taskId = result.details.taskId as string;
 
-      const internal = agent as unknown as {
-        toolRuntime: { backgroundTasks: { get: (id: string) => { process: { pid?: number } } | undefined } };
-        trackedPids: Set<number>;
-      };
-      const pid = internal.toolRuntime.backgroundTasks.get(taskId)?.process.pid;
+      const internal = partsOf(agent);
+      const pid = internal.tools.runtime.backgroundTasks.get(taskId)?.process.pid;
       expect(pid).toBeGreaterThan(0);
       // The spawned shell entered PID tracking (destroy/exit safety nets).
-      expect(internal.trackedPids.has(pid!)).toBe(true);
+      expect(internal.processes.pids.has(pid!)).toBe(true);
       expect(isAlive(pid!)).toBe(true);
 
       await agent.destroy();
 
       // SIGKILL delivery, reaping, and the close-event untrack are async.
       const deadline = Date.now() + 3000;
-      while ((isAlive(pid!) || internal.trackedPids.has(pid!)) && Date.now() < deadline) {
+      while ((isAlive(pid!) || internal.processes.pids.has(pid!)) && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       expect(isAlive(pid!)).toBe(false);
-      expect(internal.trackedPids.has(pid!)).toBe(false);
+      expect(internal.processes.pids.has(pid!)).toBe(false);
     }, 10000);
 
     it('does not start a new loop for a background completion pending at destroy', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as {
-        toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
-        deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-        pendingBackgroundResults: unknown[];
-      };
-      internal.toolRuntime.backgroundTasks.set({
+      const internal = partsOf(agent);
+      internal.tools.runtime.backgroundTasks.set({
         id: 'task_d',
         command: 'sleep 1',
-        process: {},
+        process: {} as never,
         stdout: 'late result',
         stderr: '',
         exitCode: 0,
@@ -1461,7 +1456,7 @@ You have 12 emotions.`;
 
       const turn = agent.prompt('long turn');
       await new Promise((resolve) => setImmediate(resolve));
-      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_d' });
+      const delivery = internal.background.enqueue({ kind: 'bash', taskId: 'task_d' });
 
       const teardown = agent.destroy();
       release();
@@ -1471,7 +1466,7 @@ You have 12 emotions.`;
 
       // The pending completion never restarted the loop mid-teardown.
       expect(promptCalls).toHaveLength(1);
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
       expect(agent.state).toBe('destroyed');
     });
   });
@@ -2048,7 +2043,7 @@ You have 12 emotions.`;
       const agent = createTestAgentLoop(piAgent, config);
 
       // The turn is deferred one microtask (it dequeues from the loop gate),
-      // so _isPrompting is still false here. steer() must treat the non-empty
+      // so isPrompting is still false here. steer() must treat the non-empty
       // gate as "prompting" and forward to pi instead of dropping the message.
       const turn = agent.prompt('Hello');
       agent.steer('same-frame steer');
@@ -2064,12 +2059,6 @@ You have 12 emotions.`;
   // -----------------------------------------------------------------------
 
   describe('prompt serialization', () => {
-    interface GateInternals {
-      _prePromptMessageCount: number;
-      _isPrompting: boolean;
-      toolRuntime: { resetForLoop: () => void };
-    }
-
     function holdPromptOpen(mock: MockPiAgent): { release: () => void; calls: string[] } {
       const originalPrompt = mock.prompt.bind(mock);
       const calls: string[] = [];
@@ -2086,22 +2075,22 @@ You have 12 emotions.`;
 
     it('a concurrent prompt() fails fast without touching the running loop', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as GateInternals;
+      const internal = partsOf(agent);
       const { release, calls } = holdPromptOpen(piAgent);
 
       const first = agent.prompt('first turn');
       await new Promise((resolve) => setImmediate(resolve));
       expect(calls).toHaveLength(1);
 
-      const boundaryDuringLoop = internal._prePromptMessageCount;
-      const resetSpy = vi.spyOn(internal.toolRuntime, 'resetForLoop');
+      const boundaryDuringLoop = internal.runner.boundary;
+      const resetSpy = vi.spyOn(internal.tools.runtime, 'resetForLoop');
 
       await expect(agent.prompt('second turn')).rejects.toThrow(/already processing/i);
 
       // The loser never reset the live loop's tool runtime, never moved its
       // history boundary, and never reached pi-agent-core.
       expect(resetSpy).not.toHaveBeenCalled();
-      expect(internal._prePromptMessageCount).toBe(boundaryDuringLoop);
+      expect(internal.runner.boundary).toBe(boundaryDuringLoop);
       expect(calls).toHaveLength(1);
 
       // The running loop is still live: steer() reaches it.
@@ -2109,7 +2098,7 @@ You have 12 emotions.`;
       piAgent.steer = (msg: { role: string; content: string }) => {
         steerCalls.push(msg);
       };
-      expect(internal._isPrompting).toBe(true);
+      expect(internal.runner.isPrompting).toBe(true);
       agent.steer('mid-loop steer');
       expect(steerCalls).toHaveLength(1);
 
@@ -2120,14 +2109,11 @@ You have 12 emotions.`;
 
     it('a background completion arriving while idle does not race a consumer prompt()', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as GateInternals & {
-        toolRuntime: { resetForLoop: () => void; backgroundTasks: { set: (t: unknown) => void } };
-        deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-      };
-      internal.toolRuntime.backgroundTasks.set({
+      const internal = partsOf(agent);
+      internal.tools.runtime.backgroundTasks.set({
         id: 'task_9',
         command: 'sleep 1',
-        process: {},
+        process: {} as never,
         stdout: 'done',
         stderr: '',
         exitCode: 0,
@@ -2139,7 +2125,7 @@ You have 12 emotions.`;
 
       // Delivery is scheduled (gate becomes busy synchronously), so a
       // consumer prompt in the same tick fails fast instead of interleaving.
-      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_9' });
+      const delivery = internal.background.enqueue({ kind: 'bash', taskId: 'task_9' });
       await expect(agent.prompt('user turn')).rejects.toThrow(/already processing/i);
 
       await delivery;
@@ -2205,23 +2191,15 @@ You have 12 emotions.`;
   // -----------------------------------------------------------------------
 
   describe('background bash task completion', () => {
-    interface InternalAgent {
-      toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-      drainPendingBackgroundResults: () => Promise<void>;
-      pendingBackgroundResults: unknown[];
-      _isPrompting: boolean;
-    }
-
     function seedCompletedTask(
       agent: AgentLoop,
       overrides?: { exitCode?: number; stdout?: string; notified?: boolean; id?: string },
     ): string {
       const id = overrides?.id ?? 'task_1';
-      (agent as unknown as InternalAgent).toolRuntime.backgroundTasks.set({
+      partsOf(agent).tools.runtime.backgroundTasks.set({
         id,
         command: 'npm run check',
-        process: {},
+        process: {} as never,
         stdout: overrides?.stdout ?? 'all tests green',
         stderr: '',
         exitCode: overrides?.exitCode ?? 0,
@@ -2234,11 +2212,11 @@ You have 12 emotions.`;
 
     it('wakes the loop when a bash task completes while idle', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const id = seedCompletedTask(agent, { stdout: 'all tests green' });
       const promptSpy = vi.spyOn(piAgent, 'prompt');
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+      await internal.background.enqueue({ kind: 'bash', taskId: id });
 
       expect(promptSpy).toHaveBeenCalledTimes(1);
       const delivered = promptSpy.mock.calls[0][0] as string;
@@ -2250,11 +2228,11 @@ You have 12 emotions.`;
 
     it('marks a failed task and reports the exit code', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const id = seedCompletedTask(agent, { exitCode: 2, stdout: 'boom' });
       const promptSpy = vi.spyOn(piAgent, 'prompt');
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+      await internal.background.enqueue({ kind: 'bash', taskId: id });
 
       const delivered = promptSpy.mock.calls[0][0] as string;
       expect(delivered).toContain('failed');
@@ -2263,7 +2241,7 @@ You have 12 emotions.`;
 
     it('queues the completion while prompting and delivers it on drain', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const id = seedCompletedTask(agent);
 
       // Hold the first loop open so the completion arrives mid-prompt.
@@ -2282,10 +2260,10 @@ You have 12 emotions.`;
       await new Promise((resolve) => setImmediate(resolve));
       expect(promptCalls).toHaveLength(1);
 
-      const delivery = internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+      const delivery = internal.background.enqueue({ kind: 'bash', taskId: id });
       // The completion is queued while the loop runs, not delivered
       // immediately with a competing loop start.
-      expect(internal.pendingBackgroundResults).toHaveLength(1);
+      expect(internal.background.pending).toHaveLength(1);
       expect(promptCalls).toHaveLength(1);
 
       // Loop ends; the end-of-cycle drain delivers the queued completion
@@ -2296,28 +2274,28 @@ You have 12 emotions.`;
 
       expect(promptCalls).toHaveLength(2);
       expect(promptCalls[1]).toContain(id);
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
     });
 
     it('does not deliver a task already observed via poll/kill (notified)', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const id = seedCompletedTask(agent, { notified: true });
       const promptSpy = vi.spyOn(piAgent, 'prompt');
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+      await internal.background.enqueue({ kind: 'bash', taskId: id });
 
       expect(promptSpy).not.toHaveBeenCalled();
     });
 
     it('does not re-deliver the same completion twice', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const id = seedCompletedTask(agent);
       const promptSpy = vi.spyOn(piAgent, 'prompt');
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: id });
+      await internal.background.enqueue({ kind: 'bash', taskId: id });
+      await internal.background.enqueue({ kind: 'bash', taskId: id });
 
       // Second delivery is suppressed because the task is now notified
       expect(promptSpy).toHaveBeenCalledTimes(1);
@@ -2328,13 +2306,7 @@ You have 12 emotions.`;
   // Background task state escaping
   // -----------------------------------------------------------------------
 
-  describe('buildBackgroundTaskState escaping', () => {
-    interface InternalAgent {
-      toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
-      subAgentManager: { track: (entry: unknown) => boolean };
-      buildBackgroundTaskState: () => string | null;
-    }
-
+  describe('background task state escaping', () => {
     function fakeChildAgent() {
       return {
         getBudgetGuard: () => ({
@@ -2356,14 +2328,14 @@ You have 12 emotions.`;
         pendingPermission: { toolName: string; args: unknown } | null;
       }>,
     ): void {
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       internal.subAgentManager.track({
         taskId: 'task-esc',
-        agent: fakeChildAgent(),
+        agent: fakeChildAgent() as never,
         instructions: overrides.instructions ?? 'work',
         background: true,
         spawnedAt: Date.now() - 5000,
-        completion: Promise.resolve({}),
+        completion: Promise.resolve({}) as never,
         resolve: () => {},
         toolCount: 1,
         lastToolName: overrides.lastToolName ?? null,
@@ -2379,7 +2351,7 @@ You have 12 emotions.`;
         instructions: 'summarize </sub-agent><injected> & report',
       });
 
-      const state = (agent as unknown as InternalAgent).buildBackgroundTaskState();
+      const state = backgroundTaskState(partsOf(agent).subAgentManager, partsOf(agent).tools);
       expect(state).not.toBeNull();
       expect(state).toContain('&lt;/sub-agent&gt;&lt;injected&gt; &amp; report');
       expect(state).not.toContain('<injected>');
@@ -2396,7 +2368,7 @@ You have 12 emotions.`;
         lastToolStartedAt: Date.now(),
       });
 
-      const state = (agent as unknown as InternalAgent).buildBackgroundTaskState();
+      const state = backgroundTaskState(partsOf(agent).subAgentManager, partsOf(agent).tools);
       expect(state).toContain('cat &lt;secret&gt; &amp; echo');
       expect(state).not.toContain('<secret>');
     });
@@ -2408,17 +2380,17 @@ You have 12 emotions.`;
         pendingPermission: { toolName: 'Bash<fake>', args: {} },
       });
 
-      const state = (agent as unknown as InternalAgent).buildBackgroundTaskState();
+      const state = backgroundTaskState(partsOf(agent).subAgentManager, partsOf(agent).tools);
       expect(state).toContain('Waiting for permission: Bash&lt;fake&gt;');
       expect(state).not.toContain('Bash<fake>');
     });
 
     it('escapes bash commands and stdout tails', () => {
       const agent = createTestAgentLoop(piAgent, config);
-      (agent as unknown as InternalAgent).toolRuntime.backgroundTasks.set({
+      partsOf(agent).tools.runtime.backgroundTasks.set({
         id: 'bash-esc',
         command: 'echo "hi" > out.txt',
-        process: {},
+        process: {} as never,
         stdout: 'line1\n<fake-tag attr="x">\n</bash>',
         stderr: '',
         exitCode: null,
@@ -2427,7 +2399,7 @@ You have 12 emotions.`;
         startTime: Date.now() - 1000,
       });
 
-      const state = (agent as unknown as InternalAgent).buildBackgroundTaskState();
+      const state = backgroundTaskState(partsOf(agent).subAgentManager, partsOf(agent).tools);
       expect(state).not.toBeNull();
       // The command sits inside a quoted attribute: quotes escape too.
       expect(state).toContain('command="echo &quot;hi&quot; &gt; out.txt"');
@@ -2442,7 +2414,7 @@ You have 12 emotions.`;
       const agent = createTestAgentLoop(piAgent, config);
       trackSubAgent(agent, { instructions: 'summarize the quarterly report' });
 
-      const state = (agent as unknown as InternalAgent).buildBackgroundTaskState();
+      const state = backgroundTaskState(partsOf(agent).subAgentManager, partsOf(agent).tools);
       expect(state).toContain('Instructions: summarize the quarterly report');
     });
   });
@@ -2452,17 +2424,11 @@ You have 12 emotions.`;
   // -----------------------------------------------------------------------
 
   describe('background result delivery durability', () => {
-    interface InternalAgent {
-      toolRuntime: { backgroundTasks: { set: (t: unknown) => void } };
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-      pendingBackgroundResults: unknown[];
-    }
-
     function seedCompletedTask(agent: AgentLoop, id: string, stdout: string): void {
-      (agent as unknown as InternalAgent).toolRuntime.backgroundTasks.set({
+      partsOf(agent).tools.runtime.backgroundTasks.set({
         id,
         command: 'npm run check',
-        process: {},
+        process: {} as never,
         stdout,
         stderr: '',
         exitCode: 0,
@@ -2522,11 +2488,11 @@ You have 12 emotions.`;
 
     it('re-queues a failed bash delivery and delivers it on the next attempt', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       seedCompletedTask(agent, 'task_r1', 'durable output');
       const promptCalls = installFailingPrompt(1);
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_r1' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_r1' });
 
       // First attempt failed, second delivered the same formatted message
       // (Bash tasks are marked notified on first format, so the re-queued
@@ -2534,7 +2500,7 @@ You have 12 emotions.`;
       expect(promptCalls).toHaveLength(2);
       expect(promptCalls[1]).toContain('task_r1');
       expect(promptCalls[1]).toContain('durable output');
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
       expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(0);
 
       // The failed attempt's transcript additions were unwound before the
@@ -2546,18 +2512,18 @@ You have 12 emotions.`;
 
     it('does not duplicate the completion message in history across re-queued attempts', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       seedCompletedTask(agent, 'task_dup', 'sixty-thousand-token payload');
       installFailingPrompt(2);
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_dup' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_dup' });
 
       // Two failed attempts, then success. Each failed attempt pushed the
       // delivery message into the transcript (pi does this at run start,
       // before any model call); without unwinding, attempts 2 and 3 would
       // append the identical body again and history would read
       // user, user, user, assistant.
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
       expect(historyRoles(agent)).toEqual(['user', 'assistant']);
       expect(historyOccurrences(agent, 'sixty-thousand-token payload')).toBe(1);
     });
@@ -2569,17 +2535,15 @@ You have 12 emotions.`;
       // with the surviving post-slot length (here: back to the empty
       // pre-delivery transcript) so the watermark is clamped.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const spy = vi.spyOn(
-        (agent as unknown as {
-          compactionManager: { onSourceHistoryTailTrimmed: (n: number) => void };
-        }).compactionManager,
+        partsOf(agent).compactionManager,
         'onSourceHistoryTailTrimmed',
       );
       seedCompletedTask(agent, 'task_wm', 'watermark payload');
       installFailingPrompt(1);
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_wm' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_wm' });
 
       expect(spy).toHaveBeenCalled();
       const lastCall = spy.mock.calls[spy.mock.calls.length - 1]!;
@@ -2590,10 +2554,10 @@ You have 12 emotions.`;
 
     it('re-queues a failed sub-agent result delivery without losing the result', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const promptCalls = installFailingPrompt(1);
 
-      await internal.deliverOrQueueBackgroundCompletion({
+      await internal.background.enqueue({
         kind: 'subagent',
         taskId: 'sa_1',
         result: {
@@ -2606,7 +2570,7 @@ You have 12 emotions.`;
       expect(promptCalls).toHaveLength(2);
       expect(promptCalls[1]).toContain('sa_1');
       expect(promptCalls[1]).toContain('research findings');
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
       // The sub-agent result reaches the transcript exactly once.
       expect(historyRoles(agent)).toEqual(['user', 'assistant']);
       expect(historyOccurrences(agent, 'research findings')).toBe(1);
@@ -2614,16 +2578,16 @@ You have 12 emotions.`;
 
     it('dead-letters a completion after repeated delivery failures', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       seedCompletedTask(agent, 'task_dead', 'lost output');
       const promptCalls = installFailingPrompt(Infinity);
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_dead' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_dead' });
 
       // Exactly the capped number of attempts, then the item leaves the queue
       // permanently instead of redelivering forever.
       expect(promptCalls).toHaveLength(3);
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
       // Every failed attempt was unwound; the dead-lettered body does not
       // linger in the transcript (in any copy) after the final failure.
       expect(historyRoles(agent)).toEqual([]);
@@ -2641,7 +2605,7 @@ You have 12 emotions.`;
 
     it('recovers a public steer destroyed by the failed-delivery unwind via wake parking', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
 
       // Give the mock a real steering queue: pi drains it at run start.
       const steeringQueue: Array<{ role: string; content: string }> = [];
@@ -2676,7 +2640,7 @@ You have 12 emotions.`;
 
       // The steer lands while the drain holds the gate, so pi injects it
       // right after the delivery message inside the doomed run.
-      const delivery = internal.deliverOrQueueBackgroundCompletion({
+      const delivery = internal.background.enqueue({
         kind: 'subagent',
         taskId: 'sa_steer',
         result: {
@@ -2712,28 +2676,28 @@ You have 12 emotions.`;
       // per-attempt emission, and the pending throw from the failed attempt
       // is suppressed instead of reaching the scheduled-drain onError root.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const errored = vi.fn();
       agent.onError(errored);
       seedCompletedTask(agent, 'task_s3a', 'eventually delivered output');
       installFailingPrompt(1);
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s3a' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_s3a' });
 
       expect(historyOccurrences(agent, 'eventually delivered output')).toBe(1);
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
       expect(errored).not.toHaveBeenCalled();
     });
 
     it('fires onError exactly once when a delivery exhausts all attempts', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const errored = vi.fn();
       agent.onError(errored);
       seedCompletedTask(agent, 'task_s3b', 'never delivered output');
       installFailingPrompt(10);
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s3b' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_s3b' });
 
       // Terminal failure: dead-lettered, and the chain root reports it once
       // (not once per attempt, and not doubled by the propagated re-throw).
@@ -2749,9 +2713,9 @@ You have 12 emotions.`;
       // concern surfaced through onError, never a rejection of the
       // consumer's own successful turn.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       seedCompletedTask(agent, 'task_s3c', 'cycle-drain output');
-      (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
+      (internal.background.pending as Array<Record<string, unknown>>).push(
         { kind: 'bash', taskId: 'task_s3c' },
       );
 
@@ -2786,7 +2750,7 @@ You have 12 emotions.`;
       // consumer must fix credentials first. Burning the attempt cap in
       // milliseconds would only hide the real failure mode.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const errored = vi.fn();
       agent.onError(errored);
       seedCompletedTask(agent, 'task_s4a', 'auth-blocked output');
@@ -2804,7 +2768,7 @@ You have 12 emotions.`;
         throw new Error('Invalid API key provided');
       };
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s4a' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_s4a' });
 
       expect(promptCalls).toHaveLength(1);
       const dead = agent.getDeadLetteredBackgroundResults();
@@ -2820,11 +2784,11 @@ You have 12 emotions.`;
       // this re-queue would succeed on the next immediate attempt and a
       // real outage could hold the loop gate for three full ladders.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       seedCompletedTask(agent, 'task_s4b', 'over-budget output');
       const promptCalls = installFailingPrompt(1);
 
-      await internal.deliverOrQueueBackgroundCompletion({
+      await internal.background.enqueue({
         kind: 'bash',
         taskId: 'task_s4b',
         firstDeliveryAttemptAt: Date.now() - 5 * 60 * 60 * 1000,
@@ -2834,7 +2798,7 @@ You have 12 emotions.`;
       const dead = agent.getDeadLetteredBackgroundResults();
       expect(dead).toHaveLength(1);
       expect(dead[0].attempts).toBe(1);
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
     });
 
     it('caps the in-run retry ladder by the remaining delivery budget', async () => {
@@ -2845,7 +2809,7 @@ You have 12 emotions.`;
         retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 3 },
       });
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const scheduled = vi.fn();
       agent.onRetryScheduled(scheduled);
       seedCompletedTask(agent, 'task_s4c', 'ladder-capped output');
@@ -2861,7 +2825,7 @@ You have 12 emotions.`;
         throw new Error('connect ECONNREFUSED');
       };
 
-      await internal.deliverOrQueueBackgroundCompletion({
+      await internal.background.enqueue({
         kind: 'bash',
         taskId: 'task_s4c',
         firstDeliveryAttemptAt: Date.now() - 5 * 60 * 60 * 1000,
@@ -2881,7 +2845,7 @@ You have 12 emotions.`;
         retryPolicy: { backoffMs: [1], maxBackoffMs: 1, maxAttempts: 1 },
       });
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const exhausted = vi.fn();
       const errored = vi.fn();
       agent.onRetryExhausted(exhausted);
@@ -2923,7 +2887,7 @@ You have 12 emotions.`;
           return { content: 'delivered' };
         };
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_n1' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_n1' });
 
       // The chain recovered: the completion was delivered and nothing
       // surfaced to the consumer, exhaustion included.
@@ -2936,13 +2900,13 @@ You have 12 emotions.`;
 
     it('notifies onBackgroundResultDeadLettered when delivery gives up', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const deadLettered = vi.fn();
       agent.onBackgroundResultDeadLettered(deadLettered);
       seedCompletedTask(agent, 'task_s5a', 'undeliverable output');
       installFailingPrompt(10);
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s5a' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_s5a' });
 
       expect(deadLettered).toHaveBeenCalledTimes(1);
       expect(deadLettered.mock.calls[0][0]).toMatchObject({
@@ -2955,12 +2919,12 @@ You have 12 emotions.`;
 
     it('dead-letters completions still queued when the agent is destroyed', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       const deadLettered = vi.fn();
       agent.onBackgroundResultDeadLettered(deadLettered);
       // Queue directly without scheduling a drain, simulating a completion
       // the shutdown raced.
-      (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
+      (internal.background.pending as Array<Record<string, unknown>>).push(
         { kind: 'bash', taskId: 'task_s5b' },
       );
 
@@ -2985,9 +2949,9 @@ You have 12 emotions.`;
       // destroyed, so the Bash output is still readable there, and an empty
       // message would make the output unrecoverable.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       seedCompletedTask(agent, 'task_sf1a', 'shutdown-orphaned output');
-      (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
+      (internal.background.pending as Array<Record<string, unknown>>).push(
         { kind: 'bash', taskId: 'task_sf1a' },
       );
 
@@ -3005,10 +2969,10 @@ You have 12 emotions.`;
       // message must be formatted at dead-letter time. Sub-agent items carry
       // their result, so this works even after full teardown.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       await agent.destroy();
 
-      await internal.deliverOrQueueBackgroundCompletion({
+      await internal.background.enqueue({
         kind: 'subagent',
         taskId: 'sa_sf1b',
         result: {
@@ -3031,19 +2995,14 @@ You have 12 emotions.`;
       // SubAgentManager.destroy() for the late result to stay a purposeful
       // discard instead of dead-lettering as "shut down before delivery".
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent & {
-        subAgentManager: {
-          track: (entry: unknown) => boolean;
-          cancel: (taskId: string, abortFn: (a: unknown) => Promise<void>) => Promise<boolean>;
-        };
-      };
+      const internal = partsOf(agent);
       internal.subAgentManager.track({
         taskId: 'sa_cancelled_late',
-        agent: { destroy: async () => {} },
+        agent: { destroy: async () => {} } as never,
         instructions: 'work',
         background: true,
         spawnedAt: Date.now(),
-        completion: Promise.resolve({}),
+        completion: Promise.resolve({}) as never,
         resolve: () => {},
         toolCount: 0,
         lastToolName: null,
@@ -3055,7 +3014,7 @@ You have 12 emotions.`;
 
       await agent.destroy();
 
-      await internal.deliverOrQueueBackgroundCompletion({
+      await internal.background.enqueue({
         kind: 'subagent',
         taskId: 'sa_cancelled_late',
         result: {
@@ -3070,10 +3029,10 @@ You have 12 emotions.`;
 
     it('dead-letters a completion that arrives after shutdown begins', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       await agent.destroy();
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_s5c' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_s5c' });
 
       const dead = agent.getDeadLetteredBackgroundResults();
       expect(dead).toHaveLength(1);
@@ -3085,12 +3044,12 @@ You have 12 emotions.`;
 
     it('evicts the oldest dead-letter entries once the cap is exceeded', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       await agent.destroy();
 
       // Every arrival during shutdown dead-letters; push past the 50 cap.
       for (let i = 0; i < 55; i++) {
-        await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: `task_cap_${i}` });
+        await internal.background.enqueue({ kind: 'bash', taskId: `task_cap_${i}` });
       }
 
       const dead = agent.getDeadLetteredBackgroundResults();
@@ -3102,21 +3061,21 @@ You have 12 emotions.`;
 
     it('fires onBackgroundResultDelivery once per completion, not per attempt', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       seedCompletedTask(agent, 'task_h1', 'output');
       installFailingPrompt(1);
 
       const seen: string[][] = [];
       agent.onBackgroundResultDelivery((taskIds) => seen.push(taskIds));
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_h1' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_h1' });
 
       expect(seen).toEqual([['task_h1']]);
     });
 
     it('delivers completions that arrive during a failed delivery', async () => {
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as InternalAgent;
+      const internal = partsOf(agent);
       seedCompletedTask(agent, 'task_a', 'first output');
       seedCompletedTask(agent, 'task_b', 'second output');
 
@@ -3128,7 +3087,7 @@ You have 12 emotions.`;
         if (!failed) {
           failed = true;
           // A second completion lands while the first delivery is failing.
-          (internal.pendingBackgroundResults as Array<Record<string, unknown>>).push(
+          (internal.background.pending as Array<Record<string, unknown>>).push(
             { kind: 'bash', taskId: 'task_b' },
           );
           // Mirror pi: the prompt message and failure stub reach the
@@ -3145,44 +3104,36 @@ You have 12 emotions.`;
         return originalPrompt(input);
       };
 
-      await internal.deliverOrQueueBackgroundCompletion({ kind: 'bash', taskId: 'task_a' });
+      await internal.background.enqueue({ kind: 'bash', taskId: 'task_a' });
 
       // The re-queued first completion is delivered ahead of the new one,
       // both in the same follow-up message.
       expect(promptCalls).toHaveLength(2);
       expect(promptCalls[1]).toContain('task_a');
       expect(promptCalls[1]).toContain('task_b');
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
       // One combined delivery in history; each body exactly once.
       expect(historyRoles(agent)).toEqual(['user', 'assistant']);
       expect(historyOccurrences(agent, 'first output')).toBe(1);
       expect(historyOccurrences(agent, 'second output')).toBe(1);
     });
 
-    interface RequeueInternals {
-      requeueOrDeadLetter: (batch: unknown[], err: unknown) => void;
-      unwindFailedDelivery: (preDeliveryCount: number) => boolean;
-      batchRecoveredAfterRequeue: (batch: unknown[]) => boolean;
-      pendingBackgroundResults: unknown[];
-      isAborted: () => boolean;
-    }
-
     it('does not spend a delivery attempt when the user aborts mid-delivery', async () => {
       // An abort is the user stopping the agent, not the delivery failing on
       // its own terms. Charging it an attempt means a few quick aborts
       // permanently dead-letter completed work that never actually failed.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as RequeueInternals;
-      vi.spyOn(internal, 'isAborted').mockReturnValue(true);
+      const internal = partsOf(agent);
+      vi.spyOn(agent as unknown as { isAborted: () => boolean }, 'isAborted').mockReturnValue(true);
       const item = { kind: 'bash' as const, taskId: 'task_abort' };
 
       for (let i = 0; i < 4; i++) {
-        internal.pendingBackgroundResults.length = 0;
-        internal.requeueOrDeadLetter([item], new Error('Operation aborted'));
+        internal.background.pending.length = 0;
+        internal.background.requeueOrDeadLetter([item], new Error('Operation aborted'));
       }
 
       expect((item as { deliveryAttempts?: number }).deliveryAttempts).toBe(0);
-      expect(internal.pendingBackgroundResults).toContain(item);
+      expect(internal.background.pending).toContain(item);
       expect(agent.getDeadLetteredBackgroundResults()).toHaveLength(0);
     });
 
@@ -3192,22 +3143,22 @@ You have 12 emotions.`;
       // dead-letters would otherwise read as "recovered" and swallow the
       // consumer's onError for a delivery that never landed.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as RequeueInternals;
+      const internal = partsOf(agent);
       const item = { kind: 'bash' as const, taskId: 'task_evicted', deliveryAttempts: 3 };
 
-      internal.requeueOrDeadLetter([item], new Error('delivery down'));
-      expect(internal.batchRecoveredAfterRequeue([item])).toBe(false);
+      internal.background.requeueOrDeadLetter([item], new Error('delivery down'));
+      expect(internal.background.batchRecoveredAfterRequeue([item])).toBe(false);
 
       // Push it out of the bounded dead-letter list.
       for (let i = 0; i < 55; i++) {
-        internal.requeueOrDeadLetter(
+        internal.background.requeueOrDeadLetter(
           [{ kind: 'bash' as const, taskId: `filler_${i}`, deliveryAttempts: 3 }],
           new Error('delivery down'),
         );
       }
       const dead = agent.getDeadLetteredBackgroundResults();
       expect(dead.some(d => d.taskId === 'task_evicted')).toBe(false);
-      expect(internal.batchRecoveredAfterRequeue([item])).toBe(false);
+      expect(internal.background.batchRecoveredAfterRequeue([item])).toBe(false);
     });
 
     it('unwinds a delivery whose run left an unpaired assistant tool call', async () => {
@@ -3215,7 +3166,7 @@ You have 12 emotions.`;
       // leaves a transcript the provider rejects outright. Treating that as
       // "delivered" would strand the completion AND wedge the next request.
       const agent = createTestAgentLoop(piAgent, config);
-      const internal = agent as unknown as RequeueInternals;
+      const internal = partsOf(agent);
       const preDeliveryCount = piAgent.state.messages.length;
       piAgent.state.messages.push({ role: 'user', content: 'delivery body' } as never);
       piAgent.state.messages.push({
@@ -3224,7 +3175,7 @@ You have 12 emotions.`;
         stopReason: 'toolUse',
       } as never);
 
-      const requeue = internal.unwindFailedDelivery(preDeliveryCount);
+      const requeue = internal.queues.unwindFailedDelivery(preDeliveryCount);
 
       expect(requeue).toBe(true);
       expect(piAgent.state.messages).toHaveLength(preDeliveryCount);

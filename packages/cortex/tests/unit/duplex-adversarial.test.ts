@@ -40,6 +40,7 @@ import {
   waitUntil,
 } from './duplex-scenario-harness.js';
 import type { DuplexScenarioHarness } from './duplex-scenario-harness.js';
+import { partsOf } from './agent-loop/parts.js';
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -620,9 +621,7 @@ describe('adversarial: races around cancel, abort, and barge-in', () => {
       status: 'completed',
       usage: { turns: 1, cost: 0, durationMs: 1, contextTokens: 0 },
     };
-    await (h.reasonerLoop as unknown as {
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-    }).deliverOrQueueBackgroundCompletion({ kind: 'subagent', taskId, result: lateResult });
+    await partsOf(h.reasonerLoop).background.enqueue({ kind: 'subagent', taskId, result: lateResult });
     await settle();
 
     // Nothing woke, nothing was delivered, nothing was dead-lettered: a
@@ -655,9 +654,7 @@ describe('adversarial: races around cancel, abort, and barge-in', () => {
     // inside the teardown window (destroy() marks the loop shutting down
     // synchronously, before its first await).
     const teardown = h.reasonerLoop.destroy();
-    await (h.reasonerLoop as unknown as {
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-    }).deliverOrQueueBackgroundCompletion({
+    await partsOf(h.reasonerLoop).background.enqueue({
       kind: 'subagent',
       taskId,
       result: lateSubAgentResult(),
@@ -700,9 +697,7 @@ describe('adversarial: races around cancel, abort, and barge-in', () => {
     h.reasonerPi.hold = true;
     h.reasonerPi.failWith = new Error('provider returned a malformed response body');
     const runsBefore = h.reasonerPi.promptCalls.length;
-    void (h.reasonerLoop as unknown as {
-      deliverOrQueueBackgroundCompletion: (item: unknown) => Promise<void>;
-    }).deliverOrQueueBackgroundCompletion({
+    void partsOf(h.reasonerLoop).background.enqueue({
       kind: 'subagent',
       taskId,
       result: lateSubAgentResult(),

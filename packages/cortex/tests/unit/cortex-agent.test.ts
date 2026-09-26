@@ -21,6 +21,7 @@ import {
   buildReasonerConfig,
 } from '../../src/cortex-agent.js';
 import type { CortexAgentConfig, ForwardedLoopMember } from '../../src/cortex-agent.js';
+import { partsOf } from './agent-loop/parts.js';
 
 // These harnesses bypass create() and inject already-resolved loop configuration.
 type ResolvedFacadeConfig = Omit<CortexAgentConfig, 'sandbox'> & Pick<AgentLoopConfig, 'sandbox'>;
@@ -807,18 +808,8 @@ describe('CortexAgent settlement', () => {
 
   it('waitForWorkSettled blocks on ask settlement without hot-polling', async () => {
     const { facade, loop } = createFacade();
-    const registry = loop as unknown as {
-      registerPendingAsk(ask: {
-        askId: string;
-        loopPath: string;
-        toolName: string;
-        renderedRequest: string;
-        requestedAt: number;
-        voiced: boolean;
-      }): void;
-      settlePendingAsk(askId: string): void;
-    };
-    registry.registerPendingAsk({
+    const registry = partsOf(loop);
+    registry.asks.register({
       askId: 'ask-outlives-child',
       loopPath: 'main',
       toolName: 'Bash',
@@ -841,7 +832,7 @@ describe('CortexAgent settlement', () => {
     expect(settled).toBe(false);
     expect(pendingAsksSpy.mock.calls.length).toBeLessThan(20);
 
-    registry.settlePendingAsk('ask-outlives-child');
+    registry.asks.settle('ask-outlives-child');
     await wait;
     expect(settled).toBe(true);
     expect(facade.workSettled).toBe(true);

@@ -5,6 +5,7 @@ import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
 import { EventBridge } from '../../src/event-bridge.js';
 import type { CortexEvent, PiEvent } from '../../src/event-bridge.js';
+import { partsOf } from './agent-loop/parts.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -56,14 +57,9 @@ function createTestAgentLoop(
   );
 }
 
+/** The loop's child factory, which spawn-path tests stand in for. */
 interface SpawnInternals {
   createChildAgent: (params: unknown) => Promise<unknown>;
-  spawnForegroundSubAgentInternal: (params: {
-    instructions: string;
-  }) => Promise<{ taskId: string; status: string }>;
-  spawnBackgroundSubAgentInternal: (params: {
-    instructions: string;
-  }) => Promise<{ taskId: string }>;
 }
 
 /**
@@ -91,7 +87,7 @@ describe('AgentLoop spawn-path lifecycle', () => {
       const { destroySpy } = stubChildAgent(agent);
       const internal = agent as unknown as SpawnInternals;
 
-      const result = await internal.spawnForegroundSubAgentInternal({
+      const result = await partsOf(agent).subAgents.spawnForeground({
         instructions: 'do something',
       });
 
@@ -107,7 +103,7 @@ describe('AgentLoop spawn-path lifecycle', () => {
       const internal = agent as unknown as SpawnInternals;
 
       await expect(
-        internal.spawnBackgroundSubAgentInternal({ instructions: 'do something' }),
+        partsOf(agent).subAgents.spawnBackground({ instructions: 'do something' }),
       ).rejects.toThrow('Concurrency limit reached');
       expect(destroySpy).toHaveBeenCalledTimes(1);
     });
@@ -151,11 +147,6 @@ describe('AgentLoop spawn-path lifecycle', () => {
   });
 
   describe('cancelSubAgent', () => {
-    interface DeliveryInternals {
-      pendingBackgroundResults: Array<Record<string, unknown>>;
-      drainPendingBackgroundResults: () => Promise<void>;
-    }
-
     /** A child stub whose prompt hangs until destroy() rejects it (like a real abort). */
     function createHangingChild() {
       let rejectPrompt!: (err: Error) => void;
@@ -214,7 +205,7 @@ describe('AgentLoop spawn-path lifecycle', () => {
       const internal = agent as unknown as SpawnInternals;
       internal.createChildAgent = vi.fn().mockResolvedValue(child);
 
-      const spawnPromise = internal.spawnForegroundSubAgentInternal({
+      const spawnPromise = partsOf(agent).subAgents.spawnForeground({
         instructions: 'long task',
       });
       await new Promise((resolve) => setImmediate(resolve));
@@ -295,7 +286,7 @@ describe('AgentLoop spawn-path lifecycle', () => {
 
     it('purges a queued pending result for the cancelled task', async () => {
       const agent = createTestAgentLoop();
-      const internal = agent as unknown as DeliveryInternals;
+      const internal = partsOf(agent);
       const manager = agent.getSubAgentManager();
 
       const child = createHangingChild();
@@ -317,7 +308,7 @@ describe('AgentLoop spawn-path lifecycle', () => {
         lastToolStartedAt: null,
         pendingPermission: null,
       });
-      internal.pendingBackgroundResults.push({
+      internal.background.pending.push({
         kind: 'subagent',
         taskId: 'queued-task',
         result: {
@@ -328,14 +319,14 @@ describe('AgentLoop spawn-path lifecycle', () => {
       });
 
       await agent.cancelSubAgent('queued-task');
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
     });
 
     it('drops a cancelled task result at drain time', async () => {
       const piAgent = createMockPiAgent();
       const promptSpy = vi.spyOn(piAgent, 'prompt');
       const agent = createTestAgentLoop({}, piAgent);
-      const internal = agent as unknown as DeliveryInternals;
+      const internal = partsOf(agent);
       const manager = agent.getSubAgentManager();
 
       // Cancel directly through the manager (bypassing cancelSubAgent's
@@ -360,7 +351,7 @@ describe('AgentLoop spawn-path lifecycle', () => {
       });
       await manager.cancel('late-task', async () => {});
 
-      internal.pendingBackgroundResults.push({
+      internal.background.pending.push({
         kind: 'subagent',
         taskId: 'late-task',
         result: {
@@ -369,10 +360,10 @@ describe('AgentLoop spawn-path lifecycle', () => {
           usage: { turns: 1, cost: 0, durationMs: 10, contextTokens: 0 },
         },
       });
-      await internal.drainPendingBackgroundResults();
+      await internal.background.drain();
 
       expect(promptSpy).not.toHaveBeenCalled();
-      expect(internal.pendingBackgroundResults).toHaveLength(0);
+      expect(internal.background.pending).toHaveLength(0);
     });
   });
 

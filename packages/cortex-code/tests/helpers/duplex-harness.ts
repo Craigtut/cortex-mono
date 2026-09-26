@@ -597,7 +597,7 @@ export async function settle(ticks = 8): Promise<void> {
 /**
  * Fire a loop's retry and compaction callbacks the way the framework fires
  * them, **including the loop's own origin stamp**: these reach the loop's
- * private dispatchers rather than fabricating a `LoopOriginContext`, so the
+ * own notifiers rather than fabricating a `LoopOriginContext`, so the
  * origin a consumer handler receives is the real one the loop would have
  * supplied.
  *
@@ -607,12 +607,24 @@ export async function settle(ticks = 8): Promise<void> {
  * framework's retry and compaction engines instead, and those have their own
  * suites.
  */
+type RetryNotifier = { emit(info: unknown, origin: unknown): void };
+
+/** The loop's turn runner owns the retry notifiers; `origin` is the loop's own. */
+function retryParts(loop: AgentLoop): {
+  runner: { retryScheduled: RetryNotifier; retrySucceeded: RetryNotifier };
+  origin: unknown;
+} {
+  return (loop as unknown as { parts: ReturnType<typeof retryParts> }).parts;
+}
+
 export function fireRetryScheduled(loop: AgentLoop, info: Record<string, unknown>): void {
-  (loop as unknown as { fireRetryScheduled: (i: unknown) => void }).fireRetryScheduled(info);
+  const { runner, origin } = retryParts(loop);
+  runner.retryScheduled.emit(info, origin);
 }
 
 export function fireRetrySucceeded(loop: AgentLoop, info: Record<string, unknown>): void {
-  (loop as unknown as { fireRetrySucceeded: (i: unknown) => void }).fireRetrySucceeded(info);
+  const { runner, origin } = retryParts(loop);
+  runner.retrySucceeded.emit(info, origin);
 }
 
 /** Runs the loop's own wrapper, which is what applies the origin stamp. */

@@ -4,6 +4,7 @@ import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
 import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
+import { partsOf } from './agent-loop/parts.js';
 
 // ---------------------------------------------------------------------------
 // Scriptable mock that mutates state.messages the way pi-agent-core does:
@@ -555,9 +556,7 @@ describe('AgentLoop abort-stub trim', () => {
     // message that was never observed.
     const mock = createCleanAbortMock([]);
     const agent = build(mock, createConfig());
-    const internal = agent as unknown as {
-      compactionManager: { onSourceHistoryTailTrimmed: (n: number) => void };
-    };
+    const internal = partsOf(agent);
     const spy = vi.spyOn(internal.compactionManager, 'onSourceHistoryTailTrimmed');
 
     const turn = agent.prompt('hi');
@@ -575,9 +574,7 @@ describe('AgentLoop abort-stub trim', () => {
     // no tail-trim to reconcile.
     const mock = createCleanAbortMock([{ type: 'text', text: 'partial answer' }]);
     const agent = build(mock, createConfig());
-    const internal = agent as unknown as {
-      compactionManager: { onSourceHistoryTailTrimmed: (n: number) => void };
-    };
+    const internal = partsOf(agent);
     const spy = vi.spyOn(internal.compactionManager, 'onSourceHistoryTailTrimmed');
 
     const turn = agent.prompt('hi');

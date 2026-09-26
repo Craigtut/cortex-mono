@@ -50,6 +50,7 @@ import {
 } from '../../src/duplex/prompts.js';
 import { TOOL_NAMES } from '../../src/tools/index.js';
 import { McpClientManager } from '../../src/mcp-client.js';
+import { partsOf } from './agent-loop/parts.js';
 
 // ---------------------------------------------------------------------------
 // Mock pi agent: holdable runs, pi-shaped turn_end/agent_end payloads
@@ -1615,9 +1616,7 @@ describe('duplex wake-delivery dead-lettering', () => {
 
     // Hold the gate with an empty background drain so the utterance parks
     // instead of prompting, putting it on the sweep path.
-    const drain = (talkerLoop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(talkerLoop).background.schedule();
     const turn = facade.prompt('did you hear me');
     await drain;
 
@@ -1800,9 +1799,7 @@ describe('duplex destroyed-content recording', () => {
       talkerPi.state.messages.push(...messages);
       throw new Error('provider down');
     };
-    const drain = (talkerLoop as unknown as {
-      schedulePendingResultDelivery: () => Promise<void>;
-    }).schedulePendingResultDelivery();
+    const drain = partsOf(talkerLoop).background.schedule();
     const turn = facade.prompt(longUtterance);
     await drain;
 
@@ -1824,9 +1821,7 @@ describe('duplex destroyed-content recording', () => {
 
 describe('duplex headlines', () => {
   function talkerHeadline(talkerLoop: AgentLoop): string | null {
-    const provider = (talkerLoop as unknown as {
-      headlineProvider: (() => string | null) | null;
-    }).headlineProvider;
+    const provider = partsOf(talkerLoop).pipeline.headline.current;
     expect(provider).toBeTypeOf('function');
     return provider!();
   }

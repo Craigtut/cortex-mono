@@ -36,6 +36,7 @@ import {
   waitUntil,
 } from './duplex-scenario-harness.js';
 import type { ScriptedPiAgent } from './duplex-scenario-harness.js';
+import { partsOf } from './agent-loop/parts.js';
 
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -1126,19 +1127,16 @@ describe('scenario: the reasoner fails', () => {
 
     // The ladder itself is the loop's, tested there; what is wired here is
     // what the facade does with its signals, so they are fired through the
-    // loop's own notifiers.
-    const loop = h.reasonerLoop as unknown as {
-      fireRetryScheduled: (info: Record<string, unknown>) => void;
-      fireRetryExhausted: (info: Record<string, unknown>) => void;
-    };
-    loop.fireRetryScheduled({
+    // loop's own retry notifiers.
+    const { runner, origin } = partsOf(h.reasonerLoop);
+    runner.retryScheduled.emit({
       category: 'server_error',
       attempt: 3,
       maxAttempts: 5,
       delayMs: 1000,
       nextAttemptAt: Date.now() + 1000,
       originalMessage: '500 internal server error',
-    });
+    }, origin);
 
     // Mid-ladder the block says retrying, not working: "still working on it"
     // is the answer that makes the user wait through a failing session.
@@ -1147,7 +1145,7 @@ describe('scenario: the reasoner fails', () => {
       /Retrying after a server_error failure: attempt 3 of 5 \(as of \d+s ago\)/,
     );
 
-    loop.fireRetryExhausted({ attempts: 5, category: 'server_error' });
+    runner.retryExhausted.emit({ attempts: 5, category: 'server_error' }, origin);
     await waitUntil(
       () => entriesOfType(h.facade, 'delivery').length === 1,
       2000, 'the exhausted ladder was delivered',

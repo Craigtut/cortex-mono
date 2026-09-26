@@ -6,6 +6,7 @@ import { AgentLoop } from '../../src/agent-loop.js';
 import type { PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
+import { partsOf } from './agent-loop/parts.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -63,10 +64,10 @@ function createTestAgentLoop(
 }
 
 function getRegisteredTool(agent: AgentLoop, name: string): ExecutableTool {
-  const tools = (agent as unknown as { registeredTools: ExecutableTool[] }).registeredTools;
+  const tools = partsOf(agent).tools.registered;
   const tool = tools.find(t => t.name === name);
   expect(tool, `built-in tool ${name} should be registered`).toBeDefined();
-  return tool!;
+  return tool as unknown as ExecutableTool;
 }
 
 function textOf(result: { content: Array<{ type: string; text?: string }> }): string {
