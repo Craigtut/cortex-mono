@@ -287,7 +287,8 @@ describe('ask intake and voicing', () => {
     // A re-voice reuses the same id rather than minting a guessable
     // successor, so a second reading is no easier to escape than the first.
     h.advance(3_001);
-    h.broker.voicing.revoiceCurrent();
+    h.setTalkerCauseTags([]);
+    await callAnswerAsk(h, { decision: 'allow' });
     await waitUntil(() => h.askVoicings.length === 2);
     expect(h.askVoicings[1]!.content).toContain(open);
     expect(h.askVoicings[1]!.content).toContain(close);
@@ -394,7 +395,7 @@ describe('unheard voicings', () => {
     const firstAnchor = h.lastVoicedSeq();
     const voicing = h.askVoicings[0]!.deliveryId;
 
-    expect(h.broker.voicing.noteDestroyed(voicing)).toBe(true);
+    expect(h.broker.noteDeliveryDestroyed(voicing)).toBe(true);
     expect(h.askVoicings).toHaveLength(2);
     const secondAnchor = h.lastVoicedSeq();
     expect(secondAnchor).toBeGreaterThan(firstAnchor);
@@ -422,7 +423,7 @@ describe('unheard voicings', () => {
     expect(h.askVoicings).toHaveLength(2);
 
     // The first, superseded voicing is destroyed; the second one stands.
-    expect(h.broker.voicing.noteDestroyed(h.askVoicings[0]!.deliveryId)).toBe(false);
+    expect(h.broker.noteDeliveryDestroyed(h.askVoicings[0]!.deliveryId)).toBe(false);
     expect(h.askVoicings).toHaveLength(2);
 
     // The user's answer to the request they heard still binds.
@@ -438,7 +439,7 @@ describe('unheard voicings', () => {
     h.advance(3_001);
     h.setTalkerCauseTags([]);
     await callAnswerAsk(h, { decision: 'allow' });
-    expect(h.broker.voicing.noteDestroyed(h.askVoicings[1]!.deliveryId)).toBe(true);
+    expect(h.broker.noteDeliveryDestroyed(h.askVoicings[1]!.deliveryId)).toBe(true);
     expect(h.askVoicings).toHaveLength(3);
   });
 
@@ -446,8 +447,8 @@ describe('unheard voicings', () => {
     const h = createHarness();
     requestAsk(h);
     const anchor = h.lastVoicedSeq();
-    expect(h.broker.voicing.noteDestroyed('some-other-delivery')).toBe(false);
-    expect(h.broker.voicing.noteDestroyed(undefined)).toBe(false);
+    expect(h.broker.noteDeliveryDestroyed('some-other-delivery')).toBe(false);
+    expect(h.broker.noteDeliveryDestroyed(undefined)).toBe(false);
     expect(h.askVoicings).toHaveLength(1);
     expect(h.lastVoicedSeq()).toBe(anchor);
   });
@@ -592,7 +593,7 @@ describe('D16 consent binding', () => {
   it('does not re-voice on a refused answer while a conversation abort holds the request', async () => {
     const h = createHarness();
     requestAsk(h);
-    h.broker.voicing.hold();
+    h.broker.holdVoicing();
     h.advance(3_001);
     h.setTalkerCauseTags([]);
     const refused = await callAnswerAsk(h, { decision: 'allow' });
@@ -602,7 +603,7 @@ describe('D16 consent binding', () => {
     expect(h.askVoicings).toHaveLength(1);
 
     // The conversation reopening reads it out again.
-    h.broker.voicing.reopen();
+    h.broker.reopenVoicing();
     expect(h.askVoicings).toHaveLength(2);
   });
 

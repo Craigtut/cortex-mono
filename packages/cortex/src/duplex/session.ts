@@ -133,7 +133,7 @@ export class DuplexSession implements SessionMode {
       router.dropPendingDeliveries();
       this.recorder.recordDroppedQueue(talker, 'abort', talker.clearAllQueues());
       // Everything parked is gone, voicings included.
-      this.broker.voicing.noteParkedCleared();
+      this.broker.noteParkedCleared();
       work.push(talker.abort());
       // Quick lookups belong to the conversation surface (abort table):
       // cancelled here, untouched by a 'work' abort.
@@ -166,7 +166,7 @@ export class DuplexSession implements SessionMode {
       // busy talker outlives its ask, gets read out afterwards, and the
       // user's answer then lands in an empty registry and is told there
       // is nothing pending. Retract the voicings with their asks.
-      this.broker.voicing.retractParked('abort');
+      this.broker.retractParkedVoicings('abort');
     }
     try {
       await Promise.all(work);
@@ -176,7 +176,7 @@ export class DuplexSession implements SessionMode {
     // The user said stop, so a request whose voicing went with the
     // talker's queues is held silent rather than read straight back out.
     if (scope === 'conversation') {
-      this.broker.voicing.hold();
+      this.broker.holdVoicing();
     }
   }
 
@@ -197,10 +197,11 @@ export class DuplexSession implements SessionMode {
     // Whether the user was ever read an ask the broker holds is the broker's
     // fact alone (markAskVoiced below refuses to write the loop registry's
     // flag in duplex), so it replaces the registry's value, never merges.
-    const { voicing } = this.broker;
-    const brokered = new Set(this.broker.getPendingAsks().map((ask) => ask.askId));
-    const asks = this.reasoner.getPendingAsks().map((ask) =>
-      (brokered.has(ask.askId) ? { ...ask, voiced: voicing.stateOf(ask.askId).voiced } : ask));
+    const brokered = new Map(this.broker.getPendingAsks().map((ask) => [ask.askId, ask.voiced]));
+    const asks = this.reasoner.getPendingAsks().map((ask) => {
+      const voiced = brokered.get(ask.askId);
+      return voiced === undefined ? ask : { ...ask, voiced };
+    });
     const mirrored = new Set(asks.map((ask) => ask.askId));
     const brokerOnly = this.broker.getPendingAsks()
       .filter((ask) => !mirrored.has(ask.askId))

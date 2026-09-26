@@ -232,7 +232,7 @@ export class PermissionBroker {
   private readonly askTimeoutMs: number | null;
   private readonly escalationAskTimeoutMs: number | null;
   /** What the user has heard: queue, voiced ask, consent anchors. */
-  readonly voicing: AskVoicing;
+  private readonly voicing: AskVoicing;
 
   private readonly asks = new Map<string, BrokeredAsk>();
   /**
@@ -452,6 +452,39 @@ export class PermissionBroker {
         this.settle(ask, { decision: 'deny', reason: DROP_REASONS[cause] });
       }
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // What happened on the conversation surface (AskVoicing owns the meaning)
+  // -------------------------------------------------------------------------
+
+  /** A conversation abort: hold the voiced request silent until reopened. */
+  holdVoicing(): void {
+    this.voicing.hold();
+  }
+
+  /** The conversation received input: read out a held request again. */
+  reopenVoicing(): void {
+    this.voicing.reopen();
+  }
+
+  /** The talker's queues were cleared: none of its voicings are parked any more. */
+  noteParkedCleared(): void {
+    this.voicing.noteParkedCleared();
+  }
+
+  /** Asks were settled wholesale: retract their voicings still parked on the talker. */
+  retractParkedVoicings(reason: 'abort' | 'restore'): void {
+    this.voicing.retractParked(reason);
+  }
+
+  /**
+   * A talker delivery was destroyed before a run took it. Returns whether
+   * it was the voicing consent rests on (which is then withdrawn and read
+   * again).
+   */
+  noteDeliveryDestroyed(deliveryId: string | undefined): boolean {
+    return this.voicing.noteDestroyed(deliveryId);
   }
 
   /** Facade restore(): the pending asks belong to the replaced session. */

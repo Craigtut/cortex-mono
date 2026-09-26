@@ -742,7 +742,9 @@ describe('scenario: permission brokering through conversation', () => {
       { text: 'Approving that.', calls: [{ name: 'answer_ask', args: { askId, decision: 'allow' } }] },
       { text: 'Okay.' },
     ];
-    getBroker(h.facade).voicing.noteLost();
+    // A conversation abort's hold, then input reopening it: a fresh read-out.
+    getBroker(h.facade).holdVoicing();
+    getBroker(h.facade).reopenVoicing();
     await waitUntil(() => h.talkerLoop.isPrompting, 2000, 'voicing run live');
     h.facade.steer('yes');
     h.talkerPi.releaseRun();

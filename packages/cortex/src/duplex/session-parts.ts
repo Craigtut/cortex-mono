@@ -195,7 +195,7 @@ export function assembleSessionParts(
     recorder,
     prompts: services.prompts,
     beforeInput: () => parts.digestion.preempt(),
-    reopenVoicing: () => parts.broker.voicing.reopen(),
+    reopenVoicing: () => parts.broker.reopenVoicing(),
     noteInputArriving: () => services.noteInputArriving(),
     promptThroughFacade: (text) => services.prompt(text),
     logger,
@@ -304,7 +304,7 @@ function wire(
     // the broker still counts as read out: it withdraws the consent anchor
     // and reads it again (D16 anchor rules).
     if (result.kind === 'wake_delivery') {
-      broker.voicing.noteDestroyed(result.deliveryId);
+      broker.noteDeliveryDestroyed(result.deliveryId);
     }
   });
 
