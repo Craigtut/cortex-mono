@@ -17,15 +17,12 @@
 import {
   PROVIDER_REGISTRY,
   OAUTH_PROVIDER_IDS,
-  UTILITY_MODEL_OVERRIDES,
 } from './provider-registry.js';
 import type { ProviderInfo, ModelInfo } from './provider-registry.js';
 import { wrapModel } from './model-wrapper.js';
-import { inferUtilityModelId } from './utility-model-inference.js';
 import type { CortexModel } from './model-wrapper.js';
 import type { OllamaModelConfig } from './providers/ollama/runtime.js';
 import { loadPiAi } from './provider-manager/pi-ai.js';
-import type { PiAiModule } from './provider-manager/pi-ai.js';
 import type {
   OAuthCallbacks,
   OAuthResult,
@@ -35,6 +32,8 @@ import { OAUTH_CALLBACK_ROUTES, probeCallbackPortInUse } from './provider-manage
 import type { OAuthCallbackRoute } from './provider-manager/oauth-callback-page.js';
 import { OAuthFlows } from './provider-manager/oauth-flows.js';
 import { listProviderModels } from './provider-manager/model-catalog.js';
+import { validateProviderApiKey } from './provider-manager/api-key-validation.js';
+import type { ApiKeyValidationResult } from './provider-manager/api-key-validation.js';
 
 export { OAuthError } from './provider-manager/oauth-types.js';
 export type {
@@ -51,6 +50,10 @@ export type {
   OAuthErrorCode,
 } from './provider-manager/oauth-types.js';
 export type { OAuthCallbackRoute } from './provider-manager/oauth-callback-page.js';
+export type {
+  ApiKeyValidationResult,
+  ApiKeyValidationStatus,
+} from './provider-manager/api-key-validation.js';
 
 /** Configuration for creating a custom model endpoint. */
 export interface CustomModelConfig {
@@ -69,21 +72,6 @@ export interface CustomModelConfig {
     /** Whether the server supports reasoning_effort (default: true). */
     supportsReasoningEffort?: boolean | undefined;
   } | undefined;
-}
-
-export type ApiKeyValidationStatus =
-  | 'valid'
-  | 'invalid_credentials'
-  | 'transient_error'
-  | 'resolution_error';
-
-export interface ApiKeyValidationResult {
-  provider: string;
-  modelId: string | null;
-  valid: boolean;
-  retryable: boolean;
-  status: ApiKeyValidationStatus;
-  message?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,33 +234,7 @@ export class ProviderManager implements IProviderManager {
    * @throws Error if pi-ai is not installed
    */
   async validateApiKey(provider: string, apiKey: string): Promise<ApiKeyValidationResult> {
-    const piAi = await loadPiAi();
-
-    const models = piAi.getModels(provider) ?? [];
-    if (models.length === 0) {
-      return {
-        provider,
-        modelId: null,
-        valid: false,
-        retryable: false,
-        status: 'resolution_error',
-        message: `No models found for provider "${provider}"`,
-      };
-    }
-
-    const modelId = this.getSmallestModelId(provider, models);
-    if (!modelId) {
-      return {
-        provider,
-        modelId: null,
-        valid: false,
-        retryable: false,
-        status: 'resolution_error',
-        message: `No usable models found for provider "${provider}"`,
-      };
-    }
-
-    return this.tryValidation(piAi, provider, modelId, apiKey);
+    return validateProviderApiKey(provider, apiKey);
   }
 
   /**
@@ -378,141 +340,5 @@ export class ProviderManager implements IProviderManager {
   async createOllamaModel(config: OllamaModelConfig): Promise<CortexModel> {
     const { createOllamaModel } = await import('./providers/ollama/model.js');
     return createOllamaModel(config);
-  }
-
-  // -----------------------------------------------------------------------
-  // Private helpers
-  // -----------------------------------------------------------------------
-
-  /**
-   * Get the cheapest likely utility model ID for a provider.
-   */
-  private getSmallestModelId(provider: string, models: Array<Record<string, unknown>>): string | null {
-    return UTILITY_MODEL_OVERRIDES[provider] ?? inferUtilityModelId(models);
-  }
-
-  /**
-   * Attempt to validate an API key by making a minimal LLM call.
-   */
-  private async tryValidation(
-    piAi: PiAiModule,
-    provider: string,
-    modelId: string,
-    apiKey: string,
-  ): Promise<ApiKeyValidationResult> {
-    try {
-      const model = piAi.getModel(provider, modelId);
-
-      // Try completeSimple first, then complete
-      const completeFn = piAi.completeSimple ?? piAi.complete;
-
-      if (typeof completeFn !== 'function') {
-        // Cannot validate without a complete function; assume valid
-        // (the consumer will discover failures at first real call)
-        return {
-          provider,
-          modelId,
-          valid: true,
-          retryable: false,
-          status: 'valid',
-        };
-      }
-
-      const result = await completeFn(
-        model,
-        { messages: [{ role: 'user', content: 'hi' }] },
-        { apiKey, maxTokens: 1 },
-      );
-      const silentError = this.extractSilentValidationError(result);
-      if (silentError) {
-        throw new Error(silentError);
-      }
-      return {
-        provider,
-        modelId,
-        valid: true,
-        retryable: false,
-        status: 'valid',
-      };
-    } catch (err) {
-      return this.classifyValidationError(provider, modelId, err);
-    }
-  }
-
-  private classifyValidationError(
-    provider: string,
-    modelId: string,
-    err: unknown,
-  ): ApiKeyValidationResult {
-    const message = err instanceof Error ? err.message : String(err);
-    const normalized = message.toLowerCase();
-
-    if (
-      /\b401\b/.test(normalized) ||
-      /\b403\b/.test(normalized) ||
-      normalized.includes('invalid api key') ||
-      normalized.includes('incorrect api key') ||
-      normalized.includes('authentication failed') ||
-      normalized.includes('invalid_auth') ||
-      normalized.includes('unauthorized') ||
-      normalized.includes('forbidden') ||
-      normalized.includes('invalid credential')
-    ) {
-      return {
-        provider,
-        modelId,
-        valid: false,
-        retryable: false,
-        status: 'invalid_credentials',
-        message,
-      };
-    }
-
-    if (
-      /\b429\b/.test(normalized) ||
-      /\b500\b/.test(normalized) ||
-      /\b502\b/.test(normalized) ||
-      /\b503\b/.test(normalized) ||
-      /\b504\b/.test(normalized) ||
-      normalized.includes('rate limit') ||
-      normalized.includes('timeout') ||
-      normalized.includes('timed out') ||
-      normalized.includes('temporar') ||
-      normalized.includes('overloaded') ||
-      normalized.includes('unavailable') ||
-      normalized.includes('server error') ||
-      normalized.includes('network') ||
-      normalized.includes('econn') ||
-      normalized.includes('enotfound') ||
-      normalized.includes('eai_again')
-    ) {
-      return {
-        provider,
-        modelId,
-        valid: false,
-        retryable: true,
-        status: 'transient_error',
-        message,
-      };
-    }
-
-    return {
-      provider,
-      modelId,
-      valid: false,
-      retryable: false,
-      status: 'resolution_error',
-      message,
-    };
-  }
-
-  private extractSilentValidationError(result: unknown): string | null {
-    if (!result || typeof result !== 'object') return null;
-    const msg = result as Record<string, unknown>;
-    if (msg['stopReason'] !== 'error') return null;
-    const errorMessage = msg['errorMessage'];
-    return typeof errorMessage === 'string'
-      ? errorMessage
-      : 'Provider validation failed';
   }
 }
