@@ -20,11 +20,10 @@
 
 import { ContextManager } from './context-manager.js';
 import type { AgentContext, AgentMessage } from './context-manager.js';
-import { computeCacheBreakpointIndices } from './cache-breakpoints.js';
 import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-breakpoints.js';
 import { EventBridge } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
-import { classifyError, errorMessageOf, toError } from './error-classifier.js';
+import { classifyError, toError } from './error-classifier.js';
 import {
   resolveRetryPolicy,
   backoffForAttempt,
@@ -36,7 +35,6 @@ import type { McpClientManager } from './mcp-client.js';
 import { CompactionManager, buildCompactionConfig } from './compaction/index.js';
 import { isContextOverflow } from './compaction/failsafe.js';
 import type { ObservationalMemoryState, ObservationEvent, ReflectionEvent } from './compaction/observational/types.js';
-import { DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS } from './compaction/observational/index.js';
 import { createRecallTool } from './compaction/observational/recall-tool.js';
 import { SubAgentManager } from './sub-agent-manager.js';
 import type { SkillRegistry } from './skill-registry.js';
@@ -54,6 +52,8 @@ import { createBuiltinTools } from './agent-loop/builtin-tools.js';
 import { ToolRegistry } from './agent-loop/tool-registry.js';
 import { McpAttachment } from './agent-loop/mcp-attachment.js';
 import { DeliveryQueues } from './agent-loop/delivery-queues.js';
+import { ContextPipeline } from './agent-loop/context-pipeline.js';
+import type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
 import { BackgroundDelivery } from './agent-loop/background-delivery.js';
 import type { PendingBackgroundCompletion } from './agent-loop/background-delivery.js';
 import type {
@@ -62,11 +62,9 @@ import type {
   QueuedDelivery,
 } from './agent-loop/delivery-queues.js';
 import {
-  ABORTED,
   AbortState,
   isAbortShapedError,
   LoopGate,
-  raceAbort,
   raceTimeout,
   sleepUnlessAborted,
 } from './agent-loop/run-control.js';
@@ -85,7 +83,6 @@ import type { PiHookHost, ToolResultInterceptor } from './agent-loop/pi-hooks.js
 import { DeadLetterStore } from './agent-loop/delivery-failure.js';
 import { buildBackgroundTaskState } from './agent-loop/background-task-text.js';
 import type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
-import { estimateTokens } from './token-estimator.js';
 import type { CortexToolRuntime } from './tools/runtime.js';
 import { NOOP_LOGGER } from './noop-logger.js';
 import { PromptWatchdogDiagnostics } from './prompt-diagnostics.js';
@@ -142,6 +139,7 @@ import type {
 export type { PiAgent, PiModel, QueueDrainMode } from './agent-loop/pi-agent.js';
 export type { DirectCompletionOptions } from './agent-loop/direct-completion.js';
 export type { DeliverOptions, DeliverOutcome, DeliverResult } from './agent-loop/delivery-queues.js';
+export type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
 export { TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop/pi-hooks.js';
 export type {
   ToolResultInterceptor,
@@ -150,60 +148,9 @@ export type {
 } from './agent-loop/pi-hooks.js';
 
 /**
- * Default hard token cap for the consumer-fed headline block. Injected
- * user-role content is never trimmed by microcompaction, so an unbounded
- * block would inflate utilization (triggering early source compaction)
- * without itself shrinking; the cap is enforced here, not downstream.
- */
-const DEFAULT_HEADLINE_MAX_TOKENS = 2_000;
-
-/** Marker appended when a headline block is cut at its token cap. */
-const HEADLINE_TRUNCATION_MARKER = '\n[headline block truncated]';
-
-/**
  * Legacy fallback for unknown capacity. Explicit budgets have no minimum floor.
  */
 export { MINIMUM_CONTEXT_WINDOW } from './context-budget.js';
-
-/** Options for {@link AgentLoop.digestIdle}. */
-export interface IdleDigestionOptions {
-  /**
-   * Wall-clock budget applied to EACH bounded phase of the digestion
-   * (default 60s): the observer catch-up waits, and then the blocking
-   * threshold pass (activation, reflection, classic summarization). Idle
-   * digestion holds the loop gate, so a hung utility request in either
-   * phase must time the digestion out (the hung call left in flight)
-   * rather than wedge the gate: while the gate is wedged, prompt() fails
-   * fast and parked wake deliveries wait on the sweep behind it. The
-   * timed-out pass is invalidated: if the hung call settles later, its
-   * history mutations are discarded rather than applied over live state.
-   */
-  observerTimeoutMs?: number;
-  /**
-   * Preempts the digestion: when it aborts, the pass stops waiting exactly
-   * as a timeout would (the in-flight call is left to settle and its
-   * mutations are discarded) and releases the gate at once. An owner that
-   * digests in idle windows aborts it when input arrives, so a user's next
-   * words never wait behind background compaction.
-   */
-  signal?: AbortSignal;
-}
-
-/** Result of {@link AgentLoop.digestIdle}. */
-export interface IdleDigestionResult {
-  /**
-   * Whether an observer call ran to completion to buffer unobserved
-   * history. False also covers a wait abandoned at observerTimeoutMs.
-   */
-  observerRan: boolean;
-  /**
-   * Whether the threshold pass changed the durable history (observation
-   * activation trimmed it, or summarization rewrote it).
-   */
-  historyCompacted: boolean;
-  /** Whether the pass was cut short by {@link IdleDigestionOptions.signal}. */
-  preempted?: boolean;
-}
 
 /**
  * Wrap a logger so every message carries the loop's identity prefix. All
@@ -292,28 +239,11 @@ export class AgentLoop {
   // Permission asks blocked on a resolver decision (this loop's and its children's)
   private readonly asks = new PendingAskRegistry();
 
-  // Consumer-fed headline block: rebuilt from the provider on every LLM
-  // call, view-injected after the BP3 cache boundary (never in the cached
-  // prefix, never in the transcript), hard token-capped.
-  private headlineProvider: (() => string | null) | null = null;
   /** Tool-result interceptor and working-tags reminder (pi's afterToolCall). */
   private readonly finalizer: ToolResultFinalizer;
-  private headlineMaxTokens = DEFAULT_HEADLINE_MAX_TOKENS;
 
-  // Set while digestIdle() runs the transform pipeline, so the compaction
-  // manager runs its blocking work (sync observer, summarization) even
-  // under the non-blocking posture: the idle window is exactly where that
-  // work is supposed to happen.
-  private _forceBlockingCompaction = false;
-
-  // Generation token for transform/digestion passes (mirrors the buffering
-  // engine's activationEpoch). A timed-out digestIdle() threshold pass is
-  // abandoned, not cancelled: its hung utility call can settle minutes
-  // later, after the gate released and a real prompt appended messages.
-  // Advancing the generation at abandonment makes that late continuation
-  // discard itself: it must neither rewrite history from its stale
-  // snapshot nor lower _forceBlockingCompaction under a later pass.
-  private _digestionGeneration = 0;
+  // What the model sees on each call: transformContext, headline, idle digestion
+  private readonly pipeline: ContextPipeline;
 
   // Event bridge unsubscribers (for cleanup)
   private eventUnsubscribers: Array<() => void> = [];
@@ -368,12 +298,6 @@ export class AgentLoop {
   // cross-tick prefix caching of conversation history.
   private _prePromptMessageCount: number = 0;
 
-  // Shared state between getTransformContextHook() and the onPayload hook.
-  // Computed in transformContext (which has the transformed message array),
-  // consumed in onPayload (which has the final Anthropic API params).
-  // Stores the API-level message indices where cache_control breakpoints
-  // should be injected (BP2 = after last slot, BP3 = old history boundary).
-  private _cacheBreakpointIndices: CacheBreakpointIndices | null = null;
 
   // Session-lifetime usage plus the last direct completion's usage.
   private readonly usage = new UsageLedger();
@@ -648,6 +572,34 @@ export class AgentLoop {
         this.models.contextWindowLimit ?? this.models.primary.contextWindow,
       ),
       refreshTools: () => this.refreshTools(),
+      logger: this.logger,
+    });
+    this.pipeline = new ContextPipeline({
+      agentState: () => this.agent.state,
+      setAgentMessages: (messages) => {
+        this.agent.state.messages = messages;
+      },
+      slots: this.contextManager,
+      compaction: () => this.compactionManager,
+      injections: () => {
+        const stable: string[] = [];
+        const ephemeral = this.contextManager.getEphemeral();
+        if (ephemeral) stable.push(ephemeral);
+        const skills = this.skills.renderInjection();
+        if (skills) stable.push(skills);
+        // Background task state gives the agent visibility into running
+        // sub-agents and background bash processes.
+        const background = this.buildBackgroundTaskState();
+        return { stable, volatile: background ? [background] : [] };
+      },
+      boundary: () => this._prePromptMessageCount,
+      setBoundary: (boundary) => {
+        this._prePromptMessageCount = boundary;
+      },
+      isPrompting: () => this._isPrompting,
+      gate: this.gate,
+      assertNotShuttingDown: () => this.assertNotShuttingDown(),
+      isShuttingDown: () => this.isShuttingDown(),
       logger: this.logger,
     });
 
@@ -1543,13 +1495,7 @@ export class AgentLoop {
     provider: (() => string | null) | null,
     options?: { maxTokens?: number },
   ): void {
-    this.headlineProvider = provider;
-    if (options?.maxTokens !== undefined) {
-      if (!Number.isFinite(options.maxTokens) || options.maxTokens <= 0) {
-        throw new Error('setHeadlineProvider maxTokens must be a positive finite number');
-      }
-      this.headlineMaxTokens = options.maxTokens;
-    }
+    this.pipeline.headline.set(provider, options);
   }
 
   /**
@@ -1565,31 +1511,6 @@ export class AgentLoop {
    */
   setToolResultInterceptor(interceptor: ToolResultInterceptor | null): void {
     this.finalizer.setInterceptor(interceptor);
-  }
-
-  /**
-   * Build the capped headline injection for the current LLM call, or null
-   * when no provider is set or it produced nothing.
-   */
-  private buildHeadlineInjection(): string | null {
-    if (!this.headlineProvider) return null;
-    let content: string | null;
-    try {
-      content = this.headlineProvider();
-    } catch (err) {
-      this.logger.warn('headline provider threw', {
-        error: errorMessageOf(err),
-      });
-      return null;
-    }
-    if (!content || content.trim().length === 0) return null;
-    if (estimateTokens(content) <= this.headlineMaxTokens) return content;
-    // Hard cap: cut at the estimator's character budget, marker included.
-    const budgetChars = Math.max(
-      0,
-      this.headlineMaxTokens * 4 - HEADLINE_TRUNCATION_MARKER.length,
-    );
-    return content.slice(0, budgetChars) + HEADLINE_TRUNCATION_MARKER;
   }
 
   /**
@@ -1702,7 +1623,7 @@ export class AgentLoop {
       }),
       syncActiveLoopTools: (ctx) => this.tools.syncActiveLoopTools(ctx),
       finalizer: this.finalizer,
-      cacheBreakpointIndices: () => this._cacheBreakpointIndices,
+      cacheBreakpointIndices: () => this.pipeline.cacheBreakpointIndices,
     };
   }
 
@@ -2565,14 +2486,7 @@ export class AgentLoop {
    * internal decision logic.
    */
   estimateCurrentContextTokens(): number {
-    const boundary = this._isPrompting
-      ? this._prePromptMessageCount
-      : this.agent.state.messages.length;
-    const snapshot = this.buildInjectedAndSanitizedContextSnapshot(
-      this.buildAgentContextSnapshot(),
-      boundary,
-    );
-    return this.compactionManager.estimateCurrentContextTokens(snapshot);
+    return this.pipeline.estimateTokens();
   }
 
   /**
@@ -2736,102 +2650,7 @@ export class AgentLoop {
    * appended in the meantime.
    */
   async digestIdle(options?: IdleDigestionOptions): Promise<IdleDigestionResult> {
-    this.assertNotShuttingDown();
-    return this.enqueueLoopTask(async () => {
-      if (this.isShuttingDown()) {
-        return { observerRan: false, historyCompacted: false };
-      }
-      // Every wait below races the owner's preemption signal.
-      const signal = options?.signal;
-      if (signal?.aborted) {
-        return { observerRan: false, historyCompacted: false, preempted: true };
-      }
-
-      // 1. Buffer catch-up (observational only): make sure the expensive
-      // observer work over the unobserved tail is done and chunked, so the
-      // next activation is a cheap merge. Preempting abandons only the
-      // wait, like the timeout: the observer lands its chunk when it
-      // settles.
-      let observerRan = false;
-      if (this.compactionManager.strategy === 'observational') {
-        const outcome = await raceAbort(
-          this.compactionManager.digestPendingObservationBuffers(
-            this.agent.state.messages,
-            this.contextManager.slotCount,
-            options?.observerTimeoutMs,
-          ),
-          signal,
-        );
-        if (outcome === ABORTED) {
-          this.logger.debug('idle digestion preempted during observer catch-up');
-          return { observerRan: false, historyCompacted: false, preempted: true };
-        }
-        observerRan = outcome;
-      }
-      if (signal?.aborted) {
-        return { observerRan, historyCompacted: false, preempted: true };
-      }
-      return this.runDigestionThresholdPass(observerRan, options);
-    });
-  }
-
-  /**
-   * Phase 2 of {@link digestIdle}, under the gate it holds: the threshold
-   * pass, bounded by the timeout and by preemption, which abandon it the
-   * same way.
-   */
-  private async runDigestionThresholdPass(
-    observerRan: boolean,
-    options?: IdleDigestionOptions,
-  ): Promise<IdleDigestionResult> {
-    // 2. Threshold pass: run the same pipeline transformContext runs
-    // against the live source history. Source mutations (activation
-    // trims, summarization rewrites) persist; the returned view is
-    // discarded. _forceBlockingCompaction lets the manager run its
-    // synchronous paths regardless of the configured posture; those
-    // paths block on utility requests (reflection, summarization), so
-    // the pass shares the observer deadline rather than holding the
-    // gate indefinitely behind a hung request.
-    const lengthBefore = this.agent.state.messages.length;
-    const hook = this.getTransformContextHook();
-    const passGeneration = this._digestionGeneration;
-    this._forceBlockingCompaction = true;
-    const thresholdPass = (async () => {
-      try {
-        await hook(this.buildAgentContextSnapshot());
-      } finally {
-        // Only the pass that still owns the current generation may lower
-        // the flag: an abandoned pass settling here while a LATER pass is
-        // mid-flight would otherwise silently degrade that pass to the
-        // non-blocking posture.
-        if (passGeneration === this._digestionGeneration) {
-          this._forceBlockingCompaction = false;
-        }
-      }
-    })();
-    const timeoutMs = options?.observerTimeoutMs ?? DEFAULT_IDLE_DIGESTION_OBSERVER_TIMEOUT_MS;
-    const outcome = await raceTimeout(thresholdPass, timeoutMs, options?.signal);
-    const wasPreempted = outcome === 'aborted';
-    if (outcome !== 'settled') {
-      // Abandoned (timed out or preempted), not cancelled: nothing can
-      // cancel the utility call, so it can still settle minutes from
-      // now, after the gate released and a real prompt appended live
-      // messages. Advance the generation so that late continuation
-      // discards itself instead of replacing live history from its stale
-      // snapshot, and lower the flag for the pass (its own finally is now
-      // stale). The race already swallows the eventual settlement.
-      this._digestionGeneration += 1;
-      this._forceBlockingCompaction = false;
-      if (wasPreempted) {
-        this.logger.debug('idle digestion threshold pass preempted');
-      } else {
-        this.logger.warn('idle digestion threshold pass timed out', { timeoutMs });
-      }
-    }
-    const historyCompacted = this.agent.state.messages.length !== lengthBefore;
-
-    this.logger.debug('idle digestion complete', { observerRan, historyCompacted });
-    return { observerRan, historyCompacted, ...(wasPreempted ? { preempted: true } : {}) };
+    return this.pipeline.digest(options);
   }
 
   /**
@@ -2972,202 +2791,7 @@ export class AgentLoop {
    * @returns An async transformContext function for the Agent constructor
    */
   getTransformContextHook(): (context: AgentContext) => Promise<AgentContext> {
-    const slotCount = this.contextManager.slotCount;
-
-    return async (context: AgentContext): Promise<AgentContext> => {
-      const sourceMessages = context.messages;
-      // Generation this pass runs under. digestIdle() advances it when it
-      // abandons a timed-out pass; from then on this pass's continuation is
-      // stale and must not touch live state (its hung call can settle after
-      // a later prompt appended messages to the same live history).
-      const passGeneration = this._digestionGeneration;
-      const passIsStale = (): boolean => passGeneration !== this._digestionGeneration;
-
-      // Step 0: Apply Tier 1 insertion-time cap to the source messages.
-      // Mutate the active transformContext source array, not only
-      // agent.state.messages. Pi-agent-core keeps its own in-loop
-      // currentContext.messages array and does not replace it with the
-      // transformContext return value, so source mutations must hit this
-      // array to persist for the next turn in the same loop.
-      // passIsStale is threaded in: the aggregate phase awaits a consumer
-      // persistResult, and an abandoned pass settling there must not write
-      // a stale message back into an array a later splice has changed.
-      await this.compactionManager.applyInsertionCap(
-        sourceMessages,
-        slotCount,
-        passIsStale,
-      );
-      if (passIsStale()) return context;
-      this.agent.state.messages = [...sourceMessages];
-
-      // Step 1: Insert ephemeral and skill buffer at the boundary position
-      // (after old history, before new tick content).
-      // This keeps the tick prompt as the last message for better model
-      // attention and enables cross-tick conversation history caching.
-      // Previously, ephemeral was appended at the END of messages, making
-      // it the "last user message" where pi-ai places BP4. That meant
-      // the entire conversation history was cache-WRITTEN but never
-      // cache-READ because the ephemeral prefix changed every tick.
-      const boundary = this._prePromptMessageCount;
-      let result = this.buildInjectedAndSanitizedContextSnapshot(context, boundary);
-
-      // Step 3: Compaction (all three layers integrated)
-      // Source-history compaction operates on the active pi-agent-core loop
-      // transcript and syncs that result back to agent.state.messages. The
-      // returned context alone only affects the immediate LLM call.
-      result = await this.compactionManager.applyInTransformContext(
-        result,
-        // getHistory: extract conversation history (post-slot region)
-        (ctx) => ctx.messages.slice(slotCount),
-        // setHistory: replace conversation history in the context
-        (ctx, history) => ({
-          ...ctx,
-          messages: [...ctx.messages.slice(0, slotCount), ...history],
-        }),
-        // getSourceHistory: get original transcript history from the active
-        // pi-agent-core loop context, not only agent.state.messages.
-        () => sourceMessages.slice(slotCount),
-        // setSourceHistory: replace original transcript after compaction in
-        // both the active loop context and the persisted agent state.
-        // Covers the observational activation trim and sync-observer paths
-        // and the classic summarizer rewrite: all of them land here.
-        (history) => {
-          if (passIsStale()) {
-            // An abandoned digestIdle() pass settling late: its snapshot
-            // predates messages a real prompt has since appended, so this
-            // rewrite would silently destroy them. Discard it.
-            this.logger.warn('discarding history rewrite from an abandoned digestion pass');
-            return;
-          }
-          // Adjust boundary after compaction. This recalculation is exact
-          // only while every rewrite keeps the current tick's messages as a
-          // contiguous suffix of `history`; all setSourceHistory callers
-          // hold that today, and a strategy that breaks it skews the tick
-          // boundary silently.
-          const currentTickCount = sourceMessages.length - this._prePromptMessageCount;
-          sourceMessages.splice(slotCount, sourceMessages.length - slotCount, ...history);
-          this.agent.state.messages = [...sourceMessages];
-          // Recalculate boundary: new total minus current-tick messages
-          this._prePromptMessageCount = Math.max(
-            slotCount,
-            sourceMessages.length - currentTickCount,
-          );
-        },
-        // digestIdle() re-enables blocking work for its pass; otherwise the
-        // manager's configured posture decides. Staleness is threaded so an
-        // abandoned pass suppresses its compaction/observation/reflection
-        // event dispatch: its rewrite is discarded (setSourceHistory
-        // above), and a consumer must never see a compaction reported for
-        // a rewrite that never landed.
-        {
-          ...(this._forceBlockingCompaction ? { allowBlocking: true } : {}),
-          isStale: passIsStale,
-        },
-      );
-      // A pass abandoned while the manager call hung must not mutate the
-      // live observation slot or breakpoint state either; its return value
-      // goes nowhere.
-      if (passIsStale()) return result;
-
-      // After compaction/observation runs, update the observation slot
-      if (this.compactionManager.strategy === 'observational') {
-        const slotContent = this.compactionManager.getObservationSlotContent();
-        if (slotContent) {
-          this.contextManager.setSlot('_observations', slotContent);
-          // Also update the in-memory context for this LLM call so the
-          // returned context reflects post-reflection observation content
-          if (this.compactionManager.hasObservations()) {
-            const obsSlotIndex = this.contextManager.slotCount - 1;
-            if (obsSlotIndex >= 0 && obsSlotIndex < result.messages.length) {
-              result.messages[obsSlotIndex] = { role: 'user', content: slotContent, timestamp: Date.now() };
-            }
-          }
-        }
-      }
-
-      // Step 4: Compute API message indices for cache breakpoints.
-      // Count how messages map from our array to the Anthropic API format
-      // (convertMessages skips empty messages and merges consecutive
-      // toolResults). The indices are consumed by the onPayload hook.
-      //
-      // BP3 covers old history plus the stable injections (ephemeral and
-      // skills, which hold constant across ticks within a turn). Background
-      // task state churns every tick, so it is injected after this boundary
-      // and stays outside the cached prefix.
-      const stableInjectionCount =
-        (this.contextManager.getEphemeral() ? 1 : 0) +
-        (this.skills.loadedCount > 0 ? 1 : 0);
-      this._cacheBreakpointIndices = computeCacheBreakpointIndices(result.messages, {
-        slotCount,
-        boundary: this._prePromptMessageCount + stableInjectionCount,
-      });
-
-      return result;
-    };
-  }
-
-  private buildAgentContextSnapshot(): AgentContext {
-    return {
-      systemPrompt: this.agent.state.systemPrompt ?? '',
-      model: this.agent.state.model ?? null,
-      messages: this.agent.state.messages,
-      tools: (this.agent.state.tools ?? []) as unknown[],
-      thinkingLevel: typeof this.agent.state.thinkingLevel === 'string'
-        ? this.agent.state.thinkingLevel
-        : 'medium',
-    };
-  }
-
-  private buildInjectedAndSanitizedContextSnapshot(
-    context: AgentContext,
-    boundary: number,
-  ): AgentContext {
-    let result = context;
-    const ephemeralContent = this.contextManager.getEphemeral();
-
-    // Build injection messages ordered by stability: ephemeral and skills
-    // hold constant across ticks within a turn, so the BP3 cache breakpoint
-    // can sit after them. Background task state (durations, live output)
-    // churns every tick and must come last, outside the cached prefix.
-    const injections: AgentMessage[] = [];
-    if (ephemeralContent) {
-      injections.push({ role: 'user' as const, content: ephemeralContent, timestamp: Date.now() });
-    }
-    const skills = this.skills.renderInjection();
-    if (skills) {
-      injections.push({ role: 'user' as const, content: skills, timestamp: Date.now() });
-    }
-
-    // Inject background task state so the agent has visibility into
-    // running sub-agents and background bash processes.
-    const backgroundState = this.buildBackgroundTaskState();
-    if (backgroundState) {
-      injections.push({ role: 'user' as const, content: backgroundState, timestamp: Date.now() });
-    }
-
-    // Consumer-fed headline block (facade status lines). Like background
-    // task state it churns every tick, so it rides after the BP3 boundary
-    // (it is NOT counted in stableInjectionCount) while still being built
-    // here so token estimation and compaction utilization see it.
-    const headline = this.buildHeadlineInjection();
-    if (headline) {
-      injections.push({ role: 'user' as const, content: headline, timestamp: Date.now() });
-    }
-
-    if (injections.length > 0) {
-      // Insert at boundary: [...slots + old_history] [injections] [...new_tick_content]
-      const messages = [...result.messages];
-      // boundary may exceed array length on first tick or after reset
-      const insertIdx = Math.min(boundary, messages.length);
-      messages.splice(insertIdx, 0, ...injections);
-      result = { ...result, messages };
-    }
-
-    // Sanitize messages before token estimation or compaction.
-    return {
-      ...result,
-      messages: result.messages.map(withPlaceholderContent),
-    };
+    return this.pipeline.hook();
   }
 
   // Cache breakpoint index computation lives in cache-breakpoints.ts,
@@ -3503,6 +3127,18 @@ export class AgentLoop {
 
   private settlePendingAsk(askId: string): void {
     this.asks.settle(askId);
+  }
+
+  private get headlineProvider(): (() => string | null) | null {
+    return this.pipeline.headline.current;
+  }
+
+  private get _cacheBreakpointIndices(): CacheBreakpointIndices | null {
+    return this.pipeline.cacheBreakpointIndices;
+  }
+
+  private set _cacheBreakpointIndices(indices: CacheBreakpointIndices | null) {
+    this.pipeline.cacheBreakpointIndices = indices;
   }
 
   private get pendingBackgroundResults(): PendingBackgroundCompletion[] {

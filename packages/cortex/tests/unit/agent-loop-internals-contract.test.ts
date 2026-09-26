@@ -50,6 +50,8 @@ const COMPAT: Record<string, Kind> = {
   _abortEpoch: 'accessor',
   pendingWakeDeliveries: 'getter',
   pendingBackgroundResults: 'getter',
+  headlineProvider: 'getter',
+  _cacheBreakpointIndices: 'accessor',
   deliverOrQueueBackgroundCompletion: 'method',
   schedulePendingResultDelivery: 'method',
   drainPendingBackgroundResults: 'method',
