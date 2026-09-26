@@ -150,8 +150,13 @@ export interface PermissionBrokerPorts {
    * carries no ordering guarantee; the consent check scans all of it.
    */
   currentTalkerCauseTags(): readonly CauseTag[];
-  /** Mark the loop-registry pending ask as voiced (tool asks only). */
-  markAskVoiced?(askId: string): void;
+  /** Loop path the voicing's own lifecycle entries are filed under. */
+  talkerLoopPath: string;
+  /**
+   * Remove the talker's parked wake deliveries whose content matches;
+   * returns what was removed (moot voicings, see AskVoicing.retractParked).
+   */
+  dropParkedDeliveries(matches: (content: string) => boolean): string[];
   logger?: CortexLogger;
 }
 
@@ -278,7 +283,7 @@ export class PermissionBroker {
   private readonly askTimeoutMs: number | null;
   private readonly escalationAskTimeoutMs: number | null;
   /** What the user has heard: queue, voiced ask, consent anchors. */
-  private readonly voicing: AskVoicing;
+  readonly voicing: AskVoicing;
 
   private readonly asks = new Map<string, BrokeredAsk>();
   /**
@@ -306,9 +311,8 @@ export class PermissionBroker {
       {
         appendLog: (input) => this.ports.appendLog(input),
         voiceToTalker: (content, causeTag) => this.ports.voiceToTalker(content, causeTag),
-        ...(ports.markAskVoiced
-          ? { markAskVoiced: (askId: string) => this.ports.markAskVoiced!(askId) }
-          : {}),
+        talkerLoopPath: ports.talkerLoopPath,
+        dropParked: (matches) => this.ports.dropParkedDeliveries(matches),
       },
       {
         settleVoiceDelayMs: options?.settleVoiceDelayMs
@@ -544,31 +548,6 @@ export class PermissionBroker {
   // -------------------------------------------------------------------------
 
   /**
-   * Re-read the currently voiced ask to the user (refusal recovery). The
-   * anchor does not move; damped (AskVoicing.revoiceCurrent).
-   */
-  revoiceCurrent(): void {
-    this.voicing.revoiceCurrent();
-  }
-
-  /**
-   * The current voicing never reached the user: withdraw its anchor and
-   * read it out again (AskVoicing.noteLost). Returns whether an ask was
-   * affected.
-   */
-  noteVoicingLost(): boolean {
-    return this.voicing.noteLost();
-  }
-
-  /**
-   * Destroyed delivery content from the loop's dead-letter surface; a match
-   * with the current voicing is a lost voicing (AskVoicing.noteDestroyed).
-   */
-  noteDeliveryDestroyed(content: string): boolean {
-    return this.voicing.noteDestroyed(content);
-  }
-
-  /**
    * Settle every pending ask as deny (facade abort, restore, or teardown).
    * Tool asks also settle through their own abort signals; double settlement
    * is guarded. Never leaves a resolver hanging.
@@ -595,6 +574,7 @@ export class PermissionBroker {
   /** Facade restore(): the pending asks belong to the replaced session. */
   reset(): void {
     this.settleAll('restore');
+    this.voicing.resetForRestore();
   }
 
   destroy(): void {
@@ -616,7 +596,7 @@ export class PermissionBroker {
    * hand-off that threw) still reports true while the broker has decided the
    * user never heard it. The anchor is the broker's own answer to "could the
    * user have heard this", it is what the D16 consent check reads, and
-   * {@link noteVoicingLost} withdraws it.
+   * AskVoicing.noteLost withdraws it.
    */
   getPendingAsks(): Array<PendingAsk & { kind: BrokeredAskKind; voicedAtSeq: number | null }> {
     return [...this.asks.values()].map((ask) => ({

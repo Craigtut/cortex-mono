@@ -645,6 +645,31 @@ describe('scenario: permission brokering through conversation', () => {
     expect(answer.causedBy).toBe(yes.seq);
   });
 
+  it('reports a read-out tool ask as voiced on the consumer surface, from the broker', async () => {
+    const h = brokeredScenario();
+    h.reasonerPi.script = [
+      { text: 'Deploying.', calls: [{ name: 'Deploy', args: { command: 'ship --prod' } }] },
+      { text: 'Stopped.' },
+    ];
+    h.talkerPi.script = [
+      { text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'deploy' } }] },
+      { text: 'It wants to run ship --prod. Allow that?' },
+    ];
+    await h.facade.prompt('please deploy');
+    await waitUntil(() => entriesOfType(h.facade, 'ask').length === 1, 2000, 'ask raised');
+    await waitUntil(() => !h.talkerLoop.isLoopActive, 2000, 'request read out');
+    const askId = pendingAskId(h.facade);
+
+    // Duplex never marks the loop registry: whether the user heard a
+    // request is the broker's fact, and the facade overlays it.
+    expect(h.reasonerLoop.getPendingAsks()).toMatchObject([{ askId, voiced: false }]);
+    expect(h.facade.getPendingAsks()).toMatchObject([{ askId, voiced: true }]);
+    expect(h.facade.getPendingAsks()).toHaveLength(1);
+
+    getBroker(h.facade).answer(askId, 'deny', undefined);
+    await waitUntil(() => h.facade.getPendingAsks().length === 0, 2000, 'ask settled');
+  });
+
   it('an unanswered ask times out as a deny the reasoner can see', async () => {
     const h = brokeredScenario({ askTimeoutMs: 40 });
     h.reasonerPi.script = [

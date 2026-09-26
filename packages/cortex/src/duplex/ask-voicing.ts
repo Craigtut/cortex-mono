@@ -4,11 +4,13 @@
  *
  * Exactly one ask is voiced at a time; the rest queue behind it. For each
  * ask this owns the consent anchor (the `ask_voiced` entry a qualifying
- * utterance must follow), the sticky "was ever voiced" flag, and the text of
- * the last voicing handed over, which is how a destroyed delivery is
- * recognized as a lost voicing. The broker owns the asks and their
- * settlement; it asks this module who is voiced and whether they could have
- * heard it.
+ * utterance must follow) and the sticky "was ever voiced" flag. For the
+ * conversation surface it owns the ledger of voicing texts handed to the
+ * talker, which is how a destroyed delivery is recognized as a lost voicing
+ * and how a voicing parked behind a busy talker is found and retracted once
+ * its ask is gone, and the hold a conversation abort puts on reading a
+ * request out. The broker owns the asks and their settlement; it asks this
+ * module who is voiced and whether they could have heard it.
  */
 
 import type { CortexLogger } from '../types.js';
@@ -30,6 +32,16 @@ import type { BrokeredAskKind, BrokerLogInput } from './permission-broker.js';
  * construction.
  */
 const REVOICE_MIN_INTERVAL_MS = 3_000;
+
+/**
+ * Cap on the voicing-text ledger. It exists only to recognize the session's
+ * own voicings among the talker's PARKED deliveries, which a run drains at
+ * the next turn, so the live window is a handful at most. An evicted text
+ * degrades to "not recognized as a voicing", which leaves a moot request
+ * readable rather than dropping something else: the safe direction for a
+ * bounded cache to fail in.
+ */
+const MAX_LEDGER_ENTRIES = 32;
 
 /** What voicing needs of one pending ask. */
 export interface VoiceableAsk {
@@ -56,8 +68,6 @@ export interface AskVoicingState {
 
 interface VoicingRecord extends AskVoicingState {
   ask: VoiceableAsk;
-  /** The exact text of the last voicing handed over; null while unheard. */
-  lastVoicingText: string | null;
   /** Clock stamp of the last voicing delivery, for revoice damping. */
   lastVoicedAtMs: number;
 }
@@ -69,8 +79,13 @@ export interface AskVoicingPorts {
    * carrying its ask-kind cause tag. A throw means nothing reached the user.
    */
   voiceToTalker(content: string, causeTag: CauseTag): void;
-  /** Mark the loop-registry pending ask as voiced (tool asks only). */
-  markAskVoiced?(askId: string): void;
+  /** Loop path the voicing's own lifecycle entries are filed under. */
+  talkerLoopPath: string;
+  /**
+   * Remove the talker's parked wake deliveries whose content matches;
+   * returns what was removed.
+   */
+  dropParked(matches: (content: string) => boolean): string[];
 }
 
 export interface AskVoicingOptions {
@@ -94,6 +109,18 @@ export class AskVoicing {
   private draining = false;
   /** Re-entrancy guard for lost-voicing recovery (see noteLost). */
   private revoicingLostVoicing = false;
+  /**
+   * Voicing texts handed to the talker and the ask each voices, FIFO and
+   * bounded (Maps iterate in insertion order). Keyed by exact text because
+   * the loop's surfaces carry no delivery id.
+   */
+  private readonly ledger = new Map<string, string>();
+  /**
+   * A conversation abort silenced the voiced request: it is pending, silent
+   * and un-anchored, and is read out again the next time the conversation
+   * surface receives input (see hold).
+   */
+  private held = false;
   private destroyed = false;
 
   constructor(ports: AskVoicingPorts, options: AskVoicingOptions) {
@@ -107,7 +134,6 @@ export class AskVoicing {
       ask,
       voiced: false,
       voicedAtSeq: null,
-      lastVoicingText: null,
       lastVoicedAtMs: 0,
     });
     this.queue.push(ask.askId);
@@ -172,7 +198,6 @@ export class AskVoicing {
     const record = this.records.get(this.voicedAskId);
     if (!record) return false;
     record.voicedAtSeq = null;
-    record.lastVoicingText = null;
     // Re-entrancy guard: the re-delivery below can itself be destroyed
     // synchronously (a re-voice landing inside an abort that is still
     // draining), and an un-anchored ask is already safe, so the recovery
@@ -195,10 +220,87 @@ export class AskVoicing {
    * ignored. Returns whether it matched the current voicing.
    */
   noteDestroyed(content: string): boolean {
-    if (this.voicedAskId === null) return false;
-    const record = this.records.get(this.voicedAskId);
-    if (!record || record.lastVoicingText === null || record.lastVoicingText !== content) return false;
+    if (this.voicedAskId === null || this.ledger.get(content) !== this.voicedAskId) return false;
+    this.ledger.delete(content);
     return this.noteLost();
+  }
+
+  /**
+   * Conversation abort with a voiced ask still pending on live work.
+   *
+   * Two facts have to come apart here. The user never heard this request
+   * (its voicing went with the talker's queues, or its read-out turn was
+   * aborted mid-sentence), so the consent anchor must be withdrawn NOW:
+   * left standing, the user's next words would satisfy D16's "an utterance
+   * after the voicing" test for a request nobody read to them. But the user
+   * just said stop, and following that with the agent immediately talking
+   * again is the opposite of what they asked for.
+   *
+   * So the anchor is withdrawn and the read-out is not performed: the ask
+   * stays pending, silent and answerable with no anchor, visible in the
+   * headline block and bounded by its own timeout, until {@link reopen}.
+   */
+  hold(): void {
+    if (this.destroyed || this.draining || this.voicedAskId === null) return;
+    const record = this.records.get(this.voicedAskId);
+    if (!record) return;
+    record.voicedAtSeq = null;
+    this.held = true;
+    this.ports.appendLog({
+      type: 'lifecycle',
+      loopPath: this.ports.talkerLoopPath,
+      content: 'Permission request held silent after a conversation abort; ' +
+        'it will be read out again when the conversation reopens',
+      data: { event: 'ask_voicing_deferred', reason: 'conversation_abort' },
+    });
+  }
+
+  /**
+   * The conversation surface just received input, so the channel is open
+   * again: read out any request {@link hold} silenced. Called after the
+   * input is handed to the talker, so the voicing parks behind that run and
+   * arrives carrying its ask cause tag, which is what stops the same run
+   * from granting the request it is about to read. A lost-voicing re-read
+   * rather than {@link revoiceCurrent}: the anchor is already withdrawn and
+   * this re-read must take a fresh one, and it must not be swallowed by the
+   * re-voice damping window.
+   */
+  reopen(): void {
+    if (!this.held) return;
+    this.held = false;
+    this.noteLost();
+  }
+
+  /**
+   * Retract voicings still parked on the talker after their asks were
+   * settled wholesale. Only the session's own voicing texts are matched, so
+   * a parked user utterance (and the cause tag that makes it able to grant
+   * consent) is left exactly where it is.
+   */
+  retractParked(reason: 'abort' | 'restore'): void {
+    if (this.ledger.size === 0) return;
+    const dropped = this.ports.dropParked((content) => this.ledger.has(content));
+    // Every ask is gone, so every remembered voicing is moot whether or not
+    // it was still parked.
+    this.ledger.clear();
+    if (dropped.length === 0) return;
+    this.ports.appendLog({
+      type: 'lifecycle',
+      loopPath: this.ports.talkerLoopPath,
+      content: `${dropped.length} permission voicing(s) dropped by ${reason}: their requests are settled`,
+      data: { event: 'ask_voicing_dropped', reason, count: dropped.length },
+    });
+  }
+
+  /** The talker's queues were cleared: nothing of ours is parked any more. */
+  noteParkedCleared(): void {
+    this.ledger.clear();
+  }
+
+  /** A restore: nothing is held and nothing parked is ours any more. */
+  resetForRestore(): void {
+    this.ledger.clear();
+    this.held = false;
   }
 
   /**
@@ -237,23 +339,14 @@ export class AskVoicing {
 
   /**
    * Voice (or re-voice) one ask and commit the voiced state only once the
-   * talker has accepted the hand-off. `voiced`, the loop-registry sync, and
-   * the consent anchor all assert "the user could have heard this", so a
-   * delivery that threw must set none of them.
+   * talker has accepted the hand-off. `voiced` and the consent anchor both
+   * assert "the user could have heard this", so a delivery that threw must
+   * set neither.
    */
   private voice(record: VoicingRecord): boolean {
     const firstVoicing = !record.voiced;
     if (!this.deliverVoicing(record, !firstVoicing)) return false;
-    if (firstVoicing) {
-      record.voiced = true;
-      try {
-        this.ports.markAskVoiced?.(record.ask.askId);
-      } catch (err) {
-        this.options.logger.warn('markAskVoiced port threw', {
-          error: errorMessageOf(err),
-        });
-      }
-    }
+    record.voiced = true;
     return true;
   }
 
@@ -308,7 +401,6 @@ export class AskVoicing {
       // talker would grant a request nobody ever read out. The ask itself
       // stays pending and answerable, and timeout/abort still bound it.
       record.voicedAtSeq = null;
-      record.lastVoicingText = null;
       this.options.logger.error('ask voicing delivery failed', {
         askId: ask.askId,
         error: errorMessageOf(err),
@@ -316,8 +408,20 @@ export class AskVoicing {
       return false;
     }
     if (anchoring) record.voicedAtSeq = anchorSeq;
-    record.lastVoicingText = text;
+    this.remember(text, ask.askId);
+    // A voicing reached the talker, so nothing is being held any more.
+    this.held = false;
     return true;
+  }
+
+  private remember(text: string, askId: string): void {
+    this.ledger.delete(text);
+    this.ledger.set(text, askId);
+    while (this.ledger.size > MAX_LEDGER_ENTRIES) {
+      const oldest = this.ledger.keys().next().value;
+      if (oldest === undefined) break;
+      this.ledger.delete(oldest);
+    }
   }
 
   private scheduleVoiceNext(): void {

@@ -107,11 +107,13 @@ export function makeTestRouterPorts(
 
 /**
  * The broker-side ports the duplex session supplies in production: the
- * reserved ask lane into the talker and the loop-registry voiced sync.
+ * reserved ask lane into the talker, and the talker's parked deliveries
+ * (for retracting moot voicings). Parked-delivery retraction defaults to
+ * "nothing parked", since these harnesses have no talker queue.
  */
 export interface TestVoicingPorts {
   voiceAskToTalker(content: string, causeTag: CauseTag): void;
-  markAskVoiced?(askId: string): void;
+  dropParkedDeliveries?(matches: (content: string) => boolean): string[];
 }
 
 /**
@@ -128,10 +130,10 @@ export function makeTestRouter(
 ): { router: DuplexRouter; broker: PermissionBroker } {
   // Descriptors, not a rest spread: a spread would read an idleSignal
   // getter once here and pin it (see makeTestRouterPorts).
-  const { voiceAskToTalker: voiceDescriptor, markAskVoiced: markDescriptor, ...routerDescriptors } =
+  const { voiceAskToTalker: voiceDescriptor, dropParkedDeliveries: dropDescriptor, ...routerDescriptors } =
     Object.getOwnPropertyDescriptors(overrides);
   const voiceAskToTalker = voiceDescriptor?.value as TestVoicingPorts['voiceAskToTalker'] | undefined;
-  const markAskVoiced = markDescriptor?.value as TestVoicingPorts['markAskVoiced'] | undefined;
+  const dropParked = dropDescriptor?.value as TestVoicingPorts['dropParkedDeliveries'] | undefined;
   const brokerRef: { broker: PermissionBroker | null } = { broker: null };
   const ports = makeTestRouterPorts({
     answerAsk: (askId, decision, reason) => brokerRef.broker!.answer(askId, decision, reason),
@@ -159,7 +161,8 @@ export function makeTestRouter(
       voiceAskToTalker(content, causeTag);
     },
     currentTalkerCauseTags: () => ports.currentTalkerCauseTags(),
-    ...(markAskVoiced ? { markAskVoiced } : {}),
+    talkerLoopPath: ports.talkerLoopPath ?? 'talker',
+    dropParkedDeliveries: (matches) => dropParked?.(matches) ?? [],
   }, brokerOptions);
   brokerRef.broker = broker;
   return { router, broker };

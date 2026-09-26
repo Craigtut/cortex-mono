@@ -58,23 +58,6 @@ import { ReasonerOutcomeReporter } from './reasoner-outcomes.js';
 import { errorMessageOf } from '../error-classifier.js';
 import type { CortexAbortScope, CortexDeliverOptions } from '../cortex-agent.js';
 
-/**
- * Why a voicing hand-off was refused. Surfaces in the broker's delivery-failed
- * log line, so a deliberate hold reads as one rather than as a talker fault.
- */
-const ASK_VOICING_HELD_REASON =
-  'conversation aborted; the permission request is held until the conversation reopens';
-
-/**
- * Cap on remembered ask-voicing texts. They exist only to recognize the
- * session's own content among the talker's PARKED deliveries, which a run
- * drains at the next turn, so the live window is a handful at most. An
- * evicted text degrades to "not recognized as a voicing", which leaves a
- * moot request readable rather than dropping something else: the safe
- * direction for a bounded cache to fail in.
- */
-const MAX_TRACKED_ASK_VOICINGS = 32;
-
 /** What the session needs of the facade that hosts it. */
 export interface DuplexSessionServices {
   readonly recorder: LogRecorder;
@@ -125,22 +108,6 @@ export class DuplexSession {
   private consumerBasePrompt: string | null;
   /** Lazily-built D6 fan-out view over both loops' context managers. */
   private fanOutContextManager: FanOutContextManager | null = null;
-  /**
-   * Ask-voicing texts handed to the talker, so the session can recognize
-   * its own voicings among the talker's parked deliveries and retract the
-   * ones an abort has made moot. Bounded; see MAX_TRACKED_ASK_VOICINGS.
-   */
-  private readonly trackedAskVoicings = new Set<string>();
-  /** True while a conversation abort is refusing voicing hand-offs. */
-  private askVoicingHeld = false;
-  /**
-   * A voicing was withheld by a conversation abort and the request is now
-   * pending and silent. It is read out again the next time the conversation
-   * surface receives input, which is the next moment the agent is talking to
-   * the user anyway.
-   */
-  private deferredAskVoicing = false;
-
   constructor(
     reasoner: AgentLoop,
     talker: AgentLoop,
@@ -217,11 +184,10 @@ export class DuplexSession {
       delegations: () => this.router.getDelegations(),
       // The BROKER, not the facade's merged consumer view. The broker holds
       // every ask (tool, escalation, network, so a blocked egress wait is
-      // visible here too) and is the authority on whether one has actually
-      // been read out: the loop registry's `voiced` is set at hand-off and
-      // never cleared, so a voicing the broker later withdrew still reads as
-      // heard there, and the block would offer a request as answerable that
-      // the router would refuse an answer for.
+      // visible here too) and its consent anchor is the authority on whether
+      // one could have been heard: the sticky `voiced` flag keeps reading
+      // true after a voicing is lost, and the block would offer a request as
+      // answerable that the broker would refuse an answer for.
       pendingAsks: () => this.broker.getPendingAsks(),
     });
     this.outcomes = new ReasonerOutcomeReporter({
@@ -297,7 +263,7 @@ export class DuplexSession {
   }
 
   private brokerPorts(): PermissionBrokerPorts {
-    const { talker, reasoner } = this;
+    const { talker } = this;
     return {
       appendLog: (input) => this.recorder.append({
         type: input.type,
@@ -315,26 +281,12 @@ export class DuplexSession {
       // instead of talking over it.
       voiceToTalker: (content, causeTag) => {
         this.router.stampReservedLane();
-        if (this.askVoicingHeld) {
-          // A conversation abort just happened: the user said stop, so the
-          // request is not read out now. Refusing the hand-off is how the
-          // ask stays SAFE while it stays quiet: the broker treats a throw
-          // as "nothing reached the user" and withdraws the consent anchor,
-          // which is exactly true here. Delivering and then discarding
-          // would leave the ask anchored for a voicing nobody heard.
-          throw new Error(ASK_VOICING_HELD_REASON);
-        }
-        this.deferredAskVoicing = false;
-        this.trackAskVoicing(content);
         this.digestion.preempt();
         talker.deliver(content, { wake: true, causeTag });
       },
       currentTalkerCauseTags: () => collectCauseTags(talker.activeRunCauseTags),
-      // Keep the loop registry's voiced flag truthful for tool asks so
-      // headline and consumer surfaces show what has been read out.
-      markAskVoiced: (askId) => {
-        reasoner.markAskVoiced(askId);
-      },
+      talkerLoopPath: talker.loopPath,
+      dropParkedDeliveries: (matches) => talker.dropPendingWakeDeliveries(matches),
       logger: this.logger,
     };
   }
@@ -373,7 +325,7 @@ export class DuplexSession {
       // the broker still counts as read out. The broker withdraws its
       // consent anchor and reads it again (D16 anchor rules).
       if (result.kind === 'wake_delivery') {
-        this.broker.noteDeliveryDestroyed(result.message);
+        this.broker.voicing.noteDestroyed(result.message);
       }
     });
 
@@ -475,7 +427,7 @@ export class DuplexSession {
       });
       // The user is back, so a request an abort silenced is read out again,
       // behind this input rather than ahead of it.
-      this.reopenHeldAskVoicing();
+      this.broker.voicing.reopen();
       if (result.outcome === 'prompted' && result.turn) {
         return await result.turn;
       }
@@ -571,7 +523,7 @@ export class DuplexSession {
     // A waking delivery reopens the conversation channel, so a request an
     // abort silenced is read out behind it. A silent one does not: nothing
     // is being said to the user yet.
-    if (options?.wake !== false) this.reopenHeldAskVoicing();
+    if (options?.wake !== false) this.broker.voicing.reopen();
     return result;
   }
 
@@ -610,7 +562,7 @@ export class DuplexSession {
       router.dropPendingDeliveries();
       this.recorder.recordDroppedQueue(talker, 'abort', talker.clearAllQueues());
       // Everything parked is gone, voicings included.
-      this.trackedAskVoicings.clear();
+      this.broker.voicing.noteParkedCleared();
       work.push(talker.abort());
       // Quick lookups belong to the conversation surface (abort table):
       // cancelled here, untouched by a 'work' abort.
@@ -643,15 +595,17 @@ export class DuplexSession {
       // busy talker outlives its ask, gets read out afterwards, and the
       // user's answer then lands in an empty registry and is told there
       // is nothing pending. Retract the voicings with their asks.
-      this.dropMootAskVoicings('abort');
+      this.broker.voicing.retractParked('abort');
     }
     try {
       await Promise.all(work);
     } finally {
       this.outcomes.abortUnwound('user');
     }
+    // The user said stop, so a request whose voicing went with the
+    // talker's queues is held silent rather than read straight back out.
     if (scope === 'conversation') {
-      this.holdVoicingForReopen();
+      this.broker.voicing.hold();
     }
   }
 
@@ -701,104 +655,6 @@ export class DuplexSession {
   }
 
   // -------------------------------------------------------------------------
-  // Ask voicing on the conversation surface
-  // -------------------------------------------------------------------------
-
-  /**
-   * Remember a voicing text so the session can recognize it later among the
-   * talker's parked deliveries. FIFO-bounded (Sets iterate insertion-order).
-   */
-  private trackAskVoicing(content: string): void {
-    this.trackedAskVoicings.add(content);
-    while (this.trackedAskVoicings.size > MAX_TRACKED_ASK_VOICINGS) {
-      const oldest = this.trackedAskVoicings.values().next().value;
-      if (oldest === undefined) break;
-      this.trackedAskVoicings.delete(oldest);
-    }
-  }
-
-  /**
-   * Retract ask voicings still parked on the talker after their asks were
-   * settled wholesale. Only the session's own voicing texts are matched, so
-   * a parked user utterance (and the cause tag that makes it able to grant
-   * consent) is left exactly where it is.
-   */
-  private dropMootAskVoicings(reason: 'abort' | 'restore'): void {
-    const talker = this.talker;
-    if (this.trackedAskVoicings.size === 0) return;
-    const dropped = talker.dropPendingWakeDeliveries(
-      (content) => this.trackedAskVoicings.has(content),
-    );
-    // Every ask is gone, so every remembered voicing is moot whether or not
-    // it was still parked.
-    this.trackedAskVoicings.clear();
-    if (dropped.length === 0) return;
-    this.recorder.append({
-      type: 'lifecycle',
-      loopPath: talker.loopPath,
-      content: `${dropped.length} permission voicing(s) dropped by ${reason}: their requests are settled`,
-      data: { event: 'ask_voicing_dropped', reason, count: dropped.length },
-      causedBy: null,
-    });
-  }
-
-  /**
-   * Conversation abort with a voiced ask still pending on live work.
-   *
-   * Two facts have to come apart here. The user never heard this request
-   * (its voicing went with the talker's queues, or its read-out turn was
-   * aborted mid-sentence), so the consent anchor must be withdrawn NOW:
-   * left standing, the user's next words would satisfy D16's "an utterance
-   * after the voicing" test for a request nobody read to them. But the user
-   * just said stop, and following that with the agent immediately talking
-   * again is the opposite of what they asked for.
-   *
-   * So the anchor is withdrawn and the read-out is not performed. Holding
-   * the hand-off is what keeps those consistent: the broker's contract is
-   * that a refused hand-off means nothing reached the user, which is
-   * literally true, and it leaves the ask pending, silent and answerable
-   * with no anchor. The request is read out again at the next conversation
-   * opening ({@link reopenHeldAskVoicing}); until then it is still visible
-   * in the headline block and still bounded by its own timeout.
-   */
-  private holdVoicingForReopen(): void {
-    const broker = this.broker;
-    this.askVoicingHeld = true;
-    let held: boolean;
-    try {
-      held = broker.noteVoicingLost();
-    } finally {
-      this.askVoicingHeld = false;
-    }
-    if (!held) return;
-    this.deferredAskVoicing = true;
-    this.recorder.append({
-      type: 'lifecycle',
-      loopPath: this.talker.loopPath,
-      content: 'Permission request held silent after a conversation abort; ' +
-        'it will be read out again when the conversation reopens',
-      data: { event: 'ask_voicing_deferred', reason: 'conversation_abort' },
-      causedBy: null,
-    });
-  }
-
-  /**
-   * The conversation surface just received input, so the channel is open
-   * again: read out any request {@link holdVoicingForReopen} silenced.
-   * Called after the input is handed to the talker, so the voicing parks
-   * behind that run and arrives carrying its ask cause tag, which is what
-   * stops the same run from granting the request it is about to read.
-   */
-  private reopenHeldAskVoicing(): void {
-    if (!this.deferredAskVoicing) return;
-    this.deferredAskVoicing = false;
-    // noteVoicingLost rather than revoiceCurrent: the anchor is already
-    // withdrawn and this re-read must take a fresh one, and it must not be
-    // swallowed by the re-voice damping window the abort just stamped.
-    this.broker.noteVoicingLost();
-  }
-
-  // -------------------------------------------------------------------------
   // Reads
   // -------------------------------------------------------------------------
 
@@ -824,7 +680,11 @@ export class DuplexSession {
    * does not own.
    */
   pendingAsks(): PendingAsk[] {
-    const asks = this.reasoner.getPendingAsks();
+    // Whether the user was ever read an ask is the broker's fact (the loop
+    // registry's flag is never set in duplex), so it is overlaid here.
+    const { voicing } = this.broker;
+    const asks = this.reasoner.getPendingAsks().map((ask) =>
+      (ask.voiced || !voicing.stateOf(ask.askId).voiced ? ask : { ...ask, voiced: true }));
     const mirrored = new Set(asks.map((ask) => ask.askId));
     const brokerOnly = this.broker.getPendingAsks()
       .filter((ask) => !mirrored.has(ask.askId))
@@ -1006,8 +866,6 @@ export class DuplexSession {
     this.restoreRouterState(routerState);
     this.aggregate.resetForRestore();
     this.guards.resetForRestore();
-    this.trackedAskVoicings.clear();
-    this.deferredAskVoicing = false;
   }
 
   /**

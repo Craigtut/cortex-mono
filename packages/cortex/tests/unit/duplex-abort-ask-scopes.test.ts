@@ -67,6 +67,9 @@ describe('abort scope and the broker drain', () => {
       { askId: 'ask-egress', voicedAtSeq: null },
     ]);
     expect(lifecycleEvents(h.facade, 'ask_voicing_deferred')).toHaveLength(1);
+    // Holding is not a voicing attempt: no second ask_voiced entry is
+    // written for a read-out that deliberately did not happen.
+    expect(lifecycleEvents(h.facade, 'ask_voiced')).toHaveLength(1);
   });
 
   for (const scope of ['work', 'all'] as const) {
