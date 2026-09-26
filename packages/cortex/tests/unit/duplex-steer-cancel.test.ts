@@ -7,6 +7,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   createDuplexScenario,
   destroyLiveFacades,
+  duplexRouterOf,
   entriesOfType,
   lifecycleEvents,
   promptTexts,
@@ -242,5 +243,27 @@ describe('cancel_task and background work the cancelled task started', () => {
     expect(dropped).toContain('The helper found 40 stale shards.');
     expect(entriesOfType(h.facade, 'delivery').map((entry) => entry.content))
       .not.toContain('The helper found 40 stale shards.');
+  });
+});
+
+describe('cancel_task ordering', () => {
+  it('marks the task cancelled before its directive reaches log subscribers', async () => {
+    const h = createDuplexScenario();
+    h.reasonerPi.hold = true;
+    h.talkerPi.script = [{ text: 'On it.', calls: [{ name: 'spawn_task', args: { instructions: 'rebuild the index' } }] }];
+    await h.facade.prompt('rebuild the index');
+    await waitUntil(() => h.reasonerPi.promptCalls.length === 1, 2000, 'work started');
+
+    const seenAtEntry: boolean[] = [];
+    h.facade.subscribeLog((event) => {
+      if (event.kind !== 'entry') return;
+      if ((event.entry.data as { tool?: string } | undefined)?.tool !== 'cancel_task') return;
+      seenAtEntry.push(duplexRouterOf(h.facade).getDelegations()[0]!.cancelled);
+    });
+    h.talkerPi.script = [{ text: 'Cancelling.', calls: [{ name: 'cancel_task', args: { taskAlias: 'task-1' } }] }];
+    await h.facade.prompt('cancel that');
+    expect(seenAtEntry).toEqual([true]);
+    h.reasonerPi.releaseRun();
+    await waitUntil(() => !h.reasonerLoop.isLoopActive, 2000, 'reasoner idle');
   });
 });

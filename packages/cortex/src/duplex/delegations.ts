@@ -116,15 +116,19 @@ export class DelegationRegistry {
   }
 
   /**
-   * A cancel: whatever the reasoner says in answer to it belongs to the
-   * cancelled task too, so the cancel directive's seq joins it and its
-   * results are dropped with the rest.
+   * A cancel. The delegation is marked cancelled first and the cancel
+   * directive logged after (`logDirective` appends it and returns its seq),
+   * so anything reacting to that entry already sees the task as cancelled.
+   * Whatever the reasoner says in answer to the cancel belongs to the
+   * cancelled task too, so the directive's seq then joins it and its
+   * results are dropped with the rest. Returns the directive's seq.
    */
-  markCancelled(alias: string, seq: number): void {
+  markCancelled(alias: string, logDirective: () => number): number {
     const delegation = this.delegations.get(alias);
-    if (!delegation) return;
-    delegation.cancelled = true;
-    delegation.directiveSeqs.add(seq);
+    if (delegation) delegation.cancelled = true;
+    const seq = logDirective();
+    delegation?.directiveSeqs.add(seq);
+    return seq;
   }
 
   /** Find a delegation by alias, case-insensitively. */

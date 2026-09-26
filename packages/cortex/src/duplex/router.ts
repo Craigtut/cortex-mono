@@ -293,14 +293,13 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     }
     // No delegation caps: a cancel reduces work, and refusing a user's stop
     // request on a rate cap would be the worse failure.
-    const seq = this.ports.appendLog({
+    const seq = this.delegations.markCancelled(delegation.alias, () => this.ports.appendLog({
       type: 'directive',
       loopPath: this.talkerLoopPath,
       content: `cancel_task ${delegation.alias}`,
       data: { tool: 'cancel_task', alias: delegation.alias },
       ...this.talkerCause(),
-    });
-    this.delegations.markCancelled(delegation.alias, seq);
+    }));
     // A live run doing nothing but cancelled work is stopped outright; one
     // that also serves live work gets the stop at its next turn boundary.
     const liveRunCancelled = this.delegations.servesOnlyCancelled(this.ports.currentReasonerCauseTags());

@@ -26,7 +26,7 @@ describe('DelegationRegistry', () => {
     reg.open(a, 'a', 1);
     const b = reg.reserveAlias();
     reg.open(b, 'b', 2);
-    reg.markCancelled(a, 3);
+    reg.markCancelled(a, () => 3);
     expect(reg.servesOnlyCancelled([{ kind: 'directive', seq: 1 }, { kind: 'directive', seq: 3 }])).toBe(true);
     expect(reg.servesOnlyCancelled([{ kind: 'directive', seq: 1 }, { kind: 'directive', seq: 2 }])).toBe(false);
     expect(reg.servesOnlyCancelled([{ kind: 'utterance', seq: 1 }])).toBe(false);
