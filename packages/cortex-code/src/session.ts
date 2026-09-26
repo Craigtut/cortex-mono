@@ -29,7 +29,7 @@ import { CredentialStore } from './config/credentials.js';
 import { ApiKeyResolver } from './providers/api-key-resolver.js';
 import { PermissionBroker } from './permissions/prompt-broker.js';
 import { discoverProjectContext } from './discovery/context.js';
-import { generateSessionId, createToolResultPersistor } from './persistence/sessions.js';
+import { generateSessionId } from './persistence/sessions.js';
 import { SessionCheckpoints } from './persistence/session-checkpoints.js';
 import { TranscriptWriter } from './persistence/transcript-writer.js';
 import { getCommand, registerBuiltinCommands } from './commands/index.js';
@@ -51,6 +51,7 @@ import { SubAgentActivity } from './session/sub-agent-activity.js';
 import { AssistantStream } from './session/assistant-stream.js';
 import { TurnRunner } from './session/turn-runner.js';
 import { wireAgentEvents } from './session/agent-events.js';
+import { buildAgentConfig } from './session/agent-config.js';
 import { SessionStatusView, readGitBranch } from './session/status-view.js';
 import { RetryStatusLine } from './session/retry-status.js';
 import { ModelSelection } from './session/model-selection.js';
@@ -616,58 +617,25 @@ export class Session {
   /**
    * The config handed to CortexAgent.create(). Separate from start() so the
    * mode is assertable without standing up a TUI and a sandbox.
-   *
-   * `mode` is passed explicitly rather than left to the facade default, which
-   * is duplex. See {@link agentMode} for why, and for the single place that
-   * decision is written down.
    */
   private buildAgentConfig(): CortexAgentConfig {
-    const diagnostics = this.buildDiagnosticsConfig();
-    const sandboxOptions = this.sandbox.getAgentOptions();
-    return {
-      // No `duplex.maxTotalCost`, and that is a decision rather than an
-      // omission. The facade's aggregate guard is uncapped without it, so a
-      // duplex session runs two resident loops, sub-agents, lookups and
-      // doubled observational spend with no session ceiling. Re-taken now
-      // that `--duplex` makes this reachable, and the answer did not change:
-      // this CLI sets no `budgetGuard.maxCost` either, so a session cap would
-      // be the only cost limit in the product, and its observable behavior
-      // would be a long coding session hard-stopping mid-task with no prior
-      // warning. Cost limits for a coding CLI want a warning tier before a
-      // stop, and that is a product decision, not a constant to pick here.
-      // The framework says so instead: `duplex-cost-cap-unset` is in the
-      // resolution report `/status` prints, so the ceiling's absence is
-      // visible without being enforced at a number nobody chose.
-      mode: this.agentMode,
+    return buildAgentConfig({
+      agentMode: this.agentMode,
       model: this.model,
-      utilityModel: 'default',
-      workingDirectory: this.cwd,
-      initialBasePrompt: this.mode.systemPrompt,
-      slots: this.mode.contextSlots,
+      cwd: this.cwd,
+      mode: this.mode,
+      config: this.config,
+      sessionId: this.sessionId,
+      compactionStrategy: this.compactionStrategy,
+      sandbox: this.sandbox.getAgentOptions(),
       resolvePermission: (toolName, toolArgs, context) =>
         this.permissions.resolvePermission(toolName, toolArgs, context),
-      // WebFetch's egress gate: the same decision function the sandbox egress
-      // proxy consults for shell commands, so one grant covers both paths.
       resolveNetworkAccess: (req) => this.permissions.resolveNetworkAccess(req),
       isAutoApprove: () => this.yoloMode,
-      ...(sandboxOptions ? { sandbox: sandboxOptions } : {}),
       getApiKey: (provider) => this.apiKeys.getApiKey(provider),
-      contextWindowLimit: this.config.contextWindowLimit ?? null,
-      compaction: { strategy: this.compactionStrategy },
-      persistResult: createToolResultPersistor(this.sessionId),
-      logger: log,
-      ...(diagnostics ? { diagnostics } : {}),
-    };
+    });
   }
 
-  private buildDiagnosticsConfig(): import('@animus-labs/cortex').CortexDiagnosticsConfig | undefined {
-    const freeze = this.config.diagnostics?.freeze;
-    if (!freeze?.enabled) return undefined;
-    const watchdog: import('@animus-labs/cortex').PromptWatchdogDiagnosticsConfig = { enabled: true };
-    if (freeze.promptWatchdogIntervalMs !== undefined) watchdog.heartbeatIntervalMs = freeze.promptWatchdogIntervalMs;
-    if (freeze.abortWaitWarningMs !== undefined) watchdog.abortWaitWarningMs = freeze.abortWaitWarningMs;
-    return { promptWatchdog: watchdog };
-  }
 
   // -------------------------------------------------------------------------
   // Public accessors for command handlers
