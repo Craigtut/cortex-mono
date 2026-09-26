@@ -12,14 +12,14 @@ import type { LogRecorder } from './log-recorder.js';
 import type { SessionMode } from './session-mode.js';
 import { normalizePersistedState } from './persisted-state.js';
 import type { CortexAgentPersistedState, CortexAgentStateV2 } from './persisted-state.js';
-import { UsageLedger } from './usage-ledger.js';
-import type { UsageReadings } from './usage-ledger.js';
+import { CompositeUsage } from './composite-usage.js';
+import type { UsageReadings } from './composite-usage.js';
 
 export class CompositeState {
   private readonly topology: LoopTopology;
   private readonly recorder: LogRecorder;
   private readonly session: () => SessionMode;
-  private readonly usage = new UsageLedger();
+  private readonly usage = new CompositeUsage();
 
   constructor(parts: { topology: LoopTopology; recorder: LogRecorder; session: () => SessionMode }) {
     this.topology = parts.topology;

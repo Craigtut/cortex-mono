@@ -17,7 +17,7 @@ import { assistantText, assistantUsage, toolCallArguments } from '../pi-message.
 import { parseSchemaCompletion, structuredCompletionRequest } from '../structured-completion.js';
 import type { CortexLogger, CortexUsage } from '../types.js';
 import type { CacheRetention, PiModel } from './pi-agent.js';
-import type { UsageLedger } from './usage-ledger.js';
+import type { LoopUsage } from './loop-usage.js';
 
 export interface DirectCompletionOptions {
   cacheRetention?: CacheRetention;
@@ -56,7 +56,7 @@ export interface DirectCompletionPorts {
   emitError(error: Error, wasAborted?: boolean): void;
   /** Report a call's spend (the loop's utility_usage event feeds the ledger). */
   emitUtilityUsage(category: string, usage: CortexUsage): void;
-  ledger: UsageLedger;
+  ledger: LoopUsage;
   logger: CortexLogger;
 }
 

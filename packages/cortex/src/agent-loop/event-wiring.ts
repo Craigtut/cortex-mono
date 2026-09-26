@@ -20,12 +20,12 @@ import type {
 } from '../types.js';
 import { parseWorkingTags } from '../working-tags.js';
 import type { HandlerList } from './handler-list.js';
-import type { UsageLedger } from './usage-ledger.js';
+import type { LoopUsage } from './loop-usage.js';
 
 export interface LoopEventDeps {
   logger: CortexLogger;
   diagnostics: Pick<PromptWatchdogDiagnostics, 'recordEvent'>;
-  ledger: UsageLedger;
+  ledger: LoopUsage;
   /** pi's live state: the transcript plus the error of the run that just ended. */
   agentState(): { messages: AgentMessage[]; errorMessage?: unknown };
   slotCount(): number;

@@ -3,7 +3,7 @@ import { EventBridge } from '../../../src/event-bridge.js';
 import type { PiEvent } from '../../../src/event-bridge.js';
 import { wireLoopEvents } from '../../../src/agent-loop/event-wiring.js';
 import { HandlerList } from '../../../src/agent-loop/handler-list.js';
-import { UsageLedger } from '../../../src/agent-loop/usage-ledger.js';
+import { LoopUsage } from '../../../src/agent-loop/loop-usage.js';
 import type { CompactionManager } from '../../../src/compaction/index.js';
 import type { AgentMessage } from '../../../src/context-manager.js';
 
@@ -19,7 +19,7 @@ function setup(options?: { workingTags?: boolean; strategy?: 'observational' | '
     updateCurrentContextTokenCount: vi.fn(),
     onTurnEnd: vi.fn(),
   };
-  const ledger = new UsageLedger();
+  const ledger = new LoopUsage();
   const loopComplete = new HandlerList<[{ loopPath: string }]>('onLoopComplete', logger);
   const turnComplete = new HandlerList<[unknown, { loopPath: string }]>('onTurnComplete', logger);
   const onLoopEnd = vi.fn();

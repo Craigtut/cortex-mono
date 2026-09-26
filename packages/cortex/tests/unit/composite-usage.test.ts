@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { UsageLedger } from '../../src/facade/usage-ledger.js';
+import { CompositeUsage } from '../../src/facade/composite-usage.js';
 import type { SessionUsage } from '../../src/types.js';
 
 function spent(cost: number, turns = 1): SessionUsage {
@@ -10,9 +10,9 @@ function spent(cost: number, turns = 1): SessionUsage {
   };
 }
 
-describe('UsageLedger', () => {
+describe('CompositeUsage', () => {
   it('reports live readings unchanged before any restore', () => {
-    const ledger = new UsageLedger();
+    const ledger = new CompositeUsage();
     const breakdown = ledger.breakdown({ reasoner: spent(2), talker: spent(1), lookups: spent(0.5) });
     expect(breakdown.perLoop.reasoner.totalCost).toBe(2);
     expect(breakdown.perLoop.talker?.totalCost).toBe(1);
@@ -21,7 +21,7 @@ describe('UsageLedger', () => {
   });
 
   it('adds only the delta since the restore on top of the restored baseline', () => {
-    const ledger = new UsageLedger();
+    const ledger = new CompositeUsage();
     // The live counters had already reached 5 when the restore happened;
     // none of that belongs to the restored session.
     ledger.rebase(
@@ -33,7 +33,7 @@ describe('UsageLedger', () => {
   });
 
   it('is idempotent across repeated restores of the same artifact', () => {
-    const ledger = new UsageLedger();
+    const ledger = new CompositeUsage();
     const artifact = { total: spent(4), perLoop: { talker: null, reasoner: spent(4) } };
     ledger.rebase(artifact, { reasoner: spent(1), talker: null, lookups: null });
     ledger.rebase(artifact, { reasoner: spent(1), talker: null, lookups: null });
@@ -41,7 +41,7 @@ describe('UsageLedger', () => {
   });
 
   it('carries a restored talker and lookup side through a mode that has neither', () => {
-    const ledger = new UsageLedger();
+    const ledger = new CompositeUsage();
     ledger.rebase(
       { total: spent(6), perLoop: { talker: spent(2), reasoner: spent(3), lookups: spent(1) } },
       { reasoner: spent(0, 0), talker: null, lookups: null },
@@ -53,7 +53,7 @@ describe('UsageLedger', () => {
   });
 
   it('omits an all-zero lookup bucket and reports no talker when none exists', () => {
-    const ledger = new UsageLedger();
+    const ledger = new CompositeUsage();
     const breakdown = ledger.breakdown({ reasoner: spent(1), talker: null, lookups: spent(0, 0) });
     expect(breakdown.perLoop.talker).toBeNull();
     expect('lookups' in breakdown.perLoop).toBe(false);

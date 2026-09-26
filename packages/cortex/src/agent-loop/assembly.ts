@@ -69,7 +69,7 @@ import type { ChildLoop } from './sub-agent-spawner.js';
 import { SystemPromptState } from './system-prompt.js';
 import { ToolRegistry } from './tool-registry.js';
 import { TurnRunner } from './turn-runner.js';
-import { UsageLedger } from './usage-ledger.js';
+import { LoopUsage } from './loop-usage.js';
 
 /** The loop's own methods the parts call back into (resolved per call). */
 export interface LoopHost {
@@ -105,7 +105,7 @@ export interface LoopParts {
   models: ModelSettings;
   tools: ToolRegistry;
   completions: DirectCompletions;
-  usage: UsageLedger;
+  usage: LoopUsage;
   processes: ProcessTracker;
   mcp: McpAttachment;
   subAgentManager: SubAgentManager;
@@ -152,7 +152,7 @@ export function assembleLoop(params: {
   const turnComplete = new HandlerList<[AgentTextOutput, LoopOriginContext]>('onTurnComplete', logger);
   const deadLetters = new DeadLetterStore(logger);
   const asks = new PendingAskRegistry();
-  const usage = new UsageLedger();
+  const usage = new LoopUsage();
   const processes = new ProcessTracker();
   const transcript = () => agent.state.messages;
   const notifyTailTrimmed = (): void => {

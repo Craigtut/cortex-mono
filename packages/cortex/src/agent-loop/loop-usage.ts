@@ -13,7 +13,7 @@ import {
 } from '../session-usage.js';
 import type { CortexUsage, SessionUsage } from '../types.js';
 
-export class UsageLedger {
+export class LoopUsage {
   private session: SessionUsage = zeroSessionUsage();
 
   /**

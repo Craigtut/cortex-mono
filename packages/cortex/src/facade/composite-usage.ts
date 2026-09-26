@@ -30,7 +30,7 @@ export interface UsageReadings {
   lookups: SessionUsage | null;
 }
 
-export class UsageLedger {
+export class CompositeUsage {
   private baseline: {
     talker: SessionUsage | null;
     reasoner: SessionUsage;
