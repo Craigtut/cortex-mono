@@ -2684,40 +2684,6 @@ export class Session {
     }
   }
 
-  /** Extract readable text from a tool result (may be string, object, or content array). */
-  private extractToolResultText(result: unknown): string {
-    if (typeof result === 'string') return result;
-    if (result === null || result === undefined) return '';
-
-    // ToolContentDetails format: { content: [{ type: 'text', text: '...' }] }
-    if (typeof result === 'object') {
-      const obj = result as Record<string, unknown>;
-
-      // Direct text field
-      if (typeof obj['text'] === 'string') return obj['text'];
-
-      // Content array
-      const content = obj['content'];
-      if (Array.isArray(content)) {
-        return content
-          .filter((c): c is { type: string; text: string } =>
-            typeof c === 'object' && c !== null && 'text' in c && typeof (c as Record<string, unknown>)['text'] === 'string')
-          .map(c => c.text)
-          .join('\n');
-      }
-
-      // Try JSON stringification for unknown shapes, but truncate
-      try {
-        const json = JSON.stringify(result);
-        return json.length > 500 ? json.slice(0, 500) + '...' : json;
-      } catch {
-        return '[result]';
-      }
-    }
-
-    return String(result);
-  }
-
   /** Create a short summary of tool args for display. */
   private summarizeToolArgs(toolName: string, args: unknown): string {
     const a = args as Record<string, unknown>;
