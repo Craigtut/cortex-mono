@@ -55,6 +55,7 @@ import type { NetworkAccessRequest, ResolveNetworkAccess } from '../sandbox/type
 import type { WakeClass } from '../session-log.js';
 import { NOOP_LOGGER } from '../noop-logger.js';
 import { BASH_ESCALATION_PERMISSION_NAME } from '../tools/bash/index.js';
+import { clampRenderedRequest } from '../permission-rendering.js';
 import type { CauseTag } from './cause-tags.js';
 import { stripAskFence } from './ask-fence.js';
 import { buildAskVoicing } from './prompts.js';
@@ -908,34 +909,11 @@ export class PermissionBroker {
 /** Synthetic permission name for network egress asks. */
 export const NETWORK_ACCESS_PERMISSION_NAME = 'NetworkAccess';
 
-/**
- * Head-and-tail truncation for broker-minted renderings, mirroring the
- * loop's rendered-request rule: the tail survives because a hostile or
- * verbose payload usually sits at the end, and a head-only cut would let it
- * hide behind a long benign prefix. Sliced by code points so the cut cannot
- * split a surrogate pair.
- */
-const RENDERED_MAX_CHARS = 500;
-const RENDERED_HEAD_CHARS = 300;
-const RENDERED_TAIL_CHARS = 150;
-
-function truncateHeadTail(rendered: string): string {
-  if (rendered.length <= RENDERED_MAX_CHARS) return rendered;
-  const chars = [...rendered];
-  if (chars.length <= RENDERED_MAX_CHARS) return rendered;
-  const elided = chars.length - RENDERED_HEAD_CHARS - RENDERED_TAIL_CHARS;
-  return (
-    chars.slice(0, RENDERED_HEAD_CHARS).join('') +
-    ` …[${elided} chars elided]… ` +
-    chars.slice(-RENDERED_TAIL_CHARS).join('')
-  );
-}
-
 /** Verbatim rendering of a network egress ask (host, port, path, URL). */
 export function renderNetworkAccessRequest(req: NetworkAccessRequest): string {
   const target = req.port !== undefined ? `${req.host}:${req.port}` : req.host;
   const detail = req.via === 'webfetch' && req.url ? `${target} (${req.url})` : target;
-  return truncateHeadTail(`${NETWORK_ACCESS_PERMISSION_NAME} (${req.via}): ${detail}`);
+  return clampRenderedRequest(`${NETWORK_ACCESS_PERMISSION_NAME} (${req.via}): ${detail}`);
 }
 
 type PermissionResolver = NonNullable<AgentLoopConfig['resolvePermission']>;

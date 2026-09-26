@@ -59,6 +59,8 @@ import {
   cloneSessionUsage,
   zeroSessionUsage,
 } from './session-usage.js';
+import { renderPermissionRequest } from './permission-rendering.js';
+import { toolCallSubject } from './tools/tool-call-subject.js';
 // pi-ai 0.80 moved the static catalog reads off the root to the durable
 // `providers/all` entrypoint (`getModel`/`getModels` on root are deprecated
 // compat aliases). These are the non-deprecated replacements.
@@ -253,18 +255,6 @@ function fromPiThinkingLevel(level: string): ThinkingLevel | null {
 
 /** Leading context slot used to seed a sub-agent with background context. */
 const CHILD_SEED_CONTEXT_SLOT = '_seed_context';
-
-/**
- * Hard cap on a rendered permission request. Long enough that a real command
- * line survives verbatim. Over the cap, the HEAD and TAIL are kept with a
- * loud elision marker between them, never a summary: the tail matters as
- * much as the head, because a destructive suffix (`... && rm -rf ~`) must
- * not be concealable behind padding (review-findings F14, D16: this is the
- * string a human approves).
- */
-const RENDERED_REQUEST_MAX_CHARS = 500;
-const RENDERED_REQUEST_HEAD_CHARS = 300;
-const RENDERED_REQUEST_TAIL_CHARS = 150;
 
 /**
  * Default hard token cap for the consumer-fed headline block. Injected
@@ -3274,7 +3264,7 @@ export class AgentLoop {
         // per ask and attribute it. The nonce is security-relevant (consent
         // binding keys on it): crypto-random, never reused, never derived.
         const askId = `ask-${crypto.randomUUID()}`;
-        const renderedRequest = AgentLoop.renderPermissionRequest(permissionName, args);
+        const renderedRequest = renderPermissionRequest(permissionName, args);
         const askContext: ToolPermissionRequestContext = {
           askId,
           loopPath,
@@ -3446,72 +3436,6 @@ export class AgentLoop {
         },
       );
     });
-  }
-
-  /**
-   * Build the verbatim rendering of a permission ask: the permission name
-   * plus the actual command, path, pattern, or URL from the tool arguments.
-   * Truncated at a fixed cap but NEVER summarized or paraphrased; a surface
-   * voicing this to a human must be able to read exactly what will run
-   * (review-findings F14: a softened rendering is forced by the data, not
-   * by model misbehavior).
-   */
-  private static renderPermissionRequest(permissionName: string, params: unknown): string {
-    const p = (params && typeof params === 'object' ? params : {}) as Record<string, unknown>;
-    const verbatim = (value: unknown): string => {
-      if (typeof value === 'string') return value;
-      if (value === undefined || value === null) return '';
-      try {
-        return JSON.stringify(value) ?? '';
-      } catch {
-        return String(value);
-      }
-    };
-
-    let detail: string;
-    switch (permissionName) {
-      case 'Bash':
-      case BASH_ESCALATION_PERMISSION_NAME:
-        detail = verbatim(p['command']);
-        break;
-      case 'Read':
-      case 'Write':
-      case 'Edit':
-      case 'UndoEdit':
-        detail = verbatim(p['file_path'] ?? p['path']);
-        break;
-      case 'Glob':
-      case 'Grep': {
-        const pattern = verbatim(p['pattern']);
-        const searchPath = verbatim(p['path']);
-        detail = searchPath ? `${pattern} in ${searchPath}` : pattern;
-        break;
-      }
-      case 'WebFetch':
-        detail = verbatim(p['url']);
-        break;
-      default:
-        detail = verbatim(params);
-        break;
-    }
-
-    const rendered = detail.length > 0 ? `${permissionName}: ${detail}` : permissionName;
-    if (rendered.length <= RENDERED_REQUEST_MAX_CHARS) return rendered;
-    // Head AND tail survive verbatim; only the middle is elided. A
-    // head-only cut would let a long benign prefix conceal a destructive
-    // suffix from the human approving this string. The middle is still
-    // concealed, though: an over-cap rendering is not a full transcript of
-    // what will run, and a surface that needs certainty must read the tool
-    // call's own args. Sliced by code points so the cut cannot split a
-    // surrogate pair and corrupt the characters at the seam.
-    const chars = [...rendered];
-    if (chars.length <= RENDERED_REQUEST_MAX_CHARS) return rendered;
-    const elided = chars.length - RENDERED_REQUEST_HEAD_CHARS - RENDERED_REQUEST_TAIL_CHARS;
-    return (
-      chars.slice(0, RENDERED_REQUEST_HEAD_CHARS).join('') +
-      ` …[${elided} chars elided]… ` +
-      chars.slice(-RENDERED_REQUEST_TAIL_CHARS).join('')
-    );
   }
 
   /**
@@ -6457,17 +6381,12 @@ export class AgentLoop {
    * Build a short summary of tool args for background state display.
    */
   private summarizeToolArgs(toolName: string, args: Record<string, unknown>): string {
-    switch (toolName) {
-      case 'Bash': return String(args['command'] ?? '').slice(0, 60);
-      case 'Read': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
-      case 'Write': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
-      case 'Edit': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
-      case 'UndoEdit': return String(args['file_path'] ?? args['path'] ?? '').split('/').pop() ?? '';
-      case 'Glob': return String(args['pattern'] ?? '');
-      case 'Grep': return String(args['pattern'] ?? '');
-      case 'WebFetch': return String(args['url'] ?? '').slice(0, 60);
-      default: return '';
-    }
+    const subject = toolCallSubject(toolName, args);
+    if ('command' in subject) return String(subject.command ?? '').slice(0, 60);
+    if ('path' in subject) return String(subject.path ?? '').split('/').pop() ?? '';
+    if ('pattern' in subject) return String(subject.pattern ?? '');
+    if ('url' in subject) return String(subject.url ?? '').slice(0, 60);
+    return '';
   }
 
   /**
@@ -7399,7 +7318,7 @@ export class AgentLoop {
           loopPath: context?.loopPath ?? `${this.loopPath}/${childTaskId}`,
           toolName,
           renderedRequest: context?.renderedRequest
-            ?? AgentLoop.renderPermissionRequest(toolName, toolArgs),
+            ?? renderPermissionRequest(toolName, toolArgs),
           requestedAt: Date.now(),
           voiced: false,
         });
