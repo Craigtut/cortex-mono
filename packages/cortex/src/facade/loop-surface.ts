@@ -129,13 +129,8 @@ export abstract class LoopSurface {
   getThinkingLevel(): ThinkingLevel { return this.topology.work.getThinkingLevel(); }
   setThinkingLevel(level: ThinkingLevel): void { this.topology.work.setThinkingLevel(level); }
 
-  async getModelThinkingCapabilities(): Promise<ModelThinkingCapabilities> {
-    return this.topology.work.getModelThinkingCapabilities();
-  }
-
-  async clampThinkingLevel(level: ThinkingLevel): Promise<ThinkingLevel> {
-    return this.topology.work.clampThinkingLevel(level);
-  }
+  async getModelThinkingCapabilities(): Promise<ModelThinkingCapabilities> { return this.topology.work.getModelThinkingCapabilities(); }
+  async clampThinkingLevel(level: ThinkingLevel): Promise<ThinkingLevel> { return this.topology.work.clampThinkingLevel(level); }
 
   getCacheRetention(): 'none' | 'short' | 'long' | null { return this.topology.work.getCacheRetention(); }
   getSessionId(): string | null { return this.topology.work.getSessionId(); }
@@ -159,9 +154,7 @@ export abstract class LoopSurface {
 
   get currentContextTokenCount(): number { return this.topology.work.currentContextTokenCount; }
 
-  updateCurrentContextTokenCount(inputTokens: number): void {
-    this.topology.work.updateCurrentContextTokenCount(inputTokens);
-  }
+  updateCurrentContextTokenCount(inputTokens: number): void { this.topology.work.updateCurrentContextTokenCount(inputTokens); }
 
   estimateCurrentContextTokens(): number { return this.topology.work.estimateCurrentContextTokens(); }
   capToolResult(content: string): string { return this.topology.work.capToolResult(content); }
@@ -209,9 +202,7 @@ export abstract class LoopSurface {
     return this.topology.work.connectMcpServer(serverName, config);
   }
 
-  async disconnectMcpServer(serverName: string): Promise<void> {
-    return this.topology.work.disconnectMcpServer(serverName);
-  }
+  async disconnectMcpServer(serverName: string): Promise<void> { return this.topology.work.disconnectMcpServer(serverName); }
 
   getMcpServerStates(): McpConnectionState[] { return this.topology.work.getMcpServerStates(); }
 
@@ -227,9 +218,7 @@ export abstract class LoopSurface {
   getMcpTools(): CortexTool[] { return this.topology.work.getMcpTools(); }
   getSkillRegistry(): SkillRegistry { return this.topology.work.getSkillRegistry(); }
 
-  async loadSkill(name: string, args?: string): Promise<void> {
-    return this.topology.work.loadSkill(name, args);
-  }
+  async loadSkill(name: string, args?: string): Promise<void> { return this.topology.work.loadSkill(name, args); }
 
   clearSkillBuffer(): void { this.topology.work.clearSkillBuffer(); }
   getSkillBuffer(): LoadedSkill[] { return this.topology.work.getSkillBuffer(); }
@@ -246,13 +235,8 @@ export abstract class LoopSurface {
     return this.topology.work.spawnBackgroundSubAgent(params);
   }
 
-  async cancelSubAgent(taskId: string): Promise<boolean> {
-    return this.topology.work.cancelSubAgent(taskId);
-  }
-
-  steerSubAgent(taskId: string, message: string): boolean {
-    return this.topology.work.steerSubAgent(taskId, message);
-  }
+  async cancelSubAgent(taskId: string): Promise<boolean> { return this.topology.work.cancelSubAgent(taskId); }
+  steerSubAgent(taskId: string, message: string): boolean { return this.topology.work.steerSubAgent(taskId, message); }
 
   getActiveSubAgents(): SubAgentSnapshot[] { return this.topology.work.getActiveSubAgents(); }
 
@@ -306,9 +290,7 @@ export abstract class LoopSurface {
     return this.topology.work.digestIdle(options);
   }
 
-  async checkAndRunCompaction(): Promise<CompactionResult | null> {
-    return this.topology.work.checkAndRunCompaction();
-  }
+  async checkAndRunCompaction(): Promise<CompactionResult | null> { return this.topology.work.checkAndRunCompaction(); }
 
   async triggerObservation(): Promise<void> { return this.topology.work.triggerObservation(); }
 
@@ -332,13 +314,8 @@ export abstract class LoopSurface {
     this.topology.work.onSubAgentCompleted(handler);
   }
 
-  onSubAgentFailed(handler: (taskId: string, error: string) => void): void {
-    this.topology.work.onSubAgentFailed(handler);
-  }
-
-  onBackgroundResultDelivery(handler: (taskIds: string[]) => void): void {
-    this.topology.work.onBackgroundResultDelivery(handler);
-  }
+  onSubAgentFailed(handler: (taskId: string, error: string) => void): void { this.topology.work.onSubAgentFailed(handler); }
+  onBackgroundResultDelivery(handler: (taskIds: string[]) => void): void { this.topology.work.onBackgroundResultDelivery(handler); }
 
   onBackgroundResultDeadLettered(handler: (result: DeadLetteredBackgroundResult) => void): void {
     this.topology.work.onBackgroundResultDeadLettered(handler);

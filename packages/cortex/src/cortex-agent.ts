@@ -87,8 +87,6 @@ export type _ForwardedMembersExistOnFacade = AssertExtends<
   keyof CortexAgent
 >;
 
-const DEFAULT_STATE_DEBOUNCE_MS = 500;
-
 export class CortexAgent extends LoopSurface {
   private readonly recorder: LogRecorder;
   private readonly logger: CortexLogger;
@@ -141,7 +139,7 @@ export class CortexAgent extends LoopSurface {
       shuttingDown: () => this.topology.resident.some(
         (loop) => loop.state === 'destroying' || loop.state === 'destroyed',
       ),
-      debounceMs: config.stateChangeDebounceMs ?? DEFAULT_STATE_DEBOUNCE_MS,
+      debounceMs: config.stateChangeDebounceMs,
       logger: this.logger,
     });
     this.recorder.onAppend(() => this.stateEmitter.markDirty());

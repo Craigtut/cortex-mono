@@ -10,6 +10,8 @@ import type { CortexLogger } from '../types.js';
 import { errorMessageOf } from '../error-classifier.js';
 import type { CortexAgentStateV2 } from './persisted-state.js';
 
+const DEFAULT_DEBOUNCE_MS = 500;
+
 export interface StateEmitterOptions {
   /** A consistent composite snapshot (CortexAgent.getState). */
   snapshot: () => Promise<CortexAgentStateV2>;
@@ -20,7 +22,8 @@ export interface StateEmitterOptions {
    * window and then snapshots a torn-down loop.
    */
   shuttingDown: () => boolean;
-  debounceMs: number;
+  /** Quiet time before emitting (stateChangeDebounceMs). Default: 500. */
+  debounceMs?: number | undefined;
   logger: CortexLogger;
 }
 
@@ -91,7 +94,7 @@ export class StateEmitter {
           error: errorMessageOf(err),
         });
       });
-    }, this.options.debounceMs);
+    }, this.options.debounceMs ?? DEFAULT_DEBOUNCE_MS);
   }
 
   private async emit(): Promise<void> {
