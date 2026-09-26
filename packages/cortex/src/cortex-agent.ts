@@ -103,6 +103,7 @@ import {
   zeroSessionUsage,
 } from './session-usage.js';
 import { TOOL_NAMES } from './tools/index.js';
+import { toolCallSubject } from './tools/tool-call-subject.js';
 import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
 import type {
   DuplexRouterOptions,
@@ -510,17 +511,12 @@ function summarizeHeadlineArgs(
 ): string | null {
   if (!args) return null;
   const str = (value: unknown): string | null => (typeof value === 'string' ? value : null);
-  switch (toolName) {
-    case 'Bash': return str(args['command'])?.slice(0, 120) ?? null;
-    case 'Read':
-    case 'Write':
-    case 'Edit':
-    case 'UndoEdit': return str(args['file_path']);
-    case 'Glob':
-    case 'Grep': return str(args['pattern']);
-    case 'WebFetch': return str(args['url']);
-    default: return null;
-  }
+  const subject = toolCallSubject(toolName, args);
+  if ('command' in subject) return str(subject.command)?.slice(0, 120) ?? null;
+  if ('path' in subject) return str(subject.path);
+  if ('pattern' in subject) return str(subject.pattern);
+  if ('url' in subject) return str(subject.url);
+  return null;
 }
 
 function appendRolePrompt(basePrompt: string | undefined, rolePrompt: string): string | undefined {

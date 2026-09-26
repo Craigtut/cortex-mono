@@ -3444,19 +3444,13 @@ export class AgentLoop {
    */
   private static summarizeToolArgs(name: string, params: unknown): Record<string, unknown> {
     if (!params || typeof params !== 'object') return {};
-    const p = params as Record<string, unknown>;
-    switch (name) {
-      case 'Bash': return { command: String(p['command'] ?? '').slice(0, 200) };
-      case 'Read': return { path: p['file_path'] };
-      case 'Write': return { path: p['file_path'] };
-      case 'Edit': return { path: p['file_path'] };
-      case 'UndoEdit': return { path: p['file_path'] };
-      case 'Glob': return { pattern: p['pattern'], path: p['path'] };
-      case 'Grep': return { pattern: p['pattern'], path: p['path'] };
-      case 'WebFetch': return { url: p['url'] };
-      case 'TaskOutput': return { taskId: p['task_id'] };
-      default: return {};
-    }
+    const subject = toolCallSubject(name, params);
+    if ('command' in subject) return { command: String(subject.command ?? '').slice(0, 200) };
+    if ('path' in subject) return { path: subject.path };
+    if ('pattern' in subject) return { pattern: subject.pattern, path: subject.scope };
+    if ('url' in subject) return { url: subject.url };
+    if ('taskId' in subject) return { taskId: subject.taskId };
+    return {};
   }
 
   private static buildPermissionReason(
