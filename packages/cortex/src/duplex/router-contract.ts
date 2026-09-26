@@ -70,10 +70,10 @@ export interface DuplexRouterPorts {
    */
   answerAsk(askId: unknown, decision: unknown, reason: unknown): AskAnswerOutcome;
   /**
-   * Id of the reasoner's latest attempt (ReasonerRunTracker). Bounds on
-   * per-attempt log noise reset when it changes.
+   * A key naming the reasoner's current attempt (ReasonerRunTracker).
+   * Bounds on per-attempt log noise reset when it changes.
    */
-  reasonerAttemptId(): number;
+  reasonerAttemptKey(): string;
   /**
    * Start a facade-spawned quick lookup (D13): an ephemeral read-only
    * sub-agent, never a reasoner directive. causeSeq is the log seq of the

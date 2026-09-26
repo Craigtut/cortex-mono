@@ -35,7 +35,7 @@ export interface DeliveryIntakePorts {
   appendLog(input: RouterLogInput): number;
   deliverToTalker(content: string, wake: boolean): void;
   currentReasonerCauseTags(): readonly CauseTag[];
-  reasonerAttemptId(): number;
+  reasonerAttemptKey(): string;
 }
 
 export class DeliveryIntake {
@@ -45,7 +45,7 @@ export class DeliveryIntake {
   private readonly scheduler: DeliveryScheduler;
   private readonly options: { reasonerLoopPath: string; logger: CortexLogger };
   /** Absorbed-duplicate lifecycle entries written this reasoner attempt (bounded). */
-  private absorbed = { attemptId: -1, entries: 0 };
+  private absorbed: { attemptKey: string | null; entries: number } = { attemptKey: null, entries: 0 };
 
   constructor(
     ports: DeliveryIntakePorts,
@@ -149,8 +149,8 @@ export class DeliveryIntake {
       // are bounded per reasoner attempt (same rule as dispatch_refused,
       // N4) so an attempt re-emitting the same content in a loop cannot
       // grow the log unboundedly.
-      const attemptId = this.ports.reasonerAttemptId();
-      if (this.absorbed.attemptId !== attemptId) this.absorbed = { attemptId, entries: 0 };
+      const attemptKey = this.ports.reasonerAttemptKey();
+      if (this.absorbed.attemptKey !== attemptKey) this.absorbed = { attemptKey, entries: 0 };
       if (this.absorbed.entries < MAX_ABSORBED_ENTRIES_PER_ATTEMPT) {
         this.absorbed.entries += 1;
         const atBound = this.absorbed.entries === MAX_ABSORBED_ENTRIES_PER_ATTEMPT;
@@ -218,7 +218,7 @@ export class DeliveryIntake {
   }
 
   reset(): void {
-    this.absorbed = { attemptId: -1, entries: 0 };
+    this.absorbed = { attemptKey: null, entries: 0 };
   }
 
   private reasonerCause(): { causedBy?: number } {

@@ -8,6 +8,24 @@ import type { CortexLifecycleState } from '../../types.js';
 import type { IdleDigestionOptions, IdleDigestionResult } from '../context-pipeline.js';
 import type { DirectCompletionOptions } from '../direct-completion.js';
 
+/**
+ * One logical run: a prompt, a delivery sweep or a background drain, from
+ * its first pi attempt through its retry continuations until it unwinds.
+ */
+export interface LoopRunInfo {
+  /** Increases by one per logical run, loop-lifetime. */
+  readonly id: number;
+  /** When the run started (epoch ms). */
+  readonly startedAt: number;
+  /**
+   * The current or most recent pi attempt, 1-based: 1 for the first, one
+   * more for each retry continuation. 0 before the first attempt starts.
+   */
+  readonly attempt: number;
+  /** When the live attempt started, or null between attempts (retry backoff). */
+  readonly attemptStartedAt: number | null;
+}
+
 /** Options for {@link LoopRunApi.prompt}. */
 export interface PromptOptions extends DirectCompletionOptions {
   /**
@@ -53,6 +71,17 @@ export interface LoopRunApi {
    * run while this is true; otherwise it waits for the next run.
    */
   readonly isPrompting: boolean;
+
+  /**
+   * The logical run in flight, or null when none is: its id, when it
+   * started, and which attempt of its retry ladder is live. Non-null
+   * exactly while {@link isPrompting} is true. A snapshot; read it again for
+   * later state.
+   */
+  readonly currentRun: LoopRunInfo | null;
+
+  /** When the last logical run ended (epoch ms), or null before any has. */
+  readonly lastRunEndedAt: number | null;
 
   /**
    * Cause tags of the run currently holding the gate: the tags of every

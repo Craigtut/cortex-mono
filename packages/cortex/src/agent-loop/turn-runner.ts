@@ -28,7 +28,7 @@ import type {
   RetrySucceededInfo,
 } from '../types.js';
 import type { DeliveryQueues, QueuedDelivery } from './delivery-queues.js';
-import type { PromptOptions } from './api/run.js';
+import type { LoopRunInfo, PromptOptions } from './api/run.js';
 import { HandlerList } from './handler-list.js';
 import type { CacheRetention, PiAgent } from './pi-agent.js';
 import type { AbortState } from './run-control.js';
@@ -69,6 +69,10 @@ export class TurnRunner {
   readonly retryExhausted: HandlerList<[RetryExhaustedInfo, LoopOriginContext]>;
 
   private prompting = false;
+  // The logical run in flight (see LoopRunApi.currentRun).
+  private liveRun: { -readonly [K in keyof LoopRunInfo]: LoopRunInfo[K] } | null = null;
+  private runCount = 0;
+  private lastEndedAt: number | null = null;
   // Cause tags of the run in flight (see DeliverOptions.causeTag).
   private activeTags: readonly unknown[] = [];
   private activeRetention: CacheRetention | null = null;
@@ -88,6 +92,14 @@ export class TurnRunner {
 
   get isPrompting(): boolean {
     return this.prompting;
+  }
+
+  get currentRun(): LoopRunInfo | null {
+    return this.liveRun ? { ...this.liveRun } : null;
+  }
+
+  get lastRunEndedAt(): number | null {
+    return this.lastEndedAt;
   }
 
   get activeCauseTags(): readonly unknown[] {
@@ -201,6 +213,8 @@ export class TurnRunner {
     }
     this.prompting = true;
     const loopStartMs = Date.now();
+    this.runCount += 1;
+    this.liveRun = { id: this.runCount, startedAt: loopStartMs, attempt: 0, attemptStartedAt: null };
 
     this.boundaryIndex = this.ports.agent.state.messages.length;
 
@@ -246,6 +260,8 @@ export class TurnRunner {
     } finally {
       this.activeRetention = null;
       this.prompting = false;
+      this.liveRun = null;
+      this.lastEndedAt = Date.now();
       this.activeTags = [];
 
       this.ports.logger.debug('loop complete', {
@@ -308,8 +324,9 @@ export class TurnRunner {
 
     for (;;) {
       try {
-        const result =
-          retryIndex === 0 ? await this.ports.agent.prompt(promptInput) : await this.ports.agent.continue();
+        const result = await this.attempt(
+          () => (retryIndex === 0 ? this.ports.agent.prompt(promptInput) : this.ports.agent.continue()),
+        );
 
         // pi stores streaming/provider errors in state.errorMessage without
         // re-throwing.
@@ -409,6 +426,19 @@ export class TurnRunner {
         this.trimFailureStubs();
         retryIndex += 1;
       }
+    }
+  }
+
+  /** One pi attempt of the live run, recorded on it while it runs. */
+  private async attempt<T>(call: () => Promise<T>): Promise<T> {
+    if (this.liveRun) {
+      this.liveRun.attempt += 1;
+      this.liveRun.attemptStartedAt = Date.now();
+    }
+    try {
+      return await call();
+    } finally {
+      if (this.liveRun) this.liveRun.attemptStartedAt = null;
     }
   }
 

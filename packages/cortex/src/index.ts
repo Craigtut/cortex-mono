@@ -170,6 +170,7 @@ export type {
   DeliverResult,
   PendingWakeDelivery,
   PromptOptions,
+  LoopRunInfo,
   IdleDigestionResult,
   QueueDrainMode,
   ToolResultInterceptor,

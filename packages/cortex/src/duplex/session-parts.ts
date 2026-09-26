@@ -146,7 +146,7 @@ export function assembleSessionParts(
       currentTalkerCauseTags: () => causation.tags('conversation'),
       currentReasonerCauseTags: () => causation.tags('work'),
       answerAsk: (askId, decision, reason) => parts.broker.answer(askId, decision, reason),
-      reasonerAttemptId: () => parts.run.latestAttemptId,
+      reasonerAttemptKey: () => parts.run.attemptKey(),
       workRefusal: () => parts.aggregate.workRefusal(),
       idleSignal: config.idleSignal,
       logger,
@@ -168,6 +168,7 @@ export function assembleSessionParts(
   });
   parts.outcomes = new ReasonerOutcomeReporter({
     reasoner,
+    runId: () => parts.run.runId(),
     router: parts.router,
     headlines: parts.headlines,
     aggregateBreached: () => parts.aggregate.guard.isBreached(),

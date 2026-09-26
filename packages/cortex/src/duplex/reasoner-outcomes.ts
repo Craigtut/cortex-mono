@@ -3,7 +3,9 @@
  * through here, and here is where a reasoner attempt's outcome is decided,
  * at most once.
  *
- * The policy, per attempt (outcome starts `open` when an attempt starts):
+ * The policy, per logical reasoner run (keyed by the loop's run id; the
+ * outcome starts `open` for each new run, and a retry attempt inside the run
+ * keeps it):
  *
  * | producer                          | delivered when       | outcome after |
  * |-----------------------------------|----------------------|---------------|
@@ -77,6 +79,8 @@ export type RequestedAbort = 'user' | 'cancel';
 
 export interface ReasonerOutcomePorts {
   reasoner: AgentLoop;
+  /** The reasoner's logical run in flight (ReasonerRunTracker), or null. */
+  runId(): number | null;
   /** The router's delivery intake (wake policy) and delegation retirement. */
   router: Pick<DuplexRouter, 'deliverFromReasoner' | 'retireRunDelegations'>;
   headlines: Pick<DuplexHeadlines, 'noteRetry' | 'clearRetry'>;
@@ -90,8 +94,11 @@ type DeliveryMeta = { implicit?: boolean; synthetic?: boolean; terminal?: boolea
 
 export class ReasonerOutcomeReporter implements DeliveryTarget {
   private readonly ports: ReasonerOutcomePorts;
-  /** The current attempt's outcome (see the policy table above). */
-  private outcome: 'open' | 'delivered' | 'failed' = 'open';
+  /** The outcome of the run it names (see the policy table above). */
+  private outcome: { runId: number | null; state: 'open' | 'delivered' | 'failed' } = {
+    runId: null,
+    state: 'open',
+  };
   /** When the reasoner last produced anything bound for the conversation. */
   private lastOutput = 0;
   /**
@@ -117,7 +124,8 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
     wake: WakeClass | undefined,
     meta?: DeliveryMeta,
   ): DeliveryIntakeResult {
-    if (deliveryConcludes(wake, meta) && this.outcome === 'open') this.outcome = 'delivered';
+    const outcome = this.runOutcome();
+    if (deliveryConcludes(wake, meta) && outcome.state === 'open') outcome.state = 'delivered';
     return this.intake(content, wake, meta);
   }
 
@@ -154,9 +162,8 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
     if (this.abortCause === cause) this.abortCause = null;
   }
 
-  /** A reasoner attempt started: its outcome is open, its silence fresh. */
+  /** A reasoner attempt started: its silence is fresh. */
   noteAttemptStart(): void {
-    this.outcome = 'open';
     this.lastOutput = this.ports.now();
   }
 
@@ -175,7 +182,7 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
       this.handleStopped();
       return;
     }
-    if (this.outcome !== 'open') return;
+    if (this.runOutcome().state !== 'open') return;
     if (last.stopReason === 'error') {
       // Only when nothing else in the system is going to speak.
       //
@@ -317,17 +324,15 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
    * statements later in the same synchronous unwind. The first wins because
    * its message is the better one ("gave up after N attempts").
    *
-   * The outcome resets per attempt, which is the correct unit ONLY because
-   * nothing announces a failure mid-ladder: the attempt-end branch defers a
-   * recorded stub to the error path, so the two calls above are the only
-   * ones, and no attempt start falls between them. It is emphatically not
-   * "once per logical run" (a run spanning a ladder crosses several
-   * attempts).
+   * The outcome is per logical run, so this holds across a retry ladder
+   * too: the attempt-end branch defers a recorded stub to the error path,
+   * and whatever ends the run speaks for it once.
    */
   private deliverFailure(text: string): void {
     if (this.ports.destroyed()) return;
-    if (this.outcome === 'failed') return;
-    this.outcome = 'failed';
+    const outcome = this.runOutcome();
+    if (outcome.state === 'failed') return;
+    outcome.state = 'failed';
     // interrupt: a user waiting on work that is never coming is exactly the
     // case the class exists for. The router may still demote it under
     // backpressure, which is the intended tradeoff. `terminal` marks it as a
@@ -337,6 +342,13 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
       synthetic: true,
       terminal: true,
     });
+  }
+
+  /** The outcome of the run in flight, opened fresh when the run changed. */
+  private runOutcome(): { runId: number | null; state: 'open' | 'delivered' | 'failed' } {
+    const runId = this.ports.runId();
+    if (this.outcome.runId !== runId) this.outcome = { runId, state: 'open' };
+    return this.outcome;
   }
 
   /** Hand one delivery to the router's intake, stamping the silence clock. */

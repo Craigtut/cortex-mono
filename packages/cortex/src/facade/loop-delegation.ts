@@ -42,6 +42,11 @@ export const AGENT_LOOP_DELEGATION = {
   waitForLoopIdle: 'subsumed',
   waitForAskSettlement: 'subsumed',
   waitForWakeDeliveriesDrained: 'subsumed',
+  // Withheld: one loop's run identity, which has no single composite
+  // meaning in duplex (two resident loops, each with its own runs). The
+  // duplex session reads the reasoner's through ReasonerRunTracker.
+  currentRun: 'withheld',
+  lastRunEndedAt: 'withheld',
   // Queues.
   setSteeringQueueMode: 'forwarded',
   setFollowUpQueueMode: 'forwarded',

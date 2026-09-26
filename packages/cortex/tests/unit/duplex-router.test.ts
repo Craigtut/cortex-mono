@@ -132,7 +132,7 @@ function createHarness(options?: ConstructorParameters<typeof DuplexRouter>[1] &
     },
     currentTalkerCauseTags: () => talkerCauseTags,
     currentReasonerCauseTags: () => reasonerCauseTagsOverride ?? derivedReasonerCauseTags(),
-    reasonerAttemptId: () => reasonerAttemptId,
+    reasonerAttemptKey: () => String(reasonerAttemptId),
     get idleSignal() {
       return idleSignal;
     },

@@ -62,7 +62,7 @@ const UNSTUBBED_PORTS: { [K in RequiredPort]: true } = {
   currentTalkerCauseTags: true,
   currentReasonerCauseTags: true,
   answerAsk: true,
-  reasonerAttemptId: true,
+  reasonerAttemptKey: true,
   spawnLookup: true,
 };
 

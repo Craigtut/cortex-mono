@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { AgentLoop } from '../../src/agent-loop.js';
-import type { PiAgent, PiModel } from '../../src/agent-loop.js';
+import type { LoopRunInfo, PiAgent, PiModel } from '../../src/agent-loop.js';
 import type { PiEvent } from '../../src/event-bridge.js';
 import type { AgentLoopConfig } from '../../src/types.js';
 import { wrapModel } from '../../src/model-wrapper.js';
@@ -584,5 +584,38 @@ describe('AgentLoop abort-stub trim', () => {
 
     expect(lastMessage(mock)).toMatchObject({ role: 'assistant', stopReason: 'aborted' });
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentLoop.currentRun across a retry ladder', () => {
+  it('names one logical run across its attempts, with no live attempt during backoff', async () => {
+    const agent = createRetryMock(['fail', 'ok']);
+    const loop = build(agent, createConfig());
+    const seen: Array<LoopRunInfo | null> = [];
+    const original = { prompt: agent.prompt.bind(agent), continue: agent.continue.bind(agent) };
+    agent.prompt = async (input: string) => { seen.push(loop.currentRun); return original.prompt(input); };
+    agent.continue = async () => { seen.push(loop.currentRun); return original.continue(); };
+    const backoff: Array<LoopRunInfo | null> = [];
+    loop.onRetryScheduled(() => { backoff.push(loop.currentRun); });
+
+    expect(loop.currentRun).toBeNull();
+    const before = Date.now();
+    await loop.prompt('work');
+
+    // Two attempts of run 1, each live while pi ran it.
+    expect(seen).toEqual([
+      expect.objectContaining({ id: 1, attempt: 1, attemptStartedAt: expect.any(Number) }),
+      expect.objectContaining({ id: 1, attempt: 2, attemptStartedAt: expect.any(Number) }),
+    ]);
+    expect(seen[0]!.startedAt).toBeGreaterThanOrEqual(before);
+    expect(seen[1]!.startedAt).toBe(seen[0]!.startedAt);
+    // Between them the run is in flight but no attempt is.
+    expect(backoff).toEqual([expect.objectContaining({ id: 1, attempt: 1, attemptStartedAt: null })]);
+
+    expect(loop.currentRun).toBeNull();
+    expect(loop.lastRunEndedAt).toBeGreaterThanOrEqual(seen[0]!.startedAt);
+
+    await loop.prompt('more');
+    expect(seen.at(-1)).toEqual(expect.objectContaining({ id: 2, attempt: 1 }));
   });
 });

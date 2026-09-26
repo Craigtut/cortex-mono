@@ -60,7 +60,7 @@ import type { LoopDeliveryApi } from './agent-loop/api/delivery.js';
 import type { LoopEventApi } from './agent-loop/api/events.js';
 import type { LoopModelApi } from './agent-loop/api/models.js';
 import type { LoopPromptApi } from './agent-loop/api/prompt.js';
-import type { LoopRunApi, PromptOptions } from './agent-loop/api/run.js';
+import type { LoopRunApi, LoopRunInfo, PromptOptions } from './agent-loop/api/run.js';
 import type { LoopSubAgentApi } from './agent-loop/api/sub-agents.js';
 import type { LoopToolApi } from './agent-loop/api/tools.js';
 import { assembleLoop } from './agent-loop/assembly.js';
@@ -96,7 +96,7 @@ export type {
   DeliverResult,
   PendingWakeDelivery,
 } from './agent-loop/api/delivery.js';
-export type { PromptOptions } from './agent-loop/api/run.js';
+export type { LoopRunInfo, PromptOptions } from './agent-loop/api/run.js';
 export type { IdleDigestionOptions, IdleDigestionResult } from './agent-loop/context-pipeline.js';
 export { TOOL_RESULT_WORKING_TAGS_REMINDER } from './agent-loop/pi-hooks.js';
 export type {
@@ -321,6 +321,8 @@ export class AgentLoop implements
 
   get isLoopActive(): boolean { return this.parts.gate.isActive; }
   get isPrompting(): boolean { return this.parts.runner.isPrompting; }
+  get currentRun(): LoopRunInfo | null { return this.parts.runner.currentRun; }
+  get lastRunEndedAt(): number | null { return this.parts.runner.lastRunEndedAt; }
   get activeRunCauseTags(): readonly unknown[] { return this.parts.runner.activeCauseTags; }
   async waitForLoopIdle(): Promise<void> { return this.parts.gate.waitForIdle(); }
   get isRunning(): boolean { return this.parts.lifecycle.state === 'active' && this.parts.runner.isPrompting; }

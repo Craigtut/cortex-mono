@@ -96,11 +96,14 @@ describe('ReasonerOutcomeReporter silence clock and outcome', () => {
     reporter: ReasonerOutcomeReporter;
     intake: Array<{ content: string; wake: WakeClass | undefined; meta: unknown }>;
     clock: { t: number };
+    run: { id: number | null };
   } {
     const intake: Array<{ content: string; wake: WakeClass | undefined; meta: unknown }> = [];
     const clock = { t: 5_000 };
+    const run: { id: number | null } = { id: 1 };
     const reporter = new ReasonerOutcomeReporter({
       reasoner: {} as AgentLoop,
+      runId: () => run.id,
       router: {
         deliverFromReasoner: (content, wake, meta) => {
           intake.push({ content, wake, meta });
@@ -113,7 +116,7 @@ describe('ReasonerOutcomeReporter silence clock and outcome', () => {
       destroyed: () => false,
       now: () => clock.t,
     });
-    return { reporter, intake, clock };
+    return { reporter, intake, clock, run };
   }
 
   function endedWith(text: string) {
@@ -153,9 +156,30 @@ describe('ReasonerOutcomeReporter silence clock and outcome', () => {
     concluded.reporter.noteAttemptEnd(endedWith('All done.'));
     expect(concluded.intake.map((item) => item.content)).toEqual(['The result.']);
 
-    // The next attempt's outcome is open again.
+    // The next run's outcome is open again.
+    concluded.run.id = 2;
     concluded.reporter.noteAttemptStart();
     concluded.reporter.noteAttemptEnd(endedWith('Second result.'));
     expect(concluded.intake.at(-1)!.content).toBe('Second result.');
+  });
+
+  it('keys the outcome by run: a retry attempt of a delivered run adds no implicit result', () => {
+    // Attempt 1 delivers the result explicitly and then fails; the retry
+    // ladder resumes the SAME run, and its closing text must not reach the
+    // user as a second answer.
+    const { reporter, intake, run } = createReporter();
+    run.id = 7;
+    reporter.noteAttemptStart();
+    reporter.deliverFromReasoner('The result.', 'when_idle');
+    reporter.noteAttemptStart();
+    reporter.noteAttemptEnd(endedWith('Wrapping up: the result.'));
+    expect(intake.map((item) => item.content)).toEqual(['The result.']);
+
+    // Precondition for the negative above: a run that delivered nothing
+    // does surface its closing text.
+    run.id = 8;
+    reporter.noteAttemptStart();
+    reporter.noteAttemptEnd(endedWith('Fresh answer.'));
+    expect(intake.at(-1)!.content).toBe('Fresh answer.');
   });
 });
