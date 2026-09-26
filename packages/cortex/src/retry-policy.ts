@@ -60,6 +60,17 @@ export function backoffForAttempt(policy: RetryPolicy, retryIndex: number): numb
   return Math.min(policy.maxBackoffMs, Math.max(0, scheduled));
 }
 
+/**
+ * `policy` with its elapsed ceiling lowered to at most `remainingMs`, so an
+ * in-run retry ladder cannot outlast an outer budget it runs inside.
+ */
+export function withElapsedCeiling(policy: RetryPolicy, remainingMs: number): RetryPolicy {
+  return {
+    ...policy,
+    maxElapsedMs: Math.min(policy.maxElapsedMs ?? Number.POSITIVE_INFINITY, remainingMs),
+  };
+}
+
 /** Context for a retry decision, captured at the moment of failure. */
 export interface RetryDecisionContext {
   /** Retries already scheduled so far (0-based index of the NEXT retry). */

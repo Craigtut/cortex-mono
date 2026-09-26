@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyError, extractCauseDetail } from '../../src/error-classifier.js';
+import { classifyError, errorMessageOf, extractCauseDetail, toError } from '../../src/error-classifier.js';
 
 describe('classifyError', () => {
   // -----------------------------------------------------------------------
@@ -330,5 +330,16 @@ describe('classifyError', () => {
       expect(detail!.length).toBeLessThanOrEqual(200);
       expect(detail!.endsWith('…')).toBe(true);
     });
+  });
+});
+
+describe('toError / errorMessageOf', () => {
+  it('passes Errors through and wraps other thrown values', () => {
+    const error = new TypeError('boom');
+    expect(toError(error)).toBe(error);
+    expect(toError('text')).toBeInstanceOf(Error);
+    expect(toError('text').message).toBe('text');
+    expect(errorMessageOf(error)).toBe('boom');
+    expect(errorMessageOf(42)).toBe('42');
   });
 });

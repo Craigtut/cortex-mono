@@ -13,6 +13,16 @@
 
 import type { ClassifiedError, ErrorCategory, ErrorSeverity } from './types.js';
 
+/** A thrown value as an Error, wrapping a non-Error in one. */
+export function toError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+/** The message of a thrown value, for logs and user-facing strings. */
+export function errorMessageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 // ---------------------------------------------------------------------------
 // Pattern definitions per category (checked in priority order)
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import {
   backoffForAttempt,
   shouldRetry,
   isRetryableCategory,
+  withElapsedCeiling,
 } from '../../src/retry-policy.js';
 import type { ClassifiedError } from '../../src/types.js';
 
@@ -111,5 +112,19 @@ describe('isRetryableCategory', () => {
   it('reflects the policy set', () => {
     expect(isRetryableCategory('network', DEFAULT_RETRY_POLICY)).toBe(true);
     expect(isRetryableCategory('authentication', DEFAULT_RETRY_POLICY)).toBe(false);
+  });
+});
+
+describe('withElapsedCeiling', () => {
+  it('caps an unbounded policy at the remaining budget', () => {
+    const bounded = withElapsedCeiling(DEFAULT_RETRY_POLICY, 5_000);
+    expect(bounded.maxElapsedMs).toBe(5_000);
+    expect(bounded.maxAttempts).toBe(DEFAULT_RETRY_POLICY.maxAttempts);
+    expect(DEFAULT_RETRY_POLICY.maxElapsedMs).toBeUndefined();
+  });
+
+  it('keeps a tighter existing ceiling', () => {
+    const policy = { ...DEFAULT_RETRY_POLICY, maxElapsedMs: 1_000 };
+    expect(withElapsedCeiling(policy, 5_000).maxElapsedMs).toBe(1_000);
   });
 });

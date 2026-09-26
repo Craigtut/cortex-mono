@@ -31,12 +31,13 @@ import type { CacheBreakpointIndices, DirectCompletionContext } from './cache-br
 import { EventBridge } from './event-bridge.js';
 import type { CortexEvent, PiEventSource } from './event-bridge.js';
 import { BudgetGuard } from './budget-guard.js';
-import { classifyError } from './error-classifier.js';
+import { classifyError, errorMessageOf, toError } from './error-classifier.js';
 import {
   resolveRetryPolicy,
   backoffForAttempt,
   shouldRetry,
   isRetryableCategory,
+  withElapsedCeiling,
 } from './retry-policy.js';
 import { parseWorkingTags } from './working-tags.js';
 import {
@@ -1602,7 +1603,7 @@ export class AgentLoop {
       try {
         await this.drainPendingBackgroundResults();
       } catch (err) {
-        this.emitError(err instanceof Error ? err : new Error(String(err)));
+        this.emitError(toError(err));
       }
     }
   }
@@ -1752,7 +1753,7 @@ export class AgentLoop {
         input, fromDrain, retryPolicyOverride, silentBatch, wakeBatch,
       );
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
+      const error = toError(err);
       promptStatus = this.isAborted() ? 'cancelled' : 'rejected';
       // A wake delivery spliced into a failed consumer prompt would
       // otherwise sit in the transcript with no run ever answering it.
@@ -1884,7 +1885,7 @@ export class AgentLoop {
         }
         return result;
       } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
+        const error = toError(err);
         const aborted = this.isAborted();
         const classified = classifyError(error, { wasAborted: aborted });
 
@@ -2102,7 +2103,7 @@ export class AgentLoop {
         handler(info, this.originContext);
       } catch (err) {
         this.logger.error('onRetryScheduled handler threw', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     }
@@ -2114,7 +2115,7 @@ export class AgentLoop {
         handler(info, this.originContext);
       } catch (err) {
         this.logger.error('onRetrySucceeded handler threw', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     }
@@ -2126,7 +2127,7 @@ export class AgentLoop {
         handler(info, this.originContext);
       } catch (err) {
         this.logger.error('onRetryExhausted handler threw', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     }
@@ -2267,7 +2268,7 @@ export class AgentLoop {
     const turn = this.prompt(content, options?.promptOptions);
     turn.catch((err) => {
       this.logger.warn('deliver-started turn failed', {
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
     });
     return { outcome: 'prompted', turn };
@@ -2369,7 +2370,7 @@ export class AgentLoop {
       try {
         await this.sweepParkedWakeDeliveries();
       } catch (err) {
-        this.emitError(err instanceof Error ? err : new Error(String(err)));
+        this.emitError(toError(err));
       }
     });
   }
@@ -2417,13 +2418,7 @@ export class AgentLoop {
       0,
       MAX_WAKE_DELIVERY_ELAPSED_MS - (now - oldestFirstAttemptAt),
     );
-    const boundedRetryPolicy: RetryPolicy = {
-      ...this.retryPolicy,
-      maxElapsedMs: Math.min(
-        this.retryPolicy.maxElapsedMs ?? Number.POSITIVE_INFINITY,
-        remainingBudgetMs,
-      ),
-    };
+    const boundedRetryPolicy = withElapsedCeiling(this.retryPolicy, remainingBudgetMs);
     // Boundary for the failure unwind, captured like the drain captures it:
     // pi pushes the delivery message at run start, before any model call.
     // The abort epoch is captured beside it so unwind recovery stamps
@@ -2445,7 +2440,7 @@ export class AgentLoop {
         pending.map((item) => item.causeTag).filter((tag) => tag !== undefined),
       );
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
+      const error = toError(err);
       if (!this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch)) {
         // The run progressed past the parked content: it is durable
         // history now. The run's failure still surfaces, but the delivery
@@ -2813,7 +2808,7 @@ export class AgentLoop {
       content = this.headlineProvider();
     } catch (err) {
       this.logger.warn('headline provider threw', {
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
       return null;
     }
@@ -2867,7 +2862,7 @@ export class AgentLoop {
         handler(classified, { loopPath: this.loopPath });
       } catch (handlerErr) {
         this.logger.error('onError handler threw', {
-          error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
+          error: errorMessageOf(handlerErr),
         });
       }
     }
@@ -2890,7 +2885,7 @@ export class AgentLoop {
     keyError: Error | undefined,
     signal?: AbortSignal,
   ): Error {
-    const downstream = err instanceof Error ? err : new Error(String(err));
+    const downstream = toError(err);
     const aborted =
       this.isAborted() || (signal?.aborted ?? false) || downstream.name === 'AbortError';
     const cause = aborted ? downstream : (keyError ?? downstream);
@@ -2979,7 +2974,7 @@ export class AgentLoop {
       try {
         apiKey = await this.config.getApiKey(provider);
       } catch (err) {
-        keyError = err instanceof Error ? err : new Error(String(err));
+        keyError = toError(err);
       }
     }
 
@@ -3076,7 +3071,7 @@ export class AgentLoop {
       try {
         apiKey = await this.config.getApiKey(provider);
       } catch (err) {
-        keyError = err instanceof Error ? err : new Error(String(err));
+        keyError = toError(err);
       }
     }
 
@@ -3350,7 +3345,7 @@ export class AgentLoop {
           try {
             agent.logger.error('tool result interceptor threw; ignoring', {
               toolName: toolCall.name,
-              error: err instanceof Error ? err.message : String(err),
+              error: errorMessageOf(err),
             });
           } catch {
             // Nothing safe left to report to.
@@ -4228,7 +4223,7 @@ export class AgentLoop {
       try {
         apiKey = await this.config.getApiKey(provider);
       } catch (err) {
-        keyError = err instanceof Error ? err : new Error(String(err));
+        keyError = toError(err);
       }
     }
 
@@ -5742,7 +5737,7 @@ export class AgentLoop {
             handler(this.originContext);
           } catch (err) {
             this.logger.error('onLoopComplete handler threw', {
-              error: err instanceof Error ? err.message : String(err),
+              error: errorMessageOf(err),
             });
           }
         }
@@ -5836,7 +5831,7 @@ export class AgentLoop {
                 handler(event.textOutput, { loopPath: this.loopPath });
               } catch (err) {
                 this.logger.error('onTurnComplete handler threw', {
-                  error: err instanceof Error ? err.message : String(err),
+                  error: errorMessageOf(err),
                 });
               }
             }
@@ -5851,7 +5846,7 @@ export class AgentLoop {
                   handler(output, { loopPath: this.loopPath });
                 } catch (err) {
                   this.logger.error('onTurnComplete handler threw', {
-                    error: err instanceof Error ? err.message : String(err),
+                    error: errorMessageOf(err),
                   });
                 }
               }
@@ -6324,7 +6319,7 @@ export class AgentLoop {
           } catch (err) {
             this.logger.error('onSubAgentSpawned handler threw', {
               taskId,
-              error: err instanceof Error ? err.message : String(err),
+              error: errorMessageOf(err),
             });
           }
         }
@@ -6336,7 +6331,7 @@ export class AgentLoop {
           } catch (err) {
             this.logger.error('onSubAgentCompleted handler threw', {
               taskId,
-              error: err instanceof Error ? err.message : String(err),
+              error: errorMessageOf(err),
             });
           }
         }
@@ -6348,7 +6343,7 @@ export class AgentLoop {
           } catch (err) {
             this.logger.error('onSubAgentFailed handler threw', {
               taskId,
-              error: err instanceof Error ? err.message : String(err),
+              error: errorMessageOf(err),
             });
           }
         }
@@ -6569,9 +6564,9 @@ export class AgentLoop {
     } catch (err) {
       this.logger.error('subagent failed', {
         taskId,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessageOf(err),
       });
-      this.subAgentManager.fail(taskId, err instanceof Error ? err.message : String(err));
+      this.subAgentManager.fail(taskId, errorMessageOf(err));
       return {
         taskId,
         output: '',
@@ -6683,9 +6678,9 @@ export class AgentLoop {
         this.logger.error('subagent failed', {
           taskId,
           background: true,
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
-        this.subAgentManager.fail(taskId, err instanceof Error ? err.message : String(err));
+        this.subAgentManager.fail(taskId, errorMessageOf(err));
       });
 
     return { taskId };
@@ -6740,7 +6735,7 @@ export class AgentLoop {
       try {
         await this.drainPendingBackgroundResults();
       } catch (err) {
-        this.emitError(err instanceof Error ? err : new Error(String(err)));
+        this.emitError(toError(err));
       }
     });
   }
@@ -6790,13 +6785,7 @@ export class AgentLoop {
       0,
       MAX_BACKGROUND_DELIVERY_ELAPSED_MS - (Date.now() - oldestFirstAttemptAt),
     );
-    const boundedRetryPolicy: RetryPolicy = {
-      ...this.retryPolicy,
-      maxElapsedMs: Math.min(
-        this.retryPolicy.maxElapsedMs ?? Number.POSITIVE_INFINITY,
-        remainingBudgetMs,
-      ),
-    };
+    const boundedRetryPolicy = withElapsedCeiling(this.retryPolicy, remainingBudgetMs);
 
     const message = parts.join('\n\n---\n\n');
     // Notify consumers once per completion (not again on re-attempts).
@@ -6822,7 +6811,7 @@ export class AgentLoop {
       // progressed past it, the body already lives in history where the
       // next successful run will see it, and re-queueing would append the
       // same completion a second time.
-      attemptError = err instanceof Error ? err : new Error(String(err));
+      attemptError = toError(err);
       if (this.unwindFailedDelivery(preDeliveryCount, runAbortEpoch)) {
         this.requeueOrDeadLetter(batch, err);
         requeuedForRetry = true;
@@ -6964,7 +6953,7 @@ export class AgentLoop {
    * redelivery loops and gate-holding during a sustained outage.
    */
   private requeueOrDeadLetter(batch: PendingBackgroundCompletion[], err: unknown): void {
-    const error = err instanceof Error ? err : new Error(String(err));
+    const error = toError(err);
     const lastError = error.message;
     const classified = classifyError(error, { wasAborted: this.isAborted() });
     const fatal = classified.severity === 'fatal';
@@ -7063,7 +7052,7 @@ export class AgentLoop {
         handler(entry);
       } catch (err) {
         this.logger.error('onBackgroundResultDeadLettered handler threw', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     }
@@ -7133,7 +7122,7 @@ export class AgentLoop {
         handler(taskIds);
       } catch (err) {
         this.logger.error('onBackgroundResultDelivery handler threw', {
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     }
@@ -7167,7 +7156,7 @@ export class AgentLoop {
       } catch (err) {
         this.logger.error('onBeforeSubAgentSpawn handler threw', {
           taskId: params.taskId,
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessageOf(err),
         });
       }
     }
@@ -7404,7 +7393,7 @@ export class AgentLoop {
 
       return result;
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = errorMessageOf(err);
       // A cancel destroys the child mid-run, which surfaces here as an
       // abort-shaped prompt failure. The cancel already resolved the
       // tracked completion as cancelled and fired its hooks; report the
