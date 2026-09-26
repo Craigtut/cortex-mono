@@ -48,6 +48,8 @@ type Kind = 'getter' | 'accessor' | 'method';
 const COMPAT: Record<string, Kind> = {
   trackedPids: 'getter',
   _abortEpoch: 'accessor',
+  pendingWakeDeliveries: 'getter',
+  unwindFailedDelivery: 'method',
   registeredTools: 'getter',
   toolRuntime: 'getter',
   buildChildToolSet: 'method',
