@@ -323,8 +323,8 @@ describe('ask intake and voicing', () => {
   it('the ask lane is exempt from the interrupt token bucket (asks are never delayed)', async () => {
     const h = createHarness({ interruptBucketCapacity: 1, interruptRefillMs: 10_000_000 });
     // Drain the bucket: first interrupt takes the only token, second demotes.
-    h.router.deliverFromReasoner('one', 'interrupt');
-    h.router.deliverFromReasoner('two', 'interrupt');
+    h.router.deliverFromReasoner('one', 'interrupt', { concludes: true });
+    h.router.deliverFromReasoner('two', 'interrupt', { concludes: true });
     await waitUntil(() => h.talkerDeliveries.length >= 1);
 
     // An ask raised now still voices immediately, ahead of everything.

@@ -18,8 +18,7 @@ import type { DelegationRegistry } from './delegations.js';
 import type { DeliveryScheduler } from './delivery-scheduler.js';
 import type { QuickLookupOutcome } from './quick-lookups.js';
 import type { DeliveryIntakeResult } from './reasoner-tools.js';
-import { deliveryConcludes } from './reasoner-outcomes.js';
-import type { RouterLogInput } from './router-contract.js';
+import type { ReasonerDeliveryMeta, RouterLogInput } from './router-contract.js';
 
 /**
  * Bound on delivery_absorbed lifecycle entries per reasoner attempt (the N4
@@ -112,7 +111,7 @@ export class DeliveryIntake {
   fromReasoner(
     content: string,
     wakeProposed: WakeClass | undefined,
-    meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
+    meta: ReasonerDeliveryMeta,
   ): DeliveryIntakeResult {
     // cancel_task is the one discard path (communication.md): a result
     // whose causation is entirely cancelled work never reaches the user.
@@ -126,8 +125,8 @@ export class DeliveryIntake {
         data: {
           event: 'delivery_dropped_cancelled',
           content,
-          ...(meta?.implicit ? { implicit: true } : {}),
-          ...(meta?.synthetic ? { synthetic: true } : {}),
+          ...(meta.implicit ? { implicit: true } : {}),
+          ...(meta.synthetic ? { synthetic: true } : {}),
         },
         ...this.reasonerCause(),
       });
@@ -160,8 +159,8 @@ export class DeliveryIntake {
           content: 'Duplicate delivery absorbed',
           data: {
             event: 'delivery_absorbed',
-            ...(meta?.implicit ? { implicit: true } : {}),
-            ...(meta?.synthetic ? { synthetic: true } : {}),
+            ...(meta.implicit ? { implicit: true } : {}),
+            ...(meta.synthetic ? { synthetic: true } : {}),
             ...(atBound ? { furtherAbsorbedSuppressed: true } : {}),
           },
           ...cause,
@@ -185,9 +184,9 @@ export class DeliveryIntake {
       data: {
         proposedWake: proposed,
         ...(demoted ? { demoted: true } : {}),
-        ...(meta?.implicit ? { implicit: true } : {}),
-        ...(meta?.synthetic ? { synthetic: true } : {}),
-        ...(meta?.terminal ? { terminal: true } : {}),
+        ...(meta.implicit ? { implicit: true } : {}),
+        ...(meta.synthetic ? { synthetic: true } : {}),
+        ...(meta.terminal ? { terminal: true } : {}),
       },
       ...cause,
     });
@@ -195,7 +194,7 @@ export class DeliveryIntake {
     // A result retires the work it answers, so the block and the watchdog
     // stop calling finished work live. Read AFTER the log append and before
     // any queueing, while the producing run is still the live one.
-    if (deliveryConcludes(wake, meta)) {
+    if (meta.concludes) {
       this.delegations.retireFor(this.ports.currentReasonerCauseTags());
     }
 

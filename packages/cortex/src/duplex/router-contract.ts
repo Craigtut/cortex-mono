@@ -98,6 +98,19 @@ export interface DuplexRouterPorts {
   reasonerLoopPath?: string;
 }
 
+/** What the outcome reporter tells the router about one reasoner delivery. */
+export interface ReasonerDeliveryMeta {
+  implicit?: boolean;
+  synthetic?: boolean;
+  terminal?: boolean;
+  /**
+   * Whether the delivery reports the work reaching a conclusion, decided
+   * once by the outcome reporter (deliveryConcludes): a concluding delivery
+   * retires the delegation it answers.
+   */
+  concludes: boolean;
+}
+
 /** How a dispatch should reach a reasoner that may be mid-run. */
 export interface ReasonerDispatchOptions {
   /**

@@ -14,6 +14,8 @@ import { describe, it, expect, vi } from 'vitest';
 import { DuplexRouter, DUPLEX_ROUTER_DEFAULTS } from '../../src/duplex/router.js';
 import type { ReasonerDispatchOptions, RouterLogInput } from '../../src/duplex/router.js';
 import { makeTestRouter } from './duplex-test-ports.js';
+import { deliveryConcludes } from '../../src/duplex/reasoner-outcomes.js';
+import type { WakeClass } from '../../src/session-log.js';
 import type { PermissionBroker } from '../../src/duplex/permission-broker.js';
 import type { CauseTag } from '../../src/duplex/cause-tags.js';
 import { buildControlTools } from '../../src/duplex/control-tools.js';
@@ -174,6 +176,24 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<vo
   }
 }
 
+/**
+ * The router behind the outcome reporter, as the session wires it: every
+ * reasoner delivery arrives already judged (deliveryConcludes), which is
+ * the reporter's decision, not the router's.
+ */
+function reported(router: DuplexRouter): {
+  deliverFromReasoner(
+    content: string,
+    wake: WakeClass | undefined,
+    meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
+  ): ReturnType<DuplexRouter['deliverFromReasoner']>;
+} {
+  return {
+    deliverFromReasoner: (content, wake, meta) =>
+      router.deliverFromReasoner(content, wake, { ...meta, concludes: deliveryConcludes(wake, meta) }),
+  };
+}
+
 function entryTypes(h: Harness): string[] {
   return h.log.map((entry) => entry.type);
 }
@@ -185,7 +205,7 @@ function entryTypes(h: Harness): string[] {
 describe('wake policy', () => {
   it('silent deliveries go straight to the talker silent queue and never wake', () => {
     const h = createHarness();
-    const result = h.router.deliverFromReasoner('milestone reached', 'silent');
+    const result = reported(h.router).deliverFromReasoner('milestone reached', 'silent');
     expect(result).toMatchObject({ delivered: true, wake: 'silent' });
     expect(h.talkerDeliveries).toHaveLength(1);
     expect(h.talkerDeliveries[0]!.wake).toBe(false);
@@ -196,7 +216,7 @@ describe('wake policy', () => {
   it('interrupt deliveries reach the talker as wake content', async () => {
     const h = createHarness();
     h.setTalkerIdle(false); // interrupts do not wait for a lull
-    const result = h.router.deliverFromReasoner('need a decision', 'interrupt');
+    const result = reported(h.router).deliverFromReasoner('need a decision', 'interrupt');
     expect(result).toMatchObject({ delivered: true, wake: 'interrupt' });
     await waitUntil(() => h.talkerDeliveries.length === 1);
     expect(h.talkerDeliveries[0]!.wake).toBe(true);
@@ -205,7 +225,7 @@ describe('wake policy', () => {
   it('when_idle holds while the channel is busy and delivers at the lull', async () => {
     const h = createHarness();
     h.setTalkerIdle(false);
-    const result = h.router.deliverFromReasoner('finished the analysis', 'when_idle');
+    const result = reported(h.router).deliverFromReasoner('finished the analysis', 'when_idle');
     expect(result).toMatchObject({ delivered: true, wake: 'when_idle' });
     expect(h.router.pendingDeliveryCount).toBe(1);
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -219,7 +239,7 @@ describe('wake policy', () => {
 
   it('defaults an unspecified wake class to when_idle', () => {
     const h = createHarness();
-    const result = h.router.deliverFromReasoner('result', undefined);
+    const result = reported(h.router).deliverFromReasoner('result', undefined);
     expect(result.wake).toBe('when_idle');
     const entry = h.log.find((item) => item.type === 'delivery')!;
     expect(entry.wake).toBe('when_idle');
@@ -230,7 +250,7 @@ describe('wake policy', () => {
     const h = createHarness();
     h.setTalkerIdle(true);
     h.setIdleSignal(() => false); // consumer says: user mid-utterance
-    h.router.deliverFromReasoner('done', 'when_idle');
+    reported(h.router).deliverFromReasoner('done', 'when_idle');
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(h.talkerDeliveries).toHaveLength(0);
 
@@ -241,7 +261,7 @@ describe('wake policy', () => {
   it('a throwing idle signal is treated as not idle, not as a crash', async () => {
     const h = createHarness();
     h.setIdleSignal(() => { throw new Error('signal bug'); });
-    h.router.deliverFromReasoner('done', 'when_idle');
+    reported(h.router).deliverFromReasoner('done', 'when_idle');
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(h.talkerDeliveries).toHaveLength(0);
     expect(h.router.pendingDeliveryCount).toBe(1);
@@ -250,7 +270,7 @@ describe('wake policy', () => {
   it('when_idle degrades to interrupt after the configured delay', async () => {
     const h = createHarness({ whenIdleDegradeMs: 50 });
     h.setTalkerIdle(false); // never idle
-    h.router.deliverFromReasoner('overdue result', 'when_idle');
+    reported(h.router).deliverFromReasoner('overdue result', 'when_idle');
     // The degrade clock uses the injected clock; move past the threshold.
     h.advance(60);
     await waitUntil(() => h.talkerDeliveries.length === 1);
@@ -259,7 +279,7 @@ describe('wake policy', () => {
 
   it('every delivery lands in the log before the talker sees it, with the disposed wake', () => {
     const h = createHarness();
-    h.router.deliverFromReasoner('silent note', 'silent');
+    reported(h.router).deliverFromReasoner('silent note', 'silent');
     const entry = h.log[0]!;
     expect(entry.type).toBe('delivery');
     expect(entry.wake).toBe('silent');
@@ -276,23 +296,23 @@ describe('backpressure', () => {
   it('demotes interrupts to when_idle once the token bucket is empty, refilling over time', () => {
     const h = createHarness({ interruptBucketCapacity: 2, interruptRefillMs: 1_000 });
     h.setTalkerIdle(false);
-    expect(h.router.deliverFromReasoner('a', 'interrupt').wake).toBe('interrupt');
-    expect(h.router.deliverFromReasoner('b', 'interrupt').wake).toBe('interrupt');
-    const demoted = h.router.deliverFromReasoner('c', 'interrupt');
+    expect(reported(h.router).deliverFromReasoner('a', 'interrupt').wake).toBe('interrupt');
+    expect(reported(h.router).deliverFromReasoner('b', 'interrupt').wake).toBe('interrupt');
+    const demoted = reported(h.router).deliverFromReasoner('c', 'interrupt');
     expect(demoted.wake).toBe('when_idle');
     const demotedEntry = h.log.filter((entry) => entry.type === 'delivery')[2]!;
     expect(demotedEntry.data).toMatchObject({ proposedWake: 'interrupt', demoted: true });
 
     // One refill period earns one token back.
     h.advance(1_100);
-    expect(h.router.deliverFromReasoner('d', 'interrupt').wake).toBe('interrupt');
-    expect(h.router.deliverFromReasoner('e', 'interrupt').wake).toBe('when_idle');
+    expect(reported(h.router).deliverFromReasoner('d', 'interrupt').wake).toBe('interrupt');
+    expect(reported(h.router).deliverFromReasoner('e', 'interrupt').wake).toBe('when_idle');
   });
 
   it('absorbs duplicate delivery content within the dedup window', () => {
     const h = createHarness({ deliveryDedupWindowMs: 1_000 });
-    expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(true);
-    const duplicate = h.router.deliverFromReasoner('same text', 'silent');
+    expect(reported(h.router).deliverFromReasoner('same text', 'silent').delivered).toBe(true);
+    const duplicate = reported(h.router).deliverFromReasoner('same text', 'silent');
     expect(duplicate.delivered).toBe(false);
     expect(duplicate.reason).toMatch(/duplicate/);
     // Only one delivery entry and one talker handoff.
@@ -301,13 +321,13 @@ describe('backpressure', () => {
 
     // Outside the window the same content delivers again.
     h.advance(1_100);
-    expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(true);
+    expect(reported(h.router).deliverFromReasoner('same text', 'silent').delivered).toBe(true);
   });
 
   it('a deduped delivery leaves a delivery_absorbed lifecycle trace (S3)', () => {
     const h = createHarness({ reasonerCauseTags: [{ kind: 'directive', seq: 7 }] });
-    expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(true);
-    const duplicate = h.router.deliverFromReasoner('same text', 'silent', { implicit: true });
+    expect(reported(h.router).deliverFromReasoner('same text', 'silent').delivered).toBe(true);
+    const duplicate = reported(h.router).deliverFromReasoner('same text', 'silent', { implicit: true });
     expect(duplicate.delivered).toBe(false);
     // An absorbed duplicate still enters the audit trail.
     const absorbed = h.log.find(
@@ -320,11 +340,11 @@ describe('backpressure', () => {
 
   it('bounds delivery_absorbed lifecycle entries per reasoner run', () => {
     const h = createHarness();
-    expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(true);
+    expect(reported(h.router).deliverFromReasoner('same text', 'silent').delivered).toBe(true);
     // A run re-emitting the same content in a loop: every repeat is
     // absorbed, but only a bounded number writes a lifecycle entry.
     for (let i = 0; i < 5; i++) {
-      expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(false);
+      expect(reported(h.router).deliverFromReasoner('same text', 'silent').delivered).toBe(false);
     }
     const absorbed = h.log.filter(
       (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'delivery_absorbed',
@@ -334,7 +354,7 @@ describe('backpressure', () => {
 
     // The bound is per reasoner attempt, not per session.
     h.startReasonerAttempt();
-    expect(h.router.deliverFromReasoner('same text', 'silent').delivered).toBe(false);
+    expect(reported(h.router).deliverFromReasoner('same text', 'silent').delivered).toBe(false);
     expect(h.log.filter(
       (entry) => entry.type === 'lifecycle' && (entry.data as { event?: string }).event === 'delivery_absorbed',
     )).toHaveLength(4);
@@ -342,10 +362,10 @@ describe('backpressure', () => {
 
   it('identical content under a new causing directive is delivered, not absorbed (S3)', () => {
     const h = createHarness({ reasonerCauseTags: [{ kind: 'directive', seq: 7 }] });
-    expect(h.router.deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
+    expect(reported(h.router).deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
     // "Run it again": a new directive, byte-identical result.
     h.setReasonerCauseTags([{ kind: 'directive', seq: 11 }]);
-    expect(h.router.deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
+    expect(reported(h.router).deliverFromReasoner('Scan complete: no issues.', 'silent').delivered).toBe(true);
     expect(h.log.filter((entry) => entry.type === 'delivery')).toHaveLength(2);
     expect(h.talkerDeliveries).toHaveLength(2);
   });
@@ -353,9 +373,9 @@ describe('backpressure', () => {
   it('enforces minimum inter-delivery spacing even under an always-idle signal', async () => {
     const h = createHarness({ minDeliverySpacingMs: 10_000_000 });
     h.setIdleSignal(() => true);
-    h.router.deliverFromReasoner('first', 'when_idle');
+    reported(h.router).deliverFromReasoner('first', 'when_idle');
     await waitUntil(() => h.talkerDeliveries.length === 1);
-    h.router.deliverFromReasoner('second', 'when_idle');
+    reported(h.router).deliverFromReasoner('second', 'when_idle');
     await new Promise((resolve) => setTimeout(resolve, 25));
     // The second is held on spacing despite the idle signal.
     expect(h.talkerDeliveries).toHaveLength(1);
@@ -368,8 +388,8 @@ describe('backpressure', () => {
   it('interrupts jump ahead of held when_idle deliveries', async () => {
     const h = createHarness();
     h.setTalkerIdle(false);
-    h.router.deliverFromReasoner('waiting result', 'when_idle');
-    h.router.deliverFromReasoner('urgent question', 'interrupt');
+    reported(h.router).deliverFromReasoner('waiting result', 'when_idle');
+    reported(h.router).deliverFromReasoner('urgent question', 'interrupt');
     await waitUntil(() => h.talkerDeliveries.length === 1);
     expect(h.talkerDeliveries[0]!.content).toContain('urgent question');
   });
@@ -708,7 +728,7 @@ describe('control-tool dispatch', () => {
     // reasoner's live-run causation from the directive the spawn actually
     // dispatched, so this is the whole real path (dispatch, consume, deliver)
     // rather than a hand-placed tag that only this test knows to supply.
-    h.router.deliverFromReasoner('the release is built', 'when_idle');
+    reported(h.router).deliverFromReasoner('the release is built', 'when_idle');
 
     expect(h.router.getDelegations()[0]!.completedAt).toBe(h.now());
     // And the same set produced the log stamp, from one port.
@@ -729,7 +749,7 @@ describe('control-tool dispatch', () => {
       { kind: 'directive', seq: spawnSeq },
       { kind: 'directive', seq: spawnSeq + 99 },
     ]);
-    h.router.deliverFromReasoner('done', 'when_idle');
+    reported(h.router).deliverFromReasoner('done', 'when_idle');
     expect(h.router.getDelegations()[0]!.completedAt).toEqual(expect.any(Number));
   });
 
@@ -742,12 +762,23 @@ describe('control-tool dispatch', () => {
 
     // silent is a milestone by contract (the reasoner's role prompt), and
     // the watchdog's synthetic delivery says the work is STILL running.
-    h.router.deliverFromReasoner('step one done', 'silent');
+    reported(h.router).deliverFromReasoner('step one done', 'silent');
     expect(h.router.getDelegations()[0]!.completedAt).toBeNull();
 
-    h.router.deliverFromReasoner('Background work is still running.', 'when_idle', { synthetic: true });
+    reported(h.router).deliverFromReasoner('Background work is still running.', 'when_idle', { synthetic: true });
     await waitUntil(() => h.talkerDeliveries.some((d) => d.content.includes('still running')));
     expect(h.router.getDelegations()[0]!.completedAt).toBeNull();
+  });
+
+  it('acts on the conclusion the reporter decided, never re-deriving it from the wake class', async () => {
+    const h = createHarness();
+    await callTool(h, 'spawn_task', { instructions: 'build the release' });
+    // A when_idle delivery the reporter judged non-concluding stays so.
+    h.router.deliverFromReasoner('partial numbers', 'when_idle', { concludes: false });
+    expect(h.router.getDelegations()[0]!.completedAt).toBeNull();
+    // Precondition: the same delivery judged concluding does retire it.
+    h.router.deliverFromReasoner('final numbers', 'when_idle', { concludes: true });
+    expect(h.router.getDelegations()[0]!.completedAt).toBe(h.now());
   });
 
   it('a steer takes a completed delegation back out of the completed state', async () => {
@@ -758,7 +789,7 @@ describe('control-tool dispatch', () => {
     await callTool(h, 'spawn_task', { instructions: 'design the caching layer' });
     const spawnSeq = h.log.find((entry) => entry.type === 'directive')!.seq;
     h.setReasonerCauseTags([{ kind: 'directive', seq: spawnSeq }]);
-    h.router.deliverFromReasoner('first cut of the design', 'when_idle');
+    reported(h.router).deliverFromReasoner('first cut of the design', 'when_idle');
     expect(h.router.getDelegations()[0]!.completedAt).toEqual(expect.any(Number));
 
     const steer = await callTool(h, 'steer_task', {
@@ -772,7 +803,7 @@ describe('control-tool dispatch', () => {
     // works because the steer's own seq joined the delegation's set.
     const steerSeq = h.log.filter((entry) => entry.type === 'directive').at(-1)!.seq;
     h.setReasonerCauseTags([{ kind: 'directive', seq: steerSeq }]);
-    h.router.deliverFromReasoner('switched to LRU', 'when_idle');
+    reported(h.router).deliverFromReasoner('switched to LRU', 'when_idle');
     expect(h.router.getDelegations()[0]!.completedAt).toEqual(expect.any(Number));
   });
 
@@ -945,7 +976,7 @@ describe('steer and cancel against a live run', () => {
     await callTool(h, 'spawn_task', { instructions: 'scan the repo' });
     await callTool(h, 'cancel_task', { taskAlias: 'task-1' });
 
-    const dropped = h.router.deliverFromReasoner('partial scan results', 'when_idle');
+    const dropped = reported(h.router).deliverFromReasoner('partial scan results', 'when_idle');
     expect(dropped.delivered).toBe(false);
     expect(h.log.filter((entry) => entry.type === 'delivery')).toHaveLength(0);
     const record = h.log.find((entry) =>
@@ -954,7 +985,7 @@ describe('steer and cancel against a live run', () => {
 
     // Positive control: once the run also serves live work, results flow.
     await callTool(h, 'spawn_task', { instructions: 'write the report' });
-    expect(h.router.deliverFromReasoner('report written', 'when_idle').delivered).toBe(true);
+    expect(reported(h.router).deliverFromReasoner('report written', 'when_idle').delivered).toBe(true);
     await waitUntil(() => h.talkerDeliveries.length === 1);
   });
 });
@@ -967,7 +998,7 @@ describe('router state management', () => {
   it('dropPendingDeliveries clears held deliveries but keeps their log entries', async () => {
     const h = createHarness();
     h.setTalkerIdle(false);
-    h.router.deliverFromReasoner('undelivered result', 'when_idle');
+    reported(h.router).deliverFromReasoner('undelivered result', 'when_idle');
     expect(h.router.pendingDeliveryCount).toBe(1);
     const dropped = h.router.dropPendingDeliveries();
     expect(dropped).toBe(1);
@@ -981,7 +1012,7 @@ describe('router state management', () => {
   it('waitForDeliveriesSettled resolves when the queues drain or drop', async () => {
     const h = createHarness();
     h.setTalkerIdle(false);
-    h.router.deliverFromReasoner('held', 'when_idle');
+    reported(h.router).deliverFromReasoner('held', 'when_idle');
     let settled = false;
     void h.router.waitForDeliveriesSettled().then(() => { settled = true; });
     await new Promise((resolve) => setTimeout(resolve, 15));
@@ -996,20 +1027,20 @@ describe('router state management', () => {
     const tools = buildControlTools(h.router);
     await tools.find((tool) => tool.name === 'spawn_task')!.execute({ instructions: 'scan' });
     h.setTalkerIdle(false);
-    h.router.deliverFromReasoner('result', 'when_idle');
+    reported(h.router).deliverFromReasoner('result', 'when_idle');
 
     h.router.resetForRestore();
     expect(h.router.getDelegations()).toHaveLength(0);
     expect(h.router.deltaBufferSize).toBe(0);
     expect(h.router.pendingDeliveryCount).toBe(0);
     // Post-restore, the same content is not treated as a duplicate.
-    expect(h.router.deliverFromReasoner('result', 'silent').delivered).toBe(true);
+    expect(reported(h.router).deliverFromReasoner('result', 'silent').delivered).toBe(true);
   });
 
   it('destroy stops intake and timers', () => {
     const h = createHarness();
     h.router.destroy();
-    const result = h.router.deliverFromReasoner('late', 'when_idle');
+    const result = reported(h.router).deliverFromReasoner('late', 'when_idle');
     expect(result.delivered).toBe(false);
   });
 });

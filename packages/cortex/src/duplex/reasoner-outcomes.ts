@@ -45,7 +45,8 @@ import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
  * anything. A facade-synthesized terminal delivery (a failed run) does:
  * nothing further is coming for that task. The router may demote
  * `interrupt` to `when_idle` but never to or from `silent`, so the
- * proposed and the applied wake class give the same answer here.
+ * proposed wake class decides it; the reporter decides it here, once per
+ * delivery, and the router's intake acts on that decision.
  */
 export function deliveryConcludes(
   wake: WakeClass | undefined,
@@ -125,8 +126,9 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
     meta?: DeliveryMeta,
   ): DeliveryIntakeResult {
     const outcome = this.runOutcome();
-    if (deliveryConcludes(wake, meta) && outcome.state === 'open') outcome.state = 'delivered';
-    return this.intake(content, wake, meta);
+    const concludes = deliveryConcludes(wake, meta);
+    if (concludes && outcome.state === 'open') outcome.state = 'delivered';
+    return this.intake(content, wake, meta, concludes);
   }
 
   /**
@@ -351,9 +353,18 @@ export class ReasonerOutcomeReporter implements DeliveryTarget {
     return this.outcome;
   }
 
-  /** Hand one delivery to the router's intake, stamping the silence clock. */
-  private intake(content: string, wake: WakeClass | undefined, meta?: DeliveryMeta): DeliveryIntakeResult {
+  /**
+   * Hand one delivery to the router's intake, stamping the silence clock,
+   * with its conclusion decided here (the router acts on it, never
+   * re-derives it).
+   */
+  private intake(
+    content: string,
+    wake: WakeClass | undefined,
+    meta?: DeliveryMeta,
+    concludes = deliveryConcludes(wake, meta),
+  ): DeliveryIntakeResult {
     this.lastOutput = this.ports.now();
-    return this.ports.router.deliverFromReasoner(content, wake, meta);
+    return this.ports.router.deliverFromReasoner(content, wake, { ...meta, concludes });
   }
 }

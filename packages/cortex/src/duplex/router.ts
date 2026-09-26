@@ -39,10 +39,11 @@ import type {
   DuplexRouterOptions,
   DuplexRouterPorts,
   DuplexRouterState,
+  ReasonerDeliveryMeta,
   ReasonerDispatchOptions,
   ResolvedRouterOptions,
 } from './router-contract.js';
-import type { DeliveryIntakeResult, DeliveryTarget } from './reasoner-tools.js';
+import type { DeliveryIntakeResult } from './reasoner-tools.js';
 import type { QuickLookupOutcome, QuickLookupRequestResult } from './quick-lookups.js';
 
 
@@ -56,11 +57,12 @@ export type {
   DuplexRouterOptions,
   DuplexRouterPorts,
   DuplexRouterState,
+  ReasonerDeliveryMeta,
   ReasonerDispatchOptions,
   RouterLogInput,
 } from './router-contract.js';
 
-export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
+export class DuplexRouter implements ControlDispatchTarget {
   private readonly ports: DuplexRouterPorts;
   private readonly options: ResolvedRouterOptions;
   private readonly logger: CortexLogger;
@@ -379,10 +381,11 @@ export class DuplexRouter implements ControlDispatchTarget, DeliveryTarget {
     this.intake.lookupResult(outcome);
   }
 
+  /** A reasoner delivery the outcome reporter has already judged. */
   deliverFromReasoner(
     content: string,
     wakeProposed: WakeClass | undefined,
-    meta?: { implicit?: boolean; synthetic?: boolean; terminal?: boolean },
+    meta: ReasonerDeliveryMeta,
   ): DeliveryIntakeResult {
     if (this.destroyed) {
       return { delivered: false, reason: 'router destroyed' };
