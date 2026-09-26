@@ -59,7 +59,6 @@ import type {
   RetrySucceededInfo,
   SessionUsage,
   SkillConfig,
-  UtilityUsageBucket,
   SubAgentSnapshot,
   SubAgentSpawnConfig,
   ThinkingLevel,
@@ -96,6 +95,13 @@ import {
 } from './resolution-report.js';
 import type { ResolutionNote, ResolutionNoteCode } from './resolution-report.js';
 import { spokenText, WorkingTagStreamFilter } from './working-tags.js';
+import {
+  addSessionUsage,
+  cloneSessionUsage,
+  diffSessionUsage,
+  isZeroSessionUsage,
+  zeroSessionUsage,
+} from './session-usage.js';
 import { TOOL_NAMES } from './tools/index.js';
 import { DuplexRouter, deliveryConcludes } from './duplex/router.js';
 import type {
@@ -1111,113 +1117,6 @@ export type CortexAgentPersistedState =
   | CortexAgentStateV1
   | AgentMessage[];
 
-// ---------------------------------------------------------------------------
-// Usage arithmetic (baseline-plus-delta restore model)
-// ---------------------------------------------------------------------------
-
-function zeroUsage(): SessionUsage {
-  return {
-    totalCost: 0,
-    totalTurns: 0,
-    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  };
-}
-
-function isZeroUsage(usage: SessionUsage): boolean {
-  return (
-    usage.totalCost === 0 &&
-    usage.totalTurns === 0 &&
-    usage.tokens.input === 0 &&
-    usage.tokens.output === 0 &&
-    usage.tokens.cacheRead === 0 &&
-    usage.tokens.cacheWrite === 0 &&
-    (usage.utility === undefined || Object.keys(usage.utility).length === 0)
-  );
-}
-
-function cloneUsage(usage: SessionUsage): SessionUsage {
-  const copy: SessionUsage = {
-    totalCost: usage.totalCost,
-    totalTurns: usage.totalTurns,
-    tokens: { ...usage.tokens },
-  };
-  if (usage.utility) {
-    copy.utility = Object.fromEntries(
-      Object.entries(usage.utility).map(([category, bucket]) => [
-        category,
-        { ...bucket, tokens: { ...bucket.tokens } },
-      ]),
-    );
-  }
-  return copy;
-}
-
-function addUsage(a: SessionUsage, b: SessionUsage): SessionUsage {
-  const sum = cloneUsage(a);
-  sum.totalCost += b.totalCost;
-  sum.totalTurns += b.totalTurns;
-  sum.tokens.input += b.tokens.input;
-  sum.tokens.output += b.tokens.output;
-  sum.tokens.cacheRead += b.tokens.cacheRead;
-  sum.tokens.cacheWrite += b.tokens.cacheWrite;
-  if (b.utility) {
-    sum.utility ??= {};
-    for (const [category, bucket] of Object.entries(b.utility)) {
-      const target: UtilityUsageBucket = sum.utility[category] ?? {
-        calls: 0,
-        cost: 0,
-        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      };
-      sum.utility[category] = {
-        calls: target.calls + bucket.calls,
-        cost: target.cost + bucket.cost,
-        tokens: {
-          input: target.tokens.input + bucket.tokens.input,
-          output: target.tokens.output + bucket.tokens.output,
-          cacheRead: target.tokens.cacheRead + bucket.tokens.cacheRead,
-          cacheWrite: target.tokens.cacheWrite + bucket.tokens.cacheWrite,
-        },
-      };
-    }
-  }
-  return sum;
-}
-
-/**
- * live minus baseline, per counter. Both reads come from the same loop's
- * monotonically growing counters (baseline taken at restore time), so
- * every difference is non-negative by construction.
- */
-function diffUsage(live: SessionUsage, baseline: SessionUsage): SessionUsage {
-  const delta: SessionUsage = {
-    totalCost: live.totalCost - baseline.totalCost,
-    totalTurns: live.totalTurns - baseline.totalTurns,
-    tokens: {
-      input: live.tokens.input - baseline.tokens.input,
-      output: live.tokens.output - baseline.tokens.output,
-      cacheRead: live.tokens.cacheRead - baseline.tokens.cacheRead,
-      cacheWrite: live.tokens.cacheWrite - baseline.tokens.cacheWrite,
-    },
-  };
-  if (live.utility) {
-    delta.utility = {};
-    for (const [category, bucket] of Object.entries(live.utility)) {
-      const base = baseline.utility?.[category];
-      delta.utility[category] = {
-        calls: bucket.calls - (base?.calls ?? 0),
-        cost: bucket.cost - (base?.cost ?? 0),
-        tokens: {
-          input: bucket.tokens.input - (base?.tokens.input ?? 0),
-          output: bucket.tokens.output - (base?.tokens.output ?? 0),
-          cacheRead: bucket.tokens.cacheRead - (base?.tokens.cacheRead ?? 0),
-          cacheWrite: bucket.tokens.cacheWrite - (base?.tokens.cacheWrite ?? 0),
-        },
-      };
-    }
-  }
-  return delta;
-}
-
 /**
  * The highest `task-N` alias the log's directives mention, or 0. The floor
  * for the alias counter after a restore, whatever the artifact carried.
@@ -1251,7 +1150,7 @@ function normalizePersistedState(state: CortexAgentPersistedState): CortexAgentS
 
 /** A v1 artifact restores into the reasoner with an empty talker and log. */
 function upgradeV1(state: CortexAgentStateV1): CortexAgentStateV2 {
-  const usage = state.usage ? cloneUsage(state.usage) : zeroUsage();
+  const usage = state.usage ? cloneSessionUsage(state.usage) : zeroSessionUsage();
   return {
     version: 2,
     log: [],
@@ -1260,7 +1159,7 @@ function upgradeV1(state: CortexAgentStateV1): CortexAgentStateV2 {
     talkerMemory: null,
     reasonerMemory: state.memory ?? null,
     usage: {
-      total: cloneUsage(usage),
+      total: cloneSessionUsage(usage),
       perLoop: { talker: null, reasoner: usage },
     },
   };
@@ -3530,8 +3429,8 @@ export class CortexAgent {
     const talkerUsage = this.talkerUsageWithBaseline();
     const lookupUsage = this.lookupUsageWithBaseline();
     let total = reasonerUsage;
-    if (talkerUsage) total = addUsage(total, talkerUsage);
-    if (lookupUsage) total = addUsage(total, lookupUsage);
+    if (talkerUsage) total = addSessionUsage(total, talkerUsage);
+    if (lookupUsage) total = addSessionUsage(total, lookupUsage);
     return {
       version: 2,
       log: this.log.getLog(),
@@ -3568,8 +3467,8 @@ export class CortexAgent {
   private reasonerUsageWithBaseline(): SessionUsage {
     const live = this.reasoner.getSessionUsage();
     if (!this.usageBaseline) return live;
-    const delta = this.usageAtRestore ? diffUsage(live, this.usageAtRestore) : live;
-    return addUsage(this.usageBaseline.reasoner, delta);
+    const delta = this.usageAtRestore ? diffSessionUsage(live, this.usageAtRestore) : live;
+    return addSessionUsage(this.usageBaseline.reasoner, delta);
   }
 
   /**
@@ -3578,13 +3477,13 @@ export class CortexAgent {
    */
   private talkerUsageWithBaseline(): SessionUsage | null {
     if (!this.talker) {
-      return this.usageBaseline?.talker ? cloneUsage(this.usageBaseline.talker) : null;
+      return this.usageBaseline?.talker ? cloneSessionUsage(this.usageBaseline.talker) : null;
     }
     const live = this.talker.getSessionUsage();
     if (!this.usageBaseline) return live;
-    const delta = this.talkerUsageAtRestore ? diffUsage(live, this.talkerUsageAtRestore) : live;
+    const delta = this.talkerUsageAtRestore ? diffSessionUsage(live, this.talkerUsageAtRestore) : live;
     const baseline = this.usageBaseline.talker;
-    return baseline ? addUsage(baseline, delta) : delta;
+    return baseline ? addSessionUsage(baseline, delta) : delta;
   }
 
   /**
@@ -3597,12 +3496,12 @@ export class CortexAgent {
     if (!this.lookups) {
       // Passthrough: carry a restored duplex artifact's lookup spend
       // through unchanged, like the retained talker side.
-      return baseline ? cloneUsage(baseline) : null;
+      return baseline ? cloneSessionUsage(baseline) : null;
     }
     const live = this.lookups.getSettledUsage();
-    const delta = this.lookupUsageAtRestore ? diffUsage(live, this.lookupUsageAtRestore) : live;
-    const combined = baseline ? addUsage(baseline, delta) : delta;
-    return isZeroUsage(combined) ? null : combined;
+    const delta = this.lookupUsageAtRestore ? diffSessionUsage(live, this.lookupUsageAtRestore) : live;
+    const combined = baseline ? addSessionUsage(baseline, delta) : delta;
+    return isZeroSessionUsage(combined) ? null : combined;
   }
 
   /**
@@ -3668,9 +3567,9 @@ export class CortexAgent {
     this.log.restore(v2.log);
 
     this.usageBaseline = {
-      talker: v2.usage.perLoop.talker ? cloneUsage(v2.usage.perLoop.talker) : null,
-      reasoner: cloneUsage(v2.usage.perLoop.reasoner),
-      lookups: v2.usage.perLoop.lookups ? cloneUsage(v2.usage.perLoop.lookups) : null,
+      talker: v2.usage.perLoop.talker ? cloneSessionUsage(v2.usage.perLoop.talker) : null,
+      reasoner: cloneSessionUsage(v2.usage.perLoop.reasoner),
+      lookups: v2.usage.perLoop.lookups ? cloneSessionUsage(v2.usage.perLoop.lookups) : null,
     };
     this.usageAtRestore = this.reasoner.getSessionUsage();
     this.talkerUsageAtRestore = this.talker ? this.talker.getSessionUsage() : null;
@@ -4265,9 +4164,9 @@ export class CortexAgent {
   getSessionUsage(): SessionUsage {
     let total = this.reasonerUsageWithBaseline();
     const talker = this.talkerUsageWithBaseline();
-    if (talker) total = addUsage(total, talker);
+    if (talker) total = addSessionUsage(total, talker);
     const lookups = this.lookupUsageWithBaseline();
-    if (lookups) total = addUsage(total, lookups);
+    if (lookups) total = addSessionUsage(total, lookups);
     return total;
   }
 

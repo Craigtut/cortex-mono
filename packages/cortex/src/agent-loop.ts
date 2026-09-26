@@ -52,6 +52,13 @@ import {
   userMessageText,
   withPlaceholderContent,
 } from './pi-message.js';
+import {
+  accumulateTurn,
+  accumulateUtility,
+  addSessionUsage,
+  cloneSessionUsage,
+  zeroSessionUsage,
+} from './session-usage.js';
 // pi-ai 0.80 moved the static catalog reads off the root to the durable
 // `providers/all` entrypoint (`getModel`/`getModels` on root are deprecated
 // compat aliases). These are the non-deprecated replacements.
@@ -131,7 +138,6 @@ import type {
   ToolExecuteContext,
   PersistResultFn,
   ToolCategory,
-  UtilityUsageBucket,
   UtilityUsagePayload,
 } from './types.js';
 import { THINKING_LEVEL_ORDER } from './types.js';
@@ -1128,11 +1134,7 @@ export class AgentLoop {
   // per agentic loop for enforcement), this accumulates across all loops
   // for reporting and persistence. Consumers can snapshot via getSessionUsage()
   // and restore via restoreSessionUsage().
-  private _sessionUsage: SessionUsage = {
-    totalCost: 0,
-    totalTurns: 0,
-    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  };
+  private _sessionUsage: SessionUsage = zeroSessionUsage();
 
   /**
    * Create an AgentLoop. Prefer AgentLoop.create().
@@ -4734,19 +4736,7 @@ export class AgentLoop {
    * and restore it via restoreSessionUsage() after loading a saved session.
    */
   getSessionUsage(): SessionUsage {
-    const snapshot: SessionUsage = {
-      ...this._sessionUsage,
-      tokens: { ...this._sessionUsage.tokens },
-    };
-    if (this._sessionUsage.utility) {
-      snapshot.utility = Object.fromEntries(
-        Object.entries(this._sessionUsage.utility).map(([category, bucket]) => [
-          category,
-          { ...bucket, tokens: { ...bucket.tokens } },
-        ]),
-      );
-    }
-    return snapshot;
+    return cloneSessionUsage(this._sessionUsage);
   }
 
   /**
@@ -4757,23 +4747,7 @@ export class AgentLoop {
    * before the restore call).
    */
   restoreSessionUsage(usage: SessionUsage): void {
-    this._sessionUsage.totalCost += usage.totalCost;
-    this._sessionUsage.totalTurns += usage.totalTurns;
-    this._sessionUsage.tokens.input += usage.tokens.input;
-    this._sessionUsage.tokens.output += usage.tokens.output;
-    this._sessionUsage.tokens.cacheRead += usage.tokens.cacheRead;
-    this._sessionUsage.tokens.cacheWrite += usage.tokens.cacheWrite;
-    if (usage.utility) {
-      for (const [category, bucket] of Object.entries(usage.utility)) {
-        const target = this.utilityUsageBucket(category);
-        target.calls += bucket.calls;
-        target.cost += bucket.cost;
-        target.tokens.input += bucket.tokens.input;
-        target.tokens.output += bucket.tokens.output;
-        target.tokens.cacheRead += bucket.tokens.cacheRead;
-        target.tokens.cacheWrite += bucket.tokens.cacheWrite;
-      }
-    }
+    this._sessionUsage = addSessionUsage(this._sessionUsage, usage);
   }
 
   /**
@@ -4788,20 +4762,6 @@ export class AgentLoop {
   }
 
   /** Get (or create) the session-usage bucket for a utility category. */
-  private utilityUsageBucket(category: string): UtilityUsageBucket {
-    this._sessionUsage.utility ??= {};
-    let bucket = this._sessionUsage.utility[category];
-    if (!bucket) {
-      bucket = {
-        calls: 0,
-        cost: 0,
-        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      };
-      this._sessionUsage.utility[category] = bucket;
-    }
-    return bucket;
-  }
-
   // -----------------------------------------------------------------------
   // Token Tracking and Pipeline Phase
   // -----------------------------------------------------------------------
@@ -5820,19 +5780,7 @@ export class AgentLoop {
         const category =
           (event.payload as UtilityUsagePayload | undefined)?.category ?? 'utility';
 
-        this._sessionUsage.totalCost += usage.cost.total;
-        this._sessionUsage.tokens.input += usage.input;
-        this._sessionUsage.tokens.output += usage.output;
-        this._sessionUsage.tokens.cacheRead += usage.cacheRead;
-        this._sessionUsage.tokens.cacheWrite += usage.cacheWrite;
-
-        const bucket = this.utilityUsageBucket(category);
-        bucket.calls += 1;
-        bucket.cost += usage.cost.total;
-        bucket.tokens.input += usage.input;
-        bucket.tokens.output += usage.output;
-        bucket.tokens.cacheRead += usage.cacheRead;
-        bucket.tokens.cacheWrite += usage.cacheWrite;
+        accumulateUtility(this._sessionUsage, category, usage);
 
         this.logger.debug('utility usage', {
           category,
@@ -5928,12 +5876,7 @@ export class AgentLoop {
           }
 
           // Accumulate session-lifetime usage (does not reset per loop)
-          this._sessionUsage.totalCost += event.usage.cost.total;
-          this._sessionUsage.totalTurns += 1;
-          this._sessionUsage.tokens.input += event.usage.input;
-          this._sessionUsage.tokens.output += event.usage.output;
-          this._sessionUsage.tokens.cacheRead += event.usage.cacheRead;
-          this._sessionUsage.tokens.cacheWrite += event.usage.cacheWrite;
+          accumulateTurn(this._sessionUsage, event.usage);
 
           this.logger.debug('turn_end usage', {
             input: event.usage.input,
